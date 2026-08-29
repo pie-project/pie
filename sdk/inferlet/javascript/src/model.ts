@@ -41,7 +41,7 @@ export function outputVocabSize(): number {
   return _model.outputVocabSize();
 }
 
-/** Tokens per KV page for the bound model/driver. */
+/** Tokens per KV page for the bound model/engine. */
 export function kvPageSize(): number {
   return _model.kvPageSize();
 }

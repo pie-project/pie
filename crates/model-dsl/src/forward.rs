@@ -14,7 +14,7 @@ use model_ir::{CacheRow, Guard, Dim, Dtype, GeomKind, Trace, Platform, RuntimeIn
 use crate::record::{Recorder, Refine, SplitSpec, Value};
 use crate::seam;
 
-/// One request's shape facts, as the engine states them per fire.
+/// One request's shape facts, as the runtime states them per fire.
 ///
 /// **FIVE FACTS ABOUT A REQUEST, NOT ABOUT A FIRE.** Everything here is
 /// per-lane by construction (design §0's vocabulary note): how many rows this
@@ -54,7 +54,7 @@ impl Request {
     /// The same request, routing to an adapter bank (design §8).
     ///
     /// A builder rather than a fourth positional argument: `Request::new` has
-    /// forty call sites across the tests and the engine, and every one of them
+    /// forty call sites across the tests and the runtime, and every one of them
     /// that does NOT route would have had to write `false` — which is exactly
     /// the shape a reader stops checking. Whoever routes says so.
     #[must_use]
@@ -153,7 +153,7 @@ pub struct KvSpace(pub u32);
 /// plane shared as both k and v is `[w]`, and a latent page, whose two planes
 /// are not the same width, is `[kv_lora_rank, rope_dim]`. Every kv row joins a
 /// [`KvSpace`], and the space's [`Dtype`] is its rows' element layout: the
-/// model states its kv-cache dtype here, so no driver ever picks one silently.
+/// model states its kv-cache dtype here, so no engine ever picks one silently.
 /// The dtype is all a page's element layout says — quant granularity and the
 /// fp4 block size are not dtype facts, and become sibling fields on
 /// `CacheRow::Kv` when the shell is written. One spec serves attention-only
@@ -373,7 +373,7 @@ impl<F> Input<F> {
     /// The model's paged-kv space's custom attention mask: packed `u8` mask
     /// bits, token-aligned, read by `attention.masked`. Both platforms carry
     /// the bits this way — metal's fire tables and the cuda plan's `Mask`
-    /// pair; the per-request enabled bits and spans stay driver-derived for
+    /// pair; the per-request enabled bits and spans stay engine-derived for
     /// now.
     #[must_use]
     pub fn mask(&self) -> Value {
@@ -501,7 +501,7 @@ impl<F> Input<F> {
     /// per-lane, and the fire tables — the padding mask, the token→lane map,
     /// and the write addressing — are per-token. Everything is `i32` except
     /// `RowValid`, the packed `u8` graph-padding mask. The dims state
-    /// alignment, not an arena size: geometry buffers are driver-bound, and
+    /// alignment, not an arena size: geometry buffers are engine-bound, and
     /// `Indices` in particular is lane-aligned ragged, viewed through the
     /// indptr beside it.
     ///

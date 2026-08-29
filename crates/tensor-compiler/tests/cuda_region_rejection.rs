@@ -81,7 +81,7 @@ const NO_OPINION: &[(&str, &str)] = &[
     ),
     (
         "singleton_kind",
-        "CUDA emits no singleton kernels — the driver falls back to prebuilt \
+        "CUDA emits no singleton kernels — the engine falls back to prebuilt \
          tier-0 kernels — so it never reads the singleton partition",
     ),
     ("whole_stage_fallback", "also the singleton partition only"),

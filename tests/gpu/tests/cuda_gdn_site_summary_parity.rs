@@ -1,10 +1,10 @@
-//! Live check for the driver→engine site-summary handshake on the dense
+//! Live check for the engine→runtime site-summary handshake on the dense
 //! qwen3.5-0.8B hybrid (the GDN model whose declared plan traces + validates
 //! at boot — `declared_facts.cpp`).
 //!
 //! What the increment claims and this harness verifies on the real GPU:
 //!
-//! * With `PIE_DECLARED_FORWARD=1` the driver holds a validated plan and its
+//! * With `PIE_DECLARED_FORWARD=1` the engine holds a validated plan and its
 //!   capability payload carries `model_site_summary` — PRESENT-BUT-EMPTY on
 //!   this dense model (no MoE checkpoint fits this GPU, so a populated
 //!   summary is covered by unit/dummy tests instead). The one-line
@@ -21,8 +21,8 @@
 //! this box); parity is within-model, so the Base/instruct distinction does
 //! not matter here.
 //!
-//! `#[ignore]`, driver-cuda. Run OFF then ON, the second invocation gates:
-//!   cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//! `#[ignore]`, engine-cuda. Run OFF then ON, the second invocation gates:
+//!   cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!     --test cuda_gdn_site_summary_parity -- --ignored --nocapture
 //!   PIE_DECLARED_FORWARD=1 cargo test ... --test cuda_gdn_site_summary_parity ...
 

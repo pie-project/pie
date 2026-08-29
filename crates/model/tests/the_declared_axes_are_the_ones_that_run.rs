@@ -17,7 +17,7 @@
 //!   classifier restated and could not catch it being wrong.
 //! - **does the export survive the fire?** A draft column is read after the
 //!   graph has run, by the same sampler that reads the trunk's logits
-//!   (`driver::program`'s `MtpLogits`/`MtpDrafts` index the readout at
+//!   (`engine::program`'s `MtpLogits`/`MtpDrafts` index the readout at
 //!   `mtp_draft_row`). `model_compiler::arena` gives that delivery tail to the
 //!   `"out"` seam by name and to no other, so the model text buys it by
 //!   ORDERING — and this is what notices if the order moves.

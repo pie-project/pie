@@ -21,10 +21,10 @@
 //! verify's matrix intrinsic, so the cross-check catches a matrix-argmax regression
 //! (#35-A class), not just the eq/cumprod/select DAG.
 //!
-//! `#[ignore]`, driver-cuda. Run:
+//! `#[ignore]`, engine-cuda. Run:
 //!   PIE_COMPILER_LAUNCHER=env CUDACXX=/usr/local/cuda/bin/nvcc \
 //!   CPM_SOURCE_CACHE=$HOME/.cache/pie-cpm \
-//!   cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_selfspec31 -- --ignored --nocapture
+//!   cargo test -p pie-gpu-tests --features engine-cuda-13 --test cuda_selfspec31 -- --ignored --nocapture
 
 mod common;
 
@@ -44,7 +44,7 @@ use client::client::Client;
             `Fault::Draftless`, and the `SelfSpecDraftInput` resolver that \
             aliased the drafts off `pi.tokens` went with the C++ shell -- as did \
             the `selfspec` guest"]
-async fn self_spec_device_alias_verify_on_real_driver() -> Result<()> {
+async fn self_spec_device_alias_verify_on_real_engine() -> Result<()> {
     common::init_trace();
     let pie = common::boot_cuda().await?;
     eprintln!("[self-spec] booted, listen_addr={}", pie.listen_addr);

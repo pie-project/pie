@@ -17,18 +17,18 @@ const M3: &str = "M3";
 
 /// The M1 runtime template, from
 /// `crates/tensor-compiler/runtime/metal/ptir_m1_runtime.metal` (the C++ oracle
-/// this was ported from read the same text out of the driver's tree; the file
+/// this was ported from read the same text out of the engine's tree; the file
 /// moved here when the emitter became the only implementation). Embedded so the
 /// emitter is self-contained — the C++ took it as a `runtime_template` argument
 /// read from disk at init.
 ///
 /// It still carries `#include "ptir_rng.generated.metal"`; expanding that is
-/// the driver's job at library-build time, not the emitter's.
+/// the engine's job at library-build time, not the emitter's.
 pub const RUNTIME_TEMPLATE: &str = include_str!("../../../runtime/metal/ptir_m1_runtime.metal");
 
 /// The grouped (M3) lane-table structs, in a file rather than a literal for the
 /// same reason `RUNTIME_TEMPLATE` is: a C++ reader needs them too. The Metal
-/// driver's `msl_compile_test` reconstructs the emitter's full sources from the
+/// engine's `msl_compile_test` reconstructs the emitter's full sources from the
 /// golden dump plus these two prefixes, and a raw string literal in this crate
 /// is reachable from nothing but this crate.
 ///
@@ -117,7 +117,7 @@ mod tests {
 
     use super::*;
 
-    /// `ptir_m1_grouped.metal` exists because the Metal driver's
+    /// `ptir_m1_grouped.metal` exists because the Metal engine's
     /// `msl_compile_test` needs a path it can open; it is not a second place to
     /// declare the lane table. Adding a field to [`layout::HOST_SHARED`] and
     /// not to the file (or the reverse) fails here instead of shipping a

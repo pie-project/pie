@@ -13,7 +13,7 @@
 // which is why a scalar argument lives in a staged cell and this shader
 // writes the CELL rather than the binding.
 //
-// The three law forms are `driver_metal::abi::Law`, and this is the only
+// The three law forms are `engine_metal::abi::Law`, and this is the only
 // other place they are evaluated:
 //
 //     kind 0  const   v
@@ -21,7 +21,7 @@
 //     kind 2  ceil    v = mul · ⌈(α·rows + β) / div⌉
 //
 // The coordinates are not in the descriptor. They are read OUT of it, by the
-// one linear functional per direction that `driver_metal::abi::Recipe` solves
+// one linear functional per direction that `engine_metal::abi::Recipe` solves
 // at load — the descriptor carries a class table and the laws are written in
 // a basis of reachable directions, and the recipe is the inverse of the
 // second in terms of the first.
@@ -143,7 +143,7 @@ static inline long icb_eval(device const IcbLaw& law,
     return law.mul * q;
 }
 
-// The threadgroup a slot that stated none gets — `driver_metal::device::ctx::
+// The threadgroup a slot that stated none gets — `engine_metal::device::ctx::
 // threadgroup`, in the one other place it has to be computed, because the
 // grid it is derived from is what this shader just rewrote.
 static inline uint3 icb_occupancy(IcbPipe pipe, uint3 lanes) {

@@ -33,7 +33,7 @@ these is necessary rather than fussy):
 Run from the repo root with PYTHONPATH=sdk/server/python/python:
 
     PIE_CUDA_KV_ENVELOPES=1 python tests/inferlets/bench_trackb.py \
-        --driver cuda_native --model <path>
+        --engine cuda_native --model <path>
 """
 
 import os

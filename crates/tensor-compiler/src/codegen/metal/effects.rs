@@ -279,9 +279,9 @@ pub fn emit_grouped_commit(function_name: &str) -> String {
 /// bits come from the bound trace's first-op direction table.
 ///
 /// The table is emitted here rather than derived on the far side so that a
-/// driver never needs the decoded plan to build it. That keeps the effect
+/// engine never needs the decoded plan to build it. That keeps the effect
 /// kernels the M1 and M2 launch paths bind host-emitted like every other
-/// kernel, instead of leaving one kernel family that each driver assembles for
+/// kernel, instead of leaving one kernel family that each engine assembles for
 /// itself and can get subtly different.
 pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
     let channels = &bound.container.channels;
@@ -303,7 +303,7 @@ pub fn channel_effects(bound: &BoundTrace) -> Vec<M1ChannelEffect> {
                 if used != chan {
                     continue;
                 }
-                // The driver advances the ring off these two flags, so a
+                // The engine advances the ring off these two flags, so a
                 // channel op that is not classified here leaves the ring
                 // un-advanced rather than raising anything.
                 match use_ {

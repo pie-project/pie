@@ -7,7 +7,7 @@
 //! old lib+bin anti-pattern (a *role* crate flipping identity by feature).
 //!
 //! The gate it was written for was tests/boot_smoke.rs, deleted with the dummy
-//! driver it booted; the seam is driven by the Vulkan gates in `tests/gpu/`
+//! engine it booted; the seam is driven by the Vulkan gates in `tests/gpu/`
 //! now, which call the same `run_standalone` against a real device.
 
 pub mod compose;

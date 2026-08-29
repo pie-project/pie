@@ -1,8 +1,8 @@
 """Chunked prefill must equal one-shot prefill, and must lift the ceiling.
 
 Every policy here exists for long contexts, but each one's prefill was a single
-fire, and a single fire cannot exceed the driver's structural per-launch token
-capacity (`max_embed_length()`, 8192 on this CUDA driver). That put a hard
+fire, and a single fire cannot exceed the engine's structural per-launch token
+capacity (`max_embed_length()`, 8192 on this CUDA engine). That put a hard
 ceiling on the context they could be run at -- *below* the range where sections
 14 and 15 show they start to pay for themselves, which made the ceiling a
 correctness-shaped hole in the features rather than a mere limit.
@@ -52,7 +52,7 @@ can put mass there; a tap on any earlier chunk reports zero for it.
 Run from the repo root with PYTHONPATH=sdk/server/python/python:
 
     PIE_CUDA_KV_ENVELOPES=1 python tests/inferlets/test_chunked_prefill.py \
-        --driver cuda_native --model <path>
+        --engine cuda_native --model <path>
 """
 
 import json

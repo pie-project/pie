@@ -6,21 +6,21 @@
 //! Every other decode inferlet in this directory carries its next token ON THE
 //! DEVICE: the epilogue writes the sampled token straight back into the channel
 //! the `embed` port reads, and the host never sees it. That is the fast shape,
-//! and it needs a driver that resolves the `EmbedTokens`/`KvLen` descriptor
+//! and it needs an engine that resolves the `EmbedTokens`/`KvLen` descriptor
 //! ports at kernel time — `GeometryClass::DecodeEnvelope`, or the pooled
 //! device-geometry class above it.
 //!
 //! The CUDA shell does not, and says so: its load answers `ports:
 //! PortMask::NONE` and `geometry: GeometryClass::Host`, so every geometry
 //! vector a fire runs on is staged from the host. Against that shell a
-//! device-carried token is a value the engine cannot know, and the fire is
+//! device-carried token is a value the runtime cannot know, and the fire is
 //! refused by name (`EmbedTokens is not host-derivable`) rather than run on a
 //! guess.
 //!
 //! So this one brings the TOKEN back to the host and sends it down again as a
 //! host-writer cell — and only the token. Everything else the fire reads is
 //! DERIVED from the KV length by pure arithmetic, so the epilogue still
-//! carries it on the device exactly as `naive-baseline` does, and the engine's
+//! carries it on the device exactly as `naive-baseline` does, and the runtime's
 //! host shadow folds the same arithmetic to know what each fire will read.
 //! One host round trip per token, which is the honest depth for a shell with
 //! no descriptor-port plane, and it is entirely within what the contract
@@ -98,7 +98,7 @@ async fn main(input: Input) -> Result<Output> {
     // ── PREFILL (chunked, C-wide) ─────────────────────────────────────────
     //
     // `prefill_chunks` is the SDK's split, for the same reason every other
-    // inferlet here uses it: a prompt longer than the driver's per-launch
+    // inferlet here uses it: a prompt longer than the engine's per-launch
     // token capacity has to be split, and the obvious split leaves a
     // one-token last chunk.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
@@ -151,7 +151,7 @@ async fn main(input: Input) -> Result<Output> {
     // ONE channel is host-driven, and it is the token. Everything else the
     // fire reads — the position, the write slot and offset, the page CSR and
     // the readable extent — is DERIVED from the KV length by pure
-    // arithmetic, so the epilogue carries it on the device and the engine's
+    // arithmetic, so the epilogue carries it on the device and the runtime's
     // host shadow folds the same arithmetic
     // (`tensor_compiler::eval::pareval`) to know what each fire will read.
     // That is `naive-baseline`'s decode exactly, minus the one put that makes
@@ -159,7 +159,7 @@ async fn main(input: Input) -> Result<Output> {
     //
     // The token cannot go the same way, and that is not a gap in this
     // program. A sampled token is device-DECIDED — the shadow commits it
-    // unknown rather than guessing — so a fire that reads it needs a driver
+    // unknown rather than guessing — so a fire that reads it needs an engine
     // resolving the `EmbedTokens` port at kernel time. The CUDA shell answers
     // `ports: PortMask::NONE` and `geometry: GeometryClass::Host`: it stages
     // every geometry vector from the host and resolves no descriptor port on

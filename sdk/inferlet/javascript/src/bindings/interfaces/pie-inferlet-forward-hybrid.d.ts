@@ -164,7 +164,7 @@ export class ForwardPass {
   * 
   * `kv` is `none` in exactly one case: a fire that runs recurrent
   * layers only. The RS working sets stay REQUIRED even there -- the
-  * driver still needs the folded slot and the buffered CSR -- which is
+  * engine still needs the folded slot and the buffered CSR -- which is
   * why `rs` is a plain list and only `kv` is optional.
   * 
   * This optional is also what preserves FRAME MONOMORPHISM: `submit`'s

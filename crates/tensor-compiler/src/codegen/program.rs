@@ -3,13 +3,13 @@
 //! The per-region emitters in [`crate::codegen::cuda`] and [`crate::codegen::metal`] handle one
 //! region at a time. This module owns the walk above them: which emitter each
 //! region goes through, and what its entry point is called. That decision
-//! belongs here rather than in a driver, so a driver receives a table and
+//! belongs here rather than in an engine, so an engine receives a table and
 //! compiles it instead of re-deriving from the plan what the host already
 //! worked out.
 //!
 //! Entry names and the emitter-selection rules are shared with
-//! `crates/driver-metal/csrc/src/pipeline/m1_runtime.cpp` and
-//! `crates/driver-cuda/csrc/src/pipeline/generated/module_cache.hpp` — a driver reading
+//! `crates/engine-metal/csrc/src/pipeline/m1_runtime.cpp` and
+//! `crates/driver-cuda/csrc/src/pipeline/generated/module_cache.hpp` — an engine reading
 //! this table has to find exactly the names it looks up, so the naming scheme
 //! is an ABI and not a formatting choice.
 
@@ -24,12 +24,12 @@ use tensor_ir::validate::BoundTrace;
 
 /// Which kernel family an emission is for. Re-exported from the contract
 /// rather than restated: [`EmittedKernel::kind`] is handed straight to the
-/// driver, so a second spelling here would be a second thing to keep right.
+/// engine, so a second spelling here would be a second thing to keep right.
 ///
 /// It was five `PIE_KERNEL_*` `u32` constants; the contract types them now, so
 /// the five arms below are a `match` the compiler checks instead of five
 /// integers it does not.
-pub use driver_api::program::KernelKind;
+pub use engine_api::program::KernelKind;
 
 /// One emitted kernel, or the reason it could not be emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub struct EmittedKernel {
     pub stage_index: u32,
     /// The region within that stage this kernel was emitted for.
     pub region_index: u32,
-    /// The entry-point symbol a driver looks the kernel up by; empty when
+    /// The entry-point symbol an engine looks the kernel up by; empty when
     /// emission failed.
     pub entry_name: String,
     /// The generated kernel source, or empty when emission failed.
@@ -79,8 +79,8 @@ impl EmittedKernel {
     }
 }
 
-/// The backends the host can generate for. The string form is what a driver
-/// advertises in `DriverCapabilities::codegen_backend`.
+/// The backends the host can generate for. The string form is what an engine
+/// advertises in `EngineCapabilities::codegen_backend`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Backend {
     /// CUDA, compiled by NVRTC; advertised as `"cuda"`.
@@ -99,7 +99,7 @@ impl Backend {
     /// [`parse`]: Backend::parse
     pub const ALL: &'static [Backend] = &[Backend::Cuda, Backend::Metal];
 
-    /// Parse a driver's advertised backend. Unknown names mean "no host code
+    /// Parse an engine's advertised backend. Unknown names mean "no host code
     /// generation", never a guess.
     pub fn parse(name: &str) -> Option<Self> {
         match name {
@@ -109,7 +109,7 @@ impl Backend {
         }
     }
 
-    /// The name a driver advertises. Inverse of [`Backend::parse`].
+    /// The name an engine advertises. Inverse of [`Backend::parse`].
     pub fn name(self) -> &'static str {
         match self {
             Backend::Cuda => "cuda",
@@ -117,7 +117,7 @@ impl Backend {
         }
     }
 
-    /// The emitter version a driver's compile cache must key on.
+    /// The emitter version an engine's compile cache must key on.
     pub fn emitter_version(self) -> u32 {
         match self {
             Backend::Cuda => crate::codegen::cuda::CUDA_GENERATED_EMITTER_VERSION as u32,
@@ -126,7 +126,7 @@ impl Backend {
     }
 }
 
-/// Emit every kernel a driver needs for `stages`, in stage then region order.
+/// Emit every kernel an engine needs for `stages`, in stage then region order.
 ///
 /// One `match` owns the whole backend decision, and everything a backend does
 /// lives inside its arm.
@@ -135,7 +135,7 @@ impl Backend {
 /// Backend::Metal` after the loop, say — is invisible to exhaustiveness
 /// checking, so a third backend would compile, run, and quietly emit no
 /// readiness or commit kernels at all. Inside the match, adding a backend is a
-/// compile error here rather than a missing kernel in a driver.
+/// compile error here rather than a missing kernel in an engine.
 pub fn emit_program(
     backend: Backend,
     stages: &[CompiledStage],
@@ -147,7 +147,7 @@ pub fn emit_program(
             for (stage_index, stage) in stages.iter().enumerate() {
                 emit_cuda_stage(stage, stage_index, &mut kernels);
             }
-            // No program-level effect kernels: the CUDA driver's readiness and
+            // No program-level effect kernels: the CUDA engine's readiness and
             // commit are prebuilt tier-0 kernels, not generated ones.
         }
         Backend::Metal => {
@@ -166,7 +166,7 @@ fn signature(stage: &CompiledStage) -> String {
 
 fn emit_cuda_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<EmittedKernel>) {
     let signature = signature(stage);
-    // The CUDA driver compiles one fused kernel per generated region and falls
+    // The CUDA engine compiles one fused kernel per generated region and falls
     // back to the prebuilt tier-0 kernels elsewhere, so singleton regions need
     // no emission — `module_cache.hpp` only ever calls `emit_fused_region_cuda`.
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
@@ -214,7 +214,7 @@ fn emit_metal_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<Emi
     }
 
     // M2: one kernel per fused region, bound directly to channel cells. The
-    // driver refuses this form above `kMetalM2MaxFusedChannels`, and so do we —
+    // engine refuses this form above `kMetalM2MaxFusedChannels`, and so do we —
     // emitting it anyway would produce a kernel that cannot be bound.
     let fused_supported = stage.normalized.channel_bindings.len()
         <= crate::codegen::metal::METAL_M2_MAX_FUSED_CHANNELS;
@@ -320,7 +320,7 @@ fn emit_metal_program_effects(bound: &BoundTrace, out: &mut Vec<EmittedKernel>) 
     out.push(EmittedKernel::new(KernelKind::Commit, 0, 1, commit, source));
 }
 
-/// Which library kernel a grouped region should use, reproducing the driver's
+/// Which library kernel a grouped region should use, reproducing the engine's
 /// `parallel_nucleus` / `parallel_topk` tests.
 fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> {
     let RegionKind::Library(op) = region.kind else {
@@ -329,7 +329,7 @@ fn grouped_library(stage: &CompiledStage, region: &Region) -> Option<LibraryOp> 
     match op {
         LibraryOp::NucleusSample => Some(LibraryOp::NucleusSample),
         LibraryOp::TopK => {
-            // The driver additionally checks the node really is a `top_k`, so a
+            // The engine additionally checks the node really is a `top_k`, so a
             // mislabelled region falls to the generic emitter instead of a
             // kernel that would read the wrong operands.
             let node = region.nodes.first()?.index();

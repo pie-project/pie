@@ -13,10 +13,10 @@ crate-type = ["rlib"]
 path = "src/lib.rs"
 
 # This crate is the compiler alone. There is no C ABI and no sibling
-# `-capi` crate: the drivers link the rlib and pass Rust types, and executing a
+# `-capi` crate: the engines link the rlib and pass Rust types, and executing a
 # plan is `executor`'s — see `src/executor/arena.rs` for why the device half is
 # an `ArenaBacking` the consumer supplies rather than a second executor inside
-# each driver.
+# each engine.
 
 [features]
 default = ["testkit"]
@@ -44,11 +44,11 @@ testkit = []
 #
 # WHO TURNS THIS ON, MEASURED: exactly one target in the tree, and it is a
 # test — this crate's own `tests/gpu_transform_parity.rs`, under
-# `--features cuda-13`. (`driver-cuda`'s `gpu_load_transforms` stood here too
+# `--features cuda-13`. (`engine-cuda`'s `gpu_load_transforms` stood here too
 # and is gone with the shell rewrite; nothing replaced it.) No `src/` path in
-# any driver constructs a `CudaArena`: `driver-cuda` names this crate for a
+# any engine constructs a `CudaArena`: `engine-cuda` names this crate for a
 # `From<Error>` impl and for `CUDA_TILE_MAP_MASK`, and neither reaches the
-# arena — its `crates/driver-cuda/src/weights.rs` hands the executor a
+# arena — its `crates/engine-cuda/src/weights.rs` hands the executor a
 # `Vec<u8>`, so every transform
 # it runs is host-side.
 #
@@ -56,7 +56,7 @@ testkit = []
 # device-side answer to a load transform in this tree, and the gated test is
 # what holds it bit-identical to the host executor that every other load uses
 # as its reference. Deleting it would delete the comparison, not just the
-# arm — and the arm is what a driver binds the day it stops staging every
+# arm — and the arm is what an engine binds the day it stops staging every
 # `Cast`/`Scale`/`Encode` back through the host.
 #
 # **NO `kernels-cuda/native`, AND THAT IS THE POINT OF THIS FEATURE NOW.** The
@@ -68,24 +68,24 @@ testkit = []
 # every consumer therefore inherited a CUDA toolchain requirement it had no
 # use for. The four call sites now go through `kernels-cuda`'s generated
 # `api`, which is NVRTC at run time and a text file at build time, so
-# `--features cuda-13` needs a driver and no toolkit. Nothing in this crate's
+# `--features cuda-13` needs an engine and no toolkit. Nothing in this crate's
 # graph builds an archive any more.
 cuda = ["dep:kernels-cuda", "dep:cudarc", "dep:model-ir"]
 
 # WHICH CUDA RUNTIME, and now there are TWO crates voting rather than one.
-# This crate still names no version of its own — `driver-cuda` offers
+# This crate still names no version of its own — `engine-cuda` offers
 # `cuda-12`/`cuda-13` and a binary picks one — but a version chosen here must
 # reach `kernels-cuda` as well, because that crate loads a libcudart of
 # its own to compile and fire the rows this loader calls. Two crates in one
 # process disagreeing about which is the `cudaGraphAddNode` arity trap
-# `driver-cuda/Cargo.toml` describes, reached from a third direction.
+# `engine-cuda/Cargo.toml` describes, reached from a third direction.
 #
 # That is not hypothetical. `cudarc/cuda-12080` was pinned here while
-# `driver-cuda` selected `cuda-13000`; the two unified, cudarc's cublas
+# `engine-cuda` selected `cuda-13000`; the two unified, cudarc's cublas
 # `sys` module declared every enum twice, and the failure surfaced in
 # `cargo test --doc` rather than anywhere that named a version. The rule the
 # episode leaves behind is that a version is selected in ONE place and
-# inherited everywhere — `driver-cuda`'s `cuda-13` already says
+# inherited everywhere — `engine-cuda`'s `cuda-13` already says
 # `model-loader?/cuda-13`, and these lines pass the same choice on.
 cuda-12 = ["cuda", "cudarc/cuda-12080", "kernels-cuda/cuda-12"]
 cuda-13 = ["cuda", "cudarc/cuda-13000", "kernels-cuda/cuda-13"]
@@ -121,10 +121,10 @@ kernels-cuda = { path = "../kernels-cuda", default-features = false, optional = 
 # toolkit-free default build's dependency set is unchanged.
 model-ir = { path = "../model-ir", optional = true }
 # Runtime only: the arena needs `cudaMemcpyAsync`, `cudaMemsetAsync`,
-# `cudaHostAlloc` and an event. No `driver`, no cublas, no nvrtc — a loader
+# `cudaHostAlloc` and an event. No `engine`, no cublas, no nvrtc — a loader
 # that reached for those would be doing something other than loading.
 #
-# `fallback-dynamic-loading` for the reason `driver-cuda` states: symbols
+# `fallback-dynamic-loading` for the reason `engine-cuda` states: symbols
 # resolve through `dlopen` on first call, so nothing is linked and a build
 # needs no CUDA libraries present.
 # NO VERSION FEATURE HERE — see `cuda-12`/`cuda-13` above.

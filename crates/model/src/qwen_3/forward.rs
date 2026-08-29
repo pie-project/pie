@@ -21,7 +21,7 @@ impl Facts {
     /// window as the rows of the lanes whose word satisfies the guard. So the
     /// axis needs a bit, and the bit is what makes the axis FREE when nobody
     /// uses it: a fire no lane routed has zero rows in this class,
-    /// `driver::fire::walk` skips a zero-row region before it dispatches
+    /// `engine::fire::walk` skips a zero-row region before it dispatches
     /// anything, and the correction costs that fire no launch, no empty grid
     /// and no instruction. A `Guard::Always` correction would instead launch
     /// two kernels per layer over every row of every fire to add zero to them,
@@ -46,7 +46,7 @@ impl Facts {
     /// A lane that wants the MTP head run over its rows. The head is a whole
     /// transformer block plus two projections and a vocabulary-wide readout —
     /// by far the fattest arm any qwen text states — and the bit is what makes
-    /// it cost a non-drafting fire NOTHING: `driver::fire::walk`'s rule 1 is
+    /// it cost a non-drafting fire NOTHING: `engine::fire::walk`'s rule 1 is
     /// "zero rows means the node does not run", so a fire no lane drafted has
     /// no rows in these classes and the arm's launches are not issued, not
     /// issued empty, and not in the recorded graph. This is build log 22's
@@ -438,7 +438,7 @@ fn attn_mixer(
     // normalizer every per-key score is a ratio against, and it is what the
     // consumers of this axis want: a per-query mass, per head, per layer.
     // `Attention::PrefillLse` is already in the vocabulary and already served
-    // — `driver_cuda::dispatch::attn` calls `attn::prefill_lse` with both
+    // — `engine_cuda::dispatch::attn` calls `attn::prefill_lse` with both
     // outputs bound — so this axis adds NO op and NO kernel.
     //
     // The three classes are written out again here rather than handed down,

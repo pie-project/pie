@@ -1,12 +1,12 @@
 //! The op table's two partitions, and the differential that used to be here.
 //!
-//! This file was "the Rust op table against the driver's C++ one": it read
+//! This file was "the Rust op table against the engine's C++ one": it read
 //! `crates/driver/include/pie/driver/launch/op_table.hpp` as text and checked
-//! that every `OP_TABLE` row had a `case` in the driver's `op_info`, that the
-//! arities and result counts agreed, and that the driver declared no rows the
+//! that every `OP_TABLE` row had a `case` in the engine's `op_info`, that the
+//! arities and result counts agreed, and that the engine declared no rows the
 //! Rust table did not know about.
 //!
-//! That header was deleted with the C++ Metal driver, and the three tests that
+//! That header was deleted with the C++ Metal engine, and the three tests that
 //! read it went with it here. They had not been failing quietly -- they panic
 //! on a missing file, which means `cargo test --workspace` has been red on
 //! this branch since the deletion. Nothing noticed because CI runs on pushes
@@ -15,9 +15,9 @@
 //! The reason those tests existed does not survive the deletion, so they are
 //! not being ported to something else. `op_info`'s failure mode -- an
 //! `OpCode` with no `case` falling through to `{c, 0xFF, 1, "?"}`, so a new
-//! op made the driver quietly claim an unknown operand count rather than
+//! op made the engine quietly claim an unknown operand count rather than
 //! complain -- was a property of a C++ function that no longer exists. The
-//! drivers that replaced it are Rust and match on `tensor_ir::op::OP_TABLE`
+//! engines that replaced it are Rust and match on `tensor_ir::op::OP_TABLE`
 //! itself, so there is no second table to drift from.
 //!
 //! A generated `ptir_abi.h` briefly stood between the two, projecting the

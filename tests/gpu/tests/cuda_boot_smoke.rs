@@ -2,7 +2,7 @@
 //! ingress streams a turn.
 //!
 //! Boots the embedded controller + gateway + worker in one process over
-//! loopback with the real CUDA driver (`type = "cuda_native"`) against the
+//! loopback with the real CUDA engine (`type = "cuda_native"`) against the
 //! shipping dense SKU, then drives one turn through `POST /v1/generate` — the
 //! axum ingress, which is the ONE client surface no other gate in this tree
 //! touches. `cuda_serve_round_trip` boots the same standalone and goes further
@@ -15,15 +15,15 @@
 //! It booted `Qwen/Qwen3-0.6B` and named it in three doc lines and an
 //! `#[ignore]` reason. This build ships no SKU that checkpoint can be: every
 //! row of `::model::qwen_3::IMPORTS` claims an artifact by NAME at a qwen3.5
-//! geometry, and `engine::model::ROWS` has no id for it, so
-//! `engine::driver::load` refuses before a fire and the gate would have failed
+//! geometry, and `runtime::model::ROWS` has no id for it, so
+//! `runtime::engine::load` refuses before a fire and the gate would have failed
 //! for a reason that is not about booting. It comes up on
 //! `qwen35-d0.8b-bf16-kv-bf16` now, through `common::boot_cuda`, which is the
 //! checkpoint every other gate in this directory already pins against.
 //!
 //! Run:
 //! ```text
-//! cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//! cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!   --test cuda_boot_smoke -- --ignored --nocapture
 //! ```
 
@@ -31,7 +31,7 @@ mod common;
 
 use anyhow::Result;
 
-/// Boots once with the real CUDA driver and proves all three planes co-reside
+/// Boots once with the real CUDA engine and proves all three planes co-reside
 /// and that a turn posted at the HTTP ingress streams back to `[DONE]`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "the boot gate: needs a CUDA device and the Qwen3.5-0.8B snapshot"]

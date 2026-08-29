@@ -1,15 +1,15 @@
 //! Shared real-hardware (`cuda_native`) test harness.
 //!
 //! Boots the worker's prod embedded path in-proc — `worker::run` in
-//! SingleNode mode loads the model onto the GPU via the embedded cuda driver and
-//! co-resides `::engine::bootstrap::bootstrap` — then drives inferlets through the
+//! SingleNode mode loads the model onto the GPU via the embedded cuda engine and
+//! co-resides `::runtime::bootstrap::bootstrap` — then drives inferlets through the
 //! same in-proc `program::add` → `process::spawn` flow the mock canary uses,
 //! bypassing the gateway/client edge (no msgpack/JSON codec, no identity header,
 //! no `pie-server-py`).
 //!
 //! Reused by the cuda validation tests (`cuda_forward` = dense forward; the
 //! Lane-C CAS-dedup + Lane-D fold-parity tests compose on these helpers). Every
-//! cuda test is `#[ignore]`d (real GPU + `--features driver-cuda-13`) and boots
+//! cuda test is `#[ignore]`d (real GPU + `--features engine-cuda-13`) and boots
 //! ONCE per process (global engine state forbids a second boot).
 //!
 //! The model snapshot is overridable via `PIE_CUDA_TEST_SNAPSHOT` (a local HF
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use ::engine::inferlet::program::{Manifest, ProgramName};
+use ::runtime::inferlet::program::{Manifest, ProgramName};
 use worker::WorkerHandle;
 
 /// Default local HF snapshot (Qwen3-0.6B dense) on the reference box. Override
@@ -61,7 +61,7 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
         // `expert_host_cache`, not `expert_cache_gb` / `expert_host_cache_gb`,
         // which is what this wrote until a run answered
         //
-        //     invalid [model.driver.options] for driver type CudaNative:
+        //     invalid [model.engine.options] for engine type CudaNative:
         //     unknown field `expert_cache_gb`
         //
         // The ENV knobs keep their `_GB` names, because a fraction of a GiB is
@@ -110,7 +110,7 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
          name = \"default\"\n\
          model = \"{snapshot_path}\"\n\
          \n\
-         [driver]\n\
+         [engine]\n\
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
          gpu_mem_utilization = 0.90\n\
@@ -133,7 +133,7 @@ pub fn cuda_toml() -> String {
 /// device instantiation that will not compile or load is reported by
 /// `kernels-cuda::jit::ctx::said` through `tracing::error!` and NOWHERE else
 /// -- the `KernelError::Device { call, code }` it returns holds a `&'static str` and so
-/// cannot carry the driver's sentence -- so the engine's message stops at
+/// cannot carry the engine's sentence -- so the runtime's message stops at
 /// "the compile, the load or the launch refused; see the log". Without a
 /// subscriber there is no log, and a `CUDA_ERROR_ILLEGAL_ADDRESS` in one
 /// kernel reads as an unrelated module failing to load in the next, because
@@ -219,10 +219,10 @@ pub fn load_curated_inferlet(name: &str) -> (Vec<u8>, Manifest, ProgramName) {
 /// spawns (one install per process; spawn many).
 pub async fn install_inferlet(name: &str) -> ProgramName {
     let (wasm, manifest, program_name) = load_curated_inferlet(name);
-    ::engine::inferlet::program::add(wasm, manifest, true)
+    ::runtime::inferlet::program::add(wasm, manifest, true)
         .await
         .expect("add program");
-    ::engine::inferlet::program::install(&program_name)
+    ::runtime::inferlet::program::install(&program_name)
         .await
         .expect("install program");
     program_name
@@ -244,7 +244,7 @@ pub async fn spawn_text(
 /// its result.
 pub async fn spawn_input(program: &ProgramName, input_json: &str) -> Result<String, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
-    ::engine::inferlet::process::spawn(
+    ::runtime::inferlet::process::spawn(
         "cuda-test".into(),
         program.clone(),
         input_json.to_string(),

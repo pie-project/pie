@@ -258,7 +258,7 @@ pub fn plan(
     })
 }
 
-/// The sizing pass: schedule and layout only, unbounded, so the driver can
+/// The sizing pass: schedule and layout only, unbounded, so the engine can
 /// learn the workspace a plan would need before granting one.
 pub fn workspace_size(
     op: &'static str,

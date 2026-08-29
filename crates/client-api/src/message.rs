@@ -5,7 +5,7 @@
 //! serving). The [`edge`](crate::edge) frames in this crate embed them, and the
 //! public `pie-client` crate re-exports them.
 //!
-//! Plain serde vocabulary, independent of the local runtime-driver ABI.
+//! Plain serde vocabulary, independent of the local runtime-engine ABI.
 
 use serde::{Deserialize, Serialize};
 

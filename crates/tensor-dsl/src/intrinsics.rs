@@ -45,7 +45,7 @@ pub fn logits() -> Tensor {
 }
 /// `intrinsics::mtp_logits(k)` — the model's `k` draft/future-token heads,
 /// decl'd `[k, vocab]` regardless of the embed row count. The contract:
-/// the classic `K` drafts vs `K+1` verify window are DISTINCT shapes — the CUDA driver's
+/// the classic `K` drafts vs `K+1` verify window are DISTINCT shapes — the CUDA engine's
 /// Stage-2 resolves the MtpLogits rows FROM THIS DECL (`mtp_draft_row .. +k`), so
 /// a `[K+1,V]` decl would request more rows than the head produces. Model-gated
 /// on `has_mtp_logits`. Mirrors the eDSL's `intrinsic_mtp_logits_matrix_dyn(k)`.
@@ -266,7 +266,7 @@ pub mod kernel {
     /// sites. `l` is `[num_layers, d_out]` with any static scale folded
     /// into its contents; `sites` is the trace-known placement constant.
     /// Wire-encodes as the 2-argument `lora` sink (arity selects the
-    /// form — the driver's resolver branches on it).
+    /// form — the engine's resolver branches on it).
     #[track_caller]
     pub fn adapter_scale(l: impl AsTensor, sites: impl AsTensor) {
         let span = Span::here();

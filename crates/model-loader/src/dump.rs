@@ -7,7 +7,7 @@ use crate::plan::{LoadPlan, StorageInstr, TileMapKind};
 
 // `dump_load_plan_json` STOOD HERE: `serde_json::to_string_pretty(plan)`, one
 // line, wrapped so a caller could name the failure. It had none -- not in this
-// crate, not in a driver, not in a test. A plan is `Serialize`, so anyone who
+// crate, not in an engine, not in a test. A plan is `Serialize`, so anyone who
 // wants its full text can write that line where they need it, and the golden
 // tests already do exactly that. What survives below is the surface that is
 // actually read: `describe` for the boot log, `plan_stats_json` for the
@@ -15,7 +15,7 @@ use crate::plan::{LoadPlan, StorageInstr, TileMapKind};
 
 /// The plan's own name for an instruction.
 ///
-/// A driver that renders a plan needs these names, and the table it used to keep
+/// An engine that renders a plan needs these names, and the table it used to keep
 /// was a `switch` with a `"Unknown"` fallthrough: adding a variant here left that
 /// table quietly wrong. Matching exhaustively on the enum makes the same change a
 /// compile error instead.
@@ -45,7 +45,7 @@ fn tile_map_name(kind: TileMapKind) -> &'static str {
     }
 }
 
-/// One line describing a compiled plan, for the driver's boot log.
+/// One line describing a compiled plan, for the engine's boot log.
 pub fn describe(plan: &LoadPlan) -> String {
     let rewrites: usize = plan.passes.iter().map(|pass| pass.rewrites).sum();
     let mut out = String::new();

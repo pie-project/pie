@@ -3,8 +3,8 @@
 //! Emission is total in the sense that it never panics on a plan: every path
 //! that cannot produce source returns instead, and the reason travels to the
 //! host as a string in [`EmittedKernel::error`]. That string is ABI — the
-//! runtime copies it across the C boundary (`crates/engine/src/driver/abi.rs`)
-//! and a human reads it out of a driver log — so the [`Display`](core::fmt::Display) impl here is
+//! runtime copies it across the C boundary (`crates/runtime/src/engine/abi.rs`)
+//! and a human reads it out of an engine log — so the [`Display`](core::fmt::Display) impl here is
 //! the one definition of that text, and `every_refusal_renders` pins all of
 //! it.
 //!
@@ -316,7 +316,7 @@ mod tests {
     use alloc::string::ToString;
 
     /// The rendered text is ABI: it crosses the C boundary in
-    /// `EmittedKernel::error` and a driver log is where it is read. Pinning
+    /// `EmittedKernel::error` and an engine log is where it is read. Pinning
     /// every variant means a reworded message is a diff in this file rather
     /// than a silent change in what an operator sees.
     #[test]

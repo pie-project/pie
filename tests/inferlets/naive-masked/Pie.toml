@@ -1,7 +1,7 @@
 [package]
 name = "naive-masked"
 version = "0.1.0"
-description = "MEASUREMENT INSTRUMENT (uncommitted): naive-baseline plus a semantically-causal custom AttnMask, so its decode fires take the driver's custom-mask path"
+description = "MEASUREMENT INSTRUMENT (uncommitted): naive-baseline plus a semantically-causal custom AttnMask, so its decode fires take the engine's custom-mask path"
 authors = ["Pie Team"]
 
 [runtime]

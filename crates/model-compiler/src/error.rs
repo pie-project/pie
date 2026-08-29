@@ -139,16 +139,16 @@ pub enum Error {
     /// **THE PRECONDITION OF P5's HOIST, ASKED OUT LOUD** (design §5). Prepare
     /// work is host work — a `std::vector`, a work estimate, a pageable upload
     /// — and host work inside `cudaStreamBeginCapture` is either refused by
-    /// the driver or, worse, recorded as nothing. So the prepare half of the
+    /// the engine or, worse, recorded as nothing. So the prepare half of the
     /// template runs BEFORE the capture half, whole, and `region::hoist` moves
-    /// it there; `driver::fire::walk`'s rule 3 is the same claim asked of the
+    /// it there; `engine::fire::walk`'s rule 3 is the same claim asked of the
     /// artifact.
     ///
     /// The move is sound exactly while nothing in the prepare half needs a
     /// number the graph has not computed yet. A `Ty::Struct` definer is
     /// supposed to be a plan build over CACHE GEOMETRY and RUNTIME INPUTS —
     /// the indptr, the page indices, the last-page length — every one of which
-    /// the driver binds before the fire begins, and every one of which is a
+    /// the engine binds before the fire begins, and every one of which is a
     /// `Def::Input`. One that reads an activation instead is a plan build that
     /// cannot be hoisted and a capture that cannot contain it: there is no
     /// instant that is both after the activation and before the graph.

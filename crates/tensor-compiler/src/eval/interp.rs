@@ -259,7 +259,7 @@ impl std::error::Error for HostError {}
 
 /// The one rendering of a step failure.
 ///
-/// A consumer that needs the text — a driver logging a fault, a partial
+/// A consumer that needs the text — an engine logging a fault, a partial
 /// evaluator recording a blocker — formats through this rather than matching
 /// the variants and building its own string. Two such matches in different
 /// crates are two vocabularies for one failure, and they drift without
@@ -314,7 +314,7 @@ pub struct StepReport {
 }
 
 /// Per-pass intrinsic inputs — what the forward produced, supplied by the
-/// harness/driver (the trunk is never expressed in PTIR).
+/// harness/engine (the trunk is never expressed in PTIR).
 #[derive(Clone, Debug, Default)]
 pub struct PassInputs {
     /// The forward's output logits, `[n_out, vocab]` F32, read by
@@ -341,7 +341,7 @@ pub struct PassInputs {
     pub attn_score: Vec<Value>,
 }
 
-/// Second-party kernel provider. The dummy driver implements test kernels; a
+/// Second-party kernel provider. The dummy engine implements test kernels; a
 /// returned `Err` is a device fault → poison.
 pub trait KernelHost {
     /// Runs the second-party kernel `name` over `args`, producing a [`Value`]
@@ -394,10 +394,10 @@ impl Instance {
         Instance::new_full(bound, seeds, externs, &[])
     }
 
-    /// Like [`Self::new_with_externs`], plus driver-designated shared rings
+    /// Like [`Self::new_with_externs`], plus engine-designated shared rings
     /// for channels the container does NOT declare extern: same-guest
     /// cross-pass chaining — two passes of one pipeline attach the
-    /// same DEVICE-ONLY channel, and the driver hands both instances one
+    /// same DEVICE-ONLY channel, and the engine hands both instances one
     /// ring so a producer pass's put is visible to the consumer pass. A
     /// `seeded` channel cannot be shared this way (seed staging is
     /// per-instance state).
@@ -479,7 +479,7 @@ impl Instance {
         self.with_chan(chan as usize, |st| st.queue.front().cloned())
     }
 
-    /// Poison every channel (fault / readiness deadline — an engine policy
+    /// Poison every channel (fault / readiness deadline — a runtime policy
     /// the caller applies, never a per-pass knob).
     pub fn poison(&mut self) {
         self.poisoned = true;

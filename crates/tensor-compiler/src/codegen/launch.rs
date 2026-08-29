@@ -1,15 +1,15 @@
-//! The launch package — a program in the shape a driver executes it.
+//! The launch package — a program in the shape an engine executes it.
 //!
-//! This is the whole of what crosses the host→driver boundary for a program,
-//! and it deliberately is not PTIR. A driver reading it never sees a container,
+//! This is the whole of what crosses the host→engine boundary for a program,
+//! and it deliberately is not PTIR. An engine reading it never sees a container,
 //! a sidecar, a wire format, or an identity to re-check: the compiler already
 //! decided all of that. What it gets is the value table, the channels and
 //! ports to allocate and bind, the per-stage op DAGs to launch, and the
 //! per-stage plan the emitted kernels were generated from.
 //!
-//! Two things a driver could plausibly re-derive are folded in here instead,
+//! Two things an engine could plausibly re-derive are folded in here instead,
 //! because they are decisions about the program rather than about the machine
-//! — and a driver that re-derives them is a second implementation that has to
+//! — and an engine that re-derives them is a second implementation that has to
 //! agree with this one forever:
 //!
 //! * each stage's **graph-cache identity** ([`crate::plan::stage_identity`]), and
@@ -24,7 +24,7 @@ use crate::plan::{
     CompiledStage, Dimension, LibraryOp, NodeIndex, Region, RegionKind, RegionPartition,
     SymbolicExtent, SymbolicType, stage_identity,
 };
-use driver_api::program::{
+use engine_api::program::{
     Axis, ExtentRole, LaunchChannel, LaunchChannelRule, LaunchOp, LaunchPackage, LaunchPlanValue,
     LaunchPort, LaunchPut, LaunchRegion, LaunchStage, LaunchStagePlan, LaunchValue, LibraryOp as
     LaunchLibraryOp, RegionKind as LaunchRegionKind, StageNeeds, ValueSource,
@@ -156,7 +156,7 @@ fn lower_channels(bound: &BoundTrace) -> Vec<LaunchChannel> {
                 id: index as u32,
                 capacity: decl.capacity,
                 // The program-side element type, with a late-bound activation
-                // dtype already materialized — the driver allocates cells from
+                // dtype already materialized — the engine allocates cells from
                 // this and never sees `ACT`.
                 dtype: ChanDType::Concrete(bound.channel_types[index].dtype),
                 seeded: decl.seeded,
@@ -352,7 +352,7 @@ fn lower_plan_value(value_type: &SymbolicType) -> LaunchPlanValue {
 /// The two enums are the same enum: `Dimension::Static`/`Symbolic` and
 /// `Axis::Static`/`Symbolic`, over extent tags that agree entry for entry
 /// (`extent_role` is where that is written down). They stay two types because
-/// `driver-api` may not depend on this crate — the contract sits UNDER the
+/// `engine-api` may not depend on this crate — the contract sits UNDER the
 /// compiler — and this function is the whole of the mapping.
 fn axis(dimension: Dimension) -> Axis {
     match dimension {
@@ -401,7 +401,7 @@ fn lower_region(region: &Region) -> LaunchRegion {
             RegionKind::Library(op) => LaunchRegionKind::Library(library_tag(op)),
         },
         schedule: region.schedule as u8,
-        // `LaunchRegion` is the driver ABI, which has one integer space;
+        // `LaunchRegion` is the engine ABI, which has one integer space;
         // the node tags stop here.
         nodes: region.nodes.iter().copied().map(NodeIndex::get).collect(),
         inputs: region.inputs.clone(),
@@ -436,7 +436,7 @@ fn library_tag(op: LibraryOp) -> LaunchLibraryOp {
 /// and whether the path can cover it at all.
 ///
 /// A decision about the program rather than about the device, so it is made
-/// once here rather than in each driver's launch path.
+/// once here rather than in each engine's launch path.
 #[derive(Default)]
 struct GroupedPlan {
     needs: StageNeeds,

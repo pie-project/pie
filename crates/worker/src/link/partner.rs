@@ -23,9 +23,9 @@ use crate::executor;
 pub(crate) struct PartnerBootstrap {
     pub full_identity: ModelIdentity,
     pub encode_identity: ModelIdentity,
-    pub kv_layout: driver_api::KvLayout,
+    pub kv_layout: engine_api::KvLayout,
     #[cfg_attr(not(feature = "nixl"), allow(dead_code))]
-    pub home_kv_handle: driver_api::KvHandle,
+    pub home_kv_handle: engine_api::KvHandle,
     pub transfer: crate::config::OffloadTransfer,
     pub model_idx: usize,
     pub page_size: u32,
@@ -41,10 +41,10 @@ struct ClientNixl {
 
 struct PartnerLink {
     peer: NeighborPeer,
-    driver_id: Option<usize>,
-    disconnect: Option<::engine::driver::RemoteDisconnectHandle>,
-    role: ::engine::offload::PartnerRole,
-    partner: std::sync::Arc<::engine::offload::Partner>,
+    engine_id: Option<usize>,
+    disconnect: Option<::runtime::engine::RemoteDisconnectHandle>,
+    role: ::runtime::offload::PartnerRole,
+    partner: std::sync::Arc<::runtime::offload::Partner>,
 }
 
 pub(crate) struct PartnerLinkManager {
@@ -108,7 +108,7 @@ impl PartnerLinkManager {
                     tracing::info!(
                         partner = %peer.id,
                         role = %peer.role,
-                        driver_id = ?link.driver_id,
+                        engine_id = ?link.engine_id,
                         "executor partner connected"
                     );
                     self.links.insert(peer.id, link);
@@ -166,11 +166,11 @@ impl PartnerLinkManager {
     /// identity, `KvLayout` and (under NIXL) its own registered KV handle; a
     /// `HelloResponse` whose scratch grant was range-checked against the
     /// peer's advertised pool; then `register_remote_store`,
-    /// `register_driver_backend` with a `RemoteDriver` over the client, and
-    /// `spawn_driver`. Every noun in it lived in `driver_api::remote`.
+    /// `register_engine_backend` with a `RemoteEngine` over the client, and
+    /// `spawn_engine`. Every noun in it lived in `engine_api::remote`.
     ///
     /// It refuses at the top rather than part way through, because a
-    /// half-dialled partner is a registered `DriverId` with no transport
+    /// half-dialled partner is a registered `EngineId` with no transport
     /// behind it, and the offload planner would then select it.
     ///
     /// The envelope's own requirements are listed in `crate::executor`'s
@@ -185,13 +185,13 @@ impl PartnerLinkManager {
     /// Always, until the envelope exists.
     async fn dial(&self, peer: NeighborPeer) -> Result<PartnerLink> {
         let role = match peer.role {
-            Role::Prefill => ::engine::offload::PartnerRole::Prefill,
-            Role::Encode => ::engine::offload::PartnerRole::Encode,
+            Role::Prefill => ::runtime::offload::PartnerRole::Prefill,
+            Role::Encode => ::runtime::offload::PartnerRole::Encode,
             Role::Decode => anyhow::bail!("decode peer is not an executor partner"),
         };
         let identity = match role {
-            ::engine::offload::PartnerRole::Prefill => self.config.full_identity.clone(),
-            ::engine::offload::PartnerRole::Encode => self.config.encode_identity.clone(),
+            ::runtime::offload::PartnerRole::Prefill => self.config.full_identity.clone(),
+            ::runtime::offload::PartnerRole::Encode => self.config.encode_identity.clone(),
         };
         let _ = (identity, &self.config.kv_layout, self.config.transfer);
         executor::connect_with_local_ip(&peer.addr).await?;
@@ -209,7 +209,7 @@ impl PartnerLinkManager {
         if let Some(disconnect) = &link.disconnect {
             disconnect.disconnect(reason.to_string());
         }
-        ::engine::offload::remove_partner(worker_id.0, link.role);
+        ::runtime::offload::remove_partner(worker_id.0, link.role);
         let model_idx = self.config.model_idx;
         let cleanup = tokio::spawn(async move {
             link.partner.wait_drained().await;
@@ -227,32 +227,32 @@ impl PartnerLinkManager {
 }
 
 fn finish_cleanup(worker_id: WorkerId, link: PartnerLink, model_idx: usize) {
-    let Some(driver_id) = link.driver_id else {
+    let Some(engine_id) = link.engine_id else {
         return;
     };
-    ::engine::offload::close_driver_surrogates(driver_id);
-    if let Err(error) = ::engine::scheduler::stop_driver(driver_id) {
+    ::runtime::offload::close_engine_surrogates(engine_id);
+    if let Err(error) = ::runtime::scheduler::stop_engine(engine_id) {
         tracing::warn!(
             partner = %worker_id,
-            driver_id,
+            engine_id,
             %error,
             "stopping remote scheduler"
         );
     }
-    if let Err(error) = ::engine::offload::unregister_remote_store(model_idx, driver_id) {
+    if let Err(error) = ::runtime::offload::unregister_remote_store(model_idx, engine_id) {
         tracing::warn!(
             partner = %worker_id,
-            driver_id,
+            engine_id,
             %error,
             "unregistering remote store"
         );
     }
-    if let Err(error) = ::engine::driver::unregister_driver(driver_id) {
+    if let Err(error) = ::runtime::engine::unregister_engine(engine_id) {
         tracing::warn!(
             partner = %worker_id,
-            driver_id,
+            engine_id,
             %error,
-            "unregistering remote driver"
+            "unregistering remote engine"
         );
     }
 }
@@ -300,7 +300,7 @@ impl Drop for PartnerLinkManager {
             if let Some(disconnect) = &link.disconnect {
                 disconnect.disconnect("partner manager dropped");
             }
-            ::engine::offload::remove_partner(worker_id.0, link.role);
+            ::runtime::offload::remove_partner(worker_id.0, link.role);
             let _ = std::thread::Builder::new()
                 .name(format!("pie-partner-cleanup-{}", worker_id.0))
                 .spawn(move || {

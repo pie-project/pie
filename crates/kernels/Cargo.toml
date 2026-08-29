@@ -3,7 +3,7 @@ name = "kernels"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The contract between the IR and the drivers: one Dispatch trait per op family, the aggregate exec over a Node, and the KernelError a backend may answer with. No kernels, no execution state, no walk."
+description = "The contract between the IR and the engines: one Dispatch trait per op family, the aggregate exec over a Node, and the KernelError a backend may answer with. No kernels, no execution state, no walk."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 

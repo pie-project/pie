@@ -93,7 +93,7 @@ def pie_cmd(cell, out, max_model_len, pages, swap, spread, python) -> list[str]:
     return [
         python, str(HERE / "pie_bench.py"),
         *common_args(cell, max_model_len, spread),
-        "--driver", "cuda_native",
+        "--engine", "cuda_native",
         "--total-pages", str(pages),
         "--swap-pool-size", str(swap),
         "--inferlet-dir", str(ROOT / "tests/inferlets/text-completion-bench"),
@@ -249,7 +249,7 @@ def main() -> int:
     ap.add_argument("--vllm-python", default="/root/vllm-venv/bin/python")
     ap.add_argument("--cuda-compat", default="",
                     help="prepended to LD_LIBRARY_PATH; needed when running "
-                         "cu13 binaries on an older driver via forward compat")
+                         "cu13 binaries on an older engine via forward compat")
     args = ap.parse_args()
 
     out_dir = Path(args.out)

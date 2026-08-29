@@ -403,7 +403,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // `kernels/attn/pool.cuh` takes it as `const u8* __restrict__` in
             // both boundary kernels and tests it against zero, and the C++
             // lineage held it the same way (`DeviceBuffer<std::uint8_t>` in
-            // the dev driver's persistent inputs, memset to 1). The mask is
+            // the dev engine's persistent inputs, memset to 1). The mask is
             // what `model_dsl::ops::geometry` has always declared for
             // `GeomKind::RowValid`; this row read i32 only because it was
             // copied off the positions port beside it.

@@ -25,7 +25,7 @@ pub(super) fn assign_persistent_offsets(program: &mut LoadPlan) -> Result<usize>
             buffer.persistent_offset = None;
             continue;
         }
-        // Alignment belongs to the persistent allocation unit. The driver
+        // Alignment belongs to the persistent allocation unit. The engine
         // reports the device minimum in StorageTarget; a tensor contract may
         // request a larger value. Packed views remain internal to that unit.
         let alignment = u64::from(

@@ -5,7 +5,7 @@ Embed `pie serve` inside a Python script:
     import asyncio
     from pie.server import Server
     from pie.config import (
-        Config, ServerConfig, ModelConfig, DriverConfig,
+        Config, ServerConfig, ModelConfig, EngineConfig,
     )
 
     cfg = Config(
@@ -13,7 +13,7 @@ Embed `pie serve` inside a Python script:
         model=ModelConfig(
             name="default",
             hf_repo="Qwen/Qwen3-0.6B",
-            driver=DriverConfig(type="dev", device=["cuda:0"]),
+            engine=EngineConfig(type="dev", device=["cuda:0"]),
         ),
     )
 

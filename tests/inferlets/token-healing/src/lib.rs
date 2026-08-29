@@ -19,7 +19,7 @@
 //! Step 3 is what makes it *healing* rather than truncation: the emitted token
 //! must still reproduce every byte the caller wrote, so the visible prompt is
 //! unchanged, but the model is free to pick the tokenisation it actually
-//! expects. The mask is exactly the constrained-decoding mask this engine
+//! expects. The mask is exactly the constrained-decoding mask this runtime
 //! already applies for grammars, so healing costs one `mask_apply` on one step.
 //!
 //! `heal = false` runs the identical geometry with an all-ones mask, which is

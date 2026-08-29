@@ -1,5 +1,5 @@
 //! `quant`: dtype casts and the weight quantizers the loader drives. No IR
-//! variant lands here directly; the driver and loader call these entries
+//! variant lands here directly; the engine and loader call these entries
 //! while staging checkpoints and recurrent state.
 //!
 //! The jit-stamped transcode descriptors (`DecodeBf16`,

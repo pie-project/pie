@@ -170,7 +170,7 @@ pub enum Mark {
     /// what the eye finds.
     Plain,
     /// Not there. One spelling, whether that is "not downloaded yet", "no
-    /// driver compiled" or "unsupported".
+    /// engine compiled" or "unsupported".
     Absent,
 }
 

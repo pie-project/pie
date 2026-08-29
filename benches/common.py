@@ -310,9 +310,9 @@ def print_summary(s: BenchSummary) -> None:
         "runtime all ready ms",
         "runtime first return ms",
         "runtime last return ms",
-        "runtime driver cumulative ms",
-        "runtime wall minus driver ms",
-        "runtime non-driver after launch ms",
+        "runtime engine cumulative ms",
+        "runtime wall minus engine ms",
+        "runtime non-engine after launch ms",
         "vllm spec drafts",
         "vllm spec draft tokens",
         "vllm spec accepted tokens",
@@ -328,7 +328,7 @@ def print_summary(s: BenchSummary) -> None:
         # the inferlet's execute() calls that short-circuited via
         # the chain. `chain yield` is how much of the theoretical
         # max (attempts × depth_cap) we actually captured as hits;
-        # 1.0 means every chain entry the driver fired was matched
+        # 1.0 means every chain entry the engine fired was matched
         # by an inferlet call, lower means some entries got
         # truncated (page boundaries) or orphaned (ctx ended).
         hits = s.config.get("spec hits", 0)

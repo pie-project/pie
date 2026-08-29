@@ -50,7 +50,7 @@ pub fn swiglu(
     intermediate: u32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "mlp.swiglu";
+    const OP: &str = "linear.mlp_swiglu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -66,7 +66,7 @@ pub fn swiglu_clamp(
     limit: f32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "mlp.swiglu_clamp";
+    const OP: &str = "linear.mlp_swiglu_clamp";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_clamp_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -88,7 +88,7 @@ pub fn swiglu_clamp_alpha(
     alpha: f32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "mlp.swiglu_clamp_alpha";
+    const OP: &str = "linear.mlp_swiglu_clamp_alpha";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_gptoss_swiglu_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -104,7 +104,7 @@ pub fn swiglu_clamp_alpha(
 }
 
 pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), KernelError> {
-    const OP: &str = "mlp.geglu_tanh";
+    const OP: &str = "linear.mlp_geglu_tanh";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "geglu_tanh_bfloat16" });
     ctx.fire(
         Fire::at("linear/mlp_gated.metal", entry).apply(Grid::of(
@@ -121,7 +121,7 @@ pub fn geglu_tanh_packed(
     intermediate: u32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "mlp.geglu_tanh_packed";
+    const OP: &str = "linear.mlp_geglu_tanh_packed";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_geglu_tanh_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
     ctx.fire(
@@ -140,7 +140,7 @@ pub fn situ(
     up_cap: Option<f32>,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "mlp.situ";
+    const OP: &str = "linear.mlp_situ";
     if beta == 0.0 {
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }

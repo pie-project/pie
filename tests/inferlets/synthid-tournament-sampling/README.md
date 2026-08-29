@@ -89,7 +89,7 @@ figures here are warm.
 
 ```bash
 cargo build --release --target wasm32-wasip2
-python tests/inferlets/run_all.py --driver cuda_native --model <model-path>
+python tests/inferlets/run_all.py --engine cuda_native --model <model-path>
 ```
 
 As with [`gumbel-watermark`](../gumbel-watermark), the smoke test is structural

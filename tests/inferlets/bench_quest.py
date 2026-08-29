@@ -21,7 +21,7 @@ shared, so a mean measures the neighbours, while the minimum measures the work.
 Run from the repo root with PYTHONPATH=sdk/server/python/python:
 
     PIE_CUDA_KV_ENVELOPES=1 python tests/inferlets/bench_quest.py \
-        --driver cuda_native --model <path>
+        --engine cuda_native --model <path>
 """
 
 import asyncio
@@ -53,7 +53,7 @@ REPS = int(os.environ.get("PIE_BENCH_REPS", "7"))
 
 # Contexts to sweep. This used to stop at 6144, because both this benchmark's
 # endpoints prefilled in a single fire and a single fire cannot exceed the
-# driver's per-launch token capacity (8192 here). Both inferlets now chunk their
+# engine's per-launch token capacity (8192 here). Both inferlets now chunk their
 # prefill, so the sweep reaches the range Quest actually exists for -- which is
 # the range where the constant overhead of section 14.3 stops dominating.
 CONTEXTS = [1024, 2048, 4096, 6144, 8192, 12288, 16384]

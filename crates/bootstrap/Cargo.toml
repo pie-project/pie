@@ -32,7 +32,7 @@ clap = { version = "4.6", features = ["derive"] }
 # Path/dir resolution (home dir for `$PIE_HOME` fallback).
 dirs = "6.0"
 # TLS: not used here, *selected* here. Every HTTP client in the process
-# (reqwest in the engine, the worker's blob fetch, `pie model import`) is built
+# (reqwest in the runtime, the worker's blob fetch, `pie model import`) is built
 # on `rustls-no-provider`, which refuses to pick a crypto backend on its own —
 # so process boot installs one, and installing it once beside the panic hook is
 # what keeps every bin from having to remember. `ring` rather than the aws-lc

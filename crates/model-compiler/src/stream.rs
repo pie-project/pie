@@ -43,7 +43,7 @@
 //! are DISJOINT cannot touch the same cache bytes, however conservatively the
 //! space is read. A class is a set of lanes, classes partition the lanes of a
 //! fire, and a cache's storage is owned per lane: a kv page belongs to one
-//! sequence (`driver-api`'s `Lane::kv` is one delta, the engine keeps one page
+//! sequence (`engine-api`'s `Lane::kv` is one delta, the runtime keeps one page
 //! table) and a recurrent slab is one lane's row. Disjoint classes are
 //! disjoint lanes are disjoint pages. So gemma's masked append and its decode
 //! append are not ordered against each other, and both are ordered against

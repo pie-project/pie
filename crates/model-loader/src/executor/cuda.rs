@@ -156,7 +156,7 @@ impl CudaArena {
         stream: *mut c_void,
     ) -> Result<Self, Error> {
         let slot = max_write_bytes.clamp(1, STAGING_SLOT_CEILING);
-        // Best effort: a driver that cannot pin two slots still loads. The
+        // Best effort: an engine that cannot pin two slots still loads. The
         // event is recorded before first use is possible, so a slot's first
         // synchronize is on an event that has never been recorded --
         // `cudaEventSynchronize` on such an event returns immediately, which
@@ -240,8 +240,8 @@ impl Drop for CudaArena {
 ///
 /// THE `PIE_LOADER_` PREFIX IS NOT THIS CRATE'S, and the name is kept anyway.
 /// It was the C ABI's namespace, and that ABI is gone — but the variable
-/// outlived it as a knob somebody ships: `driver-cuda`'s `Boot` parses it into
-/// `[driver] device_transforms` and has a test pinning every false spelling.
+/// outlived it as a knob somebody ships: `engine-cuda`'s `Boot` parses it into
+/// `[engine] device_transforms` and has a test pinning every false spelling.
 /// Renaming it would break a live, configured switch to tidy a prefix, in a
 /// crate that cannot see the two places it is read. It is one name, spelled
 /// twice, and this sentence is cheaper than the churn.
@@ -410,7 +410,7 @@ impl CudaArena {
     /// This arena's stream as the context an entry fires on.
     ///
     /// Built per call rather than held as a field: a [`Ctx`] is what a
-    /// driver's `Run` mints per fire, it carries no state of its own (the jit
+    /// engine's `Run` mints per fire, it carries no state of its own (the jit
     /// cache and the scratch slabs are process-global behind it), and holding
     /// one would only restate `self.stream` in a second place that could
     /// disagree with the first.

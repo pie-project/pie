@@ -1,17 +1,17 @@
 //! Real-hardware #4 validation -- production-inferlet canaries on `cuda_native`
 //! (Lane C).
 //!
-//! Proves what the mock driver CANNOT: that a curated inferlet driving the
+//! Proves what the mock engine CANNOT: that a curated inferlet driving the
 //! paged-KV / CoW forward path produces real coherent tokens on real silicon,
 //! via the result-captured canary harness. (The former CAS-index dedup half of
-//! this lane sampled the live CAS index through `::engine::arena` /
-//! `working_set::kv_cas`, an introspection surface the engine no longer
-//! exposes; the prefix-dedup contract is covered by the engine's prefix-cache
+//! this lane sampled the live CAS index through `::runtime::arena` /
+//! `working_set::kv_cas`, an introspection surface the runtime no longer
+//! exposes; the prefix-dedup contract is covered by the runtime's prefix-cache
 //! e2e and the prefix-heavy benchmark gate.)
 //!
 //! Shares the `common` cuda harness (`boot_cuda` + `install_inferlet` +
-//! `spawn_inferlet`). One boot per process (global engine state). Run warm:
-//!   cargo test -p worker --features driver-cuda-13 --test cuda_canaries -- --ignored --nocapture
+//! `spawn_inferlet`). One boot per process (global runtime state). Run warm:
+//!   cargo test -p worker --features engine-cuda-13 --test cuda_canaries -- --ignored --nocapture
 //!
 //! # The census, taken on a 4090 with CUDA 13 and qwen-3-0.6b
 //!
@@ -19,7 +19,7 @@
 //! `text-completion-spec` and `demo-persistent-kv` -- and NONE of the four is
 //! a member of `tests/inferlets` any more, so it had not reached a GPU in a
 //! long time. Picking replacements meant asking every plausible survivor what
-//! it actually does on this driver.
+//! it actually does on this engine.
 //!
 //! The census below is the SECOND one. The first was taken before
 //! `cuda_host_writer_channels`' deadlock fix and listed four fixtures as
@@ -41,17 +41,17 @@
 //!
 //! | class | fixtures | what it is |
 //! |---|---|---|
-//! | `fire geometry: EmbedTokens is not host-derivable` | `attention-sink`, `consensus-decoding`, `naive-masked`, `sliding-window-attention` | the pool-owned device-geometry class this driver deliberately does not claim |
-//! | emitter declines a single-op library lift | `beam-search`, `locally-typical-sampling`, `tail-free-sampling` | all three fold a `top_k`, and this driver has no `top_k` kernel |
-//! | a capability this driver does not claim | `tova-attention`, `trackb-h2o`, `trackb-snapkv` (`attn_score`), `mtp-speculative-decoding` (`mtp_logits`), `quest-attention` (`envelope_dot`) | five bits, all hardcoded `false` in one block of `serve/load.rs` -- see below |
+//! | `fire geometry: EmbedTokens is not host-derivable` | `attention-sink`, `consensus-decoding`, `naive-masked`, `sliding-window-attention` | the pool-owned device-geometry class this engine deliberately does not claim |
+//! | emitter declines a single-op library lift | `beam-search`, `locally-typical-sampling`, `tail-free-sampling` | all three fold a `top_k`, and this engine has no `top_k` kernel |
+//! | a capability this engine does not claim | `tova-attention`, `trackb-h2o`, `trackb-snapkv` (`attn_score`), `mtp-speculative-decoding` (`mtp_logits`), `quest-attention` (`envelope_dot`) | five bits, all hardcoded `false` in one block of `serve/load.rs` -- see below |
 //! | budget too small to finish | `constrained-speculative-decoding`, `json-schema-constrained-decoding` | eight tokens does not close a JSON object; not a defect |
 //!
 //! That row used to be two, and both said the wrong thing. It read
 //! `model-gated intrinsic attn_score unavailable on this model` as "a MODEL
 //! fact -- qwen-3-0.6b has neither", and `the backend's model profile does not
 //! advertise this kernel` as something "one layer lower". Neither is about the
-//! checkpoint. `ModelProfile` is built in `engine/src/pipeline/program.rs` by
-//! copying the DRIVER's `PtirCaps` field for field, and this driver states
+//! checkpoint. `ModelProfile` is built in `runtime/src/pipeline/program.rs` by
+//! copying the ENGINE's `PtirCaps` field for field, and this engine states
 //! `has_attn_score: false`, `has_attn_page_mask: false`, `has_kv_envelopes:
 //! false`, `has_mtp_logits: false` and `has_value_head: false` as literals, in
 //! one block of `serve/load.rs`, under a comment that says exactly why: each is
@@ -60,7 +60,7 @@
 //!
 //! Both refusals SAY that now -- the `IntrinsicUnavailable` and
 //! `KernelUnavailable` that `tensor-ir`'s `validate` raises (this crate does
-//! not link it; the strings arrive over the wire) name the driver's
+//! not link it; the strings arrive over the wire) name the engine's
 //! `PtirCaps` and add, of the intrinsic one, that it "says nothing about the
 //! checkpoint". The census quotes the old wording above because that is what
 //! the run printed when it was taken.
@@ -123,7 +123,7 @@
 //!   published into the mirror, so the guest's second `put` found the ring
 //!   permanently full. It runs to any length now. The MASK disagreement that
 //!   probe then exposed -- a dense causal mask answering differently from no
-//!   mask at all -- was a second defect, the driver packing the custom mask one
+//!   mask at all -- was a second defect, the engine packing the custom mask one
 //!   byte per pair where both kernels read one BIT per pair, and it is fixed
 //!   and gated by `cuda_element_mask_packing`.
 //! * `lora-probe` is the one left, and it was the most misleading of the four.
@@ -136,7 +136,7 @@
 //!   Three defects were in that chain, all now fixed: the shared adopter
 //!   applied METAL's boundary vocabulary to every backend, so `lora`,
 //!   `attn_page_mask` and `envelope_dot` were all non-executable on CUDA; the
-//!   library tag on the wire was a bare enum discriminant no driver could name;
+//!   library tag on the wire was a bare enum discriminant no engine could name;
 //!   and a second-party region's emitter decline -- which is correct, there is
 //!   no generated kernel for a sink -- was read as a compile failure.
 //!
@@ -159,7 +159,7 @@
 //!        2048 != q projection width 16*. The strides are now read off the
 //!        lowering's own operands, which state them once.
 //!     3. The correction's xAᵀ gate was `Scratch::attn_out`, which on a
-//!        `DriverPinned` family is the attention output buffer. The adapter
+//!        `EnginePinned` family is the attention output buffer. The adapter
 //!        wrote its intermediate over the attention's rows.
 //!
 //!   `lora-probe` now applies a real delta: `adapter_scale` 0.0 answers
@@ -303,21 +303,21 @@
 //! # What `prefix-tree-kv-cache` cost, and why it is the canary
 //!
 //! It is the only surviving fixture that drives `copy_kv`, and it found three
-//! separate defects in `driver-cuda`'s control path, each hidden by the one in
+//! separate defects in `engine-cuda`'s control path, each hidden by the one in
 //! front of it:
 //!
 //! 1. `copy_kv` and `resize_pool` notified their completion without publishing
-//!    a terminal outcome (`driver callback published before terminal outcome
+//!    a terminal outcome (`engine callback published before terminal outcome
 //!    settled`), and `copy_state` bound its target to `_completion` and did
-//!    neither -- the 850-second-hang shape `engine::driver::backend`'s
+//!    neither -- the 850-second-hang shape `runtime::engine::backend`'s
 //!    `settle_control` documents. All four control verbs settle through
 //!    `serve::settle_control` now.
 //! 2. Five of `copy_kv`'s refusals returned a bare `INVALID_ARGUMENT` with
-//!    nothing on stderr, so the engine's `status -1` was the whole of what
+//!    nothing on stderr, so the runtime's `status -1` was the whole of what
 //!    anyone got. Each names itself now.
 //! 3. The refusal those then revealed: a copy whose DESTINATION is one page
 //!    above the elastic pool was rejected instead of growing it -- the exact
-//!    defect `driver-vulkan/tests/device.rs` and `driver-wgpu/tests/serving.rs`
+//!    defect `engine-vulkan/tests/device.rs` and `engine-wgpu/tests/serving.rs`
 //!    each carry a device test for, arrived at from the third backend.
 //!
 //! # The test surface was dark, and that is why the migration stayed half done
@@ -326,8 +326,8 @@
 //! `#[cfg(test)]` module or a `tests/*.rs` target fails to COMPILE. In a
 //! workspace sweep that reads as noise. Entire crates' worth of gates had been
 //! un-run for a long time on exactly that reading: `model-ir`, `model-compiler`,
-//! `driver-metal`, six of `driver-cuda`'s seven test targets, both of
-//! `kernels`', and `driver-vulkan` outright (a merge left two imports behind,
+//! `engine-metal`, six of `engine-cuda`'s seven test targets, both of
+//! `kernels`', and `engine-vulkan` outright (a merge left two imports behind,
 //! one of them naming a type that no longer exists).
 //!
 //! **`cargo check --workspace --all-targets` is the knob that surfaces this.**
@@ -369,7 +369,7 @@
 mod common;
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local model snapshot; one boot per process"]
+#[ignore = "real-hardware: needs an RTX GPU + --features engine-cuda-13 + a local model snapshot; one boot per process"]
 fn cuda_inferlet_canaries() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -394,7 +394,7 @@ fn cuda_inferlet_canaries() {
         // context AND the branch's destination lands one page past the last
         // prefill's high-water mark. That last part is what makes it the canary:
         // it is the only surviving fixture that drives `copy_kv` at all, and it
-        // found three separate defects in this driver's control path (see the
+        // found three separate defects in this engine's control path (see the
         // census above).
         let reuse = common::spawn_inferlet("prefix-tree-kv-cache", r#"{"num_tokens":32}"#).await;
         eprintln!("[cuda canary] prefix-tree-kv-cache (shared-prefix pages) => {reuse:?}");

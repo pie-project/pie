@@ -14,9 +14,9 @@ path = "src/lib.rs"
 [dependencies]
 # Cross-node id atoms (`WorkerId`/`GatewayId`/`NodeId`) — the leaf id crate.
 ids = { path = "../ids" }
-# `WorkerInfo.capability` carries `DriverCapabilities`, which lives in
-# `driver` (`capabilities.rs`).
-driver-api = { path = "../driver-api" }
+# `WorkerInfo.capability` carries `EngineCapabilities`, which lives in
+# `engine` (`capabilities.rs`).
+engine-api = { path = "../engine-api" }
 # Plain serde — control vocabulary travels over the control channel.
 serde = { version = "1.0", features = ["derive"] }
 # The RPC mechanism. `serde1` enables the serde derives on the macro-generated

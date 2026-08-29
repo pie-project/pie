@@ -64,7 +64,7 @@ class KvWorkingSet:
 
     def page_size(self) -> int:
         """
-        Tokens per KV page for this working set's model/driver.
+        Tokens per KV page for this working set's model/engine.
         """
         raise NotImplementedError
     def page_len(self) -> int:
@@ -86,7 +86,7 @@ class KvWorkingSet:
         """
         Atomically insert or replace `key` with a structurally retained view
         of this working set. Keys are opaque bytes scoped to the active
-        model/driver store. The working set must have no in-flight fire and
+        model/engine store. The working set must have no in-flight fire and
         every logical page must be physically mapped.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
@@ -189,7 +189,7 @@ class RsWorkingSet:
         raise NotImplementedError
     def buffer_page_size(self) -> int:
         """
-        Tokens per buffered RS page for this working set's model/driver.
+        Tokens per buffered RS page for this working set's model/engine.
         """
         raise NotImplementedError
     def alloc_buffer(self, n: int) -> PageRange:

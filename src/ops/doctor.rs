@@ -2,7 +2,7 @@
 //!
 //! One command because there was no way to tell the old three apart by name.
 //! `doctor` reported the platform, `check` parsed the config, and `smoke`
-//! reported whether a driver was compiled in -- which `doctor` already did.
+//! reported whether an engine was compiled in -- which `doctor` already did.
 //! Each answered part of one question, and none of them answered it.
 //!
 //! The gap that mattered was the config: `doctor` passed on a machine whose
@@ -13,7 +13,7 @@
 //!   * 0 — pie can boot here. Warnings are allowed: a missing GPU is a fact
 //!     about the machine, not a broken installation.
 //!   * 1 — it cannot. Reserved for what actually stops a boot: an unparseable
-//!     config, or a config asking for a driver this binary does not have.
+//!     config, or a config asking for an engine this binary does not have.
 
 use std::path::Path;
 use std::process::Command;
@@ -130,14 +130,14 @@ pub fn run(global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
     sections.push(("system", vec![check_platform(), check_py_runtime()]));
     sections.push(("gpus", check_gpus()));
     sections.push((
-        "drivers",
-        worker::driver_ffi::compiled_embedded()
+        "engines",
+        worker::engine_ffi::compiled_embedded()
             .iter()
             .map(|(name, on)| {
                 if *on {
                     (name.to_string(), "compiled in".to_string(), Status::Pass)
                 } else {
-                    // A driver you did not build is not a fault until the
+                    // An engine you did not build is not a fault until the
                     // config asks for it -- which the config section checks.
                     (name.to_string(), absent_because(name), Status::Warn)
                 }
@@ -273,10 +273,10 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
         Err(error) => out.push(("weights".into(), format!("{error}"), Status::Fail)),
     }
     // The check the old `pie check` could not make and `pie smoke` made in
-    // isolation: the config names a driver, and this binary either has it or
+    // isolation: the config names an engine, and this binary either has it or
     // does not.
-    let kind = worker.model.driver.kind.as_str();
-    let compiled = worker::driver_ffi::compiled_embedded()
+    let kind = worker.model.engine.kind.as_str();
+    let compiled = worker::engine_ffi::compiled_embedded()
         .iter()
         .find(|(name, _)| *name == kind)
         .map(|(_, on)| *on)
@@ -291,7 +291,7 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
         (
             "model".into(),
             format!(
-                "{} asks for the {kind} driver: {}",
+                "{} asks for the {kind} engine: {}",
                 worker.model.name,
                 absent_because(kind)
             ),
@@ -301,21 +301,21 @@ fn check_config(path: &Path, origin: bootstrap::Origin) -> Vec<(String, String, 
     out
 }
 
-/// Why a driver flavor this binary does not have is missing.
+/// Why an engine flavor this binary does not have is missing.
 ///
 /// TWO reasons, and only one of them is a build choice. CUDA is absent
 /// because a feature was off, and the feature carries the CUDA runtime ABI
-/// in its name -- there is no version-less `driver-cuda` to advise. The three
+/// in its name -- there is no version-less `engine-cuda` to advise. The three
 /// shader flavors are absent because no build of pie hosts them: their crates
 /// left the workspace and no feature would bring one back. Advice that would
 /// not work is worse than no advice, which is the distinction
-/// `worker::driver_ffi` draws between its two error messages.
+/// `worker::engine_ffi` draws between its two error messages.
 fn absent_because(name: &str) -> String {
     match name {
         "cuda_native" => {
-            "not compiled — build with `--features driver-cuda-13` (or `-12`)".to_string()
+            "not compiled — build with `--features engine-cuda-13` (or `-12`)".to_string()
         }
-        shader => format!("retired — no build of pie hosts `driver-{shader}`; it returns at P5"),
+        shader => format!("retired — no build of pie hosts `engine-{shader}`; it returns at P5"),
     }
 }
 
@@ -429,8 +429,8 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
     let mut checks = Vec::new();
 
     match (
-        set("driver.max_forward_tokens"),
-        set("driver.max_forward_requests"),
+        set("engine.max_forward_tokens"),
+        set("engine.max_forward_requests"),
     ) {
         (Some(tokens), Some(requests)) => checks.push((
             "forward shape".to_string(),
@@ -481,7 +481,7 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
         )
     });
 
-    // The driver's own measurement, keyed by (device, model, tp, kv format) --
+    // The engine's own measurement, keyed by (device, model, tp, kv format) --
     // so its mere presence is not proof it applies HERE. Saying "measured on
     // some machine" would be worse than saying nothing, hence the wording.
     let profile_cache = worker::state::planner_profile_path();
@@ -489,7 +489,7 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
         (
             "planner profile".to_string(),
             format!(
-                "{} exists; the driver checks its key at boot",
+                "{} exists; the engine checks its key at boot",
                 crate::ui::short_path(&profile_cache)
             ),
             Status::Pass,
@@ -527,7 +527,7 @@ mod tests {
         // This section describes the machine rather than faulting the config,
         // and an unmeasured machine is a perfectly serviceable one -- it is
         // what every deployment had until now. Nothing here may block a boot.
-        for config in ["", "[driver]\nmemory_profile = \"latency\"\n"] {
+        for config in ["", "[engine]\nmemory_profile = \"latency\"\n"] {
             let checks = tuning_of(config);
             assert!(
                 !checks.iter().any(|(_, _, status)| *status == Status::Fail),

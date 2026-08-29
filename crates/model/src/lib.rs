@@ -15,7 +15,7 @@ use model_loader::types::{DType, Encoding, QuantScheme, QuantSpec};
 /// the same door the column comes out of. A party that holds a [`ClassifyFn`]
 /// has to build the [`Request`] it takes, and making it name `model_dsl` for
 /// that would put the authoring eDSL in the dependency graph of everyone who
-/// wants a lane's word — the engine's fire path, which authors nothing.
+/// wants a lane's word — the runtime's fire path, which authors nothing.
 pub use model_dsl::{ClassifyFn, Request};
 
 /// One shipping SKU: its name, the tensor-parallel width it was traced for,
@@ -24,7 +24,7 @@ pub use model_dsl::{ClassifyFn, Request};
 /// THE FOURTH COLUMN IS WHAT LETS A LANE STATE ITS CLASS. Nothing outside a
 /// family's own module can say which bit `qo_one` is — a plan's
 /// `Guard::Fact(bit)` numbers its bits and stops there — so before this column
-/// existed the engine's fire path submitted every lane as word 0, the
+/// existed the runtime's fire path submitted every lane as word 0, the
 /// all-false class, and a decode lane composed as a prefill one. `catalog!`
 /// closes each family's `Classify::of(..).word()` into a plain pointer here,
 /// and the bit numbering stays private.

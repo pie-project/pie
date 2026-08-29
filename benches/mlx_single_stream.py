@@ -6,7 +6,7 @@ comparison for a serving shape and the wrong one for this question: it needs a
 `pie model build` artifact beside the checkpoint to compare against, and on this
 machine the four models under test are 65 GiB of checkpoint with 65 GiB of
 artifact nowhere to put. This runs mlx-lm in-process against the SAME
-`.safetensors` the driver loads, so the only thing that differs between the two
+`.safetensors` the engine loads, so the only thing that differs between the two
 numbers is the implementation.
 
 What is held equal, because a throughput number is only worth the shape it was

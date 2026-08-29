@@ -19,7 +19,7 @@
 //!
 //! **The STREAM is P6.** Two arms of one fork group run at the same instant
 //! by construction, so two regions staging through one slab stage over each
-//! other — which is why `driver_cuda::EXCLUSIVE` named eleven entries and
+//! other — which is why `engine_cuda::EXCLUSIVE` named eleven entries and
 //! ordered every linear-attention split in qwen and kimi back into a line
 //! (build log 24). Per stream, they are disjoint by the same argument that
 //! makes two streams worth having.

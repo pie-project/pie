@@ -12,11 +12,11 @@
 //!
 //!   S=/path/to/an/moe/snapshot
 //!   PIE_CUDA_TEST_SNAPSHOT=$S \
-//!     cargo test --release -p worker --features driver-cuda-13 \
+//!     cargo test --release -p worker --features engine-cuda-13 \
 //!     --test cuda_moe_streaming -- --ignored --nocapture
 //!   PIE_CUDA_TEST_SNAPSHOT=$S PIE_CUDA_TEST_STREAM_EXPERTS=1 \
 //!     PIE_CUDA_TEST_EXPERT_CACHE_GB=0.0004 \
-//!     cargo test --release -p worker --features driver-cuda-13 \
+//!     cargo test --release -p worker --features engine-cuda-13 \
 //!     --test cuda_moe_streaming -- --ignored --nocapture
 //!
 //! A deliberately tiny `expert_cache` forces the slab down to a couple of slots
@@ -24,24 +24,24 @@
 //!
 //! # `--release`, and it is not a preference
 //!
-//! A `cargo test` without it builds the engine and the driver at `-O0`, and on
+//! A `cargo test` without it builds the runtime and the engine at `-O0`, and on
 //! a 20-billion-parameter mixture the HOST side is then the whole cost: the
 //! card sits at 0% while a batch takes ~36 s, and the harness's 180-second
 //! deadline expires around the third one. The same run built `--release`
 //! finishes in 95 s including a 13 GB load. Nothing about that is a device
 //! fact, which is why it is written here rather than chased.
 //!
-//! # THE SECOND RUN CANNOT BE MADE ON THIS DRIVER YET
+//! # THE SECOND RUN CANNOT BE MADE ON THIS ENGINE YET
 //!
-//! `crates/driver-cuda/src/boot.rs` is, by its own first line, "every boot knob
-//! this driver reads", and it holds nine: `runahead`, `supergraph`,
+//! `crates/engine-cuda/src/boot.rs` is, by its own first line, "every boot knob
+//! this engine reads", and it holds nine: `runahead`, `supergraph`,
 //! `trace_supergraph`, `device_transforms`, `kv_envelopes`,
 //! `attn_score_window`, `rs_stash_tokens`, `calibrating`, and the KV page size
 //! that is not a knob. `stream_routed_experts` is not among them, and neither
 //! `expert_cache` nor `expert_host_cache` appears anywhere under
-//! `crates/driver-cuda`. The worker composes all three into the boot JSON --
-//! `embedded_driver.rs` does it for `cuda_native` specifically -- and this
-//! driver reads none of them. Every expert stays resident, always.
+//! `crates/engine-cuda`. The worker composes all three into the boot JSON --
+//! `embedded_engine.rs` does it for `cuda_native` specifically -- and this
+//! engine reads none of them. Every expert stays resident, always.
 //!
 //! Which makes the two-run protocol above a comparison of a run with itself,
 //! and it duly agrees with itself: run on `openai/gpt-oss-20b`, both halves
@@ -66,10 +66,10 @@
 //! changed between them. Greedy decode on a 20B MXFP4 MoE sits on near-ties
 //! that a recompile can tip. So the load-bearing evidence that streaming is
 //! unimplemented is the SEARCH -- zero occurrences of the three knob names
-//! under `crates/driver-cuda` -- which no rebuild can move.
+//! under `crates/engine-cuda` -- which no rebuild can move.
 //!
 //! So `PIE_CUDA_TEST_STREAM_EXPERTS=1` refuses rather than passing. It is a
-//! request for a thing this driver does not do, and a test that answers such a
+//! request for a thing this engine does not do, and a test that answers such a
 //! request with success is worse than one that fails: it retires the ticket.
 //! The refusal names `boot.rs`, so the day a knob lands there this file starts
 //! working without being edited.
@@ -85,7 +85,7 @@
 mod common;
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local MoE snapshot; one boot per process"]
+#[ignore = "real-hardware: needs an RTX GPU + --features engine-cuda-13 + a local MoE snapshot; one boot per process"]
 fn cuda_moe_decodes_the_same_tokens_streamed_or_resident() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -93,13 +93,13 @@ fn cuda_moe_decodes_the_same_tokens_streamed_or_resident() {
         assert!(
             !streaming,
             "PIE_CUDA_TEST_STREAM_EXPERTS asks for expert paging, and \
-             `driver-cuda` does not do it: `crates/driver-cuda/src/boot.rs` is \
-             every boot knob this driver reads and `stream_routed_experts` is \
+             `engine-cuda` does not do it: `crates/engine-cuda/src/boot.rs` is \
+             every boot knob this engine reads and `stream_routed_experts` is \
              not one of them, nor are `expert_cache` and `expert_host_cache` \
-             read anywhere under `crates/driver-cuda`. The worker composes all \
-             three into the boot JSON and this driver ignores all three, so a \
+             read anywhere under `crates/engine-cuda`. The worker composes all \
+             three into the boot JSON and this engine ignores all three, so a \
              run with them set is the SAME run. Unset it for the resident \
-             half, which is the half this driver can make."
+             half, which is the half this engine can make."
         );
         // Pin the resident run to the dispatch streaming is forced onto, so the
         // two runs differ in residency and nothing else.

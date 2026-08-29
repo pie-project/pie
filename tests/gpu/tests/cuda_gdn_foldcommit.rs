@@ -1,10 +1,10 @@
 //! **fold-commit on the REAL linear model** — drives the `gdn-foldcommit`
 //! inferlet on Qwen3.5-0.8B (GDN backbone) so the buffer/fold machinery is
 //! exercised against real weights rather than the mock model in
-//! the engine's deleted rs_frame test.
+//! the runtime's deleted rs_frame test.
 //!
-//! the engine's deleted rs_frame test proves the HOST bookkeeping (slot accounting, CSR shapes,
-//! refusals). It cannot prove the driver actually replays buffered
+//! the runtime's deleted rs_frame test proves the HOST bookkeeping (slot accounting, CSR shapes,
+//! refusals). It cannot prove the engine actually replays buffered
 //! activations, because its model computes nothing. Everything about the
 //! recurrent read path lives on the far side of that boundary, so it needs a
 //! GPU test.
@@ -12,7 +12,7 @@
 //! Two cases, and the split is the point:
 //!
 //!  - `one_chunk_folds_from_the_buffer` — buffer one chunk, fold a prefix of
-//!    it. This is the position the driver supports today.
+//!    it. This is the position the engine supports today.
 //!  - `two_chunks_need_the_buffer_read_path` — buffer a chunk, fold PART of
 //!    it, then buffer a SECOND chunk onto the surviving tail. The second
 //!    append starts from a non-empty buffer, so its recurrence would have to
@@ -21,8 +21,8 @@
 //!    the acceptance test for the read path, and it flips from "refused for
 //!    the right reason" to "runs and is correct" when the read path lands.
 //!
-//! `#[ignore]`, driver-cuda. Run:
-//!   cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_gdn_foldcommit \
+//! `#[ignore]`, engine-cuda. Run:
+//!   cargo test -p pie-gpu-tests --features engine-cuda-13 --test cuda_gdn_foldcommit \
 //!     -- --ignored --nocapture
 
 use std::path::Path;
@@ -104,7 +104,7 @@ async fn run_foldcommit(input: &str) -> Result<std::result::Result<String, Strin
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
             `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
-            no driver in this tree, so a recurrent fold that appends to a \
+            no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
             `tests/inferlets` besides"]
@@ -144,7 +144,7 @@ async fn one_chunk_folds_from_the_buffer() -> Result<()> {
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
             `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
-            no driver in this tree, so a recurrent fold that appends to a \
+            no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
             `tests/inferlets` besides"]
@@ -182,7 +182,7 @@ async fn two_chunks_need_the_buffer_read_path() -> Result<()> {
 /// separate fires").
 ///
 /// One fire appends two tokens onto a buffer already holding two and folds all
-/// four. It is a write and a fold at once: the driver replays the buffered
+/// four. It is a write and a fold at once: the engine replays the buffered
 /// pair ahead of the new pair over the extended `[buffered | new]` layout,
 /// scatters the new pair into the buffer, and — because the boundary is the
 /// last extended token — lets the ordinary end-of-sequence writeback land the
@@ -196,7 +196,7 @@ async fn two_chunks_need_the_buffer_read_path() -> Result<()> {
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
             `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
-            no driver in this tree, so a recurrent fold that appends to a \
+            no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
             `tests/inferlets` besides"]
@@ -232,7 +232,7 @@ async fn a_fire_can_append_to_a_buffer_and_fold_through_it() -> Result<()> {
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
             `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
-            no driver in this tree, so a recurrent fold that appends to a \
+            no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
             `tests/inferlets` besides"]
@@ -255,7 +255,7 @@ async fn one_fire_can_fold_one_request_while_another_only_buffers() -> Result<()
 /// device. Reading it back to choose the commit's `fold-len` puts a host
 /// round-trip between two fires that could otherwise have been enqueued
 /// together. So the count stays in a channel: the host plans against its own
-/// UPPER BOUND (the row's whole live buffer) and the driver resolves the real
+/// UPPER BOUND (the row's whole live buffer) and the engine resolves the real
 /// value and CLAMPS it to that bound.
 ///
 /// Arm A commits from a channel it never awaits, computed as `1 + (argmax %
@@ -271,7 +271,7 @@ async fn one_fire_can_fold_one_request_while_another_only_buffers() -> Result<()
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
             `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
-            no driver in this tree, so a recurrent fold that appends to a \
+            no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
             `tests/inferlets` besides"]
@@ -293,7 +293,7 @@ async fn the_fold_length_can_live_on_device() -> Result<()> {
 /// `b < n < b + t` — the last RS position the planner refused, and the blocker
 /// for a single-fire speculative verify+commit. `commit_len` cannot express
 /// it: every kernel implements it as `if (c < Nr) Nr = c`, which TRUNCATES the
-/// sequence, so the tokens past the boundary get no outputs at all. The driver
+/// sequence, so the tokens past the boundary get no outputs at all. The engine
 /// cuts the row into two segments and runs the recurrence twice on one stream
 /// instead — the head persisting its end-of-sequence state onto the boundary,
 /// the tail continuing from that state to produce the rest.
@@ -307,7 +307,7 @@ async fn the_fold_length_can_live_on_device() -> Result<()> {
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
             `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
-            no driver in this tree, so a recurrent fold that appends to a \
+            no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
             `tests/inferlets` besides"]
@@ -336,7 +336,7 @@ async fn the_fold_boundary_can_land_inside_a_fires_own_tokens() -> Result<()> {
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
             `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
-            no driver in this tree, so a recurrent fold that appends to a \
+            no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
             `tests/inferlets` besides"]
@@ -362,7 +362,7 @@ async fn a_commit_may_carry_no_tokens_of_its_own() -> Result<()> {
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
             `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
-            no driver in this tree, so a recurrent fold that appends to a \
+            no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
             `tests/inferlets` besides"]

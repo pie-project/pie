@@ -3,7 +3,7 @@ name = "model-compiler"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Bakes a traced Plan once: class resolution, region coalescing and the arena carve, into the backend-neutral CompiledModel artifact a driver records and replays. Pure functions — no device, no I/O."
+description = "Bakes a traced Plan once: class resolution, region coalescing and the arena carve, into the backend-neutral CompiledModel artifact an engine records and replays. Pure functions — no device, no I/O."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -26,7 +26,7 @@ path = "src/lib.rs"
 # the same walk at authoring time, and a second implementation on this side
 # would be a second answer to "does this merge cover its classes".
 model-ir = { path = "../model-ir" }
-# The workspace's one error idiom (`transport`, `driver-api`, `model-loader`
+# The workspace's one error idiom (`transport`, `engine-api`, `model-loader`
 # all carry it the same way): `#[error]` attributes over the refusal enum,
 # with the message texts kept exactly as the handwritten `Display` spelled
 # them.

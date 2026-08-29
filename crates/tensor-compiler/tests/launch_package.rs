@@ -1,9 +1,9 @@
-//! What the driver is handed, pinned.
+//! What the engine is handed, pinned.
 //!
-//! [`tensor_compiler::codegen::launch::build`] produces the only artefact the driver
+//! [`tensor_compiler::codegen::launch::build`] produces the only artefact the engine
 //! executes: a `LaunchPackage` of lowered values, channels, ports, stages and
 //! per-stage grouped plans. Until this file existed it had exactly one caller
-//! in the tested workspace — `cuda_golden::emit_driver_test_kernel_fixtures`,
+//! in the tested workspace — `cuda_golden::emit_engine_test_kernel_fixtures`,
 //! which writes the encoded package into a gitignored fixtures directory and
 //! asserts nothing about its contents. So `StageNeeds::grouped_valid`,
 //! `plan.error`, `flags`, `mtp_rows` and `channel_rules` were all unpinned:
@@ -18,7 +18,7 @@
 #[path = "common/msl_corpus.rs"]
 mod msl_corpus;
 
-use driver_api::program::LaunchStagePlan;
+use engine_api::program::LaunchStagePlan;
 use msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
 use tensor_compiler::plan::compile_bound;
 use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -64,7 +64,7 @@ fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
 
 
 #[test]
-fn every_plan_the_driver_receives_is_well_formed() {
+fn every_plan_the_engine_receives_is_well_formed() {
     // `packages()` drops a trace that stops binding -- `let Ok(bound) = ...
     // else { return }` -- and then every check below runs over what is left.
     // The old guard was `>= 12` against a corpus of 24, so half the corpus
@@ -103,7 +103,7 @@ fn every_plan_the_driver_receives_is_well_formed() {
             let id = format!("{name}#{index}");
 
             // `invalid()` clears the valid bit and sets a reason. Neither half
-            // may happen without the other, or the driver sees a plan it will
+            // may happen without the other, or the engine sees a plan it will
             // run with a diagnosis attached, or refuse with none.
             assert_eq!(
                 plan.needs.grouped_valid,
@@ -116,7 +116,7 @@ fn every_plan_the_driver_receives_is_well_formed() {
             // the bitmask: `StageNeeds` is eight named booleans, so a bit no
             // constant declares is not a value it can hold.
 
-            // Every lowered op is an op, and every index the driver will
+            // Every lowered op is an op, and every index the engine will
             // dereference is in range of the table it indexes.
             for op in &plan.ops {
                 assert!(
@@ -144,13 +144,13 @@ fn every_plan_the_driver_receives_is_well_formed() {
             for binding in &plan.channel_bindings {
                 assert!(
                     *binding != u32::MAX,
-                    "{id}: an unbound channel slot reached the driver"
+                    "{id}: an unbound channel slot reached the engine"
                 );
             }
             if plan.needs.mtp_rows {
                 assert!(
                     plan.mtp_rows > 0,
-                    "{id}: asks the driver for MTP rows and then names zero of them"
+                    "{id}: asks the engine for MTP rows and then names zero of them"
                 );
             }
         }
@@ -209,7 +209,7 @@ const EXPECTED_GROUPED_VALID: usize = 18;
 /// every `sink_call`; now that two first-party sinks exist it dispatches on
 /// the resolved name, and this is what notices if that dispatch regresses in
 /// either direction — a lora stage flagged as a page mask would have the
-/// driver look for a page selection that never comes, and vice versa.
+/// engine look for a page selection that never comes, and vice versa.
 #[test]
 fn the_lora_sink_raises_its_own_stage_flag() {
     let chan = |shape| ChannelDecl {
@@ -247,7 +247,7 @@ fn the_lora_sink_raises_its_own_stage_flag() {
     let plan = &package.plans[0];
     assert!(
         plan.needs.lora,
-        "a stage writing the lora sink must tell the driver so"
+        "a stage writing the lora sink must tell the engine so"
     );
     assert!(
         !plan.needs.page_mask,

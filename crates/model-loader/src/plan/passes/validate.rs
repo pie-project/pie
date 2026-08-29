@@ -183,7 +183,7 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
     Ok(0)
 }
 
-/// A tensor the driver BINDS is stored in something the driver can read.
+/// A tensor the engine BINDS is stored in something the engine can read.
 ///
 /// Narrowly: no device may be handed a self-contained block. A GGUF block
 /// carries its scales inside the payload, and `CONVERT_TILE_MAP_MASK`'s own
@@ -213,7 +213,7 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
 /// can see it rather than left resting on a decision made for other reasons.
 ///
 /// Only `Visibility::Public` tensors are checked. An `Internal` tensor is an
-/// intermediate the plan itself consumes and the driver never sees, and a
+/// intermediate the plan itself consumes and the engine never sees, and a
 /// blocked one is exactly what a `Decode` reads from — refusing it would
 /// refuse the repair.
 pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> {

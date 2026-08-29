@@ -84,7 +84,7 @@ impl ClassSet {
     /// asks the mirror-image question every launch and gets a set of classes
     /// back for its trouble: which classes did this batch TURN OUT to contain?
     /// That answer is the argument `model_compiler::ClassOrder::class_order`
-    /// takes, so a driver composing a fire has to be able to say it in this
+    /// takes, so an engine composing a fire has to be able to say it in this
     /// type — otherwise the one caller the seriation exists for is the one
     /// caller that cannot knock on the door, and reaches a layer further down
     /// for the ordering instead.
@@ -164,7 +164,7 @@ pub struct ClassTable {
     /// to: a model may state a fact it does not yet split on, and a word with
     /// that bit set names no class here. Masking with this before
     /// [`class_of`](ClassTable::class_of) is what keeps that from reading as "the
-    /// engine and the shell disagree about what is loaded".
+    /// runtime and the shell disagree about what is loaded".
     pub mask: u64,
     /// Node indices demanded in no class at all. A report, not a fault: a plan
     /// may legitimately compute something only a later revision will read, and
@@ -702,7 +702,7 @@ mod tests {
             ValueId((self.trace.values.len() - 1) as u32)
         }
 
-        /// A demand sink: something the driver binds, distinct per call.
+        /// A demand sink: something the engine binds, distinct per call.
         fn input(&mut self) -> ValueId {
             self.inputs += 1;
             let which = RuntimeInput::Mask {

@@ -51,7 +51,7 @@ geometry exposes. The attention-score eviction family — H2O, SnapKV, TOVA,
 Quest, RetrievalAttention — is not implementable today because `IntrinsicId`
 exposes logits, embeddings and geometry but no attention weights.
 
-The page CSR has to track the logical KV length exactly. The CUDA driver derives
+The page CSR has to track the logical KV length exactly. The CUDA engine derives
 `kv_len = (page_count - 1) * page_size + last_page_len` from the page CSR, not
 from the `KvLen` port, so the inferlet uses `page_count = ceil(kv_len / page_size)`
 instead of declaring the whole page pool. Over-declaring pages makes attention
@@ -62,5 +62,5 @@ read uninitialised KV and produces fluent garbage; this is contract 3 in
 
 ```bash
 cargo build --release --target wasm32-wasip2
-python tests/inferlets/run_all.py --driver cuda_native --model <model-path>
+python tests/inferlets/run_all.py --engine cuda_native --model <model-path>
 ```

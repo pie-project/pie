@@ -174,7 +174,7 @@ pub async fn dial_controller(addr: &str) -> Result<ControlClient> {
 
 /// Spawn the worker's three control-plane loops against `ctrl` (the dialed
 /// client or the in-proc adapter) and return their join handles, aborted on
-/// engine shutdown.
+/// runtime shutdown.
 ///
 /// - **heartbeat** every [`HEARTBEAT_INTERVAL`]; an [`Ack::ReRegister`] is fatal
 ///   because the controller may mint a new worker id and all gateway/partner
@@ -223,8 +223,8 @@ pub fn spawn_control_tasks<C: ControlLink>(
         loop {
             ticker.tick().await;
             let status = WorkerStatus {
-                kv_pressure_bucket: ::engine::store::kv_pressure_bucket(),
-                inflight: ::engine::inferlet::process::list()
+                kv_pressure_bucket: ::runtime::store::kv_pressure_bucket(),
+                inflight: ::runtime::inferlet::process::list()
                     .len()
                     .min(u32::MAX as usize) as u32,
             };

@@ -1,7 +1,7 @@
 /// A contract stored next to the test that compiles it.
 ///
 /// The families these exercise — GPT-OSS's native MXFP4 expert groups,
-/// Nemotron-H's packed experts, Kimi's MLA joins — are authored by the driver
+/// Nemotron-H's packed experts, Kimi's MLA joins — are authored by the engine
 /// now, so there is no function in this crate that could rebuild one. That is
 /// the point: what these tests are about is the *plan* the compiler produces
 /// for a contract shaped like that, and the contract is an input like any
@@ -90,7 +90,7 @@ fn metal_qwen35_schema_emits_canonical_affine_u4_arena() {
     };
     // The MLX schema states 4-bit weights that the checkpoint packs eight to a
     // u32 word: a bitcast to the logical shape and an affine-U4 encoding, with
-    // the scales and biases named as the tensors they are. The driver authors
+    // the scales and biases named as the tensors they are. The engine authors
     // this; the test states it directly, because what is under test here is the
     // arena the compiler builds from it, not who wrote it down.
     let affine_u4 = |group_size: u32| {
@@ -418,7 +418,7 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
     // 64 payload + 4 exponents, read once. If the encode had gone back to the
     // checkpoint rather than reading what the decode wrote, this would be more.
     assert_eq!(plan.memory.checkpoint_read_bytes, 68);
-    // `Finalize` is what puts a name in the driver's bind table, and an
+    // `Finalize` is what puts a name in the engine's bind table, and an
     // internal declaration gets none. Asserted on the instruction rather than
     // on `plan.tensors`, which lists internal declarations too so a kernel can
     // know their type.
@@ -502,7 +502,7 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
         // A target claiming the native MXFP4 GEMM is claiming the Marlin
         // repack that builds its operand. `CUDA_TILE_MAP_MASK` used to carry
         // `Repack` for every CUDA target and so this pairing was implicit; it
-        // is stated now, because no driver in this tree sets the flag and a
+        // is stated now, because no engine in this tree sets the flag and a
         // mask claiming a kernel nothing implements refused nothing.
         tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK | model_loader::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
@@ -563,7 +563,7 @@ fn a_repack_declaration_is_checked_against_its_transform() {
         // A target claiming the native MXFP4 GEMM is claiming the Marlin
         // repack that builds its operand. `CUDA_TILE_MAP_MASK` used to carry
         // `Repack` for every CUDA target and so this pairing was implicit; it
-        // is stated now, because no driver in this tree sets the flag and a
+        // is stated now, because no engine in this tree sets the flag and a
         // mask claiming a kernel nothing implements refused nothing.
         tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK | model_loader::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
@@ -601,7 +601,7 @@ fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
         // A target claiming the native MXFP4 GEMM is claiming the Marlin
         // repack that builds its operand. `CUDA_TILE_MAP_MASK` used to carry
         // `Repack` for every CUDA target and so this pairing was implicit; it
-        // is stated now, because no driver in this tree sets the flag and a
+        // is stated now, because no engine in this tree sets the flag and a
         // mask claiming a kernel nothing implements refused nothing.
         tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK | model_loader::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
@@ -640,7 +640,7 @@ fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
 ///
 /// The old contract carried `source_row_offset: 64` -- `rank * local` for rank
 /// one -- as an integer inside the spec, so the *contract* was valid for
-/// exactly one rank and the driver had to re-author it per rank. Flipping the
+/// exactly one rank and the engine had to re-author it per rank. Flipping the
 /// target's rank then changed exactly one line of the plan: the recorded
 /// `tp_rank`. Every read offset was identical.
 ///
@@ -867,7 +867,7 @@ fn a_contract_whose_declared_shape_is_wrong_is_rejected() {
 /// contiguous run.
 ///
 /// Nemotron-H's Mamba mixer depends on this for every band of its fused
-/// `in_proj`. The driver used to shard those on the host after the load, which
+/// `in_proj`. The engine used to shard those on the host after the load, which
 /// is how the rule ended up restated as a hand-written divisibility check.
 #[test]
 fn a_head_boundary_shard_is_one_contiguous_run() {
@@ -1136,7 +1136,7 @@ fn mxfp4(channel_axis: u8) -> QuantSpec {
     }
 }
 
-/// The dequantization a driver used to do by hand, said as one declaration.
+/// The dequantization an engine used to do by hand, said as one declaration.
 ///
 /// `factors` names the tensor holding the exponents, and is the whole point:
 /// the payload and its factors are paired by a name the contract already
@@ -1384,7 +1384,7 @@ fn a_scale_by_one_factor_per_element_is_rejected() {
 /// Scaling by an expression, rather than by a tensor some contract published,
 /// is refused — and refused with the fix in the message.
 ///
-/// The restriction is what keeps one copy of the factors: a driver reads them
+/// The restriction is what keeps one copy of the factors: an engine reads them
 /// anyway, so the contract that publishes them is the one that should say what
 /// they are.
 #[test]
@@ -1995,7 +1995,7 @@ fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
 ///
 /// DeepSeek-V4 pairs FP8-E4M3 weights with OCP Microscaling E8M0 scales --
 /// a combination `QuantScheme::Mxfp4E2M1E8M0` cannot name, because that symbol
-/// bundles the element format together with the scale format. The driver used
+/// bundles the element format together with the scale format. The engine used
 /// to bridge the gap by copying the scales to the host and running `ldexpf`
 /// over them at bind time.
 ///
@@ -2050,7 +2050,7 @@ fn an_e8m0_block_scale_read_as_fp32_lowers_to_a_cast() {
 
 // ── quant attachments ──────────────────────────────────
 //
-// A quantized weight and its scales are two runtime tensors, and the driver has
+// A quantized weight and its scales are two runtime tensors, and the engine has
 // to know they belong together. The loader used to work that out after the fact,
 // by matching `_scale_inv` / `.scale` suffixes over the finished tensor table
 // with the group size hardcoded to 128 beside them, in
@@ -2068,7 +2068,7 @@ fn scale_target() -> StorageTarget {
 }
 
 /// The MXFP4 GEMM asserts its scale operand is U8, so a plan that asks the
-/// driver to expand these to F32 makes the kernel reject the load.
+/// engine to expand these to F32 makes the kernel reject the load.
 #[test]
 fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
     let metadata = CheckpointMetadata {
@@ -2103,7 +2103,7 @@ fn scales_the_loader_writes_while_encoding_mxfp4_stay_raw_e8m0() {
     // get wrong without anything noticing.
     assert_eq!(program.tensors[attach.tensor.0 as usize].name, "runtime.w");
     // `.scales`, THE ONE SPELLING. It was `_scale`, which nothing in this tree
-    // ever looked for: a driver binds an encoded plane out of the same table
+    // ever looked for: an engine binds an encoded plane out of the same table
     // as a shipped one, by name, and the name the model plane binds is
     // `<w>.scales`. See `ScaleLayout::for_encode`'s MXFP4 arm for the ruling.
     assert_eq!(
@@ -2212,7 +2212,7 @@ fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
 fn scales_named_for_a_weight_the_loader_quantizes_are_a_contract_error() {
     // The loader writes this weight's scales itself while encoding it, and
     // states that pairing. A contract that names a second set would attach
-    // quant metadata to one weight twice, which the driver discovers only at
+    // quant metadata to one weight twice, which the engine discovers only at
     // load time.
     let metadata = CheckpointMetadata {
         files: vec![CheckpointFile {
@@ -2352,7 +2352,7 @@ fn scales_may_name_a_tensor_declared_after_them() {
 
 /// A quantized weight without its scales is not a smaller weight, it is an
 /// unreadable one. Each of these used to compile, publish exactly one tensor,
-/// and hand the driver an encoding whose scales did not exist.
+/// and hand the engine an encoding whose scales did not exist.
 fn encode_to(
     name: &str,
     shape: &[i64],
@@ -2399,7 +2399,7 @@ fn encode_to(
 /// checkpoint could not be compiled at all.
 ///
 /// The scales keep the payload's axes rather than the fold, because the plane
-/// a driver BINDS is bound at its declared rank -- `[experts, rows, cols/32]`
+/// an engine BINDS is bound at its declared rank -- `[experts, rows, cols/32]`
 /// is what `model_dsl`'s `Weight::planes` interns for it.
 #[test]
 fn a_rank_3_bank_encodes_and_its_scales_keep_the_expert_axis() {

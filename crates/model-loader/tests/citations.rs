@@ -241,7 +241,7 @@ fn every_cited_workspace_crate_exists() {
     const FAMILIES: &[&str] = &[
         "client-",
         "controller-",
-        "driver-",
+        "engine-",
         "kernels-",
         "model-",
         "tensor-",

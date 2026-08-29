@@ -176,7 +176,7 @@ impl Port {
 /// A SET of descriptor ports, as one word.
 ///
 /// **THE PORTS CAME HOME** (palo design §7, decision 19). This set used to be
-/// spelled `PIE_DEVICE_PORT_*` in `driver-api`: thirteen `u32` bit constants
+/// spelled `PIE_DEVICE_PORT_*` in `engine-api`: thirteen `u32` bit constants
 /// in a second, private numbering that agreed with [`Port`]'s wire tags
 /// nowhere — `PIE_DEVICE_PORT_PAGES` was bit 1 while [`Port::Pages`] is tag 3,
 /// and `EmbedIndptr` and `Readout` had no bit at all. Two numberings for one
@@ -291,7 +291,7 @@ impl PortMask {
 /// How much of a fire's geometry the device resolves for itself.
 ///
 /// Three points on one axis — how far the descriptor ports reach — and it came
-/// home with them (decision 19). It was `driver-api`'s `GeometryClass` beside
+/// home with them (decision 19). It was `engine-api`'s `GeometryClass` beside
 /// a `PIE_GEOMETRY_CLASS_*` triple of `u32`s that a `const` assertion held in
 /// step with it; here the classes ARE the port sets they name, and
 /// [`GeometryClass::ports`] is the one place the correspondence is written.
@@ -462,7 +462,7 @@ impl ModelProfile {
         self.kernels.iter().find(|k| k.name == name)
     }
 
-    /// A small test/dummy-driver profile.
+    /// A small test/dummy-engine profile.
     pub fn dummy() -> Self {
         ModelProfile {
             vocab: 32,

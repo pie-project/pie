@@ -29,7 +29,7 @@ namespace pie::linear {
 // adapterless row inside an adapter window (a lane that stated an id the
 // caller then cleared) costs one predicated load and a branch, which is the
 // cheapest honest answer there is. A fire with no adapter lane at all costs
-// less than that — `driver::fire::walk` skips the zero-row region and this
+// less than that — `engine::fire::walk` skips the zero-row region and this
 // kernel is never launched.
 //
 // `t` is read by every thread of the block at the same `rank` addresses, so it
@@ -55,7 +55,7 @@ namespace pie::linear {
 //
 // **THE GRID IS MAX-GRID PLUS EARLY EXIT** (decision #15). `z` is the segment
 // and its extent is the artifact's load-time bound on the segment count
-// (`driver::fire::max_runs`), not this fire's; `y` is the row within the
+// (`engine::fire::max_runs`), not this fire's; `y` is the row within the
 // segment and its extent is the longest segment. Both overshoot and both
 // return before reading anything, which is a handful of empty blocks against
 // a binary search per block or a host-side grid that moves per fire.

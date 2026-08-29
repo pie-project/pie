@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# TYPE-CHECK AND LINT `driver-metal`'s APPLE HALF ON A MACHINE WITH NO APPLE IN IT.
+# TYPE-CHECK AND LINT `engine-metal`'s APPLE HALF ON A MACHINE WITH NO APPLE IN IT.
 #
-# `driver-metal` splits behind a Cargo feature: without `metal-4` the crate is
+# `engine-metal` splits behind a Cargo feature: without `metal-4` the crate is
 # `baker/`, `layout/`, `model/` and `envelope/` -- the half that is a function
 # of a plan's numbers -- and with it, six more modules that name Metal types.
 # `src/lib.rs` turns the feature into a `compile_error!` off an Apple target,
-# so `cargo check -p driver-metal --all-targets` on a Linux box compiles the
+# so `cargo check -p engine-metal --all-targets` on a Linux box compiles the
 # portable half and CANNOT SEE the other one.
 #
 # That is not a theoretical gap. It hid a four-argument `model::produce`
 # called with two for the whole of Q6 through Q11, plus twenty-nine more
 # errors across `serve/`, `bind/` and `fire/`, plus nine device test targets
-# still naming `driver_metal::lowering`, `model_compiler::lower` and
+# still naming `engine_metal::lowering`, `model_compiler::lower` and
 # `model::shared::llama_like` -- every one of them deleted at P5, in the same
 # commit that wrote the gated half. The crate's own manifest argues for the
 # feature over a `cfg` on the grounds that "a platform cfg cannot be tested. A
@@ -77,7 +77,7 @@ fi
 # library still built, and a check of the library alone would report them
 # green forever. It is also what compiles the `#[cfg(test)]` modules inside
 # `src/`, which a plain `cargo check` does not.
-exec cargo clippy --no-deps -p driver-metal \
+exec cargo clippy --no-deps -p engine-metal \
     --features metal-4 \
     --target "$TARGET" \
     --all-targets \

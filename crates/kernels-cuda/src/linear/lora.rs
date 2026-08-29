@@ -62,7 +62,7 @@ const WAIST: &str = "linear.lora.waist";
 /// the combine can skip the foreign rows standing between them.
 ///
 /// WHY THE BOUND IS SEPARATE FROM THE COUNT. `count` is this fire's; `cap` is
-/// the artifact's (`driver::fire::max_runs`), and it is what the grid's `z`
+/// the artifact's (`engine::fire::max_runs`), and it is what the grid's `z`
 /// extent is sized at so that the grid does not move with the composition. The
 /// blocks between the two return immediately (decision #15: max-grid plus
 /// early exit, because the shell cannot rebind a captured launch's extent —
@@ -101,7 +101,7 @@ pub struct Segments {
 /// foreign rows in the gaps as well. That is correct rather than merely
 /// harmless: those rows belong to classes OUTSIDE the correction's window, the
 /// shell refuses a lane that carries an adapter against a word that does not
-/// route (`driver_cuda::Fault::AdapterWord`), so their route is `-1` and the
+/// route (`engine_cuda::Fault::AdapterWord`), so their route is `-1` and the
 /// select writes them a zero row — which the combine then never reads,
 /// because no segment names them. The cost is real and it is the price of not
 /// teaching an MoE kernel about layout: one gather-free GEMV over the gap

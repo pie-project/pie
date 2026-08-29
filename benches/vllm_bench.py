@@ -636,7 +636,7 @@ def main() -> None:
             type=int,
             default=0,
             help="Exact KV block count. Paired with --block-size 16 this is "
-                 "the token-for-token match to pie's `total_pages` driver "
+                 "the token-for-token match to pie's `total_pages` engine "
                  "option, so both engines can be sized by the same budget "
                  "instead of by a calibrated memory fraction.",
         )

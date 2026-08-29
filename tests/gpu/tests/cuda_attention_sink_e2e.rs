@@ -1,4 +1,4 @@
-//! A4 mask-migration DEVICE e2e — real driver. Second exercise of the
+//! A4 mask-migration DEVICE e2e — real engine. Second exercise of the
 //! token-at-a-time, B=1 explicit-write PTIR geometry the A4 mask inferlets
 //! migrated onto (superseding the classic `forward-pass` +
 //! `attention_mask(list<brle>)` surface). The `attention-sink` inferlet drives a
@@ -10,7 +10,7 @@
 //!
 //!   guest sink-decode program
 //!     → runtime device-geometry submit (PageLease grants, run-ahead FIFO)
-//!     → driver descriptor resolver (`resolve_descriptors` → `FireGeometry`)
+//!     → engine descriptor resolver (`resolve_descriptors` → `FireGeometry`)
 //!     → B2 explicit-KV-write (`launch_write_kv_explicit_bf16` honoring
 //!       WSlot/WOff — the single sequence's append cell written in place)
 //!     → attention under the packed dense sink+window mask
@@ -19,10 +19,10 @@
 //! This is the INTEGRATION gate for the sink+window variant of the A4 mask
 //! geometry: the mask admits KV position j iff (j <= p) AND (j < sink OR
 //! j + window > p) — the initial sink tokens plus the most recent `window`. It
-//! reuses the SAME driver path the beam-designb + sliding-window e2es proved,
+//! reuses the SAME engine path the beam-designb + sliding-window e2es proved,
 //! at B=1 with a compound sink+window mask.
 //!
-//!   cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//!   cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!     --test cuda_attention_sink_e2e -- --ignored --nocapture
 
 mod common;
@@ -34,12 +34,12 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "BLOCKED, and not on hardware: `driver-cuda` advertises \
+#[ignore = "BLOCKED, and not on hardware: `engine-cuda` advertises \
             `GeometryClass::DecodeEnvelope`, whose port set is `EmbedTokens | \
             Positions | KvLen`; `Port::AttnMask` is in no `PortMask` any class \
             denotes, so the mask this guest puts on every fire is a port no \
             shell in this tree resolves"]
-async fn attention_sink_on_real_driver() -> Result<()> {
+async fn attention_sink_on_real_engine() -> Result<()> {
     common::init_trace();
     let pie = common::boot_cuda().await?;
     eprintln!(

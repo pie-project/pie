@@ -3,14 +3,14 @@
 //! Defines the uniform interface every engine implements and the
 //! register → transfer → complete lifecycle vocabulary. Engines (`local`,
 //! `nixl`) plug in behind the [`Engine`] trait; the [`crate::registry`] binds a
-//! driver-exported handle to one and dispatches.
+//! engine-exported handle to one and dispatches.
 //!
 //! The KV handle the data plane consumes lives on the schema floor
-//! ([`driver_api::KvHandle`]) — transport never owns or interprets the
+//! ([`engine_api::KvHandle`]) — transport never owns or interprets the
 //! bytes, it only moves pages between workers.
 
 use crate::error::Result;
-use driver_api::KvHandle;
+use engine_api::KvHandle;
 
 /// Worker identity on the data plane — re-exported from the interface leaf.
 ///
@@ -71,7 +71,7 @@ pub enum EngineKind {
     Nixl,
 }
 
-/// A driver-exported handle bound to an engine — the output of
+/// An engine-exported handle bound to a transfer engine — the output of
 /// [`Engine::register`]. Carries the engine tag and owning worker so the
 /// registry can route subsequent `send`/`recv`/`poll` calls.
 #[derive(Debug, Clone)]
@@ -92,7 +92,7 @@ impl RegisteredHandle {
         self.owner
     }
 
-    /// The underlying driver-exported handle.
+    /// The underlying engine-exported handle.
     pub fn handle(&self) -> &KvHandle {
         &self.handle
     }
@@ -129,8 +129,8 @@ pub trait Engine {
     /// The engine kind this implementation provides.
     fn kind(&self) -> EngineKind;
 
-    /// Register a driver-exported handle owned by `owner` so this engine can
-    /// move its pages.
+    /// Register an engine-exported handle owned by `owner` so this transfer
+    /// engine can move its pages.
     fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle>;
 
     /// Start sending `pages` of `handle` to worker `dst`. Async — returns a

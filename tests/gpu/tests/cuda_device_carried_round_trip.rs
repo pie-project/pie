@@ -9,7 +9,7 @@
 //! channel the `embed` port reads and never tells the host. Against the old
 //! shell that fire was refused by name (`EmbedTokens is not host-derivable`);
 //! against this one the shell reads the token off the ring the epilogue wrote
-//! (`driver_cuda::program::ports`).
+//! (`engine_cuda::program::ports`).
 //!
 //! # Why `token-healing`, of all the device-carried fixtures
 //!
@@ -40,7 +40,7 @@
 //!    `cuda_serve_round_trip` pins for the host-carried fixture and what
 //!    `cuda_boot_smoke` and `serve_smoke` pin one and two layers below that.
 //! 3. **The token never reached the host.**
-//!    `engine::driver::envelopes_resolved()` counts the one thing that
+//!    `runtime::engine::envelopes_resolved()` counts the one thing that
 //!    HAPPENS when a round trip does not: an envelope read off a device ring
 //!    in front of the walk. One per decode fire, counted per launch.
 //!
@@ -51,7 +51,7 @@
 //!
 //! # It used to be two binaries with one launch each, and that was a bug
 //!
-//! The runtime's rule is one boot per process (the driver grabs the device,
+//! The runtime's rule is one boot per process (the engine grabs the device,
 //! `auth` panics on a second boot), and `cuda_runahead_depth1` is still its
 //! own binary for that reason: it boots at `frame_size = 1` and a boot is
 //! not a launch parameter.
@@ -65,14 +65,14 @@
 //! the capital of"`, then `" France is France is France is France is"`, at
 //! zero envelopes. That was not a property of launching twice. It was
 //! `qwen35`'s eighteen GDN layers reading the previous launch's recurrent
-//! bank, because nothing on the engine's path cleared a slot a fresh
-//! sequence took — fixed in `driver_cuda::serve`, gated by
+//! bank, because nothing on the runtime's path cleared a slot a fresh
+//! sequence took — fixed in `engine_cuda::serve`, gated by
 //! `cuda_launch_isolation`, and the two arms below are the collapse of the
 //! routing-around.
 //!
 //! Run:
 //! ```text
-//! cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//! cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!   --test cuda_device_carried_round_trip -- --ignored --nocapture
 //! ```
 
@@ -148,7 +148,7 @@ async fn a_device_carried_decode_says_what_the_host_carried_one_says() -> Result
         .context("add_program token-healing")?;
 
     // ── ARM 1: the corpus claim, and it runs first on purpose ────────────
-    let before = engine::driver::envelopes_resolved();
+    let before = runtime::engine::envelopes_resolved();
     let input = serde_json::json!({
         "prompt": common::SERVING_PROMPT,
         "max_tokens": CORPUS_TOKENS,
@@ -162,7 +162,7 @@ async fn a_device_carried_decode_says_what_the_host_carried_one_says() -> Result
         .wait_for_return()
         .await
         .context("wait_for_return naive-baseline")?;
-    let envelopes = engine::driver::envelopes_resolved() - before;
+    let envelopes = runtime::engine::envelopes_resolved() - before;
 
     let parsed: serde_json::Value = serde_json::from_str(&out).context("the return is JSON")?;
     let text = parsed["text"].as_str().unwrap_or_default();
@@ -182,7 +182,7 @@ async fn a_device_carried_decode_says_what_the_host_carried_one_says() -> Result
     );
 
     // ── ARM 2: the identity claim, through a slot arm 1 already used ─────
-    let before = engine::driver::envelopes_resolved();
+    let before = runtime::engine::envelopes_resolved();
     let started = Instant::now();
     let input = serde_json::json!({
         "prompt": common::SERVING_PROMPT,
@@ -202,7 +202,7 @@ async fn a_device_carried_decode_says_what_the_host_carried_one_says() -> Result
         .await
         .context("wait_for_return token-healing")?;
     let elapsed = started.elapsed();
-    let envelopes = engine::driver::envelopes_resolved() - before;
+    let envelopes = runtime::engine::envelopes_resolved() - before;
 
     let parsed: serde_json::Value = serde_json::from_str(&out).context("the return is JSON")?;
     let text = parsed["text"].as_str().unwrap_or_default();

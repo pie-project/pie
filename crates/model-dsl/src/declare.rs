@@ -40,7 +40,7 @@ impl Weight {
     /// The checkpoint does not publish this plane. It is reserved at load from
     /// the shape declared here, zeroed — and a zeroed low-rank `A` is the
     /// identity correction, so every unwritten row of the bank is the base
-    /// model — and filled a row at a time by `Driver::register_adapter`, which
+    /// model — and filled a row at a time by `Engine::register_adapter`, which
     /// is a pool write and a table row and NOT a recapture: the graph key is
     /// the fire's composition and a bank's contents are not in it.
     ///

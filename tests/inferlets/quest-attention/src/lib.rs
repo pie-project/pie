@@ -23,7 +23,7 @@
 //! ## What the backend does under `intrinsics::kernel::envelope_dot`
 //!
 //! The call lowers to `Op::KernelCall{name:"envelope_dot"}`, which the CUDA
-//! driver binds to a second-party kernel only when the model reports the
+//! engine binds to a second-party kernel only when the model reports the
 //! `has_kv_envelopes` capability (native bf16 NHD pages, a post-rope query
 //! family, and `tp == 1`). The kernel reads the *runtime* post-rope query row
 //! for the lane, so the `p_max` argument declares only the score width; there
@@ -83,8 +83,8 @@ struct Input {
     /// the per-step cost identical. Defaults to `max_tokens`.
     #[serde(default)]
     reserve_tokens: Option<usize>,
-    /// Prefill chunk width, clamped to the driver's `max_embed_length()`.
-    /// Defaults to that limit, i.e. the fewest chunks the driver allows.
+    /// Prefill chunk width, clamped to the engine's `max_embed_length()`.
+    /// Defaults to that limit, i.e. the fewest chunks the engine allows.
     ///
     /// Concatenating the chunks has to equal the one-shot fire, and the only
     /// decisive way to check that is to run the same prompt at two chunk
@@ -130,9 +130,9 @@ struct Output {
     /// KV page size, so a test can convert token counts into page counts.
     page_size: u32,
     /// The fire's `kv_len` at the last decode step — i.e. the KV length the
-    /// driver derives its slot boundaries from. Reported so a test can predict
+    /// engine derives its slot boundaries from. Reported so a test can predict
     /// `pages_finite` / `pages_pinned` / `pages_absent` by independent host
-    /// arithmetic instead of asserting on whatever the driver happened to say.
+    /// arithmetic instead of asserting on whatever the engine happened to say.
     kv_len_last: u32,
     page_budget: u32,
     /// Layers whose envelope tap actually fired, counted on-device.
@@ -202,9 +202,9 @@ async fn main(input: Input) -> Result<Output> {
     // is zero), so the bound is `+inf` everywhere and carries no information.
     //
     // The prompt is split into `ceil(n / C)` chunks, `C = max_embed_length()`
-    // -- the driver's structural per-launch token capacity. Quest exists for
+    // -- the engine's structural per-launch token capacity. Quest exists for
     // long contexts, so a one-shot prefill is the wrong shape for it: on this
-    // CUDA driver C is 8192, which put a hard ceiling on the context Quest
+    // CUDA engine C is 8192, which put a hard ceiling on the context Quest
     // could ever be run at, well below the range where it pays for itself.
     //
     // Chunk `i` attends over the whole prefix written so far (`kv_len` is

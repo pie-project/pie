@@ -123,7 +123,7 @@ pub struct StorageTarget {
     pub native_mxfp4_moe: bool,
     /// Which fused transform chains the backend has kernels for.
     ///
-    /// A capability, not a preference: the driver both knows whether the fused
+    /// A capability, not a preference: the engine both knows whether the fused
     /// kernels are built and owns the opt-out that used to be
     /// `PIE_CUDA_DISABLE_FUSED_TRANSCODE`. Reading it here rather than in the
     /// executor is what makes the choice part of the plan, and therefore part
@@ -150,17 +150,17 @@ pub struct StorageTarget {
 impl StorageTarget {
     /// The target a backend asks for, stated once.
     ///
-    /// Four sites used to write this literal — both drivers, `pie model build`
+    /// Four sites used to write this literal — both engines, `pie model build`
     /// and `pie model import` — and every one of them repeated `256`, `64 MiB`
     /// and `BF16`. Repetition was not the worst of it: each also restated the
-    /// backend's `tile_map_mask`, so a driver and
+    /// backend's `tile_map_mask`, so an engine and
     /// [`passes::tile`](crate::plan::passes::tile) each held an opinion about
     /// which transforms that device implements, and a test compared the two
     /// instead of there being one.
     ///
     /// The mask comes from [`passes::tile::tile_map_mask`], which is the
     /// loader's model of the backend and now the only statement of it. That
-    /// inverts the old rule — the driver was the authority and the loader
+    /// inverts the old rule — the engine was the authority and the loader
     /// checked it — and the reason is that the loader is where the consequence
     /// lands: it decides which plans compile, and it owns the host fallback
     /// every claimed transform has to have.
@@ -185,7 +185,7 @@ impl StorageTarget {
             // FALSE, and the name is the trap. `native_mxfp4_moe` does not mean
             // "reads MXFP4"; it means "has a native MXFP4 *GEMM*", which in
             // gpt-oss's contract selects a Marlin REPACK of the expert banks —
-            // work this tree did not port. A driver whose GEMM reads the stored
+            // work this tree did not port. An engine whose GEMM reads the stored
             // banks directly wants the other branch, which is this one.
             native_mxfp4_moe: false,
             // No fused transcode kernels in this tree.
@@ -282,7 +282,7 @@ impl BufferDecl {
 ///
 /// `SourceTensorDecl::file_id` indexes this table. Before it existed, the table
 /// was an *unwritten* contract: the loader enumerated the shards one way and
-/// the driver re-enumerated them another, and nothing checked that the two
+/// the engine re-enumerated them another, and nothing checked that the two
 /// agreed on which file index 3 was. Both sides sorted, so they did agree — but
 /// by coincidence of two implementations, not by construction
 /// (`architecture.md` §6).
@@ -312,7 +312,7 @@ pub struct SourceTensorDecl {
 
 /// A quantized tensor and the tensor holding its scales.
 ///
-/// The two are separate runtime tensors — the driver materializes both and then
+/// The two are separate runtime tensors — the engine materializes both and then
 /// has to know they belong together in order to attach the quant metadata its
 /// kernels read.
 ///
@@ -400,10 +400,10 @@ impl TileMapKind {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TileSpec {
     pub max_tile_bytes: u64,
-    /// Rows of the output the driver transforms per launch; `0` means the whole
+    /// Rows of the output the engine transforms per launch; `0` means the whole
     /// tensor in one pass.
     ///
-    /// A *decision*, unlike `max_tile_bytes`, which is only a budget. The driver
+    /// A *decision*, unlike `max_tile_bytes`, which is only a budget. The engine
     /// used to turn the budget into a row count while executing
     /// (`transcode_engine.hpp::encode_rows_per_tile`), which left the plan
     /// silent about how it would actually run. Filled in by
@@ -598,7 +598,7 @@ pub struct LoadPlan {
 /// One plan, `arity` instances, differing only in which bytes they read.
 ///
 /// See [`plan::group`](crate::plan::group) for what that sentence is worth and
-/// how it is proved. The driver decides what a group is *for*; the plan only
+/// how it is proved. The engine decides what a group is *for*; the plan only
 /// says the instances are substitutable and where each one's bytes live.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupPlan {
@@ -608,7 +608,7 @@ pub struct GroupPlan {
     ///
     /// A whole [`LoadPlan`] rather than a bare instruction list: an instance is
     /// a self-contained load, with its own buffers and its own memory
-    /// accounting, and the driver runs it with the executor it already has.
+    /// accounting, and the engine runs it with the executor it already has.
     pub plan: LoadPlan,
     /// `bindings[i]` is what instance `i` reads instead of what
     /// [`plan`](Self::plan) says. Indexed by instance, then by the
@@ -663,10 +663,10 @@ impl LoadPlan {
     ///
     /// The plan's own tensor list is the only opinion that cannot be wrong in
     /// a way the binding survives, so it is the one every family follows. It
-    /// It is a method here rather than a helper in a driver because a driver
+    /// It is a method here rather than a helper in an engine because an engine
     /// asking the question had to spell `shared_embedding.weight` to ask it
     /// — a name four contract authors in `crates/model` produce and no
-    /// driver owns. See [`TIED_EMBEDDING_NAME`] for what this does and does
+    /// engine owns. See [`TIED_EMBEDDING_NAME`] for what this does and does
     /// not close.
     #[must_use]
     pub fn ties_embeddings(&self) -> bool {
@@ -693,7 +693,7 @@ impl LoadPlan {
     /// produced NaNs from the first routed projection of layer 0 onward while
     /// every structural gate passed.
     ///
-    /// A driver computing this itself has to match on `Encoding::Quant` and
+    /// An engine computing this itself has to match on `Encoding::Quant` and
     /// on the `QuantScheme` variant — two of this crate's enums, read
     /// structurally, in a crate that should be reading answers.
     #[must_use]
@@ -727,7 +727,7 @@ impl LoadPlan {
     /// fluent model answering wrongly, measured at cosine 0.84 against the
     /// reference logits.
     ///
-    /// A driver cannot see this. It is handed the checkpoint's
+    /// An engine cannot see this. It is handed the checkpoint's
     /// `config.json` point — ONE `(group, bits)` — and builds one kernel
     /// set from it, so a second point in the tensors is read at the first
     /// and nothing anywhere says so. The plan is where the per-tensor
@@ -771,7 +771,7 @@ impl LoadPlan {
     /// Every affine tensor's point, by name.
     ///
     /// [`Self::affine_point_of`] answers one name in a scan of the whole
-    /// declaration list; a driver that must answer several — and that must
+    /// declaration list; an engine that must answer several — and that must
     /// not read [`Encoding`] and [`QuantScheme`] structurally to do it, which
     /// is the coupling `mxfp4_tensor_names` exists to avoid — takes the map
     /// once and asks it.
@@ -795,9 +795,9 @@ impl LoadPlan {
 
     /// The affine point ONE named tensor arrives at, if it is affine.
     ///
-    /// The by-name form of [`Self::affine_points`], for a driver that must
+    /// The by-name form of [`Self::affine_points`], for an engine that must
     /// know not just how many points a checkpoint holds but WHICH tensor
-    /// holds which. `driver-metal` puts two names to this — the expert bank
+    /// holds which. `engine-metal` puts two names to this — the expert bank
     /// and the router gate — and a checkpoint that answers a third point for
     /// anything else is one it refuses.
     ///
@@ -845,7 +845,7 @@ impl LoadPlan {
 /// do — `llama_3`, `qwen_3` and `gemma_4` each `format!` it — and the
 /// dependency runs `model` → `model-loader`, so nothing links their spelling
 /// to this one. A constant here does not fix that; what it fixes is the
-/// smaller thing, that a **driver** asking whether a plan ties its
+/// smaller thing, that a **engine** asking whether a plan ties its
 /// embeddings no longer has to spell the name to find out.
 ///
 /// The larger gap is real and stays open: rename the tied tensor in those
@@ -894,7 +894,7 @@ mod plan_query_tests {
     ///
     /// `mlx_lm` does this deliberately: the gate is a small tensor whose
     /// error the WHOLE mixture inherits, so it is published at 8 bits
-    /// inside a 4-bit stack. A driver handed one `(group, bits)` off
+    /// inside a 4-bit stack. An engine handed one `(group, bits)` off
     /// `config.json` reads it at 4 and the mixture routes each token to
     /// almost the right experts — cosine 0.84 against the reference
     /// logits, and not one NaN to notice it by.
@@ -948,7 +948,7 @@ mod plan_query_tests {
             .push(decl("layer.0.norm.weight", Encoding::Raw(DType::BF16)));
         assert_eq!(plan.affine_points(), vec![(64, 4), (64, 8)]);
 
-        // AND WHICH TENSOR MADE IT SO. The count above says a driver cannot
+        // AND WHICH TENSOR MADE IT SO. The count above says an engine cannot
         // serve this checkpoint; only the witness says the obstacle is the
         // router gate, which is the sentence that names the next piece of
         // work rather than ending the conversation.

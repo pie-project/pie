@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Sweep this driver's per-device crossovers and print a `tuning_for()` block.
+"""Sweep this engine's per-device crossovers and print a `tuning_for()` block.
 
-Every crossover in `crates/driver-metal/csrc/src/device_tuning.hpp` was measured on one
+Every crossover in `crates/engine-metal/csrc/src/device_tuning.hpp` was measured on one
 machine. The file's rule is that a default-constructed `DeviceTuning`
 reproduces those numbers exactly and a new device gets an override carrying
 its own measurement -- which means somebody has to run the measurement, and
@@ -19,7 +19,7 @@ tok/s and the script called it "keeps the default", which reads like a
 measurement and is not one. Same for `qmm_min_batch` at 16 rows and for all
 three MoE knobs at the row counts first chosen here.
 
-So this does not take a row count on faith. Each knob carries the driver's
+So this does not take a row count on faith. Each knob carries the engine's
 own rule as a predicate, and the script picks the batch: it walks candidate
 row counts until it finds one where the settings provably choose DIFFERENT
 paths, prints what each arm decides there, and refuses to sweep a knob whose
@@ -37,7 +37,7 @@ The rest of the method:
   * MEDIANS, every run printed, and a winner declared only when the gap
     between arms clears the noise WITHIN them.
 
-Rules mirrored from the driver -- `qmm_bn`/`qmm_bn_unsplit` and
+Rules mirrored from the engine -- `qmm_bn`/`qmm_bn_unsplit` and
 `sdpa_should_tile` in model/qwen3_5/decode_dispatch_mb.hpp, `moe_should_batch`
 and `moe_tile_rows` in model/shared_kernels.hpp. If those move, `--control`
 is what notices.
@@ -90,7 +90,7 @@ class Model:
                      tuple(sorted(w for w in widths if w > 0)))
 
 
-# Each rule returns what the driver would CHOOSE for a setting at a batch.
+# Each rule returns what the engine would CHOOSE for a setting at a batch.
 # Two settings diverge exactly when their choices differ.
 
 def rule_always(value: int, rows: int, m: Model):
@@ -182,7 +182,7 @@ class Knob:
                         # them, which is the standard the M2 entry in
                         # `device_tuning.hpp` was already held to and the
                         # script was not
-    rule: Callable      # what the driver chooses, for finding a batch that splits
+    rule: Callable      # what the engine chooses, for finding a batch that splits
     why: str
     rows: list[int] = field(default_factory=list)  # batches to consider
 
@@ -204,7 +204,7 @@ class Knob:
 # that owns them, and a knob whose first candidate is not the default is a hard
 # error rather than a footnote.
 _TUNING_HPP = (Path(__file__).resolve().parent.parent
-               / "crates/driver-metal/csrc/src/device_tuning.hpp")
+               / "crates/engine-metal/csrc/src/device_tuning.hpp")
 
 
 def header_defaults() -> dict[str, int]:
@@ -520,7 +520,7 @@ def main() -> int:
         print("provably diverge, nothing beat the M1 numbers by more than the runs")
         print("moved on their own.")
         return 0
-    print("Paste into `tuning_for()` in crates/driver-metal/csrc/src/device_tuning.cpp, under")
+    print("Paste into `tuning_for()` in crates/engine-metal/csrc/src/device_tuning.cpp, under")
     print("the case for this device's family, WITH the runs above as the comment.")
     print("A value without its measurement is the thing that file exists to stop.\n")
     for field_name, value in chosen.items():

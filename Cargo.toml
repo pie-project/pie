@@ -22,7 +22,7 @@ members = [
     # /metrics, signal/panic/exit lifecycle. Depends on no role lib. Also ships
     # the `pie-env` diagnostic bin ("do this role's boot preconditions hold").
     "crates/bootstrap",
-    "crates/engine",
+    "crates/runtime",
     # Role libraries (pure libs: run(Config) -> Handle; no bin, never dep each other).
     "crates/controller",
     "crates/gateway",
@@ -43,8 +43,8 @@ members = [
     # dep each other and bidirectional pairs would cycle.
     #
     # `-abi` was the other suffix, for the repr(C) FFI contract, and no crate
-    # carries it any more: every driver on the far side is Rust, so the
-    # marshalling shapes went. `driver-api` kept the shape of one for a while
+    # carries it any more: every engine on the far side is Rust, so the
+    # marshalling shapes went. `engine-api` kept the shape of one for a while
     # after the C++ left -- an `i32` status ladder, an ABI version on an
     # in-process call, `u8` tag constants re-spelling `tensor-ir`'s vocabulary
     # -- and the palo rewrite (design §7) deleted the last of it. It is owned
@@ -53,23 +53,23 @@ members = [
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
-    "crates/driver-api",
+    "crates/engine-api",
 
-    # -- driver-*: execution shells ----------------------------------------
+    # -- engine-*: execution shells ----------------------------------------
     # The PTIR channel plane, shared by both Rust shells. It was `src/pipeline/`
-    # inside `driver-metal` until the CUDA shell reached the same file, and
+    # inside `engine-metal` until the CUDA shell reached the same file, and
     # the move cost nothing because not one line of it named a Metal type --
     # the directory already built and tested on Linux while the crate around it
-    # did not. A `default-member`, unlike every driver below it: it needs no
+    # did not. A `default-member`, unlike every engine below it: it needs no
     # GPU, no toolkit and no OS, so there is no reason a workspace sweep should
     # not carry its tests.
-    "crates/driver",
+    "crates/engine",
 
     # -- model-*: what a model IS, and how it gets onto a device ------------
     # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
-    # drivers at cold start, not by the serving runtime. One crate: the drivers
+    # engines at cold start, not by the serving runtime. One crate: the engines
     # link the rlib and pass Rust types, and a device's arena crosses as an
-    # `ArenaBacking` rather than as a second executor inside each driver.
+    # `ArenaBacking` rather than as a second executor inside each engine.
     "crates/model-loader",
 
     # -- tensor-*: the guest-program toolchain ------------------------------
@@ -94,7 +94,7 @@ members = [
     # names. Layering: model-ir is a leaf of pure data; kernels is the
     # dispatch contract; kernels-* are entry functions with no IR knowledge;
     # kernels also carries the one walk written over that contract;
-    # driver-* own the Run.
+    # engine-* own the Run.
     # The IR: typed op enums, Def x Ty value declarations, the validator.
     "crates/model-ir",
     # The authoring surface: Recorder/Value, wrappers that own their shapes.
@@ -113,15 +113,15 @@ members = [
     # Pure Metal kernel definitions over the encode sink.
     "crates/kernels-metal",
     # The CUDA Run: one resolver, host-twin geometry, plan staging.
-    "crates/driver-cuda",
+    "crates/engine-cuda",
     # The Metal Run over dyn Encode -- OS-portable like the walk it uses.
-    "crates/driver-metal",
+    "crates/engine-metal",
 
     # -- Rust that lives outside crates/ on purpose -------------------------
     # The python SDK's backend: pyo3/maturin want the Rust half beside its
     # product, not in the workspace tree.
     "sdk/server/python",
-    # The engine's on-device end-to-end suite. No code of its own; it exists so
+    # The runtime's on-device end-to-end suite. No code of its own; it exists so
     # that `cargo test -p pie` means the CLI's own tests rather than
     # "compile thirty GPU test binaries". Almost everything in it is `#[ignore]`d
     # and asks for a real device.
@@ -132,7 +132,7 @@ members = [
 # host target and would fail the sweep it is not part of.
 default-members = [
     "crates/bootstrap",
-    "crates/engine",
+    "crates/runtime",
     "crates/controller",
     "crates/gateway",
     "crates/worker",
@@ -145,8 +145,8 @@ default-members = [
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
-    "crates/driver-api",
-    "crates/driver",
+    "crates/engine-api",
+    "crates/engine",
     # The three shader drivers stood here through R2's quarantine and are out
     # of the workspace altogether now — see `exclude`.
     "crates/model",
@@ -166,8 +166,8 @@ default-members = [
     "tests/gpu",
 ]
 exclude = [
-    # ALL THREE SHADER PLANES ARE IN THE WORKSPACE NOW. `driver-metal` came
-    # back at P5a, `driver-wgpu` at P5b and `driver-vulkan` at P5c; this list
+    # ALL THREE SHADER PLANES ARE IN THE WORKSPACE NOW. `engine-metal` came
+    # back at P5a, `engine-wgpu` at P5b and `engine-vulkan` at P5c; this list
     # held the last of them for the whole of the quarantine and holds none.
     "tests/inferlets",
     # Worktree checkouts under .claude/worktrees/ must never be captured by
@@ -221,26 +221,26 @@ name = "pie-worker"
 path = "src/bin/pie-worker.rs"
 
 [features]
-# This package selects the driver backend; it forwards the flavors to the
+# This package selects the engine backend; it forwards the flavors to the
 # embedded worker. Default = none, and none means none: the always-linked
 # `Dummy` flavor that used to catch a featureless build went with its crate,
 # so `pie config init` refuses rather than writing a config naming it. Enable
-# driver-cuda-12 / driver-cuda-13 for real inference.
+# engine-cuda-12 / engine-cuda-13 for real inference.
 default = []
 # NVIDIA. The number is the CUDA runtime ABI the binary will LOAD, and it is
 # in the name because this is the last package in the chain -- the one that
 # actually produces a binary, and so the one where guessing is unrecoverable.
-# `driver-cuda` STOOD HERE and meant `cuda-13` silently; the release workflow
-# built six `cuda12.8`-labelled artifacts through it. See `crates/engine`.
-_driver-cuda = ["worker/_driver-cuda"]
-driver-cuda-12 = ["_driver-cuda", "worker/driver-cuda-12"]
-driver-cuda-13 = ["_driver-cuda", "worker/driver-cuda-13"]
+# `engine-cuda` STOOD HERE and meant `cuda-13` silently; the release workflow
+# built six `cuda12.8`-labelled artifacts through it. See `crates/runtime`.
+_engine-cuda = ["worker/_engine-cuda"]
+engine-cuda-12 = ["_engine-cuda", "worker/engine-cuda-12"]
+engine-cuda-13 = ["_engine-cuda", "worker/engine-cuda-13"]
 # BACK, forwarding to `worker`. No ABI in the name because Metal has none to
-# choose: `driver-metal/metal-4` is the device half's gate and the version it
+# choose: `engine-metal/metal-4` is the device half's gate and the version it
 # states. Apple-only, and the seam that reads it says so with a target cfg
 # rather than this flag -- so a non-Apple build with the feature on is a build
 # with no metal seam in it, not a link error.
-driver-metal = ["worker/driver-metal"]
+engine-metal = ["worker/engine-metal"]
 # Probe passthroughs to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]
 
@@ -252,7 +252,7 @@ bootstrap = { path = "crates/bootstrap" }
 controller = { path = "crates/controller" }
 gateway = { path = "crates/gateway" }
 worker = { path = "crates/worker", default-features = false }
-engine = { path = "crates/engine" }  # program/manifest types for `pie inferlet`
+runtime = { path = "crates/runtime" }  # program/manifest types for `pie inferlet`
 # `pie model import` — the host-side load-plan executor and checkpoint
 # writer. Pure Rust; needs no driver and no GPU.
 model-loader = { path = "crates/model-loader" }
@@ -271,10 +271,10 @@ client = { path = "crates/client" }
 # `snapshot::Snapshot` and `identify` to answer "can pie serve this?". M18/M19
 # deleted all three names, and their replacements are not in that crate. The
 # object name lives with its readers in `worker::weights`; the identity
-# question is `engine::driver::load::identify`, which compiles each SKU's load
+# question is `runtime::engine::load::identify`, which compiles each SKU's load
 # contract against the checkpoint rather than matching tensor names — a name
 # match cannot tell a 3B Qwen from a 0.8B one, which is measured. This package
-# links `worker` and `engine` already, so the edge went with the names.
+# links `worker` and `runtime` already, so the edge went with the names.
 # Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
 # GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
 # the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.
@@ -367,7 +367,7 @@ rust-version = "1.91"
 # linker is asked for, and the wasm object format offers no such facility, so
 # `linkme` refuses the target by name: "distributed_slice is not implemented
 # for this platform" (dtolnay/linkme#86 -- not an omission, a missing
-# primitive). `driver-wgpu/tests/browser.rs` claims the kernel table reaches a
+# primitive). `engine-wgpu/tests/browser.rs` claims the kernel table reaches a
 # browser, so a plane with no table there would be that claim quietly ending.
 linkme = "0.3"
 # THE SAME REGISTRY, FOR WASM ONLY. `inventory` collects by running a
@@ -447,11 +447,11 @@ print_stderr = "deny"
 #
 # NO `panic = "abort"`. It was here, and it was quietly deleting behaviour
 # this tree goes to some length to provide: three `catch_unwind` barriers
-# turn a panic into an answer rather than a dead process -- the driver lane
-# in `engine::scheduler::worker` (which drains and fails the requests behind
+# turn a panic into an answer rather than a dead process -- the engine lane
+# in `runtime::scheduler::worker` (which drains and fails the requests behind
 # a poisoned lane instead of leaving a frame in flight, after one was
 # measured stalled for 7030s), and the two C ABI seams in
-# `driver_cuda::serve::guard` and `pie_wake`, whose whole documented purpose
+# `engine_cuda::serve::guard` and `pie_wake`, whose whole documented purpose
 # is that an operator gets a message naming the entry point "instead of a
 # bare SIGABRT". Under `abort` every one of them is dead code and the
 # shipped binary does exactly what those comments say it must not.

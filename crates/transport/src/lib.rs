@@ -14,7 +14,7 @@
 //! engines/
 //!     local/  same-node device-to-device copy (co-located PD, zero network)
 //!     nixl/   cross-node RDMA/TCP/NVMe via NIXL  [feature = "nixl", deferred]
-//! registry/   binds a driver-exported handle to an engine, dispatches
+//! registry/   binds an engine-exported handle to a transfer engine, dispatches
 //! ```
 //!
 //! **Minimal start = `core` + `local`.** Co-located prefill+decode defers all
@@ -25,18 +25,18 @@
 //!
 //! # Boundaries
 //!
-//!   * **↔driver (handle boundary):** the driver pins its KV buffers and exports
-//!     a [`driver_api::KvHandle`]; transport consumes it without owning or
+//!   * **↔engine (handle boundary):** the engine pins its KV buffers and exports
+//!     a [`engine_api::KvHandle`]; transport consumes it without owning or
 //!     interpreting the bytes. The per-backend registration shim lives on the
-//!     driver's export surface. Transport never imports the driver — they meet
+//!     engine's export surface. Transport never imports the engine — they meet
 //!     only through the handle type on the schema floor.
 //!   * **↔controller:** receives a pairing decision and executes it. No routing
 //!     or scheduling here.
 //!   * **↔runtime:** transfers are async — transport exposes the start and a
 //!     completion signal ([`Completion`]); *when* to await is the scheduler's
 //!     job.
-//!   * **↔interface/driver:** the KV layout and handle type live in
-//!     [`driver`], shared by driver / transport / runtime / controller.
+//!   * **↔interface/engine:** the KV layout and handle type live in
+//!     [`engine_api`], shared by engine / transport / runtime / controller.
 
 pub mod core;
 pub mod engines;
@@ -53,10 +53,10 @@ pub use error::{Result, TransportError};
 pub use registry::Registry;
 
 // `KvDtype` is gone: a cache row's element type is the model's, and
-// `driver-api` names `model_ir::Dtype` for it now (palo decision 18). The
+// `engine-api` names `model_ir::Dtype` for it now (palo decision 18). The
 // re-export follows, so `transport::Dtype` is what `transport::KvDtype` was.
-pub use driver_api::{KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
-pub use driver_api::model_ir::Dtype;
+pub use engine_api::{KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};
+pub use engine_api::model_ir::Dtype;
 
 #[cfg(test)]
 mod tests {

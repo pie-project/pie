@@ -3,7 +3,7 @@
 These mirror the Rust `crate::config::*` types in `worker/src/config.rs`
 field-for-field. Each dataclass serializes itself to TOML (via
 `Config.to_toml()`); the resulting string is what the pyo3 layer
-hands to `serve::start_engine`. The same TOML the `pie serve --config`
+hands to `serve::start_runtime`. The same TOML the `pie serve --config`
 binary consumes — single source of truth on the Rust side.
 
 Fields default to `None` so we don't have to mirror Rust defaults here;
@@ -16,7 +16,7 @@ serialization — handled by `Server.__aenter__` before TOML-ifying.
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -30,8 +30,11 @@ class ServerConfig:
     port: Optional[int] = None
     verbose: Optional[bool] = None
     registry: Optional[str] = None
-    max_concurrent_processes: Optional[int] = None
-    python_snapshot: Optional[bool] = None
+    # How the PROCESS is sized. These used to sit in the old `[runtime]`
+    # because that was where tuning went; they size the server, so they are
+    # the server's.
+    worker_threads: Optional[int] = None
+    max_upload_mb: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -46,40 +49,11 @@ class TelemetryConfig:
 
 
 # ---------------------------------------------------------------------------
-# [runtime]
+# [runtime] — batching and timeouts
 # ---------------------------------------------------------------------------
 
 @dataclass
 class RuntimeConfig:
-    worker_threads: Optional[int] = None
-    wasm_max_instances: Optional[int] = None
-    wasm_max_memory_mb: Optional[int] = None
-    wasm_warm_memory_mb: Optional[int] = None
-    wasm_warm_slots: Optional[int] = None
-    allow_fs: Optional[bool] = None
-    fs_scratch_dir: Optional[str] = None
-    allow_network: Optional[bool] = None
-    network_allowed_hosts: Optional[list[str]] = None
-    max_upload_mb: Optional[int] = None
-
-
-# ---------------------------------------------------------------------------
-# [model] / [model.driver] / [model.scheduler]
-# ---------------------------------------------------------------------------
-
-@dataclass
-class DriverConfig:
-    """`[model.driver]` — `type` is required, others have Rust defaults."""
-    type: str = "dev"
-    device: list[str] = field(default_factory=list)
-    tensor_parallel_size: Optional[int] = None
-    activation_dtype: Optional[str] = None
-    random_seed: Optional[int] = None
-    options: dict = field(default_factory=dict)
-
-
-@dataclass
-class SchedulerConfig:
     request_timeout_secs: Optional[int] = None
     speculation_depth: Optional[int] = None
     # Frame geometry. Absent means the engine's own defaults, which is what
@@ -93,28 +67,73 @@ class SchedulerConfig:
     frame_dispatch_depth: Optional[int] = None
     # Durations are written with their unit ("50ms", "120s").
     submit_deadline: Optional[str] = None
+    # Admission is scheduling, so it sits with the batching knobs rather than
+    # with the server that happens to run them.
+    max_concurrent_processes: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# [sandbox] — the box an inferlet runs in: its walls, and its size
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SandboxConfig:
+    # No `wasm_` prefix: the section already says which box these size.
+    max_instances: Optional[int] = None
+    max_memory_mb: Optional[int] = None
+    warm_memory_mb: Optional[int] = None
+    warm_slots: Optional[int] = None
+    allow_fs: Optional[bool] = None
+    fs_scratch_dir: Optional[str] = None
+    allow_network: Optional[bool] = None
+    network_allowed_hosts: Optional[list[str]] = None
+    python_snapshot: Optional[bool] = None
+
+
+# ---------------------------------------------------------------------------
+# [model] / [model.engine]
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EngineConfig:
+    """`[model.engine]` — `type` is required, others have Rust defaults."""
+    type: str = "dev"
+    device: list[str] = field(default_factory=list)
+    tensor_parallel_size: Optional[int] = None
+    activation_dtype: Optional[str] = None
+    random_seed: Optional[int] = None
+    # How many KV pages a shell opens with. `None` is the backend's own
+    # default, which is what every ordinary run wants.
+    #
+    # It sits with the rest of the KV geometry (`kv_page_size`,
+    # `kv_cache_dtype`, `swap_pool_size`, `cpu_pages`) because it is one
+    # decision with them, and because `engine-vulkan` and `engine-wgpu` both
+    # take it. A boot key no config object can express is reachable only by
+    # hand-writing TOML, which means the harnesses that would most want it
+    # cannot ask.
+    #
+    # What wants it is a SMALL number. Two defects in `engine-vulkan`'s
+    # elastic pool were found by running the curated sweep and both lived in
+    # the growth path, which the default of 1024 pages barely enters; a sweep
+    # run at a handful of pages exercises it on every request.
+    kv_pages: Optional[int] = None
+    # Stated once for every engine rather than per backend: what "ready" and
+    # "shut down" mean is a property of the launch, not of the hardware.
+    # Durations carry their unit ("600s").
+    ready_timeout: Optional[str] = None
+    shutdown_timeout: Optional[str] = None
+    options: dict = field(default_factory=dict)
 
 
 @dataclass
 class ModelConfig:
     name: str = "default"
     hf_repo: str = ""
-    driver: DriverConfig = field(default_factory=DriverConfig)
-    scheduler: Optional[SchedulerConfig] = None
-    # How many KV pages a shell opens with. `None` is the backend's own
-    # default, which is what every ordinary run wants.
-    #
-    # It is here because `[model] kv_pages` is a key two backends already read
-    # -- `driver-vulkan` and `driver-wgpu` both take it, and both document it
-    # in those words -- and this emitter could not write it. A boot key no
-    # config object can express is reachable only by hand-writing TOML, which
-    # means the harnesses that would most want it cannot ask.
-    #
-    # What wants it is a SMALL number. Two defects in `driver-vulkan`'s
-    # elastic pool were found by running the curated sweep and both lived in
-    # the growth path, which the default of 1024 pages barely enters; a sweep
-    # run at a handful of pages exercises it on every request.
-    kv_pages: Optional[int] = None
+    # What the CHECKPOINT holds, which is a model fact. `activation_dtype`
+    # and `kv_cache_dtype` stay on the engine because they are what the
+    # engine computes and stores in.
+    weight_dtype: Optional[str] = None
+    engine: EngineConfig = field(default_factory=EngineConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +145,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
 
     def _emit_worker_tables(self, buf, prefix: str) -> None:
@@ -138,28 +158,27 @@ class Config:
         _emit_table(buf, f"{prefix}server", _block(self.server))
         _emit_table(buf, f"{prefix}telemetry", _block(self.telemetry))
         _emit_table(buf, f"{prefix}runtime", _block(self.runtime))
+        _emit_table(buf, f"{prefix}sandbox", _block(self.sandbox))
         m = self.model
         buf.write(f"\n[{prefix}model]\n")
         _emit_kv(buf, "name", m.name)
-        _emit_kv(buf, "hf_repo", m.hf_repo)
-        if m.kv_pages is not None:
-            _emit_kv(buf, "kv_pages", m.kv_pages)
-        _emit_table(buf, f"{prefix}model.driver", _driver_block(m.driver),
+        # `model`, not `hf_repo`: the field is spelled `model` internally and
+        # this emitter feeds the internal deserializer directly.
+        _emit_kv(buf, "model", m.hf_repo)
+        if m.weight_dtype is not None:
+            _emit_kv(buf, "weight_dtype", m.weight_dtype)
+        _emit_table(buf, f"{prefix}model.engine", _engine_block(m.engine),
                     leading_newline=True)
-        if m.driver.options:
-            buf.write(f"\n[{prefix}model.driver.options]\n")
-            for k, v in m.driver.options.items():
+        if m.engine.options:
+            buf.write(f"\n[{prefix}model.engine.options]\n")
+            for k, v in m.engine.options.items():
                 _emit_kv(buf, k, v)
-        if m.scheduler is not None:
-            _emit_table(buf, f"{prefix}model.scheduler", _block(m.scheduler),
-                        leading_newline=True)
 
     def to_engine_toml(self) -> str:
         """Serialize to the FLAT document the embedded engine parses.
 
         `pie._engine.bootstrap` deserializes straight into the worker's own
-        `ServeConfig`, which knows nothing about roles — it rejects a
-        `[controller]` or `[worker]` table outright. The embedded wheel is
+        `ServeConfig`, which knows nothing about roles. The embedded wheel is
         always single-node and IS the worker, so there is no role to select.
         """
         buf = io.StringIO()
@@ -175,36 +194,32 @@ class Config:
 
             [server]   where it listens, what it fetches from, what it reports
             [model]    which weights
-            [driver]   which hardware, and every knob that hardware has
+            [engine]   which hardware, and every knob that hardware has
             [runtime]  batching and timeouts
             [sandbox]  what an inferlet may do, and how big it may get
             [cluster]  distributed only; absent for single-node
 
-        `[controller]`, `[gateway]` and `[worker]` are retired and now rejected
-        outright (`config_layout::reshape`), as are `[model.driver]` and
-        `[model.scheduler]`. That is why this cannot just prefix the internal
-        tables the way `to_engine_toml` does: the embedded engine deserializes
-        the INTERNAL spelling, and only this method speaks the file's.
+        Only three things move between the two shapes now: telemetry folds
+        into `[server]`, `[engine]` is `[model.engine]` flattened together
+        with the options the engine's own struct takes, and `hf_repo` is
+        written under its current name. `[runtime]` and `[sandbox]` are the
+        same keys in the same sections either way.
 
         `[auth]` has no counterpart here or in `to_engine_toml`: the section
-        was retired on the Rust side, which now rejects a config carrying it
-        (`worker/src/config.rs::rejects_legacy_auth_section`), so emitting it
-        made every embedded-engine boot fail with "unknown field `auth`".
+        is not part of the config, so emitting it made every embedded-engine
+        boot fail with "unknown field `auth`".
         """
         server: dict = {}
-        runtime: dict = {}
-        sandbox: dict = {}
 
         def put(table: dict, key: str, value) -> None:
             if value is not None:
                 table[key] = value
 
         s = self.server
-        for name in ("host", "port", "verbose", "registry", "python_snapshot"):
+        for name in ("host", "port", "verbose", "registry"):
             put(server, name, getattr(s, name))
-        # Admission is scheduling, so it sits in `[runtime]` in the file even
-        # though it is a `ServerConfig` field internally.
-        put(runtime, "max_concurrent_processes", s.max_concurrent_processes)
+        put(server, "worker_threads", s.worker_threads)
+        put(server, "max_upload", _mib(s.max_upload_mb))
 
         # Observability is three keys that belong with the process emitting
         # them rather than in a section of their own.
@@ -213,46 +228,30 @@ class Config:
         put(server, "otlp_endpoint", t.endpoint)
         put(server, "service_name", t.service_name)
 
-        # `[runtime]` internally is the sandbox: the box an inferlet runs in.
-        # The `wasm_` prefix drops off, since the section already says which
-        # box these size, and the `_mb` fields become size strings.
-        r = self.runtime
-        put(server, "worker_threads", r.worker_threads)
-        put(server, "max_upload", _mib(r.max_upload_mb))
-        put(sandbox, "max_instances", r.wasm_max_instances)
-        put(sandbox, "max_memory", _mib(r.wasm_max_memory_mb))
-        put(sandbox, "warm_memory", _mib(r.wasm_warm_memory_mb))
-        put(sandbox, "warm_slots", r.wasm_warm_slots)
-        for name in ("allow_fs", "fs_scratch_dir", "allow_network",
-                     "network_allowed_hosts"):
-            put(sandbox, name, getattr(r, name))
+        # `_block` does the unit work: `*_mb` and `*_secs` fields carry
+        # COUNTS and the file spells the same knobs as size and duration
+        # STRINGS under the bare stem.
+        runtime = _block(self.runtime)
+        sandbox = _block(self.sandbox)
 
         m = self.model
         model: dict = {"name": m.name, "model": m.hf_repo}
+        put(model, "weight_dtype", m.weight_dtype)
 
-        # `[model.driver.options]` was four levels deep; the section is now
-        # split by NAME, so the common keys and the driver's own knobs sit
-        # side by side in one `[driver]`.
-        driver = _driver_block(m.driver)
-        for key, value in m.driver.options.items():
-            if key in driver:
+        # The section is split by NAME rather than by nesting, so the common
+        # keys and the engine's own knobs sit side by side in one `[engine]`.
+        engine = _engine_block(m.engine)
+        for key, value in m.engine.options.items():
+            if key in engine:
                 raise ValueError(
-                    f"driver option {key!r} collides with a common [driver] key"
+                    f"engine option {key!r} collides with a common [engine] key"
                 )
-            driver[key] = value
-
-        if m.scheduler is not None:
-            sch = m.scheduler
-            put(runtime, "request_timeout", _secs(sch.request_timeout_secs))
-            for f in fields(sch):
-                if f.name in ("request_timeout_secs",):
-                    continue
-                put(runtime, f.name, getattr(sch, f.name))
+            engine[key] = value
 
         buf = io.StringIO()
         _emit_table(buf, "server", server)
         _emit_table(buf, "model", model, leading_newline=True)
-        _emit_table(buf, "driver", driver, leading_newline=True)
+        _emit_table(buf, "engine", engine, leading_newline=True)
         _emit_table(buf, "runtime", runtime, leading_newline=True)
         _emit_table(buf, "sandbox", sandbox, leading_newline=True)
         return buf.getvalue().lstrip("\n")
@@ -271,10 +270,10 @@ def _block(obj) -> dict:
 
     `*_mb` / `*_secs` fields carry COUNTS, while every schema this feeds
     spells the same knob as a size/duration STRING under the bare stem
-    (`wasm_warm_memory_mb=64` -> `wasm_warm_memory="64MiB"`). `to_engine_toml`
+    (`warm_memory_mb=64` -> `warm_memory="64MiB"`). `to_engine_toml`
     has always converted them; this emitter did not, so any `_mb` field set
     through the embedded path was rejected by the engine as an unknown key.
-    `wasm_warm_slots` hid it — it is the one sized-sounding knob whose name
+    `warm_slots` hid it — it is the one sized-sounding knob whose name
     has no suffix, so it was the only one anybody had reason to set.
     """
     from dataclasses import fields, is_dataclass
@@ -304,14 +303,17 @@ def _secs(value: Optional[int]) -> Optional[str]:
     return None if value is None else f"{value}s"
 
 
-def _driver_block(d: DriverConfig) -> dict:
-    """`[model.driver]` block — skip `options` (it goes in its own
+def _engine_block(d: EngineConfig) -> dict:
+    """`[model.engine]` block — skip `options` (it goes in its own
     sub-table) and never None-suppress `type`/`device` (they're required)."""
     out = {"type": d.type, "device": d.device}
     for name in (
         "tensor_parallel_size",
         "activation_dtype",
         "random_seed",
+        "kv_pages",
+        "ready_timeout",
+        "shutdown_timeout",
     ):
         v = getattr(d, name)
         if v is not None:

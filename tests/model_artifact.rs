@@ -2,14 +2,14 @@
 //!
 //! `import` on an F32 snapshot exercises the streaming executor and the disk
 //! spool from the side they exist for: the decoded set is the whole model,
-//! and the artifact must hold the BF16 the engine reads.
+//! and the artifact must hold the BF16 the runtime reads.
 //!
 //! `build_materializes_the_serve_contract` and
 //! `a_built_artifact_still_identifies_as_the_row_it_was_built_from` STOOD
 //! HERE. Both exercised `pie model build`, which authored a
 //! `model_legacy::contract` and materialized it offline; R3 deleted the
 //! command with the contract, so their subject is gone. Nothing replaces
-//! them, and that is the point: a driver produces its weights from the
+//! them, and that is the point: an engine produces its weights from the
 //! checkpoint through the SKU's own import table at load, so there is no
 //! offline rewrite left to prove anything about.
 //!

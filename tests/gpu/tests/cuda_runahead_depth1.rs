@@ -28,7 +28,7 @@
 //! here would be a claim about this box, and the claim that survives the box
 //! is the one above it — the tokens do not change.
 //!
-//! One boot per process, which is the runtime's own rule (the driver grabs
+//! One boot per process, which is the runtime's own rule (the engine grabs
 //! the device, `auth` panics on a second boot) — and a boot is what separates
 //! this file from `cuda_device_carried_round_trip`: `frame_size` is set in
 //! the config, so the two arms of the A/B cannot share a process however many
@@ -37,12 +37,12 @@
 //! It once said "one LAUNCH per process", for a second reason that turned out
 //! to be a bug rather than a rule: a second launch through one boot answered
 //! differently from the first. That was `qwen35`'s GDN layers reading the
-//! previous launch's recurrent bank — fixed in `driver_cuda::serve`, gated by
+//! previous launch's recurrent bank — fixed in `engine_cuda::serve`, gated by
 //! `cuda_launch_isolation` — and the twin's two arms are now one binary.
 //!
 //! Run:
 //! ```text
-//! cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//! cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!   --test cuda_runahead_depth1 -- --ignored --nocapture
 //! ```
 
@@ -95,7 +95,7 @@ async fn the_same_device_carried_decode_at_depth_one_says_the_same_thing() -> Re
         .await
         .context("add_program")?;
 
-    let before = engine::driver::envelopes_resolved();
+    let before = runtime::engine::envelopes_resolved();
     let started = Instant::now();
     let input = serde_json::json!({
         "prompt": common::SERVING_PROMPT,
@@ -109,7 +109,7 @@ async fn the_same_device_carried_decode_at_depth_one_says_the_same_thing() -> Re
         .context("launch")?;
     let out = proc.wait_for_return().await.context("wait_for_return")?;
     let elapsed = started.elapsed();
-    let envelopes = engine::driver::envelopes_resolved() - before;
+    let envelopes = runtime::engine::envelopes_resolved() - before;
 
     let parsed: serde_json::Value = serde_json::from_str(&out).context("the return is JSON")?;
     let text = parsed["text"].as_str().unwrap_or_default();

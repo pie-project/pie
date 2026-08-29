@@ -1,4 +1,4 @@
-//! Shutdown helpers for [`super::EngineHandle`].
+//! Shutdown helpers for [`super::RuntimeHandle`].
 
 /// Wait for SIGTERM (and SIGTERM only — SIGINT lives on
 /// `tokio::signal::ctrl_c`). Returns once a SIGTERM is observed.

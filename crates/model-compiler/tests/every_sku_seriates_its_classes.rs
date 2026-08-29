@@ -31,7 +31,7 @@
 //! What has not changed:
 //!
 //! - **the promise is kept** — every constrained mask P4 SEATED is an interval
-//!   of the order the driver will actually be handed, which is
+//!   of the order the engine will actually be handed, which is
 //!   [`ClassOrder::class_order`] and not the frontier read off the tree;
 //! - **the bake is a function of the plan** — same text, same order, twice.
 //!
@@ -196,7 +196,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
                 continue;
             };
 
-            // The order the driver is handed, not the one read off the tree.
+            // The order the engine is handed, not the one read off the tree.
             let order = compiled.order.class_order(everything, None);
             if order.len() != classes {
                 wrong.push(format!(
@@ -215,7 +215,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
             for mask in constraints(&compiled.regions, &compiled.classes) {
                 // **THE PROMISE IS ABOUT WHAT P4 SEATED**, and a withdrawn
                 // consumer is precisely the one it made no promise to — it got
-                // a `FallbackTable` row instead, and `driver::fire::walk`
+                // a `FallbackTable` row instead, and `engine::fire::walk`
                 // serves that row rather than reading a span it was never
                 // told to expect. Asking the question of a withdrawn mask
                 // would be asking P4 to keep a promise it declined to make.

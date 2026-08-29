@@ -930,7 +930,7 @@ pub fn pool_boundary_prefill(positions: &Value, row_valid: &Value, ratio: u32) -
 
 /// `dtype` is the pooled entries' element type — the wrapper has no data
 /// input to inherit it from, so the model states its activation dtype
-/// here, from its own declaration (`m.act`): no implicit driver state.
+/// here, from its own declaration (`m.act`): no implicit engine state.
 pub fn pool_gather(
     boundary_pos: &Value,
     boundary_req: &Value,

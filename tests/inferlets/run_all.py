@@ -3,7 +3,7 @@
 Usage::
 
     uv run python tests/inferlets/run_all.py --model Qwen/Qwen3-0.6B --device cuda:0
-    uv run python tests/inferlets/run_all.py --driver vulkan \
+    uv run python tests/inferlets/run_all.py --engine vulkan \
         --model mlx-community/Qwen3-0.6B-4bit
 """
 from conftest import run_tests

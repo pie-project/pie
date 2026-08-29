@@ -1,7 +1,7 @@
-//! Every region a plan declares reaches the CUDA driver as something it can
+//! Every region a plan declares reaches the CUDA engine as something it can
 //! launch — or this file says why it does not.
 //!
-//! The CUDA driver has no second path. It launches compiled `PIE_KERNEL_FUSED`
+//! The CUDA engine has no second path. It launches compiled `PIE_KERNEL_FUSED`
 //! kernels and nothing else: no tier-0 fallback for a generated region, no
 //! native implementation of any `RegionKind::Library`. So a region the emitter
 //! declines is a region that does not run, while the plan around it goes on
@@ -41,7 +41,7 @@ const REFUSED: &[(&str, &str)] = &[(
          — `top_k`, `sort_desc`, `cumsum`/`cumprod`, `matmul`, a second-party \
          call. The generic emitter would fall back to `ptir_m1_execute`, whose \
          single-threaded forms are O(len^2) or worse and do not return at a \
-         real vocabulary, so refusing is the honest answer and the driver now \
+         real vocabulary, so refusing is the honest answer and the engine now \
          reports it at load rather than skipping it.",
 )];
 
@@ -104,7 +104,7 @@ fn every_planned_region_emits_or_is_named_here() {
     assert!(
         holes.is_empty(),
         "these regions are planned but not emitted, and nothing in `REFUSED` \
-         covers them. The CUDA driver launches compiled regions and nothing \
+         covers them. The CUDA engine launches compiled regions and nothing \
          else, so each of these is work a plan expects to happen that will \
          not, leaving its results at the zeros `Prepared::build` wrote:\n  {}",
         holes.join("\n  ")

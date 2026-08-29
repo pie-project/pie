@@ -20,7 +20,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//! cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!   --test cuda_chat_completion_e2e -- --ignored --nocapture
 //! ```
 
@@ -34,7 +34,7 @@ use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "the chat-turn gate: needs a CUDA device and the Qwen3.5-0.8B snapshot"]
-async fn chat_completion_on_real_driver() -> Result<()> {
+async fn chat_completion_on_real_engine() -> Result<()> {
     common::init_trace();
     let pie = common::boot_cuda().await?;
     eprintln!(

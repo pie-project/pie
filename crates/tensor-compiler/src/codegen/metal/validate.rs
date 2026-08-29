@@ -42,7 +42,7 @@ pub(crate) fn is_library(region: &Region) -> bool {
 ///
 /// `ptir_m1_runtime.metal` handles op tag `0xA0` by reinterpreting its `a0`
 /// slot as `bfloat*` logits, and the only id it branches on is `MtpDrafts`.
-/// The driver (`m1_runtime.cpp`) likewise binds nothing but `logits_bf16` to
+/// The engine (`m1_runtime.cpp`) likewise binds nothing but `logits_bf16` to
 /// that buffer. Any other id therefore reads the logits rows *as if* they were
 /// the requested intrinsic: no fault, no bounds violation (`hidden()` is
 /// declared `[rows, vocab]`, so the length even matches), just the wrong
@@ -185,7 +185,7 @@ fn partition_valid(stage: &CompiledStage, partition: &RegionPartition) -> Result
 }
 
 /// `validate_singleton_plan` — accept a stage for the one-op-per-dispatch
-/// tier, returning the per-op metadata the driver dispatches from.
+/// tier, returning the per-op metadata the engine dispatches from.
 pub fn validate_singleton_plan(stage: &CompiledStage) -> Result<Vec<M1OpMeta>, EmitError> {
     let (operations, result) = validate_singleton_plan_partial(stage);
     result.map(|()| operations)

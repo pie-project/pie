@@ -2,7 +2,7 @@
 //!
 //! An entry never touches cudarc. It names a jit unit and an instantiation
 //! ([`Fire`]), marshals arguments ([`ArgValue`]), and hands both to the
-//! [`Ctx`] — the stream a driver `Run` wraps — which compiles the unit on
+//! [`Ctx`] — the stream an engine `Run` wraps — which compiles the unit on
 //! first use, caches the module, and enqueues the launch. Enqueue only,
 //! never sync (decision #15): a returned `Ok` means the launch is on the
 //! stream, not that it ran.
@@ -115,7 +115,7 @@ pub(crate) enum Fault {
     },
     /// A scratch slab asked to grow mid-capture. Growth frees and
     /// reallocates, which would poison the graph, so the fire is refused —
-    /// the driver's warm-before-capture pass is the fix (see
+    /// the engine's warm-before-capture pass is the fix (see
     /// [`Ctx::scratch`]).
     Unwarmed {
         name: &'static str,

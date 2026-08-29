@@ -2,7 +2,7 @@
 //! `cuda_native`.
 //!
 //! What it MEANT to prove: the inferlet hands the host raw encoded image bytes,
-//! the host runs the bound model's vision tower driver-side, scatters the
+//! the host runs the bound model's vision tower engine-side, scatters the
 //! projected soft-token rows into the hidden state, commits them as ordinary KV
 //! through the working-set forward txn, and a coherent text answer proves the
 //! spliced visual span actually conditioned generation.
@@ -32,20 +32,18 @@
 //! block lifts. A claim about hardware is worth exactly one measurement, and
 //! this one had none.
 //!
-//! # The four layers of config rot, in the order they surfaced
+//! # The three layers of config rot, in the order they surfaced
 //!
 //! Each hid the next; this file hand-rolls its own worker TOML instead of going
-//! through `common::cuda_toml_for`, so none of the migrations that kept the
-//! shared harness honest reached it.
+//! through `common::cuda_toml_for`, so nothing that kept the shared harness
+//! honest reached it.
 //!
-//!   1. `[model.driver] / [model.scheduler] are now [driver] and [runtime].`
-//!      The parser says this itself, which is the only reason it took one run.
-//!   2. The sandbox section is `[sandbox]`, and the driver's knobs are FLAT
-//!      under `[driver]` -- there is no nested `[model.driver.options]` table.
-//!   3. `invalid kv_cache_dtype "fp8"; expected one of: auto, bf16, bfloat16,
+//!   1. The sandbox section is `[sandbox]`, and the engine's knobs are FLAT
+//!      under `[engine]` -- there is no nested `[model.engine.options]` table.
+//!   2. `invalid kv_cache_dtype "fp8"; expected one of: auto, bf16, bfloat16,
 //!      fp8_e4m3, fp8_e5m2, ...` -- the dtype is spelled by its FORMAT, not by
-//!      its width. Moot now that the squeeze is gone, but it was layer three.
-//!   4. The bench image lives at the REPO root's `benches/assets`, not
+//!      its width. Moot now that the squeeze is gone, but it was layer two.
+//!   3. The bench image lives at the REPO root's `benches/assets`, not
 //!      `crates/benches/assets`. `CARGO_MANIFEST_DIR` is `crates/worker`, so it
 //!      is two hops up, not one. The one-hop form failed as "No such file or
 //!      directory", which reads like a missing asset rather than a wrong path.
@@ -67,7 +65,7 @@
 //! else -- there is no `Context` helper -- and `MULTIMODAL.md`, which every one
 //! of these comments pointed at, is no longer in the tree.
 //!
-//! The driver side is still there and still built: `kernels-cuda/kernels/vision`
+//! The engine side is still there and still built: `kernels-cuda/kernels/vision`
 //! holds `gemma4_vision.cuh` and `qwen3_vl_tower.cuh`. So the tower can run and
 //! nothing can ask it to. That is the ticket this file now carries, and it is a
 //! larger one than a missing fixture: restoring an image entry point on the
@@ -75,12 +73,12 @@
 //!
 //! # Running it
 //!
-//! Needs a multimodal model. `gemma-4-E4B` is the only driver-supported vision
+//! Needs a multimodal model. `gemma-4-E4B` is the only engine-supported vision
 //! checkpoint cached here (gemma3n has no vision forward). Snapshot overridable
 //! via `PIE_CUDA_TEST_MM_SNAPSHOT`. Use `--release`: a debug engine makes the
 //! host the entire cost on a model this size.
 //!
-//!   cargo test --release -p worker --features driver-cuda-13 \
+//!   cargo test --release -p worker --features engine-cuda-13 \
 //!       --test cuda_multimodal -- --ignored --nocapture
 //!
 //! It will boot, which is the part that works, and then fail on the missing
@@ -150,7 +148,7 @@ fn extract_u64(json: &str, field: &str) -> Option<u64> {
 /// Vision splice: encode a local image with the bound model's vision tower,
 /// splice the soft-token KV, then answer about it with ordinary text generation.
 #[test]
-#[ignore = "real-hardware, and CANNOT PASS on any GPU today: there is no image entry point on the forward interface -- forward.wit, forward-hybrid.wit and forward-recurrent.wit do not mention an image, and no `image-qa-bench` fixture survives to call one. media.wit and the driver-side vision towers are both intact, so the tower can run and nothing can ask it to. NOT VRAM: gemma-4-E4B boots on a 24 G 4090 in 43 s at the default 0.90 utilization -- measured, see this file's header, which the previous reason got wrong."]
+#[ignore = "real-hardware, and CANNOT PASS on any GPU today: there is no image entry point on the forward interface -- forward.wit, forward-hybrid.wit and forward-recurrent.wit do not mention an image, and no `image-qa-bench` fixture survives to call one. media.wit and the engine-side vision towers are both intact, so the tower can run and nothing can ask it to. NOT VRAM: gemma-4-E4B boots on a 24 G 4090 in 43 s at the default 0.90 utilization -- measured, see this file's header, which the previous reason got wrong."]
 fn cuda_native_image_splice_conditions_generation() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

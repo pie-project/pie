@@ -322,7 +322,7 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
                     // The kernel reads the factors out of memory, so they have
                     // to be a tensor that exists rather than an expression the
                     // multiply would have to evaluate on its way past. Declare
-                    // them -- `Visibility::Internal` if the driver has no use
+                    // them -- `Visibility::Internal` if the engine has no use
                     // for them -- and scale by that name.
                     if !matches!(by.as_ref(), Expr::Out(_)) {
                         return Err(Error::Contract(

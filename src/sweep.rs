@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 ///
 /// Only the three that `scheduler::reconfigure` can move. The memory-lattice
 /// knobs (`kv_page_size`, `max_forward_tokens`, `max_forward_requests`) are
-/// fixed at boot and belong to the driver's own sweep — see the plan's §6.
+/// fixed at boot and belong to the engine's own sweep — see the plan's §6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Knobs {
     pub frame_size: usize,
@@ -33,11 +33,36 @@ pub struct Knobs {
 }
 
 impl Knobs {
-    /// Steps the driver's upload staging pool sees. The bound this feeds is
-    /// `SchedulerConfig::validate`'s, and it is checked there rather than here
-    /// so the constant has one home.
+    /// The largest `frame_size` a deployment may state — `k` in the engine's
+    /// staging formula. Read from the formula's own module rather than
+    /// restated (article 8).
+    pub const MAX_FRAME_SIZE: usize = worker::config::Runahead::STEPS_MAX as usize;
+    /// The largest `frame_dispatch_depth` a deployment may state.
+    pub const MAX_DISPATCH_DEPTH: usize = worker::config::Runahead::MAX_FRAMES as usize;
+
+    /// Steps the engine has in flight at this shape — `frames × k`.
+    ///
+    /// **NO LONGER A BOUND, ONLY A DESCRIPTION** (alto F2b). It used to be
+    /// checked against a fixed staging pool of thirteen; the engine carves its
+    /// ring from `frames_in_flight` and `k` now, so what a candidate has to
+    /// clear is each factor's own ceiling and this is just how big the ring
+    /// will be.
     pub fn steps_in_flight(&self) -> usize {
         self.frame_size * self.dispatch_depth
+    }
+
+    /// How many staging slots the engine will carve for this shape.
+    pub fn staging_depth(&self) -> usize {
+        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).staging_depth()
+    }
+
+    /// Is this a shape `RuntimeConfig::validate` will admit?
+    pub fn admissible(&self) -> bool {
+        self.frame_size >= 1
+            && self.frame_size <= Self::MAX_FRAME_SIZE
+            && self.dispatch_depth >= 1
+            && self.dispatch_depth <= Self::MAX_DISPATCH_DEPTH
+            && self.submit_depth >= 2
     }
 }
 
@@ -88,7 +113,7 @@ impl Round {
     /// Is this candidate better than `other`, on `metric`, by more than the two
     /// of them can explain by noise?
     ///
-    /// The same rule the driver's own sweep uses after `fe8d85040`: combine the
+    /// The same rule the engine's own sweep uses after `fe8d85040`: combine the
     /// two candidates' spreads in quadrature and require the gap to clear it.
     /// Anything closer than that is a coin flip that will land the other way on
     /// the next run, and reporting it as a win is how a sweep produces
@@ -253,7 +278,7 @@ const MAX_WARMUP_ROUNDS: usize = 5;
 /// Set the knobs, run the load, report.
 ///
 /// Every lane connects fresh and retires before this returns, so the next call
-/// finds the engine idle and its `reconfigure` succeeds. A caller that leaves
+/// finds the runtime idle and its `reconfigure` succeeds. A caller that leaves
 /// guests running between rounds gets a refusal rather than a silently
 /// mis-attributed measurement, which is the intended failure.
 pub async fn measure(
@@ -302,7 +327,7 @@ pub async fn sweep_all(
 
     for pass in 0..repeats {
         for (index, knobs) in candidates.iter().enumerate() {
-            engine::scheduler::reconfigure(
+            runtime::scheduler::reconfigure(
                 knobs.frame_size,
                 knobs.submit_depth,
                 knobs.dispatch_depth,
@@ -337,15 +362,16 @@ pub async fn sweep_all(
         .collect())
 }
 
-/// Every knob combination worth measuring, given the driver's staging bound.
+/// Every knob combination worth measuring, given the engine's staging bound.
 ///
 /// Enumerated rather than searched, and the plan's §8 argues why: the feasible
 /// set is small, each point is seconds, and enumeration has no surrogate model
 /// to misfit or evaluation order to depend on. `steps_in_flight < staging_depth`
 /// is what makes it small — at a staging depth of 13 there are only a few dozen
 /// combinations, most of which the bound removes.
-pub fn candidates(staging_depth: usize) -> Vec<Knobs> {
+pub fn candidates() -> Vec<Knobs> {
     let mut groups: Vec<Vec<Knobs>> = Vec::new();
+    debug_assert!(4 <= Knobs::MAX_FRAME_SIZE && 4 <= Knobs::MAX_DISPATCH_DEPTH);
     for frame_size in [1usize, 2, 3, 4] {
         let mut group = Vec::new();
         for dispatch_depth in 1usize..=4 {
@@ -355,12 +381,16 @@ pub fn candidates(staging_depth: usize) -> Vec<Knobs> {
                 submit_depth: 2,
                 dispatch_depth,
             };
-            if shape.steps_in_flight() >= staging_depth {
-                continue;
-            }
+            // **THE BOUND IS PER FACTOR NOW** (alto F2b): the engine carves
+            // its staging ring from these two numbers rather than owning a
+            // fixed pool a product could overflow, so what a candidate has to
+            // clear is `frame_size <= STEPS_MAX` and
+            // `dispatch_depth <= MAX_FRAMES` — both of which the loops above
+            // already stay inside, which is why nothing is skipped here.
+            let _ = &shape;
             // `frame_submit_depth` must be at least 2 -- one frame runs while
             // the rest stay queued, and 1 leaves nothing queued. Its own field
-            // doc has the argument, and `SchedulerConfig::validate` enforces it.
+            // doc has the argument, and `RuntimeConfig::validate` enforces it.
             for submit_depth in 2usize..=6 {
                 group.push(Knobs {
                     frame_size,
@@ -393,17 +423,19 @@ pub fn candidates(staging_depth: usize) -> Vec<Knobs> {
 mod tests {
     use super::*;
 
+    /// **EVERY CANDIDATE IS ONE THE RUNTIME WILL ADMIT** (alto F2b).
+    ///
+    /// The old shape of this test was "no candidate exceeds the staging pool
+    /// of thirteen". There is no fixed pool any more — the engine carves the
+    /// ring from the candidate's own numbers — so what has to hold is that
+    /// every generated shape clears `RuntimeConfig::validate`'s two per-factor
+    /// bounds, which is the same property against the check that now exists.
     #[test]
-    fn the_staging_bound_removes_candidates_rather_than_the_engine_rejecting_them_later() {
-        // Generating a candidate the engine will refuse wastes a round and
-        // reports it as a failure, which is indistinguishable from a real one.
-        let candidates = candidates(13);
+    fn every_candidate_is_one_the_runtime_admits() {
+        let candidates = candidates();
         assert!(!candidates.is_empty());
         for knobs in &candidates {
-            assert!(
-                knobs.steps_in_flight() < 13,
-                "{knobs} would block on the staging pool"
-            );
+            assert!(knobs.admissible(), "{knobs} is a shape the runtime refuses");
             assert!(knobs.submit_depth >= 2, "{knobs} leaves nothing queued");
         }
     }
@@ -412,7 +444,7 @@ mod tests {
     fn a_budget_sees_every_frame_size_before_it_sees_a_second_of_any() {
         // A lexicographic list spent a budget of six entirely on k=1. The
         // report then ranked one axis and presented it as a sweep.
-        let candidates = candidates(13);
+        let candidates = candidates();
         let first_four: Vec<usize> = candidates.iter().take(4).map(|k| k.frame_size).collect();
         let mut distinct = first_four.clone();
         distinct.sort_unstable();
@@ -424,14 +456,18 @@ mod tests {
         );
     }
 
+    /// The ring a candidate asks the engine to carve is the formula's answer,
+    /// not a constant — and the deepest shape this sweep offers is one the
+    /// free-slot word can still hold.
     #[test]
-    fn a_narrower_staging_pool_narrows_the_search() {
-        // The bound is the driver's, so a driver with a different pool gets a
-        // different space rather than the same space and a runtime error.
-        let wide = candidates(13);
-        let narrow = candidates(5);
-        assert!(narrow.len() < wide.len());
-        assert!(narrow.iter().all(|k| k.steps_in_flight() < 5));
+    fn a_candidates_staging_depth_is_the_formula() {
+        for knobs in candidates() {
+            assert_eq!(
+                knobs.staging_depth(),
+                knobs.dispatch_depth * Knobs::MAX_FRAME_SIZE + 1
+            );
+            assert!(knobs.staging_depth() <= 64);
+        }
     }
 
     fn round(knobs: Knobs, tok_s: f64, rel_sigma: f64, failed: usize) -> Round {

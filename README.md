@@ -81,14 +81,14 @@ number in it is the CUDA runtime ABI the binary will load, which is why there
 is no version-less spelling to guess at:
 
 ```bash
-cargo build --release -p pie --bin pie --features driver-cuda-13
+cargo build --release -p pie --bin pie --features engine-cuda-13
 ```
 
-A binary built with no driver feature has nothing true to put in `[driver]`,
+A binary built with no engine feature has nothing true to put in `[engine]`,
 so `pie config init` says so instead of writing a config that will not parse.
 
 The Metal, Vulkan and WGPU planes are mid-migration. Their kernel tables are
-in the workspace and green; their drivers are not, and a config naming one is
+in the workspace and green; their engines are not, and a config naming one is
 told what happened at boot rather than falling back to something slower. They
 return when each has an executor for the compiled forward pass (P5).
 
@@ -97,13 +97,13 @@ return when each has an executor for the compiled forward pass (P5).
 | Directory | Description |
 |---|---|
 | `src/` | The `pie` CLI and the three role daemons — the invariant entry point |
-| `crates/engine/` | Inferlet runtime |
+| `crates/runtime/` | Inferlet runtime |
 | `crates/tensor-*/` | Tensor-program toolchain: authoring eDSL → PTIR → planning → CUDA/Metal codegen (+ the reference interpreter) |
 | `crates/model*/` | What a model is: the catalog, the authoring eDSL and its traced IR, the forward compiler, the checkpoint loader |
 | `crates/controller/` | Cluster-coordination control plane (pairing · roles · health) |
 | `crates/transport/` | Worker↔worker P2P KV-tensor data plane |
-| `crates/driver*/` | Backend drivers: the CUDA shell + the shared execution-shell substrate (the three shader shells are out of the workspace until P5) |
-| `crates/*-api` | Boundary contracts (`client` · `controller` · `worker` · `driver`) — the dependency floor |
+| `crates/engine*/` | Backend engines: the CUDA shell + the shared execution-shell substrate (the three shader shells are out of the workspace until P5) |
+| `crates/*-api` | Boundary contracts (`client` · `controller` · `worker` · `engine`) — the dependency floor |
 | `tests/inferlets/` | Curated inferlet E2E fixtures |
 | `sdk/inferlet/` | SDKs for programs that run ON pie (Python · JavaScript · tools) |
 | `sdk/client/` | SDKs for programs that CALL pie (Python · JavaScript) |

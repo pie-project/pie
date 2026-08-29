@@ -1,7 +1,7 @@
 //! The device fault-code space — every number a kernel can leave in
 //! `M1Status::fault` / `M3Status::fault`, declared once.
 //!
-//! Nothing decodes these: the drivers surface the number and a human reads it.
+//! Nothing decodes these: the engines surface the number and a human reads it.
 //! That is exactly why they were worth naming — an undecoded diagnostic has no
 //! test that fails when two conditions start reporting the same value, so the
 //! only protection is that the space is written down and checked.
@@ -39,7 +39,7 @@
 
 /// One named region of the fault space.
 ///
-/// `Copy` and the comparison traits are derived because the drivers re-export
+/// `Copy` and the comparison traits are derived because the engines re-export
 /// this rather than restating it, and a decoder walks the table by value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FaultClass {

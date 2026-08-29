@@ -27,7 +27,7 @@ export interface PageSpan {
 export class KvWorkingSet {
   constructor()
   /**
-  * Tokens per KV page for this working set's model/driver.
+  * Tokens per KV page for this working set's model/engine.
   */
   pageSize(): number;
   /**
@@ -44,7 +44,7 @@ export class KvWorkingSet {
   /**
   * Atomically insert or replace `key` with a structurally retained view
   * of this working set. Keys are opaque bytes scoped to the active
-  * model/driver store. The working set must have no in-flight fire and
+  * model/engine store. The working set must have no in-flight fire and
   * every logical page must be physically mapped.
   */
   updateIndex(key: Uint8Array): void;
@@ -102,7 +102,7 @@ export class RsWorkingSet {
   */
   bufferSize(): number;
   /**
-  * Tokens per buffered RS page for this working set's model/driver.
+  * Tokens per buffered RS page for this working set's model/engine.
   */
   bufferPageSize(): number;
   /**

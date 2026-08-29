@@ -1,28 +1,28 @@
 //! **B3, THE GATE**: the serving door, end to end.
 //!
-//! `pie serve`'s own composition root boots the engine over the CUDA shell, a
+//! `pie serve`'s own composition root boots the runtime over the CUDA shell, a
 //! wasm inferlet is installed through the client edge a deployment is reached
 //! by, and tokens come back. Everything between is real: `bootstrap::init` →
 //! `derive_standalone` → `run_standalone` (embedded controller + gateway +
-//! worker over loopback) → `create_driver_backend` → `engine::driver::load`
-//! → `driver_cuda::Shell::load` → wasmtime component → the inferlet host glue
-//! → `pipeline::fire` → `Driver::fire`.
+//! worker over loopback) → `create_engine_backend` → `runtime::engine::load`
+//! → `engine_cuda::Shell::load` → wasmtime component → the inferlet host glue
+//! → `pipeline::fire` → `Engine::fire`.
 //!
 //! In-process rather than a spawned `pie serve`, because the boot is the same
 //! function `src/main.rs` calls and a socket in between proves nothing this does
-//! not — and because one boot per process is the runtime's rule (the driver
+//! not — and because one boot per process is the runtime's rule (the engine
 //! grabs the device, `auth` panics on a second boot), so a spawn would buy a
 //! second process to say the same thing.
 //!
 //! The assertion is a FACT, not fluency: greedy decoding of "The capital of
 //! France is" begins " Paris", the same continuation
-//! `engine/tests/cuda_boot_smoke` pins one fire below this and
-//! `driver-cuda/tests/serve_smoke` pins one below that. Three paths to one
+//! `runtime/tests/cuda_boot_smoke` pins one fire below this and
+//! `engine-cuda/tests/serve_smoke` pins one below that. Three paths to one
 //! device have to agree about it.
 //!
 //! Run:
 //! ```text
-//! cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//! cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!   --test cuda_serve_round_trip -- --ignored --nocapture
 //! ```
 

@@ -5,14 +5,14 @@
 //! destructure → resolve → call (decision #13).
 //!
 //! **The §6 substitution, stated once for the whole family.** Everywhere the
-//! old path reached into implicit driver state — `Ctx.raised::<Fa2Decode>`,
+//! old path reached into implicit engine state — `Ctx.raised::<Fa2Decode>`,
 //! `Ctx.raised::<MlaPlanned>`, the pool row's smuggled `qo_indptr`, the
 //! raised mask/fire-table views — the new entries take explicit arguments
 //! instead: the plan structs built by [`plan`]'s pure builders, the
 //! [`RaggedTensor`] whose indptr is the fire's shared boundaries, and the
 //! geometry tensors the IR names on the op. What has no IR seat and no
 //! plan seat is an explicit argument marked `MENLO-SEAM` at its site; the
-//! driver binds it from fire state, visibly.
+//! engine binds it from fire state, visibly.
 //!
 //! The families that shared the old file keep their seats: [`mla`],
 //! [`index`], [`pool`], and the recurrent [`ssm`] mixers live as submodules;
@@ -354,7 +354,7 @@ pub fn prefill_lse(
 /// What the refusal actually feared — "a windowed schedule would discard
 /// positions the mask may keep" — is the wrong way round for a model that
 /// states a window. Gemma's masked reading is *causal ∧ mask ∧ window*: the
-/// causal bound is already folded into the staged bits (`driver_cuda::mask`),
+/// causal bound is already folded into the staged bits (`engine_cuda::mask`),
 /// the window is the model's own statement on the node, and a key outside it
 /// is dropped by the variant whether the schedule visited it or not. The
 /// schedule's window is not an approximation of the mask, it is the second
@@ -382,12 +382,12 @@ pub fn masked(
     // carved its kv spans for, windowed or not.
     plan.accepts(OP, head_dim, None, window)?;
     // MENLO-SEAM: the op names the mask bits, but their per-request span
-    // table has no IR seat — the driver binds it onto the plan at build
+    // table has no IR seat — the engine binds it onto the plan at build
     // (`plan_prefill`'s `mask_indptr`).
     let Some(mask_indptr) = plan.mask_indptr else {
         return Err(refuse(
             OP,
-            "no mask span table rides this prefill plan; the driver binds one at plan build",
+            "no mask span table rides this prefill plan; the engine binds one at plan build",
         ));
     };
     fa2_prefill(

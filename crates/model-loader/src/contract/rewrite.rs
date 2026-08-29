@@ -4,7 +4,7 @@
 //! declares exactly the same tensors as the one it was given. They live in the
 //! planner because they reason about *shape and cost*, never about which model
 //! a tensor belongs to — a rewrite that needed the model's name would be the
-//! driver's business, not the compiler's.
+//! engine's business, not the compiler's.
 //!
 //! What they return is a contract for ONE RANK. A rewrite runs with the target
 //! in hand and resolves the shards it rewrites, so the expressions it emits

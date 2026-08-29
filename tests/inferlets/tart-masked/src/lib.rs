@@ -4,7 +4,7 @@
 //! decode evolution is `and(causal, causal)` — same trick, device-side.
 //! This is the mask axis's parity probe AND the spatial-split trigger:
 //! co-fired with plain lanes it must produce a MASK region in the
-//! scheduler's region table and the driver's planned mask split.
+//! scheduler's region table and the engine's planned mask split.
 
 use inferlet::chat;
 use inferlet::ptir::attention::prelude::*;
@@ -46,7 +46,7 @@ struct Input {
     /// the mask.
     #[serde(default)]
     adapter_scale: Option<f32>,
-    /// Adapter geometry — MUST match the mounted model (the driver
+    /// Adapter geometry — MUST match the mounted model (the engine
     /// refuses a mismatched declaration loudly). Defaults = Qwen3-0.6B;
     /// Qwen3-8B = 36 / 4096 / 4096.
     #[serde(default = "default_lora_layers")]
@@ -274,7 +274,7 @@ async fn main(input: Input) -> Result<String> {
             break;
         }
         // Host-advance the geometry for the next fire. Two channel
-        // postures here (engine program.rs channel_accesses): channels
+        // postures here (runtime program.rs channel_accesses): channels
         // bound to EmbedTokens/Positions/WSlot/WOff (or ChanTake'd in a
         // stage) are CONSUMED per fire — queue the next value with `put`.
         // Everything else (KvLen/Pages/PageIndptr/EmbedIndptr/AttnMask)
@@ -367,7 +367,7 @@ impl Lane {
 /// the dense custom mask (exactly-causal numerics), lane B is plain causal.
 /// Both fires of a step are submitted back-to-back before either take, so
 /// they ride one frame: the scheduler's region table must show a MASK
-/// region next to a plain region, and the driver's planned mask split must
+/// region next to a plain region, and the engine's planned mask split must
 /// engage. Stop tokens are ignored so the lanes stay in lockstep.
 async fn run_co(input: &Input, prompt_b: &str) -> Result<String> {
     let ws = WorkingSet::new();

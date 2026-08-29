@@ -1,7 +1,7 @@
 //! `Moe`: routers, routed matmuls, and the folds that bring the fan-out
 //! back. One entry per IR variant. The one quantized bank form this plane
 //! stamps is mxfp4, and its bank arrives as the explicit `(codes, scales)`
-//! pair the driver resolved (the metal precedent) — plain pointers, no
+//! pair the engine resolved (the metal precedent) — plain pointers, no
 //! by-value descriptor.
 
 use kernels::KernelError;

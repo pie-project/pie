@@ -3,7 +3,7 @@
 //! The sibling of `cuda_forward`, pointed at the model whose layers are not
 //! all the same shape: Qwen3.5-0.8B runs a gated-delta-net recurrence in
 //! three layers out of every four and full paged attention in the fourth.
-//! That path owns machinery nothing else on this driver touches — the
+//! That path owns machinery nothing else on this engine touches — the
 //! recurrent-state slabs, `ssm::causal_conv1d_prefill_batched`, the chunked
 //! delta rule, `norm::rmsnorm_gated_fp32_in` — and until this file existed,
 //! NOTHING IN THE TREE RAN IT.
@@ -22,13 +22,13 @@
 //! is not one — hence `assert_coherent`.
 //!
 //! Run explicitly (one boot per process, like every gate in this directory):
-//!   cargo test --release -p worker --features driver-cuda-13 \
+//!   cargo test --release -p worker --features engine-cuda-13 \
 //!       --test cuda_gdn_forward -- --ignored --nocapture
 
 mod common;
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local Qwen3.5 GDN snapshot (PIE_CUDA_TEST_GDN_SNAPSHOT); one boot per process"]
+#[ignore = "real-hardware: needs an RTX GPU + --features engine-cuda-13 + a local Qwen3.5 GDN snapshot (PIE_CUDA_TEST_GDN_SNAPSHOT); one boot per process"]
 fn cuda_native_hybrid_gdn_decode_is_coherent() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

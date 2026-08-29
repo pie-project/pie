@@ -1,4 +1,4 @@
-//! The plan structs and their builders — the §6 payoff. What the old driver
+//! The plan structs and their builders — the §6 payoff. What the old engine
 //! conjured behind `Ctx.raised` (`Fa2Decode`, `Fa2Prefill`, `MlaPlanned`,
 //! mutable `*PlanCache`s) is now four owned structs, each defined by an
 //! explicit plan op in the IR and built by a **pure function** of:
@@ -8,14 +8,14 @@
 //!   cannot be read host-side (see the MENLO-SEAM notes on each builder);
 //! - the shape facts of the attention being planned ([`Shape`]);
 //! - the device facts ([`Device`]) and the workspace grant ([`Workspace`]) —
-//!   the driver owns where both come from;
-//! - the operator toggles ([`Toggles`]) — the driver resolves them from the
+//!   the engine owns where both come from;
+//! - the operator toggles ([`Toggles`]) — the engine resolves them from the
 //!   environment once ([`Toggles::from_env`]) and hands them in, so a
 //!   builder never reads the environment itself.
 //!
 //! A build stages the schedule's index vectors into `int_upload` and records
 //! byte offsets into the granted workspace. Nothing device-side happens at
-//! build time: the driver copies `int_upload` to `workspace.int_ptr` in the
+//! build time: the engine copies `int_upload` to `workspace.int_ptr` in the
 //! prepare phase (a [`stage`](DecodePlan::stage) call, or its own memcpy),
 //! and the capture-phase attention entries then only read.
 
@@ -48,7 +48,7 @@ impl Device {
         max_smem_per_block_optin: 101_376,
     };
 
-    /// Probes the current device once. A convenience for the driver — the
+    /// Probes the current device once. A convenience for the engine — the
     /// builders themselves never call it.
     #[must_use]
     pub fn probe(ctx: &Ctx) -> Option<Self> {
@@ -70,7 +70,7 @@ impl Device {
     }
 }
 
-/// The workspace grant a plan is carved into: the driver's bounded pool,
+/// The workspace grant a plan is carved into: the engine's bounded pool,
 /// as base addresses plus byte bounds. The builders read only the bounds
 /// (an offset past them is a refusal at build time, not a device fault at
 /// fire time); the addresses ride the plan so the launches can resolve the
@@ -129,7 +129,7 @@ pub struct Sizes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodePlan {
     pub info: DecodePlanInfo,
-    /// The int-workspace image; the driver copies it to
+    /// The int-workspace image; the engine copies it to
     /// `workspace.int_ptr` each prepare phase (see [`DecodePlan::stage`]).
     pub int_upload: Vec<u8>,
     pub int_bytes: usize,
@@ -149,7 +149,7 @@ impl DecodePlan {
     }
 
     /// The op's restated facts must be the ones this plan was carved at —
-    /// plan facts are driver-supplied, so disagreement is refused, not
+    /// plan facts are engine-supplied, so disagreement is refused, not
     /// asserted (the old `agrees`/`variant_agrees`). Decode states no kv
     /// head count and no exact window: only the windowed/full reading has
     /// to match.
@@ -195,12 +195,12 @@ pub struct PrefillPlan {
     pub causal: bool,
     /// Whether the schedule kept its graph-shaped padding. A build asked to
     /// be capturable may fall back to an uncapturable schedule rather than
-    /// decline (the old retry, kept); the driver reads this before capture.
+    /// decline (the old retry, kept); the engine reads this before capture.
     pub graph_capturable: bool,
     /// `i32`, `[lanes + 1]`: each request's span of the mask bits
     /// `attention.masked` names. Bound only when this plan serves that op.
     // MENLO-SEAM: the op states the mask bits themselves, but this span
-    // table has no IR seat — the driver derives it and binds it here at
+    // table has no IR seat — the engine derives it and binds it here at
     // build time.
     pub mask_indptr: Option<Tensor>,
     pub device: Device,
@@ -318,7 +318,7 @@ pub fn head_dim_instantiated(head_dim: u32) -> bool {
 
 /// The operator toggles a decode build takes as an argument — like
 /// [`Device`], never probed inside a builder (purity is the design). The
-/// driver resolves them once with [`Toggles::from_env`] and threads the
+/// engine resolves them once with [`Toggles::from_env`] and threads the
 /// value through every [`plan_decode`] call.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Toggles {
@@ -333,7 +333,7 @@ pub struct Toggles {
 }
 
 impl Toggles {
-    /// Reads both toggles from the environment. Driver-side, once — the
+    /// Reads both toggles from the environment. Engine-side, once — the
     /// builders only ever see the resulting value.
     #[must_use]
     pub fn from_env() -> Self {
@@ -402,14 +402,14 @@ fn some_requests(op: &'static str, shape: &Shape) -> Result<(), KernelError> {
 
 /// Builds the fa2 decode plan.
 ///
-/// `max_grid_size` is a device fact the driver obtains from
+/// `max_grid_size` is a device fact the engine obtains from
 /// [`crate::attn::fa2::decode_max_grid_size`] (an occupancy probe, so it
-/// cannot live inside a pure builder); `toggles` is the driver's one
+/// cannot live inside a pure builder); `toggles` is the engine's one
 /// [`Toggles::from_env`] read, for the same reason.
 ///
 // MENLO-SEAM: `attention.plan_decode` in the IR names on-device geometry
 // (kv_indptr/kv_indices/last_page_len/kv_len); this builder walks
-// `kv_indptr`'s CONTENTS, so the driver binds a host copy beside the device
+// `kv_indptr`'s CONTENTS, so the engine binds a host copy beside the device
 // tensor — and the same duality serves `kv_len` here. kv_indices and
 // last_page_len are never read at build time (they ride the pool row into
 // the launch), and the fa2 decode schedule derives its extents from
@@ -483,11 +483,11 @@ pub fn plan_decode(
 /// that on `graph_capturable` — the old retry, kept.
 ///
 // MENLO-SEAM: as `plan_decode`, plus the qo side — the builder walks host
-// copies of both indptrs, bound by the driver beside the device tensors the
+// copies of both indptrs, bound by the engine beside the device tensors the
 // IR names. The fa2 prefill schedule, too, derives its extents from
 // kv_indptr alone, so the op-named `kv_len` goes unread here (the sm90
 // twin reads it); `mask_indptr` is the span table `attention.masked`'s
-// op-named bits ride with — driver-derived, see the field's seam note.
+// op-named bits ride with — engine-derived, see the field's seam note.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prefill(
     qo_indptr: &[i32],
@@ -567,7 +567,7 @@ pub fn plan_prefill(
 /// Builds the sm90 prefill plan — the schedule the `AttnPrefillPlanSm90`
 /// struct kind names. `kv_len` is the op's own named input now (per-request
 /// kv lengths in tokens); as with the indptrs, the builder walks the host
-/// twin the driver binds beside the device tensor.
+/// twin the engine binds beside the device tensor.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_prefill_sm90(
     qo_indptr: &[i32],
@@ -647,7 +647,7 @@ pub fn plan_mla(
 
 /// Copies a plan's staged int workspace to the device, async on the
 /// context's stream. Prepare-phase work: the source is pageable host
-/// memory, which CUDA graph capture would refuse — the driver runs this
+/// memory, which CUDA graph capture would refuse — the engine runs this
 /// before capture, never inside it (the old plane pinned these bytes to
 /// smuggle the copy into capture; the prepare/capture split makes that
 /// machinery unnecessary).

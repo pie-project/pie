@@ -1,7 +1,7 @@
 //! The convert path, end to end: a checkpoint in, a `.zt` artifact out, and
 //! the artifact read back as a checkpoint.
 //!
-//! `pie model import` writes what the engine will later load, so the two
+//! `pie model import` writes what the runtime will later load, so the two
 //! halves have to agree about more than shapes: the bytes a plan addresses in
 //! the artifact must be the bytes the executor produced. These tests run the
 //! write and the read against each other and compare payloads, not just

@@ -142,7 +142,7 @@ pub fn materialize_contract(metadata: &CheckpointMetadata) -> Result<Materializa
             //
             // Every device kernel pie ships reads BF16 -- norm weights, affine
             // scales and biases alike -- so a checkpoint that stores F16 or F32
-            // is cast on the way in, by the CUDA driver and the Metal one
+            // is cast on the way in, by the CUDA engine and the Metal one
             // alike. That cast cannot be skipped and it cannot be a
             // reinterpretation: F16 and BF16 put the exponent in a different
             // place and at a different width, so reading one as the other turns
@@ -150,17 +150,17 @@ pub fn materialize_contract(metadata: &CheckpointMetadata) -> Result<Materializa
             //
             // Which makes it work this command exists to absorb. `.zt` is a
             // LOCAL artifact -- converted on the machine that will serve it,
-            // for the engine that will serve it -- so the width every consumer
+            // for the runtime that will serve it -- so the width every consumer
             // wants is a fact about the artifact, not a preference imposed on
             // it. mlx-community ships its affine scales and biases as F16, and
-            // leaving them that way makes the driver rewrite them at every
-            // boot; worse, it makes them the only tensors the driver cannot
+            // leaving them that way makes the engine rewrite them at every
+            // boot; worse, it makes them the only tensors the engine cannot
             // bind where they lie, which on Qwen3.5-0.8B costs a 629 MB copy to
             // rewrite 0.0 MB.
             //
             // Narrowing, and deliberately: F16 carries three mantissa bits BF16
             // does not, and this drops them. It drops exactly the bits the
-            // engine drops at load, so the artifact serves what a cold load
+            // runtime drops at load, so the artifact serves what a cold load
             // would have served -- which is this command's whole contract.
             Encoding::Raw(DType::F16) | Encoding::Raw(DType::F32) => {
                 decoded.push(tensor.name.clone());
@@ -302,7 +302,7 @@ mod tests {
     /// An F16 tensor is rewritten as BF16, and the values survive the trip.
     ///
     /// The point is not that a cast works -- it is that the artifact carries
-    /// the width the engine reads, so nothing is left for load time to do. The
+    /// the width the runtime reads, so nothing is left for load time to do. The
     /// value is chosen to be exact in both widths: a check that passed on a
     /// reinterpretation instead of a conversion would prove nothing, and
     /// reinterpreting F16 `1.0` (0x3C00) as BF16 gives 0.0078125.
@@ -353,7 +353,7 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// A checkpoint of raw tensors the engine reads directly copies everything.
+    /// A checkpoint of raw tensors the runtime reads directly copies everything.
     #[test]
     fn a_plain_checkpoint_is_all_passthrough() {
         let metadata = CheckpointMetadata {

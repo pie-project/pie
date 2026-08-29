@@ -53,7 +53,7 @@ pub struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    /// Create a neutral builder with engine-sourced trace constants.
+    /// Create a neutral builder with runtime-sourced trace constants.
     pub fn new(vocab: u32, page_size: u32) -> Builder<'a> {
         Builder {
             ports: Vec::new(),

@@ -1,6 +1,6 @@
-//! Trace-known model constants supplied by the SDK from engine host calls.
+//! Trace-known model constants supplied by the SDK from runtime host calls.
 //! Layer count and intrinsic gates never enter this guest-side state; the
-//! engine-owned `ModelProfile` is authoritative at bind.
+//! runtime-owned `ModelProfile` is authoritative at bind.
 
 use core::cell::Cell;
 

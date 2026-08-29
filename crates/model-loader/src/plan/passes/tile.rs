@@ -1,13 +1,13 @@
 //! Backend tile-map lowering.
 //!
-//! `architecture.md` §9 draws the line this file sits on. A fact the driver can
+//! `architecture.md` §9 draws the line this file sits on. A fact the engine can
 //! *measure* is data and travels in [`StorageTarget`]; a rule that differs per
 //! backend and cannot be parameterized is code and lives here. It is the same
 //! split LLVM draws between target features and `TargetLowering`.
 //!
-//! Everything here answers a question the C++ driver used to answer at run
+//! Everything here answers a question the C++ engine used to answer at run
 //! time. That mattered less for being wrong than for being *unrecorded*: the
-//! C++ transcode engine (`driver-cuda/csrc/src/loader/transcode_engine.hpp`,
+//! C++ transcode engine (`engine-cuda/csrc/src/loader/transcode_engine.hpp`,
 //! deleted in `2cc4e5e4d` — cited as provenance, not as a path to open) chose a
 //! tile size and a fusion strategy while executing, so one plan could run two
 //! different kernel sequences and nothing in the plan said which
@@ -77,7 +77,7 @@ pub const CUDA_SCALE_ROWS_BF16: &str = "quant::scale_rows";
 pub const CUDA_QUANTIZE_BF16_TO_MXFP4: &str = "quant::quantize_bf16_to_mxfp4_e2m1_per_block";
 pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_per_channel";
 
-/// The transforms `driver/cuda`'s kernels implement.
+/// The transforms `engine/cuda`'s kernels implement.
 ///
 /// `Repack` and `Reblock` were here and are not, and the correction matters
 /// because this constant is load-bearing twice over: it decides which plans
@@ -90,16 +90,16 @@ pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_pe
 /// at execution with nothing but a kind to name. Refusing it here refuses it
 /// with the TENSOR named.
 ///
-/// The driver used to restate a narrower mask of its own and a test compared
+/// The engine used to restate a narrower mask of its own and a test compared
 /// the two. There is nothing to compare now: this is the one statement, and
-/// `StorageTarget::for_backend` is how a driver gets it.
+/// `StorageTarget::for_backend` is how an engine gets it.
 ///
 /// What a CUDA arena actually launches is narrower still and is not a mask:
 /// the plan names a kernel per instruction, and the backing looks it up.
 ///
 /// `TILE_MAP_DECODE` is here because an archive may hold a self-contained
 /// block. It is not a device kernel and does not claim to be: none of these
-/// three drivers implements `run_tile_map`, so a decode in one of their plans
+/// three engines implements `run_tile_map`, so a decode in one of their plans
 /// runs on the HOST, streaming into the arena — slower than a load whose bytes
 /// are already plain, and the price of an archive that kept its source
 /// packing. The three masks below say the same thing about their own backends;
@@ -110,14 +110,14 @@ pub const CUDA_TILE_MAP_MASK: u32 =
 /// The transforms a plan for a Metal target may CARRY.
 ///
 /// `SCALE` decodes a block-scaled scheme to values and `CAST` re-encodes them as
-/// the affine-U4 that driver's matvecs read, which is what lets it load the
+/// the affine-U4 that engine's matvecs read, which is what lets it load the
 /// published MXFP4 gpt-oss checkpoint directly. There is no repacking or
 /// reblocking, so those bits stay clear.
 ///
-/// It said "the transforms `driver/metal`'s load-time kernels implement,
+/// It said "the transforms `engine/metal`'s load-time kernels implement,
 /// mirrored in C++ as `kMetalTileMapMask`". Three things were wrong with that.
 /// The C++ was deleted in `2cc4e5e4d` and `kMetalTileMapMask` appears nowhere
-/// but in the sentence claiming to mirror it. `driver-metal`'s backing
+/// but in the sentence claiming to mirror it. `engine-metal`'s backing
 /// implements neither [`ArenaBacking::runs_named_kernels`] nor `run_tile_map`,
 /// so it takes the default — no — and EVERY transform in a Metal plan runs on
 /// the host. And this is the compile-time question anyway: what a device
@@ -140,7 +140,7 @@ pub const METAL_TILE_MAP_MASK: u32 =
 ///
 /// Equal to Metal's today and written out rather than aliased to it. They are
 /// two answers that happen to agree, and the day a load-time compute kernel
-/// is added to one of these drivers is the day an alias would quietly change
+/// is added to one of these engines is the day an alias would quietly change
 /// the other.
 ///
 /// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
@@ -170,7 +170,7 @@ pub const HOST_TILE_MAP_MASK: u32 =
 /// kernel reads. The first half is still true and the conclusion was not: a
 /// device mask says which transforms a plan for that backend may CARRY, not
 /// which its kernels run, and a decode in a Cuda/Metal/Vulkan plan runs on the
-/// host like every other transform those drivers do not implement. Refusing it
+/// host like every other transform those engines do not implement. Refusing it
 /// here refused an archive that kept its source packing, which is a much
 /// larger thing than it was meant to protect — so the three device masks
 /// admit it now, and `validate_bound_encodings` enforces the fact that
@@ -180,7 +180,7 @@ pub const CONVERT_TILE_MAP_MASK: u32 = HOST_TILE_MAP_MASK | TILE_MAP_ENCODE | TI
 /// Which transforms a plan compiled for `backend` may CARRY.
 ///
 /// A compile-time property, and the only statement of it: `StorageTarget::for_backend`
-/// is how a driver gets this, and the lowering below refuses an instruction
+/// is how an engine gets this, and the lowering below refuses an instruction
 /// whose kind falls outside it with the TENSOR named rather than leaving it to
 /// fail at dispatch with nothing but a kind.
 ///
@@ -188,7 +188,7 @@ pub const CONVERT_TILE_MAP_MASK: u32 = HOST_TILE_MAP_MASK | TILE_MAP_ENCODE | TI
 /// [`ArenaBacking`](crate::executor::arena::ArenaBacking) the caller handed
 /// over — `runs_named_kernels`, one bit — and it can be narrower than this on
 /// any given load: device transforms turned off, a build without the `cuda`
-/// feature, a driver that supplied a plain `&mut [u8]`. Every transform this
+/// feature, an engine that supplied a plain `&mut [u8]`. Every transform this
 /// admits also has a host implementation, which is the property
 /// `mask_tests::every_device_transform_has_a_host_implementation` pins, and it
 /// is what makes the narrower case a slower load rather than a failed one.
@@ -213,7 +213,7 @@ mod mask_tests {
 
     /// Every transform a device plan may carry has a host implementation.
     ///
-    /// This lived in `driver-cuda`, comparing the driver's mask against
+    /// This lived in `engine-cuda`, comparing the engine's mask against
     /// `CONVERT_TILE_MAP_MASK`. It comes here with the mask it was checking,
     /// and it is the property that survives rather than the drift check beside
     /// it — that one compared two statements of one fact, and there is one
@@ -306,7 +306,7 @@ pub struct TileMapFacts {
     pub has_source: bool,
     /// Whether the source extent is one contiguous run. A strided source cannot
     /// be sliced by rows without re-deriving the stride per tile, which is why
-    /// the driver refused to tile those.
+    /// the engine refused to tile those.
     pub compact_source: bool,
     /// Declared 2-D shape of the primary output, or `None` if it is not 2-D.
     ///
@@ -346,7 +346,7 @@ pub struct TileMapFacts {
 /// What the lowering decided. Written into the instruction verbatim.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TileLowering {
-    /// Rows of the output the driver transforms per launch. `0` means "no
+    /// Rows of the output the engine transforms per launch. `0` means "no
     /// tiling" — do the whole tensor in one pass — which is both the answer for
     /// instructions that cannot be tiled and the answer when one tile covers
     /// everything.
@@ -437,7 +437,7 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
 /// [`stage_device_transforms`] rewrites a transform so its operands are on the
 /// device, and it has to know BEFORE rewriting whether the rewrite buys
 /// anything — so it builds the facts the rewritten instruction would have and
-/// asks here. Restating the table there instead is how the driver and the
+/// asks here. Restating the table there instead is how the engine and the
 /// loader came to hold two opinions about one device
 /// (`.wiki/fix/loader.md` §3.1); there is one table and this is the way in.
 ///
@@ -461,7 +461,7 @@ pub(crate) fn facts_of(
 
 /// Which kernel row runs these operands, or `None` for the host.
 ///
-/// **This is the table that used to live in the driver**, as a `run_tile_map`
+/// **This is the table that used to live in the engine**, as a `run_tile_map`
 /// that took the operands and answered `Ok(false)` when it had no kernel for
 /// them. Two things were wrong with that, and neither was the code:
 ///
@@ -473,7 +473,7 @@ pub(crate) fn facts_of(
 ///   deciding without the tensor's name, so a refusal could say "this backing
 ///   has no kernel for these bytes" where the compiler can say which tensor.
 ///
-/// Every rule below is the driver's own, moved and not rewritten. What changes
+/// Every rule below is the engine's own, moved and not rewritten. What changes
 /// is when it runs.
 fn cuda_kernel(facts: &TileMapFacts) -> Option<&'static str> {
     match facts.kind {
@@ -549,7 +549,7 @@ fn cuda_encode(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering {
     }
 }
 
-/// Rows of the output the driver transforms per launch, or `0` for "all at
+/// Rows of the output the engine transforms per launch, or `0` for "all at
 /// once".
 ///
 /// Ported including its use of the *logical* dtype width for a quantized
@@ -591,7 +591,7 @@ fn encode_rows_per_tile(facts: &TileMapFacts, target: &StorageTarget) -> u32 {
     };
     let rows_per_tile = rows_under_budget(rows, scratch_per_row, facts.max_tile_bytes);
     // One tile covering everything is the untiled case; say so, rather than
-    // making the driver compare a row count against the shape to find out.
+    // making the engine compare a row count against the shape to find out.
     if u64::from(rows_per_tile) >= rows {
         0
     } else {
@@ -613,7 +613,7 @@ fn encode_rows_per_tile(facts: &TileMapFacts, target: &StorageTarget) -> u32 {
 /// The *chain* stays here rather than becoming data, and that is the
 /// `architecture.md` §9 line: which two steps `Fp8ToMxfp4` collapses, and the
 /// proof that collapsing them is bit-identical, is the loader's model of the
-/// transform. Whether the kernel exists is the driver's, and that is the bit.
+/// transform. Whether the kernel exists is the engine's, and that is the bit.
 fn encode_fusion(facts: &TileMapFacts, target: &StorageTarget) -> TransformFusion {
     let fusable = target.fusion_mask & FUSION_FP8_TO_MXFP4 != 0
         && facts.transform_to == Some(QuantScheme::Mxfp4E2M1E8M0)
@@ -658,7 +658,7 @@ fn extent_is_compact(extent: &crate::extent::Extent) -> bool {
 }
 
 /// The dtype a transform sees, which for a quantized encoding is the logical
-/// one. This is the value the driver reads off `PieLoaderSourceTensorView`, so
+/// one. This is the value the engine reads off `PieLoaderSourceTensorView`, so
 /// the two must agree.
 fn encoding_dtype(encoding: &Encoding) -> DType {
     match encoding {

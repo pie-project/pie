@@ -1,6 +1,6 @@
 //! Where the emitter version constants meet the bytes they describe.
 //!
-//! Both drivers key their compiled-kernel cache on the emitter version. A
+//! Both engines key their compiled-kernel cache on the emitter version. A
 //! version that stays put across a change to the emitted text is not a stale
 //! comment — it is a cache that hands back a cubin or a `MTLLibrary` built from
 //! the *old* source for a program the compiler now emits differently, with no
@@ -12,7 +12,7 @@
 //! passed. Metal had no guard at all.
 //!
 //! So each backend pins both numbers here: the version against the constant the
-//! drivers are compiled with, and a fingerprint against a hash of everything
+//! engines are compiled with, and a fingerprint against a hash of everything
 //! `emit_program` produces for both corpora. Neither number can move without
 //! failing this file — an emitter change moves the fingerprint, a constant
 //! change moves the version — so both have to be restated here, in the commit
@@ -28,7 +28,7 @@
 //! that whichever version is written here is the one being shipped.
 //!
 //! Closing it for real needs a cache key the compiler cannot forget rather than
-//! a stricter test: the drivers are already handed the `source` they compile,
+//! a stricter test: the engines are already handed the `source` they compile,
 //! so a key derived from that would not need a maintained number at all.
 //!
 //! The hash is a fingerprint, not a golden: it says *that* the output changed,
@@ -51,14 +51,14 @@ use tensor_compiler::codegen::program::{Backend, emit_program};
 ///
 /// A change that leaves the fingerprint alone did not change the emitted bytes
 /// and must not move the version either — a gratuitous bump throws away every
-/// driver's cache — so a constant that moves on its own fails
+/// engine's cache — so a constant that moves on its own fails
 /// `the_pinned_versions_are_the_compiled_ones` until someone comes here and
 /// says so in the same commit.
 // Re-pinned WITHOUT a version bump when `lora_prologue` joined the corpus:
 // the fingerprint is a hash over everything the corpus emits, so growing the
 // corpus moves it even when no pre-existing case's bytes changed — and the
 // oracle dumps (`golden-cuda/`, `golden-msl/`) show that growth was purely
-// additive. Bumping the constants for that would discard every driver's
+// additive. Bumping the constants for that would discard every engine's
 // compile cache over sources they would re-emit identically.
 //
 // Re-pinned again WITH both bumps already made, which is the case this file's
@@ -80,21 +80,21 @@ use tensor_compiler::codegen::program::{Backend, emit_program};
 // not one byte of any emitted SOURCE did, and the regions whose text changed
 // are exactly the ones that emit nothing at all. A cache keyed on version 22
 // therefore cannot hand back a cubin built from anything: there is no cubin.
-// Bumping would discard both drivers' caches to re-emit identical sources.
+// Bumping would discard both engines' caches to re-emit identical sources.
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 22, 0x5d98_7c38_15e8_2c41),
     ("metal", 36, 0x0f81_7250_caff_2a71),
 ];
 
-/// Everything a driver receives for both corpora, hashed.
+/// Everything an engine receives for both corpora, hashed.
 ///
 /// The extended corpus is included because it exists to reach what the base one
 /// does not — further ops, further intrinsics, the hierarchical-row schedule —
 /// and the emitters have per-op arms, so a change confined to those paths would
-/// otherwise leave this hash untouched while changing what a driver runs.
+/// otherwise leave this hash untouched while changing what an engine runs.
 ///
 /// Refusals are hashed alongside sources because a region that stops being
-/// emittable changes what the driver runs just as much as one whose source
+/// emittable changes what the engine runs just as much as one whose source
 /// changes, and the version has to move for both.
 fn fingerprint(backend: Backend) -> u64 {
     let stages: Vec<_> = corpus_stages()
@@ -123,7 +123,7 @@ fn backend_of(name: &str) -> Backend {
     }
 }
 
-/// The pinned version literals are the constants the drivers are compiled
+/// The pinned version literals are the constants the engines are compiled
 /// against, so `PINNED` describes this compiler rather than a past one.
 #[test]
 fn the_pinned_versions_are_the_compiled_ones() {
@@ -136,14 +136,14 @@ fn the_pinned_versions_are_the_compiled_ones() {
             *version, constant,
             "the {name} emitter version constant is {constant}, but PINNED still says {version}. \
              If the emitted bytes changed, update both; if they did not, the constant moved for \
-             nothing and every driver's cache was discarded."
+             nothing and every engine's cache was discarded."
         );
     }
 }
 
 /// The emitted bytes are still the ones the pinned version was written for.
 ///
-/// A failure means the drivers would key a cache on a version that no longer
+/// A failure means the engines would key a cache on a version that no longer
 /// describes what they will be handed. The repair is to bump the backend's
 /// constant and re-pin; this test sees only the re-pinning, so the bump is the
 /// reader's to make.
@@ -161,7 +161,7 @@ fn each_emitter_version_still_describes_its_output() {
     }
     assert!(
         moved.is_empty(),
-        "the emitted bytes changed, so the drivers' compile caches must be \
+        "the emitted bytes changed, so the engines' compile caches must be \
          invalidated:\n  {}\n\nBump the backend's emitter version constant and \
          put the new fingerprint in PINNED, in the same commit. If the change \
          was meant to be output-neutral, this is the bug report.",

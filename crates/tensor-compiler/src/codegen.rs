@@ -11,7 +11,7 @@
 //! pure `Plan -> String` with no device-architecture inputs, so a kernel can be
 //! emitted, diffed and reviewed without a device; [`op_view`], [`wellformed`],
 //! [`alias`], [`launch`] and [`program`] support them. Anything only one
-//! backend's driver reads lives under that backend — [`cuda::region_analysis`].
+//! backend's engine reads lives under that backend — [`cuda::region_analysis`].
 
 pub mod alias;
 pub mod cuda;

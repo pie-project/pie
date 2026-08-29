@@ -25,13 +25,13 @@ pub use tune::Objective;
 /// The generated default config, for tests in this module's children that
 /// need a document the schema accepts.
 ///
-/// Rendered against a driver block of the template's choosing rather than
-/// this binary's, so that a test run with no `driver-*` feature still has a
+/// Rendered against an engine block of the template's choosing rather than
+/// this binary's, so that a test run with no `engine-*` feature still has a
 /// document to parse. What these tests are about is the schema, not the
 /// device.
 #[cfg(test)]
 pub(crate) fn default_config_for_test() -> String {
-    template::config_content_with_any_driver()
+    template::config_content_with_any_engine()
 }
 
 #[derive(Subcommand, Debug)]
@@ -154,19 +154,19 @@ fn list(global: &bootstrap::GlobalArgs, prefix: Option<String>) -> Result<Answer
         ),
     };
 
-    // Which driver the config asks for decides which option keys exist at all.
-    let driver = worker::config_schema::lookup(&file, "driver.type")
+    // Which engine the config asks for decides which option keys exist at all.
+    let engine = worker::config_schema::lookup(&file, "engine.type")
         .and_then(|v| v.as_str())
         .and_then(|s| match s {
-            "cuda_native" | "cuda" => Some(worker::config::DriverKind::CudaNative),
-            "metal" => Some(worker::config::DriverKind::Metal),
-            "vulkan" => Some(worker::config::DriverKind::Vulkan),
-            "wgpu" => Some(worker::config::DriverKind::Wgpu),
+            "cuda_native" | "cuda" => Some(worker::config::EngineKind::CudaNative),
+            "metal" => Some(worker::config::EngineKind::Metal),
+            "vulkan" => Some(worker::config::EngineKind::Vulkan),
+            "wgpu" => Some(worker::config::EngineKind::Wgpu),
             _ => None,
         })
-        .unwrap_or(default_driver_kind());
+        .unwrap_or(default_engine_kind());
 
-    let fields = worker::config_schema::fields(driver);
+    let fields = worker::config_schema::fields(engine);
     let selected: Vec<_> = fields
         .iter()
         .filter(|f| match &prefix {
@@ -232,7 +232,7 @@ impl crate::ui::Report for ConfigList {
         let leaf = |key: &str| key.rsplit('.').next().unwrap_or(key).to_string();
 
         // Grouped rather than printed as the walk emits them: the walk descends
-        // into `model.driver` and comes back to `model.weight_cache_dir`, so
+        // into `model.engine` and comes back to `model.weight_cache_dir`, so
         // following it directly printed `[worker.model]` twice. Sections keep
         // the order they first appear in, which is declaration order.
         let mut order: Vec<&str> = Vec::new();
@@ -310,7 +310,7 @@ fn effective(file: &toml::Value, field: &worker::config_schema::Field) -> String
 /// used to fail with "nope.key does not accept \"1\"", which describes a type
 /// mismatch on a key that does not exist.
 fn schema_field(file: &toml::Value, key: &str) -> Result<worker::config_schema::Field> {
-    let fields = worker::config_schema::fields(driver_kind(file));
+    let fields = worker::config_schema::fields(engine_kind(file));
     if let Some(found) = fields.iter().find(|f| f.key == key) {
         return Ok(found.clone());
     }
@@ -326,30 +326,30 @@ fn schema_field(file: &toml::Value, key: &str) -> Result<worker::config_schema::
     bail!("unknown key {key:?}; did you mean {}?", near.join(" or "))
 }
 
-/// Which driver the config asks for, since that decides which `[driver]` keys
+/// Which engine the config asks for, since that decides which `[engine]` keys
 /// exist at all.
-fn driver_kind(file: &toml::Value) -> worker::config::DriverKind {
-    worker::config_schema::lookup(file, "driver.type")
+fn engine_kind(file: &toml::Value) -> worker::config::EngineKind {
+    worker::config_schema::lookup(file, "engine.type")
         .and_then(|v| v.as_str())
         .and_then(|s| match s {
-            "cuda_native" | "cuda" => Some(worker::config::DriverKind::CudaNative),
-            "metal" => Some(worker::config::DriverKind::Metal),
-            "vulkan" => Some(worker::config::DriverKind::Vulkan),
-            "wgpu" => Some(worker::config::DriverKind::Wgpu),
+            "cuda_native" | "cuda" => Some(worker::config::EngineKind::CudaNative),
+            "metal" => Some(worker::config::EngineKind::Metal),
+            "vulkan" => Some(worker::config::EngineKind::Vulkan),
+            "wgpu" => Some(worker::config::EngineKind::Wgpu),
             _ => None,
         })
-        .unwrap_or(default_driver_kind())
+        .unwrap_or(default_engine_kind())
 }
 
-/// The driver a config is read against when it names none.
+/// The engine a config is read against when it names none.
 ///
 /// `dummy` was that answer, and it is gone with the crate. The fallback is
-/// the driver this binary was BUILT with, in the precedence
-/// `driver_ffi::default_flavor` already states — the option keys that exist
+/// the engine this binary was BUILT with, in the precedence
+/// `engine_ffi::default_flavor` already states — the option keys that exist
 /// at all follow from it, so guessing the other one would offer a reader
 /// fields their build cannot honour.
-fn default_driver_kind() -> worker::config::DriverKind {
-    worker::config::DriverKind::CudaNative
+fn default_engine_kind() -> worker::config::EngineKind {
+    worker::config::EngineKind::CudaNative
 }
 
 fn is_set(file: &toml::Value, key: &str) -> bool {
@@ -511,14 +511,8 @@ fn set(global: &bootstrap::GlobalArgs, key: String, value: String) -> Result<Ans
 
     let (serialized, chosen) = typed_by_schema(&content, &key, &value)?;
     std::fs::write(&cfg_path, serialized).map_err(|e| anyhow!("write {cfg_path:?}: {e}"))?;
-    // Report the key that was actually written, which a renamed one is not.
-    let written = normalize_key(&key);
     let value = display_value(&chosen);
-    Ok(Answer::did(if written == key {
-        format!("set {key} = {value}")
-    } else {
-        format!("set {written} = {value} ({key} was renamed)")
-    }))
+    Ok(Answer::did(format!("set {key} = {value}")))
 }
 
 /// Choose the TOML type for `value` by asking the schema, not by looking at
@@ -550,13 +544,9 @@ fn typed_by_schema(content: &str, key: &str, value: &str) -> Result<(String, tom
     // Checked first so a typo reads as a typo. Without it the candidate loop
     // runs to its last (string) reading and reports THAT failure, which for a
     // key that does not exist describes a type mismatch instead.
-    //
-    // Normalized before checking, or a superseded spelling the parser still
-    // accepts as an alias would be rejected here as unknown -- `set
-    // model.hf_repo` failing while a hand-written `hf_repo` boots fine.
     let parsed: toml::Value =
         toml::from_str(content).unwrap_or_else(|_| toml::Value::Table(Default::default()));
-    schema_field(&parsed, &normalize_key(key))?;
+    schema_field(&parsed, key)?;
     let mut errors: Vec<anyhow::Error> = Vec::new();
     for candidate in candidates(value) {
         // Validated on a plain re-serialization, but *written* from a
@@ -612,7 +602,7 @@ fn candidates(value: &str) -> Vec<toml::Value> {
     // A literal in TOML's own syntax, read first because it is the only
     // spelling that can denote a value the heuristics below cannot: an array
     // (`["metal:0"]`), an inline table, or a string that would otherwise be
-    // read as a number. Without it `config set driver.device '["metal:0"]'`
+    // read as a number. Without it `config set engine.device '["metal:0"]'`
     // fell through to the string reading and the file got the brackets stored
     // as text, while the confirmation line printed an array.
     if let Some(parsed) = parse_toml_literal(value) {
@@ -822,23 +812,9 @@ fn display_value(v: &toml::Value) -> String {
     }
 }
 
-/// Keys that were renamed, and what they are now.
-///
-/// The setter writes whatever key string it is handed, so without this a
-/// `pie config set model.hf_repo …` on a config that already uses the new
-/// spelling would leave *both* in the file — and `ModelConfig` accepts
-/// `hf_repo` only as an alias for `model`, so serde rejects a document
-/// carrying the two as a duplicate field. Normalizing here makes a config
-/// converge on one spelling however it is edited.
-/// Matched against the *end* of a dot-path, because the same table is reached
-/// as `model.hf_repo` in a worker config and `worker.model.hf_repo` in a
-/// standalone one.
-const RENAMED_KEYS: [(&str, &str); 1] = [("model.hf_repo", "model.model")];
-
 /// Walk a dot-path into the TOML tree, creating intermediate tables
 /// as needed. Mirrors `pie_cli/config.py::_set_nested`.
 fn set_nested(root: &mut toml::Value, key: &str, value: toml::Value) -> Result<()> {
-    let key = normalize_key(key);
     let parts: Vec<&str> = key.split('.').collect();
     if parts.is_empty() {
         bail!("empty key");
@@ -856,41 +832,7 @@ fn set_nested(root: &mut toml::Value, key: &str, value: toml::Value) -> Result<(
         .as_table_mut()
         .ok_or_else(|| anyhow!("{} is not a table", parts.join(".")))?;
     table.insert(last.to_string(), value);
-
-    // Having written the current spelling, drop the superseded one from the
-    // same table. `ModelConfig` takes the old name only as an alias, so a
-    // document carrying both is a duplicate field rather than a preference —
-    // and this is the one place that can notice.
-    if parts.len() >= 2 {
-        for (old, new) in RENAMED_KEYS {
-            let (old_table, stale) = old.rsplit_once('.').expect("renamed keys are dotted");
-            let (_, current) = new.rsplit_once('.').expect("renamed keys are dotted");
-            if last == current && parts[parts.len() - 2] == old_table {
-                table.remove(stale);
-            }
-        }
-    }
     Ok(())
-}
-
-/// Rewrites a renamed dot-path to its current spelling, matching on the tail
-/// so both the worker and standalone shapes are covered.
-///
-/// Public spellings outlive the code that reads them: someone has
-/// `pie config set model.hf_repo …` in a script, and the rename is pie's
-/// problem rather than theirs.
-pub(crate) fn normalize_key(key: &str) -> String {
-    for (old, new) in RENAMED_KEYS {
-        if key == old {
-            return new.to_string();
-        }
-        if let Some(prefix) = key.strip_suffix(old)
-            && prefix.ends_with('.')
-        {
-            return format!("{prefix}{new}");
-        }
-    }
-    key.to_string()
 }
 
 fn step<'a>(
@@ -917,7 +859,6 @@ fn step<'a>(
 /// turned the annotated file into a bare table. `toml_edit` keeps the original
 /// bytes for everything it did not touch, so only the assigned value moves.
 fn set_nested_doc(doc: &mut toml_edit::DocumentMut, key: &str, value: &toml::Value) -> Result<()> {
-    let key = normalize_key(key);
     let parts: Vec<&str> = key.split('.').collect();
     if parts.is_empty() {
         bail!("empty key");
@@ -947,16 +888,6 @@ fn set_nested_doc(doc: &mut toml_edit::DocumentMut, key: &str, value: &toml::Val
         }
         None => {
             cursor.insert(last, item);
-        }
-    }
-
-    if parts.len() >= 2 {
-        for (old, new) in RENAMED_KEYS {
-            let (old_table, stale) = old.rsplit_once('.').expect("renamed keys are dotted");
-            let (_, current) = new.rsplit_once('.').expect("renamed keys are dotted");
-            if last == current && parts[parts.len() - 2] == old_table {
-                cursor.remove(stale);
-            }
         }
     }
     Ok(())
@@ -1129,7 +1060,7 @@ mod tests {
             r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 "#,
         )
         .unwrap();
@@ -1143,43 +1074,13 @@ hf_repo = "Qwen/Qwen3-0.6B"
             t["model"]["model"].as_str().unwrap(),
             "meta-llama/Llama-3.2-1B"
         );
-        // The old spelling is removed rather than left beside the new one:
-        // `ModelConfig` takes `hf_repo` as an alias for `model`, and a document
-        // carrying both is a duplicate field, not a preference.
-        assert!(t["model"].get("hf_repo").is_none());
     }
 
-    /// The renamed key still works from the command line, and lands on the new
-    /// spelling — in both config shapes. Someone with
-    /// `pie config set model.hf_repo …` in a script should not have to learn
-    /// about the rename to keep working.
-    #[test]
-    fn the_old_model_key_sets_the_new_one() {
-        for (prefix, table) in [("", "model"), ("worker.", "worker")] {
-            let doc = if prefix.is_empty() {
-                "[model]\nname = \"default\"\nhf_repo = \"old\"\n".to_string()
-            } else {
-                "[worker.model]\nname = \"default\"\nhf_repo = \"old\"\n".to_string()
-            };
-            let mut t: toml::Value = toml::from_str(&doc).unwrap();
-            set_nested(
-                &mut t,
-                &format!("{prefix}model.hf_repo"),
-                toml::Value::String("Qwen/Qwen3-1.7B".to_string()),
-            )
-            .unwrap();
-            let model = if table == "model" {
-                &t["model"]
-            } else {
-                &t["worker"]["model"]
-            };
-            assert_eq!(model["model"].as_str().unwrap(), "Qwen/Qwen3-1.7B");
-            assert!(
-                model.get("hf_repo").is_none(),
-                "the old spelling survived beside the new one ({prefix}model)"
-            );
-        }
-    }
+    // `the_old_model_key_sets_the_new_one` STOOD HERE, together with
+    // `RENAMED_KEYS` and the two loops that consumed it. It proved that a set
+    // of the model key's retired spelling landed on `model.model` and left no
+    // second spelling behind. `ModelConfig` no longer takes that alias, so
+    // there is one name, and the setter writes the one it is handed.
 
     #[test]
     fn set_rejects_invalid_result_without_writing() {
@@ -1188,9 +1089,9 @@ hf_repo = "Qwen/Qwen3-0.6B"
         let original = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[driver]
+[engine]
 type = "vulkan"
 device = ["vulkan:0"]
 "#;
@@ -1214,9 +1115,9 @@ port = 8080
 
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[driver]
+[engine]
 type = "vulkan"
 device = ["vulkan:0"]
 "#
@@ -1270,21 +1171,21 @@ device = ["vulkan:0"]
 
     /// C3: an array literal lands in the file as an array.
     ///
-    /// `pie config set driver.device '["metal:0"]'` used to print
+    /// `pie config set engine.device '["metal:0"]'` used to print
     /// `= ["metal:0"]` and write `device = '["metal:0"]'` -- a string whose
     /// text happens to look like an array. The confirmation hid it, and the
     /// next boot read a one-element device list named `["metal:0"]`.
     #[test]
     fn an_array_literal_is_stored_as_an_array() {
         let (written, chosen) =
-            typed_by_schema(fixture(), "driver.device", r#"["metal:0"]"#).unwrap();
+            typed_by_schema(fixture(), "engine.device", r#"["metal:0"]"#).unwrap();
         assert_eq!(
             chosen,
             toml::Value::Array(vec![toml::Value::String("metal:0".into())])
         );
         let back: toml::Value = toml::from_str(&written).unwrap();
         assert_eq!(
-            get_nested(&back, "driver.device")
+            get_nested(&back, "engine.device")
                 .and_then(|v| v.as_array())
                 .map(|a| a.len()),
             Some(1),
@@ -1321,7 +1222,7 @@ port = 8080
 name = "default"
 model = "Qwen/Qwen3-0.6B"
 
-[driver]
+[engine]
 type = "vulkan"         # trailing note
 device = ["vulkan:0"]
 "#;
@@ -1355,7 +1256,7 @@ port = 8080
 name = "default"
 model = "Qwen/Qwen3-0.6B"
 
-[driver]
+[engine]
 type = "dummy"          # trailing note
 device = ["cpu"]
 "#;

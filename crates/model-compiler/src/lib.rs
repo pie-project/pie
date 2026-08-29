@@ -1,13 +1,13 @@
-//! Bakes a traced `Trace` once, into the artifact a driver records and replays
+//! Bakes a traced `Trace` once, into the artifact an engine records and replays
 //! forever (palo design §2).
 //!
-//! > model/ declares a supergraph, model-compiler bakes it once, the driver
+//! > model/ declares a supergraph, model-compiler bakes it once, the engine
 //! > records one immutable graph per bucket and replays it forever. Nothing
 //! > compiles, allocates, or captures on the fire path.
 //!
 //! This crate is the middle clause. It runs ONCE PER LOAD and never again: not
 //! per fire, not per bucket, not per composition. Everything it produces is
-//! either a static table or a symbolic expression the driver evaluates with
+//! either a static table or a symbolic expression the engine evaluates with
 //! arithmetic — because the alternative, deciding anything at the fire, is the
 //! cost this whole design exists to remove.
 //!

@@ -6,9 +6,9 @@
 //! either cannot be reclaimed or is reclaimed by surprise.
 //!
 //! This is deliberately a description of the tree, not of the code that writes
-//! it. The one coupling that matters is the driver cache root: this module
-//! names `cache/`, and `embedded_driver::set_cache_dir` is what tells the
-//! drivers to write there. Its *contents* are enumerated from disk rather than
+//! it. The one coupling that matters is the engine cache root: this module
+//! names `cache/`, and `embedded_engine::set_cache_dir` is what tells the
+//! engines to write there. Its *contents* are enumerated from disk rather than
 //! listed here, because the subdirectory names (`ptir-cuda`, the GEMM tuning
 //! files) are chosen on the C++ side and a list here would be a second copy
 //! free to drift from them.
@@ -24,7 +24,7 @@
 
 use std::path::PathBuf;
 
-/// The driver's measured planner shape, inside the driver cache but not of it.
+/// The engine's measured planner shape, inside the engine cache but not of it.
 ///
 /// Named here — the one filename this module spells out — because it is the
 /// only thing under `cache/` that a boot does **not** re-derive. Every sibling
@@ -46,29 +46,29 @@ pub const PLANNER_PROFILE_FILE: &str = "cuda_memory_profiles.json";
 /// a fresh inode and believe it holds the same lock.
 pub const PLANNER_PROFILE_LOCK: &str = "cuda_memory_profiles.json.lock";
 
-/// The root every driver-side disk cache derives from.
+/// The root every engine-side disk cache derives from.
 ///
 /// Defined here rather than at the call site so the registry below and
-/// `embedded_driver::set_cache_dir` -- the thing that actually tells the
-/// drivers where to write -- cannot drift. A `pie cache clear` that looked in
+/// `embedded_engine::set_cache_dir` -- the thing that actually tells the
+/// engines where to write -- cannot drift. A `pie cache clear` that looked in
 /// a directory nothing writes to would report success and reclaim nothing.
-pub fn driver_cache_dir() -> PathBuf {
+pub fn engine_cache_dir() -> PathBuf {
     crate::paths::pie_home().join("cache")
 }
 
-/// Where the driver keeps materialized device weights.
+/// Where the engine keeps materialized device weights.
 ///
-/// Defined once for the same reason `driver_cache_dir` is: this and
-/// `engine::boot` both need it, and when they were two expressions they landed
+/// Defined once for the same reason `engine_cache_dir` is: this and
+/// `::runtime::boot` both need it, and when they were two expressions they landed
 /// on two directories -- one of them the artifact store, which is not a cache
 /// at all.
 pub fn weight_cache_dir() -> PathBuf {
-    driver_cache_dir().join("weights")
+    engine_cache_dir().join("weights")
 }
 
-/// Where the driver records the planner shape it measured on this machine.
+/// Where the engine records the planner shape it measured on this machine.
 pub fn planner_profile_path() -> PathBuf {
-    driver_cache_dir().join(PLANNER_PROFILE_FILE)
+    engine_cache_dir().join(PLANNER_PROFILE_FILE)
 }
 
 /// Whether an entry may be deleted to reclaim space.
@@ -98,7 +98,7 @@ pub struct Entry {
     ///
     /// This is what keeps the registry a flat list over a nested tree. `cache/`
     /// physically contains the weight cache and the planner profile, but each
-    /// of those has its own reclaim policy — so a `driver` entry that swallowed
+    /// of those has its own reclaim policy — so an `engine` entry that swallowed
     /// them would report their bytes twice and delete a measurement while
     /// claiming to reclaim a cache.
     pub keep: &'static [&'static str],
@@ -113,20 +113,20 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
     let mut entries = vec![
         Entry {
             name: "launch",
-            path: crate::embedded_driver::launch_state_root(),
-            what: "Per-launch driver bootstrap TOMLs. Dead as soon as the drivers \
+            path: crate::embedded_engine::launch_state_root(),
+            what: "Per-launch engine bootstrap TOMLs. Dead as soon as the engines \
                    they configured are down; swept at boot for pids that are gone.",
             reclaim: Reclaim::Safe,
             keep: &[],
         },
         Entry {
-            name: "driver",
-            path: driver_cache_dir(),
+            name: "engine",
+            path: engine_cache_dir(),
             // No longer says "planner profiles": that file is its own entry
             // below, because it is the one thing here a cold boot does not
             // rebuild. The claim "deleting costs one cold rebuild" is true of
             // what is left, and was false while it covered the profile.
-            what: "Driver-side disk caches: compiled PTIR modules, GEMM \
+            what: "Engine-side disk caches: compiled PTIR modules, GEMM \
                    autotuning results. All keyed and self-invalidating; \
                    deleting costs one cold rebuild.",
             reclaim: Reclaim::Safe,
@@ -151,7 +151,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
         Entry {
             name: "models",
             path: home.join("models"),
-            // The artifact store, not a cache. It used to be the driver's
+            // The artifact store, not a cache. It used to be the engine's
             // materialized-weight cache, which was re-derived on the next
             // load; `.zt` artifacts are not. Losing one costs a download and a
             // conversion, and the file is portable in a way device weights
@@ -349,7 +349,7 @@ mod tests {
     /// `cache/` physically contains both the weight cache and the planner
     /// profile, and while all three were entries over the same tree, `pie
     /// cache list` counted those bytes twice and `pie cache clear` deleted
-    /// `driver` -- taking `weights` with it -- and then reported an error for
+    /// `engine` -- taking `weights` with it -- and then reported an error for
     /// failing to delete a directory it had just removed.
     ///
     /// Stated over `keep` rather than over the raw paths, because nesting is
@@ -397,7 +397,7 @@ mod tests {
                 // The lock file is the one carve-out with no entry of its own:
                 // it belongs to the planner profile, and is held rather than
                 // reclaimed.
-                if path == driver_cache_dir().join(PLANNER_PROFILE_LOCK) {
+                if path == engine_cache_dir().join(PLANNER_PROFILE_LOCK) {
                     continue;
                 }
                 assert!(
@@ -425,16 +425,16 @@ mod tests {
         assert_eq!(profile.reclaim, Reclaim::OnRequest);
         assert_eq!(profile.path, planner_profile_path());
 
-        let driver = entries(None)
+        let engine = entries(None)
             .into_iter()
-            .find(|e| e.name == "driver")
-            .expect("the driver cache is an entry");
+            .find(|e| e.name == "engine")
+            .expect("the engine cache is an entry");
         assert!(
-            driver.keep.contains(&PLANNER_PROFILE_FILE),
-            "clearing the driver cache would take the profile with it",
+            engine.keep.contains(&PLANNER_PROFILE_FILE),
+            "clearing the engine cache would take the profile with it",
         );
         assert!(
-            !driver.what.contains("planner profile"),
+            !engine.what.contains("planner profile"),
             "the description still claims to cover a file it no longer does",
         );
     }
@@ -485,11 +485,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {n} entry"))
                 .path
         };
-        assert_eq!(by_name("driver"), driver_cache_dir());
+        assert_eq!(by_name("engine"), engine_cache_dir());
         assert_eq!(by_name("weights"), weight_cache_dir());
         assert_eq!(
             by_name("launch"),
-            crate::embedded_driver::launch_state_root()
+            crate::embedded_engine::launch_state_root()
         );
     }
 

@@ -12,7 +12,7 @@ Lifecycle:
   * `__aenter__`: serialize the `Config` to TOML and hand it to the pyo3
     `bootstrap`. If `ServerConfig.port == 0`, Rust asks the OS for an
     ephemeral port and returns the bound URL. The pyo3 layer blocks until
-    drivers + WS listener are up, then returns a handle. We run that on a
+    engines + WS listener are up, then returns a handle. We run that on a
     thread (`asyncio.to_thread`) so the asyncio loop isn't blocked.
   * `connect()`: build a `pie_client.PieClient` against the bound URL.
     Each call returns a fresh client; the user is responsible for
@@ -20,7 +20,7 @@ Lifecycle:
   * `__aexit__`: closes any connect()'d clients, then shuts the engine
     down (also off-thread). The pyo3 handle's `Drop` is the safety net
     if `__aexit__` doesn't run (interpreter exit, hard crash) — combined
-    with `PR_SET_PDEATHSIG` on subprocess drivers, this means "script
+    with `PR_SET_PDEATHSIG` on subprocess engines, this means "script
     ends → server is gone, no orphans".
 """
 
@@ -93,7 +93,7 @@ class Server:
 
         from pie.server import Server
         from pie.config import (
-            Config, ServerConfig, ModelConfig, DriverConfig,
+            Config, ServerConfig, ModelConfig, EngineConfig,
         )
 
         cfg = Config(
@@ -101,7 +101,7 @@ class Server:
             model=ModelConfig(
                 name="default",
                 hf_repo="Qwen/Qwen3-0.6B",
-                driver=DriverConfig(type="dev", device=["cuda:0"]),
+                engine=EngineConfig(type="dev", device=["cuda:0"]),
             ),
         )
         async with Server(cfg) as server:
@@ -158,7 +158,7 @@ class Server:
                 "the in-process engine (`pie._engine`) is unavailable and no `pie` "
                 "binary was found. Set $PIE_BIN, or build one, e.g.:\n"
                 "  cargo build --release -p pie-bin --no-default-features "
-                "--features driver-metal"
+                "--features engine-metal"
             )
 
         # The CLI needs a concrete port; `port = 0` is an in-process-only affordance.

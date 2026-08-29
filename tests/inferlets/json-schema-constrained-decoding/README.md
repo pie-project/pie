@@ -64,5 +64,5 @@ constraint object.
 
 ```bash
 cargo build --release --target wasm32-wasip2
-python tests/inferlets/run_all.py --driver cuda_native --model <model-path>
+python tests/inferlets/run_all.py --engine cuda_native --model <model-path>
 ```

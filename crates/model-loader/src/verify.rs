@@ -1,20 +1,20 @@
 //! Does this plan honour its contract?
 //!
 //! Verification is deliberately not a second compiler. It takes the plan
-//! exactly as the driver sees it and asks questions that can be answered from
+//! exactly as the engine sees it and asks questions that can be answered from
 //! the plan alone plus the filesystem — which is what makes it a *second
 //! opinion* rather than a restatement (`architecture.md` §8). The compiler and
 //! this module share no code: if `compile` had a bug that made it emit a plan
 //! that does not produce a declared tensor, nothing in `compile` would notice,
 //! because the same wrong belief produced both halves.
 //!
-//! There is no driver-side counterpart. `loaded_model.cpp` used to compare a
+//! There is no engine-side counterpart. `loaded_model.cpp` used to compare a
 //! covered count against a demanded one, which was `if (x != x)` twice over:
 //! first because both were assigned from `view.tensors.len`, and then, once the
 //! contract gave them separate origins, because `check_contract` below throws
 //! on the only way they could differ. Counting again on the far side of a
 //! boundary only looked like a check, and there is no far side now — that
-//! driver was deleted, and its callers call this.
+//! engine was deleted, and its callers call this.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -77,7 +77,7 @@ pub struct TensorView<'a> {
     /// different code, so two spellings of the same quantization must not read
     /// as a disagreement.
     pub encoding: Encoding,
-    /// Whether the driver binds this name. An [`Visibility::Internal`]
+    /// Whether the engine binds this name. An [`Visibility::Internal`]
     /// declaration is a name the contract needed for itself, so it is typed and
     /// planned like any other but never finalized.
     pub visibility: Visibility,
@@ -108,7 +108,7 @@ pub struct ContractView<'a> {
 
 /// One tensor the runtime demands.
 ///
-/// Every demand is read off a contract the driver authored, so the encoding is
+/// Every demand is read off a contract the engine authored, so the encoding is
 /// always pinned: a contract states the encoding of every tensor it defines.
 /// The shape is pinned only when the contract declared one — a contract may
 /// decline to predict a shape (`TensorContract::inferred`), and inventing one
@@ -123,7 +123,7 @@ pub struct ContractView<'a> {
 /// is left here is what a second opinion can actually hold: the tensor is
 /// present, and its encoding is what was asked for.
 ///
-/// There is no `optional`. It existed for a driver that declared the tensors it
+/// There is no `optional`. It existed for an engine that declared the tensors it
 /// would bind without authoring them, and could only guess whether a weight it
 /// named would be present; a contract does not guess, because the author read
 /// the checkpoint's tensor table before writing it. A tied-embedding checkpoint
@@ -228,7 +228,7 @@ impl fmt::Display for Certificate {
 /// Check a plan against the contract it declares.
 ///
 /// The contract a plan carries is its `tensors` list: those are the names and
-/// types a driver will look up after the load. Everything below asks whether
+/// types an engine will look up after the load. Everything below asks whether
 /// the instruction stream actually delivers them.
 pub fn verify(
     plan: &PlanView<'_>,
@@ -290,13 +290,13 @@ fn check_schedule(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
 /// Every public declaration must be finalized, under its declared name, exactly
 /// once — and nothing else may be.
 ///
-/// A public `TensorDecl` with no `Finalize` is a weight the driver will look up
-/// and not find. A `Finalize` with no `TensorDecl` is a name the driver was
+/// A public `TensorDecl` with no `Finalize` is a weight the engine will look up
+/// and not find. A `Finalize` with no `TensorDecl` is a name the engine was
 /// never told to expect. Both are the plan disagreeing with itself.
 ///
 /// The declaration table and the bind table are not the same set, which is what
 /// [`Visibility`] says: an internal declaration is a name later expressions
-/// resolve through, and finalizing it would put in the driver's hands the very
+/// resolve through, and finalizing it would put in the engine's hands the very
 /// tensor the contract asked to keep.
 fn check_coverage(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
     let mut finalized: HashMap<&str, usize> = HashMap::new();
@@ -309,7 +309,7 @@ fn check_coverage(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
         if !declared.insert(tensor.name) {
             found.push(Violation::tensor(
                 tensor.name,
-                "is declared more than once, so a driver's lookup is ambiguous",
+                "is declared more than once, so an engine's lookup is ambiguous",
             ));
         }
         match (tensor.visibility, finalized.get(tensor.name)) {
@@ -320,7 +320,7 @@ fn check_coverage(plan: &PlanView<'_>, found: &mut Vec<Violation>) {
             (Visibility::Public, Some(1)) | (Visibility::Internal, None) => {}
             (Visibility::Internal, Some(_)) => found.push(Violation::tensor(
                 tensor.name,
-                "is internal but finalized, so the driver would bind a name the \
+                "is internal but finalized, so the engine would bind a name the \
                  contract asked to keep to itself",
             )),
             (Visibility::Public, Some(count)) => found.push(Violation::tensor(
@@ -468,14 +468,14 @@ fn check_contract(plan: &PlanView<'_>, contract: &ContractView<'_>, found: &mut 
     // The converse is not a violation by symmetry: a contract may publish views
     // alongside the buffer they borrow — packed MoE experts republished under
     // their original names, as `tests/storage_compiler.rs` pins for Nemotron-H —
-    // and a given driver may never bind them. Producing more than was demanded
+    // and a given engine may never bind them. Producing more than was demanded
     // costs a name, not correctness. Producing less is the failure.
 }
 
 /// Compare two encodings over the fields a plan can actually carry.
 ///
 /// A [`PlanView`] can arrive two ways: from a plan the loader still holds in
-/// typed form, or rebuilt from the POD arena the driver received. The POD
+/// typed form, or rebuilt from the POD arena the engine received. The POD
 /// `TensorDecl` carries `scheme`, `dtype`, `bits_per_element` and `group_size`
 /// and nothing else, because the rest of [`QuantSpec`] had no reader on the far
 /// side — the scale tensor's axis, dtype and granularity are stated on the
@@ -508,13 +508,13 @@ fn encoding_matches(planned: &Encoding, demanded: &Encoding) -> bool {
 /// # Why this did not exist before
 ///
 /// Verification used to run only on the MARSHALLED plan — the POD form a C++
-/// driver held — and model-loader-capi::view::verify_marshalled was the only
+/// engine held — and model-loader-capi::view::verify_marshalled was the only
 /// way in. Its own doc explained the choice: "Verification runs *here*, on the
 /// marshalled bytes, and nowhere else. There is no path that verifies the Rust
 /// plan directly, and that is the point: a bug in the marshalling is in scope
 /// for every caller."
 ///
-/// That was right while a marshalling existed. Both drivers are Rust now and
+/// That was right while a marshalling existed. Both engines are Rust now and
 /// read [`LoadPlan`] itself, so the POD form and the bug class it guarded
 /// against are gone together — and routing verification through a C round-trip
 /// that no longer happens would be checking a translation nobody performs.
@@ -597,7 +597,7 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
 ///
 /// The instances are the point. A group's plan is compiled at index 0, so
 /// verifying it alone checks one instance out of `arity` and leaves the other
-/// bindings — which are what the driver will actually read — unchecked.
+/// bindings — which are what the engine will actually read — unchecked.
 /// Rewriting the template's reads with each instance's binding and running the
 /// same file-bounds check over the result is the cheapest way to say "every
 /// instance stays inside its file", and it reuses the check rather than

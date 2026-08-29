@@ -63,7 +63,7 @@ same 4× for the same reason.
 
 ```bash
 cargo build --release --target wasm32-wasip2
-python tests/inferlets/run_all.py --driver cuda_native --model <model-path>
+python tests/inferlets/run_all.py --engine cuda_native --model <model-path>
 ```
 
 The suite includes an **identity control**: at `guidance = 1.0` the rule

@@ -23,13 +23,13 @@ use super::symbolic::{Dimension, SymbolicType, symbolic_result_type};
 
 /// What a normalized value is *about*, coarsely.
 ///
-/// Read for meaning by nothing — no emitter, planner or driver branches on it.
+/// Read for meaning by nothing — no emitter, planner or engine branches on it.
 /// It is not dead, though, and deleting it is not a cleanup: it is hashed into
 /// [`StageSignature`](super::signature::StageSignature), whose hash becomes the
-/// emitted kernel's entry-point name (`crate::codegen::program`) and the driver's
+/// emitted kernel's entry-point name (`crate::codegen::program`) and the engine's
 /// pipeline cache key (`launch::build`). So its only observable effect is to
 /// make two stages that agree on every op and type, but disagree here, compile
-/// to differently named kernels that the driver caches apart.
+/// to differently named kernels that the engine caches apart.
 ///
 /// `the_signature_still_depends_on_value_domains` pins that, because the
 /// effect is invisible from this file: the only other thing that would notice
@@ -444,7 +444,7 @@ mod value_domain_tests {
 
     /// [`ValueDomain`] has no reader that branches on it, so the only thing
     /// stopping it from being deleted as dead is that the signature hashes it —
-    /// and that hash is the emitted kernel's entry-point name and the driver's
+    /// and that hash is the emitted kernel's entry-point name and the engine's
     /// pipeline cache key. Deleting the field would rename every kernel in
     /// `golden-{msl,cuda}/`, so it is an ABI change rather than a cleanup.
     ///

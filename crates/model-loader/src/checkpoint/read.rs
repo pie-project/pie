@@ -346,8 +346,8 @@ pub fn parse_checkpoint_tokenizer(snapshot_dir: &Path) -> Result<TokenizerTables
 /// it refuses. Touching the filesystem is this module's job, so the check that
 /// touches it is this module's too.
 ///
-/// Both drivers carried this block, bit for bit, after their own
-/// `plan::compile`. It is not a driver's question: the plan names the files
+/// Both engines carried this block, bit for bit, after their own
+/// `plan::compile`. It is not an engine's question: the plan names the files
 /// and states their sizes, so a snapshot that moved under a plan compiled
 /// against it is a fact about the checkpoint. Catching it here is the
 /// difference between a named file with two byte counts and a fault in the

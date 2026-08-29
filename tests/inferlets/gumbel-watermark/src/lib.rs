@@ -32,7 +32,7 @@
 //! ```
 //!
 //! The multiplier and modulus are kept small deliberately: `h * 31 + token`
-//! stays under 2^26 so the u32 arithmetic cannot overflow, and the driver's
+//! stays under 2^26 so the u32 arithmetic cannot overflow, and the engine's
 //! counter-based RNG does the actual mixing. A weak input hash is fine when it
 //! only has to be *distinct per context*.
 //!

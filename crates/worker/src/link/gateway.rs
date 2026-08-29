@@ -19,9 +19,9 @@
 //!
 //! ## Runtime bridge
 //! Each gateway logical [`SessionId`] maps to one runtime session
-//! ([`::engine::server::open_session`]) — warm KV across a multi-turn session. A
+//! ([`::runtime::server::open_session`]) — warm KV across a multi-turn session. A
 //! per-session driver task feeds each turn's [`Request::message`] into the
-//! runtime ([`::engine::server::send_client_message`]) and pumps the resulting
+//! runtime ([`::runtime::server::send_client_message`]) and pumps the resulting
 //! `ServerMessage`s back out as [`Tokens::Chunk`], terminated by one
 //! [`Tokens::Eos`] when the turn completes. Backpressure is inherent: the
 //! runtime outbox is bounded, so a slow `push_tokens` (slow gateway/user) stalls
@@ -31,7 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use ::engine::server::ClientId;
+use ::runtime::server::ClientId;
 use anyhow::{Context, Result, anyhow};
 use client_api::{ClientMessage, ServerMessage};
 use controller_api::GatewayEndpoint;
@@ -352,7 +352,7 @@ impl WorkerControlServer {
             return Ok(handle.turns.clone());
         }
         let client_id =
-            ::engine::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
+            ::runtime::server::open_session().map_err(|e| anyhow!("open session: {e}"))?;
         let (turns_tx, turns_rx) = mpsc::channel::<Request>(TURN_QUEUE_DEPTH);
         let cancels: Arc<Mutex<HashMap<ReqId, Arc<Notify>>>> = Arc::default();
         tokio::spawn(session_driver(
@@ -550,7 +550,7 @@ async fn session_driver(
 
         // The runtime is fed HERE, in the driver loop, and not from the spawned
         // task. Chunked `AddProgram` uploads arrive as one turn per chunk, and
-        // `crates/engine/src/server/data_transfer.rs` hard-rejects a chunk
+        // `crates/runtime/src/server/data_transfer.rs` hard-rejects a chunk
         // that is not the one it expects next, tearing the upload down. Feeding
         // from the tasks would have made chunk order depend on `JoinSet::spawn`
         // first-poll order across worker threads, which tokio's LIFO slot and
@@ -584,7 +584,7 @@ async fn session_driver(
 
     router.abort();
     running.shutdown().await;
-    ::engine::server::close_session(client_id);
+    ::runtime::server::close_session(client_id);
     // Best-effort removal; if the registry is already gone (the connection's
     // server dropped) the stale entry died with it.
     if let Some(reg) = registry.upgrade() {
@@ -597,7 +597,7 @@ async fn session_driver(
 /// turn that owns it. Runs until aborted by `session_driver`.
 async fn message_router(client_id: ClientId, routes: Arc<Mutex<TurnRoutes>>) {
     loop {
-        let msgs = match ::engine::server::recv_messages(client_id, 200, 64).await {
+        let msgs = match ::runtime::server::recv_messages(client_id, 200, 64).await {
             Ok(msgs) => msgs,
             Err(e) => {
                 tracing::warn!(error = %e, "runtime recv failed; router stopping");
@@ -651,7 +651,7 @@ fn feed_turn(client_id: ClientId, req_id: ReqId, message: ClientMessage) -> Fed 
     let non_final_chunk =
         matches!(upload_chunk_info(&message), Some((idx, total)) if idx + 1 < total);
     let expects_reply = corr_id_of(&message).is_some();
-    if let Err(e) = ::engine::server::send_client_message(client_id, message) {
+    if let Err(e) = ::runtime::server::send_client_message(client_id, message) {
         tracing::warn!(%req_id, error = %e, "feeding turn into runtime failed");
         return Fed::Silent;
     }
@@ -696,7 +696,7 @@ async fn run_turn(
             _ = cancel.notified() => {
                 tracing::debug!(%req_id, "turn cancelled");
                 if let Some(pid) = &process_id {
-                    let _ = ::engine::server::send_client_message(client_id, terminate(pid));
+                    let _ = ::runtime::server::send_client_message(client_id, terminate(pid));
                 }
                 // Abort = bare channel-close on the gateway side (no Eos), per
                 // the Tokens contract; the gateway's TokenRx observes the close.
@@ -714,7 +714,7 @@ async fn run_turn(
                     Ok(Control::Abort) => {
                         tracing::debug!(%req_id, "gateway piggybacked abort");
                         if let Some(pid) = &process_id {
-                            let _ = ::engine::server::send_client_message(client_id, terminate(pid));
+                            let _ = ::runtime::server::send_client_message(client_id, terminate(pid));
                         }
                         return TurnEnd::Aborted;
                     }

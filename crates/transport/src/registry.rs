@@ -1,4 +1,4 @@
-//! Engine registry — binds a driver-exported handle to an engine and dispatches
+//! Engine registry — binds an engine-exported handle to a transfer engine and dispatches
 //! the data-plane lifecycle to it.
 //!
 //! This is the single entry point the runtime drives. It receives the
@@ -19,7 +19,7 @@ use crate::core::{
 };
 use crate::engines::local::{D2dCopier, LocalEngine};
 use crate::error::{Result, TransportError};
-use driver_api::KvHandle;
+use engine_api::KvHandle;
 
 /// Where an outward [`TransferId`] was issued: which engine, and that engine's
 /// own (per-engine) transfer id.
@@ -29,7 +29,7 @@ struct Route {
     inner: TransferId,
 }
 
-/// Binds driver-exported handles to engines and dispatches transfers.
+/// Binds engine-exported handles to transfer engines and dispatches transfers.
 pub struct Registry {
     local: LocalEngine,
     #[cfg(feature = "nixl")]
@@ -95,7 +95,7 @@ impl Registry {
         out
     }
 
-    /// Register a driver-exported handle owned by `owner` with `engine` (the
+    /// Register an engine-exported handle owned by `owner` with `engine` (the
     /// caller picks it from the pairing — co-located → `Local`, cross-node →
     /// `Nixl`).
     pub fn register(

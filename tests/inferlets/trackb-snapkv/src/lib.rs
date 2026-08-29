@@ -89,8 +89,8 @@ struct Input {
     /// makes the per-step cost identical. Defaults to `max_tokens`.
     #[serde(default)]
     reserve_tokens: Option<usize>,
-    /// Prefill chunk width, clamped to the driver's `max_embed_length()`.
-    /// Defaults to that limit, i.e. the fewest chunks the driver allows.
+    /// Prefill chunk width, clamped to the engine's `max_embed_length()`.
+    /// Defaults to that limit, i.e. the fewest chunks the engine allows.
     /// Forcing it down runs the multi-chunk path on a short prompt, which is
     /// the only way to test chunk equivalence without a 16K-token prompt.
     #[serde(default)]
@@ -141,13 +141,13 @@ struct Output {
     /// How many fires the prefill was split into, and how many tokens the
     /// FINAL (observed) one carried. Reported because the observation window
     /// is the last `window` rows *of that chunk*: if `prefill_final` drops
-    /// below the driver's window the observation is silently truncated, and a
+    /// below the engine's window the observation is silently truncated, and a
     /// truncated window still produces a plausible-looking ranking. With even
     /// chunking `prefill_final == prompt_len / prefill_chunks`, the largest a
     /// last chunk can be.
     prefill_chunks: u32,
     prefill_final: u32,
-    /// KV page size, reported so a consumer can convert the driver's
+    /// KV page size, reported so a consumer can convert the engine's
     /// observation window (a token count) into the page span it covers.
     page_size: u32,
     /// Layers that reported a score row during the single prefill fire. This is
@@ -160,7 +160,7 @@ struct Output {
     /// capture writes one entry per LIVE kv position and nothing else.
     tail_nonzero: usize,
     /// One past the highest slot carrying attention mass, i.e. the prompt
-    /// length as the DRIVER saw it. Reported next to `prompt_len` because a
+    /// length as the ENGINE saw it. Reported next to `prompt_len` because a
     /// disagreement between the two means the row describes different positions
     /// than the program thinks it does.
     observed_live: usize,
@@ -221,7 +221,7 @@ async fn main(input: Input) -> Result<Output> {
     // Like Quest's `p_max` and H2O's, the program declares a static ceiling for
     // the score row; the backend refuses (rather than truncates) a request that
     // outgrows it. Sized off `max_pages` so it is an exact multiple of the page
-    // geometry the driver derives its own length from.
+    // geometry the engine derives its own length from.
     let kv_max = max_pages * page_size;
     let p_max = max_pages;
     let prompt_pages = n.div_ceil(page_size).min(p_max);

@@ -18,7 +18,7 @@
 //! `mask_indptr` is therefore a BYTE offset, and a request has to start on a
 //! byte boundary or its first row reads its neighbour's tail.
 //!
-//! This driver published one BYTE per pair, with the CSR counting pairs. The
+//! This engine published one BYTE per pair, with the CSR counting pairs. The
 //! kernel then fetched pair `8i`'s byte for all of pairs `8i..8i+8` and took
 //! bit `k % 8` of a value that is only ever 0 or 1 -- so one position in eight
 //! was read at all, and the other seven were forced closed. Every attention
@@ -50,13 +50,13 @@
 //! snapshot change moves the text, and would not move the agreement.
 //!
 //! Run:
-//!   cargo test --release -p worker --features driver-cuda-13 \
+//!   cargo test --release -p worker --features engine-cuda-13 \
 //!     --test cuda_element_mask_packing -- --ignored --nocapture
 
 mod common;
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local model snapshot"]
+#[ignore = "real-hardware: needs an RTX GPU + --features engine-cuda-13 + a local model snapshot"]
 fn a_causal_user_mask_answers_what_no_mask_answers() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -88,7 +88,7 @@ fn a_causal_user_mask_answers_what_no_mask_answers() {
         for (bisect, text) in &answers[..2] {
             assert_eq!(
                 text, reference,
-                "a causal mask changed the answer (bisect={bisect}): the driver's \
+                "a causal mask changed the answer (bisect={bisect}): the engine's \
                  mask layout no longer matches what the kernels read"
             );
         }

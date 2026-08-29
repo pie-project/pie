@@ -37,7 +37,7 @@ pub enum Dtype {
     E8m0,
 }
 
-/// The whole surviving shape algebra. Symbolic dims are sized by engine
+/// The whole surviving shape algebra. Symbolic dims are sized by runtime
 /// budgets (`Tokens` → max_tokens, `Lanes` → max_lanes) when the arena is cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Dim {
@@ -86,8 +86,8 @@ pub enum GeomKind {
     WriteOffset,
 }
 
-/// What the driver binds each fire. Geometry is a declared input, not implicit
-/// driver state: cache ops become pure functions of visible inputs.
+/// What the engine binds each fire. Geometry is a declared input, not implicit
+/// engine state: cache ops become pure functions of visible inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuntimeInput {
     Tokens,
@@ -126,7 +126,7 @@ pub enum Ty {
 /// Where a value comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Def {
-    /// Bound by the driver each fire.
+    /// Bound by the engine each fire.
     Input(RuntimeInput),
     /// Index into `Trace::params`. Weights are plain values — no `WeightId`;
     /// the compiler skips non-`Op` defs during allocation.

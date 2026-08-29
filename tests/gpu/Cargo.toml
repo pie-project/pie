@@ -3,7 +3,7 @@ name = "pie-gpu-tests"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The engine's on-device end-to-end suite: boots the real standalone through the real client edge and asserts what the driver produced."
+description = "The runtime's on-device end-to-end suite: boots the real standalone through the real client edge and asserts what the engine produced."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 # Nothing depends on this crate and it has no code of its own. It exists to own
@@ -18,12 +18,12 @@ test = false
 doctest = false
 
 [features]
-# Forwarded to the composition root, which is what selects the driver. There
-# is no fallback: the dummy driver these no-GPU diagnostics used to run
+# Forwarded to the composition root, which is what selects the engine. There
+# is no fallback: the dummy engine these no-GPU diagnostics used to run
 # against is deleted, so a build with neither feature reaches no device.
 default = []
-driver-cuda-12 = ["pie/driver-cuda-12"]
-driver-cuda-13 = ["pie/driver-cuda-13"]
+engine-cuda-12 = ["pie/engine-cuda-12"]
+engine-cuda-13 = ["pie/engine-cuda-13"]
 
 [dev-dependencies]
 # The composition root. These tests boot the same `run_standalone` a `pie
@@ -34,14 +34,14 @@ pie = { path = "../.." }
 client = { path = "../../crates/client" }
 # The runtime lib — read `inference::get_stats()` in-process to observe the
 # scheduler's fire probes (the thrust-2 bubble/quorum gate) after a decode.
-engine = { path = "../../crates/engine" }
+runtime = { path = "../../crates/runtime" }
 
 anyhow = "1.0"
 tokio = { version = "1.53", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3"
-# `cuda_boot_smoke` drives one turn through the booted engine's HTTP ingress
+# `cuda_boot_smoke` drives one turn through the booted runtime's HTTP ingress
 # (`POST /v1/generate`), which is the one client surface no other gate here
 # touches.
 #
@@ -55,9 +55,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # Diagnostic trace subscriber for the inproc forward-path probes (RUST_LOG).
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `libc` STOOD HERE. Its one user was `cuda_declared_family_parity`, which
-# captured fd 2 to assert on what the driver printed during a fire. That gate
+# captured fd 2 to assert on what the engine printed during a fire. That gate
 # went in the census wave: its OFF/ON polarity was `PIE_DECLARED_FORWARD`, an
 # environment switch no crate in this tree reads any more, because the declared
 # model text is the only forward this build has. What asks the per-family
-# question now is `driver/tests/every_sku_walks_its_classes` over the whole
-# catalog and `driver-cuda/tests/masked_axis::every_sku_probes_its_caches`.
+# question now is `engine/tests/every_sku_walks_its_classes` over the whole
+# catalog and `engine-cuda/tests/masked_axis::every_sku_probes_its_caches`.

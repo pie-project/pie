@@ -3,7 +3,7 @@
 """
 The pipeline is an ordering domain, not the owner of any working set
 (kv_refact.md). Every command on every pipeline enters the single
-per-driver sequencer queue in program order and is linearized there; a
+per-engine sequencer queue in program order and is linearized there; a
 pipeline names the ordering domain a command belongs to. Device-visible
 working-set mutations (`working-set.wit`) and forward submissions
 (`forward.wit`) take `borrow<pipeline>`.

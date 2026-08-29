@@ -74,12 +74,12 @@ def output_vocab_size() -> int:
     tokenizer's vocabs() token count due to padding. Use THIS for
     sampler-program lowering and any logits-shaped op; use vocabs() only for
     token-space work. Sourced from the model (not hardcoded) so the
-    inferlet's lowering vocab == the driver's logits / recognizer-table vocab.
+    inferlet's lowering vocab == the engine's logits / recognizer-table vocab.
     """
     raise NotImplementedError
 def kv_page_size() -> int:
     """
-    Tokens per KV page for the bound model/driver.
+    Tokens per KV page for the bound model/engine.
     """
     raise NotImplementedError
 def frame_size() -> int:
@@ -119,7 +119,7 @@ def max_embed_length() -> int:
 def rs_state_size() -> int:
     """
     ── Working-set / arena capabilities (global, over the bound model) ──
-    Memory-shaping parameters of the bound model's driver, so an inferlet
+    Memory-shaping parameters of the bound model's engine, so an inferlet
     can size working sets and validate fold lengths before allocating.
     Size in bytes of one folded recurrent-state object. 0 if the model has
     no recurrent state (pure attention).

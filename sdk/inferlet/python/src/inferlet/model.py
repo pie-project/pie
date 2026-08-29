@@ -50,7 +50,7 @@ def output_vocab_size() -> int:
 
 
 def kv_page_size() -> int:
-    """Tokens per KV page for the bound model/driver."""
+    """Tokens per KV page for the bound model/engine."""
     return _model.kv_page_size()
 
 

@@ -4,16 +4,16 @@
 //! SPMD fire, enqueued like any launch and never synchronised on.
 //!
 //! Communicator SETUP — `ncclGetUniqueId`, rank exchange, `ncclCommInitRank`
-//! — is engine/driver boot business, outside the plan (design §9); the
+//! — is runtime/engine boot business, outside the plan (design §9); the
 //! [`Ctx`] arrives with the communicator already open, or with none, and a
 //! collective on a comm-less context is a typed refusal. That order is also
 //! the availability proof: a live communicator can only exist because the
-//! driver already loaded `libnccl` to build it, so no entry probes for the
+//! engine already loaded `libnccl` to build it, so no entry probes for the
 //! library.
 //!
 //! The old plane's P2P custom all-reduce (`comm.rs`: the vllm cross-device
 //! reduction and flashinfer's fused lamport landing) is NOT carried in this
-//! wave — it was bound to driver-built peer workspaces and the by-value abi,
+//! wave — it was bound to engine-built peer workspaces and the by-value abi,
 //! and it only ever spelled `all_reduce`. NCCL spells all three variants
 //! uniformly; the crossover tuning can return later as selection *below*
 //! these entries, where decision #13 keeps it.

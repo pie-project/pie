@@ -119,7 +119,7 @@ fn list() -> Result<Answer> {
         .into_iter()
         .map(|entry| {
             let exists = entry.path.exists();
-            // `entry.size()`, not `disk_usage(entry.path)`: the driver cache
+            // `entry.size()`, not `disk_usage(entry.path)`: the engine cache
             // physically contains the weight cache and the planner profile,
             // and each of those is its own row. Summing the raw trees counted
             // their bytes twice, so the "reclaimable" total below overstated
@@ -240,7 +240,7 @@ fn clear(names: Vec<String>, skip_confirm: bool) -> Result<Answer> {
     let mut freed = 0u64;
     for (entry, size) in &present {
         // `entry.remove()` rather than a blanket `remove_dir_all`, so clearing
-        // `driver` leaves behind the two things inside it that are somebody
+        // `engine` leaves behind the two things inside it that are somebody
         // else's: the weight cache, which is its own row, and the planner
         // profile, which no boot rebuilds.
         match entry.remove() {
@@ -278,7 +278,7 @@ mod tests {
         let err = selected(&["ptir".to_string()]).unwrap_err().to_string();
         assert!(err.contains("unknown entry"), "got: {err}");
         assert!(
-            err.contains("driver"),
+            err.contains("engine"),
             "should list the real names; got: {err}"
         );
     }

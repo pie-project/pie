@@ -1,6 +1,6 @@
 //! `Norm`: the rms family, residual folds, and scalar gains — one entry per
 //! IR variant. Selection (which unit, which element stamp) lives here, so
-//! the driver's dispatch arm stays destructure → resolve → call.
+//! the engine's dispatch arm stays destructure → resolve → call.
 
 use kernels::KernelError;
 use model_ir::Dtype;

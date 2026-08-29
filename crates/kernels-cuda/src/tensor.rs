@@ -21,7 +21,7 @@ use crate::jit::ArgValue;
 /// behind a `CUdeviceptr`-shaped address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tensor {
-    /// The device address, resolved by the driver (arena offset, weight
+    /// The device address, resolved by the engine (arena offset, weight
     /// table, or pool) before this handle reaches an entry.
     pub ptr: u64,
 
@@ -62,7 +62,7 @@ impl Tensor {
 /// `indptr` is the one indptr of the whole fire — `i32`, `[lanes + 1]` — and
 /// every fire-aligned value can be viewed through it. Boundary-oblivious
 /// kernels take `data` alone; boundary-aware entries (`prefill`,
-/// `*_chunked`) take the pair, already built by the driver.
+/// `*_chunked`) take the pair, already built by the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RaggedTensor {
     pub data: Tensor,
@@ -72,7 +72,7 @@ pub struct RaggedTensor {
 }
 
 /// The paged kv cache a fire reads and appends into — the old `PagedKvView`,
-/// dtype-erased. Storage plus the page geometry the driver resolved from
+/// dtype-erased. Storage plus the page geometry the engine resolved from
 /// declared inputs (design §7); this is what the pool pointer resolves to.
 ///
 /// Erasure retired two fields outright: `storage_dtype` and `native_bf16`

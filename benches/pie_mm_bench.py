@@ -2,7 +2,7 @@
 """Pie multimodal (image) latency/throughput benchmark.
 
 The Pie-side counterpart to `vllm_mm_bench.py`. Starts the embedded server with
-the `cuda_native` driver, installs the `image-qa-bench` inferlet, and drives it
+the `cuda_native` engine, installs the `image-qa-bench` inferlet, and drives it
 with a fixed local image + question per request. The inferlet returns exact
 prompt and output token counts (prompt = text tokens + image soft-token rows),
 so the accounting matches vLLM's.
@@ -67,10 +67,10 @@ def bench_inferlet_paths(inferlet_dir: str) -> tuple[Path, Path, str]:
 def build_config(args: argparse.Namespace, port: int):
     from pie.config import (
         Config,
-        DriverConfig,
+        EngineConfig,
         ModelConfig,
         RuntimeConfig,
-        SchedulerConfig,
+        SandboxConfig,
         ServerConfig,
         TelemetryConfig,
     )
@@ -81,17 +81,18 @@ def build_config(args: argparse.Namespace, port: int):
     else:
         max_concurrent = None if args.concurrency == 0 else args.concurrency
 
-    driver_options = {
+    engine_options = {
         "gpu_mem_utilization": args.gpu_mem_util,
-        "ready_timeout": f"{int(args.server_startup_timeout)}s",
     }
     requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
         "speculation_depth": args.speculation_depth,
+        # Admission is scheduling, so the cap rides with the batching knobs.
+        "max_concurrent_processes": max_concurrent,
     }
-    scheduler_parameters = inspect.signature(SchedulerConfig).parameters
+    scheduler_parameters = inspect.signature(RuntimeConfig).parameters
     scheduler_kwargs = {
         key: value
         for key, value in requested_scheduler_kwargs.items()
@@ -102,33 +103,35 @@ def build_config(args: argparse.Namespace, port: int):
             host="127.0.0.1",
             port=port,
             verbose=True,
-            max_concurrent_processes=max_concurrent,
         ),
         telemetry=TelemetryConfig(),
-        runtime=RuntimeConfig(
+        runtime=RuntimeConfig(**scheduler_kwargs),
+        sandbox=SandboxConfig(
             # See pie_bench.py: a pooling slot costs ~4 GiB of virtual address
             # space, so this must track the admission cap, not the total
             # request count, or the reservation exceeds the 128 TiB user VA
             # limit and the engine panics inside mmap.
-            wasm_max_instances=max(4096, (max_concurrent or 0) * 4),
+            max_instances=max(4096, (max_concurrent or 0) * 4),
         ),
         model=ModelConfig(
             name="default",
             hf_repo=args.model,
-            scheduler=SchedulerConfig(**scheduler_kwargs),
-            driver=DriverConfig(
-                type=args.driver,
+            engine=EngineConfig(
+                type=args.engine,
                 device=device,
                 tensor_parallel_size=args.tp_size,
                 activation_dtype=args.activation_dtype,
-                options=driver_options,
+                # Stated once for every engine now, so it is a common
+                # `[engine]` key rather than one of the backend's options.
+                ready_timeout=f"{int(args.server_startup_timeout)}s",
+                options=engine_options,
             ),
         ),
     )
     config_blob = {
         "modality": "image",
         "image": args.image,
-        "driver": args.driver,
+        "engine": args.engine,
         "endowment_pages": args.endowment_pages,
         "gpu_mem_utilization": args.gpu_mem_util,
         "max_concurrent_processes": max_concurrent,
@@ -224,7 +227,7 @@ async def run(args: argparse.Namespace):
 
             # Diagnostic: did the scheduler coalesce concurrent contexts into
             # batched forward passes, and where does per-batch time go?
-            #   avg_batch_latency_us ≈ time INSIDE the forward pass (driver).
+            #   avg_batch_latency_us ≈ time INSIDE the forward pass (engine).
             #   wall/total_batches   ≈ time per batch INCLUDING gaps (runtime).
             # If wall/batch >> avg_batch_latency_us, the cost is between passes
             # (dispatch / per-process round-trips), not in the GPU forward pass.
@@ -250,7 +253,7 @@ async def run(args: argparse.Namespace):
                     if tb:
                         sys.stderr.write(
                             f"[stat] wall/batch = {wall / tb * 1e3:.1f} ms | "
-                            f"driver/batch = {cum / tb / 1e3:.1f} ms | "
+                            f"engine/batch = {cum / tb / 1e3:.1f} ms | "
                             f"gap/batch = {(wall - cum / 1e6) / tb * 1e3:.1f} ms\n"
                         )
                     sys.stderr.flush()
@@ -279,7 +282,7 @@ def main() -> None:
                         help="Path to a built image-qa-bench inferlet project.")
         sp.add_argument("--question",
                         default="What is in this image? Answer in one sentence.")
-        sp.add_argument("--driver", default="cuda_native")
+        sp.add_argument("--engine", default="cuda_native")
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--activation-dtype", default="bfloat16")
         sp.add_argument("--endowment-pages", type=int, default=64,

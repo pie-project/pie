@@ -26,11 +26,11 @@ const VECTOR_GROUP: u32 = 128;
 const LANES_PER_COLUMN: u32 = 32;
 
 pub fn matmul(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), KernelError> {
-    act_x_wt(ctx, "gemm.matmul", act, w, y)
+    act_x_wt(ctx, "linear.matmul", act, w, y)
 }
 
 pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), KernelError> {
-    act_x_wt(ctx, "gemm.lm_head", act, w, y)
+    act_x_wt(ctx, "linear.lm_head", act, w, y)
 }
 
 /// `y = act x w^T`. Skinny fires (fewer than [`TILE_M`] rows — the decode

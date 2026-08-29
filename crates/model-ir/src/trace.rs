@@ -31,7 +31,7 @@ pub enum Shard {
 /// runtime story: the loader lands it once and the address never moves again.
 /// An adapter bank is the same STORAGE with a different provenance — reserved
 /// at load from its own declared shape, written between fires by
-/// `Driver::register_adapter`, read on the fire path by a routed op that
+/// `Engine::register_adapter`, read on the fire path by a routed op that
 /// indexes its first axis with per-row ids (`RuntimeInput::AdapterRoutes`).
 ///
 /// So the seat is not a new `Def`: MoE already showed that a runtime-indexed
@@ -47,7 +47,7 @@ pub enum ParamSource {
     /// contract lands it once and it never changes again.
     #[default]
     Checkpoint,
-    /// Reserved at load and zeroed; written by `Driver::register_adapter`.
+    /// Reserved at load and zeroed; written by `Engine::register_adapter`.
     /// **ZEROED IS THE IDENTITY**, which is what makes an unregistered row of
     /// a bank the base model rather than garbage — the correction's `A` is
     /// zero, so its `ΔW·x` is zero, so `y` is what it already was.
@@ -78,7 +78,7 @@ pub enum CacheRow {
     /// latent page, whose two planes are not the same width. The shell
     /// allocates what is declared here and checks a launch's restatement
     /// against it where a launch restates one. `dtype` is declared by the
-    /// model, not chosen by the driver — the append kernel and the plane bytes
+    /// model, not chosen by the engine — the append kernel and the plane bytes
     /// both follow from it. `space` is the geometry group this cache's rows
     /// belong to — kv caches of all layers share one space; pool/index spaces
     /// are their own.

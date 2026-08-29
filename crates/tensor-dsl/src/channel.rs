@@ -201,7 +201,7 @@ impl Channel {
 
     /// Record a host-consumer endpoint span for a `take` — the readback
     /// counterpart of [`note_host_put`](Self::note_host_put). The bytes cross
-    /// the driver boundary, so there is no in-program value to hand back.
+    /// the engine boundary, so there is no in-program value to hand back.
     #[track_caller]
     pub fn note_host_take(&self) {
         self.state.borrow_mut().host_takes.push(Span::here());
@@ -236,7 +236,7 @@ impl Channel {
     /// `take()` — full ⇒ value + empty; empty ⇒ block. The in-program taken
     /// [`Tensor`], for use inside a stage closure. A host channel has no
     /// in-program value: use [`note_host_take`](Self::note_host_take) and read
-    /// the bytes across the driver instead.
+    /// the bytes across the engine instead.
     #[track_caller]
     pub fn take(&self) -> Tensor {
         let span = Span::here();
@@ -301,7 +301,7 @@ fn host_take_poison(chan: &ChannelRef) -> Tensor {
     let st = chan.borrow();
     crate::value::poison_const(
         alloc::format!(
-            "channel {} is a host channel: its take crosses the driver boundary and has no \
+            "channel {} is a host channel: its take crosses the engine boundary and has no \
              in-program value",
             st.name
         ),
@@ -327,7 +327,7 @@ pub enum PutValue {
     /// An in-program value: a [`Tensor`] recorded into the trace.
     Tensor(Tensor),
     /// Host bytes: a [`ConstData`] seed or host-writer payload staged across
-    /// the driver.
+    /// the engine.
     Data(ConstData),
 }
 

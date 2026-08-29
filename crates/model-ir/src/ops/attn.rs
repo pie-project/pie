@@ -60,7 +60,7 @@ pub enum Attention {
         o: ValueId,
     },
     /// Prefill against a query-provided mask instead of the causal one;
-    /// the op names the `mask` it applies, not the driver.
+    /// the op names the `mask` it applies, not the engine.
     Masked {
         q: ValueId,
         plan: ValueId,

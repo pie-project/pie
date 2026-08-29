@@ -16,14 +16,14 @@
 //! be missing, and would let a typo in a store name quietly become a relative
 //! path that does not exist either.
 //!
-//! An HF snapshot directory still resolves, because the driver can still load
+//! An HF snapshot directory still resolves, because the engine can still load
 //! one and the migration is not finished. It is not the intended input: it
 //! carries no compiled metadata, so serving it goes back to parsing
 //! `config.json` at boot, which is the thing the artifact exists to stop.
 
 use std::path::{Path, PathBuf};
 
-use ::engine::model::ModelMetadata;
+use ::runtime::model::ModelMetadata;
 use anyhow::{Result, anyhow, bail};
 
 /// The artifact object the checkpoint's own `config.json` is written under.
@@ -44,10 +44,10 @@ pub const CONFIG_OBJECT: &str = "model/config";
 /// disagree with the first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Model {
-    /// A `.zt` artifact: everything the driver needs, in one file.
+    /// A `.zt` artifact: everything the engine needs, in one file.
     Artifact(PathBuf),
     /// A HuggingFace snapshot directory, or a single checkpoint file. Legacy:
-    /// no compiled metadata, so the driver falls back to `config.json`.
+    /// no compiled metadata, so the engine falls back to `config.json`.
     Snapshot(PathBuf),
 }
 
@@ -58,7 +58,7 @@ impl Model {
         }
     }
 
-    /// Everything the runtime and the drivers need, lifted in **one** open.
+    /// Everything the runtime and the engines need, lifted in **one** open.
     ///
     /// The config is always produced: an artifact carries it embedded and a
     /// snapshot has it on disk, and both hand over the SAME bytes. That is
@@ -119,7 +119,7 @@ impl Model {
 ///
 /// It used to run the config through an 845-line normalizer into a
 /// `pie.model/1` descriptor — ~40 fields, resolved from a 136-field
-/// schema — so that a driver would not have to parse HuggingFace's
+/// schema — so that an engine would not have to parse HuggingFace's
 /// spelling variations itself. That was the right shape of answer to
 /// the wrong question. Every one of those fields except three is a
 /// fact about the MODEL, and a model is a catalog row now: the row
@@ -142,7 +142,7 @@ impl Model {
 /// cannot be told apart from a config that states that value.
 ///
 /// A missing or unreadable `config.json` is an error here, not a
-/// fallback. It used to be one: the driver would find nothing and parse
+/// fallback. It used to be one: the engine would find nothing and parse
 /// the file itself. That branch is what this function exists to delete,
 /// so restoring it as an error path would restore the thing being
 /// removed.
@@ -167,7 +167,7 @@ fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
             config.display(),
         )
     })?;
-    // Parsed only to REFUSE a config that is not JSON. A driver that
+    // Parsed only to REFUSE a config that is not JSON. An engine that
     // received an unparseable document would refuse it too, but several
     // frames later and with a snapshot already half-opened.
     serde_json::from_str::<serde_json::Value>(&raw)
@@ -298,7 +298,7 @@ mod tests {
     }
 
     /// A snapshot directory and a lone checkpoint still resolve, and say they
-    /// are legacy — the driver reads `config.json` for those, which is what
+    /// are legacy — the engine reads `config.json` for those, which is what
     /// the artifact removes.
     #[test]
     fn snapshots_resolve_as_legacy() {
@@ -444,7 +444,7 @@ mod tests {
     /// for byte.**
     ///
     /// This is the property that let the second and third normalizers go — the
-    /// drivers' `config.json` parsers and the runtime's own key probes — so it
+    /// engines' `config.json` parsers and the runtime's own key probes — so it
     /// is pinned rather than left implied. If a snapshot ever again reaches
     /// them without one, there is nothing left to fall back to.
     ///

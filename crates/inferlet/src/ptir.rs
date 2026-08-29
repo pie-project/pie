@@ -692,7 +692,7 @@ impl RsWorkingSet {
         self.rs.buffer_size()
     }
 
-    /// Tokens per buffered RS page for this model/driver. A cached
+    /// Tokens per buffered RS page for this model/engine. A cached
     /// [`crate::model::rs_buffer_page_size`]; see [`WorkingSet::page_size`].
     pub fn buffer_page_size(&self) -> u32 {
         thread_local! {
@@ -864,7 +864,7 @@ impl PassWit for wit_hybrid::ForwardPass {
 /// The PEFT adapter surface's expression vocabulary
 /// ([`Pass::adapter`]): a tiny CLOSED language over the site's input `x`
 /// and base output `y`, classified — never interpreted — into the
-/// driver's CORRECTION lowerings. `mm` multiplies by a channel-borne
+/// engine's CORRECTION lowerings. `mm` multiplies by a channel-borne
 /// weight; `+` composes. Scale/bias join with their forms. (0.3 re-port
 /// of the 0.2 surface; lowering is guest-side into prologue sinks, so no
 /// WIT change rides along.)
@@ -873,7 +873,7 @@ pub mod adapter {
 
     /// Model projection sites, the llama-like bit vocabulary
     /// (crates/driver-cuda/csrc/src/model/lora.hpp `LoraSite` — placement is
-    /// structure; the driver refuses unconsumed sites loudly).
+    /// structure; the engine refuses unconsumed sites loudly).
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Site {
         Q,
@@ -1044,7 +1044,7 @@ pub struct RsGeometry<'a, B> {
     ///
     /// A channel rather than a scalar so that a device-computed accepted count
     /// can drive the fold directly, fusing verify and commit into one fire:
-    /// the driver resolves it as a descriptor port, so the count never
+    /// the engine resolves it as a descriptor port, so the count never
     /// round-trips through the host.
     pub fold_len: Option<&'a Channel>,
     /// Capacity grant, not an address. The buffer's addressing is derived by
@@ -1166,7 +1166,7 @@ impl<W: PassWit> Pass<W> {
     /// in hand and its own doc says it is not the place for per-pass
     /// restrictions.
     ///
-    /// The engine classifies such a pass as pool-owned device geometry
+    /// The runtime classifies such a pass as pool-owned device geometry
     /// (`lease::detect_pooled_device_geometry`), and every descriptor port of
     /// one -- the mask included -- is read back at FRAME ENTRY, before any
     /// slot of the frame has run. So slot 1 of a frame cannot see a token
@@ -1175,12 +1175,12 @@ impl<W: PassWit> Pass<W> {
     /// should size its run-ahead to avoid building it.
     ///
     /// Every entry of `ports` binds a channel, so the port's presence IS the
-    /// channel binding the engine tests for. This is a safe
-    /// over-approximation of the engine's rule -- which also requires the
+    /// channel binding the runtime tests for. This is a safe
+    /// over-approximation of the runtime's rule -- which also requires the
     /// channel to be republished by a traced stage, something no builder can
     /// see -- and it over-approximates in the direction that costs a masked
     /// lane some run-ahead width rather than the direction that submits a
-    /// frame the engine refuses.
+    /// frame the runtime refuses.
     pub fn binds_device_mask(&self) -> bool {
         self.inner
             .borrow()
@@ -1383,7 +1383,7 @@ impl<W: PassWit> Pass<W> {
     /// and base output `y` and returns the corrected output as an
     /// [`adapter`] expression. v0 lowers three forms — LoRA
     /// `y + mm(b, mm(a, x))`, IA3 `scale(y, l)`, and the DoRA composite
-    /// `scale(y + mm(b, mm(a, x)), s)` — into prologue sinks the driver
+    /// `scale(y + mm(b, mm(a, x)), s)` — into prologue sinks the engine
     /// resolves per layer. One adapter per site per pass.
     pub fn adapter(
         &self,
@@ -1394,7 +1394,7 @@ impl<W: PassWit> Pass<W> {
         let expr = f(adapter::Expr::x(), adapter::Expr::y());
         // DoRA: scale(y + mm(b, mm(a, x)), s) — the composite lowers to
         // the low-rank sink THEN the scale sink on the same site (the
-        // driver applies every scale after every delta).
+        // engine applies every scale after every delta).
         if let K::Scale(l, inner) = &expr.kind
             && let K::Add(lhs, rhs) = &inner.kind
         {
@@ -1469,7 +1469,7 @@ impl<W: PassWit> Pass<W> {
         };
         {
             // One pair per SITE (the per-site rung): each call emits its
-            // own lora sink; the driver enforces the same disjointness at
+            // own lora sink; the engine enforces the same disjointness at
             // resolution.
             let mut inner = self.inner.borrow_mut();
             if inner.adapter_lowrank_sites & site.bit() != 0 {
@@ -1558,7 +1558,7 @@ impl<W: PassWit> Default for Pass<W> {
 }
 
 /// Waves per frame (k) for this deployment — the static constant
-/// `forward.submit` sizes its slot list to (cached; fixed at engine start,
+/// `forward.submit` sizes its slot list to (cached; fixed at runtime start,
 /// exactly like the KV page size). Guests must be output-correct for any k.
 pub fn frame_size() -> usize {
     thread_local! {
@@ -1568,10 +1568,10 @@ pub fn frame_size() -> usize {
 }
 
 /// How long a pipeline may hold a frame's wait-set without submitting before
-/// the engine stops waiting for it (cached; static, like `frame_size`).
+/// the runtime stops waiting for it (cached; static, like `frame_size`).
 ///
 /// Measures consecutive silence while actually blocking a seal, and stops
-/// while the engine is what you are waiting on — so a pipeline that keeps
+/// while the runtime is what you are waiting on — so a pipeline that keeps
 /// submitting can never trip it. To stop legitimately, call `Pipeline::park`.
 ///
 /// Overrunning it is not fatal: the slot leaves the frame, work already
@@ -1593,7 +1593,7 @@ pub fn submit_deadline() -> std::time::Duration {
     )
 }
 
-/// Host-reader channel capacity, in cells, that sustains the engine's
+/// Host-reader channel capacity, in cells, that sustains the runtime's
 /// run-ahead for one lane. Size every host-reader channel to at least this.
 ///
 /// Deliberately NOT cached, unlike [`frame_size`]: `frame-size` is promised to
@@ -1624,8 +1624,8 @@ pub fn live_slots() -> usize {
     // template refused every fire carrying RS rows. `299b76320` lifted that:
     // an unbuffered fold-all recurrent decode — the ordinary shape — takes the
     // template and resolves at KERNEL time, so the chained value is there. The
-    // engine's refusal was narrowed to match (`validate_frame` in
-    // `crates/engine/src/pipeline/fire.rs`), and `cuda_rs_buffer_bench`'s
+    // runtime's refusal was narrowed to match (`validate_frame` in
+    // `crates/runtime/src/pipeline/fire.rs`), and `cuda_rs_buffer_bench`'s
     // `coframe` arm proves the shape runs on device with an identical
     // trajectory — and 31.7% faster than the 1-wide arm.
     //
@@ -1668,7 +1668,7 @@ pub fn max_embed_length() -> usize {
 
 /// The `[start, end)` spans a prompt of `n` tokens must be prefilled in.
 ///
-/// The driver's per-launch token capacity ([`max_embed_length`]) is a hard
+/// The engine's per-launch token capacity ([`max_embed_length`]) is a hard
 /// structural limit, so any prompt longer than it has to be split. This is the
 /// split to use, and the reason it is here rather than in each guest is that
 /// the obvious version is subtly wrong.
@@ -1686,7 +1686,7 @@ pub fn max_embed_length() -> usize {
 /// count is identical, every chunk is within one token of every other, and the
 /// final chunk is `floor(n / k)` -- the largest a last chunk can be.
 ///
-/// `cap` overrides the driver limit (clamped to it); pass `None` for the
+/// `cap` overrides the engine limit (clamped to it); pass `None` for the
 /// default. A smaller cap is useful in tests, where forcing the multi-chunk
 /// path on a short prompt is the only practical way to check that concatenating
 /// the chunks reproduces the one-shot fire.
@@ -1699,7 +1699,7 @@ pub fn prefill_chunks(n: u32, cap: Option<u32>) -> Vec<(u32, u32)> {
     even_spans(n, cap)
 }
 
-/// The arithmetic of [`prefill_chunks`], with the driver limit already applied.
+/// The arithmetic of [`prefill_chunks`], with the engine limit already applied.
 /// Split out so it is testable off-device: `max_embed_length` reaches the host.
 fn even_spans(n: u32, cap: u32) -> Vec<(u32, u32)> {
     if n == 0 {
@@ -1747,7 +1747,7 @@ pub fn submit_frame<W: PassWit>(on: &Pipeline, slots: &[Option<&Pass<W>>]) -> Re
     W::submit(&on.wit, &borrows)
 }
 
-/// Keeps the engine's run-ahead window full while `on_token` consumes results,
+/// Keeps the runtime's run-ahead window full while `on_token` consumes results,
 /// submitting `pass` on `on` until `budget` fires have been submitted or
 /// `on_token` returns [`ControlFlow::Break`].
 ///
@@ -1786,7 +1786,7 @@ pub async fn run_ahead<W: PassWit>(
         return Ok(0);
     }
     // A pass that binds a dense device mask takes ONE slot per frame: the
-    // engine resolves its descriptors at frame entry, so a second slot
+    // runtime resolves its descriptors at frame entry, so a second slot
     // chained off the first would read a value that does not exist yet, and
     // `validate_frame` refuses the frame rather than run it. See
     // `Pass::binds_device_mask`.
@@ -1825,7 +1825,7 @@ pub async fn run_ahead<W: PassWit>(
 
     // END OF STREAM. The instant this lane will not submit again, every other
     // lane in the fleet is holding its frame seal for a guest with nothing left
-    // to contribute -- and the engine cannot work that out for itself, because a
+    // to contribute -- and the runtime cannot work that out for itself, because a
     // finished guest and one merely between decode steps look identical to it
     // (empty queue, no outstanding debt). Only the loop that owns `budget`
     // knows, so it has to say so. This is `Pipeline`'s own documented rule:
@@ -1838,7 +1838,7 @@ pub async fn run_ahead<W: PassWit>(
     //
     // Safe with fires still in flight -- close never waits for an unsettled
     // fire, and already-submitted fires settle in FIFO order and stay
-    // take-able. `ended` is not redundant with the engine's own `first_close`
+    // take-able. `ended` is not redundant with the runtime's own `first_close`
     // latch: that latch only suppresses the wait-set notify, while every
     // `close()` still crosses into the host and drains settled entries
     // (measured 3 us p50 at conc 512). So a caller's trailing `close()` stays
@@ -1888,7 +1888,7 @@ pub async fn run_ahead<W: PassWit>(
 // ---------------------------------------------------------------------------
 
 /// A run-ahead ordering domain (overview §3, pipeline.wit) — every command on
-/// it linearizes in submission order through the per-driver sequencer.
+/// it linearizes in submission order through the per-engine sequencer.
 /// Ordering across fires is carried by the channels' full/empty bits, not
 /// host code. Working-set mutators ([`WorkingSet::fork`]/`slice`/`discard`/
 /// `copy_into`) and every pass `submit` take `&Pipeline`.
@@ -1932,7 +1932,7 @@ impl Pipeline {
     /// `submit` rejoins automatically; there is no explicit rejoin. Unlike
     /// `close`, the pipeline stays usable.
     pub fn park(&self) {
-        // Every forward interface declares the same `park`; the engine
+        // Every forward interface declares the same `park`; the runtime
         // implements all three with one function, so the pass kind (which we
         // do not have here — park carries no pass) is irrelevant.
         wit_attention::park(&self.wit);

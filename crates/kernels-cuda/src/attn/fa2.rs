@@ -371,7 +371,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
     )
 }
 
-// ── occupancy probes the driver sizes plans with ────────────────────────────
+// ── occupancy probes the engine sizes plans with ────────────────────────────
 
 /// How many decode blocks one SM holds at this lattice point — the
 /// occupancy fact behind [`decode_max_grid_size`]. Resolves (and so may

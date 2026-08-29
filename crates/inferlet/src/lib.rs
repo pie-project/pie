@@ -86,7 +86,7 @@ pub mod ptir;
 
 pub mod chat;
 
-/// The engine serves exactly one model; these are global functions over
+/// The runtime serves exactly one model; these are global functions over
 /// that single bound model. There is no `Model`/`Tokenizer` handle to pass
 /// around — call `model::encode`, `model::name`, etc. directly.
 pub mod model {
@@ -108,7 +108,7 @@ pub mod runtime {
 }
 
 /// Suspend the current inferlet for `duration` without blocking the host
-/// event loop. Backed by the engine's async timer (host-provided under
+/// event loop. Backed by the runtime's async timer (host-provided under
 /// component-model-async — wasi:clocks 0.2 pollables have no guest-side
 /// future bridge). Use for streaming pacing, retry backoff, etc.
 ///

@@ -55,7 +55,7 @@
 //! ## What the backend does under `intrinsics::attn_score`
 //!
 //! The call lowers to `Op::IntrinsicVal{intr: AttnScore}` at the `on_attn`
-//! stage. The CUDA driver serves it only when the model reports the
+//! stage. The CUDA engine serves it only when the model reports the
 //! `has_attn_score` capability (llama-like family, no sliding window, native
 //! bf16 pages, `tp == 1`, and a decode fire on the plain paged-decode path).
 //! The scores are the softmax probabilities the decode kernel itself computed —
@@ -107,8 +107,8 @@ struct Input {
     /// makes the per-step cost identical. Defaults to `max_tokens`.
     #[serde(default)]
     reserve_tokens: Option<usize>,
-    /// Prefill chunk width, clamped to the driver's `max_embed_length()`.
-    /// Defaults to that limit, i.e. the fewest chunks the driver allows.
+    /// Prefill chunk width, clamped to the engine's `max_embed_length()`.
+    /// Defaults to that limit, i.e. the fewest chunks the engine allows.
     /// Forcing it down runs the multi-chunk path on a short prompt, which is
     /// the only way to test chunk equivalence without a 16K-token prompt.
     #[serde(default)]
@@ -174,7 +174,7 @@ struct Output {
     /// The largest value past the live prefix, for the same check by eye.
     tail_max: f32,
     /// One past the highest slot carrying any attention mass, i.e. the live KV
-    /// length as the DRIVER saw it. Reported next to `kv_len` (the length the
+    /// length as the ENGINE saw it. Reported next to `kv_len` (the length the
     /// program believes it declared) because a disagreement between the two is
     /// the whole failure mode: it means the row describes different positions
     /// than the program thinks it does.
@@ -238,7 +238,7 @@ async fn main(input: Input) -> Result<Output> {
     // `p_max` — it declares a static ceiling and the backend refuses (rather
     // than truncates) a request that outgrows it. Sizing it off `max_pages`
     // rather than `n + max_tokens` keeps it an exact multiple of the page
-    // geometry the driver derives its own length from.
+    // geometry the engine derives its own length from.
     let kv_max = max_pages * page_size;
     let p_max = max_pages;
     let page_budget = input.page_budget.min(p_max);
@@ -254,7 +254,7 @@ async fn main(input: Input) -> Result<Output> {
     // moving. The paper applies it from the first generated token onward.
     //
     // Split into `ceil(n / C)` chunks, `C = max_embed_length()`. A one-shot
-    // fire cannot exceed the driver's per-launch token capacity, which capped
+    // fire cannot exceed the engine's per-launch token capacity, which capped
     // this policy at 8192 prompt tokens; chunk `i` attends over the whole
     // prefix written so far and writes only its own tokens, so the
     // concatenation equals the one-shot fire (section 17).

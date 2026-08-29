@@ -5,7 +5,7 @@
 //! nothing internal, so the controller-, worker-, and client-facing interface
 //! crates can all share one canonical set of id newtypes instead of each
 //! minting its own. These are cross-node control/edge vocabulary (plain serde,
-//! never `#[repr(C)]`/rkyv); the driver ABI keeps its own in-node C ids and does
+//! never `#[repr(C)]`/rkyv); the engine ABI keeps its own in-node C ids and does
 //! NOT depend on this crate.
 
 use serde::{Deserialize, Serialize};

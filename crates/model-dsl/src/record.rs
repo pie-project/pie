@@ -28,7 +28,7 @@ pub struct Recorder {
     inner: Rc<RefCell<Trace>>,
 
     /// The layer the trace is inside, driven by `enter`/`leave` (the
-    /// `Layers` iterator in `forward.rs` is the usual driver).
+    /// `Layers` iterator in `forward.rs` is the usual engine).
     at: Rc<Cell<Option<u32>>>,
 }
 
@@ -159,7 +159,7 @@ impl Recorder {
         ValueId((p.values.len() - 1) as u32)
     }
 
-    /// The value the driver binds for `which`, declared once per input no
+    /// The value the engine binds for `which`, declared once per input no
     /// matter how many layers ask.
     pub fn input(&self, which: RuntimeInput, ty: Ty) -> Value {
         let mut p = self.inner.borrow_mut();

@@ -761,7 +761,7 @@ mod tests {
     ///
     /// The loader compiles in every `ztensor-compat` projection, so it reads
     /// all of them — and a file it read perfectly well used to be handed to
-    /// the driver labelled `Unknown`, which reads as "could not identify" when
+    /// the engine labelled `Unknown`, which reads as "could not identify" when
     /// the truth was "did not bother to say".
     ///
     /// `Unknown` stays for the case this cannot cover: a newer zTensor

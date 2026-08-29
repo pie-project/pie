@@ -22,8 +22,8 @@
 //! A segmented backing STOOD BESIDE THEM — an arena spread over several
 //! allocations, differentially compared against the flat one — and it went
 //! with the executor::chunked module it was the only reader of. That module
-//! was driver-metal's, moved here so the chunk arithmetic could be checked
-//! with no GPU in the build; driver-metal came back at P5a with a baker
+//! was engine-metal's, moved here so the chunk arithmetic could be checked
+//! with no GPU in the build; engine-metal came back at P5a with a baker
 //! executor whose staging is its own, and took no loader dependency with it.
 //! What was left was a public module read by one test of its own crate.
 
@@ -528,7 +528,7 @@ fn named_kernels(plan: &LoadPlan) -> Vec<String> {
 /// A load that completes says so, once.
 ///
 /// `.wiki/fix/weight-loader.md` §8.1: release belongs to the seam, not to the
-/// caller. Before it did, driver-cuda's own staging (deleted with the legacy load contract at R3) called
+/// caller. Before it did, engine-cuda's own staging (deleted with the legacy load contract at R3) called
 /// `arena.finish()?` itself after `run()?` returned — which is the same
 /// sentence with a `?` in the middle of it, and the `?` is the bug. Every
 /// caller had to remember, and on the path where it mattered most none of
@@ -548,7 +548,7 @@ fn a_completed_load_finishes_the_arena_exactly_once() {
 ///
 /// This is the half that reads backwards, so it is worth being explicit about
 /// what it means. `finish` is "the arena is complete, publish it" — a failed
-/// load has nothing to publish, and calling it would hand the driver a
+/// load has nothing to publish, and calling it would hand the engine a
 /// half-written arena that reported success. What must happen instead is
 /// RELEASE, and release is `Drop`, which is why §8.1 added one to `CudaArena`
 /// rather than making the executor call `finish` on both paths.
@@ -621,7 +621,7 @@ fn scratch_plan() -> LoadPlan {
 ///
 /// 206 lib tests and this file did not catch it because every one of them
 /// either passes its own arena or executes a plan with no staging region.
-/// It surfaced from `driver-cuda`'s `gpu_load_transforms`, two crates away,
+/// It surfaced from `engine-cuda`'s `gpu_load_transforms`, two crates away,
 /// where it read as a CUDA failure.
 #[test]
 fn the_executor_allocates_an_arena_its_own_plan_fits_in() {

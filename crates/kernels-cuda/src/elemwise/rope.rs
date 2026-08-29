@@ -48,7 +48,7 @@ const fn rotate_launch(num_tokens: u32, total_heads: u32, per_block: u32, smem: 
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn ramp_bounds(
-    span: i32,
+    head_dim: i32,
     theta: f32,
     beta_fast: f32,
     beta_slow: f32,
@@ -57,14 +57,14 @@ pub fn ramp_bounds(
     const TWO_PI: f32 = core::f32::consts::TAU;
     let ln_theta = theta.ln();
     let corr_dim = |rot: f32| -> f32 {
-        span as f32 * (original_max_position as f32 / (rot * TWO_PI)).ln() / (2.0 * ln_theta)
+        head_dim as f32 * (original_max_position as f32 / (rot * TWO_PI)).ln() / (2.0 * ln_theta)
     };
     let mut low_dim = corr_dim(beta_fast).floor();
     let mut high_dim = corr_dim(beta_slow).ceil();
     if low_dim < 0.0 {
         low_dim = 0.0;
     }
-    let max_pair = (span / 2) as f32 - 1.0;
+    let max_pair = (head_dim / 2) as f32 - 1.0;
     if high_dim > max_pair {
         high_dim = max_pair;
     }

@@ -4,7 +4,7 @@
 //! The worker lib resolves already-present snapshots (`weights::resolve`); this
 //! crate owns the *fetch*. Downloads are runtime-artifact selective: safetensors
 //! weights plus config/tokenizer files, excluding alternate checkpoint formats
-//! the drivers cannot load (`.pt`/`.bin`/`.gguf`/`consolidated.safetensors`).
+//! the engines cannot load (`.pt`/`.bin`/`.gguf`/`consolidated.safetensors`).
 
 pub mod download;
 

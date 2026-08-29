@@ -422,7 +422,7 @@ impl Builder<'_> {
     /// which types the unspecialized expression with every shard read at
     /// [`Partition::WHOLE`]. Nothing else moves: the plan is still built from
     /// the specialized expression and still declares this rank's shape, which
-    /// is what a driver binds.
+    /// is what an engine binds.
     ///
     /// `TensorContract::shape` is optional, so this is a no-op for a contract
     /// that declares none — and then nothing is typed twice either. The caller
@@ -684,7 +684,7 @@ impl Builder<'_> {
     /// The buffer holding a per-group `Scale`'s factors.
     ///
     /// The factors must be a tensor an earlier contract declared, and the
-    /// restriction is deliberate. Scales are published anyway — a driver reads
+    /// restriction is deliberate. Scales are published anyway — an engine reads
     /// them for the GEMM that consumes the weight — so referring to that
     /// declaration is what keeps one set of bytes rather than two, and it makes
     /// the pairing a name the contract already checks instead of one this
@@ -878,8 +878,8 @@ impl Builder<'_> {
     /// A [`Visibility::Public`] entry is promoted out of the temporary pool and
     /// finalized, which is the pair of steps that make it a runtime weight: the
     /// promotion puts it in the persistent arena, and the `Finalize` is how the
-    /// driver learns its name. An [`Visibility::Internal`] entry gets neither,
-    /// so it stays a temporary the memory planner may reuse and the driver never
+    /// engine learns its name. An [`Visibility::Internal`] entry gets neither,
+    /// so it stays a temporary the memory planner may reuse and the engine never
     /// hears about — while still being declared, because later entries resolve
     /// it through [`Expr::Out`].
     fn realize(
@@ -1364,7 +1364,7 @@ fn source_scheme(encoding: &Encoding) -> Option<QuantScheme> {
 /// ships the same scheme may well store its scales some other way.
 struct ScaleLayout {
     /// Appended to the weight's declared name. Two conventions, inherited from
-    /// what the drivers already look for.
+    /// what the engines already look for.
     suffix: &'static str,
     /// The zero point's suffix, for an affine scheme, or `None` for a symmetric
     /// one. Its shape and encoding are the scales' -- an affine scheme offsets
@@ -1377,7 +1377,7 @@ struct ScaleLayout {
     /// Both conventions are in the wild and neither is derivable: a scheme whose
     /// encoder was written here names `w` and `w_scale`, while MLX names the
     /// triplet `w.weight`, `w.scales`, `w.biases` -- siblings, not descendants.
-    /// A driver binding a converted checkpoint looks the shipped names up, so an
+    /// An engine binding a converted checkpoint looks the shipped names up, so an
     /// encode that produced descendants would publish tensors correct in every
     /// respect except findable.
     naming: MetaNaming,
@@ -1440,7 +1440,7 @@ impl ScaleLayout {
     /// The scales keep the payload's LEADING AXES and replace its last one, so
     /// a `[experts, rows, cols]` bank publishes `[experts, rows, cols / 32]` —
     /// the same shape `model_dsl`'s `Weight::planes` interns for the plane the
-    /// driver will bind, one axis per axis rather than a flattened count. At
+    /// engine will bind, one axis per axis rather than a flattened count. At
     /// rank 2 every line below is exactly what it was.
     fn for_encode(scheme: QuantScheme, shape: &[i64]) -> Result<Self> {
         let Some((_rows, cols)) = crate::types::rectangle(shape) else {
@@ -1480,7 +1480,7 @@ impl ScaleLayout {
             // `model_dsl`'s `SCALES`, interned by `Weight::planes` into
             // `Trace::params` as `<w>.scales`, written by every family import
             // that names a stored scales tensor, and looked up by name in the
-            // driver's residency sink (`driver-cuda/src/weights.rs` indexes
+            // engine's residency sink (`engine-cuda/src/weights.rs` indexes
             // `trace.params` by name and refuses a param the load never
             // published). A weight this loader ENCODES lands beside a weight
             // the checkpoint shipped, in the same table, under the same rule —
@@ -1493,7 +1493,7 @@ impl ScaleLayout {
             // as open on, and it is closed HERE rather than in the contract
             // for the reason [`Scales`](crate::contract::Scales) states: the
             // loader creates this tensor, so the loader names it, and the
-            // pairing a driver reads is the `QuantAttachment`'s tensor id and
+            // pairing an engine reads is the `QuantAttachment`'s tensor id and
             // never a suffix match. "Every param has one producer" stays TRUE
             // rather than exempted — the producer of `<w>.scales` is the
             // encode instruction that also produces `<w>`, and it now
@@ -1526,7 +1526,7 @@ impl ScaleLayout {
             // shaped alike and written by one kernel pass -- the pass that found
             // each group's min and max had to see both to produce either.
             //
-            // `.scales` and `.biases` are MLX's own names, and the drivers that
+            // `.scales` and `.biases` are MLX's own names, and the engines that
             // read a converted checkpoint already look for exactly those, so an
             // encoded weight is bindable by the code that binds a shipped one.
             QuantScheme::MlxAffineU4 => {

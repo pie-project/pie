@@ -23,8 +23,8 @@
 //! carry far more than the struct declarations — so they are checked rather
 //! than produced. A seventh row stood above until the C++ drivers were
 //! deleted: a plain-C printing (`DeviceStruct::emit_c`) into the generated
-//! `ptir_abi.h`, which those drivers `#include`d instead of retyping the
-//! table. The Rust drivers that replaced them read this module directly, and a
+//! `ptir_abi.h`, which those engines `#include`d instead of retyping the
+//! table. The Rust engines that replaced them read this module directly, and a
 //! printer whose only consumer was a deleted header is not a tie to anything.
 //!
 //! A field added on one side and not the other is now a compile error or a
@@ -34,7 +34,7 @@
 //! goldens (and the `# @grouped:` length+hash pin in `emit_grouped_*.txt`)
 //! check on every run. Those bytes came from the deleted C++ oracle, so they
 //! are an independent witness that this generator reproduces the ABI the
-//! driver was built against.
+//! engine was built against.
 
 use alloc::format;
 use alloc::string::String;
@@ -87,7 +87,7 @@ pub struct Field {
     /// The name MSL uses, when it differs. It differs in exactly one place —
     /// see [`LANE_TABLE_HEADER`] — and carrying the difference here is what
     /// lets the generator reproduce the existing bytes instead of quietly
-    /// renaming a field the goldens and the driver already agree on.
+    /// renaming a field the goldens and the engine already agree on.
     pub msl_name: &'static str,
     /// The field's scalar width.
     pub ty: FieldType,
@@ -222,7 +222,7 @@ impl DeviceStruct {
 }
 
 /// The status word a lane's commit slot points at. Written by the readiness
-/// and commit kernels, read by the driver. It has no `tensor-compiler` counterpart —
+/// and commit kernels, read by the engine. It has no `tensor-compiler` counterpart —
 /// the host never builds one, it only hands out the address — so it is pinned
 /// by the goldens alone.
 pub const STATUS: DeviceStruct = DeviceStruct {

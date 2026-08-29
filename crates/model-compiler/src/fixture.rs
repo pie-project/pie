@@ -68,7 +68,7 @@ impl Build {
         ValueId((self.trace.values.len() - 1) as u32)
     }
 
-    /// A demand sink the driver binds, distinct per call.
+    /// A demand sink the engine binds, distinct per call.
     pub(crate) fn input(&mut self, width: u64) -> ValueId {
         self.inputs += 1;
         let which = RuntimeInput::Mask {

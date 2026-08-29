@@ -1,9 +1,9 @@
 //! Binary Run-Length Encoded (BRLE) boolean sequences.
 //!
-//! `RunMask` is part of the submission schema — the driver contract's
+//! `RunMask` is part of the submission schema — the engine contract's
 //! `fire::Mask` is the same run encoding, reached through a lane rather than
 //! through the `LaunchPlan` that used to carry a `Vec<RunMask>` — AND is the
-//! type the runtime/drivers manipulate directly. Putting the type and its
+//! type the runtime/engines manipulate directly. Putting the type and its
 //! operations here keeps the schema single-source: no duplicate `RunMask`
 //! types, no conversion at the wire boundary.
 //!

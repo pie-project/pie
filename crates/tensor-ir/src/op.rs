@@ -6,7 +6,7 @@
 //! ## Relation to PSIR v4
 //!
 //! Where an op coincides with a PSIR v4 op, the **wire tag is
-//! identical** (e.g. `Add` = 0x10, `Gather` = 0x60), so a driver-side decoder
+//! identical** (e.g. `Add` = 0x10, `Gather` = 0x60), so an engine-side decoder
 //! extends its v4 table instead of forking. New tags occupy free
 //! space; tag `0x80` (`Input`) is *reserved-unused* — PTIR stage bodies have no
 //! input slots: values enter through channel ops ([`Op::ChanTake`] /
@@ -48,7 +48,7 @@ pub type NameIndex = u16;
 /// Same rule as `declare_ops!`: an intrinsic's id is spelled as a number on
 /// exactly one line. `from_u16`, the name table and the generated C++ header's
 /// `PtirIntrinsic` enum are all derived from it, because a hand-kept copy that
-/// misses an entry is an intrinsic the driver never learns about.
+/// misses an entry is an intrinsic the engine never learns about.
 macro_rules! declare_intrinsics {
     ($($(#[$doc:meta])* $variant:ident = $id:literal, $konst:ident, $name:literal;)*) => {
         /// First-party stage-scoped value intrinsics. Wire tags are stable
@@ -72,7 +72,7 @@ macro_rules! declare_intrinsics {
 
         impl IntrinsicId {
             /// Every intrinsic, in wire-id order. Anything that must cover the
-            /// whole set (the generated C++ header, a driver dispatch table)
+            /// whole set (the generated C++ header, an engine dispatch table)
             /// iterates this instead of repeating the list.
             pub const ALL: &'static [IntrinsicId] = &[$(IntrinsicId::$variant,)*];
 
@@ -972,7 +972,7 @@ macro_rules! declare_ops {
        $rep:expr, $pat:pat, [$($wire:ident),*];)*) => {
         /// The wire tag of every op, by name. **The only place a PTIR op tag
         /// is spelled as a number.** Downstream crates (`tensor-compiler`,
-        /// `tensor-compiler`, and drivers via the generated header) import these
+        /// `tensor-compiler`, and engines via the generated header) import these
         /// instead of keeping their own copies: a hand-copied tag that drifts
         /// by one hex digit is a silently wrong kernel, and nothing but a
         /// single definition can rule that out.
@@ -984,7 +984,7 @@ macro_rules! declare_ops {
         }
 
         /// The op table — one row per wire tag, sorted by tag. The generated
-        /// C++ header and any driver-side dispatch table MUST be derived from
+        /// C++ header and any engine-side dispatch table MUST be derived from
         /// this list.
         pub const OP_TABLE: &[OpSpec] = &[
             $(OpSpec {

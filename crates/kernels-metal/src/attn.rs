@@ -506,8 +506,8 @@ fn tiled(
 pub fn decode(
     ctx: &Ctx<'_>,
     q: Tensor,
-    pool: &KvPool,
     plan: &DecodePlan,
+    pool: &KvPool,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
@@ -531,8 +531,8 @@ pub fn decode(
 pub fn decode_lse(
     ctx: &Ctx<'_>,
     q: Tensor,
-    pool: &KvPool,
     plan: &DecodePlan,
+    pool: &KvPool,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
@@ -560,8 +560,8 @@ pub fn decode_lse(
 pub fn prefill(
     ctx: &Ctx<'_>,
     q: RaggedTensor,
-    pool: &KvPool,
     plan: &PrefillPlan,
+    pool: &KvPool,
     window: Option<u32>,
     head_dim: u32,
     kv_heads: u32,
@@ -579,8 +579,8 @@ pub fn prefill(
 pub fn prefill_lse(
     ctx: &Ctx<'_>,
     q: RaggedTensor,
-    pool: &KvPool,
     plan: &PrefillPlan,
+    pool: &KvPool,
     window: Option<u32>,
     head_dim: u32,
     kv_heads: u32,
@@ -618,9 +618,9 @@ pub fn prefill_lse(
 pub fn masked(
     ctx: &Ctx<'_>,
     q: RaggedTensor,
-    pool: &KvPool,
     plan: &PrefillPlan,
     mask: Tensor,
+    pool: &KvPool,
     window: Option<u32>,
     head_dim: u32,
     sm_scale: f32,
@@ -822,7 +822,7 @@ pub mod mla {
     use crate::encode::Ctx;
     use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
-    /// Never constructed: `mla.plan` refuses before one exists. The type
+    /// Never constructed: `attention.mla_plan` refuses before one exists. The type
     /// keeps the driver's plan arm shaped like the claimed families'.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MlaPlan;
@@ -834,7 +834,9 @@ pub mod mla {
         _last_page_len: Tensor,
         _kv_len: Tensor,
     ) -> Result<MlaPlan, KernelError> {
-        Err(KernelError::Unsupported { op: "mla.plan" })
+        Err(KernelError::Unsupported {
+            op: "attention.mla_plan",
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -847,7 +849,9 @@ pub mod mla {
         _kv_c: Tensor,
         _k_pe: Tensor,
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported { op: "mla.latents" })
+        Err(KernelError::Unsupported {
+            op: "attention.mla_latents",
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -864,7 +868,7 @@ pub mod mla {
         _k_pe: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "mla.latents_rope",
+            op: "attention.mla_latents_rope",
         })
     }
 
@@ -879,7 +883,7 @@ pub mod mla {
         _q_pe: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "mla.split_q_b",
+            op: "attention.mla_split_q_b",
         })
     }
 
@@ -894,7 +898,9 @@ pub mod mla {
         _v_head_dim: u32,
         _q_latent: Tensor,
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported { op: "mla.absorb_q" })
+        Err(KernelError::Unsupported {
+            op: "attention.mla_absorb_q",
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -909,7 +915,7 @@ pub mod mla {
         _o: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "mla.absorb_out",
+            op: "attention.mla_absorb_out",
         })
     }
 
@@ -922,7 +928,7 @@ pub mod mla {
         _write_offset: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "mla.kv_append",
+            op: "attention.mla_kv_append",
         })
     }
 
@@ -930,16 +936,16 @@ pub mod mla {
     pub fn attention_decode(
         _ctx: &Ctx<'_>,
         _q: Tensor,
-        _pool: &KvPool,
         _plan: &MlaPlan,
         _q_pe: Tensor,
+        _pool: &KvPool,
         _heads: u32,
         _kv_lora_rank: u32,
         _sm_scale: f32,
         _o: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "mla.attention_decode",
+            op: "attention.mla_decode",
         })
     }
 
@@ -947,16 +953,16 @@ pub mod mla {
     pub fn attention_prefill(
         _ctx: &Ctx<'_>,
         _q: RaggedTensor,
-        _pool: &KvPool,
         _plan: &MlaPlan,
         _q_pe: Tensor,
+        _pool: &KvPool,
         _heads: u32,
         _kv_lora_rank: u32,
         _sm_scale: f32,
         _o: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "mla.attention_prefill",
+            op: "attention.mla_prefill",
         })
     }
 
@@ -964,17 +970,17 @@ pub mod mla {
     pub fn attention_decode_selected(
         _ctx: &Ctx<'_>,
         _q: Tensor,
-        _pool: &KvPool,
         _plan: &MlaPlan,
         _q_pe: Tensor,
         _selection: Tensor,
+        _pool: &KvPool,
         _heads: u32,
         _kv_lora_rank: u32,
         _sm_scale: f32,
         _o: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "mla.attention_decode_selected",
+            op: "attention.mla_decode_selected",
         })
     }
 
@@ -982,17 +988,17 @@ pub mod mla {
     pub fn attention_prefill_selected(
         _ctx: &Ctx<'_>,
         _q: RaggedTensor,
-        _pool: &KvPool,
         _plan: &MlaPlan,
         _q_pe: Tensor,
         _selection: Tensor,
+        _pool: &KvPool,
         _heads: u32,
         _kv_lora_rank: u32,
         _sm_scale: f32,
         _o: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "mla.attention_prefill_selected",
+            op: "attention.mla_prefill_selected",
         })
     }
 }
@@ -1017,7 +1023,7 @@ pub mod index {
         _theta: f32,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "index.layernorm_rope",
+            op: "attention.index_layernorm_rope",
         })
     }
 
@@ -1031,7 +1037,9 @@ pub mod index {
         _rope_dim: u32,
         _theta: f32,
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported { op: "index.rope" })
+        Err(KernelError::Unsupported {
+            op: "attention.index_rope",
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1045,7 +1053,9 @@ pub mod index {
         _top_k: u32,
         _selection: Tensor,
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported { op: "index.topk" })
+        Err(KernelError::Unsupported {
+            op: "attention.index_topk",
+        })
     }
 
     pub fn kv_append(
@@ -1056,7 +1066,7 @@ pub mod index {
         _write_offset: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "index.kv_append",
+            op: "attention.index_kv_append",
         })
     }
 }
@@ -1078,7 +1088,7 @@ pub mod pool {
         _boundary_req: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "pool.boundary_decode",
+            op: "attention.pool_boundary_decode",
         })
     }
 
@@ -1091,7 +1101,7 @@ pub mod pool {
         _boundary_req: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "pool.boundary_prefill",
+            op: "attention.pool_boundary_prefill",
         })
     }
 
@@ -1105,7 +1115,9 @@ pub mod pool {
         _ratio: u32,
         _entries: Tensor,
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported { op: "pool.gather" })
+        Err(KernelError::Unsupported {
+            op: "attention.pool_gather",
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1119,7 +1131,7 @@ pub mod pool {
         _write_offset: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "pool.kv_append",
+            op: "attention.pool_kv_append",
         })
     }
 
@@ -1138,7 +1150,7 @@ pub mod pool {
         _lse: Tensor,
     ) -> Result<(), KernelError> {
         Err(KernelError::Unsupported {
-            op: "pool.attention_lse",
+            op: "attention.pool_lse",
         })
     }
 }

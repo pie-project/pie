@@ -217,7 +217,7 @@ struct Allowlists {
     /// and the only way past the guard was to claim the file OWNS the
     /// contract, which is a much stronger and quite false statement.
     ///
-    /// Found by `driver-metal/tests/fixtures/cuda_reference.cu`, which is a
+    /// Found by `engine-metal/tests/fixtures/cuda_reference.cu`, which is a
     /// splitmix64 input generator and not a PTIR stream.
     ///
     /// (Named in prose rather than written out, for the reason the `shift`
@@ -245,7 +245,7 @@ fn path_in(list: &[&str], relative: &Path) -> bool {
 fn allowlists() -> Allowlists {
     Allowlists {
         // Repo-wide on purpose: the point is that nobody outside the contract
-        // — a driver, a kernel, the engine — re-types these constants.
+        // — an engine, a kernel, the runtime — re-types these constants.
         owners: &[
             "crates/tensor-ir/src/rng.rs",
             // `crates/tensor-compiler/include/rng_contract.generated.h` was the
@@ -259,24 +259,24 @@ fn allowlists() -> Allowlists {
             STAGED_RNG_PREAMBLE,
         ],
         stride: &[
-            // `driver-metal/tests/fixtures/cuda_reference.cu` STOOD HERE —
+            // `engine-metal/tests/fixtures/cuda_reference.cu` STOOD HERE —
             // the CUDA reference generator's splitmix64 increment, an input
             // generator for the cross-language comparison. It went with the
-            // old driver-metal test tree in the palo sweep, and this entry
+            // old engine-metal test tree in the palo sweep, and this entry
             // goes with it, which is what `allowlisted_paths_still_exist`
             // is for.
             "crates/gateway/src/route.rs",
-            "crates/engine/src/inferlet/linker.rs",
+            "crates/runtime/src/inferlet/linker.rs",
             // splitmix64 id generation: the canonical splitmix increment
             // happens to be the same golden-ratio word; not a keyed-RNG
             // transcription.
-            "crates/engine/src/pipeline/offload.rs",
+            "crates/runtime/src/pipeline/offload.rs",
             // driver-cuda/src/fire/lora.rs STOOD HERE — the staged lora
             // table's fingerprint, a splitmix mixer over what a captured lora
             // body baked, allowlisted because it had to agree with the
             // capture it fingerprinted branch for branch. Two C++ siblings
             // and a Rust `model/llama_like.rs` had already gone with the C++
-            // driver; the file itself went with R2 (no point declares the
+            // engine; the file itself went with R2 (no point declares the
             // lora correction, so nothing fired the staging). An allowlist
             // entry for a file that is not there is what
             // `allowlisted_paths_still_exist` catches.
@@ -315,7 +315,7 @@ fn allowlists() -> Allowlists {
             //
             // The GEMM service parity pair STOOD HERE — a Rust harness and a
             // C++ oracle seeding the same word on both sides. The whole
-            // oracle tree went with the old driver-cuda in the palo sweep
+            // oracle tree went with the old engine-cuda in the palo sweep
             // (its successor parities — serve_smoke, graph_replay,
             // program_parity — seed nothing with the golden-ratio word), so
             // all three entries go with it.
@@ -329,7 +329,7 @@ fn allowlists() -> Allowlists {
         mask: &["crates/grammar/src/brle.rs"],
         // The float conversion's shift is the weakest needle here: any 64-bit
         // -> float reduction that wants 24 mantissa bits writes it. A murmur3
-        // finalizer in a driver test is not a PTIR stream.
+        // finalizer in an engine test is not a PTIR stream.
         //
         // (Spelled in fragments at the use site like every other constant, and
         // for the reason this guard exists: writing it out in a comment makes
@@ -349,10 +349,10 @@ fn allowlists() -> Allowlists {
         // file stopped needing the exemption" from "the file stopped
         // existing", and only one of those is progress. Nothing outside the
         // contract writes this shift today either way.
-        // `driver-metal/tests/fixtures/cuda_reference.cu` STOOD HERE too —
+        // `engine-metal/tests/fixtures/cuda_reference.cu` STOOD HERE too —
         // **a splitmix64 input generator, not a PTIR stream** — driving the
         // CUDA kernels so a Metal one could be compared against them. The
-        // fixture went with the old driver-metal test tree in the palo sweep,
+        // fixture went with the old engine-metal test tree in the palo sweep,
         // and both its exemptions go with it; nothing outside the contract
         // writes the shift or the divisor today.
         shift: &[],

@@ -71,8 +71,8 @@ pub const PTIR_VERSION: u16 = 1;
 /// container's bytes — and therefore every existing hash — are unchanged.
 pub const PTIR_VERSION_EXTERN: u16 = 2;
 
-/// FNV-1a 64 — the one implementation, byte-identical to the CUDA driver's
-/// FNV-1a used by the program and driver caches.
+/// FNV-1a 64 — the one implementation, byte-identical to the CUDA engine's
+/// FNV-1a used by the program and engine caches.
 ///
 /// This is the *primitive*. It is not an identity: what a hash means depends on
 /// what was fed to it, so the named contracts below (and
@@ -143,8 +143,8 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 /// instance-independent by construction.
 ///
 /// Because the container encoder is canonical (same trace ⟺ same bytes) this is
-/// a *sound* identity key, and because it is byte-identical to the driver's
-/// This keeps the host program cache, the driver compile cache, and the
+/// a *sound* identity key, and because it is byte-identical to the engine's
+/// This keeps the host program cache, the engine compile cache, and the
 /// cross-request group key are one mechanism rather than three.
 pub fn container_hash(container_bytes: &[u8]) -> u64 {
     fnv1a64(container_bytes)
@@ -156,7 +156,7 @@ mod fnv_tests {
     use alloc::vec::Vec;
 
     /// The published FNV-1a 64 vectors. Without these the two forms below could
-    /// agree with each other on some *other* function and the driver would be
+    /// agree with each other on some *other* function and the engine would be
     /// the one to notice.
     #[test]
     fn the_hash_is_fnv_1a_64() {
@@ -167,7 +167,7 @@ mod fnv_tests {
 
     /// Structured callers feed fields; slice callers feed bytes. They are the
     /// same walk, so a `u32_le` field must equal its four little-endian bytes —
-    /// otherwise a host/driver pair hashing the same plan two ways disagrees.
+    /// otherwise a host/engine pair hashing the same plan two ways disagrees.
     #[test]
     fn the_streaming_form_is_the_slice_form() {
         let mut streamed = Fnv1a::new();

@@ -528,11 +528,11 @@ fn attn_score_accepted_at_on_attn() {
     assert!(bind(c, ModelProfile::dummy()).is_ok());
 }
 
-/// A driver without the capture path must make the program fail at BIND.
+/// An engine without the capture path must make the program fail at BIND.
 /// The buffer is otherwise simply never written, and a policy reading it
 /// would silently rank on garbage.
 #[test]
-fn attn_score_rejected_when_driver_lacks_capture() {
+fn attn_score_rejected_when_engine_lacks_capture() {
     let mut profile = ModelProfile::dummy();
     profile.has_attn_score = false;
     let c = TraceContainer {

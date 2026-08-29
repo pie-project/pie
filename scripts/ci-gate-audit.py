@@ -14,7 +14,7 @@ doubled, and answering it meant diffing the list against
 `cargo metadata` by hand.
 
 The second time was worse and silent. Sixteen of the twenty ungated
-crates had drifted out of rustfmt -- `engine` by 146 hunks, and by 144 the
+crates had drifted out of rustfmt -- `runtime` by 146 hunks, and by 144 the
 ahead-of-time CUDA archive crate that has since been deleted -- because
 they had never been in the fmt list at
 all. There was no signal. A crate that is not in the list is
@@ -41,7 +41,7 @@ a rewrite that is actively in flight.
 `STEPS` reads steps by name from the whole workflow, not from one job, so
 a crate gated on the macOS runner is GATED and not merely excused.
 
-`driver-metal` was the case that shaped this and it has now been through
+`engine-metal` was the case that shaped this and it has now been through
 the whole cycle. It began as an exclusion reading "gated on the macOS job
 instead, in BOTH feature halves" -- a true sentence that nothing checked,
 so deleting those two steps would have left this audit green while the
@@ -74,11 +74,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 
-# The driver-flavor and probe chain: an inner library, and the package that
+# The engine-flavor and probe chain: an inner library, and the package that
 # must re-declare its features for them to be reachable from a build command.
 # `pie` is where the chain has to end, because it is the only member with a
 # `[[bin]]`.
-FORWARDS = [("engine", "worker"), ("worker", "pie")]
+FORWARDS = [("runtime", "worker"), ("worker", "pie")]
 
 # Features deliberately not forwarded, and why. Same contract as EXCLUSIONS:
 # the reason lives in the data, because the next reader's question is "was
@@ -102,7 +102,7 @@ FORWARD_EXCLUSIONS = {
 # reader comes here for, so it lives in the data rather than a comment.
 EXCLUSIONS = {
     "fmt": {
-        "driver-cuda": (
+        "engine-cuda": (
             "being rewritten wholesale (108 commits in three days); "
             "reformatting it would collide with in-flight work for no "
             "benefit to files that are being replaced. Add it when the "
@@ -129,14 +129,14 @@ EXCLUSIONS = {
         # SITES from a cold `cargo clean -p <crate>` -- a warm clippy run
         # replays nothing and reports zero, which is how several of these
         # looked clean for months.
-        "driver-cuda": "needs nvcc, and is being rewritten",
-        # `driver-vulkan` STOOD HERE reading "needs slangc on the runner;
+        "engine-cuda": "needs nvcc, and is being rewritten",
+        # `engine-vulkan` STOOD HERE reading "needs slangc on the runner;
         # zero warnings otherwise", and the entry outlived its subject the
         # way an exclusion always can: R3 put the crate in the root
         # manifest's `exclude`, and an exclusion naming a NON-MEMBER is what
         # the check below refuses -- correctly, because it reads as a crate
         # somebody decided not to lint rather than as a crate cargo can no
-        # longer see. `driver-metal` and `driver-wgpu` went the same way and
+        # longer see. `engine-metal` and `engine-wgpu` went the same way and
         # were never entries here at all: they were named in the gate lists,
         # which is why they surfaced as `-p ... is not a workspace member`
         # instead. Both halves of this file caught the same deletion from
@@ -176,7 +176,7 @@ STEPS = {
     "clippy": [
         "cargo clippy (deny warnings)",
         "cargo clippy (model, deny warnings)",
-        # `cargo clippy (driver-metal, portable half)` and `(driver-metal,
+        # `cargo clippy (engine-metal, portable half)` and `(engine-metal,
         # metal-4)` STOOD HERE, on the macOS job, because a lint can depend
         # on `cfg(target_os)` and only a Mac can ask that question in both
         # feature halves. Naming them here is what turned "gated on the macOS
@@ -213,11 +213,11 @@ def forward_problems(pkgs):
     """Features that stop at a library instead of reaching the binary.
 
     A feature is only real if the package that produces a BINARY can select
-    it. `engine` and `worker` are libraries, so every flavor and probe they
+    it. `runtime` and `worker` are libraries, so every flavor and probe they
     offer has to be re-declared twice on the way out -- by hand, in three
     manifests, with nothing checking that the copies agree.
 
-    They have not agreed. The root package lost its `driver-metal` forward
+    They have not agreed. The root package lost its `engine-metal` forward
     when the C++ Metal driver was retired and never got it back, leaving
     five dead `#[cfg]` blocks in `pie init`'s config template (see
     `scripts/cfg-feature-audit.py`, which catches the OTHER half of that

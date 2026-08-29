@@ -122,7 +122,7 @@ async fn main(input: Input) -> Result<String> {
         let w_off_p = Channel::from(w_off_pv).named("w_off_p");
         let klen_p = Channel::from([n]).named("klen_p");
         let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
-        // The page CSR is the wire's source of truth for kv_len: the driver derives
+        // The page CSR is the wire's source of truth for kv_len: the engine derives
         // `last_page_len = ((kv_len-1) % PAGE_T) + 1` and reads back a span of
         // `(page_count-1)*PAGE_T + last_page_len` cells. A pool-wide constant count
         // inflates that span past the live prefix and attends uninitialized KV, so
@@ -162,7 +162,7 @@ async fn main(input: Input) -> Result<String> {
             //
             // Do NOT `broadcast` the read-out row to [B, vocab] here. The
             // compiler still matches `LibraryOp::NucleusSample` on the widened
-            // form, but the driver's library fast path assumes its logits input
+            // form, but the engine's library fast path assumes its logits input
             // is the logits intrinsic (behind at most a reshape) and elides the
             // scratch for it (`fused_runtime.cuh` nucleus prep). A `broadcast`
             // producer still executes and writes a full [B, vocab] tensor into

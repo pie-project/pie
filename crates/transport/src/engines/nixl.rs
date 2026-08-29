@@ -41,7 +41,7 @@ use crate::core::{
     Completion, Engine, EngineKind, PageSet, PeerConn, RegisteredHandle, TransferId, WorkerId,
 };
 use crate::error::{Result, TransportError};
-use driver_api::{KvHandle, MemoryDomain};
+use engine_api::{KvHandle, MemoryDomain};
 use ffi::*;
 
 const OK: nixl_capi_status_t = nixl_capi_status_t_NIXL_CAPI_SUCCESS;
@@ -418,8 +418,8 @@ impl Drop for NixlEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use driver_api::model_ir::Dtype;
-    use driver_api::{KvLayout, KvLayoutKind};
+    use engine_api::model_ir::Dtype;
+    use engine_api::{KvLayout, KvLayoutKind};
 
     fn layout() -> KvLayout {
         // 1 layer · KvSeparate(2 planes) · 1 head · head_dim 64 · page_size 16 ·
@@ -438,7 +438,7 @@ mod tests {
 
     fn host_handle(buf: &[u8]) -> KvHandle {
         KvHandle {
-            regions: vec![driver_api::KvRegion {
+            regions: vec![engine_api::KvRegion {
                 base: buf.as_ptr() as u64,
                 len: buf.len() as u64,
                 page_stride: layout().page_bytes(),

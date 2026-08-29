@@ -9,7 +9,7 @@
 //! take the fire-aligned tensor directly, with no indptr plumbing. Caches are
 //! storage-only ids; geometry enters the graph through
 //! [`Input`](crate::Input)'s accessors as declared runtime inputs — a runtime
-//! input is something the driver binds, not something a kernel computes, so
+//! input is something the engine binds, not something a kernel computes, so
 //! its declaration belongs beside the handle a forward reaches for it with —
 //! and the plan ops here are pure functions of them (§6, §7).
 //!
@@ -19,7 +19,7 @@
 //! `CustomCuda::QkvFusedQknormRopeVnormWrite` is
 //! [`custom::qkv_fused_qknorm_rope_vnorm_write`]. The surface is the taxonomy:
 //! a call site reads as the op's name, so one vocabulary runs from the model
-//! text through the plan to the driver arm.
+//! text through the plan to the engine arm.
 
 use crate::declare::Weight;
 use crate::record::Value;

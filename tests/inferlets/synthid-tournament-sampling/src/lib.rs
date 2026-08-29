@@ -169,7 +169,7 @@ const DECOY_SALT: u32 = 0x0200_0000;
 /// Layer ℓ's g-function: a keyed fair coin per vocabulary entry.
 ///
 /// The reference implementation hashes `(context n-gram, candidate token,
-/// layer key)` into a precomputed Bernoulli table. Here the driver's
+/// layer key)` into a precomputed Bernoulli table. Here the engine's
 /// counter-based RNG is the hash: the `[key, ctr]` state fixes the context and
 /// the layer, and the element index within the `[vocab]` draw supplies the
 /// candidate token, so `g` is a pure function of the same three inputs.

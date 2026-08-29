@@ -10,17 +10,17 @@
 #
 # THEY NOW FIRE THROUGH THE SHELL. This script used to run `baker-smoke`,
 # a binary that reached `kernels-cuda` directly and was therefore a second
-# executor beside `driver-cuda`'s, with its own pools, staging and fire.
+# executor beside `engine-cuda`'s, with its own pools, staging and fire.
 # Two executors over one set of kernels drift, and only one of them was ever
-# measured against a checkpoint. The gate is now a driver-cuda test, so what
+# measured against a checkpoint. The gate is now an engine-cuda test, so what
 # it exercises is the path that actually serves.
 #
 # FOUR PLANES ANSWER NOW, AND THE THREE THAT ARE NOT CUDA ARE THE POINT.
-# `driver-wgpu` reached this milestone first for `qwen35-d0.8b-bf16-kv-bf16` --
+# `engine-wgpu` reached this milestone first for `qwen35-d0.8b-bf16-kv-bf16` --
 # the whole chain, `model::produce` through an upload, pools, a
 # `model_compiler::program::Program` walk, 387 dispatches onto the card and a
 # read-out -- and answered 198 at 12.3125, which is what cuda banked. Before it,
-# no plane but cuda had ever been asked. `driver-vulkan` and `driver-metal`
+# no plane but cuda had ever been asked. `engine-vulkan` and `engine-metal`
 # followed, and every one of the twelve cells is now a measurement.
 #
 # WHAT EACH ROW COST, because none of it was reachable by a narrower test:
@@ -47,7 +47,7 @@
 #
 # AND BOTH LANES, NOW. Every banked answer was fired from ONE ROW, which is a
 # decode by the `qo_one` fact — so the PREFILL spelling of a real tower went
-# unmeasured everywhere until `driver-wgpu` grew a test for it. It is not a
+# unmeasured everywhere until `engine-wgpu` grew a test for it. It is not a
 # small gap: metal's prefill lane turned out not to fire at all, refusing at
 # its first attention because `serve::launch` had never staged `qo_indptr` or
 # `row_valid`, which only the prefill lane's attention reads.
@@ -67,7 +67,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-cargo test --quiet -p driver-cuda --features cuda-13,abi \
+cargo test --quiet -p engine-cuda --features cuda-13,abi \
     --test banked_argmaxes -- --ignored --nocapture
 
 echo
@@ -85,7 +85,7 @@ echo "                 and the prefill lane fired over all three."
 # checkpoint, which is the exact failure its own head names. `skip.rs` already
 # built the two gates; a caller whose whole subject is the answer sets them.
 PIE_WGPU_REQUIRE_DEVICE=1 PIE_WGPU_REQUIRE_WEIGHTS=1 \
-    cargo test --quiet -p driver-wgpu --features native \
+    cargo test --quiet -p engine-wgpu --features native \
     --test banked_argmax -- --nocapture
 
 echo
@@ -105,11 +105,11 @@ echo "                 qwen35-d0.8b at 198, gptoss-20b at 11, gemma4-e4b at 785.
 # missing -- see `scripts/planes.sh`.
 #
 # THE LOGIT IS ASSERTED WITHIN ONE bf16 STEP HERE and exactly on the two above.
-# `driver-vulkan/tests/banked_argmax.rs` says why: the id is the claim and the
+# `engine-vulkan/tests/banked_argmax.rs` says why: the id is the claim and the
 # logit is the witness, and this plane answers 14.5000 where cuda banked
 # 14.4375 -- the ulp at fourteen, and no more.
 if [ -x "${PIE_SLANGC:-}" ] || command -v slangc >/dev/null 2>&1; then
-    cargo test --quiet -p driver-vulkan --features native,device \
+    cargo test --quiet -p engine-vulkan --features native,device \
         --test banked_argmax -- --ignored --nocapture
     echo
     echo "banked-argmaxes: vulkan answered all three --"
@@ -125,7 +125,7 @@ fi
 # Apple hardware and only there, so this file cannot run it and says so rather
 # than leaving a plane that serves invisible. On a Mac:
 #
-#     cargo test -p driver-metal --features metal-4 --test banked_argmax -- \
+#     cargo test -p engine-metal --features metal-4 --test banked_argmax -- \
 #         --ignored --test-threads=1
 #
 # answers 11 at 14.4375 EXACTLY for gpt-oss, token 198 at 12.2500 for qwen3.5

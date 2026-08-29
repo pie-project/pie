@@ -13,9 +13,9 @@
 //!
 //! WHY THE BIT NUMBER MUST NOT BE A PRIORITY. It is one half of a pair: the
 //! other half is the shift in `Classify::word`, and that word is `Lane::word`,
-//! the engine's submission field (decision #18). If the bit number also chose
+//! the runtime's submission field (decision #18). If the bit number also chose
 //! the layout, then retuning the layout would mean renumbering the bits, which
-//! means changing what the engine sends — a performance knob welded to a wire
+//! means changing what the runtime sends — a performance knob welded to a wire
 //! format, and therefore a knob nobody can A/B.
 //!
 //! WHAT THIS ASSERTS. Permute the fact bits of a traced plan — every

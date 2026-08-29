@@ -1,4 +1,4 @@
-//! Design B COMPACTION device e2e — real driver. First real end-to-end
+//! Design B COMPACTION device e2e — real engine. First real end-to-end
 //! exercise of the `pipeline.copy_into` KV cell-move primitive (K3/K6 resolved:
 //! the move rides the SAME scheduler FIFO / CUDA stream as the forward fires, so
 //! the B3 ordering invariant sequences it — no QUIESCE/drain barrier).
@@ -13,7 +13,7 @@
 //!   guest mask-out beam program + copy_into(dst,src)
 //!     → runtime device-geometry submit (run-ahead FIFO)
 //!     → PendingOp::Move enqueued on the same FIFO right behind the fire
-//!     → driver `is_kv_move()` branch → `launch_copy_kv_cells_bf16` per layer
+//!     → engine `is_kv_move()` branch → `launch_copy_kv_cells_bf16` per layer
 //!       (two-pointer disjoint move, no scratch) on the fire stream
 //!     → the next fire's masked attention reads BOS from its NEW physical slot.
 //!
@@ -21,11 +21,11 @@
 //! physical slot is pure storage; moving BOS's K/V and pointing the mask at the
 //! new column is the same query attending the same stored K/V, so a faithful
 //! `copy_into` must leave the emitted token stream UNCHANGED. This test runs the
-//! SAME wasm twice on the same booted driver — once in `no-move` mode, once in
+//! SAME wasm twice on the same booted engine — once in `no-move` mode, once in
 //! `move` mode (identical code, geometry and klen; the only difference is the
 //! physical KV relocation) — and asserts the two token vectors are byte-identical.
 //!
-//!   PIE_PTIR_TRACE=1 cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//!   PIE_PTIR_TRACE=1 cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!     --test cuda_beam_designb_compact_e2e -- --ignored --nocapture
 
 mod common;
@@ -45,13 +45,13 @@ fn extract_tokens(out: &str) -> Option<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "BLOCKED, and not on hardware: `driver-cuda` advertises \
+#[ignore = "BLOCKED, and not on hardware: `engine-cuda` advertises \
             `GeometryClass::DecodeEnvelope`, whose port set is `EmbedTokens | \
             Positions | KvLen`; `Port::AttnMask` is in no `PortMask` any class \
             denotes, so the mask this guest puts on every fire is a port no \
             shell in this tree resolves. The `beam-designb-compact` guest is \
             gone with the workspace move to `tests/inferlets` besides"]
-async fn beam_designb_compact_on_real_driver() -> Result<()> {
+async fn beam_designb_compact_on_real_engine() -> Result<()> {
     common::init_trace();
     let pie = common::boot_cuda().await?;
     eprintln!("[beam-compact-e2e] booted, listen_addr={}", pie.listen_addr);

@@ -142,10 +142,17 @@ struct Ramp {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn ramp_bounds(head_dim: i32, theta: f32, beta_fast: f32, beta_slow: f32, span: i32) -> (f32, f32) {
+fn ramp_bounds(
+    head_dim: i32,
+    theta: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    original_max_position: i32,
+) -> (f32, f32) {
+    const TWO_PI: f32 = core::f32::consts::TAU;
     let ln_theta = theta.ln();
     let corr_dim = |rot: f32| -> f32 {
-        head_dim as f32 * (span as f32 / (rot * core::f32::consts::TAU)).ln() / (2.0 * ln_theta)
+        head_dim as f32 * (original_max_position as f32 / (rot * TWO_PI)).ln() / (2.0 * ln_theta)
     };
     let low_dim = corr_dim(beta_fast).floor().max(0.0);
     let high_dim = corr_dim(beta_slow)
@@ -195,7 +202,7 @@ pub fn full(
     theta: f32,
     interleaved: bool,
 ) -> Result<(), KernelError> {
-    const OP: &str = "rope.full";
+    const OP: &str = "elementwise.rope_full";
     if interleaved {
         return Err(refuse(
             OP,
@@ -217,7 +224,7 @@ pub fn partial(
     head_dim: u32,
     theta: f32,
 ) -> Result<(), KernelError> {
-    const OP: &str = "rope.partial";
+    const OP: &str = "elementwise.rope_partial";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
     rotate_proportional(ctx, OP, q, positions, UNSCALED, base, head_dim, rotary_dim)?;
@@ -234,7 +241,7 @@ pub fn partial_q(
 ) -> Result<(), KernelError> {
     rotate_proportional(
         ctx,
-        "rope.partial_q",
+        "elementwise.rope_partial_q",
         q,
         positions,
         UNSCALED,
@@ -254,7 +261,7 @@ pub fn partial_last(
     theta: f32,
     interleaved: bool,
 ) -> Result<(), KernelError> {
-    const OP: &str = "rope.partial_last";
+    const OP: &str = "elementwise.rope_partial_last";
     if rotary_dim > head_dim {
         return Err(refuse(
             OP,
@@ -291,9 +298,9 @@ pub fn yarn(
     original_max_position: u32,
     interleaved: bool,
 ) -> Result<(), KernelError> {
-    const OP: &str = "rope.yarn";
+    const OP: &str = "elementwise.rope_yarn";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
-    let span = stated(
+    let max_position = stated(
         OP,
         nonzero(
             OP,
@@ -302,7 +309,7 @@ pub fn yarn(
         )?,
     )?;
     let width = stated(OP, nonzero(OP, "the head width this rotation states", head_dim)?)?;
-    let (low_dim, high_dim) = ramp_bounds(width, theta, beta_fast, beta_slow, span);
+    let (low_dim, high_dim) = ramp_bounds(width, theta, beta_fast, beta_slow, max_position);
     let ramp = Ramp {
         factor,
         low_dim,

@@ -24,11 +24,11 @@ use serde::{Deserialize, Serialize};
 // consumers can still reach them as `controller_api::{WorkerId, …}`.
 pub use ids::{GatewayId, NodeId, WorkerId};
 
-// The driver contract owns the capability record (`driver_api::caps`);
+// The engine contract owns the capability record (`engine_api::caps`);
 // `WorkerInfo.capability` carries it. It was `DriverCapabilities`, a 30-field
 // flat struct mixing device, load and model facts; `Capabilities` is the same
 // answer with those three separated.
-use driver_api::caps::Capabilities;
+use engine_api::caps::Capabilities;
 
 // ──────────────────────────── role / health ───────────────────────────
 
@@ -99,8 +99,8 @@ pub struct WorkerInfo {
     /// Where peers reach this worker's control/data endpoint
     /// (e.g. `"10.0.0.4:7000"`).
     pub addr: String,
-    /// What the worker's driver can do (page geometry, forward limits, arch,
-    /// …) — the existing driver-handshake capability descriptor.
+    /// What the worker's engine can do (page geometry, forward limits, arch,
+    /// …) — the existing engine-handshake capability descriptor.
     pub capability: Capabilities,
 }
 

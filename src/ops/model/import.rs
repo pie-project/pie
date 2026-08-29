@@ -6,7 +6,7 @@
 //! "which files make up this model, and in what format" is answered at import
 //! rather than at every serve boot.
 //!
-//! The command's contract with the user: everything it does is work the engine
+//! The command's contract with the user: everything it does is work the runtime
 //! would do at load time anyway, done ahead of time, with results that are
 //! bit-identical to a cold load. What runs is *derived*, never chosen by flag —
 //! the knobs are operational (`--dry-run`, `--force`, `--delete-source`) or
@@ -17,7 +17,7 @@
 //! is copied byte for byte, keeping its encoding — `.zt` carries quantization
 //! schemes parametrically, so the copy is exact. What the format then gives for
 //! free is the point of the exercise: every tensor lands on a 64 KiB page of
-//! its own (what lets the driver mmap-stream routed experts), carries an XXH3
+//! its own (what lets the engine mmap-stream routed experts), carries an XXH3
 //! digest, and records its provenance in the file.
 //!
 //! Passthrough tensors stream from the source through a bounded buffer, so
@@ -28,7 +28,7 @@
 //! is. It had a family-aware half — an ingest pass that renamed a GGUF's
 //! tensors into the vocabulary a legacy load contract would bind, and a
 //! `pie model build` beside it that authored that contract — and R3 deleted
-//! both with the contract. A driver produces its weights from the checkpoint
+//! both with the contract. An engine produces its weights from the checkpoint
 //! through the SKU's own import table at load, so a naming pass here would be
 //! an earlier, worse answer to a question the load already asks.
 
@@ -275,7 +275,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     // catalog identified, so that the legacy contract could later bind the
     // artifact by name.
     //
-    // There is no such binding any more. A driver produces its weights from
+    // There is no such binding any more. An engine produces its weights from
     // the CHECKPOINT through the SKU's own import table
     // (`model::import_of`), which reads the source's own spelling and states
     // every rewrite it performs. So a naming pass here would be a second,
@@ -1277,7 +1277,7 @@ fn tied_head_sources(metadata: &CheckpointMetadata) -> Vec<String> {
 /// # Why this stopped normalizing
 ///
 /// It used to compile the config into a `pie.model/1` descriptor: 136 fields
-/// of normalized geometry, which the driver then re-parsed to learn what
+/// of normalized geometry, which the engine then re-parsed to learn what
 /// model it had. That was the *identity* crossing as a document, and it is
 /// what the catalog refactor removed — identity is now a manifest match
 /// against the tensors, and the tensors are already in the artifact.

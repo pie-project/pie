@@ -1,4 +1,4 @@
-//! §6.2 beam DESIGN B DEVICE e2e — real driver. First real end-to-end
+//! §6.2 beam DESIGN B DEVICE e2e — real engine. First real end-to-end
 //! exercise of the Design B steady-state (no-compaction) path: logical mask-out
 //! + flat tail-append, NO heir election / freeze arithmetic / fresh-page
 //! handshake / page reorder. The `beam-designb` inferlet drives a beam search
@@ -11,20 +11,20 @@
 //!
 //!   guest mask-out beam program
 //!     → runtime device-geometry submit (PageLease grants, run-ahead FIFO)
-//!     → driver descriptor resolver (`resolve_descriptors` → `FireGeometry`)
+//!     → engine descriptor resolver (`resolve_descriptors` → `FireGeometry`)
 //!     → B2 explicit-KV-write (`launch_write_kv_explicit_bf16` honoring
 //!       WSlot/WOff so each survivor's flat pool cell is written in place)
 //!     → beam attention with the packed dense per-beam mask
 //!     → harvest → the guest's `out`/`out_par`/`out_scr` take.
 //!
 //! This is the INTEGRATION gate for Design B's steady-state path: it proves the
-//! mask-out beam fire flows guest → device-geometry submit → the driver's
+//! mask-out beam fire flows guest → device-geometry submit → the engine's
 //! explicit write + masked attention → harvest, end to end on real logits,
 //! without crashing or degenerating. Compaction (the generic KV cell-move
 //! primitive) is out of scope here — this exercises only the fixed-pool
 //! steady state.
 //!
-//!   PIE_PTIR_TRACE=1 cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//!   PIE_PTIR_TRACE=1 cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!     --test cuda_beam_designb_e2e -- --ignored --nocapture
 
 mod common;
@@ -36,13 +36,13 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "BLOCKED, and not on hardware: `driver-cuda` advertises \
+#[ignore = "BLOCKED, and not on hardware: `engine-cuda` advertises \
             `GeometryClass::DecodeEnvelope`, whose port set is `EmbedTokens | \
             Positions | KvLen`; `Port::AttnMask` is in no `PortMask` any class \
             denotes, so the mask this guest puts on every fire is a port no \
             shell in this tree resolves. The `beam-designb` guest is gone with \
             the workspace move to `tests/inferlets` besides"]
-async fn beam_designb_on_real_driver() -> Result<()> {
+async fn beam_designb_on_real_engine() -> Result<()> {
     common::init_trace();
     let pie = common::boot_cuda().await?;
     eprintln!("[beam-designb-e2e] booted, listen_addr={}", pie.listen_addr);

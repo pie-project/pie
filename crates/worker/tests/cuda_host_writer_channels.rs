@@ -4,30 +4,30 @@
 //!
 //! A guest that feeds a descriptor port from the HOST each decode step -- puts
 //! the next token id into the channel its `embed` reads, rather than letting
-//! the epilogue carry it on-device -- used to deadlock on `driver-cuda` after
+//! the epilogue carry it on-device -- used to deadlock on `engine-cuda` after
 //! exactly `capacity` steps. At the default capacity of one, that is the SECOND
 //! step.
 //!
-//! The ring has one consumer on that driver, `Session::pull_channels`, which
-//! copies the engine's mirror cells into the device ring and advances the
-//! mirror's `head` as it goes. Nothing else moves `head`; the driver never
+//! The ring has one consumer on that engine, `Session::pull_channels`, which
+//! copies the runtime's mirror cells into the device ring and advances the
+//! mirror's `head` as it goes. Nothing else moves `head`; the engine never
 //! writes the binding's head word from anywhere else. And `head` is exactly
-//! what the engine's writer checks before staging a cell, in
-//! `engine/src/pipeline/channel.rs`:
+//! what the runtime's writer checks before staging a cell, in
+//! `runtime/src/pipeline/channel.rs`:
 //!
 //! ```text
 //!     if self.writer_tail - head >= capacity { return Err(ChannelError::Full) }
 //! ```
 //!
 //! `fire::envelope::compose` pulled only on its device-resolved branch. A
-//! member whose geometry the ENGINE resolves -- the ordinary case, and the only
-//! one this driver builds for anything but the decode envelope -- took an early
+//! member whose geometry the RUNTIME resolves -- the ordinary case, and the only
+//! one this engine builds for anything but the decode envelope -- took an early
 //! `Composed::Wire` return, or the host branch's `continue`, and never touched
 //! its rings. So `head` stayed at zero for the life of the instance and the
 //! writer filled after `capacity` puts and stayed full.
 //!
 //! What that looks like from outside is the worst available failure: the guest
-//! blocks on a cell that can never be staged, the driver blocks on a fire that
+//! blocks on a cell that can never be staged, the engine blocks on a fire that
 //! is never submitted, and NEITHER SIDE SAYS ANYTHING. `nvidia-smi` reads 0%.
 //! The planner's contention trace prints nothing, because nothing is queued.
 //! `RUST_LOG=debug` prints nothing after the last program registers. It is
@@ -62,13 +62,13 @@
 //! fixture runs two passes and several host round trips per token) and the
 //! harness's 180 s deadline is not generous.
 //!
-//!   cargo test --release -p worker --features driver-cuda-13 \
+//!   cargo test --release -p worker --features engine-cuda-13 \
 //!       --test cuda_host_writer_channels -- --ignored --nocapture
 
 mod common;
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local snapshot"]
+#[ignore = "real-hardware: needs an RTX GPU + --features engine-cuda-13 + a local snapshot"]
 fn a_host_written_descriptor_port_outlives_its_ring() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

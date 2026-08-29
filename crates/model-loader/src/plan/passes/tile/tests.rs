@@ -39,7 +39,7 @@ fn facts(source_dtype: DType, rows: u64, cols: u64, max_tile_bytes: u64) -> Tile
 }
 
 /// A CUDA target with the two constants that used to be hardcoded in the
-/// backend module, now stated the way the driver states them.
+/// backend module, now stated the way the engine states them.
 fn cuda_target(fused: bool) -> StorageTarget {
     StorageTarget {
         backend: BackendKind::Cuda,
@@ -91,7 +91,7 @@ fn non_bf16_source_budgets_both_sides_of_the_dequant() {
 #[test]
 fn a_budget_that_covers_the_tensor_reports_untiled() {
     // 4096 rows * 8 KiB is 32 MiB, so a 64 MiB budget fits the whole tensor.
-    // The plan says `0` rather than `4096` because the driver should not have to
+    // The plan says `0` rather than `4096` because the engine should not have to
     // compare a row count against the shape to learn there is one tile.
     let facts = facts(DType::BF16, 4096, 4096, 64 * MIB);
     assert_eq!(rows_per_tile(&facts), 0);
@@ -181,7 +181,7 @@ fn fusion_needs_every_conjunct() {
     let base = facts(DType::F8E4M3, 4096, 4096, 4 * MIB);
     assert_eq!(cuda_lower(&base, true).fusion, TransformFusion::Fp8ToMxfp4);
 
-    // The driver's opt-out, formerly PIE_CUDA_DISABLE_FUSED_TRANSCODE.
+    // The engine's opt-out, formerly PIE_CUDA_DISABLE_FUSED_TRANSCODE.
     assert_eq!(cuda_lower(&base, false).fusion, TransformFusion::None);
 
     // Only MXFP4 has a fused kernel.
@@ -344,7 +344,7 @@ fn lowering_writes_decisions_back_into_the_instruction() {
 
 #[test]
 fn a_quantized_source_resolves_to_its_logical_dtype() {
-    // The driver reads `PieLoaderSourceTensorView::dtype`, which is the logical
+    // The engine reads `PieLoaderSourceTensorView::dtype`, which is the logical
     // dtype for a quantized encoding. If this pass used the storage dtype
     // instead, the two would disagree about what the transform reads.
     let mut plan = encode_plan(

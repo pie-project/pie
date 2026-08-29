@@ -1,14 +1,14 @@
-//! **The engine states the next fire itself** — step 6 of the palo cuda-abi
+//! **The runtime states the next fire itself** — step 6 of the palo cuda-abi
 //! wave (`.wiki/palo/cuda-abi.md` §6d→§6e), gated end to end.
 //!
 //! Step 5 proved the prebind at the SHELL: alternating two compositions
 //! through one folded bucket, a test-side `Shell::expect` before each fire
 //! took the ~261 us critical-path rebind and hid it under the previous
-//! fire's execution (4.201 → 3.939 ms/fire). Nothing in the engine called
+//! fire's execution (4.201 → 3.939 ms/fire). Nothing in the runtime called
 //! `expect`. This gate runs the alternating shape through the SERVING DOOR —
 //! boot, websocket, wasm guests, the frame scheduler — with the hint stated
-//! by the engine's own driver lane (`Driver::expect_fire`, issued from
-//! `engine::scheduler::worker::fire_frame`) and nothing test-side touching
+//! by the runtime's own engine lane (`Engine::expect_fire`, issued from
+//! `runtime::scheduler::worker::fire_frame`) and nothing test-side touching
 //! the shell at all.
 //!
 //! # The workload, and why it is this one
@@ -16,8 +16,8 @@
 //! One carried completion decodes steadily (`text-completion`,
 //! [`common::SERVING_PROMPT`]) while a churn lane launches short fresh
 //! completions beside it. Every fire stays under the shell's default
-//! lattice floor (8 rows — the engine states no bucket lattice, so
-//! `driver-cuda`'s `default_lattice` applies), which puts the decode-only
+//! lattice floor (8 rows — the runtime states no bucket lattice, so
+//! `engine-cuda`'s `default_lattice` applies), which puts the decode-only
 //! waves, the prefill waves and the co-batched mixed waves in ONE bucket
 //! with DIFFERENT class signatures — the alternating-inside-one-bucket
 //! shape that made every fire of step 5's shell gate rebind, with more than
@@ -28,15 +28,15 @@
 //!
 //! **Asserted**: the SOLO phase — the carried prompt decoded with nothing
 //! beside it — answers the pinned greedy continuation
-//! ([`common::SERVING_GREEDY_16`]) in every mode. That is the engine-level
+//! ([`common::SERVING_GREEDY_16`]) in every mode. That is the runtime-level
 //! "folded serving says what eager serving says", single-lane, and it is
 //! the identity the shell's own gates pin. And the fold's MOTION: the
 //! measured mixed window folds its fires; the `PIE_CUDA_PIPELINE=off` arm
 //! pays critical-path rebinds (or the workload is not alternating and the
 //! gate measures nothing); the pipelined arm turns the pair instead.
 //!
-//! **Printed, not asserted**: the mixed window's texts and the engine's own
-//! ms/fire (`driver_fire_us` when the `profile-fire` probes are compiled
+//! **Printed, not asserted**: the mixed window's texts and the runtime's own
+//! ms/fire (`engine_fire_us` when the `profile-fire` probes are compiled
 //! in, the always-on `lane_launch_us` beside it). Co-batched token
 //! IDENTITY is deliberately not asserted here: what a lane answers when
 //! others ride beside it is a property of the composition quantization
@@ -52,14 +52,14 @@
 //!
 //! ```text
 //! PIE_CUDA_PIPELINE=off cargo test -p pie-gpu-tests \
-//!   --features driver-cuda-13,engine/profile-fire --release \
+//!   --features engine-cuda-13,runtime/profile-fire --release \
 //!   --test cuda_fold_hint_e2e -- --ignored --nocapture   # step-4 fold
 //! cargo test -p pie-gpu-tests \
-//!   --features driver-cuda-13,engine/profile-fire --release \
+//!   --features engine-cuda-13,runtime/profile-fire --release \
 //!   --test cuda_fold_hint_e2e -- --ignored --nocapture   # hint wired
 //! ```
 //!
-//! `PIE_FOLD_E2E_DEPTH` states the run-ahead depth (default: the engine's
+//! `PIE_FOLD_E2E_DEPTH` states the run-ahead depth (default: the runtime's
 //! own 2). §6d hoped the depth-2 post point holds fire N+1 sealed while
 //! fire N executes; the lane's lookahead makes that observable — `prebinds`
 //! stays zero when the successor was still being sealed at fire time, and
@@ -139,7 +139,7 @@ async fn the_engines_own_hint_reaches_the_fold_without_a_test_side_expect() -> R
         _ => Mode::Folded,
     };
     // The fold and the recorder are load-time opt-ins (`PIE_CUDA_FOLD`
-    // defaults off; the serving boot's `[driver] graphs` defaults to eager),
+    // defaults off; the serving boot's `[engine] graphs` defaults to eager),
     // and this gate is ABOUT them. Set before the boot, on the test's main
     // thread, before any thread the boot spawns can read the environment.
     //
@@ -213,8 +213,8 @@ async fn the_engines_own_hint_reaches_the_fold_without_a_test_side_expect() -> R
     );
     let (churn_solo, _) = complete(&client, CHURN_PROMPT, CHURN_TOKENS).await?;
 
-    let stats_before = engine::scheduler::get_stats().await;
-    let fold_before = engine::driver::fold_observed();
+    let stats_before = runtime::scheduler::get_stats().await;
+    let fold_before = runtime::engine::fold_observed();
     let began = Instant::now();
 
     // ── THE MEASURED WINDOW: the carried decode and the churn lane,
@@ -239,13 +239,13 @@ async fn the_engines_own_hint_reaches_the_fold_without_a_test_side_expect() -> R
     let (carried_text, carried_count) = carried?;
     let churn_answers = churn?;
 
-    let stats_after = engine::scheduler::get_stats().await;
-    let fold_after = engine::driver::fold_observed();
+    let stats_after = runtime::scheduler::get_stats().await;
+    let fold_after = runtime::engine::fold_observed();
 
     let launches =
         stats_after.fire.quorum.lane_launch_n - stats_before.fire.quorum.lane_launch_n;
-    let fire_us = stats_after.fire.execute.driver_fire_us_sum
-        - stats_before.fire.execute.driver_fire_us_sum;
+    let fire_us = stats_after.fire.execute.engine_fire_us_sum
+        - stats_before.fire.execute.engine_fire_us_sum;
     let lane_us =
         stats_after.fire.quorum.lane_launch_us - stats_before.fire.quorum.lane_launch_us;
     let (folds, rebinds, rebind_us, swaps, prebinds, prebind_us, twins) = (
@@ -259,7 +259,7 @@ async fn the_engines_own_hint_reaches_the_fold_without_a_test_side_expect() -> R
     );
     eprintln!(
         "[fold-e2e] arm={arm} {:.1} ms wall  launches={launches}  \
-         driver_fire={:.3} ms/fire (0 = profile-fire not compiled)  \
+         engine_fire={:.3} ms/fire (0 = profile-fire not compiled)  \
          lane_launch={:.3} ms/post",
         elapsed.as_secs_f64() * 1e3,
         fire_us as f64 / launches.max(1) as f64 / 1e3,

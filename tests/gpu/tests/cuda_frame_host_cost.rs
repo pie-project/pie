@@ -37,7 +37,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo test -p pie-gpu-tests --features driver-cuda-13,pie/profile-fire \
+//! cargo test -p pie-gpu-tests --features engine-cuda-13,pie/profile-fire \
 //!   --release --test cuda_frame_host_cost -- --ignored --nocapture
 //! ```
 
@@ -98,7 +98,7 @@ struct Arm {
     /// nothing about how often they happen.
     device_idle_us: u64,
     device_idle_gaps: u64,
-    /// The driver lane's own busy time per posted launch: the floor a frame
+    /// The engine lane's own busy time per posted launch: the floor a frame
     /// can never beat, with queueing excluded (unlike `batch_lat_avg`, which
     /// is post→retire and therefore counts time spent behind another frame).
     lane_launch_us: u64,
@@ -110,14 +110,14 @@ struct Arm {
     turnaround_n: u64,
     /// `execute` children (profile-fire only).
     batch_build_us: u64,
-    driver_fire_us: u64,
+    engine_fire_us: u64,
     seal_events: u64,
     seal_while_executing: u64,
     /// The guest thread's own submit, phase by phase (palo D0).
-    host: engine::scheduler::HostSubmitStats,
+    host: runtime::scheduler::HostSubmitStats,
 }
 
-/// The bucket bounds `engine::scheduler::stats::BUBBLE_HIST_UPPER_US` states.
+/// The bucket bounds `runtime::scheduler::stats::BUBBLE_HIST_UPPER_US` states.
 /// Restated here rather than imported because that module is `pub(crate)` —
 /// the same restatement `cuda_contention` makes, for the same reason.
 const BUBBLE_HIST_UPPER_US: [u64; 16] = [
@@ -146,8 +146,8 @@ async fn run_arm(
     program: &str,
     input: serde_json::Value,
 ) -> Result<Arm> {
-    let before = engine::scheduler::get_stats().await;
-    let envelopes_before = engine::driver::envelopes_resolved();
+    let before = runtime::scheduler::get_stats().await;
+    let envelopes_before = runtime::engine::envelopes_resolved();
     let started = Instant::now();
     let mut proc = client
         .launch_process(program.to_string(), input.to_string(), true)
@@ -158,8 +158,8 @@ async fn run_arm(
         .await
         .with_context(|| format!("wait_for_return {program}"))?;
     let elapsed = started.elapsed();
-    let after = engine::scheduler::get_stats().await;
-    let envelopes = engine::driver::envelopes_resolved() - envelopes_before;
+    let after = runtime::scheduler::get_stats().await;
+    let envelopes = runtime::engine::envelopes_resolved() - envelopes_before;
 
     let parsed: serde_json::Value = serde_json::from_str(&out).context("the return is JSON")?;
     let text = parsed["text"].as_str().unwrap_or_default().to_string();
@@ -195,11 +195,11 @@ async fn run_arm(
         turnaround_sum_us: after.fire.quorum.turnaround_sum_us - before.fire.quorum.turnaround_sum_us,
         turnaround_n: after.fire.quorum.turnaround_n - before.fire.quorum.turnaround_n,
         batch_build_us: after.fire.execute.batch_build_us_sum - before.fire.execute.batch_build_us_sum,
-        driver_fire_us: after.fire.execute.driver_fire_us_sum - before.fire.execute.driver_fire_us_sum,
+        engine_fire_us: after.fire.execute.engine_fire_us_sum - before.fire.execute.engine_fire_us_sum,
         seal_events: after.fire.quorum.seal_events - before.fire.quorum.seal_events,
         seal_while_executing: after.fire.quorum.seal_while_executing
             - before.fire.quorum.seal_while_executing,
-        host: engine::scheduler::HostSubmitStats {
+        host: runtime::scheduler::HostSubmitStats {
             submits: after.host_submit.submits - before.host_submit.submits,
             total_us: after.host_submit.total_us - before.host_submit.total_us,
             drain_settled_us: after.host_submit.drain_settled_us
@@ -238,7 +238,7 @@ fn report(arm: &Arm) {
     eprintln!(
         "[d0]   {:<16}       idle={:>6.2} ms/tok over {:<4} gaps ({:>5.2} ms each)  \
          lane_launch={:>5.2} ms/post ({} posts)  accept={:>5.1} us/call ({})  \
-         turnaround={:>5.2} ms  build={:>5.1} us/post  driver_fire={:>5.2} ms/post  \
+         turnaround={:>5.2} ms  build={:>5.1} us/post  engine_fire={:>5.2} ms/post  \
          seal_exec={}/{}",
         "",
         per_tok(arm.device_idle_us),
@@ -250,7 +250,7 @@ fn report(arm: &Arm) {
         arm.accept_calls,
         arm.turnaround_sum_us as f64 / arm.turnaround_n.max(1) as f64 / 1e3,
         arm.batch_build_us as f64 / arm.lane_launch_n.max(1) as f64,
-        arm.driver_fire_us as f64 / arm.lane_launch_n.max(1) as f64 / 1e3,
+        arm.engine_fire_us as f64 / arm.lane_launch_n.max(1) as f64 / 1e3,
         arm.seal_while_executing,
         arm.seal_events,
     );
@@ -285,7 +285,7 @@ async fn the_frame_path_and_the_plain_path_measured_in_one_process() -> Result<(
     let (host_wasm, host_manifest) = build_fixture("text-completion", "text_completion")?;
     let (dev_wasm, dev_manifest) = build_fixture("token-healing", "token_healing")?;
     // THE THIRD ARM, and it is the control that separates the fixture from
-    // the engine: `naive-baseline` is device-carried and `run_ahead`-driven
+    // the runtime: `naive-baseline` is device-carried and `run_ahead`-driven
     // exactly like `token-healing`, and it never calls `model::vocabs()`. If
     // the device path's per-launch constant follows the RUN-AHEAD it shows up
     // here too; if it follows the VOCABULARY it does not. Its sampler is not

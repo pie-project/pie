@@ -9,7 +9,7 @@
 //! and one `executeCommandsInBuffer:` with no host walk between them
 //! (`.wiki/palo/icb.md` §2, §7 step 4). It is seated here rather than in the
 //! shell for the reason every other shader is: **the source text lives beside
-//! the crate that ships shaders**, and `driver-metal` compiles it through the
+//! the crate that ships shaders**, and `engine-metal` compiles it through the
 //! same `Pipelines` door as `sdpa_paged_tiled`.
 //!
 //! # The bytes are the interface
@@ -27,7 +27,7 @@
 //!
 //! # What a law is
 //!
-//! Three forms, and they are `driver_metal::abi::Law`:
+//! Three forms, and they are `engine_metal::abi::Law`:
 //!
 //! ```text
 //! kind 0  const   v

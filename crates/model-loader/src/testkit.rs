@@ -3,7 +3,7 @@
 //!
 //! One module, one feature gate, one reason: [`mod@reference`] — the
 //! differential oracle plans are replayed against — is not on the load path,
-//! so a driver that links this crate has no use for it. `worker/Cargo.toml`
+//! so an engine that links this crate has no use for it. `worker/Cargo.toml`
 //! turns `testkit` off, which is also the check — if the load path ever grows
 //! a route into the oracle, the worker stops compiling.
 //!

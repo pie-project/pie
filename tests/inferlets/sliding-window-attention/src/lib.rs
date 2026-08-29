@@ -61,7 +61,7 @@ async fn main(input: Input) -> Result<String> {
     let prefill_offsets = Channel::from_iter((0..n).map(|position| position % page_t));
     let prefill_klen = Channel::from([n]);
     let prefill_pages = Channel::from(pool_ids.clone());
-    // The page CSR is the wire's source of truth for kv_len: the driver derives
+    // The page CSR is the wire's source of truth for kv_len: the engine derives
     // `kv_len = (page_count-1)*page_t + last_page_len`. A pool-wide constant page
     // count claims a kv length the pass does not have and silently corrupts
     // attention, so the count must track `kv_len` exactly.

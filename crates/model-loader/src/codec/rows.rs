@@ -1,6 +1,6 @@
 //! Encoding a 2-D tensor row by row, in parallel.
 //!
-//! The driver over the per-format group encoders. It is here rather than in
+//! The engine over the per-format group encoders. It is here rather than in
 //! the walker because it knows nothing about a plan: it takes counts, two
 //! flat output buffers and a closure, and the only reason it exists is that
 //! a row's bytes depend on that row alone.
@@ -165,7 +165,7 @@ pub fn encode_rows(
 mod tests {
     use super::*;
 
-    /// The parallel row driver against a plain sequential loop of the same
+    /// The parallel row engine against a plain sequential loop of the same
     /// job, at a size that engages the worker split.
     ///
     /// Determinism is the claim `encode_rows` makes — the worker count changes

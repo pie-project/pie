@@ -1,7 +1,7 @@
 //! Golden vectors: canonical container bytes, identity hash,
 //! validator verdict and tier-0 reference results, checked into
 //! `golden/*.txt`. **This is the conformance suite for every backend** —
-//! the CUDA driver's tiers and the SDK diff against these files: the SDK must
+//! the CUDA engine's tiers and the SDK diff against these files: the SDK must
 //! emit byte-identical containers (same hex, same hash) and any executor must
 //! reproduce the step lines exactly.
 //!
@@ -382,11 +382,11 @@ fn golden_counter_pingpong() {
 /// `lora(A, B, SITES)` in the pass prologue: A/B are *seeded channel
 /// contents* read with peeks (an adapter swap is a re-seed, never a
 /// re-trace), SITES is a trace-known placement constant. Three properties
-/// this golden pins for every executor — including the dummy driver, which
+/// this golden pins for every executor — including the dummy engine, which
 /// embeds exactly this interpreter:
 ///
 ///   - the sink FIRES in the prologue and records the peeked A/B values plus
-///     the SITES constant (the driver-side analogue is the begin-time
+///     the SITES constant (the engine-side analogue is the begin-time
 ///     harvest of the A/B cell addresses into the launch's lora table);
 ///   - executing a lora-carrying prologue is not a crash or a fault on a
 ///     backend with no projection GEMMs — the sink is configuration, and an
@@ -878,7 +878,7 @@ fn golden_matrix_select_mask() {
     // [k,v])) -> per-row argmax. EVERY matrix operand materializes k FULL
     // rows (k*v, row-major). Non-degenerate: each row's raw argmax is masked
     // out, so undersized rows / bf16-vs-f32 indexing errors cannot pass.
-    // Cross-backend gate: the CUDA driver's JIT + the Metal driver both match
+    // Cross-backend gate: the CUDA engine's JIT + the Metal engine both match
     // these step lines bit-exact.
     let (k, v) = (4u32, 8u32);
     let mut b = B::new();
@@ -955,7 +955,7 @@ fn golden_matrix_select_mask() {
 
 #[test]
 fn golden_pivot_predicates_multistage() {
-    // Regression pin (the CUDA driver's bound-trace decoder): container.rs
+    // Regression pin (the CUDA engine's bound-trace decoder): container.rs
     // decodes `Predicate::{RankLe,CummassLe,ProbGe}`'s payload as a
     // per-STAGE-LOCAL ValueId (same as any op arg) — a translator MUST remap
     // it through that stage's global-id base before dereferencing it, exactly

@@ -337,11 +337,11 @@ fn emitter_version_matches_oracle() {
     assert_eq!(recorded, CUDA_GENERATED_EMITTER_VERSION);
 }
 
-/// Whole-program emission: the table a driver receives.
+/// Whole-program emission: the table an engine receives.
 ///
 /// The per-region emitters are pinned against their recorded goldens above;
 /// this pins the walk around them — that every region gets an entry, that entry
-/// names are exactly the ones the drivers look up, and that a failure is
+/// names are exactly the ones the engines look up, and that a failure is
 /// recorded rather than dropped.
 #[test]
 fn emit_program_covers_every_region() {
@@ -431,7 +431,7 @@ fn emit_program_metal_covers_every_family() {
 
 /// `tensor_compiler::plan::stage_identity` is a cache key, so it must not move by accident.
 ///
-/// A driver keys its graph cache on this value and a wrong key is silent: it
+/// An engine keys its graph cache on this value and a wrong key is silent: it
 /// does not fail, it reuses the wrong graph. The expected column was produced
 /// by an external host-side implementation and nothing recomputes it here, so
 /// this is not a differential check — it is the weaker but still necessary
@@ -474,15 +474,15 @@ fn stage_identity_is_pinned() {
     }
 }
 
-/// Emit the CUDA kernel table for the traces the driver's own tests register.
+/// Emit the CUDA kernel table for the traces the engine's own tests register.
 ///
-/// Kernels are generated here, not in the driver, so a C++ test that registers
-/// a program has to be handed the same table the engine would hand it. It
+/// Kernels are generated here, not in the engine, so a C++ test that registers
+/// a program has to be handed the same table the runtime would hand it. It
 /// cannot run the Rust emitter, so the table is written here as a fixture
 /// beside the traces.
 ///
-/// The corpus is `compiler/tests/driver-corpus/`: one hex container per file,
-/// named for the program the driver's tests register under that name. It is not
+/// The corpus is `compiler/tests/engine-corpus/`: one hex container per file,
+/// named for the program the engine's tests register under that name. It is not
 /// a subset of `compiler/tests/golden/` (`staged_dispatch` exists only here), so
 /// it stays a corpus of its own — but a corpus only, holding containers and
 /// nothing else. Decoded plans, sidecars and readiness verdicts must not be
@@ -494,20 +494,20 @@ fn stage_identity_is_pinned() {
 ///   `kernel <kind> <stage> <region> <entry-or-dash> <source-byte-count>`
 ///   followed by exactly that many bytes of source and a newline.
 #[test]
-fn emit_driver_test_kernel_fixtures() {
+fn emit_engine_test_kernel_fixtures() {
     use tensor_compiler::codegen::program::{Backend, emit_program};
     use tensor_ir::container::decode as decode_container;
     use tensor_ir::validate::bind;
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let traces = manifest.join("tests/driver-corpus");
-    let out_dir = manifest.join("../../tests/driver-fixtures");
+    let traces = manifest.join("tests/engine-corpus");
+    let out_dir = manifest.join("../../tests/engine-fixtures");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     let mut written = 0;
     let mut unbindable: Vec<String> = Vec::new();
     let mut entries: Vec<_> = std::fs::read_dir(&traces)
-        .expect("driver corpus directory")
+        .expect("engine corpus directory")
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "ptir"))
@@ -554,10 +554,10 @@ fn emit_driver_test_kernel_fixtures() {
         // THE LAUNCH PACKAGE IS STILL BUILT, AND NO LONGER WRITTEN.
         //
         // It used to travel with the kernels as a relocatable image of the
-        // `#[repr(C)]` records the engine shipped, because the driver's C++
-        // tests could not run the host's planner and the driver no longer
+        // `#[repr(C)]` records the runtime shipped, because the engine's C++
+        // tests could not run the host's planner and the engine no longer
         // decoded PTIR. Those tests are gone, `register_program` takes an
-        // owned `ProgramRegistration`, and `driver_api::image` — the encoder
+        // owned `ProgramRegistration`, and `engine_api::image` — the encoder
         // that wrote this — went with the record family it encoded.
         //
         // Building it stays, because that is the part with value here: the
@@ -599,7 +599,7 @@ fn emit_driver_test_kernel_fixtures() {
         std::fs::write(out_dir.join(format!("{name}.regions")), regions).unwrap();
         written += 1;
     }
-    assert!(written > 0, "no driver-test kernel fixtures were written");
+    assert!(written > 0, "no engine-test kernel fixtures were written");
 
     // A corpus trace that no longer binds is drift, not a missing feature: the
     // C++ tests that register these fail for want of a fixture, which is the
@@ -614,7 +614,7 @@ fn emit_driver_test_kernel_fixtures() {
         // only reports a count, and the count is useless without the names.
         #[allow(clippy::print_stderr, reason = "names the fixtures the assert counts")]
         {
-            eprintln!("[driver kernel fixtures] skipped {reason}");
+            eprintln!("[engine kernel fixtures] skipped {reason}");
         }
     }
     // Zero, not a tolerance. The last survivor was `staged_dispatch`, and it
@@ -624,6 +624,6 @@ fn emit_driver_test_kernel_fixtures() {
     // reasons.
     assert!(
         drifted.is_empty(),
-        "vendored driver traces no longer bind: {drifted:?}"
+        "vendored engine traces no longer bind: {drifted:?}"
     );
 }

@@ -1,7 +1,7 @@
-//! `worker` library — engine boot path + supporting modules.
+//! `worker` library — runtime boot path + supporting modules.
 //!
 //! The `pie` CLI binary and the `pie-server` pyo3 wheel both link against this
-//! lib, so [`engine::start_engine`] has a single source of truth. Modules are
+//! lib, so [`runtime::start_runtime`] has a single source of truth. Modules are
 //! `pub` so the wheel can reach the surface it needs.
 
 /// The process-wide allocator for every engine entry point.
@@ -20,15 +20,15 @@ static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod config;
 pub mod config_layout;
 pub mod config_schema;
-pub mod driver_ffi;
-pub mod embedded_driver;
+pub mod embedded_engine;
+pub mod engine_ffi;
 pub mod paths;
 pub mod state;
 pub mod translate;
 pub mod weights;
 
 mod client_server;
-pub mod engine;
+pub mod runtime;
 mod executor;
 mod lifecycle;
 mod link;
@@ -38,7 +38,7 @@ mod preflight;
 // wheel code against these top-level paths, so impls can move underneath.
 pub use config::Config;
 pub use controller_api::Role;
-pub use engine::{WorkerHandle, run, run_with};
+pub use runtime::{WorkerHandle, run, run_with};
 // The control-plane seam `run_with` is generic over — re-exported so the
 // composition root (`bin/pie`) can impl it for its `EmbeddedControl` adapter.
 pub use link::control::ControlLink;

@@ -31,12 +31,12 @@
 //! conv+delta state, and a scan reads its WHOLE state on its first step, so
 //! there is no `kv_len` to make a stale one harmless. The shell zeroes those
 //! banks in `Pools::clear`, called from `Shell::open`, which the contract has
-//! no verb for and an engine that keeps its own page table therefore never
+//! no verb for and a runtime that keeps its own page table therefore never
 //! reached. Launch 1 was right because the slab was `cudaMemset` at load;
 //! launches 2 and 3 continued launch 1's sequence through eighteen layers
 //! while the six attention layers read a correct five-token prompt, which is
 //! exactly what "fluent, built out of the prompt's own words, worse each
-//! time" looks like. `driver_cuda::serve` now clears the slot on the fire
+//! time" looks like. `engine_cuda::serve` now clears the slot on the fire
 //! that states `held == 0`.
 //!
 //! The assertion is an identity, not a fluency: launch 2 and launch 3 must
@@ -54,7 +54,7 @@
 //!
 //! Run:
 //! ```text
-//! cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//! cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!   --test cuda_launch_isolation -- --ignored --nocapture --test-threads=1
 //! ```
 

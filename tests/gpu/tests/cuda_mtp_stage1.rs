@@ -1,11 +1,11 @@
 //! **MTP Stage 1 — native-drafter de-risk** (bravo), on the a real CUDA device +
 //! Qwen3.5-0.8B (GDN backbone + a 1-layer MTP head). Validates that the
-//! driver's NATIVE system drafter (`qwen3_5_mtp_forward` + `wire_system_drafter`,
+//! engine's NATIVE system drafter (`qwen3_5_mtp_forward` + `wire_system_drafter`,
 //! auto-active on MTP-weight presence) produces GENUINE, LOSSLESS t+2 drafts.
 //! This is FUNCTIONAL cross-backend parity + an HONEST throughput number — NOT a
 //! claimed perf win (mac-master: MTP is a perf LOSS at K=1, tied 248K lm_head).
 //!
-//! K (native draft tokens) is `[model.driver.options].mtp_num_drafts` (clamp
+//! K (native draft tokens) is `[model.engine.options].mtp_num_drafts` (clamp
 //! 0..32; K=0 disables the drafter = the non-spec baseline), which this suite
 //! picks from `PIE_MTP_DRAFT_TOKENS` as a harness parameter. Only the first
 //! boot in a process succeeds, so spec vs non-spec is a CROSS-INVOCATION
@@ -21,14 +21,14 @@
 //!     still lossless — it just has low acceptance).
 //!   * T4 THROUGHPUT (host, measure) — wall-clock tok/s, K=0 vs K=2. Honest
 //!     curve; EXPECT K small ≤ K=0. Reported, not gated.
-//!   * T2 ACCEPTANCE > 0 (driver signal, hard) — the draft-quality de-risk. A
+//!   * T2 ACCEPTANCE > 0 (engine signal, hard) — the draft-quality de-risk. A
 //!     genuine t+2 head is accepted on varied text; a t+1 ECHO drafts the WRONG
-//!     (previous) token → ~never accepted → rate ≈ 0. Requires a driver-emitted
+//!     (previous) token → ~never accepted → rate ≈ 0. Requires an engine-emitted
 //!     accept trace (see `CHARLIE` note below); the harness reads it from
 //!     `PIE_MTP_TRACE_FILE` when present.
-//!   * T3 NO-ECHO (driver signal, optional-stronger) — the direct CUDA analog of
+//!   * T3 NO-ECHO (engine signal, optional-stronger) — the direct CUDA analog of
 //!     mac's attn=V bug: assert the MTP draft distribution differs from the
-//!     backbone's t+1 distribution. Needs a cheap driver debug hook; deferred to
+//!     backbone's t+1 distribution. Needs a cheap engine debug hook; deferred to
 //!     charlie if the hook is heavy (T2 acceptance is the black-box detector).
 //!
 //! CHARLIE (GPU execution, post-dev-land): the native drafter's ACCEPTANCE is
@@ -43,10 +43,10 @@
 //!      `[mtp] emitted=<n> drafted=<d> accepted=<a>` — so T2 reads a real rate.
 //!   Then run K=0 and K=2 and report T1/T2/T4.
 //!
-//! `#[ignore]`, driver-cuda. Run (both K, second run cross-checks):
-//!   PIE_MTP_DRAFT_TOKENS=0 cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//! `#[ignore]`, engine-cuda. Run (both K, second run cross-checks):
+//!   PIE_MTP_DRAFT_TOKENS=0 cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!     --test cuda_mtp_stage1 -- --ignored --nocapture
-//!   PIE_MTP_DRAFT_TOKENS=2 cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//!   PIE_MTP_DRAFT_TOKENS=2 cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!     --test cuda_mtp_stage1 -- --ignored --nocapture
 
 mod common;
@@ -71,7 +71,7 @@ const DECODE_TOKENS: usize = 24;
 /// ("\n\n```html\n<!DOCTYPE html>..."). NOTE: alpha's committed golden b183291b was
 /// for `Qwen3.5-0.8B-Base` ([271,2,220,16,15..], a digit loop) — the WRONG model
 /// variant for this harness (same tokenizer, different weights). The discriminating
-/// lock is the leading run; T0 asserts the driver reproduces it.
+/// lock is the leading run; T0 asserts the engine reproduces it.
 const GDN_GOLDEN: &[u32] = &[271, 71093, 1497, 198, 13151, 15004, 5104, 29];
 
 /// Detect a degenerate decode (the garbage-state signature): a recurrent state
@@ -161,8 +161,8 @@ fn parse_generated_tokens(result: &str) -> Option<Vec<u32>> {
 }
 
 /// Read the native drafter's accept trace (`PIE_MTP_TRACE_FILE`, emitted by the
-/// driver — see the CHARLIE note) and sum `emitted`/`accepted` for a rate. None
-/// when the driver did not emit it (the host cannot see internal drafts).
+/// engine — see the CHARLIE note) and sum `emitted`/`accepted` for a rate. None
+/// when the engine did not emit it (the host cannot see internal drafts).
 fn read_acceptance() -> Option<(u64, u64)> {
     let path = std::env::var_os("PIE_MTP_TRACE_FILE")?;
     let text = std::fs::read_to_string(path).ok()?;
@@ -328,8 +328,8 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
         );
     }
 
-    // T2 ACCEPTANCE (driver signal) — the draft-quality de-risk. Only when the
-    // driver emitted the accept trace (K>0 spec run). A genuine t+2 head has
+    // T2 ACCEPTANCE (engine signal) — the draft-quality de-risk. Only when the
+    // engine emitted the accept trace (K>0 spec run). A genuine t+2 head has
     // acceptance > 0 on varied text; a t+1 echo ≈ 0.
     if k > 0 {
         match read_acceptance() {
@@ -346,7 +346,7 @@ async fn mtp_native_drafter_de_risk() -> Result<()> {
                 );
             }
             _ => eprintln!(
-                "[mtp-stage1] T2 SKIPPED — no PIE_MTP_TRACE_FILE accept trace (driver did not \
+                "[mtp-stage1] T2 SKIPPED — no PIE_MTP_TRACE_FILE accept trace (engine did not \
                  emit `[mtp] emitted=.. accepted=..`; see the CHARLIE note). Wire the emission to \
                  gate T2 on real acceptance."
             ),

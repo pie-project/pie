@@ -2,7 +2,7 @@
 //! deployment's whole life.
 //!
 //! WHY THIS IS NOT A SCHEDULE PER COMPOSITION. Which windows a fire has rows
-//! for is RUNTIME DATA — it is the batch the engine happened to assemble —
+//! for is RUNTIME DATA — it is the batch the runtime happened to assemble —
 //! and there are 2^K of them. So the artifact is the one capture script plus
 //! the tables that parameterize it: the regions in program order, the arena's
 //! static offsets, the class table the descriptor's counts are indexed by.
@@ -88,7 +88,7 @@ pub struct CompiledModel {
     /// P7's output: one slot per plan value, static offsets, rows symbolic in
     /// the bucket.
     pub arena: ArenaMap,
-    /// P6's seam: which regions the driver may have in flight at once, and
+    /// P6's seam: which regions the engine may have in flight at once, and
     /// what the arena was carved against — two values may share bytes only if
     /// no instant holds them both, and "instant" is exactly what this relation
     /// widens once regions run beside each other.
@@ -300,7 +300,7 @@ pub struct Region {
 /// launch. It is no longer what `compile` returns for an ordinary plan.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ClassOrder {
-    /// Lanes fire in the order the engine assembled them: classes ascending.
+    /// Lanes fire in the order the runtime assembled them: classes ascending.
     #[default]
     Identity,
     /// Every ordering under which the seated consumers are intervals, with the
@@ -312,7 +312,7 @@ impl ClassOrder {
     /// The order the classes PRESENT in one fire are seriated in.
     ///
     /// THE ONE THING THE FIRE PATH ASKS. A fire has rows for some subset of
-    /// the plan's classes — which subset is the batch the engine happened to
+    /// the plan's classes — which subset is the batch the runtime happened to
     /// assemble, and there are `2^K` of them, which is why this is a filter
     /// over one baked answer rather than a table with a row per composition.
     /// Absent classes simply drop out: a sub-order of an ordering that makes a
@@ -329,7 +329,7 @@ impl ClassOrder {
     /// already bound to, since re-binding a kernel node costs ~0.11 us per
     /// node and doing it for no reason costs that times every node. The
     /// parameter is here NOW so that landing the pick is a body change: this
-    /// signature is what a driver's fire path compiles against, and it is not
+    /// signature is what an engine's fire path compiles against, and it is not
     /// going to move under it.
     #[must_use]
     pub fn class_order(&self, present: &ClassSet, prev: Option<&[u8]>) -> Vec<u8> {
@@ -380,10 +380,10 @@ impl ClassOrder {
 ///
 /// A row here names a consumer the C1P instance could not seat — see
 /// [`crate::layout`] for which one gets withdrawn and why — and
-/// `driver::fire::fallback` is what reads it, at the bucket the fire landed in
+/// `engine::fire::fallback` is what reads it, at the bucket the fire landed in
 /// (`fallback::answer_at`): [`Fallback::Split`] is what every shell serves, and
 /// [`Fallback::Copy`] is served by a shell that publishes a row gather and says
-/// so (`fallback::Serve`) — `driver-cuda` does; `driver-metal` does not, and
+/// so (`fallback::Serve`) — `engine-cuda` does; `engine-metal` does not, and
 /// splits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FallbackTable {

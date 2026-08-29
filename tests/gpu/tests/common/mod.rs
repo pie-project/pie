@@ -2,7 +2,7 @@
 //! checkpoint they all come up on.
 //!
 //! There are two families here and the split is the wave they were written in.
-//! `boot_cuda*` is the LEGACY family: the standalone with the driver's own
+//! `boot_cuda*` is the LEGACY family: the standalone with the engine's own
 //! `gpu_mem_utilization` deriving every ceiling, which is what the pre-palo
 //! harnesses were written against. `boot_serving*` is the palo B3 family: the
 //! same standalone with the ceilings STATED, because the arena reserves
@@ -10,12 +10,12 @@
 //! is 8 GiB of arena for a gate that fires eight tokens.
 //!
 //! Both resolve the SAME checkpoint. There is exactly one dense SKU the
-//! catalog, `engine::model::ROWS` and the reference device all agree about —
+//! catalog, `runtime::model::ROWS` and the reference device all agree about —
 //! `qwen35-d0.8b-bf16-kv-bf16` — and a gate that booted anything else in this
 //! tree would be measuring a load refusal.
 //!
 //! ONE boot per process (the runtime owns process-global singletons — `auth`
-//! panics on a 2nd boot; the driver grabs a fixed POSIX shmem), so every test
+//! panics on a 2nd boot; the engine grabs a fixed POSIX shmem), so every test
 //! that boots must live in its own `#[ignore]` test process.
 
 // Not every integration-test file uses every helper (each `mod common;` is a
@@ -27,7 +27,7 @@ use pie::derive::derive_standalone;
 use pie::run_standalone;
 
 /// Install a `tracing` subscriber driven by `RUST_LOG` so the inproc
-/// forward-path debug probes (`engine::driver::inproc`) and any other `tracing`
+/// forward-path debug probes (`runtime::engine::inproc`) and any other `tracing`
 /// events surface on the diagnostic runs. Idempotent + non-panicking: a 2nd
 /// call (or a boot that already set a global) is a silent no-op.
 pub fn init_trace() {
@@ -44,8 +44,8 @@ pub fn init_trace() {
 // every `boot_4090*` below resolved through them. This build ships no SKU that
 // checkpoint can be: `::model::qwen_3::IMPORTS` claims an artifact by NAME, and
 // all five of its rows ask for `model.language_model.layers.*` at a qwen3.5
-// geometry, which a Qwen3-0.6B file does not hold. `engine::model::ROWS` has no
-// id for it either. So `engine::driver::load` cannot identify it and the boot
+// geometry, which a Qwen3-0.6B file does not hold. `runtime::model::ROWS` has no
+// id for it either. So `runtime::engine::load` cannot identify it and the boot
 // dies before a fire, for a reason that has nothing to do with what any gate
 // here measures.
 //
@@ -57,7 +57,7 @@ pub fn init_trace() {
 /// The cuda_native standalone TOML (`[controller]/[gateway]/[worker]`).
 ///
 /// `binary_path` is omitted (accepted-but-ignored for cuda_native — the
-/// standalone embeds the driver as a static lib). The CUDA driver loads
+/// standalone embeds the engine as a static lib). The CUDA engine loads
 /// `config.json` + `model.safetensors` + `tokenizer.json` from the snapshot
 /// dir, so `hf_repo` is a **local snapshot path** (R3: the worker never
 /// downloads). `device` is an array (`["cuda:0"]`); auth off; gateway on an
@@ -82,7 +82,7 @@ pub fn cuda_standalone_toml_capped(
     total_pages: u32,
 ) -> String {
     // cpu_pages (the runtime KV stash pool for suspend/restore) is derived from
-    // the cuda driver's `swap_pool_size` (translate.rs:117). MANDATORY > 0 for
+    // the cuda engine's `swap_pool_size` (translate.rs:117). MANDATORY > 0 for
     // suspend/restore (with swap_pool_size=0 the runtime cpu_pages=0 → every suspend is
     // all-cold → the fix makes suspends inert (freed_now=0 → decline), and pre-fix
     // it silently dropped written KV → "slot 0 has no written page"). Default 512
@@ -100,7 +100,7 @@ pub fn cuda_standalone_toml_capped(
          name = \"qwen35\"\n\
          model = \"{hf_repo}\"\n\
          \n\
-         [driver]\n\
+         [engine]\n\
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
          \n\
@@ -119,7 +119,7 @@ pub fn cuda_standalone_toml_capped(
 }
 
 /// Boot the embedded standalone (controller + gateway + worker) with the real
-/// CUDA driver against the shipping dense SKU. The client edge is at
+/// CUDA engine against the shipping dense SKU. The client edge is at
 /// `handle.listen_addr` (`ws://{listen_addr}` for the `pie-client`).
 ///
 /// The LEGACY boot: every ceiling is derived from `gpu_mem_utilization`, which
@@ -135,7 +135,7 @@ pub async fn boot_cuda() -> Result<pie::StandaloneHandle> {
 /// fleet over-fills it — the preempt/restore over-capacity e2e
 /// (`cuda_contention`). Contention is forced by the explicit KV-page cap
 /// (`PIE_CONTENTION_TOTAL_PAGES` → `[batching].total_pages`), NOT by util: util
-/// only needs to clear the ~0.3 forward-layout floor so the driver boots
+/// only needs to clear the ~0.3 forward-layout floor so the engine boots
 /// (util < ~0.3 → fatal "no viable forward/KV layout"). The cap then shrinks
 /// the KV pool to exactly N pages (`min(kv_pages, cap)`), so a modest fleet
 /// genuinely over-fills it deterministically.
@@ -194,7 +194,7 @@ pub fn resolve_qwen35_snapshot() -> Result<String> {
 }
 
 /// The cuda_native standalone TOML for an MTP model. Same shape as
-/// [`cuda_standalone_toml`] but `name = "default"` so the driver auto-detects
+/// [`cuda_standalone_toml`] but `name = "default"` so the engine auto-detects
 /// the architecture (GDN + MTP head) from the snapshot's `config.json` rather
 /// than being pinned to the dense `qwen3` path.
 pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
@@ -206,7 +206,7 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
          name = \"default\"\n\
          model = \"{hf_repo}\"\n\
          \n\
-         [driver]\n\
+         [engine]\n\
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
          \n\
@@ -215,9 +215,9 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
     )
 }
 
-/// Boot the embedded standalone with the real CUDA driver against
+/// Boot the embedded standalone with the real CUDA engine against
 /// [`QWEN35_0_8B_REPO`]. K (native draft tokens) is `mtp_num_drafts`, passed
-/// through `[model.driver.options]` like any other driver setting -- 0 disables
+/// through `[model.engine.options]` like any other engine setting -- 0 disables
 /// speculation and gives the non-spec baseline. Client edge at
 /// `handle.listen_addr`.
 pub async fn boot_cuda_mtp(mtp_num_drafts: u32) -> Result<pie::StandaloneHandle> {
@@ -235,7 +235,7 @@ pub async fn boot_cuda_mtp(mtp_num_drafts: u32) -> Result<pie::StandaloneHandle>
 /// fires eight tokens.
 ///
 /// `[model] name` is the deployment's name, not the checkpoint's — the SKU is
-/// identified from the checkpoint's own tensors by `engine::driver::load`.
+/// identified from the checkpoint's own tensors by `runtime::engine::load`.
 pub fn serving_standalone_toml(checkpoint: &str) -> String {
     format!(
         "[server]\n\
@@ -245,7 +245,7 @@ pub fn serving_standalone_toml(checkpoint: &str) -> String {
          name = \"qwen35\"\n\
          model = \"{checkpoint}\"\n\
          \n\
-         [driver]\n\
+         [engine]\n\
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
          gpu_mem_utilization = 0.85\n\
@@ -274,7 +274,7 @@ pub const SERVING_PROMPT: &str = "The capital of France is";
 /// travelling through the host, `token-healing` produces it with the token
 /// carried on the device, and the run-ahead A/B produces it at each of two
 /// `frame_size`s. Those arms are spread over several processes because a
-/// BOOT is what they differ by (one boot per process — the driver grabs the
+/// BOOT is what they differ by (one boot per process — the engine grabs the
 /// device and `auth` panics on a second), and a constant is how several
 /// processes agree about a fact. Launches within one boot are not spread:
 /// `cuda_launch_isolation` is the gate that says so.
@@ -295,11 +295,11 @@ pub async fn boot_serving() -> Result<pie::StandaloneHandle> {
 /// `validate_frame` and every fire settles before the next is built, which is
 /// one host round trip per token; at `2` a frame carries two ordered slots
 /// and slot 1 consumes the channel slot 0 published, which is the chained
-/// decode. `None` keeps the engine's own default so
+/// decode. `None` keeps the runtime's own default so
 /// [`boot_serving`]'s callers are unchanged.
 ///
-/// It rides `[runtime]`, which `worker::config_layout::reshape` moves to
-/// `model.scheduler`, which is where the engine reads its frame knobs from.
+/// It rides `[runtime]`, which is where the frame knobs live in the file and
+/// in `worker::config::RuntimeConfig` alike.
 pub async fn boot_serving_frame(frame_size: Option<u32>) -> Result<pie::StandaloneHandle> {
     let checkpoint = resolve_qwen35_snapshot()?;
     let mut toml = serving_standalone_toml(&checkpoint);
@@ -311,8 +311,8 @@ pub async fn boot_serving_frame(frame_size: Option<u32>) -> Result<pie::Standalo
 }
 
 /// K for the MTP suites, from `PIE_MTP_DRAFT_TOKENS`. A harness parameter, not
-/// engine config: it selects which arm of a manual A/B to boot, and is handed
-/// to the driver as `mtp_num_drafts`.
+/// runtime config: it selects which arm of a manual A/B to boot, and is handed
+/// to the engine as `mtp_num_drafts`.
 pub fn mtp_draft_tokens(default_k: u32) -> u32 {
     std::env::var("PIE_MTP_DRAFT_TOKENS")
         .ok()
@@ -321,20 +321,20 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
         .unwrap_or(default_k)
 }
 
-// ── The dummy driver, and the three gates that stood on it ─────────────
+// ── The dummy engine, and the three gates that stood on it ─────────────
 //
 // `dummy_standalone_toml` and `boot_dummy` STOOD HERE. They fabricated
-// everything a portable driver reads from weights -- no GPU, no 20 GB load,
-// near-instant boot -- so a gate could exercise the driver-AGNOSTIC client
+// everything a portable engine reads from weights -- no GPU, no 20 GB load,
+// near-instant boot -- so a gate could exercise the engine-AGNOSTIC client
 // edge (connect -> add_program -> launch -> forward round-trip) on a machine
 // with no CUDA and no artifact.
 //
-// The driver they named is deleted. `DriverKind` accepts `cuda_native`,
+// The engine they named is deleted. `EngineKind` accepts `cuda_native`,
 // `metal`, `vulkan` and `wgpu` and nothing else, so `type = "dummy"` no longer
 // parses -- `worker::config` refuses it before a boot is attempted, and there
-// is no driverless boot left anywhere in this tree. That is a decision made
+// is no engineless boot left anywhere in this tree. That is a decision made
 // upstream and recorded in this crate's `Cargo.toml`: *"there is no fallback:
-// the dummy driver these no-GPU diagnostics used to run against is deleted, so
+// the dummy engine these no-GPU diagnostics used to run against is deleted, so
 // a build with neither feature reaches no device."* These helpers were what
 // that sentence had not finished removing.
 //
@@ -342,7 +342,7 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
 // plain `cargo test` with no GPU and no env var, and the gates that took over
 // do not: they are `#[ignore]`d and want a device. That is a real reduction in
 // what CI notices on a machine with no device, and it is stated here rather
-// than discovered later. It is the cost of the dummy driver's deletion, not of
+// than discovered later. It is the cost of the dummy engine's deletion, not of
 // this edit. The end-to-end half -- boot from a snapshot and round-trip a turn
 // through the real client edge -- is `cuda_serve_round_trip` in this
 // directory, against a real model on a real device.
@@ -350,14 +350,14 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
 // ── `build_inferlet` and `run_inferlet` STOOD HERE ──────────────────────
 //
 // They built `-p generate -p mirostat -p grammar` out of
-// `crates/engine/tests/inferlets` and submitted the result over the client
+// `crates/runtime/tests/inferlets` and submitted the result over the client
 // websocket. BOTH halves of that are gone: the guest workspace moved to
 // `tests/inferlets`, and none of those three packages is in it -- the sampler
 // capability suite they served (`programmable_sampler_4090`, `cuda_mirostat19`,
-// `cuda_grammar_op`, `cuda_grammar_late`) went with the driver-baked sampler
+// `cuda_grammar_op`, `cuda_grammar_late`) went with the engine-baked sampler
 // plane it was written for, and what asks that question now is
-// `driver-cuda/tests/program_parity` (the emitted guest kernels diffed against
-// the host interpreter, ring for ring) and `engine/tests/cuda_program_epilogue`.
+// `engine-cuda/tests/program_parity` (the emitted guest kernels diffed against
+// the host interpreter, ring for ring) and `runtime/tests/cuda_program_epilogue`.
 //
 // The gates that still submit a guest build it themselves against
 // `tests/inferlets`, one package each, which is what lets a harness name the
@@ -367,6 +367,6 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
 //
 // `vulkan_standalone_toml*`, `wgpu_standalone_toml*`, `boot_vulkan*` and
 // `boot_wgpu*`, together with the fifteen gates that called them, went with
-// R3: the vulkan and wgpu drivers are out of the workspace until their
+// R3: the vulkan and wgpu engines are out of the workspace until their
 // baker executors land (P5), so this crate has no feature that reaches one.
-// They come back with the drivers.
+// They come back with the engines.

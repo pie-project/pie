@@ -30,7 +30,7 @@ pub mod cuda;
 compile_error!(
     "model-loader's `cuda` feature needs a runtime version too: enable \
      `cuda-12` or `cuda-13`, matching the libcudart this binary will load. \
-     `driver-cuda`'s own `cuda-12`/`cuda-13` already pass the choice on."
+     `engine-cuda`'s own `cuda-12`/`cuda-13` already pass the choice on."
 );
 
 use std::collections::HashMap;
@@ -79,7 +79,7 @@ pub enum Residency<'a> {
 /// // Allocate the arena, keep every tensor, hand both back.
 /// let storage = Execution::new(&plan, dir).run()?;
 ///
-/// // A discrete device's arena, and the driver's own sink.
+/// // A discrete device's arena, and the engine's own sink.
 /// Execution::new(&plan, dir).arena(&mut backing).sink(&mut sink).run()?;
 ///
 /// // `pie model import`: no arena at all, each tensor streamed out as it
@@ -117,7 +117,7 @@ impl<'a> Execution<'a> {
     /// Write the plan's persistent buffers into an arena the CALLER owns.
     ///
     /// The shape a resident device load wants. Without it the executor
-    /// allocates the arena itself and hands it back, so a driver staging
+    /// allocates the arena itself and hands it back, so an engine staging
     /// weights holds the whole model TWICE — once in that vector and once in
     /// the buffer it copies the vector into. On a machine where the model is a
     /// meaningful fraction of RAM that is the difference between loading and

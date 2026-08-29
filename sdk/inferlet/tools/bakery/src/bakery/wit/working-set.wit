@@ -4,7 +4,7 @@ interface working-set {
     use pipeline.{pipeline};
 
     // A working set exposes only what is TRUE OF ITSELF: its extent, its
-    // shape, its lineage. Driver constants that merely happen to be reachable
+    // shape, its lineage. Engine constants that merely happen to be reachable
     // through it -- KV page size, folded-state byte size, buffered RS page
     // size -- live on `model` instead. The engine serves exactly one model, so
     // a per-resource copy could never disagree with the global; it would just
@@ -63,7 +63,7 @@ interface working-set {
 
         // Atomically insert or replace `key` with a structurally retained view
         // of this working set. Keys are opaque bytes scoped to the active
-        // model/driver store. The working set must have no in-flight fire and
+        // model/engine store. The working set must have no in-flight fire and
         // every logical page must be physically mapped.
         update-index: func(key: list<u8>) -> result<_, error>;
 

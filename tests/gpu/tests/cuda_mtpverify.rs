@@ -8,7 +8,7 @@
 //! masks cannot be one broadcast), per-row `argmax`, verify the `[k]` draft
 //! (`eq → cumprod` prefix-AND → sentinel `[k]`-Token). This is the FULL composed
 //! program (mask-`select` + spec-verify DAG) lowering through the real Sampling-IR
-//! CUDA backend on genuine model logits — what the mock (the engine's deleted north_star_e2e test)
+//! CUDA backend on genuine model logits — what the mock (the runtime's deleted north_star_e2e test)
 //! proved host-side, now certified on the device.
 //!
 //! Distinct from the two half-tests already on GPU:
@@ -32,10 +32,10 @@
 //!   * LOOP_CTRL_OK — the multi-step accept-prefix decode loop advances by exactly
 //!     each step's accepted length (control-flow correctness of the §6.1 loop).
 //!
-//! `#[ignore]`, driver-cuda. Run:
+//! `#[ignore]`, engine-cuda. Run:
 //!   PIE_COMPILER_LAUNCHER=env CUDACXX=/usr/local/cuda/bin/nvcc \
 //!   CPM_SOURCE_CACHE=$HOME/.cache/pie-cpm \
-//!   cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_mtpverify -- --ignored --nocapture
+//!   cargo test -p pie-gpu-tests --features engine-cuda-13 --test cuda_mtpverify -- --ignored --nocapture
 
 mod common;
 
@@ -54,7 +54,7 @@ use client::client::Client;
             plain `qwen35-d0.8b` dense row, so a drafting lane gets \
             `Fault::Draftless`, and the `mtpverify` guest that composed it with \
             a grammar mask is gone with the workspace move to `tests/inferlets`"]
-async fn mtp_grammar_composition_on_real_driver() -> Result<()> {
+async fn mtp_grammar_composition_on_real_engine() -> Result<()> {
     common::init_trace();
     let pie = common::boot_cuda().await?;
     eprintln!("[mtp-verify] booted, listen_addr={}", pie.listen_addr);

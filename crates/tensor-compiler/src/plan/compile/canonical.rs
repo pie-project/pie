@@ -5,7 +5,7 @@
 //! a type, or an op so that two stages that should share a compiled executable
 //! hash the same — and two that should not, do not.
 //!
-//! **The layout is locked to the CUDA driver.** `program_identity.hpp` walks the
+//! **The layout is locked to the CUDA engine.** `program_identity.hpp` walks the
 //! same fields in the same order to key its graph cache, and
 //! `stage_identity_matches_the_driver` in `compiler/tests` pins the two
 //! together. Reordering a field here is an ABI break, not a refactor; bump

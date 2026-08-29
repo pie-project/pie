@@ -13,7 +13,7 @@ epilogue does only temperature scaling and a Gumbel-max draw.
 
 The repo's two existing completion inferlets do not serve this role. When this
 crate was written the reason given was that neither one ran — `text-completion-
-bench` was said to stall the driver on `ResizePool`, and `chat-completion` to
+bench` was said to stall the engine on `ResizePool`, and `chat-completion` to
 fail with `EmbedTokens is not host-derivable: channel 0 has no host-known
 value`. **Both of those failures are gone, and neither was ever the real
 reason.** `cuda_forward` drives `text-completion-bench` to a coherent sixteen
@@ -115,10 +115,10 @@ Three conclusions, spelled out in the audit's `## Runtime cost` section:
   the last ones anyone can quote, because the fix is
   `codegen/metal/topk.rs::emit_grouped_topk` — one backend's grouped library
   kernel. `codegen/cuda` has written no library kernels at all, so on the
-  `cuda_native` driver the `## Run` line below invokes, these two inferlets do
+  `cuda_native` engine the `## Run` line below invokes, these two inferlets do
   not run slowly: they do not run. A single-op `top_k` lift reaches the CUDA
   emitter, which declines it with `generated region contains a non-generated
-  boundary (top_k)`, and the driver refuses the program (`crates/worker/tests/
+  boundary (top_k)`, and the engine refuses the program (`crates/worker/tests/
   cuda_canaries.rs` records the same three fixtures under the same class).
   Re-measuring the pair against this baseline needs either that CUDA kernel or
   a re-run of the whole table on a backend that has one.
@@ -130,7 +130,7 @@ Three conclusions, spelled out in the audit's `## Runtime cost` section:
 
 ```bash
 cargo build --release --target wasm32-wasip2
-python tests/inferlets/run_all.py --driver cuda_native --model <model-path>
+python tests/inferlets/run_all.py --engine cuda_native --model <model-path>
 ```
 
 Details are in the `//!` header of [`src/lib.rs`](src/lib.rs).

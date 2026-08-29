@@ -2,12 +2,12 @@
 //! `pie` CLI binary.
 //!
 //! Both surfaces drive the same library (`worker`); this crate
-//! is just a pyo3 wrapper around [`worker::engine::start_engine`]
-//! plus a [`worker::engine::EngineHandle`] handle. Lifecycle:
+//! is just a pyo3 wrapper around [`worker::runtime::start_runtime`]
+//! plus a [`worker::runtime::RuntimeHandle`] handle. Lifecycle:
 //! when the Python `EngineHandle` is dropped (or the user's interpreter
-//! exits), the embedded tokio runtime + every subprocess driver are
+//! exits), the embedded tokio runtime + every subprocess engine are
 //! torn down — combined with the `PR_SET_PDEATHSIG` hook in
-//! `subprocess_driver`, this means "script ends → server is gone, no
+//! `subprocess_engine`, this means "script ends → server is gone, no
 //! orphans".
 
 use std::sync::{Arc, Mutex};
@@ -16,21 +16,21 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
 use worker::config::Config as ServeConfig;
-use worker::engine::{self, EngineHandle as ServeHandle};
+use worker::runtime::{self, RuntimeHandle as ServeHandle};
 
 /// Live engine returned by `bootstrap`. Holds the tokio runtime that
-/// keeps the WS scheduler + driver supervisors alive.
+/// keeps the WS scheduler + engine supervisors alive.
 ///
 /// Methods:
 ///   - `url` (str)        — `ws://host:port` the engine is listening on
-///   - `shutdown()`       — blocking, idempotent. Stops drivers + runtime.
+///   - `shutdown()`       — blocking, idempotent. Stops engines + runtime.
 ///   - `is_running()`     — `True` until `shutdown()` returns.
 #[pyclass(name = "EngineHandle")]
 struct PyEngineHandle {
     url: String,
     /// `(handle, runtime)` together — once `shutdown()` runs, both are
     /// taken to `None`. The runtime has to outlive every subprocess
-    /// driver join, which `ServeHandle::shutdown` guarantees.
+    /// engine join, which `ServeHandle::shutdown` guarantees.
     inner: Mutex<Option<(ServeHandle, Arc<tokio::runtime::Runtime>)>>,
 }
 
@@ -46,7 +46,7 @@ impl PyEngineHandle {
         self.inner.lock().unwrap().is_some()
     }
 
-    /// Tear down the engine: signals every driver, joins them, releases
+    /// Tear down the engine: signals every engine, joins them, releases
     /// the tokio runtime. Idempotent — calling twice is a no-op.
     /// Releases the GIL during the (potentially slow) join.
     fn shutdown(&self, py: Python<'_>) {
@@ -98,7 +98,7 @@ fn init_tracing() {
 /// --config <path>` reads). Returns an [`EngineHandle`] that the caller
 /// can query and shut down.
 ///
-/// Blocks until the engine is fully booted (drivers spawned, weights
+/// Blocks until the engine is fully booted (engines spawned, weights
 /// loaded, WS listener bound). Releases the GIL during the wait so
 /// other Python threads keep running.
 #[pyfunction]
@@ -116,19 +116,19 @@ fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
         .map_err(|e| PyValueError::new_err(format!("validate config: {e:#}")))?;
 
     py.detach(|| -> PyResult<PyEngineHandle> {
-        let runtime = engine::build_runtime(&cfg)
+        let runtime = runtime::build_runtime(&cfg)
             .map_err(|e| PyRuntimeError::new_err(format!("build tokio runtime: {e:#}")))?;
         let runtime = Arc::new(runtime);
 
         // The embedded engine wheel is always single-node: embed an in-proc
         // controller and self-register before booting the engine.
         let control_addr = format!("{}:{}", cfg.server.host, cfg.server.port);
-        let coordinator = engine::connect(&engine::TopologyMode::SingleNode, control_addr)
+        let coordinator = runtime::connect(&runtime::TopologyMode::SingleNode, control_addr)
             .map_err(|e| PyRuntimeError::new_err(format!("join control plane: {e:#}")))?;
 
         let handle = runtime
-            .block_on(engine::start_engine(cfg, coordinator))
-            .map_err(|e| PyRuntimeError::new_err(format!("start_engine: {e:#}")))?;
+            .block_on(runtime::start_runtime(cfg, coordinator))
+            .map_err(|e| PyRuntimeError::new_err(format!("start_runtime: {e:#}")))?;
 
         let url = handle.url.clone();
         Ok(PyEngineHandle {

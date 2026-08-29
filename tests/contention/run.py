@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the contention scenario suite against a REAL driver.
+"""Run the contention scenario suite against a REAL engine.
 
     python tests/contention/run.py                     # every scenario
     python tests/contention/run.py -k tinyswap,soak    # a subset
@@ -13,7 +13,7 @@ usable directly as a CI step on a GPU runner.
 
 There is no mock device anywhere in this suite: contention lives in the
 interaction between the planner, the scheduler's frame boundary and the
-driver's copy engine, and a mock driver cannot reproduce it.
+driver's copy engine, and a mock engine cannot reproduce it.
 
 Environment:
   PIE_CONTENTION_SUITE_PYTHON   interpreter that has the pie server installed
@@ -241,7 +241,7 @@ def run_once(scenario: Scenario, args: argparse.Namespace,
     env.update(scenario.env)
 
     cmd = [args.python, "pie_bench.py", "tput",
-           "--driver", args.driver, "--model", args.model,
+           "--engine", args.engine, "--model", args.model,
            "--warmup", str(scenario.warmup),
            "--request-timeout", str(args.request_timeout),
            "--json-out", str(jout)]
@@ -296,8 +296,8 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-k", "--only", default="",
                         help="comma-separated scenario names")
-    parser.add_argument("--driver", default="cuda_native",
-                        help="real driver to exercise (no mock devices)")
+    parser.add_argument("--engine", default="cuda_native",
+                        help="real engine to exercise (no mock devices)")
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B")
     parser.add_argument("--python",
                         default=os.environ.get("PIE_CONTENTION_SUITE_PYTHON",

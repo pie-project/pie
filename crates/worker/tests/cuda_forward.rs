@@ -8,12 +8,12 @@
 //!
 //! Shares the `common` cuda harness with the Lane-C CAS-dedup and Lane-D
 //! fold-parity tests (`boot_cuda()` + `spawn_text()`). Run explicitly:
-//!   cargo test -p worker --features driver-cuda-13 --test cuda_forward -- --ignored --nocapture
+//!   cargo test -p worker --features engine-cuda-13 --test cuda_forward -- --ignored --nocapture
 
 mod common;
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local model snapshot; one boot per process"]
+#[ignore = "real-hardware: needs an RTX GPU + --features engine-cuda-13 + a local model snapshot; one boot per process"]
 fn cuda_native_text_and_device_geometry_decode() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -46,18 +46,18 @@ fn cuda_native_text_and_device_geometry_decode() {
         // successor is `sliding-window-attention`, which builds the same wire
         // form and is what `tests/gpu/tests/cuda_sliding_window_attention_e2e`
         // drives -- and that gate fails on this exact box, with the card
-        // present and the model loaded, because THIS DRIVER DOES NOT CLAIM
-        // THAT CLASS. `driver-cuda/src/serve/load.rs` says so in as many
+        // present and the model loaded, because THIS ENGINE DOES NOT CLAIM
+        // THAT CLASS. `engine-cuda/src/serve/load.rs` says so in as many
         // words beside `device_geometry_port_mask`:
         //
         //     `DEVICE_GEOMETRY_PORTS` is deliberately absent: it wins the
-        //     pool-owned class this driver does not build.
+        //     pool-owned class this engine does not build.
         //
-        // so the engine sends such a program down the host fallback, which
+        // so the runtime sends such a program down the host fallback, which
         // cannot derive `EmbedTokens` and reports `EmbedTokens is not
         // host-derivable: channel 0 has no host-known value` -- a sentence
         // about the symptom rather than about the claim, which is what
-        // `engine/src/driver/backend/vulkan.rs` warns it reads as.
+        // `runtime/src/engine/backend/vulkan.rs` warns it reads as.
         //
         // A step here that turned that into a failure would make this file a
         // standing red about a capability nobody has regressed, and one that

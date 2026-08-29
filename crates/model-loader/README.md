@@ -17,13 +17,13 @@ measured. `tests/standalone.rs` pins that as four properties rather than as
 prose.
 
 The contract is internal IR. It read `author(facts, source, policy)` here, for
-a driver-side contract author that R3 deleted with the legacy load contract;
+an engine-side contract author that R3 deleted with the legacy load contract;
 the live path synthesizes one instead — `contract::materialize` reads the
 checkpoint and produces the `ModelContract` that `plan::compile` consumes, in
 the same call. The compiler stays family-blind either way: none of its inputs
 is a model's name.
 
-There is no C ABI. The drivers link this crate as an rlib and pass Rust types;
+There is no C ABI. The engines link this crate as an rlib and pass Rust types;
 `crates/driver-cuda/csrc`'s `load_plan_executor.hpp`, `weight_store.cpp` and
 the generated `pie_loader.h` were deleted with the rest of the C++ loader, and
 executing a plan is `executor`'s — one implementation, one set of decisions,
@@ -50,7 +50,7 @@ turns it on, and it is a test — see the feature's note in `Cargo.toml`.
 This crate declares no `[[bin]]`. The command is `pie`'s, and there is one:
 `pie model import`, which compiles a plan and runs it through
 `executor::Execution` in its streaming shape, with no GPU, no runtime and no
-driver.
+engine.
 
 An offline `pie model build` stood beside it — weight conversion that ran the
 load transforms ahead of time and wrote the result as a second `.zt` — and R3
@@ -113,13 +113,13 @@ They live in the wiki, under `loader/`:
 | Page | What it is |
 | --- | --- |
 | `architecture.md` | Target state, the boundaries, and §12's numbered log of what has landed |
-| `spec.md` | The model contract format a driver authors |
+| `spec.md` | The model contract format an engine authors |
 | `loader_v2_plan.md` | The north star the v2 refactor was measured against |
 | `contribution.md` | Paper design notes — *don't trust the loader, check the plan* |
 
 A `metal_todos.md` row stood here — "what the refactor changed in the Metal ABI
-but could not run". There is no Metal ABI: the drivers pass Rust types, and
-`driver-metal` left the workspace entirely in R3. The page is still in the wiki
+but could not run". There is no Metal ABI: the engines pass Rust types, and
+`engine-metal` left the workspace entirely in R3. The page is still in the wiki
 as a record of what was never verified.
 
 Source comments cite these by filename — "`spec.md` §3.3", "`loader/architecture.md`

@@ -3,7 +3,7 @@
 //! Everything `sweep` and `scheduler::reconfigure` are made of has unit tests,
 //! and none of them answer this. The unit tests check arithmetic — a percentile,
 //! a candidate filter, a tokens-per-second division — and `reconfigure`'s own
-//! test moves three statics in an empty process with no engine under them.
+//! test moves three statics in an empty process with no runtime under them.
 //!
 //! What has never been observed is the thing the whole plan rests on: a model
 //! that stays resident while the knobs change beneath it, round after round,
@@ -15,7 +15,7 @@
 //!      after the first, and a sweep would measure one candidate N times.
 //!   2. It succeeds and does nothing, because something downstream cached the
 //!      old value at boot the way guests cache `frame-size`.
-//!   3. The rounds run but the engine degrades across them, so later candidates
+//!   3. The rounds run but the runtime degrades across them, so later candidates
 //!      are penalised for their position rather than judged on their merits.
 //!
 //! This test is the one that would catch all three, so it asserts on all three
@@ -38,18 +38,18 @@
 //! ```
 //!
 //! — because `Lane::slot`, the sequence's seat in the shell's pools, had no
-//! owner: both engine fire paths stated zero and the caller their comments
+//! owner: both runtime fire paths stated zero and the caller their comments
 //! said would stamp it did not exist. `palo` build log 29 gave the seat to
-//! the KV working set (`engine::store::seat`), which is the engine's
+//! the KV working set (`runtime::store::seat`), which is the runtime's
 //! per-sequence identity, and this gate is GREEN on it: four rounds, eight
 //! lanes each, `failed 0`. Keep it that way — a regression here is the
 //! defect coming back, and the host-side half of the same claim is
-//! `engine::scheduler::batch`'s
+//! `runtime::scheduler::batch`'s
 //! `two_seated_members_batch_into_a_fire_the_contract_accepts`.
 //!
 //! `#[ignore]` (needs a CUDA device and the Qwen3.5-0.8B snapshot). Run:
 //!   PIE_COMPILER_LAUNCHER=env \
-//!     cargo test -p pie-gpu-tests --features driver-cuda-13 --release \
+//!     cargo test -p pie-gpu-tests --features engine-cuda-13 --release \
 //!     --test cuda_sweep_e2e -- --ignored --nocapture
 
 mod common;
@@ -62,7 +62,7 @@ use client::client::Client;
 use pie::sweep::{self, Knobs};
 
 /// The program every lane runs. It was `generate@0.1.0`, a package deleted
-/// with the guest workspace's move from `crates/engine/tests/inferlets` to
+/// with the guest workspace's move from `crates/runtime/tests/inferlets` to
 /// `tests/inferlets`; `text-completion` replaces it. Nothing here reads the
 /// guest's answer — the assertions are all `sweep::Round` — so the repoint is
 /// a package name and the shape of the budget it is handed.
@@ -190,17 +190,17 @@ async fn a_sweep_measures_many_candidates_against_one_resident_model() -> Result
         );
     }
 
-    // (3) The knobs reached the engine. `frame_size` is the one that is
+    // (3) The knobs reached the runtime. `frame_size` is the one that is
     //     observable from outside the scheduler, because guests are told it —
     //     so read it back through the same accessor the host function serves.
     anyhow::ensure!(
-        engine::scheduler::configured_frame_size() == 2,
-        "the last round set k=2; the engine reports {}",
-        engine::scheduler::configured_frame_size()
+        runtime::scheduler::configured_frame_size() == 2,
+        "the last round set k=2; the runtime reports {}",
+        runtime::scheduler::configured_frame_size()
     );
 
     // (4) No drift across the sweep. Rounds 0 and 3 ran identical knobs; if the
-    //     engine degrades as rounds accumulate, the sweep ranks position rather
+    //     runtime degrades as rounds accumulate, the sweep ranks position rather
     //     than configuration and every conclusion from it is worthless.
     //
     //     The bound is loose on purpose: this catches a systematic slide, not a

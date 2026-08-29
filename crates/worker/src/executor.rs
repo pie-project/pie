@@ -6,9 +6,9 @@
 //! `ExecutorRequest`/`ExecutorResponse` dispatch, a per-client hello
 //! handshake with a `REMOTE_WIRE_VERSION` check and a scratch-grant lease, a
 //! blob-fetch budget, an inline KV push that `cudaMemcpy`'d pages out of the
-//! local pool, a NIXL registration path, and a FIFO driver actor that
+//! local pool, a NIXL registration path, and a FIFO engine actor that
 //! translated `RemoteLaunch` back into a `FrameSubmission`. Every message
-//! type it named lived in `driver_api::remote`, and the palo contract rewrite
+//! type it named lived in `engine_api::remote`, and the palo contract rewrite
 //! deleted that module whole (design §7, decision 19):
 //!
 //! > Remote is a property, not an encoding: every noun serde, trait
@@ -24,19 +24,19 @@
 //!
 //! * **the hello** — a wire version (on the transport, not on the contract),
 //!   the peer's [`ModelIdentity`], its
-//!   [`Capabilities`](driver_api::Capabilities), its
-//!   [`KvLayout`](driver_api::KvLayout), and the scratch grant (base page +
+//!   [`Capabilities`](engine_api::Capabilities), its
+//!   [`KvLayout`](engine_api::KvLayout), and the scratch grant (base page +
 //!   count) the caller may address inside the peer's pool.
 //! * **the verbs** — `register_program`, `register_channel`, `bind_instance`,
 //!   `fire`, `copy_kv`, `encode`, `close_*`. All seven take serde nouns now,
 //!   so the message set is the trait; what the envelope adds is id mapping
 //!   (the peer mints program/channel/instance ids), a frame-size ceiling, and
-//!   an asynchronous [`FireTicket`](driver_api::FireTicket) path.
+//!   an asynchronous [`FireTicket`](engine_api::FireTicket) path.
 //! * **the transfer** — inline bytes or an RDMA handle, and a way to say
 //!   which was used.
 //!
 //! `crate::link::partner` carries the same marker on the client half, and
-//! `engine::pipeline::offload` on the admission half.
+//! `::runtime::pipeline::offload` on the admission half.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -45,13 +45,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::translate::ModelDrivers;
+use crate::translate::ModelEngines;
 
 /// Which half of a model a load carries.
 ///
-/// **WORKER VOCABULARY NOW.** It was `driver_api::ModelComponent`, and the
+/// **WORKER VOCABULARY NOW.** It was `engine_api::ModelComponent`, and the
 /// contract dropped it because it says WHICH GRAPH to load by enum, and that
-/// is now which `Trace` you hand over (`driver-api::load`'s header: "the
+/// is now which `Trace` you hand over (`engine-api::load`'s header: "the
 /// encoder is a traced plan like any other"). What it still means here is
 /// which of a deployment's two loads a worker is: a decode worker's full
 /// model, or an encode partner's encoder.
@@ -69,11 +69,11 @@ pub enum ModelComponent {
 /// The token two workers compare before they trade KV pages.
 ///
 /// Worker vocabulary for the same reason [`ModelComponent`] is: it is a hash
-/// of what the two DRIVERS loaded plus which component each is, and neither
-/// half of that is a statement a driver makes about itself.
+/// of what the two ENGINES loaded plus which component each is, and neither
+/// half of that is a statement an engine makes about itself.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelIdentity {
-    /// blake3 over the model name, the checkpoint digest, and the driver's
+    /// blake3 over the model name, the checkpoint digest, and the engine's
     /// own answers about what it loaded.
     pub hash: [u8; 32],
     /// Which half.
@@ -123,15 +123,15 @@ impl ExecutorServer {
     /// dispatching prefills into silence.
     pub(crate) async fn bind_with_transfer(
         addr: &str,
-        drivers: ModelDrivers,
+        engines: ModelEngines,
         model: ModelIdentity,
         max_clients: usize,
         transfer: crate::config::OffloadTransfer,
     ) -> Result<Self> {
-        let _ = (drivers, model, max_clients, transfer);
+        let _ = (engines, model, max_clients, transfer);
         Err(anyhow!(
             "this build cannot serve the executor role at {addr}: the remote \
-             envelope `driver_api::remote` carried was deleted by the palo \
+             envelope `engine_api::remote` carried was deleted by the palo \
              contract rewrite and its successor is palo B-remote. Boot this \
              worker in the standalone role."
         ))

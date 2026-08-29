@@ -232,7 +232,7 @@ fn nothing_in_the_compiler_knows_what_a_model_is() {
     }
     assert!(
         offences.is_empty(),
-        "the compiler must not know what a model is; the driver states it in a \
+        "the compiler must not know what a model is; the engine states it in a \
          contract:\n{}",
         offences.join("\n")
     );
@@ -257,13 +257,13 @@ fn the_backend_lowering_reads_its_numbers_off_the_target() {
     let mut offences = Vec::new();
     for (line_no, line) in production_lines(tile) {
         let trimmed = line.trim();
-        // A `const` here is a number the driver never stated. Two kinds are
+        // A `const` here is a number the engine never stated. Two kinds are
         // not, and the difference is what the rule is about: a NUMBER
         // describes the device, while a NAME is the loader's own vocabulary
         // for expressing a transform.
         //
         // * the tile-map masks — the set of transforms the *loader* knows how
-        //   to emit, which the driver intersects with its own;
+        //   to emit, which the engine intersects with its own;
         // * a kernel symbol (`: &str = "..."`) — which row a chosen transform
         //   IS. The failure this test exists to catch is a fallback tile size,
         //   a block-scale granularity, a scratch dtype: quantities that make
@@ -280,7 +280,7 @@ fn the_backend_lowering_reads_its_numbers_off_the_target() {
     }
     assert!(
         offences.is_empty(),
-        "a device constant belongs in `StorageTarget`, stated by the driver \
+        "a device constant belongs in `StorageTarget`, stated by the engine \
          that measured it:\n{}",
         offences.join("\n")
     );

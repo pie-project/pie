@@ -271,7 +271,7 @@ fn gpt_oss_checkpoint() -> CheckpointMetadata {
     ck.finish("gpt_oss")
 }
 
-/// GPT-OSS at the ABI where the driver repacks into Marlin's layout.
+/// GPT-OSS at the ABI where the engine repacks into Marlin's layout.
 ///
 /// The only fixture that reaches [`Expr::Repack`]. The biases used to reach it
 /// too, through a gather layout that existed because the algebra could not say
@@ -358,7 +358,7 @@ fn awq_checkpoint() -> CheckpointMetadata {
 /// The two go together and did not used to have to: `CUDA_TILE_MAP_MASK`
 /// claimed `Repack` for every CUDA target, so setting `native_mxfp4_moe`
 /// alone was enough to compile a repacking plan. That made the mask carry a
-/// capability on behalf of a flag — and the flag is FALSE on every driver in
+/// capability on behalf of a flag — and the flag is FALSE on every engine in
 /// this tree, because none of them ported the Marlin repack, so the claim was
 /// true of nothing.
 ///
@@ -399,7 +399,7 @@ fn target(backend: BackendKind, tp_rank: u32, tp_size: u32) -> StorageTarget {
 /// contract. Storing the contract instead of re-deriving it from a model type
 /// is what lets the loader stop knowing what a model is: after `arch/` is gone
 /// there is no function in this crate that could produce one, and there should
-/// not be — authorship is the driver's job. Freezing them here keeps every
+/// not be — authorship is the engine's job. Freezing them here keeps every
 /// construct the real families use (the MXFP4 repacks, the fused QKV `Concat`, the
 /// `Out` aliases into a bank, the strided GPTQ slices) under test, expressed as
 /// what they actually are: programs over a checkpoint.
@@ -431,9 +431,9 @@ fn golden_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-/// The driver's boot-log and debug renderings, exercised on every golden plan.
+/// The engine's boot-log and debug renderings, exercised on every golden plan.
 ///
-/// The driver has no other test for these: it prints whatever it is handed.
+/// The engine has no other test for these: it prints whatever it is handed.
 /// Checking that the histogram accounts for every instruction is what catches an
 /// instruction variant added without a name for it.
 fn check_stats_render(name: &str, plan: &LoadPlan) {

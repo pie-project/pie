@@ -176,7 +176,7 @@ fn every_emitted_source_is_structurally_closed() {
 }
 
 /// A kernel is either a source with an entry point in it, or a refusal with a
-/// reason. `EmittedKernel::new` is what makes that true, and the drivers join
+/// reason. `EmittedKernel::new` is what makes that true, and the engines join
 /// on it: an empty source with an empty error reads as a kernel that emitted
 /// successfully to nothing.
 #[test]
@@ -267,7 +267,7 @@ fn literal_fault_codes(source: &str) -> Vec<u32> {
 /// `transpose`). The generated Metal regions use the other vocabulary: the
 /// named classes in `tensor_compiler::codegen::fault`.
 ///
-/// Nothing decodes a fault code — the driver surfaces the number and a human
+/// Nothing decodes a fault code — the engine surfaces the number and a human
 /// looks it up. So the property that has to hold is that there is exactly one
 /// table to look it up in: a kernel that dispatches op tags may only write
 /// numbers the op table assigns, and a kernel that does not may only write

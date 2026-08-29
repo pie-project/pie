@@ -62,10 +62,10 @@ struct Input {
     /// Attach a per-attention-layer `on_attn` counter tap to the decode pass
     /// (a genuine hook program, numerics untouched) and return the final
     /// count — layers-that-fired x fires. On hybrid models this is the direct
-    /// probe that the driver executes hook stages on attention layers only.
+    /// probe that the engine executes hook stages on attention layers only.
     #[serde(default)]
     hook_fold: bool,
-    /// Accepted for input-compat; speculation is driver-side now.
+    /// Accepted for input-compat; speculation is engine-side now.
     #[serde(default)]
     #[allow(dead_code)]
     system_speculation: Option<bool>,
@@ -81,8 +81,8 @@ struct Input {
     /// the live `t0` message.
     #[serde(default)]
     report_arrivals: bool,
-    /// Frames of decode run-ahead each lane keeps queued in the engine.
-    /// Leave unset to use the engine's own sizing (`channel-capacity()`),
+    /// Frames of decode run-ahead each lane keeps queued in the runtime.
+    /// Leave unset to use the runtime's own sizing (`channel-capacity()`),
     /// which is what every other inferlet does; set it only to sweep the
     /// depth against a measurement. The wave quorum waits for every lane, so
     /// a lane that drops to one queued frame puts its whole guest turnaround
@@ -331,10 +331,10 @@ macro_rules! define_run_one {
             // runs in parallel off the critical path.
             let prompt_i32: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
 
-            // Prefill is chunked against the driver's per-launch token capacity
+            // Prefill is chunked against the engine's per-launch token capacity
             // `max_embed_length()` (C). A single pass over the whole prompt is
             // rejected outright once L > C —
-            //     "forward request has 1047 forward tokens, exceeding driver limit 1024"
+            //     "forward request has 1047 forward tokens, exceeding engine limit 1024"
             // — and C is derived from the memory plan, so on a model whose weights
             // leave a small workspace (Qwen3.6-35B-A3B: 71.9 GB on an 80 GB card)
             // C stays at 1024 and no `--gpu-mem-util` / `--memory-profile` setting
@@ -381,7 +381,7 @@ macro_rules! define_run_one {
 
             // Run-ahead window in FIRES and the take-side ring that has to hold it.
             //
-            // The engine owns this sizing: `channel-capacity()` is the ring size in
+            // The runtime owns this sizing: `channel-capacity()` is the ring size in
             // cells with the staging margin already baked in, so the window is
             // exactly one less. The window is a whole number of frames, and the
             // top-up below adds a whole frame at a time starting from below the
@@ -397,7 +397,7 @@ macro_rules! define_run_one {
             // The ring is sized a full frame of margin ABOVE the advertised
             // capacity (`7 * live_slots` covers every frame size this bench
             // runs). `channel-capacity()` bakes in a staging margin, but the
-            // engine's ticket check is more conservative still, and a
+            // runtime's ticket check is more conservative still, and a
             // continuation that lands inside that margin is silently skipped at
             // the reader-cell validation rather than refused. Sized at exactly
             // `cap`, the measured continuation engaged on 12% of frames — the
@@ -433,12 +433,12 @@ macro_rules! define_run_one {
 
             // Hybrid/recurrent architectures (Qwen3.6's GDN layers, Mamba2) carry a
             // folded recurrent state per request alongside the KV pages, and the
-            // driver rejects a forward whose rs-working-set count doesn't match its
+            // engine rejects a forward whose rs-working-set count doesn't match its
             // request rows. One row per fire here, so one set — reused by BOTH passes
             // so the decode continues the prefill's state rather than starting cold.
             // `rs_state_size() == 0` on pure-attention models, which bind none.
             // `pass_kind() != Attention` is the class predicate: true iff the model
-            // folds a recurrent state, which is exactly when the driver requires one
+            // folds a recurrent state, which is exactly when the engine requires one
             // rs-working-set per request row.
             let rs_ws: Vec<RsWorkingSet> = if model::pass_kind() != model::ForwardKind::Attention {
                 vec![RsWorkingSet::new()]
@@ -629,7 +629,7 @@ macro_rules! define_run_one {
             // submitted count. Decode geometry is device-carried (`tok_in`), so a
             // successor never waits on a sampled token.
             //
-            // `window_fires` comes from the engine (see the `channel_capacity()`
+            // `window_fires` comes from the runtime (see the `channel_capacity()`
             // computation above). What it has to buy is COVER: the frame seal is
             // wait-for-ALL, so it holds until every awaited lane's oldest queued
             // frame is arrival-complete and the binding term is the SLOWEST of
@@ -637,7 +637,7 @@ macro_rules! define_run_one {
             // what gives that straggler time, and it is counted in WAVES, not
             // frames — a 2-frame window gives only k waves, so k = 1 got a single
             // ~7 ms wave and a cohort that fell behind never caught back up
-            // (see §20.10). That is why the engine's `HOST_TURNAROUND_WAVES` is
+            // (see §20.10). That is why the runtime's `HOST_TURNAROUND_WAVES` is
             // k-independent and the frame count is derived from it.
             //
             // Measured, Qwen3-0.6B / L40S / conc 256, median of 6-8 trials:
@@ -677,7 +677,7 @@ macro_rules! define_run_one {
             step(&mut prologue_us, input.report_timing); // [4] build_submit (both passes)
 
             // ── HOST DRAIN (off the critical path — the decode burst is already in
-            // the engine while this first take waits on the prefill).
+            // the runtime while this first take waits on the prefill).
             let g0 = g0_ch.take_host::<i32>().await?;
 
             let ttft_us = input
@@ -707,13 +707,13 @@ macro_rules! define_run_one {
             // Leaving the wait-set is an END-OF-STREAM statement, not a
             // teardown step: from the moment this lane will not submit again,
             // every other lane in the fleet is holding its frame seal for a
-            // guest that has nothing left to contribute. The engine cannot
+            // guest that has nothing left to contribute. The runtime cannot
             // infer this -- an empty queue looks identical between a guest
             // that is finished and one that is mid-decode -- so the guest,
             // which does know, has to say it. Closing here rather than after
             // the drain is what makes that statement on time; the remaining
             // takes below are unaffected (close never waits for an unsettled
-            // fire). `closed` is not redundant with the engine's `first_close`
+            // fire). `closed` is not redundant with the runtime's `first_close`
             // latch -- that latch only suppresses the wait-set notify, while
             // each `close()` still crosses into the host and drains settled
             // entries -- so the trailing call stays correct but is worth

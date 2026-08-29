@@ -1,11 +1,11 @@
-//! Per-region decisions the host makes and the CUDA driver currently
+//! Per-region decisions the host makes and the CUDA engine currently
 //! re-derives.
 //!
 //! CUDA-only, and filed here to say so. These are the other half of *this*
 //! backend's contract — which regions bind, and how the generated kernel's
-//! intrinsic side tables are laid out — so they mean nothing to a driver
-//! running someone else's kernels. The engine already gates on that
-//! (`crates/engine/src/driver/backend.rs`, `codegen_backend == Some("cuda")`)
+//! intrinsic side tables are laid out — so they mean nothing to an engine
+//! running someone else's kernels. The runtime already gates on that
+//! (`crates/runtime/src/engine/backend.rs`, `codegen_backend == Some("cuda")`)
 //! and no Metal path reads a [`RegionAnalysis`].
 //!
 //! Two per-program analyses the launch package has yet to absorb still live
@@ -25,7 +25,7 @@
 //! does not fail to compile — it produces a kernel that reads a slot the packer
 //! never wrote.
 //!
-//! So the answers ship. The driver keeps its derivation while both exist,
+//! So the answers ship. The engine keeps its derivation while both exist,
 //! compares, and counts divergence; the copy goes when the counter is zero
 //! *and* the host-supplied counter is not (`e50769003` — a comparison that
 //! never ran reports the same zero as one that always agreed).
@@ -48,7 +48,7 @@ pub const REGION_GENERATED_VALID: u32 = 1 << 1;
 
 /// One `argmax` that reads a logits intrinsic's buffer directly.
 ///
-/// Sparse on purpose: the driver's form is four arrays as long as the stage's
+/// Sparse on purpose: the engine's form is four arrays as long as the stage's
 /// op list, and almost every entry is the "does not apply" sentinel. What the
 /// packer actually consumes is this handful of records.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,12 +60,12 @@ pub struct DirectArgmaxRecord {
     /// `IntrinsicId` of that buffer — `Logits` or `MtpLogits`.
     pub intrinsic: u16,
     /// The rewrite is only valid if the source has exactly one runtime row,
-    /// which is a per-fire check the driver makes against the lane's
+    /// which is a per-fire check the engine makes against the lane's
     /// descriptors.
     pub requires_single_row: u8,
 }
 
-/// Every decision about one region that the driver derives for itself today.
+/// Every decision about one region that the engine derives for itself today.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegionAnalysis {
     /// Index of the stage this region belongs to, matching `emit_program`'s
@@ -78,14 +78,14 @@ pub struct RegionAnalysis {
     /// The [`DirectArgmaxRecord`]s for this region's `argmax` nodes that read a
     /// logits intrinsic's buffer directly; empty when none qualify.
     pub direct_argmax: Vec<DirectArgmaxRecord>,
-    /// Nodes made redundant by the rewrites above, ascending. The driver's
+    /// Nodes made redundant by the rewrites above, ascending. The engine's
     /// dense `skipped` array is exactly this set.
     pub skipped: Vec<u32>,
 }
 
 /// Analyse every fused region of every stage, in stage then region order.
 ///
-/// Indices match `emit_program`'s, so a driver can join the two tables on
+/// Indices match `emit_program`'s, so an engine can join the two tables on
 /// `(stage_index, region_index)` without knowing what a plan is.
 pub fn analyze_program(stages: &[CompiledStage]) -> Vec<RegionAnalysis> {
     let mut out = Vec::new();

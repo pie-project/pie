@@ -88,9 +88,9 @@ async fn main(input: Input) -> Result<String> {
     let n = prompt_tokens.len() as u32;
     let stop = chat::stop_tokens();
 
-    // Tokens per pool page. Taken from the driver, never assumed: this pass
+    // Tokens per pool page. Taken from the engine, never assumed: this pass
     // builds its own write descriptors (`cell c -> pool_ids[c/page_t] @
-    // c%page_t`) and its own page CSR, and the driver reads both back at ITS
+    // c%page_t`) and its own page CSR, and the engine reads both back at ITS
     // page size. A constant here that disagreed would put the tokens somewhere
     // other than where the CSR says they are -- and with no mask on the wire
     // any more, nothing downstream would notice.
@@ -121,20 +121,20 @@ async fn main(input: Input) -> Result<String> {
         let w_off_p = Channel::from(w_off_pv).named("w_off_p");
         let klen_p = Channel::from([n]).named("klen_p");
         let pages_p = Channel::from(pool_ids.clone()).named("pages_p");
-        // The page CSR is the SOURCE OF TRUTH for kv_len on the wire: the driver
+        // The page CSR is the SOURCE OF TRUTH for kv_len on the wire: the engine
         // derives `kv_len = (page_count-1)*page_t + last_page_len`. Declaring the
         // whole pool here would claim a kv length the pass does not have and
         // silently corrupt attention — the count must track `kv_len` exactly.
         let page_indptr_p = Channel::from([0u32, n.div_ceil(page_t)]).named("pidx_p");
 
         // No AttnMask port. A prefill query attends every key up to its own
-        // position, which is the bound the driver already derives from
+        // position, which is the bound the engine already derives from
         // `qo_indptr` and the page CSR — so a causal mask here only restates
         // the CSR two lines up, in `[N, POOL]` bools, over the wire, every
         // fire. The decode fire below has always said this; the prefill was
         // paying for the same statement twice.
         //
-        // It was not free, either. A driver that cannot decode the wire form
+        // It was not free, either. An engine that cannot decode the wire form
         // has to refuse the launch or find the dense buffer some other way,
         // and the mask's length is a second claim about `kv_len` that can
         // disagree with the CSR's — which is a silent wrong answer when the
@@ -203,7 +203,7 @@ async fn main(input: Input) -> Result<String> {
     // No AttnMask port: a decode query attends every key up to `klen`, which
     // this pass already carries on device, so a causal mask would only restate
     // it. Binding one would also cost the whole run-ahead: the mask port is a
-    // per-lane dense buffer, so a pass that binds it needs the driver to carry
+    // per-lane dense buffer, so a pass that binds it needs the engine to carry
     // per-lane mask state through batch composition, which the CUDA backend
     // does not advertise — the pass would fall out of the decode-envelope class
     // and lose the only descriptor resolver that works inside one frame.

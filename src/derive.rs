@@ -16,7 +16,7 @@ pub fn read_config_file(path: &std::path::Path) -> Result<String> {
 }
 
 /// Load just the `[worker]` role Config from the combined standalone file — for
-/// ops that need worker-domain settings (registry, drivers) without booting the
+/// ops that need worker-domain settings (registry, engines) without booting the
 /// cluster. Replaces the old worker-only `Config::from_toml_file`.
 pub fn load_worker_config(path: &std::path::Path) -> Result<worker::Config> {
     worker::Config::parse(&read_config_file(path)?).context("parsing config")
@@ -24,7 +24,7 @@ pub fn load_worker_config(path: &std::path::Path) -> Result<worker::Config> {
 
 /// Extract one top-level `[section]` from the combined standalone config as a
 /// standalone TOML string (its contents promoted to top level, e.g.
-/// `[worker.driver]` → `[driver]`). A **missing** section yields an empty string
+/// `[worker.engine]` → `[engine]`). A **missing** section yields an empty string
 /// — the role lib then applies its own defaults (matching
 /// `bootstrap::config::source`'s empty-on-missing contract). A present section
 /// that isn't a table is a config error.
@@ -68,7 +68,7 @@ mod tests {
 [gateway]
 [worker]
 name = "w0"
-[worker.driver]
+[worker.engine]
 kind = "dummy"
 "#;
 
@@ -77,8 +77,8 @@ kind = "dummy"
         let w = extract_section(STANDALONE, "worker").unwrap();
         let parsed: toml::Table = w.parse().unwrap();
         assert_eq!(parsed["name"].as_str(), Some("w0"));
-        assert!(parsed["driver"].is_table(), "driver promoted: {w}");
-        assert_eq!(parsed["driver"]["kind"].as_str(), Some("dummy"));
+        assert!(parsed["engine"].is_table(), "engine promoted: {w}");
+        assert_eq!(parsed["engine"]["kind"].as_str(), Some("dummy"));
         assert!(parsed.get("worker").is_none());
     }
 

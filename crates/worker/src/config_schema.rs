@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::{Config, DriverKind};
+use crate::config::{Config, EngineKind};
 
 const SOURCE: &str = include_str!("config.rs");
 
@@ -141,32 +141,32 @@ fn parse_structs() -> BTreeMap<String, Vec<Parsed>> {
     out
 }
 
-/// The option struct a driver kind parses `[model.driver.options]` into, or
+/// The option struct an engine kind parses `[model.engine.options]` into, or
 /// `None` for a kind no build hosts.
 ///
 /// `None` is what makes the listing honest. The three retired kinds named
-/// option structs here after R3 deleted the drivers that read them, so
-/// `pie config list` went on advertising sixteen `driver.*` knobs — twelve
+/// option structs here after R3 deleted the engines that read them, so
+/// `pie config list` went on advertising sixteen `engine.*` knobs — twelve
 /// under `metal`, three under `vulkan`, one under `wgpu` — that no build
 /// would have obeyed. A key is listed when a seam reads it.
-fn options_struct(driver: DriverKind) -> Option<&'static str> {
-    match driver {
-        DriverKind::CudaNative => Some("CudaNativeDriverOptions"),
-        DriverKind::Metal | DriverKind::Vulkan | DriverKind::Wgpu => None,
+fn options_struct(engine: EngineKind) -> Option<&'static str> {
+    match engine {
+        EngineKind::CudaNative => Some("CudaNativeEngineOptions"),
+        EngineKind::Metal | EngineKind::Vulkan | EngineKind::Wgpu => None,
     }
 }
 
 /// Every key settable under `[worker]`, in declaration order, for a config
-/// using `driver`.
+/// using `engine`.
 ///
-/// The driver matters because `[model.driver.options]` is an untyped table
-/// until the driver kind picks the struct it parses into -- so a listing that
+/// The engine matters because `[model.engine.options]` is an untyped table
+/// until the engine kind picks the struct it parses into -- so a listing that
 /// ignored it would either show the wrong knobs or none.
-pub fn fields(driver: DriverKind) -> Vec<Field> {
+pub fn fields(engine: EngineKind) -> Vec<Field> {
     let structs = parse_structs();
-    let defaults = default_values(driver);
+    let defaults = default_values(engine);
     let mut out = Vec::new();
-    walk(&structs, "Config", "", driver, &defaults, &mut out);
+    walk(&structs, "Config", "", engine, &defaults, &mut out);
     // The struct paths are an implementation detail; what `pie config set`
     // accepts is what the file spells. One translation, at the boundary, so
     // the walk stays a walk.
@@ -188,7 +188,7 @@ fn walk(
     structs: &BTreeMap<String, Vec<Parsed>>,
     struct_name: &str,
     prefix: &str,
-    driver: DriverKind,
+    engine: EngineKind,
     defaults: &toml::Value,
     out: &mut Vec<Field>,
 ) {
@@ -205,12 +205,12 @@ fn walk(
             format!("{prefix}.{}", field.name)
         };
         // `options` is the one field whose shape depends on another field's
-        // value, so it is the one place the walk consults the driver kind.
+        // value, so it is the one place the walk consults the engine kind.
         let nested = if field.ty == "toml::Table" {
             // No struct, no keys, and the untyped table itself is not one
             // either: a kind no build hosts parses nothing out of
-            // `[model.driver.options]`, so nothing under it is settable.
-            let Some(inner) = options_struct(driver) else {
+            // `[model.engine.options]`, so nothing under it is settable.
+            let Some(inner) = options_struct(engine) else {
                 continue;
             };
             Some(inner.to_owned())
@@ -223,7 +223,7 @@ fn walk(
             structs.contains_key(inner).then(|| inner.to_string())
         };
         match nested {
-            Some(inner) => walk(structs, &inner, &key, driver, defaults, out),
+            Some(inner) => walk(structs, &inner, &key, engine, defaults, out),
             None => out.push(Field {
                 doc: field.doc.clone(),
                 default: if field.required {
@@ -245,11 +245,11 @@ fn walk(
 /// `model` has required fields, and a type that cannot be defaulted is exactly
 /// how the schema says so. The placeholders below are never read, because a
 /// required field reports no default.
-fn default_values(driver: DriverKind) -> toml::Value {
+fn default_values(engine: EngineKind) -> toml::Value {
     let minimal = format!(
-        "[model]\nname = \"x\"\nhf_repo = \"x\"\n\
-         [driver]\ntype = \"{}\"\ndevice = [\"x\"]\n",
-        driver.as_str()
+        "[model]\nname = \"x\"\nmodel = \"x\"\n\
+         [engine]\ntype = \"{}\"\ndevice = [\"x\"]\n",
+        engine.as_str()
     );
     let Ok(parsed) = Config::parse(&minimal) else {
         return toml::Value::Table(Default::default());
@@ -258,7 +258,7 @@ fn default_values(driver: DriverKind) -> toml::Value {
         toml::Value::try_from(parsed).unwrap_or_else(|_| toml::Value::Table(Default::default()));
 
     // `options` round-trips as the empty table it was parsed from, so the
-    // driver's own option defaults have to be asked for separately -- by
+    // engine's own option defaults have to be asked for separately -- by
     // deserializing an empty table, which is serde applying the same defaults
     // it would apply to a config that omitted the section.
     let empty = toml::Value::Table(Default::default());
@@ -272,17 +272,17 @@ fn default_values(driver: DriverKind) -> toml::Value {
         let parsed: T = empty.clone().try_into().ok()?;
         toml::Value::try_from(parsed).ok()
     }
-    let options = match driver {
-        DriverKind::CudaNative => defaults_of::<crate::config::CudaNativeDriverOptions>(&empty),
-        DriverKind::Metal | DriverKind::Vulkan | DriverKind::Wgpu => None,
+    let options = match engine {
+        EngineKind::CudaNative => defaults_of::<crate::config::CudaNativeEngineOptions>(&empty),
+        EngineKind::Metal | EngineKind::Vulkan | EngineKind::Wgpu => None,
     };
-    if let (Some(options), Some(driver_table)) = (
+    if let (Some(options), Some(engine_table)) = (
         options,
         root.get_mut("model")
-            .and_then(|m| m.get_mut("driver"))
+            .and_then(|m| m.get_mut("engine"))
             .and_then(|d| d.as_table_mut()),
     ) {
-        driver_table.insert("options".to_string(), options);
+        engine_table.insert("options".to_string(), options);
     }
     root
 }
@@ -301,8 +301,8 @@ pub fn lookup<'a>(root: &'a toml::Value, key: &str) -> Option<&'a toml::Value> {
 mod tests {
     use super::*;
 
-    fn keys(driver: DriverKind) -> Vec<String> {
-        fields(driver).into_iter().map(|f| f.key).collect()
+    fn keys(engine: EngineKind) -> Vec<String> {
+        fields(engine).into_iter().map(|f| f.key).collect()
     }
 
     #[test]
@@ -313,7 +313,7 @@ mod tests {
         // has a blind spot -- which is how a parse that quietly broke would
         // otherwise present itself.
         let listed: std::collections::BTreeSet<String> =
-            keys(DriverKind::CudaNative).into_iter().collect();
+            keys(EngineKind::CudaNative).into_iter().collect();
 
         fn collect(value: &toml::Value, prefix: &str, out: &mut Vec<String>) {
             let Some(table) = value.as_table() else {
@@ -330,7 +330,7 @@ mod tests {
             }
         }
         let mut serialized = Vec::new();
-        collect(&default_values(DriverKind::CudaNative), "", &mut serialized);
+        collect(&default_values(EngineKind::CudaNative), "", &mut serialized);
 
         let missing: Vec<String> = serialized
             .iter()
@@ -345,23 +345,28 @@ mod tests {
 
     #[test]
     fn a_kind_no_build_hosts_advertises_no_option_keys() {
-        // `[model.driver.options]` is untyped until the driver kind names the
+        // `[model.engine.options]` is untyped until the engine kind names the
         // struct it parses into -- and three of the four kinds name none, so
-        // the listing offers an operator nothing under them. It offered
-        // sixteen keys across the three -- `driver.total_pages`,
-        // `driver.kv_pages`, `driver.kv_cache_dtype` among them -- for
-        // drivers that leave `pie serve` refusing the config by name before
-        // one of them is read.
-        let cuda = keys(DriverKind::CudaNative);
-        assert!(cuda.contains(&"driver.gpu_mem_utilization".to_string()));
-        for retired in [DriverKind::Metal, DriverKind::Vulkan, DriverKind::Wgpu] {
+        // the listing offers an operator nothing under them beyond the common
+        // keys `EngineConfig` itself declares. It offered sixteen keys across
+        // the three -- `engine.total_pages`, `engine.kv_cache_dtype` among
+        // them -- for engines that leave `pie serve` refusing the config by
+        // name before one of them is read.
+        //
+        // `engine.kv_pages` is NOT in that list any more and must not go back
+        // into it: it is a field of `EngineConfig`, so it is common to every
+        // kind, and the two backends that read it are two of the retired ones.
+        let cuda = keys(EngineKind::CudaNative);
+        assert!(cuda.contains(&"engine.gpu_mem_utilization".to_string()));
+        for retired in [EngineKind::Metal, EngineKind::Vulkan, EngineKind::Wgpu] {
             let listed = keys(retired);
             assert!(
                 listed.iter().all(|key| cuda.contains(key)),
-                "{retired:?} lists a key the hosted driver does not: {listed:?}"
+                "{retired:?} lists a key the hosted engine does not: {listed:?}"
             );
-            for key in ["kv_pages", "total_pages", "kv_cache_dtype", "kernels"] {
-                assert!(!listed.contains(&format!("driver.{key}")));
+            assert!(listed.contains(&"engine.kv_pages".to_string()));
+            for key in ["total_pages", "kv_cache_dtype", "kernels"] {
+                assert!(!listed.contains(&format!("engine.{key}")));
             }
         }
     }
@@ -370,7 +375,7 @@ mod tests {
     fn every_listed_key_carries_a_description() {
         // The reason this module exists. An empty column is worse than no
         // column: it reads as "this key means nothing".
-        for field in fields(DriverKind::CudaNative) {
+        for field in fields(EngineKind::CudaNative) {
             assert!(!field.doc.is_empty(), "{} has no description", field.key);
         }
     }
@@ -379,7 +384,7 @@ mod tests {
     fn the_summary_stops_at_the_blank_doc_line() {
         // Several fields carry paragraphs of measurement rationale after the
         // summary. A table of 80 rows cannot hold those.
-        let fields = fields(DriverKind::CudaNative);
+        let fields = fields(EngineKind::CudaNative);
         let threads = fields
             .iter()
             .find(|f| f.key == "server.worker_threads")
@@ -400,28 +405,28 @@ mod tests {
 
     #[test]
     fn fields_pie_populates_itself_are_not_offered() {
-        // `device` and `verbose` in the driver options are `#[serde(skip)]`:
-        // pie fills them from `[driver] device` and `[server] verbose`. After
-        // the options table is flattened into `[driver]`, the skipped `device`
+        // `device` and `verbose` in the engine options are `#[serde(skip)]`:
+        // pie fills them from `[engine] device` and `[server] verbose`. After
+        // the options table is flattened into `[engine]`, the skipped `device`
         // would land on the same path as the real one -- so it has to be the
         // real one that survives, exactly once.
-        let cuda = keys(DriverKind::CudaNative);
+        let cuda = keys(EngineKind::CudaNative);
         assert_eq!(
-            cuda.iter().filter(|k| *k == "driver.device").count(),
+            cuda.iter().filter(|k| *k == "engine.device").count(),
             1,
-            "driver.device must appear once, from DriverConfig"
+            "engine.device must appear once, from EngineConfig"
         );
-        assert!(!cuda.contains(&"driver.verbose".to_string()));
+        assert!(!cuda.contains(&"engine.verbose".to_string()));
         assert!(cuda.contains(&"server.verbose".to_string()));
     }
 
     #[test]
     fn a_derived_field_has_no_default_to_print() {
-        let fields = fields(DriverKind::CudaNative);
+        let fields = fields(EngineKind::CudaNative);
         let by_key = |k: &str| fields.iter().find(|f| f.key == k).expect(k);
         // `Option` and `None`: absence is the setting.
         assert!(by_key("runtime.max_concurrent_processes").default.is_none());
-        assert!(by_key("driver.kv_page_size").default.is_none());
+        assert!(by_key("engine.kv_page_size").default.is_none());
         // A concrete default prints as itself.
         assert_eq!(
             by_key("server.port").default,

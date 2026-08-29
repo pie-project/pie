@@ -73,7 +73,7 @@ use std::fmt::{self, Debug, Formatter};
 /// One class, as a leaf of the tree.
 ///
 /// A `u8` BECAUSE THE FRONTIER IS THE FIRE PATH'S. `class_order` hands the
-/// driver a `Vec<u8>` per fire (design §3), so 256 classes is the ceiling the
+/// engine a `Vec<u8>` per fire (design §3), so 256 classes is the ceiling the
 /// whole seam is spelled at; [`crate::layout`] declines to seriate a plan past
 /// it rather than truncating one.
 pub type Leaf = u8;

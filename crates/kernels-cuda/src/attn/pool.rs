@@ -1,7 +1,7 @@
 //! `Pool`: pooled (compressed) attention — every `ratio` tokens close a
 //! boundary whose pooled entry lands in its own cache. Transcribed from the
 //! old POOL claims. The pooled compressor state slabs still have no IR seat and arrive
-//! as explicit seam arguments the driver binds from fire state; the
+//! as explicit seam arguments the engine binds from fire state; the
 //! geometry the ops once smuggled (`row_valid`, `request_of_token`) is
 //! op-named now (see the remaining MENLO-SEAM notes per entry).
 
@@ -138,7 +138,7 @@ pub fn boundary_prefill(
 /// Pools the closing window out of the kv cache into per-boundary entries.
 ///
 // MENLO-SEAM: the pooled compressor state (`state_kv`, `state_score`, `ape`)
-// has no IR seat; the driver binds the slabs it staged for this cache.
+// has no IR seat; the engine binds the slabs it staged for this cache.
 #[allow(clippy::too_many_arguments)]
 pub fn gather(
     ctx: &Ctx,

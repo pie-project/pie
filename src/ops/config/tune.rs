@@ -102,7 +102,7 @@ pub struct Workload {
 /// What one `pie config tune` run was asked to do.
 #[derive(clap::Args, Debug)]
 pub struct TuneArgs {
-    /// Which serving shape to optimize for. Sets `[driver] memory_profile` as
+    /// Which serving shape to optimize for. Sets `[engine] memory_profile` as
     /// well as choosing the load. Required when the profile is `auto`.
     #[arg(long = "for", value_name = "SHAPE")]
     pub objective: Option<Objective>,
@@ -191,7 +191,7 @@ pub fn resolve_objective(flag: Option<Objective>, configured: &str) -> Result<Ob
         (None, "latency") => Ok(Objective::Latency),
         (None, "throughput") => Ok(Objective::Throughput),
         (None, _) => bail!(
-            "`[driver] memory_profile` is \"auto\", which names no objective to \
+            "`[engine] memory_profile` is \"auto\", which names no objective to \
              optimise toward — latency and throughput pull opposite ways. Pass \
              `--for latency` or `--for throughput`; it sets the profile as well \
              as choosing the load."
@@ -205,13 +205,8 @@ pub fn resolve_objective(flag: Option<Objective>, configured: &str) -> Result<Ob
 /// state as the candidates it will be compared against — a baseline taken last
 /// is a baseline taken on a different machine.
 pub fn plan(baseline: Knobs, budget: Option<usize>) -> (Vec<Knobs>, usize) {
-    let staging = worker::config::UPLOAD_STAGING_DEPTH as usize;
     let mut all = vec![baseline];
-    all.extend(
-        sweep::candidates(staging)
-            .into_iter()
-            .filter(|k| *k != baseline),
-    );
+    all.extend(sweep::candidates().into_iter().filter(|k| *k != baseline));
     match budget {
         Some(n) if n < all.len() => {
             let skipped = all.len() - n;
@@ -480,7 +475,7 @@ pub fn lane_inputs(fleet: usize, tokens: usize) -> Vec<String> {
 /// Through `typed_by_schema`, the same path `pie config set` uses, so a value
 /// the schema would refuse is refused here too rather than written and
 /// discovered at the next boot. It also means the joint staging bound is
-/// checked on the way in: `SchedulerConfig::validate` runs on each candidate
+/// checked on the way in: `RuntimeConfig::validate` runs on each candidate
 /// document, and it sees both factors at once.
 pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
     let mut content = content.to_string();
@@ -539,7 +534,7 @@ async fn calibrate_planner(content: &str) -> Result<()> {
     let pie = crate::compose::run_standalone(controller, gateway, worker)
         .await
         .context("boot the engine to calibrate the planner")?;
-    // Calibration runs inside the driver's own bootstrap, so by the time the boot
+    // Calibration runs inside the engine's own bootstrap, so by the time the boot
     // returns the sweep is done and the profile is written. Nothing to drive.
     pie.shutdown().await;
     Ok(())
@@ -614,7 +609,7 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
 
     let file: toml::Value =
         toml::from_str(&content).map_err(|e| anyhow!("parse {cfg_path:?}: {e}"))?;
-    let configured_profile = worker::config_schema::lookup(&file, "driver.memory_profile")
+    let configured_profile = worker::config_schema::lookup(&file, "engine.memory_profile")
         .and_then(|v| v.as_str().map(str::to_string))
         .unwrap_or_else(|| "auto".to_string());
     let objective = resolve_objective(args.objective, &configured_profile)?;
@@ -623,7 +618,7 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
     // and serving with another is a mismatch nothing downstream would report.
     let content = if configured_profile != objective.as_profile() {
         let (updated, _) =
-            typed_by_schema(&content, "driver.memory_profile", objective.as_profile())?;
+            typed_by_schema(&content, "engine.memory_profile", objective.as_profile())?;
         updated
     } else {
         content
@@ -639,9 +634,9 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
 
     let (controller, gateway, worker) = crate::derive::derive_standalone(&content)?;
     let baseline = Knobs {
-        frame_size: worker.model.scheduler.frame_size as usize,
-        submit_depth: worker.model.scheduler.frame_submit_depth as usize,
-        dispatch_depth: worker.model.scheduler.frame_dispatch_depth as usize,
+        frame_size: worker.runtime.frame_size as usize,
+        submit_depth: worker.runtime.frame_submit_depth as usize,
+        dispatch_depth: worker.runtime.frame_dispatch_depth as usize,
     };
     let (plan, skipped) = plan(baseline, args.budget);
     let workload = args.workload(objective);
@@ -679,7 +674,7 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
         // boot is that weight loads are the expensive part.
         println!("  This boots the model a second time; `--skip-planner` reuses an earlier one.");
         let profile = worker::state::planner_profile_path();
-        // Observed, not assumed. The driver REFUSES to calibrate for
+        // Observed, not assumed. The engine REFUSES to calibrate for
         // `tensor_parallel_size > 1` and for recurrent-state models, saying so
         // on stderr and booting normally -- so a successful boot is not a
         // measurement, and claiming "written to ..." after one would be this
@@ -687,7 +682,7 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
         let before = written_at(&profile);
         calibrate_planner_in_child(&content, &args.program).await?;
         if written_at(&profile) == before {
-            println!("  no measurement was recorded -- the driver declined to calibrate");
+            println!("  no measurement was recorded -- the engine declined to calibrate");
             println!("  (it refuses for tensor_parallel_size > 1 and recurrent-state models;");
             println!("   its reason is on stderr above). Stage 2 runs against the scored shape.");
         } else {
@@ -810,9 +805,9 @@ mod tests {
         let asked = "\
 [model]
 name = \"Qwen/Qwen3-0.6B\"
-hf_repo = \"Qwen/Qwen3-0.6B\"
+model = \"Qwen/Qwen3-0.6B\"
 
-[driver]
+[engine]
 type = \"cuda_native\"
 device = [\"cuda:0\"]
 calibrate_planner = true
@@ -827,7 +822,7 @@ calibrate_planner = true
         // And it is not a settable key either, so `pie config set` cannot
         // produce the document above in the first place.
         assert!(
-            !worker::config_schema::fields(worker::config::DriverKind::CudaNative)
+            !worker::config_schema::fields(worker::config::EngineKind::CudaNative)
                 .iter()
                 .any(|f| f.key.ends_with("calibrate_planner")),
             "a measurement is not a setting"
@@ -854,12 +849,14 @@ calibrate_planner = true
         assert_eq!(capped[0], BASE, "the baseline survives any budget");
     }
 
+    /// Every planned candidate is a shape `RuntimeConfig::validate` admits —
+    /// the bound is per factor now (alto F2b), because the engine carves its
+    /// staging ring from those factors rather than owning a fixed pool.
     #[test]
-    fn every_planned_candidate_respects_the_staging_bound() {
-        let staging = worker::config::UPLOAD_STAGING_DEPTH as usize;
+    fn every_planned_candidate_is_one_the_runtime_admits() {
         let (plan, _) = plan(BASE, None);
         for knobs in plan {
-            assert!(knobs.steps_in_flight() < staging, "{knobs}");
+            assert!(knobs.admissible(), "{knobs}");
         }
     }
 
@@ -907,14 +904,15 @@ calibrate_planner = true
 
     #[test]
     fn a_combination_the_engine_would_refuse_is_never_written() {
-        // 4 * 4 = 16 exceeds the driver's staging pool. Writing it would produce
-        // a config that parses and then blocks every submit with no diagnostic
-        // -- the failure `UPLOAD_STAGING_DEPTH` exists to make loud.
+        // `frame_size = 5` is past `Runahead::STEPS_MAX`: the frame scheduler
+        // was built and measured around four waves per frame, and the staging
+        // formula's `k` is that number. Writing it would produce a config that
+        // parses and that the runtime then refuses at boot.
         let content = crate::ops::config::default_config_for_test();
         let error = apply(
             &content,
             Knobs {
-                frame_size: 4,
+                frame_size: 5,
                 submit_depth: 3,
                 dispatch_depth: 4,
             },

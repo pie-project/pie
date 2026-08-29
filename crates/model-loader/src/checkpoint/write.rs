@@ -867,7 +867,7 @@ mod tests {
     /// the default for non-canonical writers too and the explicit request went
     /// away — which means the property now rests on a default in another
     /// crate. It is the property the artifact exists for (per-tensor page
-    /// exclusivity is what lets the driver mmap-stream routed experts), and a
+    /// exclusivity is what lets the engine mmap-stream routed experts), and a
     /// regression in it would be invisible: every file still reads back fine.
     /// So it is checked here rather than assumed.
     #[test]

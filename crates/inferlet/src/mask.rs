@@ -1,10 +1,10 @@
 //! Packed-bitmask logit-mask semantics — the single source of truth for cut #2
-//! grammar masking, byte-identical to the driver's `0x65 MaskApply` op and the
+//! grammar masking, byte-identical to the engine's `0x65 MaskApply` op and the
 //! host-side bit-AND composition.
 //!
 //! A logit mask is one bit per vocabulary token, packed into `ceil(vocab/32)`
 //! `u32` words: **bit `1` = ALLOWED, bit `0` = DISALLOWED**. Token `j`'s bit is
-//! word `j >> 5`, bit `j & 31`. The driver's mask-apply sets the bf16 logit to
+//! word `j >> 5`, bit `j & 31`. The engine's mask-apply sets the bf16 logit to
 //! `−∞` wherever the bit is `0`, then argmax picks the highest survivor.
 //!
 //! These helpers let host code (the SDK constraint composition and the grammar
@@ -68,7 +68,7 @@ pub fn unpack_mask(packed: &[u32], vocab: u32) -> Vec<bool> {
 }
 
 /// Argmax over `logits` with the packed mask applied — the host reference for
-/// the driver's `0x65 MaskApply` + argmax: a disallowed token (bit `0`) is
+/// the engine's `0x65 MaskApply` + argmax: a disallowed token (bit `0`) is
 /// treated as `−∞`, so the result is the highest-logit *allowed* token. Ties go
 /// to the lowest index (matching a forward argmax scan). If every token is
 /// disallowed, returns `0`.

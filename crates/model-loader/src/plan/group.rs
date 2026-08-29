@@ -4,7 +4,7 @@
 //! tensors that differ from each other only in which bytes they read -- routed
 //! experts being the case that motivated it, but nothing here knows that word.
 //! The loader's job is to prove that claim and to say what "which bytes"
-//! resolves to for each index; what the driver then *does* with a group (stack
+//! resolves to for each index; what the engine then *does* with a group (stack
 //! every instance into an arena, or page instances through a fixed set of
 //! slots) is policy, and policy is not in the plan.
 //!
@@ -66,7 +66,7 @@ fn compile_one(
     }
 
     // A group is compiled as a contract of its own. It has to be: the whole
-    // point is that its instructions are a self-contained program the driver
+    // point is that its instructions are a self-contained program the engine
     // can run against a destination of its choosing, which it would not be if
     // its buffers were numbered inside the resident plan.
     let sub = ModelContract {

@@ -48,7 +48,7 @@ pub fn act_x_wt(
     // The rows `[rows, bucket)` this makes the gemm read and write are in
     // bounds (the arena reserves at the ceiling, P0 refuses a lattice above
     // it) and harmless (a gemm is row-independent, so the garbage that lands
-    // there stays there) — and they are NOBODY'S only because the driver
+    // there stays there) — and they are NOBODY'S only because the engine
     // declined to arm a windowed region at all. This entry does not and cannot
     // check that: `Ctx::opaque_rows` carries both gates and the argument for
     // each. What the entry owes is the extent of the rectangle it was handed,

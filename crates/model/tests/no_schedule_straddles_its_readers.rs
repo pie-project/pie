@@ -1,7 +1,7 @@
 //! The authoring-time half of palo build log 20's second blocker: an attention
 //! SCHEDULE may only be read in the window it was built in.
 //!
-//! **WHY THIS IS A MODEL TEST AND NOT A DRIVER ONE.** A schedule is not a
+//! **WHY THIS IS A MODEL TEST AND NOT AN ENGINE ONE.** A schedule is not a
 //! row-shaped table that slices — it is a carving. How many requests it
 //! batches, where each request's query rows begin, how its work items split
 //! the kv and how much of its grant it padded to are all fixed when the

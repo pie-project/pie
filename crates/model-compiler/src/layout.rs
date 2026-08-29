@@ -89,7 +89,7 @@ use crate::pq::{Leaf, PqTree};
 
 /// The most classes this pass will seriate.
 ///
-/// THE FIRE PATH'S CEILING, NOT THIS PASS'S. `class_order` hands the driver a
+/// THE FIRE PATH'S CEILING, NOT THIS PASS'S. `class_order` hands the engine a
 /// `Vec<u8>` per fire, so a class index is a byte everywhere downstream. A
 /// plan with more behaviours than that is not refused HERE —
 /// [`ClassOrder::Identity`] is what it gets, and P4 is an optimization pass
@@ -241,10 +241,10 @@ fn constrains(trace: &Trace, region: &Region, classes: usize) -> bool {
 /// whose canonical order puts classes 2 and 3 at positions 1 and 3, and a fire
 /// carrying an adapted prefill lane beside an adapted decode lane then covers
 /// two row intervals rather than one — `Fallback::Split { r: 2 }`, which the
-/// shells now serve as two launches (`driver::fire::fallback`). Offering the
+/// shells now serve as two launches (`engine::fire::fallback`). Offering the
 /// constraint is still the better answer, because a split costs a launch and
 /// a tile that the seated order does not; what it no longer costs is the fire.
-/// (It did: `driver_cuda::Fault::Fragmented` used to refuse every such batch,
+/// (It did: `engine_cuda::Fault::Fragmented` used to refuse every such batch,
 /// on the premise — false since C4 — that this table is always empty.)
 /// `crates/model-compiler/tests/every_sku_carves_an_arena.rs` pins both halves.
 ///
@@ -314,13 +314,13 @@ fn composed_of(trace: &Trace, regions: &[Region], stated_by: &[usize], names: &[
 /// actually costs is `node_cost x (fallback_ratio - 1)`, summed over the
 /// buckets a deployment fires at and weighted by how often the composition
 /// straddles at all — and neither factor is known here (`CROSSOVER_ROWS` is
-/// one measured point, and the composition distribution is the engine's).
+/// one measured point, and the composition distribution is the runtime's).
 /// What IS known is that both factors are near enough common across the
 /// candidates of one plan for the ranking to survive dropping them: on
 /// qwen35-d0.8b the two feasible withdrawals fragment in 158 and 159 of the
 /// 255 compositions, so the choice is decided by the nodes alone — 24 linear
 /// nodes at 40 us against 6 attention nodes at 60 us, a factor of 2.65. The
-/// day the engine reports its own distribution, THIS is the function that
+/// day the runtime reports its own distribution, THIS is the function that
 /// grows the weight, and nothing above it moves.
 ///
 /// **AND A GROUPABLE CONSUMER IS NEARLY FREE TO LOSE, WHICH IS WHY THE TWO

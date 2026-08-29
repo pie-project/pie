@@ -29,9 +29,9 @@
 //!
 //! ⚠️ GPU-only (the `MtpLogits` intrinsic is disabled in the mock profile).
 //!
-//! `#[ignore]`, driver-cuda. Run:
+//! `#[ignore]`, engine-cuda. Run:
 //!   PIE_MTP_DRAFT_TOKENS=4 cargo test -p pie-gpu-tests \
-//!     --features driver-cuda-13 --test cuda_mtp_specdecode_ab -- --ignored --nocapture
+//!     --features engine-cuda-13 --test cuda_mtp_specdecode_ab -- --ignored --nocapture
 
 use std::path::Path;
 use std::process::Command;
@@ -50,7 +50,7 @@ mod common;
 /// bound overshoots by a trajectory-dependent amount.
 const MIN_COMMITTED: usize = 16;
 
-/// Draft window k, handed to the driver as `mtp_num_drafts`. `PIE_MTP_DRAFT_TOKENS`
+/// Draft window k, handed to the engine as `mtp_num_drafts`. `PIE_MTP_DRAFT_TOKENS`
 /// selects the arm; below 2 there is nothing to A/B, so it is ignored.
 fn draft_k() -> u32 {
     std::env::var("PIE_MTP_DRAFT_TOKENS")

@@ -115,7 +115,7 @@ pub fn rmsnorm(
 ) -> Result<(), KernelError> {
     rms_row(
         ctx,
-        "norm.rmsnorm",
+        "elementwise.rmsnorm",
         x,
         weight,
         y,
@@ -137,7 +137,7 @@ pub fn rmsnorm_per_head(
 ) -> Result<(), KernelError> {
     rms_row(
         ctx,
-        "norm.rmsnorm_per_head",
+        "elementwise.rmsnorm_per_head",
         x,
         weight,
         y,
@@ -158,7 +158,7 @@ pub fn rmsnorm_plus_one(
 ) -> Result<(), KernelError> {
     rms_row(
         ctx,
-        "norm.rmsnorm_plus_one",
+        "elementwise.rmsnorm_plus_one",
         x,
         weight,
         y,
@@ -180,7 +180,7 @@ pub fn rmsnorm_per_head_plus_one(
 ) -> Result<(), KernelError> {
     rms_row(
         ctx,
-        "norm.rmsnorm_per_head_plus_one",
+        "elementwise.rmsnorm_per_head_plus_one",
         x,
         weight,
         y,
@@ -199,7 +199,7 @@ pub fn rmsnorm_no_scale(
     eps: f32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "norm.rmsnorm_no_scale";
+    const OP: &str = "elementwise.rmsnorm_no_scale";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "vnorm_single_row_bfloat16" });
     let grid = rms_grid(OP, x.width, head_dim, x.rows)?;
     ctx.fire(
@@ -224,7 +224,7 @@ pub fn rmsnorm_gated(
     eps: f32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "norm.rmsnorm_gated";
+    const OP: &str = "elementwise.rmsnorm_gated";
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_f32_bfloat16" });
@@ -263,7 +263,7 @@ pub fn rmsnorm_gated_by(
     eps: f32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "norm.rmsnorm_gated_by";
+    const OP: &str = "elementwise.rmsnorm_gated_by";
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_by_f32_bfloat16" });
@@ -294,7 +294,7 @@ pub fn rmsnorm_gated_by(
 
 /// `y += x`, in place on `y` (the IR aliases `y_out` onto `y`).
 pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), KernelError> {
-    const OP: &str = "norm.residual_add";
+    const OP: &str = "elementwise.residual_add";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "residual_add_bfloat16" });
     ctx.fire(
         Fire::at("elemwise/norm_residual_add.metal", entry)
@@ -305,7 +305,7 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), KernelErr
 
 /// `out += bias` per row, in place on `out`.
 pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), KernelError> {
-    const OP: &str = "norm.add_bias";
+    const OP: &str = "elementwise.add_bias";
     let entry = dtype_dispatch!(OP, out.dtype, { Bf16 => "add_bias_bfloat16" });
     let lanes = elementwise_rows(OP, out.width, out.rows)?;
     ctx.fire(
@@ -321,7 +321,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), KernelEr
 
 /// `x *= s` for a plan-stated scalar, in place on `x`.
 pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), KernelError> {
-    const OP: &str = "norm.mul_scalar";
+    const OP: &str = "elementwise.mul_scalar";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layer_scalar_mul_stated_bfloat16" });
     ctx.fire(
         Fire::at("elemwise/norm_layer_scalar.metal", entry)
@@ -332,7 +332,7 @@ pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), KernelError> {
 
 /// `x *= s` for a device-held scalar, in place on `x`.
 pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), KernelError> {
-    const OP: &str = "norm.scale";
+    const OP: &str = "elementwise.scale";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layer_scalar_mul_bfloat16" });
     ctx.fire(
         Fire::at("elemwise/norm_layer_scalar.metal", entry)
@@ -352,6 +352,6 @@ pub fn res_blend(
     _y: Tensor,
 ) -> Result<(), KernelError> {
     Err(KernelError::Unsupported {
-        op: "norm.res_blend",
+        op: "elementwise.res_blend",
     })
 }

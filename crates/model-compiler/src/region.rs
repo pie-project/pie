@@ -21,7 +21,7 @@
 //! AND WHY THE ONE REORDERING THERE IS, IS NOT THAT PASS. [`hoist`] moves
 //! whole regions and so looks like the scheduling the paragraph above defers.
 //! It is not: it moves nothing PAST a value it depends on, because the phase
-//! boundary is a dependence boundary — a prepare node reads what the driver
+//! boundary is a dependence boundary — a prepare node reads what the engine
 //! bound before the fire and writes a descriptor slot the graph reads, so the
 //! prepare half is upstream of the capture half in its entirety, and putting
 //! it there is restoring an order rather than choosing one. [`hoist`] proves
@@ -88,9 +88,9 @@ pub(crate) fn coalesce(trace: &Trace, classes: &ClassTable) -> Vec<Region> {
 /// P5's second half: move the prepare regions in front of the capture regions,
 /// keeping each half in program order.
 ///
-/// WHY THE COMPILER AND NOT THE DRIVER. Design §5 lists "plan structs
+/// WHY THE COMPILER AND NOT THE ENGINE. Design §5 lists "plan structs
 /// (flashinfer …)" as absorbed by a "prepare-phase hoist → descriptor slots",
-/// and `driver::fire::walk`'s rule 3 refuses a template with a prepare region
+/// and `engine::fire::walk`'s rule 3 refuses a template with a prepare region
 /// standing after a capture one — deliberately, because the order is the
 /// compiler's output and a walk that quietly repaired it would hide this pass
 /// behind a fire that mostly works. So the repair belongs here, and rule 3
@@ -329,7 +329,7 @@ mod tests {
     fn a_prepare_node_stated_last_is_hoisted_in_front_of_the_capture_it_follows() {
         // qwen3.6's shape, in miniature: the trunk, then a head appended after
         // it whose attention needs a plan build. Program order puts the build
-        // three hundred regions deep; `driver::fire::walk` refuses that, and
+        // three hundred regions deep; `engine::fire::walk` refuses that, and
         // this is the pass that makes it not happen.
         let mut b = Build::new();
         let x = b.input(4);

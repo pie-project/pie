@@ -6,7 +6,7 @@
 //! the six family traits, the aggregate requiring them all, and the blanket
 //! impl granting `exec` to any type carrying the full set. The listing *is*
 //! the contract's index — read it top to bottom and you have read the whole
-//! surface a driver must answer.
+//! surface an engine must answer.
 
 use model_ir::{Attention, Collective, CustomCuda, Elementwise, Layout, Linear, Node, Operation};
 
@@ -46,7 +46,7 @@ pub trait DispatchCustomCuda {
 ///
 /// - `dispatch` means **enqueue/encode only, never sync** (#15) —
 ///   CUDA graph capture and Metal command buffers depend on it.
-/// - Impls live in `driver-*` on that driver's `Run` type, and arms
+/// - Impls live in `engine-*` on that engine's `Run` type, and arms
 ///   stay dumb: destructure → resolve → call (#13). Kernel selection
 ///   (arch, gemv-vs-dense, dtype) belongs inside the `kernels-*`
 ///   entry fn; an `if arch >= 90` in an arm is logic leaking upward.
@@ -65,7 +65,7 @@ pub trait Dispatch:
 {
     /// Enqueue one node's op. UFCS throughout — a method call would
     /// be ambiguous across the same-named supertraits. `cond` and
-    /// `layer` are the driver walk's business; this reads only `op`.
+    /// `layer` are the engine walk's business; this reads only `op`.
     fn exec(&mut self, node: &Node) -> Result<(), KernelError> {
         match &node.op {
             Operation::Attention(op) => DispatchAttention::dispatch(self, op),

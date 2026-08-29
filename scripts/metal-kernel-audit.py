@@ -214,7 +214,7 @@ def main():
         #
         # ONE tree now. This walked two -- the shader tree and a host C++
         # library under `include/pie/kernels/` -- and the second is deleted:
-        # its launch shapes are Rust in `driver-metal/src/lowering/grid.rs`
+        # its launch shapes are Rust in `engine-metal/src/lowering/grid.rs`
         # and the C++ driver that compiled against them is gone. What is left
         # is the `*_params.h` a shader and its host caller must agree on,
         # which cannot be Rust because a `.metal` `#include`s it.
@@ -266,7 +266,7 @@ def main():
             print(f"  {where}: {why}")
         if problems:
             print(f"\n{len(problems)} boundary violation(s). kernels-metal must not "
-                  f"reach driver-metal: pass the value in instead. See "
+                  f"reach engine-metal: pass the value in instead. See "
                   f".wiki/kernel-metal-refactor.md \u00a76 invariant (3).")
             return 1
         print(f"kernels-metal reaches nothing above it, and every one of its "
@@ -277,7 +277,7 @@ def main():
         # RETIRED, and failing rather than passing is the point.
         #
         # All four served the C++ Metal driver, and that driver was deleted
-        # whole. The first three walked `crates/driver-metal/csrc`: `rglob`
+        # whole. The first three walked `crates/engine-metal/csrc`: `rglob`
         # over a missing directory yields nothing, so each printed its success
         # line over an empty set and had been guaranteeing nothing for as long
         # as the port has been finished. `--cpp` is the opposite failure and
@@ -293,11 +293,11 @@ def main():
         #   syntax. `model-compiler`'s `kernels::check_plan` runs from
         #   `trace::finish` on every plan and refuses any launched symbol
         #   no row declares, which checks the RESULT and so catches a name
-        #   built by any means. `driver-metal`'s coverage ledger asserts
+        #   built by any means. `engine-metal`'s coverage ledger asserts
         #   the same thing over all eight texts at once.
         # * `--paths` and `--dead-paths-unused` required every `.metal`
         #   literal to resolve. The literals are now the table's own
-        #   `KernelSig::file` fields, and `driver-metal`'s
+        #   `KernelSig::file` fields, and `engine-metal`'s
         #   `every_file_a_kernel_row_states_is_a_file_that_exists` holds
         #   every one of them against the tree.
         # * `--cpp` compiled `csrc/tests/entrypoint_test.cpp` against

@@ -9,7 +9,7 @@
 //! The seeds are every container the compiler can build — the golden corpus and
 //! the extended corpus both. That is the whole live surface: `PTIR` is the only
 //! byte format anything outside this directory parses
-//! (`crates/engine/src/pipeline/program.rs` on program registration,
+//! (`crates/runtime/src/pipeline/program.rs` on program registration,
 //! `pipeline/fire/kv.rs`, `driver/dummy`). Nothing else belongs in this sweep:
 //! fuzzing a format that only this crate writes and only this crate reads is
 //! fuzzing a round-trip, and it will pass no matter what either side does.

@@ -22,7 +22,7 @@
 //!       lane forced to preempt via `[batching].total_pages`, byte-identical to
 //!       its sync reference). It used to be `cuda_concurrent`'s, deleted in the
 //!       census wave because the batched-vs-solo identity it asked is
-//!       `driver-cuda/tests/serve_smoke`'s
+//!       `engine-cuda/tests/serve_smoke`'s
 //!       `three_lanes_two_decoding_and_one_prefilling_agree_with_their_solo_runs`;
 //!   (b) engaged multi-lane `restore_attributable == 0` HERE — a divergence first
 //!       appearing at KV position >= page_size (a SEALED + restored page) is real
@@ -59,7 +59,7 @@
 //!
 //! `#[ignore]` (needs a CUDA device and the Qwen3.5-0.8B snapshot). Run:
 //!   PIE_COMPILER_LAUNCHER=env \
-//!     cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//!     cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!     --test cuda_contention -- --ignored --nocapture
 //!
 //! Quantitative A/B (each command is a separate process because boot is
@@ -67,11 +67,11 @@
 //! runs). The pre-rewrite/legacy side of an A/B is measured by checking out
 //! the baseline git ref — the runtime no longer has an error-path mode:
 //!   PIE_CONTENTION_PROFILE_MODE=baseline PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
-//!     cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_contention \
+//!     cargo test -p pie-gpu-tests --features engine-cuda-13 --test cuda_contention \
 //!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
 //!   PIE_CONTENTION_PROFILE_MODE=contended PIE_CONTENTION_TOTAL_PAGES=8 \
 //!   PIE_CONTENTION_PROFILE_RECORD=/tmp/pie-contention.json \
-//!     cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_contention \
+//!     cargo test -p pie-gpu-tests --features engine-cuda-13 --test cuda_contention \
 //!     over_capacity_fleet_preempts_and_restores_transparently -- --ignored --exact --nocapture
 //!
 //! # BLOCKED: this build has no KV-page cap, so the fleet cannot be made to
@@ -88,17 +88,17 @@
 //! ```
 //!
 //! **256 pages, with the cap asking for 8.** `max_total_pages` sizes SLOTS now
-//! (`worker::embedded_driver`: `slots: pages / pages_per_slot`), and the
+//! (`worker::embedded_engine`: `slots: pages / pages_per_slot`), and the
 //! `[batching].total_pages` key it also writes is one the palo shell does not
 //! read — the page pool follows `gpu_mem_utilization` and the context ceiling
-//! through `Budgets`. The util cannot take its place: below ~0.3 the driver
+//! through `Budgets`. The util cannot take its place: below ~0.3 the engine
 //! answers "no viable forward/KV layout" and the boot is fatal. So the cap
 //! makes the deployment ONE slot and leaves the pool whole, the fleet queues at
 //! the scheduler instead of at the pool, and `waiters_parked` is 0 by
 //! construction — which is exactly what assertion 4 refuses, correctly.
 //!
 //! It is `#[ignore]`d on that fact and not on hardware. What unblocks it is a
-//! driver option that caps the KV PAGE pool, which is the thing the paragraph
+//! engine option that caps the KV PAGE pool, which is the thing the paragraph
 //! this replaced was already asking for.
 //!
 //! **A SECOND BLOCKER STOOD BEHIND IT AND IS GONE** (`palo` build log 29).
@@ -108,7 +108,7 @@
 //! of eight lanes used to come back with `invalid submission: slot 0 appears
 //! twice in one fire, at lane 1` — a multi-lane fire stated slot 0 for every
 //! lane, because `Lane::slot` had no owner. It has one now (the KV working
-//! set, through `engine::store::seat`), and the same command answers `8/8
+//! set, through `runtime::store::seat`), and the same command answers `8/8
 //! lanes: zero WorkingSetError` with the divergences it classifies all in the
 //! non-gating `[1, page_size)` band. So what is left blocking this file is
 //! the KV-page cap above and nothing else; `cuda_sweep_e2e` is the gate that
@@ -137,7 +137,7 @@ use pie::sweep::fleet::{self, FleetRun};
 /// reference is EXACT — which is what assertion 3 is a diff against.
 ///
 /// It was `generate@0.1.0`, a package deleted with the guest workspace's move
-/// from `crates/engine/tests/inferlets` to `tests/inferlets`. `text-completion`
+/// from `crates/runtime/tests/inferlets` to `tests/inferlets`. `text-completion`
 /// is its replacement and takes the same `{"prompt": ...}` document, which is
 /// what let the repoint be a rename.
 const GENERATE: &str = "text-completion@0.1.0";
@@ -254,7 +254,7 @@ fn write_profile_record(
         "bubble_p50_us": bubble_p50_us,
         "bubble_p99_us": bubble_p99_us,
     });
-    if let Some(planner) = engine::planner::planner() {
+    if let Some(planner) = runtime::planner::planner() {
         let diagnostics = planner.diagnostics();
         document[mode]["contention"] = serde_json::json!({
             "parked": diagnostics.parks_total,
@@ -306,7 +306,7 @@ fn write_profile_record(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "BLOCKED, and not on hardware: this build has no KV-page cap. \
-            `max_total_pages` sizes slots (worker::embedded_driver) and the \
+            `max_total_pages` sizes slots (worker::embedded_engine) and the \
             `[batching].total_pages` key it writes is one the palo shell does \
             not read, so at a cap of 8 the pool measures 256/256 free and the \
             fleet queues at the scheduler instead of over-filling the pool — \
@@ -381,7 +381,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         );
         reference.push(r);
     }
-    let scheduler_before = engine::scheduler::get_stats().await;
+    let scheduler_before = runtime::scheduler::get_stats().await;
 
     // Over-capacity: launch the whole fleet at once. Combined demand > pool ⇒ the
     // losers OOM in prep → acquire() → wait → a finisher frees → drain → retry.
@@ -394,7 +394,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         Some(tokio::spawn(async move {
             let t0 = std::time::Instant::now();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                if let Some(planner) = engine::planner::planner() {
+                if let Some(planner) = runtime::planner::planner() {
                     let d = planner.diagnostics();
                     eprintln!(
                         "[contention-trace] t={}ms parked={} woken={} suspends={} restores={} \
@@ -434,7 +434,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         .filter_map(Option::as_ref)
         .map(Vec::len)
         .sum();
-    let scheduler_after = engine::scheduler::get_stats().await;
+    let scheduler_after = runtime::scheduler::get_stats().await;
     let batches = scheduler_after
         .total_batches
         .saturating_sub(scheduler_before.total_batches);
@@ -465,7 +465,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
         bubble_p50_us,
         bubble_p99_us,
     );
-    if let Some(planner) = engine::planner::planner() {
+    if let Some(planner) = runtime::planner::planner() {
         let diagnostics = planner.diagnostics();
         eprintln!(
             "[contention-profile] parked={} woken={} suspends={} restores={} \
@@ -498,7 +498,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // assertion so a transparency RED still surfaces whether preempt/restore
     // fired (a degenerate-replay mismatch with suspends==0 falsifies the
     // "restore corruption" framing → the bug is not on the restore path).
-    if let Some(planner) = engine::planner::planner() {
+    if let Some(planner) = runtime::planner::planner() {
         let d = planner.diagnostics();
         eprintln!(
             "[contention] final-engagement: parked={} woken={} suspends={} restores={}",
@@ -526,7 +526,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     // trivially. Engagement = allocation waiters that PARKED (demand outran
     // the pool → blocked in acquire's queue) and were later WOKEN (freed
     // pages covered them → the drain released them → they succeeded).
-    let (parked, woken, suspends, restores) = engine::planner::planner()
+    let (parked, woken, suspends, restores) = runtime::planner::planner()
         .map(|planner| {
             let d = planner.diagnostics();
             (
@@ -576,7 +576,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     //   • position 0 — the first token off the identical `"hello world"` prefill
     //     is batch-invariant (deterministic greedy from identical rows), so ANY
     //     position-0 divergence is real prefill/page-0 restore corruption. FAIL.
-    //   • position >= `page_size` (KV page = 32 tokens, driver `kv_page_size`,
+    //   • position >= `page_size` (KV page = 32 tokens, engine `kv_page_size`,
     //     config.hpp:53) — provably inside a SEALED/RESTORED page (a generated
     //     token at index `i` sits at KV position `prompt_len + i >= i`, so
     //     `i >= page_size` ⇒ KV position >= page_size regardless of prompt length
@@ -587,7 +587,7 @@ async fn over_capacity_fleet_preempts_and_restores_transparently() -> Result<()>
     //   • position in [1, page_size) — the confounded band (non-batch-invariance
     //     ≡ partial-page-0 restore, inseparable here). LOGGED, non-gating; clean
     //     transparency in this band is the FLEET=1 bubble proof above.
-    const PAGE_SIZE: usize = 32; // driver kv_page_size (config.hpp:53)
+    const PAGE_SIZE: usize = 32; // engine kv_page_size (config.hpp:53)
     let first_divergence = |a: &Option<Vec<i64>>, b: &Option<Vec<i64>>| -> Option<usize> {
         match (a, b) {
             (Some(x), Some(y)) => (0..x.len().min(y.len()))

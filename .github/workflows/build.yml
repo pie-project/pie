@@ -89,13 +89,13 @@ jobs:
         target:
           # ── `aarch64-macos-metal` STOOD HERE, QUARANTINED (R3) ───────────
           #
-          # The leg built `cargo build -p pie --features driver-metal` on
+          # The leg built `cargo build -p pie --features engine-metal` on
           # `macos-15` and shipped `pie-aarch64-macos-metal.tar.gz`. It cannot
-          # build: R3 put `crates/driver-metal` in the root manifest's
+          # build: R3 put `crates/engine-metal` in the root manifest's
           # `exclude` -- it was one of the last consumers of `model-legacy` and
           # `model_compiler::lower`, both deleted -- and with the crate out of
-          # the workspace, `pie` no longer declares a `driver-metal` feature to
-          # forward. `--features driver-metal` is a hard cargo error, so this
+          # the workspace, `pie` no longer declares an `engine-metal` feature to
+          # forward. `--features engine-metal` is a hard cargo error, so this
           # leg failed before it compiled a line, and `fail-fast: false` meant
           # the Windows leg beside it went on publishing while this one went
           # red into a log nobody reads.
@@ -126,7 +126,7 @@ jobs:
           #       triple: aarch64-apple-darwin
           #       archive: tar.gz
           #       backend: metal
-          #       features: driver-metal
+          #       features: engine-metal
           #
           # The `platform == 'macos'` steps below (the `brew install cmake
           # ninja libomp` one, and the `TARGET_ROOT` branch in Package) are
@@ -141,9 +141,9 @@ jobs:
             # The toolkit step below installs 12.9.1, so this must be the 12
             # ABI: `cudaGraphAddNode` takes five parameters in libcudart.so.12
             # and six in .so.13, and a mismatch segfaults inside the driver
-            # rather than returning an error. This read `driver-cuda`, which
+            # rather than returning an error. This read `engine-cuda`, which
             # resolved to `cuda-13` three manifests away.
-            features: driver-cuda-12
+            features: engine-cuda-12
             # nvcc builds one real+PTX arch; the PTX keeps the artifact
             # forward-JIT-able on newer NVIDIA GPUs.
             cuda_arch: "75"
@@ -308,8 +308,8 @@ jobs:
         # builds ONE arch. The installer detects the GPU's compute capability
         # (nvidia-smi, or the PIE_CC override) and picks the matching asset.
         cuda:
-          - { version: "12.8.1", short: "12.8", feature: driver-cuda-12 }
-          - { version: "13.0.0", short: "13.0", feature: driver-cuda-13 }
+          - { version: "12.8.1", short: "12.8", feature: engine-cuda-12 }
+          - { version: "13.0.0", short: "13.0", feature: engine-cuda-13 }
         target:
           # x86_64: Ampere (80/86), Ada (89), Hopper (90), Blackwell DC (100) + consumer (120).
           - { os_arch: x86_64,  cc: "80",  runner: ubuntu-large-x64,   triple: x86_64-unknown-linux-gnu }
@@ -324,11 +324,11 @@ jobs:
         exclude:
           # Blackwell consumer (RTX 50) shipped in the CUDA-13/driver-580 era —
           # no one pairs sm120 with a CUDA 12.8 runtime.
-          - cuda: { version: "12.8.1", short: "12.8", feature: driver-cuda-12 }
+          - cuda: { version: "12.8.1", short: "12.8", feature: engine-cuda-12 }
             target: { os_arch: x86_64, cc: "120", runner: ubuntu-large-x64, triple: x86_64-unknown-linux-gnu }
           # Grace-Blackwell (GB200) is a 2025/CUDA-13 platform — the
           # arm64 × Blackwell × CUDA-12.8 intersection is empty.
-          - cuda: { version: "12.8.1", short: "12.8", feature: driver-cuda-12 }
+          - cuda: { version: "12.8.1", short: "12.8", feature: engine-cuda-12 }
             target: { os_arch: aarch64, cc: "100", runner: ubuntu-large-arm64, triple: aarch64-unknown-linux-gnu }
     container: nvidia/cuda:${{ matrix.cuda.version }}-devel-rockylinux8
     env:

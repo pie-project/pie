@@ -1,7 +1,7 @@
 //! Backend-neutral PTIR compiler planning.
 //!
 //! Rust owns normalization, stage signatures, value-domain analysis, region
-//! partitioning, and the lane-table ABI. Drivers consume the serialized plan
+//! partitioning, and the lane-table ABI. Engines consume the serialized plan
 //! and provide backend code generation and library implementations.
 
 use alloc::collections::BTreeSet;
@@ -28,8 +28,8 @@ pub use symbolic::*;
 
 /// Cache-identity tokens, not wire-format versions.
 ///
-/// Both drivers fold these into the key of their compiled-module caches
-/// (`crates/driver-cuda/csrc/.../module_cache.hpp`, `crates/driver-metal/csrc/.../m1_runtime.cpp`), so
+/// Both engines fold these into the key of their compiled-module caches
+/// (`crates/driver-cuda/csrc/.../module_cache.hpp`, `crates/engine-metal/csrc/.../m1_runtime.cpp`), so
 /// bumping one is how a change in this crate's planning semantics invalidates
 /// everything a device already built. Nothing parses a byte stream stamped with
 /// them.
@@ -224,10 +224,10 @@ pub fn debug_stage_plan(stage: &CompiledStage) -> String {
 
 /// The graph-cache identity of one compiled stage.
 ///
-/// A driver keys its graph cache on this value, so it is a decision about the
-/// program and belongs to the host. Every driver is handed the bytes rather
+/// An engine keys its graph cache on this value, so it is a decision about the
+/// program and belongs to the host. Every engine is handed the bytes rather
 /// than deriving them — the Metal runtime reads them out of
-/// `interface/driver/src/plan.rs`'s `identity` — because a driver-side copy of
+/// `interface/driver/src/plan.rs`'s `identity` — because an engine-side copy of
 /// this derivation is a second definition of a cache key, and two definitions
 /// of a cache key that drift apart share graphs between programs that are not
 /// the same program.

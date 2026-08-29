@@ -68,7 +68,7 @@ selects the degenerate raw rule if that is what you want to test.
 
 ```bash
 cargo build --release --target wasm32-wasip2
-python tests/inferlets/run_all.py --driver cuda_native --model <model-path>
+python tests/inferlets/run_all.py --engine cuda_native --model <model-path>
 ```
 
 Details are in the `//!` header of [`src/lib.rs`](src/lib.rs).

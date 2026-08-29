@@ -1,6 +1,6 @@
 //! MEASUREMENT INSTRUMENT — naive decode with an optional semantically-causal
 //! custom AttnMask. NOT a policy inferlet; exists only to measure what a
-//! plain-decode fire loses when it is forced onto the driver's custom-mask
+//! plain-decode fire loses when it is forced onto the engine's custom-mask
 //! path (`has_custom_mask` disables `use_decode_path` and
 //! `fused_decode_qkv_post` fire-wide — Stage 2 verdict item A).
 //!
@@ -30,7 +30,7 @@ struct Input {
     ///   "dense"      causal mask from generic ops (iota/le) — packs a dense
     ///                custom mask, forcing the custom-mask prefill path
     ///   "structured" causal mask via the CausalMask opcode sugar — the
-    ///                driver recognizes it and takes the window-override
+    ///                engine recognizes it and takes the window-override
     ///                decode path (structured_window_left = -1)
     ///   "dense-prefill" causal host mask on the PREFILL chunks instead
     ///                (decode unmasked) — the chunk fires are
@@ -309,7 +309,7 @@ async fn main(input: Input) -> Result<Output> {
             if masked {
                 // Full causal mask for the next query at `base`: j <= base.
                 let new_mask = if structured {
-                    // CausalMask opcode — the driver's structured-mask
+                    // CausalMask opcode — the engine's structured-mask
                     // recognizer lowers it to a runtime window override.
                     reshape(causal_mask(&base, pool_len), [1, pool_len])
                 } else {

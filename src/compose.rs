@@ -99,7 +99,7 @@ pub async fn run_standalone(
     // observability init -- but this function is the composition root for
     // embedders that reach no `bootstrap` entry point at all (`tests/gpu`
     // boots exactly this, and its boot smokes died in `reqwest::Client::new`
-    // before asserting anything about the driver they gate). Idempotent, so
+    // before asserting anything about the engine they gate). Idempotent, so
     // saying it twice in one process is a fact rather than a failure.
     bootstrap::install_crypto_provider();
 

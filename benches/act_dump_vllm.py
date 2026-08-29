@@ -1,6 +1,6 @@
 """Dump vLLM's per-layer activations for a single prefill, in pie's format.
 
-The CUDA driver writes `s<step>_<tag>.npy` files when `PIE_ACT_DUMP_DIR` is set
+The CUDA engine writes `s<step>_<tag>.npy` files when `PIE_ACT_DUMP_DIR` is set
 (see `crates/driver-cuda/csrc/src/model/act_dump.hpp`). This script produces the same tags
 from vLLM so `act_parity.py` can report the first tag where the two engines
 disagree — which turns "the models emit different tokens" into "layer 3's MoE

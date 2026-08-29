@@ -17,10 +17,10 @@
 //! Gim wants every chat inferlet to follow (explicit pipelining on the low-level
 //! API, no `collect_*` helper).
 //!
-//! `#[ignore]`, driver-cuda. Run:
+//! `#[ignore]`, engine-cuda. Run:
 //!   PIE_COMPILER_LAUNCHER=env CUDACXX=/usr/local/cuda/bin/nvcc \
 //!   CPM_SOURCE_CACHE=$HOME/.cache/pie-cpm \
-//!   cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_lowlevel_chat -- --ignored --nocapture
+//!   cargo test -p pie-gpu-tests --features engine-cuda-13 --test cuda_lowlevel_chat -- --ignored --nocapture
 
 mod common;
 
@@ -36,7 +36,7 @@ use client::client::Client;
             `tests/inferlets`, and the EOS-rollback surface it exercised \
             belonged to the deleted C++ shell's carrier. The run-ahead half is \
             `cuda_device_carried_round_trip` and `cuda_runahead_depth1`"]
-async fn lowlevel_chat_runahead_rollback_on_real_driver() -> Result<()> {
+async fn lowlevel_chat_runahead_rollback_on_real_engine() -> Result<()> {
     common::init_trace();
     let pie = common::boot_cuda().await?;
     eprintln!("[lowlevel-chat] booted, listen_addr={}", pie.listen_addr);
@@ -83,7 +83,7 @@ async fn lowlevel_chat_runahead_rollback_on_real_driver() -> Result<()> {
     );
     // DEEP carrier token-identity: the depth-k pre-submission stream (the production
     // lever for co-batch residency + reduce-R) == the sequential one. Run with
-    // `[model.scheduler] frame_dispatch_depth = 4` to exercise true 4-in-flight residency (the
+    // `[runtime] frame_dispatch_depth = 4` to exercise true 4-in-flight residency (the
     // byte-identity holds at any cap; the residency is exercised at cap≥depth).
     anyhow::ensure!(
         json.contains("DEEP_MATCH=true"),
@@ -115,7 +115,7 @@ async fn lowlevel_chat_runahead_rollback_on_real_driver() -> Result<()> {
 
 /// True if the reported `pipe=[…]` stream is non-empty and every element is the
 /// same value (the mock's degenerate constant-token failure mode). On the real
-/// driver a genuine chat decode must vary.
+/// engine a genuine chat decode must vary.
 fn degenerate_constant_stream(json: &str) -> bool {
     let Some(start) = json.find("pipe=[") else {
         return false;

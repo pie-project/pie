@@ -6,8 +6,8 @@ use kernels::KernelError;
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, stated};
 use crate::tensor::Tensor;
 
-pub fn sigmoid_mul(ctx: &Ctx<'_>, x: Tensor, gate: Tensor) -> Result<(), KernelError> {
-    const OP: &str = "gate.sigmoid_mul";
+pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), KernelError> {
+    const OP: &str = "elementwise.gate_sigmoid_mul";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "gate_bfloat16" });
     debug_assert!(
         gate.rows == x.rows && gate.width == x.width && gate.dtype == x.dtype,

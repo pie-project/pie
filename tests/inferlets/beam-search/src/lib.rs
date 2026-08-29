@@ -205,13 +205,13 @@ macro_rules! define_beam_search {
         // Constant pool geometry: page_indptr = [0, POOL_PAGES, 2*POOL_PAGES] (each
         // beam references all pool pages). Bound via a CHANNEL (not the sugar's const
         // PageIndptr): a fire that binds ANY descriptor port to a channel is a
-        // device-geometry fire, and the driver's device-geometry resolver skips const
+        // device-geometry fire, and the engine's device-geometry resolver skips const
         // ports (they never populate the wire) — so a mixed const-PageIndptr /
-        // channel-Pages fire ships an EMPTY page_indptr and the driver reads a null
+        // channel-Pages fire ships an EMPTY page_indptr and the engine reads a null
         // kv_page_indptr. Feeding page_indptr through a channel (re-put each fire with
         // the same constant) keeps every descriptor port channel-bound (the
         // device-geometry-fire wire-form).
-        // The page CSR is the wire's source of truth for kv_len: the driver derives
+        // The page CSR is the wire's source of truth for kv_len: the engine derives
         // `last_page_len = ((kv_len-1) % PAGE_T) + 1` and then reads back a span of
         // `(page_count-1)*PAGE_T + last_page_len` cells per lane. Declaring all
         // POOL_PAGES here would inflate that span past the live prefix and attend

@@ -66,7 +66,7 @@ pub type TraceFn = fn(Platform) -> Trace;
 /// pack them into the one `u64` a lane carries.
 ///
 /// MONOMORPHIC ON PURPOSE. `Classify` is a trait over a family's own `Facts`
-/// struct, and the party that needs a word — the engine's fire path — holds
+/// struct, and the party that needs a word — the runtime's fire path — holds
 /// a SKU string and nothing else: it cannot name `qwen_3::forward::Facts`,
 /// and a plan cannot tell it either, because `Guard::Fact(bit)` numbers its
 /// bits and a bit is a position and nothing else (see [`Predicate`]). The
@@ -86,7 +86,7 @@ pub type ClassifyFn = fn(&Request) -> u64;
 /// that promises it.
 ///
 /// THE CLASSIFY COLUMN IS THE SAME ARGUMENT ONE STEP FURTHER IN. A lane's word
-/// is what the driver composes a fire from, and computing it means calling
+/// is what the engine composes a fire from, and computing it means calling
 /// `<M::Facts as Classify>::of` — a call only a party that can NAME the
 /// family's `Facts` can write. The catalog is where the family's type is last
 /// visible, so it is where the call is closed over; everywhere downstream
@@ -142,7 +142,7 @@ pub mod seam {
     /// WHAT STILL OWES IT A HOME: `model_compiler::arena` gives the delivery
     /// tail — liveness to fire end, read in every class — to the `"out"` seam
     /// by name, and to no other. A draft column is read after the graph by the
-    /// same sampler that reads `"out"` (`driver::program`'s `MtpLogits` and
+    /// same sampler that reads `"out"` (`engine::program`'s `MtpLogits` and
     /// `MtpDrafts` intrinsics index the readout at `mtp_draft_row`), so it
     /// wants the same tail. Until the compiler's export pass lands, the model
     /// text states the export truthfully and the shell owes the pin — the same

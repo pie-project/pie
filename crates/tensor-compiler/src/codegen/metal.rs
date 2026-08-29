@@ -31,7 +31,7 @@ pub use singleton::emit_singleton_region;
 pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
-/// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes; the driver's pipeline cache keys on it.
+/// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes; the engine's pipeline cache keys on it.
 pub const METAL_M1_EMITTER_VERSION: u16 = 36;
 
 /// `kMetalM1MaxChannels` — the single-lane readiness/commit kernels bind one
@@ -63,13 +63,13 @@ pub struct M1ChannelEffect {
 }
 
 /// `M1OpMeta` — one accepted singleton op: where it sits in the stage, the SSA
-/// id its first result defines, and the `COp` view the driver dispatches on.
+/// id its first result defines, and the `COp` view the engine dispatches on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct M1OpMeta {
     /// The op's position in the stage op list.
     pub node: u32,
     /// The SSA id this op's first result defines.
     pub result_base: u32,
-    /// The decoded [`OpView`] the driver dispatches on.
+    /// The decoded [`OpView`] the engine dispatches on.
     pub op: OpView,
 }

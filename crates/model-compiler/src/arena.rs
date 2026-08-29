@@ -131,7 +131,7 @@ struct Export {
 /// crate does not depend on the authoring surface. The coupling is this table,
 /// republished as [`crate::EXPORT_SEAMS`] so that a shell resolving the same
 /// names reads them from here instead of keeping a second copy of the literals
-/// (`driver_cuda::serve` did, until this landed), and
+/// (`engine_cuda::serve` did, until this landed), and
 /// `tests/every_sku_carves_an_arena.rs` is what notices if they ever stop
 /// matching.
 ///
@@ -151,13 +151,13 @@ struct Export {
 /// live across the whole stack, which is sixty layers of an arena that exists
 /// to be the busiest instant.
 const EXPORTS: [Export; 3] = [
-    // `model_dsl::seam::OUT` — the trunk's logits, into the engine's sampler.
+    // `model_dsl::seam::OUT` — the trunk's logits, into the runtime's sampler.
     Export {
         seam: "out",
         read_by: Readers::EveryClass,
     },
     // `model_dsl::seam::MTP` — the draft head's logits over the draft window,
-    // into the same sampler through `driver::program`'s `MtpLogits` intrinsic
+    // into the same sampler through `engine::program`'s `MtpLogits` intrinsic
     // at `mtp_draft_row` (palo C3b).
     Export {
         seam: "mtp",
@@ -175,7 +175,7 @@ const EXPORTS: [Export; 3] = [
 /// that has to find the same values in a `Trace` it was handed.
 ///
 /// Published because the alternative is what was here before: the same literals
-/// spelled a second time in `driver-cuda`, with a comment in each place saying
+/// spelled a second time in `engine-cuda`, with a comment in each place saying
 /// the other one exists.
 pub const EXPORT_SEAMS: [&str; 3] = [EXPORTS[0].seam, EXPORTS[1].seam, EXPORTS[2].seam];
 
@@ -225,7 +225,7 @@ impl RowExpr {
     /// Does a windowed reader see only its OWN classes' rows of this column?
     ///
     /// THE PRECONDITION OF A SHARED COLUMN, AND IT IS THE SHELL'S RULE READ
-    /// BACK. `driver_cuda::run::Run::cut` slices a rectangle at the asking
+    /// BACK. `engine_cuda::run::Run::cut` slices a rectangle at the asking
     /// node's window by the value's leading `Dim`: `Tokens` at
     /// `(row_offset, rows)`, `TokensTimes(k)` at `(row_offset * k, rows * k)`,
     /// `Lanes` at `(lane_offset, lanes)` — three cuts that land inside the
@@ -281,7 +281,7 @@ pub struct Span {
     pub last: u32,
 }
 
-/// Which regions the driver may have in flight at once — P6's answer, and the
+/// Which regions the engine may have in flight at once — P6's answer, and the
 /// argument the carve's overlap predicate takes.
 ///
 /// A NO-OP HOOK IN v1, DELIBERATELY SHAPED. With one stream the walk is a
@@ -430,8 +430,8 @@ fn map_regions(regions: &[Region], nodes: usize) -> Vec<u32> {
 /// Where one value lives at the fire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
-    /// Bound by the driver each fire — tokens, positions, a mask, a geometry
-    /// vector. Outside the arena: the driver owns the buffer.
+    /// Bound by the engine each fire — tokens, positions, a mask, a geometry
+    /// vector. Outside the arena: the engine owns the buffer.
     Runtime(RuntimeInput),
     /// A loader-resident weight table, by index into `Trace::params`. Outside
     /// the arena: it is written once at residency and read forever.
@@ -547,7 +547,7 @@ impl ArenaMap {
     /// Where a value sits in a fire of `tokens` rows over `lanes` requests, or
     /// `None` if it is not in the arena.
     ///
-    /// THE DRIVER'S WHOLE ARITHMETIC, and it is this short because the offset
+    /// THE ENGINE'S WHOLE ARITHMETIC, and it is this short because the offset
     /// is static: only the length moves with the bucket.
     #[must_use]
     pub fn window(&self, value: ValueId, tokens: u64, lanes: u64) -> Option<Extent> {
@@ -900,7 +900,7 @@ pub fn elem_bytes(dtype: Dtype) -> Option<u64> {
 ///
 /// AN ALIAS THAT REACHES OUTSIDE THE ARENA IS NOT THIS PASS'S BUSINESS. A
 /// runtime binding and a host struct have no bytes here to fold, so the pair
-/// is left alone rather than refused: the driver owns that buffer and the
+/// is left alone rather than refused: the engine owns that buffer and the
 /// in-place write lands in it.
 fn fold_in_place(trace: &Trace, placements: &mut [Placement]) -> Result<(), Error> {
     let mut pairs: Vec<(ValueId, ValueId)> = Vec::new();
@@ -1016,7 +1016,7 @@ fn flatten(placements: &mut [Placement]) {
 /// touched".
 fn lives(trace: &Trace, placements: &[Placement], classes: &ClassTable) -> (Vec<Option<Span>>, Vec<ClassSet>) {
     let end = trace.nodes.len() as u32;
-    // The reader with no class: the engine, past the last node, over every row
+    // The reader with no class: the runtime, past the last node, over every row
     // the fire carried. Both pins below widen to it.
     let everywhere = ClassSet::of(0..classes.classes.len());
     let nowhere = ClassSet::default();
@@ -1040,7 +1040,7 @@ fn lives(trace: &Trace, placements: &[Placement], classes: &ClassTable) -> (Vec<
 
     // THE DELIVERY TAIL, AND EVERY DECLARED EXPORT TAKES IT ([`EXPORTS`]).
     // These values are read after the last node has run — the trunk's logits
-    // into the engine's sampler, a draft column into the same sampler through
+    // into the runtime's sampler, a draft column into the same sampler through
     // its intrinsic, a capture column into the lane's readout — by a reader no
     // node occupies, so a value sharing their bytes would clobber them between
     // the launch and the read.
@@ -1526,7 +1526,7 @@ mod tests {
     fn the_out_seam_is_live_past_the_last_node() {
         // `y` is written by the last node and read by nobody in the plan. If
         // its span ended there, the scratch before it could take its bytes and
-        // the driver would read whatever the last launch left.
+        // the engine would read whatever the last launch left.
         let mut b = Build::new();
         let x = b.input(8);
         let a = b.op(x, 8, Guard::Always);

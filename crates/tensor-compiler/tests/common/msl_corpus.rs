@@ -9,7 +9,7 @@
 //! planned by `tensor_compiler::plan::compile_bound`.
 //!
 //! These cases were originally pinned against a C++ oracle that ran the
-//! drivers' own emitters over the same plans (`compiler/tests/oracle/`, since
+//! engines' own emitters over the same plans (`compiler/tests/oracle/`, since
 //! deleted with those emitters). What survives is `golden-{msl,cuda}/`: 2,838
 //! cases that now serve as the Rust emitters' regression net. Bless with
 //! `PTIR_REGEN=1` only when the emitted change is the point of the commit —

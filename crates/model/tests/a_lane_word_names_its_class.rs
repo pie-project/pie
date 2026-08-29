@@ -1,7 +1,7 @@
 //! The catalog's fourth column, held against the plan the third one traces.
 //!
 //! A lane's word is the model's own `Classify::of(&Request)`, packed; a class
-//! is what the driver composes a fire out of, and a class is a set of words.
+//! is what the engine composes a fire out of, and a class is a set of words.
 //! The two are written in different places — `Facts::word` in a family's
 //! `forward.rs`, `resolve_classes` in the IR — and NOTHING MAKES THEM AGREE
 //! except that they both read the same bit positions. This is the test that
@@ -9,7 +9,7 @@
 //!
 //! Uncaught, a disagreement here is not a compile error and not a refusal: it
 //! is a decode lane composed as a prefill one (`palo B-word`, which is exactly
-//! what the engine shipped while the column did not exist), which runs, and
+//! what the runtime shipped while the column did not exist), which runs, and
 //! returns a plausible token computed by the wrong kernel over the wrong rows.
 
 use model_dsl::{Attention, Operation, Platform, resolve_classes};
@@ -104,8 +104,8 @@ fn a_one_token_lane_lands_in_the_decode_class() {
 /// Every word every SKU's classifier can produce names a class of that SKU's
 /// own plan.
 ///
-/// A word with no class is the refusal `driver_api::fire::Lane` describes —
-/// "the engine and the shell disagree about what is loaded" — and it is a fact
+/// A word with no class is the refusal `engine_api::fire::Lane` describes —
+/// "the runtime and the shell disagree about what is loaded" — and it is a fact
 /// about a build, not about a deployment, so it is settled here rather than at
 /// the first fire.
 #[test]

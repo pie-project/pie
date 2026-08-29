@@ -157,7 +157,7 @@ impl Staging {
 // ─── the host-table validators ──────────────────────────────────────────────
 
 /// Walks a host indptr once and hands back the per-request span widths it
-/// spells. Indptrs are driver-bound host twins, so a short or non-monotone
+/// spells. Indptrs are engine-bound host twins, so a short or non-monotone
 /// table is refused, not asserted.
 pub fn spans(
     op: &'static str,

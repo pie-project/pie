@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mlx-lm, through the same client every other engine here is measured by.
 
-The reference Apple Silicon serves against. `driver/metal` already diffs
+The reference Apple Silicon serves against. `engine/metal` already diffs
 against mlx-lm twice -- `tests/parity/*_mlx_taps.py` compares activations and
 `llama_bench`'s gates compare tokens -- but both ask whether the ANSWER agrees.
 Neither says how long it took, and the throughput comparisons that decided
@@ -114,7 +114,7 @@ async def maybe_server(args: argparse.Namespace, batch: int):
                 "recorded answer in this tree came from:\n"
                 "  python3.14 -m venv ~/.cache/pie-metal/mlxenv\n"
                 "  ~/.cache/pie-metal/mlxenv/bin/pip install -r "
-                "crates/driver-metal/csrc/tests/parity/requirements.txt\n"
+                "crates/engine-metal/csrc/tests/parity/requirements.txt\n"
                 "or point --python at another one."
             )
         url = f"http://127.0.0.1:{args.port}"

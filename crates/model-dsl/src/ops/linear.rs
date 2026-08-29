@@ -309,7 +309,7 @@ pub fn moe_sigmoid_gate_add(routed: &Value, shared: &Value, gate: &Value) -> Val
 /// "over the adapter window", and §0 defines a window as the rows of the lanes
 /// whose word satisfies the node's guard. So the call site splits on the
 /// model's own `has_adapter` fact and this op runs over that arm: a fire no
-/// lane carried an adapter into has zero rows for it, `driver::fire::walk`
+/// lane carried an adapter into has zero rows for it, `engine::fire::walk`
 /// skips a zero-row region outright, and the cost of the axis in that fire is
 /// exactly nothing — no launch, no empty grid, no instruction. What §8's table
 /// means by "conditional nodes: none" is the CUDA-graph kind (IF/SWITCH), and

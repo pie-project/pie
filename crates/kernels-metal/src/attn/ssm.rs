@@ -159,7 +159,7 @@ pub fn causal_conv1d(
     conv_width: u32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "ssm.causal_conv1d";
+    const OP: &str = "attention.ssm_causal_conv1d";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_bfloat16" });
     let channels = nonzero(OP, "the conv's channel count", x.width)?;
     let rows = nonzero(OP, "rows", x.rows)?;
@@ -193,7 +193,7 @@ pub fn causal_conv1d_chunked(
     conv_width: u32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "ssm.causal_conv1d_chunked";
+    const OP: &str = "attention.ssm_causal_conv1d_chunked";
     let entry = dtype_dispatch!(OP, x.data.dtype, { Bf16 => "causal_conv1d_chunked_bfloat16" });
     let channels = nonzero(OP, "the conv's channel count", x.data.width)?;
     nonzero(OP, "rows", x.data.rows)?;
@@ -227,7 +227,7 @@ pub fn gdn_prep(
     a_log: Tensor,
     gates: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "ssm.gdn_prep";
+    const OP: &str = "attention.ssm_gdn_prep";
     let entry = dtype_dispatch!(OP, ba.dtype, { Bf16 => "qwen_gdn_ba_gates_bfloat16" });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` lands an f32 decay row");
@@ -260,7 +260,7 @@ pub fn gdn_prep(
 }
 
 /// `z` rides the statement for planes that fold the gate inside the scan;
-/// this shader gates afterwards (`norm.rmsnorm_gated`), so it goes unread —
+/// this shader gates afterwards (`elementwise.rmsnorm_gated`), so it goes unread —
 /// as before.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta(
@@ -275,7 +275,7 @@ pub fn gated_delta(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "ssm.gated_delta";
+    const OP: &str = "attention.ssm_gated_delta";
     let _ = z;
     let entry = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_bfloat16" });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
@@ -312,7 +312,7 @@ pub fn gated_delta_chunked(
     v_dim: u32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "ssm.gated_delta_chunked";
+    const OP: &str = "attention.ssm_gated_delta_chunked";
     let _ = z;
     let entry = dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => "gated_delta_chunked_bfloat16" });
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
@@ -350,7 +350,7 @@ pub fn kda_step(
     norm_eps: f32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "ssm.kda_step";
+    const OP: &str = "attention.ssm_kda_step";
     let entry = dtype_dispatch!(OP, mixed.dtype, { Bf16 => "kda_step_bfloat16" });
     debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
@@ -390,7 +390,7 @@ pub fn kda_chunked(
     norm_eps: f32,
     y: Tensor,
 ) -> Result<(), KernelError> {
-    const OP: &str = "ssm.kda_chunked";
+    const OP: &str = "attention.ssm_kda_chunked";
     let entry = dtype_dispatch!(OP, mixed.data.dtype, { Bf16 => "kda_chunked_bfloat16" });
     debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");

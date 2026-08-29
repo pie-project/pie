@@ -13,18 +13,18 @@ profile-fire = ["worker/profile-fire"]
 # Which backends the embedded engine can host.
 #
 # `default` keeps what this wheel has always built. The three shader flavors
-# (`driver-metal`, `driver-vulkan`, `driver-wgpu`) STOOD HERE and went with
-# R3, which took those drivers out of the workspace until their baker
+# (`engine-metal`, `engine-vulkan`, `engine-wgpu`) STOOD HERE and went with
+# R3, which took those engines out of the workspace until their baker
 # executors land (P5). What is left is what `pie serve` itself can host: CUDA.
 # The CUDA default is a GUESS, and it is spelled out here so that it is a
-# greppable one. It used to read `driver-cuda`, which resolved to the 13 ABI
+# greppable one. It used to read `engine-cuda`, which resolved to the 13 ABI
 # three manifests away; a wheel built for a CUDA 12 box got no error, only a
 # segfault inside `cudaGraphAddNode`. Naming the ABI does not remove the
 # guess -- a wheel has to default to something -- but it puts it where a
 # packager can see and override it with `--no-default-features`.
-default = ["driver-cuda-13"]
-driver-cuda-12 = ["worker/driver-cuda-12"]
-driver-cuda-13 = ["worker/driver-cuda-13"]
+default = ["engine-cuda-13"]
+engine-cuda-12 = ["worker/engine-cuda-12"]
+engine-cuda-13 = ["worker/engine-cuda-13"]
 
 [lib]
 name = "pie_engine"
@@ -36,12 +36,12 @@ path = "src/lib.rs"
 # reqwest's `rustls-no-provider`, so *something* in the process has to name a
 # provider. The CLI has `bootstrap` for that; the wheel has this.
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
-# `worker` is the engine library — we link the same `serve::start_engine`
+# `worker` is the runtime library — we link the same `serve::start_runtime`
 # the CLI uses, so the CLI and the pyo3 wheel can never drift in their boot
 # behavior.
 #
-# WHICH drivers is a build choice now, made by the `[features]` table above
-# rather than pinned here. It used to say `features = ["driver-cuda"]` under a
+# WHICH engines is a build choice now, made by the `[features]` table above
+# rather than pinned here. It used to say `features = ["engine-cuda"]` under a
 # comment claiming the wheel hosted "the same local flavors as `pie serve`",
 # and a claim nobody could act on is what that was: the feature list was not
 # forwarded, so no build command could select anything else.

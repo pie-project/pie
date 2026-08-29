@@ -93,7 +93,7 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
 ///
 /// Also the gate `region_analysis` asks before declaring a region bindable, so
 /// everything emission refuses has to be refused here too — a region that
-/// passes analysis and then fails emission reaches the driver as an error
+/// passes analysis and then fails emission reaches the engine as an error
 /// kernel instead of a tier-0 fallback.
 ///
 /// A `RegionKind::Library` region is NOT refused for being one. `Library` says
@@ -101,7 +101,7 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
 /// every backend has it: Metal's `grouped_library` returns `None` for the ones
 /// it has not written and falls through to its generated emitter, and this
 /// backend has written none at all. Refusing them here emitted nothing for the
-/// region, the driver read `Slot::Refused` as "the host declined on purpose"
+/// region, the engine read `Slot::Refused` as "the host declined on purpose"
 /// and skipped it, and the sampler's whole chain silently never ran — every
 /// nonzero temperature published token 0. What actually decides emittability is
 /// the per-node check below, which is unchanged: a multi-op lift like

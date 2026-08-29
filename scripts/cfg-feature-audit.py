@@ -11,13 +11,13 @@ exactly like code that is merely off in this configuration.
 The root `pie` package forwards a driver flavor to the embedded worker:
 
     driver-cuda  = ["worker/driver-cuda"]
-    driver-metal = ["worker/driver-metal"]
+    engine-metal = ["worker/engine-metal"]
     driver-dummy = ["worker/driver-dummy"]
 
 The middle line was deleted in August 2026 when the C++ Metal driver was
 retired -- correctly, because at that moment there was no Metal driver to
-forward to. The Rust `driver-metal` then came back into `worker` and
-`engine`, and the root's forward was never restored. What survived was
+forward to. The Rust `engine-metal` then came back into `worker` and
+`runtime`, and the root's forward was never restored. What survived was
 the COMMENT that documented it, which slid down onto `driver-dummy` and
 went on describing a feature that no longer existed:
 
@@ -26,7 +26,7 @@ went on describing a feature that no longer existed:
 
 That comment was exactly right, and it sat directly above the wrong
 line. Meanwhile `src/ops/config/template.rs` held five
-`#[cfg(feature = "driver-metal")]` blocks, so `pie init` on a Mac wrote
+`#[cfg(feature = "engine-metal")]` blocks, so `pie init` on a Mac wrote
 the fallback template naming `Qwen/Qwen3-0.6B` -- a raw bf16 repo, which
 the dead block's own comment says "imports fine and then fails to bind at
 load", because Metal's llama path is 4-bit-only. The generated default
@@ -39,9 +39,9 @@ lints, which is the same as not firing.
 ## Why a script and not a lint
 
 The gates cannot reach the crates where this bug hides best. `pie`,
-`engine` and `worker` are ungated on warning count; `driver-cuda` and
-`kernels-cuda` need `nvcc`; `kernels-vulkan` and `driver-vulkan` need
-`slangc`; `driver-metal` and `kernels-metal` need a Mac. That is nine of
+`runtime` and `worker` are ungated on warning count; `engine-cuda` and
+`kernels-cuda` need `nvcc`; `kernels-vulkan` and `engine-vulkan` need
+`slangc`; `engine-metal` and `kernels-metal` need a Mac. That is nine of
 thirty-five members where `unexpected_cfgs` will not be denied on this
 job, and they are disproportionately the ones with interesting `cfg`s --
 a crate has feature-gated code precisely when it has optional backends.
@@ -76,18 +76,18 @@ A package's `cfg(feature = "x")` is legitimate when `x` is:
     is valid wherever `transport = { ..., optional = true }` is written.
 
 Features are per-package, so a name declared by a sibling does not count.
-That is the whole point: `worker` declaring `driver-metal` is precisely
+That is the whole point: `worker` declaring `engine-metal` is precisely
 what made the root's missing forward invisible to a reader who grepped
 the workspace for the string and found it.
 
 ## What it deliberately does not see
 
 Only real `cfg(...)` and `cfg_attr(...)` forms are scanned, and line
-comments are stripped first. `crates/worker/src/embedded_driver.rs`
-writes `#[cfg(feature = "driver-…")]` inside a comment, with a literal
+comments are stripped first. `crates/worker/src/embedded_engine.rs`
+writes `#[cfg(feature = "engine-…")]` inside a comment, with a literal
 ellipsis, as prose standing for two real arms below it. A scanner that
 matched `feature = "..."` anywhere in the file would report that as an
-undeclared feature named `driver-…`, and the fix a reader would reach
+undeclared feature named `engine-…`, and the fix a reader would reach
 for -- editing the prose -- would be a scanner appeasing itself.
 """
 

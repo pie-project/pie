@@ -55,7 +55,7 @@ score are outside the current surface area: `IntrinsicId` exposes logits,
 embeddings and geometry, but no attention weights.
 
 This is also one of the places where the KV page CSR contract matters most. The
-page CSR is the wire's source of truth for the attended span; the driver computes
+page CSR is the wire's source of truth for the attended span; the engine computes
 `kv_len = (page_count - 1) * page_size + last_page_len`. The correct idiom is
 `page_count = ceil(kv_len / page_size)`. Declaring `[0, pool_pages]` would make
 the lane attend through uninitialised cache cells, and the failure mode is
@@ -65,5 +65,5 @@ plausible text rather than an error.
 
 ```bash
 cargo build --release --target wasm32-wasip2
-python tests/inferlets/run_all.py --driver cuda_native --model <model-path>
+python tests/inferlets/run_all.py --engine cuda_native --model <model-path>
 ```

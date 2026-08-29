@@ -102,7 +102,7 @@ fn a_bad_channel_seed_survives_until_the_next_build() {
 fn a_host_take_used_as_a_tensor_is_reported() {
     let host = Channel::new([4], dtype::u32);
     let output = Channel::new([4], dtype::u32);
-    // Taking outside the trace, where the bytes cross the driver boundary and
+    // Taking outside the trace, where the bytes cross the engine boundary and
     // there is no in-program value to take. Carrying the stand-in into a stage
     // does not make it one.
     let taken = host.take();

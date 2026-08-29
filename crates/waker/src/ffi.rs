@@ -4,7 +4,7 @@
 // "Never unwinds" is enforced by catching, and catching needs something to
 // catch. Under `panic = "abort"` a panic in the table takes the caller's
 // process down instead of returning `0`, which is not what this module's
-// contract says and not what its callers -- a driver's completion thread,
+// contract says and not what its callers -- an engine's completion thread,
 // often not Rust -- can cope with.
 #[cfg(panic = "abort")]
 compile_error!(

@@ -183,7 +183,7 @@ fn spurious_wakes_are_harmless() {
 #[test]
 fn sweep_on_abort_resolves_blocked_take_to_err_b12() {
     // A take().await? parked on a channel that will NEVER become full:
-    // poison + sweep (from a foreign thread, as the driver would) must
+    // poison + sweep (from a foreign thread, as the engine would) must
     // resolve it to Err — never hang.
     let t = Arc::new(WakerTable::new());
     let ch = ChannelWakers::alloc(&t);

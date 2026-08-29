@@ -21,7 +21,7 @@ WHERE THE TWO SIDES COME FROM.
 
   STATED: `model::catalog()`'s row for the SKU, traced at the plane, via
   `cargo run -p model --bin trace`. Every `ops[].kernel` in the resulting
-  plan. This is the real plan the driver would walk, not a reading of the
+  plan. This is the real plan the engine would walk, not a reading of the
   model text.
 
   CLAIMED: the `CLAIMED` and `TIER2` tables in each plane's generated
@@ -61,7 +61,7 @@ wrong for all three and the reason differs each time:
   * `dist.all_reduce` — the kernel EXISTS.
     `kernels_cuda::comm::all_reduce_bf16` is a whole custom all-reduce with a
     two-shot split and a residual-rmsnorm fusion, and
-    `driver-cuda/src/fire/all_reduce.rs` drives it. The claim has one question
+    `engine-cuda/src/fire/all_reduce.rs` drives it. The claim has one question
     to answer: the point is in-place (`InOut<Tensor<T>>`) and the comm entry
     point takes a separate input and output, so does the custom kernel tolerate
     aliasing them. Verifying the answer needs two ranks, and this box has one
@@ -86,8 +86,8 @@ None of the three is closable by measuring something on this box. THE
 CHECKPOINT IS NOT THE BLOCKER for two of them, which an earlier reading of this
 had wrong: dsv4 and kimik3 being uncached matters for an end-to-end argmax and
 not for these, since a point that is pure arithmetic can be checked against a
-host reference — `driver-cuda/tests/moe_unrouted.rs` and
-`driver-metal/tests/device_routing.rs` both do exactly that. What stops all
+host reference — `engine-cuda/tests/moe_unrouted.rs` and
+`engine-metal/tests/device_routing.rs` both do exactly that. What stops all
 three is that the shape of the claim is not settled, and settling it by guessing
 would be asserting rather than measuring.
 

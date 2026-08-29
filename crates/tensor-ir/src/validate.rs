@@ -197,7 +197,7 @@ pub enum ValidateError {
     },
     /// Model-gated intrinsic the profile lacks. "Model-gated" names where the
     /// gate is READ, not where it is decided: the profile's bit is a copy of
-    /// the serving driver's `PtirCaps`, so the checkpoint has no say in it.
+    /// the serving engine's `PtirCaps`, so the checkpoint has no say in it.
     IntrinsicUnavailable {
         /// The offending intrinsic.
         intr: IntrinsicId,
@@ -294,12 +294,12 @@ impl fmt::Display for ValidateError {
                     "`{name}` (name #{name_index}): the backend's model profile does \
                      not advertise this kernel/sink, so binding it would either \
                      fail mid-fire or — far worse — run as a silent no-op. This is \
-                     the DRIVER's answer, not the checkpoint's: `ModelProfile` is \
-                     built by copying the driver's `PtirCaps` field for field, so \
-                     the bit to look at is the one that driver's `load_model` \
+                     the ENGINE's answer, not the checkpoint's: `ModelProfile` is \
+                     built by copying the engine's `PtirCaps` field for field, so \
+                     the bit to look at is the one that engine's `load_model` \
                      reports (`has_kv_envelopes` for `envelope_dot`, \
                      `has_attn_page_mask`, `has_attn_score`). No environment \
-                     variable moves it — every shader and CUDA driver in this \
+                     variable moves it — every shader and CUDA engine in this \
                      tree states all three as literal `false`"
                 )
             }
@@ -319,8 +319,8 @@ impl fmt::Display for ValidateError {
             IntrinsicUnavailable { intr } => {
                 write!(
                     f,
-                    "intrinsic {} is not advertised by the driver serving this \
-                     model (`ModelProfile` copies the driver's `PtirCaps`, so \
+                    "intrinsic {} is not advertised by the engine serving this \
+                     model (`ModelProfile` copies the engine's `PtirCaps`, so \
                      this says nothing about the checkpoint)",
                     intr.name()
                 )
@@ -614,7 +614,7 @@ fn check_second_party_names(
                     // A first-party sink name always type-checks, so the
                     // backend's ability to HONOUR it has to be checked here or
                     // not at all: a program emitting `attn_page_mask` against a
-                    // driver that cannot compact its page table would bind
+                    // engine that cannot compact its page table would bind
                     // cleanly and then either fail mid-fire or -- far worse --
                     // run as a silent no-op whose eviction policy never
                     // evicts anything.

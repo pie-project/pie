@@ -4,10 +4,10 @@
 # @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
 # @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
 # cases: 192
-# re-blessed: the C++ oracle (crates/driver-metal/csrc/src/pipeline/m1_codegen.cpp) is
+# re-blessed: the C++ oracle (crates/engine-metal/csrc/src/pipeline/m1_codegen.cpp) is
 #   deleted, so these bytes can no longer be re-derived from it. Three cases
 #   below were re-blessed from Rust in the change that made the emitted corpus
-#   compile: `crates/driver-metal/csrc/tests/msl_compile_test.cpp` put every kernel here
+#   compile: `crates/engine-metal/csrc/tests/msl_compile_test.cpp` put every kernel here
 #   through Apple's shader compiler for the first time and found two rejections
 #   the byte comparison could never see, because the oracle had them too.
 #     * readiness/commit `wide_30` emitted `[[buffer(31)]]`, one past Metal's

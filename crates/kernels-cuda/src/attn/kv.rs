@@ -76,7 +76,7 @@ pub fn max_touched_pages(total_tokens: i32, num_requests: i32, page_size: i32) -
 }
 
 /// The `(kv_heads, head_dim)` split the pool row's strides spell for an
-/// appended row. Strides are driver facts the validator never sees, so
+/// appended row. Strides are engine facts the validator never sees, so
 /// disagreement is refused, not asserted.
 pub(crate) fn head_split(
     op: &'static str,

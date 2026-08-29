@@ -80,7 +80,7 @@ keep the empty seed and score `+inf` forever. So they are an explicit opt-in:
 PIE_CUDA_KV_ENVELOPES=1
 ```
 
-Without it the driver does not advertise `has_kv_envelopes`, and this inferlet
+Without it the engine does not advertise `has_kv_envelopes`, and this inferlet
 fails at **bind** — `backend does not provide this kernel/sink` — rather than at
 its first fire. Envelope maintenance itself rides the existing KV append and is
 free within measurement noise; the cost of the tap is the per-layer scoring.

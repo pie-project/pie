@@ -18,7 +18,7 @@ import os
 # `quest-attention` needs the per-page key envelopes, which are an operator
 # opt-in because they cost `2/page_size` of the KV pool and have to be
 # allocated with the pages (crates/driver-cuda/csrc/src/store/kv_cache.cpp). Set it before
-# the engine boots — the driver reads it while sizing the cache. Enabling it
+# the engine boots — the engine reads it while sizing the cache. Enabling it
 # for the whole run is deliberate: it also proves the envelope maintenance that
 # now rides every KV append does not perturb the other inferlets.
 os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
@@ -517,7 +517,7 @@ async def test_quest_attention(client, args):
     scores = [float(s) for s in report["page_scores"][:scored]]
     assert scores[0] == max(scores), report
 
-    # Everything above is about the RANKING, and a ranking the driver computes
+    # Everything above is about the RANKING, and a ranking the engine computes
     # and then discards looks exactly like one it honours. This is the part
     # that separates them: with a budget of one page the continuation has to
     # change, and with a budget of everything it has to be the unmasked answer
@@ -562,7 +562,7 @@ async def test_tova_attention(client, args):
     assert report["tail_nonzero"] == 0, report
     assert report["scores_nan"] == 0, report
     # The row must describe the positions the program THINKS it describes. The
-    # host-side page CSR the driver hands a model body is allowed to be a
+    # host-side page CSR the engine hands a model body is allowed to be a
     # conservative upper bound (graph-lattice padding, the decode-envelope KV
     # bound), while the device CSR the attention kernel reads is exact. If the
     # capture ever sizes itself off the bound without zeroing the slack, the
@@ -728,7 +728,7 @@ async def test_greedy_decoding_is_the_same_alone_and_in_a_crowd(client, args):
 
     Everything else in this file runs one program at a time against a server
     that batches, pages, and grows a KV pool for many at once -- so the whole
-    sweep can be green while the interesting half of the driver has never been
+    sweep can be green while the interesting half of the engine has never been
     asked a question. This asks it: the same prompt at temperature 0, run alone
     and then run 2, 4 and 8 ways at once, must give back the same tokens every
     time. Anything a request can see of another -- a page, a row of scores, a

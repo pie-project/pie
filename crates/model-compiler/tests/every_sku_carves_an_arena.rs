@@ -306,7 +306,7 @@ fn the_carve_lands_on_the_busiest_instant_and_not_the_sum() {
 /// once; each PHASE's regions ascend, which is the dataflow inside the graph
 /// and a topological order among the plan builds; and every prepare region
 /// stands before every capture one, which is the property
-/// `driver::fire::walk` refuses a template for lacking.
+/// `engine::fire::walk` refuses a template for lacking.
 #[test]
 fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
     let mut wrong: Vec<String> = Vec::new();

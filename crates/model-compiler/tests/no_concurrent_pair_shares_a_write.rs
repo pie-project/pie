@@ -27,7 +27,7 @@
 //! 3. **Everything else is read-only during the capture phase** — weights,
 //!    the arena base, the pools, the fire inputs and every attention schedule.
 //!    That one is structural rather than checkable from here: it is a
-//!    statement about when a shell writes those, and `driver-cuda`'s
+//!    statement about when a shell writes those, and `engine-cuda`'s
 //!    `inputs.rs`, `weights.rs` and the prepare/capture phase split are what
 //!    make it true. `model_compiler::stream`'s module doc argues it.
 //!

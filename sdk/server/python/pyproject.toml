@@ -36,7 +36,7 @@ cache-keys = [
     { file = "pyproject.toml" },
     { file = "Cargo.toml" },
     { file = "src/**/*.rs" },
-    # The embedded engine compiles the whole runtime + driver + WIT surface;
+    # The embedded engine compiles the whole runtime + engine + WIT surface;
     # without these keys a source edit there serves a stale cached wheel. Every
     # crate lives under `crates/` now, so this is one glob instead of eleven.
     { file = "../../../crates/**/Cargo.toml" },

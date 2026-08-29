@@ -5,7 +5,7 @@
 //!
 //! | Variant | Whose fault | What the caller should do |
 //! | --- | --- | --- |
-//! | [`Error::Contract`] | the driver's declaration | fix the contract |
+//! | [`Error::Contract`] | the engine's declaration | fix the contract |
 //! | [`Error::Shard`] | the declaration, at this TP degree | fix the contract or the degree |
 //! | [`Error::Checkpoint`] | the file on disk | get a different checkpoint |
 //! | [`Error::Unsupported`] | the target's executor | use another backend, or teach it |
@@ -28,7 +28,7 @@ pub enum Error {
     Shard(String),
 
     /// The checkpoint's own metadata is missing, malformed or inconsistent
-    /// with itself. Nothing the driver declared caused this.
+    /// with itself. Nothing the engine declared caused this.
     #[error("checkpoint: {0}")]
     Checkpoint(String),
 
@@ -48,8 +48,8 @@ pub enum Error {
 
 // `Error::code(&self) -> u32` STOOD HERE: a stable number per variant, "the
 // code this error crosses the C ABI as", for a caller that could not read the
-// message. There is no C ABI -- the drivers link this crate as an rlib and
-// match on the variants, which is what `driver-cuda/src/error.rs` does -- so
+// message. There is no C ABI -- the engines link this crate as an rlib and
+// match on the variants, which is what `engine-cuda/src/error.rs` does -- so
 // the number told nobody anything the type did not. Its only readers were the
 // two assertions in this file's own test, which now name the variants they
 // were always about.

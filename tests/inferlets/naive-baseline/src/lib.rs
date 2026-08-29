@@ -2,7 +2,7 @@
 //!
 //! Structurally identical to every truncation/penalty inferlet in this
 //! directory: one N-wide prefill fire, then a device-carried decode loop
-//! driven by `ptir::run_ahead`, which keeps the engine's run-ahead window
+//! driven by `ptir::run_ahead`, which keeps the runtime's run-ahead window
 //! (`model.channel-capacity()`) full ahead of the host drain. The only
 //! difference is the epilogue, which does nothing but temperature-scale the
 //! logits and draw a Gumbel-max sample. Whatever an algorithm inferlet costs
@@ -101,7 +101,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── PREFILL (chunked, C-wide): first sampled token comes off the prompt. ──
     //
-    // Split into `ceil(n / C)` chunks, `C = max_embed_length()` -- the driver's
+    // Split into `ceil(n / C)` chunks, `C = max_embed_length()` -- the engine's
     // structural per-launch token capacity. A one-shot fire cannot exceed it,
     // which capped this reference at 8192 prompt tokens and so capped every
     // policy measured against it. When the prompt fits in one chunk the loop

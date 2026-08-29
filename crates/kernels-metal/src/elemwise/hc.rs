@@ -9,7 +9,9 @@ use crate::encode::Ctx;
 use crate::tensor::Tensor;
 
 pub fn expand(_ctx: &Ctx<'_>, _x: Tensor, _streams: u32, _y: Tensor) -> Result<(), KernelError> {
-    Err(KernelError::Unsupported { op: "hc.expand" })
+    Err(KernelError::Unsupported {
+        op: "elementwise.hc_expand",
+    })
 }
 
 pub fn rmsnorm_f32(
@@ -19,7 +21,7 @@ pub fn rmsnorm_f32(
     _y: Tensor,
 ) -> Result<(), KernelError> {
     Err(KernelError::Unsupported {
-        op: "hc.rmsnorm_f32",
+        op: "elementwise.hc_rmsnorm_f32",
     })
 }
 
@@ -38,7 +40,9 @@ pub fn gates(
     _post_mix: Tensor,
     _comb_mix: Tensor,
 ) -> Result<(), KernelError> {
-    Err(KernelError::Unsupported { op: "hc.gates" })
+    Err(KernelError::Unsupported {
+        op: "elementwise.hc_gates",
+    })
 }
 
 pub fn fold(
@@ -49,7 +53,9 @@ pub fn fold(
     _comb_mix: Tensor,
     _y: Tensor,
 ) -> Result<(), KernelError> {
-    Err(KernelError::Unsupported { op: "hc.fold" })
+    Err(KernelError::Unsupported {
+        op: "elementwise.hc_fold",
+    })
 }
 
 // `collapse` went with `Hc::Collapse`: no plane could fire it honestly (review R5).

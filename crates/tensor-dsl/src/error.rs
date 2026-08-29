@@ -55,7 +55,7 @@ impl fmt::Display for Span {
 /// The endpoint that touched a channel (SPSC has one producer + one consumer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Endpoint {
-    /// The host driver side (async `put`/`take` across the driver boundary).
+    /// The host engine side (async `put`/`take` across the engine boundary).
     Host,
     /// A traced device stage, named by its [`Stage`].
     Stage(Stage),

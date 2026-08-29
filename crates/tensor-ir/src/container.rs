@@ -884,7 +884,7 @@ mod tests {
         // the *wire* path, and nothing else does. Without the sweep a new op
         // could land in `declare_ops!` with an `encode_op` arm and no
         // `decode_op` arm, and the first thing to read the missing half back
-        // would be a driver.
+        // would be an engine.
         let missing: Vec<&str> = crate::op::OP_TABLE
             .iter()
             .filter(|spec| !ops.iter().any(|op| op.tag() == spec.tag))

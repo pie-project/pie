@@ -62,7 +62,7 @@ per-pick row rescan to a radix select; cost is now effectively flat in `k_max`
 
 ```bash
 cargo build --release --target wasm32-wasip2
-python tests/inferlets/run_all.py --driver cuda_native --model <model-path>
+python tests/inferlets/run_all.py --engine cuda_native --model <model-path>
 ```
 
 The deep explanation — including why the deviation is computed with

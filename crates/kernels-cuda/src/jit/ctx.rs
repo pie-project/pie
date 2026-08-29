@@ -1,4 +1,4 @@
-//! The context every entry takes: the stream a driver `Run` wraps, with the
+//! The context every entry takes: the stream an engine `Run` wraps, with the
 //! cuBLAS handle and device probes beside it. `fire` resolves a [`Fire`]'s
 //! unit through the module cache and enqueues the launch — enqueue only,
 //! never sync.
@@ -182,7 +182,7 @@ impl Slabs {
 /// A `Pad` is not a permission to round; it is the pair of numbers that makes
 /// rounding CHECKABLE, and [`Ctx::opaque_rows`] is the only reader. `rows` is
 /// the fire's TOTAL row count — the extent an Always region's launch is handed
-/// — and `bucket` is what `driver::fire::compose` rounded it up to. A driver
+/// — and `bucket` is what `engine::fire::compose` rounded it up to. An engine
 /// that arms neither leaves the default, which is `rows == bucket == 0`: no
 /// extent equals it, so nothing is ever padded and the plane is byte-for-byte
 /// the one that existed before this field did. That default is also what a
@@ -197,14 +197,14 @@ pub struct Pad {
 
 /// The stream and its companions. Long-lived state (jit cache, scratch
 /// slabs, device probes) is process-global behind it; the `Ctx` itself is
-/// what a driver `Run` builds per fire and lends to every entry.
+/// what an engine `Run` builds per fire and lends to every entry.
 pub struct Ctx {
     stream: *mut c_void,
     cublas: *mut c_void,
     comm: *mut c_void,
     slabs: Slabs,
 
-    /// D4's number, written per REGION by the driver's walk ([`Ctx::arm`]).
+    /// D4's number, written per REGION by the engine's walk ([`Ctx::arm`]).
     ///
     /// **A `Cell` BECAUSE THE CONTEXT OUTLIVES THE FIRE AND THE NUMBER DOES
     /// NOT.** One `Ctx` is minted per stream at LOAD (`device::Context::bind`,
@@ -294,7 +294,7 @@ impl Ctx {
     /// carries the measurements both halves come from.
     ///
     /// **The contract, both ways.** Growth is `cudaFree` + `cudaMalloc`,
-    /// which would poison a capture in progress. The driver's side: warm
+    /// which would poison a capture in progress. The engine's side: warm
     /// every scratch-consuming entry with an eager fire at full fire shape
     /// before capturing, so a captured fire only ever re-reads a slab that
     /// is already big enough — and the warm pass may fire on ONE stream,
@@ -332,7 +332,7 @@ impl Ctx {
     ///
     /// **PER REGION, NOT PER FIRE**, and that is the whole of why this is a
     /// setter on a long-lived context rather than an argument to a
-    /// constructor. The driver calls it from `Run::ctx` — the lookup every
+    /// constructor. The engine calls it from `Run::ctx` — the lookup every
     /// dispatch arm goes through to find its stream — with the walk's cursor
     /// already on the node about to launch, so what it stamps is the pad THIS
     /// REGION is allowed. A region whose window is not the whole fire is
@@ -375,7 +375,7 @@ impl Ctx {
     /// reads and writes belong to NOBODY:
     ///
     /// * **In bounds.** The arena reserves every `Dim::Tokens` column at
-    ///   `max_tokens` rows and hands out static offsets (`driver_cuda::arena`),
+    ///   `max_tokens` rows and hands out static offsets (`engine_cuda::arena`),
     ///   and P0 refuses a lattice with a bucket past that ceiling
     ///   (`model_compiler`'s `accept`: "list a bucket past the token ceiling").
     ///   So a fire's tail rows are reserved bytes, not somebody's allocation.
@@ -391,8 +391,8 @@ impl Ctx {
     ///   the same column, and under a merge or a co-tenant those are real
     ///   bytes somebody reads. Padding one is a clobber that computes.
     ///
-    /// **The first gate is the driver's, and it is the one that decides.**
-    /// `driver_cuda::run::Run::ctx` compares the region's WINDOW against the
+    /// **The first gate is the engine's, and it is the one that decides.**
+    /// `engine_cuda::run::Run::ctx` compares the region's WINDOW against the
     /// composition — span at row zero, covering every row, not gathered, no
     /// segment list — and arms this context with `Pad::default()` when any
     /// clause fails. That is the question asked where the answer lives: an
@@ -411,7 +411,7 @@ impl Ctx {
     /// column is reserved at `max_lanes` rather than at `max_tokens`. No opaque
     /// callee on this plane is lane-shaped — the catalog's cuBLASLt entries all
     /// take `Dim::Tokens` rectangles — and one added later must not read this
-    /// function without the driver first learning to say which axis it is
+    /// function without the engine first learning to say which axis it is
     /// quantizing.
     #[must_use]
     pub fn opaque_rows(&self, rows: i32) -> i32 {
@@ -587,7 +587,7 @@ mod tests {
     /// WINDOWED launch padded past its window writes the next class's rows of
     /// the same column — a clobber that computes.
     ///
-    /// The gate that decides it is the driver's (`Run::ctx` never arms a
+    /// The gate that decides it is the engine's (`Run::ctx` never arms a
     /// windowed region at all); this is the belt under it, and what it holds
     /// is that an extent which is not the fire's own row count is never
     /// rounded even inside a region that may pad.

@@ -3,7 +3,7 @@ name = "kernels-metal"
 version = "0.1.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Pure Metal kernel definitions: shader entry names, argument marshalling, and dispatch geometry. Knows nothing about the IR; a driver Run resolves plan ids to handles and calls these entry functions."
+description = "Pure Metal kernel definitions: shader entry names, argument marshalling, and dispatch geometry. Knows nothing about the IR; an engine Run resolves plan ids to handles and calls these entry functions."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 

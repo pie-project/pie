@@ -3,11 +3,11 @@ name = "worker"
 version = "0.4.0"
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Standalone Pie server (no Python). Embeds a native driver in-process."
+description = "Standalone Pie server (no Python). Embeds a native engine in-process."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
-# Library half — the engine boot path (serve::start_engine, config types,
+# Library half — the runtime boot path (serve::start_runtime, config types,
 # the supervisors). The `pie` CLI binary below is one consumer; the
 # `pie-server` Python wheel under `sdk/server/python/` is another.
 [lib]
@@ -18,11 +18,11 @@ crate-type = ["rlib"]
 # Binary half — the `pie` CLI. Parses argv via clap and dispatches into
 # the lib.
 [features]
-# Default = no embedded backend feature. Enable `driver-cuda-12` /
-# `driver-cuda-13` (Linux/NVIDIA -- the number is the CUDA runtime ABI this
+# Default = no embedded backend feature. Enable `engine-cuda-12` /
+# `engine-cuda-13` (Linux/NVIDIA -- the number is the CUDA runtime ABI this
 # binary will LOAD) to reach a device; without it, this crate builds and
-# serves nothing locally. `driver-metal` returned at P5; the other two shader
-# flavors (`driver-vulkan`, `driver-wgpu`) left the workspace with R3 and return at
+# serves nothing locally. `engine-metal` returned at P5; the other two shader
+# flavors (`engine-vulkan`, `engine-wgpu`) left the workspace with R3 and return at
 # P5 — see the root manifest's `exclude`.
 #
 # There used to be a third: an always-linked `driver-dummy` selected at
@@ -30,35 +30,35 @@ crate-type = ["rlib"]
 # Both are gone with the crate.
 default = []
 # Each flavor turns on a DEPENDENCY, not a branch in this crate's build
-# script. Both drivers are Rust now, so what this crate needs from them is
+# script. Both engines are Rust now, so what this crate needs from them is
 # that they be in the graph.
 #
-# CUDA carries its runtime ABI in the name, and `_driver-cuda` is the private
+# CUDA carries its runtime ABI in the name, and `_engine-cuda` is the private
 # "the CUDA shell is linked" gate every `#[cfg]` here is written against. See
-# `engine`'s manifest for why there is no version-less `driver-cuda`.
-_driver-cuda = ["engine/_driver-cuda"]
-driver-cuda-12 = ["_driver-cuda", "engine/driver-cuda-12"]
-driver-cuda-13 = ["_driver-cuda", "engine/driver-cuda-13"]
+# `runtime`'s manifest for why there is no version-less `engine-cuda`.
+_engine-cuda = ["runtime/_engine-cuda"]
+engine-cuda-12 = ["_engine-cuda", "runtime/engine-cuda-12"]
+engine-cuda-13 = ["_engine-cuda", "runtime/engine-cuda-13"]
 # The Metal shell, BACK AT P5. Apple-only at the crate level, so unlike the
 # CUDA pair there is no ABI in the name and the flag alone is not a build that
-# links -- `engine`'s seam pairs it with `target_vendor = "apple"`. Named
+# links -- `runtime`'s seam pairs it with `target_vendor = "apple"`. Named
 # without an underscore because `worker` has no private gate to hide behind:
 # every `#[cfg]` here reads this flag directly.
-driver-metal = ["engine/driver-metal"]
+engine-metal = ["runtime/engine-metal"]
 nixl = ["dep:transport", "transport/nixl"]
 
 # Per-domain probe passthroughs. Each forwards to the runtime crate's
-# corresponding flag. See `crates/engine/src/scheduler/probe.rs` for the
+# corresponding flag. See `crates/runtime/src/scheduler/probe.rs` for the
 # catalog of domains.
-profile-fire = ["engine/profile-fire"]
+profile-fire = ["runtime/profile-fire"]
 
 [dependencies]
 # `pie` is the runtime crate. After Phase 8 deleted the legacy
 # `pie._runtime` maturin module, runtime has no `python` feature to
-# disable — pyo3 only lives in `driver/bridge_py/` (the Rust extension
+# disable — pyo3 only lives in `engine/bridge_py/` (the Rust extension
 # bundled into the `pie-driver-bridge` wheel via maturin), not in the
 # runtime crate itself.
-engine = { path = "../engine" }
+runtime = { path = "../runtime" }
 # Shared tarpc control-plane contract.
 controller-api = { path = "../controller-api" }
 # Gateway data-plane RPC contract (post-inversion M3): GatewayInbound +
@@ -66,10 +66,16 @@ controller-api = { path = "../controller-api" }
 # INTO the gateway and serves WorkerControl over the split connection.
 worker-api = { path = "../worker-api" }
 
-# The runtime <-> driver vocabulary. A direct dep because this crate names
+# The runtime <-> engine vocabulary. A direct dep because this crate names
 # those types, not (as it once did) so its build script could receive a C
 # header directory through a `links` handoff.
-driver-api = { path = "../driver-api" }
+engine-api = { path = "../engine-api" }
+# **THE RUN-AHEAD FORMULA, READ RATHER THAN TRANSCRIBED** (alto design §9,
+# article 8). This file's `[runtime]` knobs bound what the engine's staging
+# ring can be carved from, and the one place that arithmetic lives is
+# `engine::runahead`. The edge exists so that `UPLOAD_STAGING_DEPTH = 13` — a
+# literal copied out of a C++ header this tree deleted — does not have to.
+engine = { path = "../engine" }
 transport = { path = "../transport", optional = true }
 # Shared id atoms (WorkerId / NodeId / ReqId / SessionId) and the client wire
 # vocabulary (ClientMessage / ServerMessage) the gateway data plane carries.
@@ -108,25 +114,25 @@ tracing = "0.1"
 # `bin/pie`, so no `blocking` here — blob fetch is async.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 
-# Always-linked Rust dummy driver — random tokens, no model load.
+# Always-linked Rust dummy engine — random tokens, no model load.
 # `default-features = false` drops the loader's testkit (oracle, contract
 # fixture builder, CPU executor). Nothing under `ffi/` reaches them, and this is
 # what keeps that true.
 model-loader = { path = "../model-loader", default-features = false }
 # `model-compiler` STOOD HERE, with the note "no Rust in this process calls the
-# forward toolchain — the drivers reach it over its C ABI — so the dependency
+# forward toolchain — the engines reach it over its C ABI — so the dependency
 # exists to put the rlib in the link and to order the build-script include
 # handoff." Neither half survives inspection: `build.rs` is a no-op since the
-# drivers started building their own `csrc/`, and each driver names the
-# toolchain itself, so the rlib is in the link because a driver put it there.
+# engines started building their own `csrc/`, and each engine names the
+# toolchain itself, so the rlib is in the link because an engine put it there.
 # The toolchain split made the dead edge visible — `model-compiler` means the
 # LOWERING now, and this crate does not lower anything — so it went.
 # The loader's C ABI. Depended on for two build-time reasons: the entry-point
-# anchor in `embedded_driver.rs`, and `DEP_PIE_LOADER_INCLUDE` — this crate's
-# `links = "pie_loader"` metadata — which `build.rs` hands to the C++ drivers.
+# anchor in `embedded_engine.rs`, and `DEP_PIE_LOADER_INCLUDE` — this crate's
+# `links = "pie_loader"` metadata — which `build.rs` hands to the C++ engines.
 # The artifact's compiled metadata is lifted here and handed to the runtime
 # whole. `tokenizer` names the objects that make up a `pie.tokenizer/1`, and
-# `engine::model::ModelMetadata` is the shape the two halves travel in -- so
+# `runtime::model::ModelMetadata` is the shape the two halves travel in -- so
 # the worker lifts a snapshot's own `config.json` and reads it back out of an
 # artifact under the same name `convert` writes it under.
 #
@@ -134,7 +140,7 @@ model-loader = { path = "../model-loader", default-features = false }
 # for nothing else: `ModelMetadata`, `encoding::CONFIG_OBJECT` and
 # `encoding::Encoding` were the only three names this crate ever spelled out of
 # that crate. M18 deleted the module, and the three did not land back in
-# `model` -- the first is `engine`'s (the serving fabric states the shape of
+# `model` -- the first is `runtime`'s (the serving fabric states the shape of
 # its own boot bundle), the second is `weights.rs`'s own const, and the third
 # had no non-test caller left, because a checkpoint's quantization is read off
 # its stored tensor encodings now rather than off what its config claims.
@@ -143,7 +149,7 @@ model-loader = { path = "../model-loader", default-features = false }
 # THE LEGACY CRATE went the same way one wave earlier, and for the record: it
 # was here for the `contract` feature, whose whole use was those names, and for
 # `catalog::identify_artifact`, whose only reachable leg was "is the row this
-# artifact names one this build ships" -- `engine::model::row` answers exactly
+# artifact names one this build ships" -- `runtime::model::row` answers exactly
 # that, and `weights.rs` records the measurement that the other leg never once
 # succeeded.
 tokenizer = { path = "../tokenizer" }

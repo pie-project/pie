@@ -18,10 +18,10 @@
 //! anything, each hidden by the one in front of it: one `Prepared` per program
 //! rather than per stage, an arena-resident operand `lora_pins` could not
 //! read, head counts passed where projection row strides were wanted, an
-//! xA-transpose gate aliased onto the driver-pinned attention output, and a
+//! xA-transpose gate aliased onto the engine-pinned attention output, and a
 //! GEMM autotuner that tuned inside an in-flight graph capture and consulted
 //! its throttle before its disk cache. Their histories are in
-//! `driver-cuda/src/fire/{launch,lora,scratch}.rs`, `program/session.rs` and
+//! `engine-cuda/src/fire/{launch,lora,scratch}.rs`, `program/session.rs` and
 //! `kernels-cuda/src/gemm/dense.rs`.
 //!
 //! # Why the temperature is collapsed
@@ -73,7 +73,7 @@ fn input(scale: f64) -> String {
 }
 
 #[test]
-#[ignore = "real-hardware: needs an RTX GPU + --features driver-cuda-13 + a local model snapshot; one boot per process"]
+#[ignore = "real-hardware: needs an RTX GPU + --features engine-cuda-13 + a local model snapshot; one boot per process"]
 fn cuda_zero_adapter_answers_the_base_model() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

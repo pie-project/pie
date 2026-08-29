@@ -45,7 +45,7 @@ from conftest import run_inferlet, run_tests  # noqa: E402
 
 
 class _CaptureFd2:
-    """Capture the driver's stderr, then replay it.
+    """Capture the engine's stderr, then replay it.
 
     `resolve_lane_envelope` is C++ and writes to fd 2 directly, so Python-level
     redirection cannot see it. The test needs one line from there -- the fire's

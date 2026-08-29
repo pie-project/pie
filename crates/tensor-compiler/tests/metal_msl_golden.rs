@@ -207,7 +207,7 @@ const INTENDED_ORACLE_DIVERGENCES: &[(&str, &str)] = &[
     // The oracle emitted these: it bound `intrinsic_val` ids 3 (`query`) and 4
     // (`value_head`) to the `logits` buffer, because that is the only buffer
     // `ptir_m1_runtime.metal` binds for op tag 0xA0 and neither the emitter nor
-    // the Metal driver looks at `p.intr` except for `MtpDrafts`. The kernel ran,
+    // the Metal engine looks at `p.intr` except for `MtpDrafts`. The kernel ran,
     // faulted nothing, and returned logits rows in place of the requested
     // intrinsic. `intrinsics_bindable` now rejects the region instead.
     (
@@ -574,7 +574,7 @@ fn validate_singleton_plan_matches_oracle_on_clean_plans() {
         let theirs = Verdict::parse(&oracle_case(&oracle, &format!("{} none", stage.id())));
         let mine = Verdict::of(stage);
         // The verdict and the message are the contract. `operations` is only
-        // read by the driver when the verdict is `ok`.
+        // read by the engine when the verdict is `ok`.
         let same = mine.ok == theirs.ok
             && mine.error == theirs.error
             && (!mine.ok || mine.operations == theirs.operations);

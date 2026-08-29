@@ -1,16 +1,16 @@
-//! Per-model translation helpers used by [`super::start_engine`]:
-//! topology calculation, build-feature/driver-kind validation, and
-//! the [`config::ModelConfig`] → [`DriverOptions`] projection.
+//! Per-model translation helpers used by [`super::start_runtime`]:
+//! topology calculation, build-feature/engine-kind validation, and
+//! the [`config::ModelConfig`] → [`EngineOptions`] projection.
 
 use anyhow::{Result, anyhow};
 
-#[cfg(feature = "_driver-cuda")]
-use crate::config::CudaNativeDriverOptions;
-#[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
-use crate::config::MetalDriverOptions;
-use crate::config::{self, DriverKind};
-use crate::driver_ffi::Flavor;
-use crate::embedded_driver::DriverOptions;
+#[cfg(feature = "_engine-cuda")]
+use crate::config::CudaNativeEngineOptions;
+#[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
+use crate::config::MetalEngineOptions;
+use crate::config::{self, EngineKind};
+use crate::embedded_engine::EngineOptions;
+use crate::engine_ffi::Flavor;
 
 /// Partition `world_size` ranks into ONE tensor-parallel group.
 ///
@@ -22,9 +22,9 @@ use crate::embedded_driver::DriverOptions;
 /// reports (`gateway::admission` filters on `kv_pressure_bucket` and
 /// `inflight`), which is both load-aware and the path that already exists.
 ///
-/// Putting several replicas in one engine instead asks the CUDA driver to
+/// Putting several replicas in one server instead asks the CUDA engine to
 /// serve two devices from one process, and almost nothing in it is written
-/// that way: the driver holds ~96 process-global statics, and every one
+/// that way: the engine holds ~96 process-global statics, and every one
 /// that owns device memory or a stream is a fault waiting for the second
 /// device. Three have already had to be made per-device — the cuBLASLt
 /// context and plan cache, the frame carrier's copy stream, and the baked
@@ -44,7 +44,7 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
     let num_groups = world_size / tp_degree;
     if num_groups > 1 {
         anyhow::bail!(
-            "model.driver.device lists {world_size} devices with \
+            "model.engine.device lists {world_size} devices with \
              tensor_parallel_size = {tp_degree}, which asks for \
              {num_groups} data-parallel replicas in one engine. A worker \
              serves one replica: run {num_groups} workers, each with \
@@ -57,20 +57,20 @@ pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec
         .collect())
 }
 
-/// Resolve the `[model].driver.type` to the [`Flavor`] that hosts it, naming
+/// Resolve the `[model].engine.type` to the [`Flavor`] that hosts it, naming
 /// the model in the refusal when this binary hosts none.
 ///
 /// A `ResolvedFlavor` enum STOOD HERE, wrapping the flavor in an `Embedded`
 /// variant, and a four-arm match fed it the same expression from every arm.
-/// It dated from a runtime with out-of-process drivers to dispatch to as
-/// well; every driver is a static lib now, so "which of the ways of hosting
+/// It dated from a runtime with out-of-process engines to dispatch to as
+/// well; every engine is a static lib now, so "which of the ways of hosting
 /// one" has one answer and does not need to be asked.
-pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<Flavor> {
+pub fn resolve_flavor(kind: EngineKind, model_name: &str) -> Result<Flavor> {
     Flavor::from_kind(kind).map_err(|msg| anyhow!("model {model_name:?}: {msg}"))
 }
 
-/// Project a [`config::ModelConfig`] into the typed [`DriverOptions`]
-/// the embedded driver expects. Caller has already discriminated to an
+/// Project a [`config::ModelConfig`] into the typed [`EngineOptions`]
+/// the embedded engine expects. Caller has already discriminated to an
 /// embedded [`Flavor`].
 ///
 /// The cuda variant's `device` is filled from the first device in the
@@ -79,49 +79,49 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<Flavor> {
 ///
 /// One arm, because one flavor: the `Metal`, `Vulkan` and `Wgpu` arms went
 /// with their `Flavor` variants, and [`resolve_flavor`] refuses those kinds
-/// before a `DriverOptions` is ever asked for.
+/// before a `EngineOptions` is ever asked for.
 #[cfg_attr(
-    not(feature = "_driver-cuda"),
+    not(feature = "_engine-cuda"),
     allow(
         unused_variables,
         unreachable_code,
-        reason = "with no `driver-*` feature `DriverOptions` is uninhabited, so \
+        reason = "with no `engine-*` feature `EngineOptions` is uninhabited, so \
                   every path that produces one diverges"
     )
 )]
-pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result<DriverOptions> {
+pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result<EngineOptions> {
     match flavor {
-        #[cfg(feature = "_driver-cuda")]
+        #[cfg(feature = "_engine-cuda")]
         Flavor::Cuda => {
-            let mut c: CudaNativeDriverOptions = m
-                .driver
+            let mut c: CudaNativeEngineOptions = m
+                .engine
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-            let device = m.driver.device.first().ok_or_else(|| {
+                .map_err(|e| anyhow!("[model.engine.options] for {:?}: {e}", m.name))?;
+            let device = m.engine.device.first().ok_or_else(|| {
                 anyhow!(
                     "model {:?}: cuda_native requires at least one device",
                     m.name
                 )
             })?;
             c.device = device.clone();
-            Ok(DriverOptions::CudaNative(c))
+            Ok(EngineOptions::CudaNative(c))
         }
         // NO DEVICE SELECTOR, unlike the arm above. `Shell::open` takes the
         // DEFAULT Metal 4 device and offers no way to name another, so filling
         // one in here would be a setting nothing acts on —
-        // `MetalDriverOptions::device` exists for the startup TOML an operator
+        // `MetalEngineOptions::device` exists for the startup TOML an operator
         // reads, and is `#[serde(skip)]` for the same reason.
-        #[cfg(all(feature = "driver-metal", target_vendor = "apple"))]
+        #[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
         Flavor::Metal => {
-            let p: MetalDriverOptions = m
-                .driver
+            let p: MetalEngineOptions = m
+                .engine
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[model.driver.options] for {:?}: {e}", m.name))?;
-            Ok(DriverOptions::Metal(p))
+                .map_err(|e| anyhow!("[model.engine.options] for {:?}: {e}", m.name))?;
+            Ok(EngineOptions::Metal(p))
         }
     }
 }

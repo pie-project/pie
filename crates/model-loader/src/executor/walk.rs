@@ -252,7 +252,7 @@ struct Walk<'a, 'p> {
 ///
 /// The only block decoder the loader carries, and it is here rather than beside
 /// a reader because decoding is not reading: the runtime materialization is the
-/// driver's job, and this exists so the offline executor can check the driver's
+/// engine's job, and this exists so the offline executor can check the engine's
 /// answer against an independent one.
 ///
 /// Checked against a from-scratch reimplementation on
@@ -1925,7 +1925,7 @@ impl Walk<'_, '_> {
         let scale_shape = self.buffer_shape(scales)?.to_vec();
         // What the plan's `ScaleLayout` built: the payload's leading axes,
         // then the scheme's own last axis. Compared whole rather than folded,
-        // because a scales plane the driver BINDS is bound at its declared
+        // because a scales plane the engine BINDS is bound at its declared
         // rank and a fold here would accept a plan that published the wrong
         // one.
         let lead = &shape[..shape.len() - 1];
@@ -2752,7 +2752,7 @@ mod tests {
     ///
     /// The scales plane does NOT fold: it comes back `[2, 1, 1]`, the payload's
     /// leading axes with one entry per 32-column block, because that is the
-    /// rank a driver binds it at and the shape `model_dsl`'s `Weight::planes`
+    /// rank an engine binds it at and the shape `model_dsl`'s `Weight::planes`
     /// interns for it.
     ///
     /// Before this, `ScaleLayout::for_encode` refused any rank but 2 and kimi's
@@ -2830,7 +2830,7 @@ mod tests {
         };
 
         let plan = crate::plan::compile(&metadata, &contract, target).unwrap();
-        // The plane the driver binds, at the rank it binds it.
+        // The plane the engine binds, at the rank it binds it.
         let scales = plan
             .tensors
             .iter()
@@ -3515,13 +3515,13 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    /// Factors a contract needed but the driver does not: declared, used,
+    /// Factors a contract needed but the engine does not: declared, used,
     /// never bound.
     ///
     /// The algebra has no `let`, so scaling by a tensor means publishing that
     /// tensor. Published as a runtime weight, a slab of dequantization factors
     /// lands in the persistent arena and stays there for the life of the
-    /// process -- an arena view reclaims nothing when erased -- and the driver
+    /// process -- an arena view reclaims nothing when erased -- and the engine
     /// gets a name in its bind table that no kernel will ever ask for.
     ///
     /// `Visibility::Internal` is that name without either consequence. What
@@ -3642,7 +3642,7 @@ mod tests {
         assert_eq!(storage.tensors["w"], expected);
         assert!(
             !storage.tensors.contains_key("scales"),
-            "an internal declaration must not reach the driver's bind table"
+            "an internal declaration must not reach the engine's bind table"
         );
         // 2 rows x 1 bf16 factor: the whole of what the public declaration was
         // keeping. Stated exactly, because "smaller" would also pass if the
@@ -3657,7 +3657,7 @@ mod tests {
     /// A block-scaled MXFP4 tensor and its factors, dequantized by the plan.
     ///
     /// This is the shape the DeepSeek families' expert weights arrive in, and
-    /// the reason `Scale` takes a tensor factor at all: before it did, a driver
+    /// the reason `Scale` takes a tensor factor at all: before it did, an engine
     /// loaded both halves, ran its own kernel, and left the packed originals
     /// resident because a view into the arena cannot be freed.
     #[test]
@@ -3786,7 +3786,7 @@ mod tests {
     /// The first two shapes are pinned here because pinning them costs three
     /// lines and NOTHING IN PRODUCTION EXERCISES THEM: bare `run()` and
     /// `arena().sink()` are read by this crate's own tests and by
-    /// `driver-metal`, which is out of the workspace. They are public API, so
+    /// `engine-metal`, which is out of the workspace. They are public API, so
     /// the borrow-check property is worth a caller somewhere, and here is the
     /// only place it currently has one that runs.
     #[test]

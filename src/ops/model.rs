@@ -9,7 +9,7 @@
 //! transforms offline, write the runtime tensors" — and R3 deleted it with the
 //! contract it authored. Every transform it ran was
 //! `model_legacy::contract::author`'s, for a load path that no longer exists:
-//! the driver produces its weights from the checkpoint through the SKU's own
+//! the engine produces its weights from the checkpoint through the SKU's own
 //! import table at load, so there is nothing to precompute and no artifact
 //! shape to precompute it into.
 
@@ -93,7 +93,7 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
 /// with the contract, and there is nothing to replace it WITH, because the
 /// new catalog never asks a config what a model is. It asks the TENSORS: the
 /// identify door compiles each SKU's load contract against the checkpoint's
-/// own metadata, and that is the same question a driver settles at load.
+/// own metadata, and that is the same question an engine settles at load.
 ///
 /// So this asks that question instead, one step earlier and against the
 /// checkpoint headers rather than a document about them.
@@ -104,7 +104,7 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
 /// safetensors header parser lifted out of a baker harness — and handed
 /// `model::identify` a `&dyn Fn(&str) -> Option<shape>` closure over it. Both
 /// are gone (menlo M18/M19), and what replaced them is not a rename: the
-/// engine's [`identify`](engine::driver::load::identify) does not match tensor
+/// runtime's [`identify`](runtime::engine::load::identify) does not match tensor
 /// NAMES, it compiles each candidate's load contract against the checkpoint's
 /// own metadata and answers with the SKU whose params the checkpoint actually
 /// holds. A name match cannot tell a 3B Qwen from a 0.8B one — every SKU of a
@@ -151,7 +151,7 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     // is the only question a listing asks — so the door's own note applies:
     // one platform is as good as any, and this listing is a host-side answer
     // about files, not about a device this machine has.
-    match engine::driver::load::identify(&snap, engine::driver::load::Platform::Cuda) {
+    match runtime::engine::load::identify(&snap, runtime::engine::load::Platform::Cuda) {
         Ok(sku) => (true, sku.to_string()),
         // One line, because this is a table cell. The full per-candidate
         // account is what `pie model import` prints when the load is
@@ -202,7 +202,7 @@ struct RuntimeBuild {
 #[derive(serde::Serialize)]
 struct Snapshot {
     repo_id: String,
-    /// Whether any linked driver knows this family.
+    /// Whether any linked engine knows this family.
     servable: bool,
     /// The pie arch name when servable, the reason when not.
     detail: String,

@@ -9,14 +9,14 @@ pub type Result<T> = std::result::Result<T, TransportError>;
 #[derive(Debug, Error)]
 pub enum TransportError {
     /// The requested path does not participate / is not built. metal and vulkan
-    /// are single-node — their driver shim never exports a handle, so they never
+    /// are single-node — their engine shim never exports a handle, so they never
     /// reach an engine. Also raised when a transfer is routed to the `nixl`
     /// engine in a build compiled without `feature = "nixl"`. Callers treat this
     /// as "this path simply isn't on the fabric", not a bug.
     #[error("transport path not available: {0}")]
     Unsupported(&'static str),
 
-    /// An engine could not register a driver-exported handle (out of resources,
+    /// A transfer engine could not register an engine-exported handle (out of resources,
     /// unpinnable memory, a region that isn't actually device-resident, ...).
     #[error("failed to register KV handle: {0}")]
     Registration(String),

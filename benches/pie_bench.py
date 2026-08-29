@@ -43,12 +43,12 @@ if str(SERVER_SDK) not in sys.path:
     sys.path.insert(0, str(SERVER_SDK))
 
 
-EMBEDDED_CLI_DRIVERS: set[str] = {
+EMBEDDED_CLI_ENGINES: set[str] = {
     "dummy",
-    # Apple Silicon: the Metal driver is linked into the `pie` binary, and
+    # Apple Silicon: the Metal engine is linked into the `pie` binary, and
     # there is no maturin `pie._engine` built for it, so drive the CLI.
     "metal",
-    # Vulkan is the same shape as Metal: `driver-vulkan` is linked into the
+    # Vulkan is the same shape as Metal: `engine-vulkan` is linked into the
     # `pie` binary behind a cargo feature and there is no maturin
     # `pie._engine` carrying it, so the CLI is the only way in.
     "vulkan",
@@ -88,8 +88,8 @@ def reconstruct_token_arrivals(
 
 PIE_BENCH_DEFAULT_DEVICE = "cuda:0"
 
-# Metal's driver takes these two unconditionally: its planner has no lattice
-# to collapse, so a value is always wanted. The CUDA driver documents the
+# Metal's engine takes these two unconditionally: its planner has no lattice
+# to collapse, so a value is always wanted. The CUDA engine documents the
 # opposite -- "Omit to let the memory planner choose ... A guess here is worse
 # than absence" (`crates/worker/src/config.rs`) -- so cuda_native forwards them only
 # when the caller moved them off these defaults.
@@ -125,7 +125,7 @@ def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
             "cargo build --target wasm32-wasip2 --release"
         )
     # The wasm is a build OUTPUT with no staleness guard of its own (the engine
-    # guard below covers only driver/interface/runtime/worker/sdk sources), so
+    # guard below covers only engine/interface/runtime/worker/sdk sources), so
     # an edited inferlet silently benches the previous build. Refuse instead.
     newest_src = max(
         (p.stat().st_mtime_ns for p in (inferlet_dir / "src").rglob("*.rs")),
@@ -157,12 +157,12 @@ def embedded_engine_identity() -> dict[str, str]:
         ROOT / "crates",
         ROOT / "sdk" / "server" / "python" / "src",
     ]
-    # `driver-metal` is only in the dependency list on Apple-Silicon builds
+    # `engine-metal` is only in the dependency list on Apple-Silicon builds
     # (sdk/server/python/Cargo.toml), so on Linux its sources cannot have gone
     # into this .so. Counting them makes an origin/dev pull that touched only
-    # the Metal driver look like a stale CUDA engine.
-    skip_roots = () if sys.platform == "darwin" else (ROOT / "crates" / "driver-metal",)
-    # `driver/*/bench` holds standalone microbenchmarks built directly with
+    # the Metal engine look like a stale CUDA engine.
+    skip_roots = () if sys.platform == "darwin" else (ROOT / "crates" / "engine-metal",)
+    # `engine/*/bench` holds standalone microbenchmarks built directly with
     # nvcc; the engine's CMakeLists builds `tests/`, never `bench/`. Editing
     # one cannot change the .so, so counting them here only blocks the bench
     # from running until an unrelated 12-minute rebuild is done.
@@ -243,10 +243,10 @@ def measured_average(
 def build_config(args: argparse.Namespace):
     from pie.config import (
         Config,
-        DriverConfig,
+        EngineConfig,
         ModelConfig,
         RuntimeConfig,
-        SchedulerConfig,
+        SandboxConfig,
         ServerConfig,
         TelemetryConfig,
     )
@@ -258,30 +258,29 @@ def build_config(args: argparse.Namespace):
     if args.device == PIE_BENCH_DEFAULT_DEVICE and args.tp_size > 1:
         args.device = ",".join(f"cuda:{i}" for i in range(args.tp_size))
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
-    driver_options: dict[str, Any]
-    if args.driver == "cuda_native":
-        driver_options = {
+    engine_options: dict[str, Any]
+    if args.engine == "cuda_native":
+        engine_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
-            "ready_timeout": f"{int(args.server_startup_timeout)}s",
         }
         if args.memory_profile != "auto":
-            driver_options["memory_profile"] = args.memory_profile
+            engine_options["memory_profile"] = args.memory_profile
         if args.kv_cache_dtype != "auto":
-            driver_options["kv_cache_dtype"] = args.kv_cache_dtype
+            engine_options["kv_cache_dtype"] = args.kv_cache_dtype
         if args.runtime_quant:
-            driver_options["runtime_quant"] = args.runtime_quant
+            engine_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
-            driver_options["mxfp4_moe"] = args.mxfp4_moe
+            engine_options["mxfp4_moe"] = args.mxfp4_moe
         if getattr(args, "stream_routed_experts", False):
-            driver_options["stream_routed_experts"] = True
+            engine_options["stream_routed_experts"] = True
         if args.mtp_assistant_snapshot_dir:
-            driver_options["mtp_assistant_snapshot_dir"] = (
+            engine_options["mtp_assistant_snapshot_dir"] = (
                 args.mtp_assistant_snapshot_dir
             )
         if args.mtp_num_drafts is not None:
-            driver_options["mtp_num_drafts"] = args.mtp_num_drafts
+            engine_options["mtp_num_drafts"] = args.mtp_num_drafts
         if args.enable_system_speculation:
-            driver_options["enable_system_speculation"] = True
+            engine_options["enable_system_speculation"] = True
         # `gpu_mem_utilization` sizes only the memory planner's *logical* KV
         # budget; the runtime is free to exceed it, so it cannot create KV
         # pressure. `max_total_pages` is the one binding cap, and
@@ -291,121 +290,121 @@ def build_config(args: argparse.Namespace):
         # the value IS the pool, here it is a ceiling over a number derived
         # from `gpu_mem_utilization` (crates/worker/src/config.rs).
         if getattr(args, "total_pages", 0):
-            driver_options["max_total_pages"] = args.total_pages
+            engine_options["max_total_pages"] = args.total_pages
         # Pin the forward layout only on explicit request: an unasked-for pin
         # collapses the planner's lattice to a guess. Needed when the planner
         # reports "no viable crates/model-compiler/KV layout fits budget", which a large
         # dense checkpoint can provoke by leaving too little room for the
         # prefill width the planner would otherwise pick.
         if args.max_forward_tokens != PIE_MAX_FORWARD_TOKENS_DEFAULT:
-            driver_options["max_forward_tokens"] = args.max_forward_tokens
+            engine_options["max_forward_tokens"] = args.max_forward_tokens
         if args.max_forward_requests != PIE_MAX_FORWARD_REQUESTS_DEFAULT:
-            driver_options["max_forward_requests"] = args.max_forward_requests
+            engine_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "swap_pool_size", 0):
-            driver_options["swap_pool_size"] = args.swap_pool_size
-    elif args.driver == "metal":
-        # Apple Silicon. The Metal driver sizes its own heap from the
+            engine_options["swap_pool_size"] = args.swap_pool_size
+    elif args.engine == "metal":
+        # Apple Silicon. The Metal engine sizes its own heap from the
         # checkpoint and exposes no memory-fraction knob, so the CUDA-shaped
         # `gpu_mem_utilization` has nowhere to go; the batching caps are the
         # only tunables it reads.
-        driver_options = {}
+        engine_options = {}
         # Same key, same name, both backends -- the switch is a residency trade
         # an operator makes about a model, not a backend detail.
         if getattr(args, "stream_routed_experts", False):
-            driver_options["stream_routed_experts"] = True
+            engine_options["stream_routed_experts"] = True
         # The bounded form of the same trade, and the only one that can admit a
         # checkpoint bigger than the machine: streaming maps the bank and every
         # mapped page is wired, so it moves bytes off the heap without capping
         # them, while a slab caps them and pays a submit-and-wait per layer.
         if getattr(args, "expert_slab_mb", 0):
-            driver_options["expert_slab_bytes"] = int(args.expert_slab_mb) * 1024 * 1024
+            engine_options["expert_slab_bytes"] = int(args.expert_slab_mb) * 1024 * 1024
         if getattr(args, "max_forward_tokens", 0):
-            driver_options["max_forward_tokens"] = args.max_forward_tokens
+            engine_options["max_forward_tokens"] = args.max_forward_tokens
         if getattr(args, "max_forward_requests", 0):
-            driver_options["max_forward_requests"] = args.max_forward_requests
+            engine_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "total_pages", 0):
-            driver_options["total_pages"] = args.total_pages
+            engine_options["total_pages"] = args.total_pages
         # `--max-model-len` is the cross-engine context knob (llama.cpp takes
         # it as `--ctx-size`, vLLM as `max_model_len`), and on every other
-        # engine it means ONE REQUEST's context. The Metal driver's knob is
+        # engine it means ONE REQUEST's context. The Metal engine's knob is
         # the whole fleet's ring -- it is one shared linear ring, not a
         # per-request allocation -- so the fair translation multiplies by the
         # fleet the client will actually offer. Sending the per-request number
         # straight through would hand a 16-way run 128 tokens per request and
         # measure a starved engine against unstarved ones.
         fleet = max(1, args.concurrency) if args.mode != "latency" else 1
-        driver_options["max_model_len"] = args.max_model_len * fleet
-    elif args.driver == "vllm":
-        driver_options = {
+        engine_options["max_model_len"] = args.max_model_len * fleet
+    elif args.engine == "vllm":
+        engine_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
         }
         if args.vllm_max_num_seqs is not None:
-            driver_options["max_num_seqs"] = args.vllm_max_num_seqs
+            engine_options["max_num_seqs"] = args.vllm_max_num_seqs
         if args.vllm_max_num_batched_tokens is not None:
-            driver_options["max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
+            engine_options["max_num_batched_tokens"] = args.vllm_max_num_batched_tokens
         if args.vllm_max_model_len is not None:
-            driver_options["max_model_len"] = args.vllm_max_model_len
+            engine_options["max_model_len"] = args.vllm_max_model_len
         if getattr(args, "vllm_spec_ngram", False):
-            driver_options["spec_ngram_enabled"] = True
-            driver_options["spec_ngram_num_drafts"] = args.vllm_spec_ngram_num_drafts
-            driver_options["spec_ngram_min_n"] = args.vllm_spec_ngram_min_n
-            driver_options["spec_ngram_max_n"] = args.vllm_spec_ngram_max_n
+            engine_options["spec_ngram_enabled"] = True
+            engine_options["spec_ngram_num_drafts"] = args.vllm_spec_ngram_num_drafts
+            engine_options["spec_ngram_min_n"] = args.vllm_spec_ngram_min_n
+            engine_options["spec_ngram_max_n"] = args.vllm_spec_ngram_max_n
         if getattr(args, "venv", None):
-            driver_options["venv"] = args.venv
+            engine_options["venv"] = args.venv
         if args.vllm_attention_backend:
-            driver_options["attention_backend"] = args.vllm_attention_backend
-    elif args.driver == "sglang":
-        driver_options = {
+            engine_options["attention_backend"] = args.vllm_attention_backend
+    elif args.engine == "sglang":
+        engine_options = {
             "mem_fraction_static": args.gpu_mem_util,
             "disable_cuda_graph": args.sglang_disable_cuda_graph,
             "disable_radix_cache": True,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
         }
         if getattr(args, "venv", None):
-            driver_options["venv"] = args.venv
+            engine_options["venv"] = args.venv
         if args.sglang_attention_backend:
-            driver_options["attention_backend"] = args.sglang_attention_backend
-    elif args.driver == "tensorrt_llm":
-        driver_options = {}
+            engine_options["attention_backend"] = args.sglang_attention_backend
+    elif args.engine == "tensorrt_llm":
+        engine_options = {}
         if getattr(args, "venv", None):
-            driver_options["venv"] = args.venv
+            engine_options["venv"] = args.venv
         if args.trtllm_backend:
-            driver_options["backend"] = args.trtllm_backend
+            engine_options["backend"] = args.trtllm_backend
         if args.trtllm_attn_backend:
-            driver_options["attn_backend"] = args.trtllm_attn_backend
+            engine_options["attn_backend"] = args.trtllm_attn_backend
         if args.trtllm_lookahead_tokens is not None:
-            driver_options["lookahead_tokens"] = args.trtllm_lookahead_tokens
+            engine_options["lookahead_tokens"] = args.trtllm_lookahead_tokens
         if args.trtllm_execution_mode:
-            driver_options["execution_mode"] = args.trtllm_execution_mode
+            engine_options["execution_mode"] = args.trtllm_execution_mode
         if args.trtllm_pyexecutor_max_tokens is not None:
-            driver_options["pyexecutor_max_tokens"] = args.trtllm_pyexecutor_max_tokens
+            engine_options["pyexecutor_max_tokens"] = args.trtllm_pyexecutor_max_tokens
         if args.trtllm_pyexecutor_lookahead:
-            driver_options["pyexecutor_lookahead"] = True
+            engine_options["pyexecutor_lookahead"] = True
         if args.trtllm_pyexecutor_lookahead_min_batch_size is not None:
-            driver_options["pyexecutor_lookahead_min_batch_size"] = (
+            engine_options["pyexecutor_lookahead_min_batch_size"] = (
                 args.trtllm_pyexecutor_lookahead_min_batch_size
             )
         if args.trtllm_pyexecutor_direct_token_limit is not None:
-            driver_options["pyexecutor_direct_token_limit"] = (
+            engine_options["pyexecutor_direct_token_limit"] = (
                 args.trtllm_pyexecutor_direct_token_limit
             )
         if args.trtllm_pyexecutor_speculative_lookahead:
-            driver_options["pyexecutor_speculative_lookahead"] = True
+            engine_options["pyexecutor_speculative_lookahead"] = True
         if args.trtllm_max_seq_len is not None:
-            driver_options["max_seq_len"] = args.trtllm_max_seq_len
+            engine_options["max_seq_len"] = args.trtllm_max_seq_len
         if args.trtllm_max_batch_size is not None:
-            driver_options["max_batch_size"] = args.trtllm_max_batch_size
+            engine_options["max_batch_size"] = args.trtllm_max_batch_size
         if args.trtllm_max_num_tokens is not None:
-            driver_options["max_num_tokens"] = args.trtllm_max_num_tokens
+            engine_options["max_num_tokens"] = args.trtllm_max_num_tokens
         if args.trtllm_kv_cache_free_gpu_memory_fraction is not None:
-            driver_options["kv_cache_free_gpu_memory_fraction"] = (
+            engine_options["kv_cache_free_gpu_memory_fraction"] = (
                 args.trtllm_kv_cache_free_gpu_memory_fraction
             )
     else:
-        driver_options = {}
+        engine_options = {}
 
     # Concurrency 0 means "no explicit cap": the engine then defaults its
-    # admission cap to the driver's max_forward_requests (R). Admitting more
+    # admission cap to the engine's max_forward_requests (R). Admitting more
     # than R processes cannot widen a batch (one fire per process per forward),
     # it only makes batches ragged -- see bootstrap.rs.
     if args.mode == "latency":
@@ -435,11 +434,14 @@ def build_config(args: argparse.Namespace):
         "frame_submit_depth": args.frame_submit_depth,
         "frame_dispatch_depth": args.frame_dispatch_depth,
         "submit_deadline": args.submit_deadline,
+        # Admission is scheduling, so the cap rides with the batching knobs
+        # rather than with the server that happens to run them.
+        "max_concurrent_processes": max_concurrent_processes,
     }
     requested_scheduler_kwargs = {
         k: v for k, v in requested_scheduler_kwargs.items() if v is not None
     }
-    scheduler_parameters = inspect.signature(SchedulerConfig).parameters
+    scheduler_parameters = inspect.signature(RuntimeConfig).parameters
     scheduler_kwargs = {
         key: value
         for key, value in requested_scheduler_kwargs.items()
@@ -454,10 +456,11 @@ def build_config(args: argparse.Namespace):
             host="127.0.0.1",
             port=0,
             verbose=True,
-            max_concurrent_processes=max_concurrent_processes,
+            **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
         telemetry=TelemetryConfig(),
-        runtime=RuntimeConfig(
+        runtime=RuntimeConfig(**scheduler_kwargs),
+        sandbox=SandboxConfig(
             # A pooling slot costs ~4 GiB of VIRTUAL address space (wasmtime
             # reserves a full wasm32 range per memory so it can elide bounds
             # checks), and Linux gives the process 128 TiB total. So this cap
@@ -473,13 +476,13 @@ def build_config(args: argparse.Namespace):
             # the admission cap is the true ceiling. `None` means the engine
             # falls back to max_forward_requests (R), which the 4096 floor
             # already covers for any R <= 1024.
-            wasm_max_instances=max(4096, (max_concurrent_processes or 0) * 4),
+            max_instances=max(4096, (max_concurrent_processes or 0) * 4),
             # Prepared-but-idle guest slots. The engine's default is 100, which
             # is below the fleet width every contended cell here runs at, so a
             # run with request turnover instantiates from cold for most of its
             # arrivals. Exposed to measure that, not because a default is known
             # to be wrong.
-            **({"wasm_warm_slots": args.wasm_warm_slots}
+            **({"warm_slots": args.wasm_warm_slots}
                if getattr(args, "wasm_warm_slots", None) else {}),
             # Bytes of a guest's linear memory that survive its exit instead of
             # being decommitted. The engine's default is 0, so every arriving
@@ -487,26 +490,27 @@ def build_config(args: argparse.Namespace):
             # is an address-space operation, i.e. it interrupts every other
             # thread in this process, scheduler threads included. Exposed to
             # measure that cost under turnover.
-            **({"wasm_warm_memory_mb": args.wasm_warm_memory_mb}
+            **({"warm_memory_mb": args.wasm_warm_memory_mb}
                if getattr(args, "wasm_warm_memory_mb", None) is not None else {}),
-            **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
         model=ModelConfig(
             name="default",
             hf_repo=resolved_model,
-            scheduler=SchedulerConfig(**scheduler_kwargs),
-            driver=DriverConfig(
-                type=args.driver,
+            engine=EngineConfig(
+                type=args.engine,
                 device=device,
                 tensor_parallel_size=args.tp_size,
-                options=driver_options,
+                # Stated once for every engine now, so it is a common
+                # `[engine]` key rather than one of the backend's options.
+                ready_timeout=f"{int(args.server_startup_timeout)}s",
+                options=engine_options,
             )
         ),
     )
     config_blob = {
-        "driver": args.driver,
+        "engine": args.engine,
         "resolved model": resolved_model,
-        **driver_options,
+        **engine_options,
     }
     if args.speculation_depth is not None:
         # Surface for the summary's "spec chain yield" derived stat —
@@ -554,14 +558,14 @@ async def cli_pie_client(args: argparse.Namespace):
 
     cfg, engine_config = build_config(args)
     cfg.server.port = find_free_port()
-    cfg_path = ROOT / ".tmp" / "benches" / f"pie-{args.driver}-{cfg.server.port}.toml"
+    cfg_path = ROOT / ".tmp" / "benches" / f"pie-{args.engine}-{cfg.server.port}.toml"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(cfg.to_toml())
 
     pie_bin = Path(args.pie_bin)
     if not pie_bin.exists():
-        feature = {"metal": "driver-metal", "vulkan": "driver-vulkan"}.get(
-            args.driver, "driver-cuda"
+        feature = {"metal": "engine-metal", "vulkan": "engine-vulkan"}.get(
+            args.engine, "engine-cuda"
         )
         raise FileNotFoundError(
             f"missing {pie_bin}; build with: cargo build --release -p pie "
@@ -594,11 +598,11 @@ async def cli_pie_client(args: argparse.Namespace):
             or txt.startswith("[outer-fire ")
             or txt.startswith("[sched-batch ")
             or txt.startswith("[pie-spec] ")
-            or txt.startswith("[pie-driver-cuda] sampled tokens ")
-            or "[pie-driver-cuda] memory planner:" in txt
-            or "[pie-driver-cuda] forward_limits:" in txt
-            or "[pie-driver-cuda] kv_cache:" in txt
-            or "[pie-driver-cuda] CUDA graph upfront capture:" in txt
+            or txt.startswith("[pie-engine-cuda] sampled tokens ")
+            or "[pie-engine-cuda] memory planner:" in txt
+            or "[pie-engine-cuda] forward_limits:" in txt
+            or "[pie-engine-cuda] kv_cache:" in txt
+            or "[pie-engine-cuda] CUDA graph upfront capture:" in txt
             or " xqa_decode=" in txt
             or " WARN " in txt
             or " ERROR " in txt
@@ -694,7 +698,7 @@ async def cli_pie_client(args: argparse.Namespace):
 
 
 def pie_client(args: argparse.Namespace):
-    if args.driver in EMBEDDED_CLI_DRIVERS:
+    if args.engine in EMBEDDED_CLI_ENGINES:
         return cli_pie_client(args)
     return python_pie_client(args)
 
@@ -1175,8 +1179,8 @@ async def run(args: argparse.Namespace):
                          "default.fire.execute.total_us"),
                         ("default.fire.execute.batch_build_us_sum",
                          "default.fire.execute.batch_build_us"),
-                        ("default.fire.execute.driver_fire_us_sum",
-                         "default.fire.execute.driver_fire_us"),
+                        ("default.fire.execute.engine_fire_us_sum",
+                         "default.fire.execute.engine_fire_us"),
                         ("default.fire.post_dispatch.context_tick_us_sum",
                          "default.fire.post_dispatch.context_tick_us"),
                         ("default.fire.post_dispatch.stats_update_us_sum",
@@ -1248,7 +1252,7 @@ async def run(args: argparse.Namespace):
                     ("default.fire.pre_dispatch.fire_prepare_us", "fire.pre_dispatch.fire_prepare_us"),
                     ("default.fire.execute.total_us", "fire.execute.total_us"),
                     ("default.fire.execute.batch_build_us", "fire.execute.batch_build_us"),
-                    ("default.fire.execute.driver_fire_us", "fire.execute.driver_fire_us"),
+                    ("default.fire.execute.engine_fire_us", "fire.execute.engine_fire_us"),
                     (
                         "default.fire.quorum.avg_active_pipelines_at_fire",
                         "wave avg active pipelines",
@@ -1388,10 +1392,10 @@ def build_parser() -> argparse.ArgumentParser:
                  "(or set PIE_BENCH_INFERLET_DIR).",
         )
         sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
-        # `metal` is back: its driver is wired into `pie serve` again (P5), and
-        # `EMBEDDED_CLI_DRIVERS` above has named it the whole time. `vulkan`
+        # `metal` is back: its engine is wired into `pie serve` again (P5), and
+        # `EMBEDDED_CLI_ENGINES` above has named it the whole time. `vulkan`
         # and `wgpu` are still absent because no build of pie hosts them.
-        sp.add_argument("--driver", default="cuda_native",
+        sp.add_argument("--engine", default="cuda_native",
                         choices=["cuda_native", "metal", "vllm", "sglang",
                                  "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
@@ -1405,15 +1409,15 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument(
             "--kv-pages", type=int, default=2048,
-            help="DEAD for cuda_native: never reaches driver_options, so it "
+            help="DEAD for cuda_native: never reaches engine_options, so it "
                  "silently does nothing. Use --total-pages to cap KV.",
         )
         sp.add_argument(
             "--total-pages",
             type=int,
             default=0,
-            help="HARD cap on resident KV pages (cuda_native driver option). "
-                 "0 leaves the driver to derive its own budget. This is the "
+            help="HARD cap on resident KV pages (cuda_native engine option). "
+                 "0 leaves the engine to derive its own budget. This is the "
                  "only knob that actually bounds KV residency — --gpu-mem-util "
                  "sizes the planner's logical budget only.",
         )
@@ -1421,7 +1425,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--swap-pool-size",
             type=int,
             default=0,
-            help="Host-side swap pages (cuda_native driver option). Must be "
+            help="Host-side swap pages (cuda_native engine option). Must be "
                  ">0 to arm the suspend/restore rung; 0 leaves the residency "
                  "planner with pool-only reclaim.",
         )
@@ -1438,7 +1442,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument(
             "--frame-dispatch-depth", type=int, default=None,
-            help="Frames the engine keeps posted to the driver. Omit for the "
+            help="Frames the engine keeps posted to the engine. Omit for the "
                  "engine default (2). The worker's config notes this is a "
                  "two-sided trade-off that a fully batched fleet can lose.",
         )
@@ -1485,7 +1489,7 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Per-ctx depth of pass-level speculative execution (0..=64). "
                  "0 disables speculation; 1 is piggyback (default). Forwards "
-                 "to scheduler.speculation_depth in the generated toml.",
+                 "to runtime.speculation_depth in the generated toml.",
         )
         # `choices.values()` can yield the same parser under an alias, and
         # `common.py` registers some of these already; a duplicate
@@ -1504,7 +1508,7 @@ def build_parser() -> argparse.ArgumentParser:
             ("--frame-submit-depth", "frame_submit_depth",
              "Frames a guest keeps submitted. Default: the engine's."),
             ("--frame-dispatch-depth", "frame_dispatch_depth",
-             "Frames the engine keeps posted to the driver. "
+             "Frames the engine keeps posted to the engine. "
              "Default: the engine's."),
         ):
             if not any(flag in a.option_strings for a in sp._actions):
@@ -1604,7 +1608,7 @@ def build_parser() -> argparse.ArgumentParser:
             action=argparse.BooleanOptionalAction,
             default=False,
             help="cuda_native deployment opt-in for system speculation (MTP). "
-                 "Sets the driver config [model].enable_system_speculation; the "
+                 "Sets the engine config [model].enable_system_speculation; the "
                  "runtime drives the auto-drafter only when this is on. Default "
                  "off (latency-regime feature).",
         )
@@ -1647,14 +1651,14 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--venv", default=None,
-                        help="Path to a Python venv for subprocess drivers (vllm/sglang/tensorrt_llm/dev)")
+                        help="Path to a Python venv for subprocess engines (vllm/sglang/tensorrt_llm/dev)")
     return p
 
 
 def run_data_parallel(args):
     """Fan the request set out over `dp_size` single-replica workers.
 
-    A replica is a worker, not a driver inside one engine, so measuring DP
+    A replica is a worker, not an engine inside one engine, so measuring DP
     means running that many engines. Each child gets its own slice of the
     devices through CUDA_VISIBLE_DEVICES and its own server port. Wall
     clock is the slowest child's own measured window — they run
@@ -1733,7 +1737,7 @@ def run_data_parallel(args):
 def refuse_if_a_wedged_pie_is_still_dying() -> None:
     """Abort rather than launch alongside a `pie` the kernel cannot reap.
 
-    When the Metal driver gives up waiting on an event it abandons the
+    When the Metal engine gives up waiting on an event it abandons the
     context, because the command buffers may still be executing and
     releasing their heaps would be unsafe. The process then blocks in the
     kernel on GPU work forever: it shows up in state `?E`, RSS 0,
@@ -1753,7 +1757,7 @@ def refuse_if_a_wedged_pie_is_still_dying() -> None:
     if sys.platform != "darwin":
         return
     if os.environ.get("PIE_BENCH_ALLOW_WEDGED") == "1":
-        # The driver now refuses on host memory too, so a run on a wedged box
+        # The engine now refuses on host memory too, so a run on a wedged box
         # ends in a sentence rather than a hang. This exists to exercise that
         # refusal, which is otherwise only reachable on a machine already in
         # the state we are trying to prevent.

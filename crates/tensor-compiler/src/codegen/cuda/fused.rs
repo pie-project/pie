@@ -160,9 +160,9 @@ fn row_shape(dims: &[Dimension]) -> Option<RowShape> {
 ///
 /// `source_value` and `requires_single_row` are not used by emission — the
 /// emitted kernel only needs to know *that* the rewrite applies. They are
-/// carried anyway because the driver's launch packer needs them, and shipping
+/// carried anyway because the engine's launch packer needs them, and shipping
 /// them from here is what keeps this the only implementation of the analysis.
-/// A driver that recomputed them would be a second implementation of a rule
+/// An engine that recomputed them would be a second implementation of a rule
 /// that has to match this one exactly.
 pub(crate) struct DirectArgmax {
     pub(crate) intrinsic: Vec<u16>,

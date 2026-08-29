@@ -1,6 +1,6 @@
 """Contention scenario table for pie's residency planner (Project Rainer).
 
-Every scenario drives a REAL driver (no mock device) through
+Every scenario drives a REAL engine (no mock device) through
 `benches/pie_bench.py` and aims one specific planner endgame path. The point
 of the suite is LIVENESS, not throughput: a scenario that fails requests
 loudly is acceptable, a scenario that hangs, livelocks, or silently stops

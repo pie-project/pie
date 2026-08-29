@@ -192,7 +192,7 @@ fn a_converted_artifact_carries_the_checkpoints_own_config() {
         assert_eq!(
             raw, &want,
             "the artifact's config differs from {source}; verbatim means verbatim, \
-             and a config that was rewritten on the way in is one the driver reads \
+             and a config that was rewritten on the way in is one the engine reads \
              differently from the checkpoint's author"
         );
     }

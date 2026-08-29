@@ -1,11 +1,11 @@
 //! **Host partial evaluation** of stage programs (feature `eval`) — one
 //! general mechanism with three consumers:
 //!
-//! * **Canonical-KV fire evidence** (prefix cache): the engine folds the
+//! * **Canonical-KV fire evidence** (prefix cache): the runtime folds the
 //!   geometry prologue over host-known channel values and checks the result
 //!   for the canonical append pattern, instead of pattern-matching the trace.
-//! * **Capability-less execution** (Metal): a driver with no device-geometry
-//!   ports runs loop-carried passes serialized, the engine folding the
+//! * **Capability-less execution** (Metal): an engine with no device-geometry
+//!   ports runs loop-carried passes serialized, the runtime folding the
 //!   prologue per fire once the previous fire's committed values are known.
 //! * **Geometry classification**: derivability — not op-pattern arity —
 //!   decides whether a pass's submission geometry is host-knowable
@@ -388,7 +388,7 @@ fn placeholder(ty: tensor_ir::types::ValueType) -> Value {
 /// Every descriptor port's fire-time value, by folding the prologue over
 /// host-known channel state and resolving each port against the fold
 /// (register semantics: a prologue put shadows the pre-pass value). This is
-/// the submission geometry a capability-less driver needs, and the evidence
+/// the submission geometry a capability-less engine needs, and the evidence
 /// the canonical-KV gate verifies. Per-port results: a device-carried port
 /// reports its blocker without hiding the ports the host CAN derive.
 pub fn eval_descriptor_ports(

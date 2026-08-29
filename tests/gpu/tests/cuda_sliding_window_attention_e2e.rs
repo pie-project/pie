@@ -1,4 +1,4 @@
-//! A4 mask-migration DEVICE e2e — real driver. First end-to-end exercise
+//! A4 mask-migration DEVICE e2e — real engine. First end-to-end exercise
 //! of the token-at-a-time, B=1 explicit-write PTIR geometry that the A4 mask
 //! inferlets migrated onto (superseding the classic `forward-pass` +
 //! `attention_mask(list<brle>)` surface). The `sliding-window-attention` inferlet
@@ -10,7 +10,7 @@
 //!
 //!   guest sliding-window decode program
 //!     → runtime device-geometry submit (PageLease grants, run-ahead FIFO)
-//!     → driver descriptor resolver (`resolve_descriptors` → `FireGeometry`)
+//!     → engine descriptor resolver (`resolve_descriptors` → `FireGeometry`)
 //!     → B2 explicit-KV-write (`launch_write_kv_explicit_bf16` honoring
 //!       WSlot/WOff — the single sequence's append cell written in place)
 //!     → attention under the packed dense sliding-window mask
@@ -18,12 +18,12 @@
 //!
 //! This is the INTEGRATION gate for the A4 token-at-a-time mask geometry: it
 //! proves the B=1 masked decode flows guest → device-geometry submit → the
-//! driver's explicit write + masked attention → harvest, end to end on real
-//! logits, without crashing or degenerating. It reuses the SAME driver path the
+//! engine's explicit write + masked attention → harvest, end to end on real
+//! logits, without crashing or degenerating. It reuses the SAME engine path the
 //! beam-designb e2e proved (explicit write + dense mask), at B=1 with an
 //! in-graph sliding window instead of the beam ancestry mask.
 //!
-//!   cargo test -p pie-gpu-tests --features driver-cuda-13 \
+//!   cargo test -p pie-gpu-tests --features engine-cuda-13 \
 //!     --test cuda_sliding_window_attention_e2e -- --ignored --nocapture
 //!
 //! # What it does on a box that HAS all of that, which is refuse
@@ -40,7 +40,7 @@
 //!
 //! That sentence is about the symptom, and it names the wrong port because
 //! `EmbedTokens` is the first one the fire path reaches. The claim behind it
-//! is `crates/tensor-ir/src/registry.rs`, where a driver's served set is one
+//! is `crates/tensor-ir/src/registry.rs`, where an engine's served set is one
 //! of two constants and neither holds the port this file is about:
 //!
 //! > `DECODE_ENVELOPE`: the three ports a decode envelope resolves -- the
@@ -49,17 +49,17 @@
 //! > `DEVICE_GEOMETRY`: the decode envelope plus the page table, the row
 //! > split, and the adapter routing.
 //!
-//! `Port::AttnMask` is in NEITHER. `driver-cuda::api` answers
+//! `Port::AttnMask` is in NEITHER. `engine-cuda::api` answers
 //! `GeometryClass::DecodeEnvelope` (palo build log 18: a decode-envelope
 //! lane's page table is the ENGINE's, so `bind_instance` refuses the wider
 //! class by name through `Capabilities::admits`), and a mask this guest
 //! re-derives in its epilogue and `put`s every fire is therefore a value the
-//! host is asked to know and cannot. The engine classifies the program as a
+//! host is asked to know and cannot. The runtime classifies the program as a
 //! host-evaluated decode and refuses at the first fire rather than running on
 //! a guess.
 //!
 //! So this is not a test waiting for a GPU. It is a test waiting for a shell
-//! that resolves `Port::AttnMask` on the device, which is a `driver-cuda`
+//! that resolves `Port::AttnMask` on the device, which is an `engine-cuda`
 //! `program/ports.rs` wave: build log 18 built that read for `EmbedTokens`
 //! alone and said which four of `DEVICE_GEOMETRY` it deliberately did not
 //! claim. `cuda_attention_sink_e2e` in this directory is blocked on the same
@@ -74,13 +74,13 @@ use anyhow::{Context, Result};
 use client::client::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "BLOCKED, and not on hardware: `driver-cuda` advertises \
+#[ignore = "BLOCKED, and not on hardware: `engine-cuda` advertises \
             `GeometryClass::DecodeEnvelope`, whose port set is `EmbedTokens | \
             Positions | KvLen`; `Port::AttnMask` is in no `PortMask` any class \
             denotes, so the window this guest puts on every fire is a port no \
             shell in this tree resolves. See the section at the end of this \
             file's header before running it"]
-async fn sliding_window_attention_on_real_driver() -> Result<()> {
+async fn sliding_window_attention_on_real_engine() -> Result<()> {
     common::init_trace();
     let pie = common::boot_cuda().await?;
     eprintln!(

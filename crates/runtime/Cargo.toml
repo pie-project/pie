@@ -1,0 +1,268 @@
+[package]
+name = "runtime"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Programmable Inference Engine (Pie)"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "runtime"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# tart: the declared-forward toolchain, and OPTIONAL now.
+#
+engine-api = { path = "../engine-api" }
+tensor-ir = { path = "../tensor-ir" }
+tensor-compiler = { path = "../tensor-compiler" }
+# THE CUTOVER, DONE. This was `engine-cuda-new` beside a C++ `engine-cuda`
+# that supplied the same thirteen `pie_cuda_*` symbols, so which archive
+# the seam linked was the whole switch and `backend/cuda.rs` was unchanged
+# either way. There is one now, and it has the name.
+engine-cuda = { path = "../engine-cuda", optional = true }
+# BACK AT P5, and only this one of the three. R3 cut the edge rather than
+# gating it, on the reading that "an optional path dependency is enough to drag
+# one back in: cargo adopts a path dep inside the workspace directory as a
+# member whatever its features say" -- which was right while `engine-metal` was
+# NOT a member. It is one now (see the root manifest's `members`), CI builds it
+# with `--features metal-4`, and it walks a `model_compiler::program::Program`
+# through a baker executor of its own. That was the stated P5 precondition, and
+# it is met; `engine-vulkan` and `engine-wgpu` are still waiting on theirs.
+engine-metal = { path = "../engine-metal", optional = true }
+# `metal-4` IS NOT LISTED THERE, and that is the whole shape of this feature.
+# It is the engine's DEVICE half, and that crate `compile_error!`s it off an
+# Apple target -- so naming it in the line above would make
+# `--features engine-metal` a build error everywhere else, rather than a build
+# with no metal seam in it. The target table below turns it on exactly where it
+# can exist; cargo unifies the two entries on Apple and applies only the first
+# anywhere else. See the seam's own `#[cfg(all(feature = .., target_vendor =
+# "apple"))]`, which is the same rule stated in the code.
+
+client = { path = "../client" }
+tokio = { version = "1.53", features = ["full"] }
+parking_lot = "0.12"
+tarpc = { version = "0.37", features = ["serde1"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+rand = { version = "0.10.2", features = ["std_rng", "sys_rng"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = "0.1.44"
+tracing-appender = "0.2"
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+# default-features off: the default set drags in the HTTP transports
+# (`http-proto` → prost/opentelemetry-http → a second reqwest client) which
+# `telemetry.rs` never reaches — it only ever calls `.with_tonic()`.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "grpc-tonic",
+    "trace",
+    "metrics",
+] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+# default-features off, because wasmtime's default set is the *tooling*
+# build, not the embedder one: `wat`/`wit-parser` (text and WIT parsing we
+# never do — inferlets arrive as binary components), `cache` (module cache on
+# disk), `coredump`, `profiling`, `debug-builtins`, the three GC collectors,
+# `stack-switching` and `threads` (no guest uses them). Everything the runtime
+# actually reaches is listed here.
+wasmtime = { version = "47.0.1", default-features = false, features = [
+    "runtime",
+    "std",
+    "anyhow",
+    "async",
+    "backtrace",
+    "cranelift",
+    "parallel-compilation",
+    "component-model",
+    "component-model-async",
+    "pooling-allocator",
+    "addr2line",
+    "demangle",
+] }
+# p1 off (it is a default): nothing here links preview1 — the runtime only ever
+# calls `p2::add_to_linker_async` and `p3::add_to_linker`, and p1 is what drags
+# in wiggle → witx → a second, ancient `wast`.
+wasmtime-wasi = { version = "47.0.1", default-features = false, features = ["p2", "p3"] }
+# `default-send-request` stays on (it is a default): it is what supplies the
+# blanket `WasiHttpHooks::send_request`, and its rustls is the ring build, not
+# aws-lc.
+wasmtime-wasi-http = { version = "47.0.1", default-features = false, features = [
+    "p2",
+    "p3",
+    "default-send-request",
+] }
+# Names `http::uri::Scheme` for the wasi:http@0.3 network-policy hook
+# (ProcessCtx::PieHttpHooks); shared with wasmtime-wasi-http's http 1.x.
+http = "1"
+bytes = "1.12.1"
+uuid = { version = "1.24.0", features = ["serde", "v4"] }
+dashmap = "6.2.1"
+boxcar = "0.2.14"
+thiserror = "2.0.19"
+futures = "0.3.33"
+waker = { path = "../waker" }
+tokenizer = { path = "../tokenizer" }
+grammar = { path = "../grammar" }
+# What this runtime needs to know about the model it serves that is NOT its
+# forward pass. It used to be the whole of `model::serve`, a module this crate
+# and `worker` were the only consumers of. M18 deleted it, on the ruling that
+# `model` says what a model family IS, backend-blind, and a serving process's
+# questions are not family questions. Two of the four came back through doors
+# `model` still keeps, and they are all this edge carries now:
+#
+#   * the chat template a turn is written with -- `model::template::template_of`,
+#     keyed by the same SKU the engine reports having loaded;
+#   * the decoders that read the generated tokens back as chat, reasoning and
+#     tool events -- `model::template`, re-exported from `chat_template`.
+#
+# The other two RE-HOMED HERE, because a serving fabric is what asks them:
+# `(layers, vocab, arch)` per SKU and the shape an artifact's metadata arrives
+# in are `src/model.rs`, and host-side media decode is
+# `src/inferlet/host/media/multimodal.rs`.
+model = { path = "../model" }
+# THE RUNTIME TRACES, AND THE RUNTIME STATES THE LOAD CONTRACT (palo design §7,
+# decision 18). `model` above supplies the catalog and the per-SKU import; the
+# three edges below are what it takes to USE them at the boundary:
+#
+#   * `model-loader` names `ModelContract`, the value `model::import_of`
+#     builds and `engine_api`'s `LoadRequest` deliberately has no seat for —
+#     the contract's dependency floor is `model-ir`/`tensor-ir`/serde/thiserror,
+#     and a loader type in it would put the whole checkpoint plane in the graph
+#     of everyone who reads a `KvHandle`. So the shell takes it through a
+#     function pointer this crate installs (`engine::load`).
+#   * `ztensor` + `ztensor-compat` open the checkpoint the import is checked
+#     against — the same pair `model-loader` itself takes, for the reason its
+#     manifest gives: `ztensor` owns the container format, `ztensor-compat`
+#     owns the foreign projections (a stock safetensors snapshot is one).
+#
+# `default-features = false` on the loader drops its testkit (oracle, contract
+# fixture builder, CPU executor); nothing here reaches them.
+model-loader = { path = "../model-loader", default-features = false }
+ztensor = { workspace = true }
+ztensor-compat = { workspace = true }
+# Host-side media decode for the model-agnostic multimodal API
+# (`inferlet::host::media::multimodal`). It rode `model`'s `serve` feature
+# while that module lived over there -- a flag whose whole purpose was to keep
+# twenty image crates out of an engine's link. The module is here now, where
+# every build decodes media, so the dependency is plain.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+] }
+blake3 = "1.8.5"
+fancy-regex = "0.18.0"
+async-trait = "0.1.91"
+wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
+wasmparser = "0.254.0"
+wasm-metadata = "0.254.0"
+libc = "0.2"
+# default-features off so reqwest's `default-tls` (native-tls → openssl) is
+# never pulled in: it dynamically links libssl.so.1.1, which doesn't exist on
+# OpenSSL-3 distros (Ubuntu 22.04+) and breaks the manylinux_2_28 release
+# binary. rustls is statically linked and distro-independent.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+rustc-hash = "2.1"
+smallvec = "1"
+lru = "0.18.1"
+ipnet = "2"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+engine-metal = { path = "../engine-metal", optional = true }
+
+[features]
+default = []
+# The CUDA shell. It used to share these symbols with a C++ archive of the
+# same name, and enabling both was a duplicate-symbol error -- the right
+# failure, since the seam must not be ambiguous about which engine it is
+# calling. Only one supplies them now.
+#
+# It needs a CUDA runtime ABI chosen, for the reason that crate's own
+# `compile_error!` gives: guessing wrong is a segfault inside the engine
+# rather than a build error.
+#
+# So the version is IN THE NAME, and there is no version-less `engine-cuda`
+# to select. This crate used to offer one, defined as `engine-cuda/cuda-13`,
+# and that is precisely the guess `engine-cuda` refuses to make: `pie` exposed
+# only the bare name, so `cuda-12` was unreachable from any binary while CI
+# shipped six `cuda12.8`-labelled artifacts built against the 13 ABI. Naming
+# the version is what makes forgetting it impossible -- Cargo answers a stale
+# `--features engine-cuda` with "the package does not contain this feature",
+# which is a better error than a segfault in `cudaGraphAddNode`.
+#
+# `_engine-cuda` is the private "the CUDA shell is linked" gate, the same
+# shape and the same underscore as `engine-cuda`'s own `_cuda`: every
+# `#[cfg]` in this crate is written against it, so the modules do not have to
+# name a version they do not care about.
+_engine-cuda = ["dep:engine-cuda"]
+# THE FORWARDS ARE BACK, and this is what they are for. `engine-cuda` builds
+# with no runtime selected and every device call answers `Fault::Runtimeless`
+# — deliberately, so its host tests run on a laptop — so a binary that names
+# `engine-cuda-13` here and nothing over there LINKS a shell that cannot bind
+# a device. They were dropped in the palo step-4 wave as dead refs, which they
+# were while nothing in this crate constructed a shell; `backend::cuda::open`
+# constructs one now.
+engine-cuda-12 = ["_engine-cuda", "engine-cuda/cuda-12"]
+engine-cuda-13 = ["_engine-cuda", "engine-cuda/cuda-13"]
+# The Metal shell. There is no ABI to choose and so no version in the name:
+# `engine-metal` is TARGET-gated rather than feature-gated (Metal is the
+# platform, not a choice a machine makes), so the crate builds and host-tests
+# everywhere and its device half exists on Apple targets only. The flag alone
+# is therefore not a build that links a device, which is why every `#[cfg]`
+# reading it pairs it with `target_vendor = "apple"`, and why the dependency
+# is declared twice below -- once portably, once in the Apple target table.
+engine-metal = ["dep:engine-metal"]
+# Host-side performance probes. Each scenario is a separate flag so you
+# only pay for the probes you ask for — different domains have different
+# sample rates and different audiences. The `probe_<domain>!` macros in
+# `src/scheduler/probe.rs` expands to zero code when its feature is off.
+#
+# Adding a new domain: define it under `src/scheduler/probe.rs` (or an
+# `src/scheduler/probe/` submodule) with its probe-holder
+# struct + `probe_<domain>!` macro pair, then add a feature flag here.
+profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
+# `profile-hot-path` and `profile-all` STOOD HERE, both defined as
+# `["profile-fire"]` -- three names for one domain, because `probe.rs` has
+# only ever had one. Neither carried a `#[cfg]` of its own and neither was
+# forwarded past `worker`, so no binary could select them and no code could
+# tell them apart. Bring them back when a SECOND domain makes a bundle mean
+# something; a bundle of one is a promise the catalog does not keep.
+
+[dev-dependencies]
+tempfile = "3"
+# The text-format parser, for tests only. The linker tests build their
+# fixtures as `(module ...)` source, which `Module::new` will only accept
+# with `wat` on; nothing in the runtime itself ever compiles text, so the
+# parser has no business in a shipped binary. Dev-dependencies are not built
+# for `cargo build`, which is exactly the line we want here.
+wasmtime = { version = "47", default-features = false, features = ["wat"] }
+# THE HOST HALF OF THE GUEST-PROGRAM PLANE, for the `palo B2` gate and for
+# nothing else. `engine::program` is a complete interpreter of the same launch
+# package the CUDA shell executes — same ops, same channel semantics, same
+# pass-atomic commit — and `tests/cuda_program_epilogue.rs` diffs the two over
+# a real model fire's logits. It is the golden, so it has to be the SHARED
+# crate's interpreter and not a second one written beside the test.
+engine = { path = "../engine" }
+# `model-dsl` STOOD HERE, for the boot smoke and for nothing else: `Lane::word`
+# is the one genuinely new submission field, the catalog shipped
+# `(sku, tp, TraceFn)` and no `ClassifyFn`, and the only way to state a word
+# was to name a family's own `Facts` — which a test could do and the fire path
+# could not (`palo B-word`). The catalog has the column now. Both the fire path
+# and the smoke reach it through `model`, which re-exports the `Request` a
+# `ClassifyFn` takes, so nothing here authors a forward pass and nothing here
+# needs the authoring eDSL.
+# `criterion` and `mimalloc` STOOD HERE, for benchmarks: this crate has no
+# `benches/` directory and no `[[bench]]`, and neither name appears in a line
+# of its source. The mimalloc line carried the one fact worth keeping — a
+# bench of a runtime entry point has to link the allocator `worker` installs
+# or it measures glibc malloc — so bring both back together when a bench does.
+
+#[profile.release]
+#lto = "fat"
+#codegen-units = 1

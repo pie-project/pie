@@ -10,18 +10,18 @@ use crate::tensor::Tensor;
 
 pub fn all_reduce(_ctx: &Ctx<'_>, _buf: Tensor) -> Result<(), KernelError> {
     Err(KernelError::Unsupported {
-        op: "dist.all_reduce",
+        op: "collective.all_reduce",
     })
 }
 
 pub fn all_gather(_ctx: &Ctx<'_>, _x: Tensor, _y: Tensor) -> Result<(), KernelError> {
     Err(KernelError::Unsupported {
-        op: "dist.all_gather",
+        op: "collective.all_gather",
     })
 }
 
 pub fn reduce_scatter(_ctx: &Ctx<'_>, _x: Tensor, _y: Tensor) -> Result<(), KernelError> {
     Err(KernelError::Unsupported {
-        op: "dist.reduce_scatter",
+        op: "collective.reduce_scatter",
     })
 }

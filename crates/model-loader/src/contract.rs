@@ -1,7 +1,7 @@
 //! The model contract: a declaration of what the model needs, as expressions
 //! over the checkpoint's byte space.
 //!
-//! The contract declares every tensor the driver will bind and where its bytes
+//! The contract declares every tensor the engine will bind and where its bytes
 //! come from; the compiler decides how to move them, and no part of it needs
 //! to know the model family. The declarer is `model::contract`, on this side
 //! of the ABI, so the contract is internal IR now, not an input a caller hands
@@ -291,7 +291,7 @@ pub enum Expr {
     /// forces. Everything else moves bytes or renames their type, which is why
     /// an expression's output can be checked by arithmetic on extents alone. A
     /// family reaches for this only when a factor has to be folded into a
-    /// weight, and folding it at load time is what stops a driver copying the
+    /// weight, and folding it at load time is what stops an engine copying the
     /// tensor to the host, scaling it there and uploading the result during
     /// bind, outside the plan entirely.
     ///
@@ -420,10 +420,10 @@ impl TensorType {
 
 /// One declared tensor.
 ///
-/// `encoding` is what the driver wants the tensor to *be*, and the loader
+/// `encoding` is what the engine wants the tensor to *be*, and the loader
 /// inserts whatever cast, decode or encode reaches it. `shape` is different: it
 /// is a *prediction*, checked against what the expression actually yields, so
-/// that a driver whose model of the checkpoint is wrong fails to compile instead
+/// that an engine whose model of the checkpoint is wrong fails to compile instead
 /// of silently binding a plausible-looking buffer.
 ///
 /// **The prediction is the WHOLE tensor's**, not this rank's band. A contract
@@ -432,14 +432,14 @@ impl TensorType {
 /// declaration is written before there is a rank to write one for. It is
 /// checked against the type the expression has at [`Partition::WHOLE`] —
 /// `plan::build`'s `check_declared_shape` — while the plan the same pass emits
-/// declares this rank's band, which is what a driver binds. The two differ by
+/// declares this rank's band, which is what an engine binds. The two differ by
 /// exactly the shards the expression names.
 ///
 /// A prediction may be declined. `shape: None` says "I do not claim to know",
 /// which is the honest answer for a packed quantized weight whose on-disk
 /// extents are a property of the quantizer that produced the file rather than of
 /// the model. Forcing a claim there is what produces a `LogicalShape`-style
-/// helper: something whose only job is to erase a shape the driver was made to
+/// helper: something whose only job is to erase a shape the engine was made to
 /// state and could not stand behind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TensorContract {
@@ -454,7 +454,7 @@ pub struct TensorContract {
     pub encoding: Encoding,
     /// Set when this entry holds scales for another entry. See [`Scales`].
     pub scales: Option<Scales>,
-    /// Whether the driver binds this. See [`Visibility`].
+    /// Whether the engine binds this. See [`Visibility`].
     ///
     /// Defaulted on the way in, so a contract written before this existed --
     /// or one whose author simply had nothing to hide -- reads as `Public`,
@@ -465,7 +465,7 @@ pub struct TensorContract {
 
 /// What a scale tensor scales, said by the entry that declares the scales.
 ///
-/// A quantized weight and its scales are two runtime tensors, and the driver's
+/// A quantized weight and its scales are two runtime tensors, and the engine's
 /// kernels need to know they belong together. The pairing is stated here rather
 /// than guessed from name suffixes: a suffix match is how a scale tensor gets
 /// silently reinterpreted as one it never belonged to.
@@ -477,7 +477,7 @@ pub struct TensorContract {
 /// matching suffixes.
 ///
 /// **The pairing has no name; the tensor does, and it is not free either.** An
-/// encoded scales plane is bound by a driver out of the same table as a
+/// encoded scales plane is bound by an engine out of the same table as a
 /// shipped one, by name, so `plan::build`'s `ScaleLayout` publishes it under
 /// the spelling the model plane binds — `<w>.scales` for MXFP4. That is the
 /// accord recorded as open against kimi's runtime-quantized expert banks, and
@@ -528,7 +528,7 @@ impl TensorContract {
         }
     }
 
-    /// Keep this declaration out of the driver's namespace. See
+    /// Keep this declaration out of the engine's namespace. See
     /// [`Visibility::Internal`].
     pub fn internal(mut self) -> Self {
         self.visibility = Visibility::Internal;
@@ -542,7 +542,7 @@ impl TensorContract {
     }
 }
 
-/// Everything one driver rank needs, as a name-resolved DAG.
+/// Everything one engine rank needs, as a name-resolved DAG.
 ///
 /// `tensors` is in declaration order; [`Expr::Out`] may only name an earlier
 /// entry, which makes the DAG acyclic by construction and lets the checker run
@@ -572,18 +572,18 @@ pub struct ModelContract {
 /// therefore interchangeable. That is exactly the claim a bounded cache of
 /// slots rests on — page one member out, page another in, the slot fits either
 /// way — and stating it lets the type checker prove it instead of leaving a
-/// driver to assume it (see [`Expr::SrcIndexed`]).
+/// engine to assume it (see [`Expr::SrcIndexed`]).
 ///
 /// What a group is *not* is a residency decision. It says these tensors form
 /// `arity` interchangeable instances and how to build one; it does not say
-/// where they live or when. A driver may materialize all `arity` of them and
+/// where they live or when. An engine may materialize all `arity` of them and
 /// keep them resident — which is the ordinary load, one member at a time
 /// instead of all at once, and so at a fraction of the peak — or it may keep a
 /// few slots and page. The contract reads the same either way, because where
-/// bytes live at run time is the driver's business and not the checkpoint's.
+/// bytes live at run time is the engine's business and not the checkpoint's.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupContract {
-    /// Names this grid for diagnostics and for the driver's own bookkeeping.
+    /// Names this grid for diagnostics and for the engine's own bookkeeping.
     pub name: String,
     /// How many instances the grid has. The index runs `0..arity`.
     pub arity: u32,
@@ -639,10 +639,10 @@ impl Default for Partition {
 /// [`Error::Shard`]: an axis `world` does not
 /// divide, and a `rank` outside the group. The second used to fall through and
 /// produce an over-wide band, which the slice bounds check then reported as an
-/// `Error::Contract` — telling the driver to fix a contract that was fine.
+/// `Error::Contract` — telling the engine to fix a contract that was fine.
 ///
 /// `what` names the thing being split, because this is the message a user gets
-/// for "tp_size does not divide this model". The driver used to pre-empt it with
+/// for "tp_size does not divide this model". The engine used to pre-empt it with
 /// its own per-family table of divisibility rules read off `config.json` — the
 /// same fact checked twice, and only for the families someone had listed.
 pub fn local_range(full: i64, world: u32, rank: u32, what: &str) -> Result<(i64, i64), Error> {

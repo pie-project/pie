@@ -6,7 +6,7 @@
 A `-p` naming a crate cargo cannot see is not a narrower gate and not a
 skip. Cargo exits before it compiles anything:
 
-    error: package ID specification `driver-wgpu` did not match any packages
+    error: package ID specification `engine-wgpu` did not match any packages
 
 and so does a `--features` naming a feature no manifest declares, and so
 does a `--test` naming a target that is not in the tree. Each is a hard
@@ -16,7 +16,7 @@ opens, much like a job that had nothing to do.
 
 This tree has now paid for that three times over, all in one branch:
 
-* `-p driver-metal`, `-p driver-vulkan` and `-p driver-wgpu` appeared
+* `-p engine-metal`, `-p engine-vulkan` and `-p engine-wgpu` appeared
   EIGHTEEN times in `ci.yml`, including three whole jobs, after R3 put
   all three crates in the root manifest's `exclude`.
 * `cargo check -p model --features chat|contract|chat,contract` and
@@ -24,12 +24,12 @@ This tree has now paid for that three times over, all in one branch:
   deleted with `model-legacy`. The same step had already been through
   this once with a fourth name, `forward`, and was rewritten onto two
   names that were themselves about to go.
-* `--features driver-wgpu` on `pie-gpu-tests`, `engine`, `worker` and
+* `--features engine-wgpu` on `pie-gpu-tests`, `runtime`, `worker` and
   `pie` named a feature no package in the workspace has ever declared
   since the crate left it, and `--test shader_backends_agree` named a
   test target that is not in `crates/kernels/tests` at all.
 * `build.yml`'s `aarch64-macos-metal` release leg built
-  `-p pie --features driver-metal`, so an entire published artifact was
+  `-p pie --features engine-metal`, so an entire published artifact was
   produced by a command that could not run.
 
 None of that was caught by anything. `scripts/ci-gate-audit.py` reads two

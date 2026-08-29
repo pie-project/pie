@@ -1,6 +1,6 @@
-//! **Stage-2 driver `mtp_logits` value-verify** (charlie) — drives the
+//! **Stage-2 engine `mtp_logits` value-verify** (charlie) — drives the
 //! `mtp-native-verify` inferlet (bravo's PTIR-native draft→verify→accept) on the
-//! a real CUDA device + Qwen3.5-0.8B, exercising the driver's `mtp_logits` plumbing (the
+//! a real CUDA device + Qwen3.5-0.8B, exercising the engine's `mtp_logits` plumbing (the
 //! MTP head produces K draft rows in `ws.logits`; `ctx.mtp_draft_row` points the
 //! `Intrinsic::MtpLogits [K,vocab]` binding at them).
 //!
@@ -15,12 +15,12 @@
 //! glitch until bravo's FLA fix lands. The PLUMBING signal (draft head fires +
 //! produces non-aliasing rows) is independent of decode value-correctness.
 //!
-//! `#[ignore]`, driver-cuda. **ONE TEST PER PROCESS** — each test boots its own
+//! `#[ignore]`, engine-cuda. **ONE TEST PER PROCESS** — each test boots its own
 //! embedded worker and only the first boot in a process succeeds, so running the
 //! file unfiltered fails every test after the first with "boot embedded worker".
 //! Run each by name:
 //!   PIE_MTP_DRAFT_TOKENS=4 PIE_MTP_LOGITS_TRACE=1 cargo test -p pie-gpu-tests \
-//!     --features driver-cuda-13 --test cuda_mtp_native_verify <name> \
+//!     --features engine-cuda-13 --test cuda_mtp_native_verify <name> \
 //!     -- --ignored --exact --nocapture
 
 use std::path::Path;
@@ -31,11 +31,11 @@ use client::client::Client;
 
 mod common;
 
-/// Draft window k, kept in lockstep with the driver's `max_drafts`.
+/// Draft window k, kept in lockstep with the engine's `max_drafts`.
 ///
 /// The guest asks for `k` draft rows via `intrinsics::mtp_logits(k)`, and the
-/// driver sizes `max_drafts` from `mtp_num_drafts`. Two defaults for one number
-/// is a trap -- a guest wanting 4 drafts against a driver built for some other
+/// engine sizes `max_drafts` from `mtp_num_drafts`. Two defaults for one number
+/// is a trap -- a guest wanting 4 drafts against an engine built for some other
 /// count fails deep in frame prepare with "MtpLogits draft-row requirement
 /// exceeds the production layout" -- so this ONE value feeds both: pass it to
 /// `boot_cuda_mtp` and to the guest. `PIE_MTP_DRAFT_TOKENS` overrides it.
@@ -160,13 +160,13 @@ async fn mtp_logits_value_verify() -> Result<()> {
 /// -- serializing two fires that are otherwise back to back. The device path
 /// publishes `clen` into a channel the commit fire already claimed, plans
 /// against the host's own upper bound (the row's whole live buffer), and lets
-/// the driver substitute and clamp the real value.
+/// the engine substitute and clamp the real value.
 ///
 /// The assertion is a WITHIN-RUN invariant, not a cross-run diff. Every window
 /// the inferlet echoes the device-computed `clen` back to the host and checks
 /// it against the length the host itself derived from the sentinel tail; a
 /// mismatch fails the inferlet outright. That is the exact property this path
-/// can get wrong -- the driver dropping the resolved value and folding the
+/// can get wrong -- the engine dropping the resolved value and folding the
 /// whole buffer bound instead -- and it is checked at every single fold.
 ///
 /// It deliberately does NOT compare a host-mode decode to a device-mode decode
@@ -185,7 +185,7 @@ async fn mtp_logits_value_verify() -> Result<()> {
             loads as the plain `qwen35-d0.8b` dense row, so a drafting lane \
             gets `Fault::Draftless`, and `PortMask::RS_BUFFER` -- \
             which is where a device-resident fold length would be read -- is \
-            RESERVED and served by no driver here"]
+            RESERVED and served by no engine here"]
 async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
     common::init_trace();
     let k = draft_k();
@@ -263,7 +263,7 @@ async fn a_device_resident_fold_length_decodes_identically() -> Result<()> {
     );
 
     // And at least one window must have folded MORE than the lone bonus token.
-    // If every `clen` were 1 the check above would pass against a driver that
+    // If every `clen` were 1 the check above would pass against an engine that
     // ignored the resolved value entirely and folded a constant.
     anyhow::ensure!(
         field("fold_len_nontrivial")? > 0,

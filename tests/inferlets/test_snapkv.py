@@ -52,16 +52,16 @@ async def _run(client, args, name, extra=None):
 
 
 def _window_pages(r):
-    """The page span the driver's observation window covers, derived here rather
+    """The page span the engine's observation window covers, derived here rather
     than reported by the inferlet.
 
-    The driver captures the last `window` query rows of the prompt
+    The engine captures the last `window` query rows of the prompt
     (`default_attn_score_window()` in crates/driver-cuda/csrc/src/model/attn_score.hpp,
     overridable by PIE_ATTN_SCORE_WINDOW). Those rows start at token
     `prompt_len - window`, so the kv positions they weight most heavily span
     every page from that token onward.
 
-    Computing it independently on this side is the point: the driver decides
+    Computing it independently on this side is the point: the engine decides
     which rows to capture from the same env var, and the two derivations only
     agree if the capture really is anchored to the END of the prompt. Sweeping
     PIE_ATTN_SCORE_WINDOW over 16/32/64/128 moves the observed mass profile in

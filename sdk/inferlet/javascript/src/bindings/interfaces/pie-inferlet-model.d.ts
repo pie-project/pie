@@ -36,11 +36,11 @@ export function passKind(): ForwardKind;
  * tokenizer's vocabs() token count due to padding. Use THIS for
  * sampler-program lowering and any logits-shaped op; use vocabs() only for
  * token-space work. Sourced from the model (not hardcoded) so the
- * inferlet's lowering vocab == the driver's logits / recognizer-table vocab.
+ * inferlet's lowering vocab == the engine's logits / recognizer-table vocab.
  */
 export function outputVocabSize(): number;
 /**
- * Tokens per KV page for the bound model/driver.
+ * Tokens per KV page for the bound model/engine.
  */
 export function kvPageSize(): number;
 /**
@@ -76,7 +76,7 @@ export function channelCapacity(): number;
 export function maxEmbedLength(): number;
 /**
  * ── Working-set / arena capabilities (global, over the bound model) ──
- * Memory-shaping parameters of the bound model's driver, so an inferlet
+ * Memory-shaping parameters of the bound model's engine, so an inferlet
  * can size working sets and validate fold lengths before allocating.
  * Size in bytes of one folded recurrent-state object. 0 if the model has
  * no recurrent state (pure attention).

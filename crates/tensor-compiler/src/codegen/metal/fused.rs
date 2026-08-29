@@ -30,16 +30,16 @@ fn value_ptr(value: u32) -> String {
 }
 
 /// Threads a grouped region's threadgroup gets per lane. The emitted kernel
-/// sizes its threadgroup reduction buffer to this; the driver launches the
+/// sizes its threadgroup reduction buffer to this; the engine launches the
 /// narrower of it and the pipeline's own maxTotalThreadsPerThreadgroup, and
 /// the kernel faults `0xB3` on a wider launch rather than reading past the
 /// buffer.
 ///
-/// It must not be transcribed on the driver side: a hand-kept copy carrying a
+/// It must not be transcribed on the engine side: a hand-kept copy carrying a
 /// "must equal" comment has nothing comparing the two, and the failure mode is
 /// a threadgroup sized for one count reducing over a buffer built for another.
 /// This was published as `PTIR_METAL_M3_REGION_THREADS` in the generated
-/// `ptir_abi.h` while the driver was C++; the Rust `driver-metal` reads this
+/// `ptir_abi.h` while the driver was C++; the Rust `engine-metal` reads this
 /// constant itself, and `grouped.rs` asserts its mirror against it.
 ///
 /// 512 measured against 256 with the model DAG truncated away, interleaved to
@@ -168,7 +168,7 @@ pub fn emit_grouped_fused_region(
     // A lane owns a threadgroup rather than a thread. Everything the region does
     // still happens once per lane -- ops that cannot be partitioned run on thread
     // 0 -- but the ones that walk the whole vocabulary split across it. The
-    // driver picks the actual width from the pipeline's own limit and passes it
+    // engine picks the actual width from the pipeline's own limit and passes it
     // in `m3_threads`; this array only has to be big enough for the largest it
     // will ever ask for.
     let _ = writeln!(
@@ -197,7 +197,7 @@ pub fn emit_grouped_fused_region(
          reinterpret_cast<device M1Status*>(lane.commit_slot);\n",
     );
     source.push_str("  if (status->state != 1) return;\n");
-    // The threadgroup buffer above is sized for this width and the driver asks
+    // The threadgroup buffer above is sized for this width and the engine asks
     // for no more than it, so a wider launch would read past the buffer. Say so
     // rather than doing it.
     let _ = writeln!(

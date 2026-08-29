@@ -152,7 +152,7 @@ pub struct DeviceProfile {
     /// EMPTY IS THE HONEST DEFAULT, not a claim that no such op exists: a
     /// compiler with no device in the room cannot know which entries a
     /// backend's kernels reach a shared slab through. The CUDA shell passes
-    /// `driver_cuda::EXCLUSIVE`; a golden-path walk that never launches
+    /// `engine_cuda::EXCLUSIVE`; a golden-path walk that never launches
     /// anything needs nothing here.
     pub exclusive: Vec<String>,
 
@@ -189,7 +189,7 @@ pub struct DeviceProfile {
 /// What one launch of each op family costs at fire scale, in microseconds.
 ///
 /// **AN ESTIMATE, STATED AS ONE.** A compiler cannot know a fire's
-/// composition — which windows have rows is the batch the engine happened to
+/// composition — which windows have rows is the batch the runtime happened to
 /// assemble — so it cannot know what a region will actually cost. What it can
 /// know is the CHARACTER of the ops in it, which is the same thing tart's
 /// green-context finding turns on: attention and GEMM are the fat, divergent

@@ -1,18 +1,23 @@
 //! Pie standalone server config — TOML schema mirror of `pie.config`.
 //!
-//! Same TOML the legacy Python server consumed. Embedded drivers
-//! ([`DriverKind::CudaNative`] / [`DriverKind::Metal`] / [`DriverKind::Wgpu`])
-//! are dispatched in [`crate::engine::start_engine`] via
+//! Same TOML the legacy Python server consumed. Embedded engines
+//! ([`EngineKind::CudaNative`] / [`EngineKind::Metal`] / [`EngineKind::Wgpu`])
+//! are dispatched in [`crate::runtime::start_runtime`] via
 //! [`crate::preflight::resolve_flavor`].
 //!
 //! The Rust [`Config`] type below is the user-facing TOML schema; the
-//! conversion to `::engine::bootstrap::Config` (the runtime's own config)
+//! conversion to `::runtime::bootstrap::Config` (the runtime's own config)
 //! happens in [`crate::translate`].
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
 use controller_api::Role;
+// **THE RUN-AHEAD DEPTHS COME FROM THE ENGINE'S OWN MODULE** (alto design §9,
+// article 8). This crate used to hold `UPLOAD_STAGING_DEPTH = 13`, a literal
+// transcribed out of a deleted C++ header, and bound the deployment's depths
+// against it. The formula lives in one place now and this file reads it.
+pub use engine::runahead::Runahead;
 use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------------
@@ -28,9 +33,13 @@ pub struct Config {
     /// OpenTelemetry export. Off by default.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
-    /// Tokio + wasmtime tuning and the sandbox an inferlet runs in.
+    /// Batching and timeout policy. Every field has a measured default; the
+    /// frame knobs are part of the guest contract.
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// The box an inferlet runs in: what it may reach, and how big it may get.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
     /// Distributed-cluster topology (controller + role + gateways). Absent, or
     /// `controller` unset ⇒ single-node (gateway-free local inference).
     #[serde(default)]
@@ -55,7 +64,7 @@ impl Config {
     /// The file's sections are not this struct's fields -- see
     /// [`crate::config_layout`] for why and for the mapping. Reshaping first
     /// means everything below still sees the shape it was written against, and
-    /// the driver options still land in a `deny_unknown_fields` struct.
+    /// the engine options still land in a `deny_unknown_fields` struct.
     pub fn parse(s: &str) -> Result<Self> {
         let file: toml::Table = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
@@ -89,6 +98,7 @@ impl Config {
         self.model.validate()?;
         self.server.validate()?;
         self.runtime.validate()?;
+        self.sandbox.validate()?;
         self.cluster.validate()?;
         self.executor.validate()?;
         self.offload.validate()?;
@@ -422,7 +432,7 @@ pub struct ServerConfig {
     /// Port the client edge binds.
     #[serde(default = "default_port")]
     pub port: u16,
-    /// Verbose engine logging, and passed down to the embedded driver.
+    /// Verbose server logging, and passed down to the embedded engine.
     /// Independent of `--log-level`, which sets the tracing filter.
     #[serde(default)]
     pub verbose: bool,
@@ -430,31 +440,28 @@ pub struct ServerConfig {
     /// program it is asked to run but does not have.
     #[serde(default = "default_registry")]
     pub registry: String,
-    /// Hard cap on inferlets admitted at once. **Omit to derive it** from the
-    /// driver's `max_forward_requests`, which is what fills a batch.
+    /// Tokio worker threads. Derived from the visible CPUs, capped at 64.
     ///
-    /// A physical safety limit, not a scheduling knob: past the point where
-    /// every batch is full, more concurrent processes add queueing and not
-    /// throughput.
-    #[serde(default)]
-    pub max_concurrent_processes: Option<usize>,
-    /// Apply the host-side snapshot optimization to Python components.
-    ///
-    /// On by default. It only affects bootstrap cost, so turning it off is a
-    /// debugging step -- it changes which wasmtime linker variant is built.
-    #[serde(default = "default_true")]
-    pub python_snapshot: bool,
+    /// The cap is measured, not arbitrary: past ~64 the runtime's own
+    /// scheduling overhead adds variance without adding parallelism (on a
+    /// 256-thread EPYC 7773X, +0.5% mean tok/s and about triple the stdev
+    /// without it). Raise it only for heavy non-inference work in-process.
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
+    /// Largest blob a client may upload in one request.
+    #[serde(default = "default_max_upload")]
+    pub max_upload: ByteSize,
     /// Ask this boot to measure the memory planner instead of scoring it.
     ///
     /// Set by `pie config tune` on the config it derives in memory, never
     /// read from a file — `#[serde(skip)]`, so it cannot be written down and
     /// cannot outlive the boot that asked for it. See
-    /// [`CudaNativeDriverOptions::calibrate_planner`] for why a measurement
+    /// [`CudaNativeEngineOptions::calibrate_planner`] for why a measurement
     /// must not be a persisted setting.
     ///
-    /// It rides here rather than in `[model.driver.options]` because that table
+    /// It rides here rather than in `[model.engine.options]` because that table
     /// is the file's, and this never comes from the file. Same route as
-    /// `verbose`: a typed field the engine applies to whatever driver options it
+    /// `verbose`: a typed field the server applies to whatever engine options it
     /// builds.
     #[serde(skip)]
     pub calibrate_planner: bool,
@@ -467,8 +474,8 @@ impl Default for ServerConfig {
             port: default_port(),
             verbose: false,
             registry: default_registry(),
-            max_concurrent_processes: None,
-            python_snapshot: true,
+            worker_threads: default_worker_threads(),
+            max_upload: default_max_upload(),
             calibrate_planner: false,
         }
     }
@@ -476,9 +483,11 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     fn validate(&self) -> Result<()> {
-        if let Some(n) = self.max_concurrent_processes {
-            ensure!(n > 0, "runtime.max_concurrent_processes must be > 0 if set");
-        }
+        ensure!(self.worker_threads > 0, "server.worker_threads must be > 0");
+        ensure!(
+            self.max_upload.as_bytes() > 0,
+            "server.max_upload must be > 0"
+        );
         Ok(())
     }
 }
@@ -494,6 +503,21 @@ fn default_registry() -> String {
 }
 fn default_true() -> bool {
     true
+}
+fn default_worker_threads() -> usize {
+    // Cap at 64 — pie's scheduler produces enough concurrent host work
+    // at high request concurrency. Beyond ~64 workers the runtime's
+    // scheduling overhead (queue management, wake propagation) starts
+    // adding variance without adding parallelism. Measured on AMD EPYC
+    // 7773X (256 threads visible): tok/s mean +0.5%, stdev cut to ~1/3
+    // by capping. Users with heavier non-inference work in the same
+    // process can override via `[server] worker_threads = ...`.
+    std::thread::available_parallelism()
+        .map(|n| n.get().min(64))
+        .unwrap_or(4)
+}
+fn default_max_upload() -> ByteSize {
+    ByteSize::from_mib(256)
 }
 
 // -----------------------------------------------------------------------------
@@ -532,35 +556,17 @@ fn default_service_name() -> String {
 }
 
 // -----------------------------------------------------------------------------
-// [runtime]
+// [sandbox]
 // -----------------------------------------------------------------------------
 
+/// The box an inferlet runs in: its walls and its size.
+///
+/// The `wasm_` prefix the size knobs carried is gone. The section already says
+/// which box these size, and a prefix on every key of a section is the same
+/// dead weight `worker.` was on every key of the file.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuntimeConfig {
-    /// Tokio worker threads. Derived from the visible CPUs, capped at 64.
-    ///
-    /// The cap is measured, not arbitrary: past ~64 the runtime's own
-    /// scheduling overhead adds variance without adding parallelism (on a
-    /// 256-thread EPYC 7773X, +0.5% mean tok/s and about triple the stdev
-    /// without it). Raise it only for heavy non-inference work in-process.
-    #[serde(default = "default_worker_threads")]
-    pub worker_threads: usize,
-    /// Instances the wasmtime pooling allocator may hold. A ceiling on
-    /// concurrent inferlets, reserved up front.
-    #[serde(default = "default_wasm_max_instances")]
-    pub wasm_max_instances: u32,
-    /// Linear memory one instance may address.
-    #[serde(default = "default_wasm_max_memory")]
-    pub wasm_max_memory: ByteSize,
-    /// Linear memory kept resident when an instance is returned to the pool,
-    /// rather than decommitted. Trades RSS for a cheaper next start; `0B`
-    /// keeps none.
-    #[serde(default)]
-    pub wasm_warm_memory: ByteSize,
-    /// Unused pool slots kept warm rather than torn down.
-    #[serde(default = "default_wasm_warm_slots")]
-    pub wasm_warm_slots: u32,
+pub struct SandboxConfig {
     /// Give each inferlet a private `/scratch` with read-write access.
     /// Off by default: nothing else in the sandbox reaches a filesystem.
     #[serde(default)]
@@ -580,66 +586,63 @@ pub struct RuntimeConfig {
     /// constrain it -- use `allow_network = false` when that matters.
     #[serde(default = "default_network_allowed_hosts")]
     pub network_allowed_hosts: Vec<String>,
-    /// Largest blob a client may upload in one request.
-    #[serde(default = "default_max_upload")]
-    pub max_upload: ByteSize,
+    /// Instances the wasmtime pooling allocator may hold. A ceiling on
+    /// concurrent inferlets, reserved up front.
+    #[serde(default = "default_max_instances")]
+    pub max_instances: u32,
+    /// Linear memory one instance may address.
+    #[serde(default = "default_max_memory")]
+    pub max_memory: ByteSize,
+    /// Linear memory kept resident when an instance is returned to the pool,
+    /// rather than decommitted. Trades RSS for a cheaper next start; `0B`
+    /// keeps none.
+    #[serde(default)]
+    pub warm_memory: ByteSize,
+    /// Unused pool slots kept warm rather than torn down.
+    #[serde(default = "default_warm_slots")]
+    pub warm_slots: u32,
+    /// Apply the host-side snapshot optimization to Python components.
+    ///
+    /// On by default. It only affects bootstrap cost, so turning it off is a
+    /// debugging step -- it changes which wasmtime linker variant is built.
+    #[serde(default = "default_true")]
+    pub python_snapshot: bool,
 }
 
-impl Default for RuntimeConfig {
+impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            worker_threads: default_worker_threads(),
-            wasm_max_instances: default_wasm_max_instances(),
-            wasm_max_memory: default_wasm_max_memory(),
-            wasm_warm_memory: ByteSize::from_mib(0),
-            wasm_warm_slots: default_wasm_warm_slots(),
             allow_fs: false,
             fs_scratch_dir: default_fs_scratch_dir(),
             allow_network: true,
             network_allowed_hosts: default_network_allowed_hosts(),
-            max_upload: default_max_upload(),
+            max_instances: default_max_instances(),
+            max_memory: default_max_memory(),
+            warm_memory: ByteSize::from_mib(0),
+            warm_slots: default_warm_slots(),
+            python_snapshot: true,
         }
     }
 }
 
-impl RuntimeConfig {
+impl SandboxConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(self.worker_threads > 0, "server.worker_threads must be > 0");
+        ensure!(self.max_instances > 0, "sandbox.max_instances must be > 0");
         ensure!(
-            self.wasm_max_instances > 0,
-            "sandbox.max_instances must be > 0"
-        );
-        ensure!(
-            self.wasm_max_memory.as_bytes() > 0,
+            self.max_memory.as_bytes() > 0,
             "sandbox.max_memory must be > 0"
-        );
-        ensure!(
-            self.max_upload.as_bytes() > 0,
-            "server.max_upload must be > 0"
         );
         Ok(())
     }
 }
 
-fn default_worker_threads() -> usize {
-    // Cap at 64 — pie's scheduler produces enough concurrent host work
-    // at high request concurrency. Beyond ~64 workers the runtime's
-    // scheduling overhead (queue management, wake propagation) starts
-    // adding variance without adding parallelism. Measured on AMD EPYC
-    // 7773X (256 threads visible): tok/s mean +0.5%, stdev cut to ~1/3
-    // by capping. Users with heavier non-inference work in the same
-    // process can override via `[runtime] worker_threads = ...`.
-    std::thread::available_parallelism()
-        .map(|n| n.get().min(64))
-        .unwrap_or(4)
-}
-fn default_wasm_max_instances() -> u32 {
+fn default_max_instances() -> u32 {
     1000
 }
-fn default_wasm_max_memory() -> ByteSize {
+fn default_max_memory() -> ByteSize {
     ByteSize::from_mib(4096)
 }
-fn default_wasm_warm_slots() -> u32 {
+fn default_warm_slots() -> u32 {
     100
 }
 fn default_fs_scratch_dir() -> PathBuf {
@@ -647,9 +650,6 @@ fn default_fs_scratch_dir() -> PathBuf {
 }
 fn default_network_allowed_hosts() -> Vec<String> {
     vec!["*".to_string()]
-}
-fn default_max_upload() -> ByteSize {
-    ByteSize::from_mib(256)
 }
 
 // -----------------------------------------------------------------------------
@@ -664,60 +664,38 @@ pub struct ModelConfig {
     pub name: String,
     /// What to serve: a store name (`Qwen--Qwen3-0.6B`, as `pie model list`
     /// prints it) or a path to a `.zt` artifact. See `weights::resolve`.
-    ///
-    /// Named `hf_repo` until the store existed, and still accepted under that
-    /// name — the struct is `deny_unknown_fields`, so a bare rename would greet
-    /// an existing config with *unknown field `hf_repo`* and *missing field
-    /// `model`* at bootstrap rather than with a working boot.
-    #[serde(alias = "hf_repo")]
     pub model: String,
     /// Which backend runs the model, on what devices.
-    pub driver: DriverConfig,
-    /// Batching and timeout policy. Every field has a measured default; the
-    /// frame knobs are part of the guest contract.
-    #[serde(default)]
-    pub scheduler: SchedulerConfig,
+    pub engine: EngineConfig,
     /// Where this model's materialized-weight artifacts are kept between runs.
     ///
     /// Per-model rather than process-global because the artifact IS the model:
-    /// it is that checkpoint's weights, already laid out for this driver, and
+    /// it is that checkpoint's weights, already laid out for this engine, and
     /// none of it is shared with another model. Empty derives
-    /// `$PIE_HOME/cache/weights` -- a cache, beside the driver's other ones.
+    /// `$PIE_HOME/cache/weights` -- a cache, beside the engine's other ones.
     /// NOT `$PIE_HOME/models`, which is the `.zt` artifact store: an artifact
     /// is portable and costs a re-download to replace, while these are device
-    /// bytes for one driver, one TP layout and one ABI version, rebuilt by a
+    /// bytes for one engine, one TP layout and one ABI version, rebuilt by a
     /// single cold load.
     ///
     /// The artifacts are the size of the weights -- tens to hundreds of GB --
-    /// which is why this is a path pie cannot always pick for you. The driver
+    /// which is why this is a path pie cannot always pick for you. The engine
     /// declines a write it has no room for rather than filling the disk.
     #[serde(default)]
     pub weight_cache_dir: String,
-    /// How many KV pages the driver opens its pool with. `None` is the
-    /// backend's own default.
+    /// Dtype weights are materialized in. Separate from `activation_dtype`:
+    /// narrower weights and wider compute is a normal combination.
     ///
-    /// # Why it is declared here and read somewhere else
-    ///
-    /// It is not used by this struct at all. `driver-vulkan`'s and
-    /// `driver-wgpu`'s backends both parse `[model] kv_pages` out of the RAW
-    /// config bytes -- neither has this type in scope -- and both document it
-    /// in those words: "a number the boot config can override".
-    ///
-    /// It could not be overridden. This struct is `deny_unknown_fields`, so
-    /// the key those two backends read was rejected by the deserializer
-    /// before either of them saw the bytes:
-    ///
-    /// ```text
-    ///   unknown field `kv_pages`, expected one of `name`, `hf_repo`,
-    ///   `model`, `driver`, `scheduler`, `weight_cache_dir`
-    /// ```
-    ///
-    /// So this field exists to be ACCEPTED. That is a real job under
-    /// `deny_unknown_fields`, and the alternative -- dropping the denial --
-    /// would silently swallow every typo in the table. Declaring the key that
-    /// somebody else reads is the narrow version of the same permission.
-    #[serde(default)]
-    pub kv_pages: Option<u32>,
+    /// A model fact rather than an engine one -- it is what the checkpoint
+    /// holds -- which is why it sits here and `activation_dtype` and
+    /// `kv_cache_dtype`, the dtypes the engine computes and stores in, sit in
+    /// `[engine]`.
+    #[serde(default = "default_weight_dtype")]
+    pub weight_dtype: String,
+}
+
+fn default_weight_dtype() -> String {
+    "bfloat16".to_string()
 }
 
 impl ModelConfig {
@@ -731,11 +709,10 @@ impl ModelConfig {
             "model.model must name a stored artifact or a path to one \
              (`pie model list` shows what is available)"
         );
-        self.driver.validate()?;
-        self.scheduler.validate()?;
-        // Relative resolves against the driver's working directory, which the
-        // operator did not choose and which differs between the worker and a
-        // driver launched as its own process.
+        self.engine.validate()?;
+        // Relative resolves against the engine's working directory, which the
+        // operator did not choose and which differs between the worker and an
+        // engine launched as its own process.
         ensure!(
             self.weight_cache_dir.is_empty() || Path::new(&self.weight_cache_dir).is_absolute(),
             "model.weight_cache_dir must be an absolute path (got {:?}); \
@@ -747,13 +724,13 @@ impl ModelConfig {
 }
 
 // -----------------------------------------------------------------------------
-// [model.scheduler]
+// [runtime]
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct SchedulerConfig {
-    /// How long a client request may run before the engine gives up on it.
+pub struct RuntimeConfig {
+    /// How long a client request may run before the runtime gives up on it.
     ///
     /// The outermost of the three clocks here and the only one about the
     /// client rather than the pipeline: `submit_deadline` leashes a straggler
@@ -762,7 +739,7 @@ pub struct SchedulerConfig {
     #[serde(default = "default_request_timeout")]
     pub request_timeout: Duration,
     /// How long a pipeline that is HARD-BLOCKING a frame's seal may go
-    /// without submitting before the engine stops waiting for it, in
+    /// without submitting before the runtime stops waiting for it, in
     /// microseconds.
     ///
     /// This does not fail the pipeline. At the deadline the lane is dropped
@@ -777,10 +754,10 @@ pub struct SchedulerConfig {
     /// Small (50ms) because it measures a much narrower interval than its size
     /// suggests. The clock runs only while the lane is an awaited member with
     /// nothing submitted — it is stopped by run-ahead (a lane with a queued
-    /// frame is not blocking), by an unretired dispatch (the engine owes it a
+    /// frame is not blocking), by an unretired dispatch (the runtime owes it a
     /// result, so the whole GPU wave is free), by a bind in flight, and by
     /// `forward.park()`. The host resubmit round trip already has its own
-    /// headroom in [`SchedulerConfig::frame_submit_depth`].
+    /// headroom in [`RuntimeConfig::frame_submit_depth`].
     ///
     /// Measured: on the contention suite a breach happens roughly once in
     /// several thousand requests, and when it does the lane is 0.1-3ms over
@@ -791,7 +768,7 @@ pub struct SchedulerConfig {
     #[serde(default = "default_submit_deadline")]
     pub submit_deadline: Duration,
     /// How long a lane may stay silent in total — through the leash above and
-    /// on past it — before the engine terminates its process, in seconds.
+    /// on past it — before the runtime terminates its process, in seconds.
     ///
     /// This one IS a verdict, so it is generous. A pipeline that means to go
     /// quiet calls `forward.park()`, which ends the silence and is never
@@ -801,7 +778,7 @@ pub struct SchedulerConfig {
     #[serde(default = "default_silence_timeout")]
     pub silence_timeout: Duration,
     /// Waves per frame (*k*): how many token steps the wait-all quorum admits
-    /// before it runs. A deployment constant, fixed at engine start exactly
+    /// before it runs. A deployment constant, fixed at runtime start exactly
     /// like the KV page size — never renegotiated per frame, never adapted
     /// from runtime timing. Guests read it as `model.frame-size()` and size
     /// their frames and channels to it, so it is part of the guest contract.
@@ -812,12 +789,12 @@ pub struct SchedulerConfig {
     /// 28% latency at concurrency 256. k=2 halves the number of quorum
     /// boundaries and holds duty at 1.6 with no regression at any lower
     /// concurrency. k=3 and k=4 measure the same as k=2 while costing more
-    /// driver staging depth (CONTENTION_FOLLOWUP §20.8).
+    /// engine staging depth (CONTENTION_FOLLOWUP §20.8).
     ///
-    /// Bounded above by the CUDA driver, not by taste — see [`Self::validate`].
+    /// Bounded above by the CUDA engine, not by taste — see [`Self::validate`].
     #[serde(default = "default_frame_size")]
     pub frame_size: u32,
-    /// Frames a guest keeps submitted into the engine: one running, plus the
+    /// Frames a guest keeps submitted into the runtime: one running, plus the
     /// rest queued behind it so the device always has work while the guest is
     /// back on the host deciding what to submit next. Too few and the pipeline collapses
     /// to lockstep — submit, wait, submit, wait — because the host resubmit
@@ -833,13 +810,13 @@ pub struct SchedulerConfig {
     /// Guests never read this directly — they get `model.channel-capacity()`,
     /// which is derived from it — so it can move without touching the guest
     /// contract. Not to be confused with `frame_dispatch_depth`, which is the
-    /// engine running ahead of the DRIVER rather than the guest running ahead
-    /// of the engine.
+    /// runtime running ahead of the ENGINE rather than the guest running ahead
+    /// of the runtime.
     #[serde(default = "default_frame_submit_depth")]
     pub frame_submit_depth: u32,
-    /// Frames the engine keeps POSTED to the driver but not yet retired: the
+    /// Frames the runtime keeps POSTED to the engine but not yet retired: the
     /// dispatch loop's enqueue horizon. Where `frame_submit_depth` is the
-    /// guest running ahead of the engine, this is the engine running ahead of
+    /// guest running ahead of the runtime, this is the runtime running ahead of
     /// the device, and it is what keeps the GPU from idling between frames —
     /// at 2 one frame executes while the next is already uploaded.
     ///
@@ -853,12 +830,20 @@ pub struct SchedulerConfig {
     /// two costs dominate: measured 610ms at depth 1 against 1034ms at depth 2
     /// on a pure-attention model, 8 lanes, ~29 of 32 rows per launch.
     ///
-    /// Bounded jointly with `frame_size` by the driver — see [`Self::validate`].
+    /// Bounded jointly with `frame_size` by the engine — see [`Self::validate`].
     #[serde(default = "default_frame_dispatch_depth")]
     pub frame_dispatch_depth: u32,
+    /// Hard cap on inferlets admitted at once. **Omit to derive it** from the
+    /// engine's `max_forward_requests`, which is what fills a batch.
+    ///
+    /// A physical safety limit, not a scheduling knob: past the point where
+    /// every batch is full, more concurrent processes add queueing and not
+    /// throughput.
+    #[serde(default)]
+    pub max_concurrent_processes: Option<usize>,
 }
 
-impl Default for SchedulerConfig {
+impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             request_timeout: default_request_timeout(),
@@ -867,76 +852,79 @@ impl Default for SchedulerConfig {
             frame_size: default_frame_size(),
             frame_submit_depth: default_frame_submit_depth(),
             frame_dispatch_depth: default_frame_dispatch_depth(),
+            max_concurrent_processes: None,
         }
     }
 }
 
-/// Pinned upload staging slots the CUDA driver allocates, mirroring
-/// `kUploadStagingDepth` in `crates/driver-cuda/csrc/src/runahead.hpp` (there:
-/// `kSchedulerMaxInFlight * kMaxPipelinedFrameSize + 1` = 3 * 4 + 1).
-///
-/// The driver stages per STEP, not per frame, and one frame carries up to
-/// `frame_size` steps — so the engine's steps in flight are
-/// `frame_dispatch_depth * frame_size` and the pool must strictly EXCEED
-/// them. A pool sized exactly to peak occupancy has every slot pending when
-/// the next submit arrives, so the acquire blocks in `cudaEventSynchronize`
-/// for a full GPU step (~1.6ms measured on the 4090 c64 decode workload).
-///
-/// Exceeding it is never a memory error — the pools are fixed arrays, so a
-/// submit simply waits for a slot and every submit re-serializes with no
-/// diagnostic at all. That silence is why this is rejected here rather than
-/// clamped: the config layer is the only place it can be caught.
-/// Public because `pie config tune` enumerates knob candidates against
-/// this bound rather than generating combinations the engine will refuse --
-/// and a second copy of the number is exactly the disagreement this
-/// constant's own doc warns about.
-pub const UPLOAD_STAGING_DEPTH: u32 = 13;
 
-impl SchedulerConfig {
+impl RuntimeConfig {
     fn validate(&self) -> Result<()> {
         ensure!(
             self.request_timeout.as_micros() > 0,
-            "scheduler.request_timeout must be > 0"
+            "runtime.request_timeout must be > 0"
         );
         ensure!(
             self.submit_deadline.as_micros() > 0,
-            "scheduler.submit_deadline must be > 0"
+            "runtime.submit_deadline must be > 0"
         );
         ensure!(
             self.silence_timeout.as_micros() > 0,
-            "scheduler.silence_timeout must be > 0"
+            "runtime.silence_timeout must be > 0"
         );
         ensure!(
             self.silence_timeout >= self.submit_deadline,
-            "scheduler.silence_timeout must not be shorter than submit_deadline: \
+            "runtime.silence_timeout must not be shorter than submit_deadline: \
              a kill that lands before the leash would fail guests the leash exists to spare"
         );
-        ensure!(self.frame_size >= 1, "scheduler.frame_size must be >= 1");
+        ensure!(self.frame_size >= 1, "runtime.frame_size must be >= 1");
         ensure!(
             self.frame_dispatch_depth >= 1,
-            "scheduler.frame_dispatch_depth must be >= 1"
+            "runtime.frame_dispatch_depth must be >= 1"
         );
         ensure!(
             self.frame_submit_depth >= 2,
-            "scheduler.frame_submit_depth must be at least 2: one frame runs while the rest \
+            "runtime.frame_submit_depth must be at least 2: one frame runs while the rest \
              stay queued, so a value of 1 leaves nothing queued and puts the host resubmit \
              round trip back in the critical path — the lockstep this window exists to prevent"
         );
-        // The driver coupling. Checked as the product rather than as a cap on
-        // each factor, which is both correct and less restrictive: what the
-        // staging pool sees is steps, and it cannot tell 2 frames of 3 steps
-        // from 3 frames of 2.
-        let steps_in_flight = self.frame_dispatch_depth * self.frame_size;
+        // ── THE ENGINE COUPLING, DERIVED RATHER THAN TRANSCRIBED (alto F2b).
+        //
+        // What stood here was a product checked against `UPLOAD_STAGING_DEPTH
+        // = 13` — a literal copied out of a C++ header this tree deleted,
+        // whose derivation (`3 × 4 + 1`) existed nowhere in the source. The
+        // formula is `engine::runahead::Runahead`'s now, the engine's staging
+        // ring is CARVED from these two numbers rather than fixed at thirteen,
+        // and so the check is no longer "does the product fit a constant" but
+        // "are these two numbers ones the engine can size a ring from".
+        //
+        // Two bounds, one per factor, because they bound different things:
+        // `frame_size` is `k` in the staging formula and `frame_dispatch_depth`
+        // is the multiplier. The multiplier's ceiling is a fact about the
+        // engine's free-slot word (`Runahead::MAX_FRAMES`, see its doc), and
+        // `k`'s is the frame scheduler's own `STEPS_MAX`.
         ensure!(
-            steps_in_flight < UPLOAD_STAGING_DEPTH,
-            "scheduler.frame_dispatch_depth * frame_size must be < {UPLOAD_STAGING_DEPTH} \
-             (got {} * {} = {steps_in_flight}): the CUDA driver stages one pinned upload slot \
-             per STEP and allocates {UPLOAD_STAGING_DEPTH} of them, so at or above that every \
-             submit blocks waiting for a slot and re-serializes with no error reported \
-             (kUploadStagingDepth in crates/driver-cuda/csrc/src/runahead.hpp)",
-            self.frame_dispatch_depth,
+            self.frame_size <= u32::from(Runahead::STEPS_MAX),
+            "runtime.frame_size must be at most {} (got {}): it is `k` in the engine's \
+             staging formula `frames_in_flight * k + 1`, and the frame scheduler was \
+             built and measured around that bound \
+             (`engine::runahead::Runahead::STEPS_MAX`)",
+            Runahead::STEPS_MAX,
             self.frame_size
         );
+        ensure!(
+            self.frame_dispatch_depth <= u32::from(Runahead::MAX_FRAMES),
+            "runtime.frame_dispatch_depth must be at most {} (got {}): the engine \
+             publishes its staging ring's free set as one 64-bit word, and \
+             `frames_in_flight * {} + 1` must fit in it \
+             (`engine::runahead::Runahead::MAX_FRAMES`)",
+            Runahead::MAX_FRAMES,
+            self.frame_dispatch_depth,
+            Runahead::STEPS_MAX
+        );
+        if let Some(n) = self.max_concurrent_processes {
+            ensure!(n > 0, "runtime.max_concurrent_processes must be > 0 if set");
+        }
         Ok(())
     }
 }
@@ -966,19 +954,19 @@ fn default_frame_dispatch_depth() -> u32 {
 }
 
 // -----------------------------------------------------------------------------
-// [model.driver]
+// [model.engine]
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)] // forwarded to the embedded driver via TOML; not all
+#[allow(dead_code)] // forwarded to the embedded engine via TOML; not all
 // fields are read on the Rust side yet.
-pub struct DriverConfig {
-    /// Which driver hosts this model. `cuda_native` is the one this build
+pub struct EngineConfig {
+    /// Which engine hosts this model. `cuda_native` is the one this build
     /// runs; `metal`, `vulkan` and `wgpu` are accepted spellings that boot
-    /// refuses by name until their drivers return.
+    /// refuses by name until their engines return.
     #[serde(rename = "type")]
-    pub kind: DriverKind,
+    pub kind: EngineKind,
     /// Single string or list of strings — both accepted on input.
     #[serde(deserialize_with = "deserialize_string_or_list")]
     pub device: Vec<String>,
@@ -994,22 +982,55 @@ pub struct DriverConfig {
     /// with different seeds do not trade cached weight layouts.
     #[serde(default = "default_random_seed")]
     pub random_seed: u64,
-    /// Driver-specific knobs. Embedded drivers parse this into typed
+    /// How many KV pages the engine opens its pool with. `None` is the
+    /// backend's own default.
+    ///
+    /// # Why it is declared here and read somewhere else
+    ///
+    /// It is not used by this struct at all. `engine-vulkan`'s and
+    /// `engine-wgpu`'s backends both parse it out of the RAW config bytes --
+    /// neither has this type in scope -- and both document it in those words:
+    /// "a number the boot config can override".
+    ///
+    /// It could not be overridden. The struct that carried the key is
+    /// `deny_unknown_fields`, so the key those two backends read was rejected
+    /// by the deserializer before either of them saw the bytes.
+    ///
+    /// So this field exists to be ACCEPTED. That is a real job under
+    /// `deny_unknown_fields`, and the alternative -- dropping the denial --
+    /// would silently swallow every typo in the table. Declaring the key that
+    /// somebody else reads is the narrow version of the same permission.
+    #[serde(default)]
+    pub kv_pages: Option<u32>,
+    /// How long to wait for the engine's caps handshake before giving up.
+    /// Generous because it covers loading and laying out the weights.
+    #[serde(default = "default_ready_timeout")]
+    pub ready_timeout: Duration,
+    /// How long to wait for the engine to drain before abandoning it.
+    #[serde(default = "default_shutdown_timeout")]
+    pub shutdown_timeout: Duration,
+    /// Engine-specific knobs. Embedded engines parse this into typed
     /// option structs.
     #[serde(default)]
     pub options: toml::Table,
 }
 
-impl DriverConfig {
+impl EngineConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(!self.device.is_empty(), "driver.device must be non-empty");
+        ensure!(!self.device.is_empty(), "engine.device must be non-empty");
         match self.kind {
-            DriverKind::CudaNative => {
-                let opts: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
+            EngineKind::CudaNative => {
+                let opts: CudaNativeEngineOptions = toml::Value::Table(self.options.clone())
                     .try_into()
                     .map_err(|e| {
+                        // `[engine]`, not `model.engine.options`: the operator
+                        // wrote a file, and the file spells these as plain
+                        // `[engine]` keys. The internal path is what
+                        // `config_layout::reshape` produced from it, and
+                        // naming it here sends the reader looking for a table
+                        // their config does not contain.
                         anyhow::anyhow!(
-                            "invalid [model.driver.options] for driver type {:?}: {e}",
+                            "invalid [engine] options for engine type {:?}: {e}",
                             self.kind,
                         )
                     })?;
@@ -1017,10 +1038,10 @@ impl DriverConfig {
                 validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
             // NOTHING TO CHECK, because there is no schema left to check
-            // against: the three option tables went with the drivers that
+            // against: the three option tables went with the engines that
             // read them. The kind itself is still refused, by name and
-            // once, at `driver_ffi::Flavor::from_kind`.
-            DriverKind::Metal | DriverKind::Vulkan | DriverKind::Wgpu => {}
+            // once, at `engine_ffi::Flavor::from_kind`.
+            EngineKind::Metal | EngineKind::Vulkan | EngineKind::Wgpu => {}
         }
         Ok(())
     }
@@ -1047,23 +1068,23 @@ fn validate_kv_cache_dtype(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Which driver a `[model.driver] type` names.
+/// Which engine a `[model.engine] type` names.
 ///
 /// THE LAST THREE ARE NAMED, NOT OFFERED, and no build flag changes that.
-/// Their drivers left the workspace at R3, so there is no `--features
-/// driver-metal|driver-vulkan|driver-wgpu` to rebuild with — the crates such
+/// Their engines left the workspace at R3, so there is no `--features
+/// engine-metal|engine-vulkan|engine-wgpu` to rebuild with — the crates such
 /// a feature would name are not members. The names stay so that a deployment
-/// asking for one is told what happened, by `driver_ffi::retired_msg`, rather
+/// asking for one is told what happened, by `engine_ffi::retired_msg`, rather
 /// than being told its config is malformed. They come back at P5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DriverKind {
-    /// Native CUDA driver — embedded as a static lib in `worker`
-    /// (requires `--features driver-cuda-13`).
+pub enum EngineKind {
+    /// Native CUDA engine — embedded as a static lib in `worker`
+    /// (requires `--features engine-cuda-13`).
     CudaNative,
-    /// Native MLX + Metal driver for Apple Silicon.
+    /// Native MLX + Metal engine for Apple Silicon.
     Metal,
-    /// Pure-Rust Vulkan driver: portable rather than vendor-specific, on
+    /// Pure-Rust Vulkan engine: portable rather than vendor-specific, on
     /// whatever Vulkan 1.3 device the machine exposes.
     Vulkan,
     /// The WebGPU shell — one binary over Vulkan, Metal, D3D12 or WebGPU,
@@ -1071,13 +1092,13 @@ pub enum DriverKind {
     Wgpu,
 }
 
-impl DriverKind {
+impl EngineKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            DriverKind::CudaNative => "cuda_native",
-            DriverKind::Metal => "metal",
-            DriverKind::Vulkan => "vulkan",
-            DriverKind::Wgpu => "wgpu",
+            EngineKind::CudaNative => "cuda_native",
+            EngineKind::Metal => "metal",
+            EngineKind::Vulkan => "vulkan",
+            EngineKind::Wgpu => "wgpu",
         }
     }
 }
@@ -1090,6 +1111,12 @@ fn default_activation_dtype() -> String {
 }
 fn default_random_seed() -> u64 {
     42
+}
+fn default_ready_timeout() -> Duration {
+    Duration::from_secs(600)
+}
+fn default_shutdown_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 /// Accept either a single string or a list of strings, matching
 /// `pie/config.py::_parse_driver`'s `device` handling.
@@ -1124,18 +1151,18 @@ where
 }
 
 // -----------------------------------------------------------------------------
-// Driver-specific options (typed views over `DriverConfig::options`)
+// Engine-specific options (typed views over `EngineConfig::options`)
 // -----------------------------------------------------------------------------
 
-/// `[model.driver.options]` for `type = "cuda_native"`.
+/// `[model.engine.options]` for `type = "cuda_native"`.
 /// Mirrors `pie/src/pie_driver_cuda_native/config.py::CudaNativeDriverConfig`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CudaNativeDriverOptions {
+pub struct CudaNativeEngineOptions {
     /// `[model] id`: the operator's answer to "which model is this".
     ///
-    /// Absent — the ordinary case — the driver identifies the checkpoint
-    /// from its TENSORS against the catalog every driver links. Present,
+    /// Absent — the ordinary case — the engine identifies the checkpoint
+    /// from its TENSORS against the catalog every engine links. Present,
     /// it names a row directly, for a checkpoint that is genuinely a
     /// known model under an unknown name: a fine-tune, a re-upload, a
     /// mirror that renamed the directory.
@@ -1154,17 +1181,17 @@ pub struct CudaNativeDriverOptions {
     /// `auto` to infer it, `latency` for few concurrent requests, or
     /// `throughput` for many.
     pub memory_profile: CudaMemoryProfile,
-    /// KV page size in tokens. **Omit to let the driver's memory planner
+    /// KV page size in tokens. **Omit to let the engine's memory planner
     /// derive one** by scoring candidates against the serving profile, which
     /// is what every deployment has been getting: this field reached the
-    /// driver but the planner never read it, so only the (now deleted)
+    /// engine but the planner never read it, so only the (now deleted)
     /// `PIE_CUDA_KV_PAGE_SIZE` could pin it. Setting it pins it, and the
     /// planner searches a single-candidate lattice.
     pub kv_page_size: Option<u32>,
     /// Dtype KV pages are stored in. `"auto"` follows the activation dtype;
     /// a narrower one buys pages at some accuracy.
     pub kv_cache_dtype: String,
-    /// Host-memory KV pages to swap into, reaching the driver as its
+    /// Host-memory KV pages to swap into, reaching the engine as its
     /// `cpu_pages`. `0` disables swapping.
     pub swap_pool_size: u32,
     /// HARD cap on the runtime KV page count. **Omit to derive it from
@@ -1192,21 +1219,21 @@ pub struct CudaNativeDriverOptions {
     ///
     /// Named for the same quantity Metal calls `max_forward_tokens`, because
     /// here they ARE the same quantity — unlike `total_pages`, where one name
-    /// covered two different things and this driver's field had to be renamed
+    /// covered two different things and this engine's field had to be renamed
     /// `max_total_pages` to break the collision.
     pub max_forward_tokens: Option<u32>,
     /// HARD pin on the decode width — how many requests one forward step may
     /// carry. **Omit to let the memory planner choose.**
     ///
-    /// Pinning this moves `[server] max_concurrent_processes` underneath you
-    /// when that key is absent: admission derives from the driver's request
+    /// Pinning this moves `[runtime] max_concurrent_processes` underneath you
+    /// when that key is absent: admission derives from the engine's request
     /// cap, so the two are one decision. Set both, or neither.
     pub max_forward_requests: Option<u32>,
     /// Measure the forward step on this boot instead of scoring it.
     ///
     /// The memory planner picks `max_forward_tokens` by scoring a candidate
     /// lattice with an analytic model, and where that model disagreed with
-    /// reality the driver grew per-(model, GPU) special cases carrying
+    /// reality the engine grew per-(model, GPU) special cases carrying
     /// hand-measured constants. Setting this times the real forward body across
     /// the budget ladder on THIS device and caches the winner, so the next boot
     /// selects by evidence instead.
@@ -1236,15 +1263,12 @@ pub struct CudaNativeDriverOptions {
     /// with a reason on stderr — see `batch/planner_calibration.hpp`.
     #[serde(skip)]
     pub calibrate_planner: bool,
-    /// Dtype weights are materialized in. Separate from `activation_dtype`:
-    /// narrower weights and wider compute is a normal combination.
-    pub weight_dtype: String,
     /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
-    /// from `model.driver.device`; set on the C++ side via
-    /// `cudaSetDevice` (see `crates/driver-cuda/csrc/src/engine.cpp`).
+    /// from `model.engine.device`; set on the C++ side via
+    /// `cudaSetDevice` (see `crates/engine-cuda/csrc/src/engine.cpp`).
     #[serde(skip)]
     pub device: String,
-    /// Driver-side verbose logging. Populated from `server.verbose` rather
+    /// Engine-side verbose logging. Populated from `server.verbose` rather
     /// than written here.
     #[serde(skip)]
     pub verbose: bool,
@@ -1259,7 +1283,7 @@ pub struct CudaNativeDriverOptions {
     /// experts; `"native"` requires true MXFP4 GEMM kernels.
     pub mxfp4_moe: String,
     /// Gemma-4 native MTP assistant checkpoint used by
-    /// `.system_speculation()` on cuda_native. **Omit to let the CUDA driver
+    /// `.system_speculation()` on cuda_native. **Omit to let the CUDA engine
     /// auto-discover** the paired `-assistant` checkpoint from the Hugging
     /// Face cache when available.
     pub mtp_assistant_snapshot_dir: Option<String>,
@@ -1289,17 +1313,11 @@ pub struct CudaNativeDriverOptions {
     /// latency-regime win (helps at low batch, costs at compute saturation), so
     /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
     pub enable_system_speculation: bool,
-
-    /// How long to wait for the driver's caps handshake before giving up.
-    /// Generous because it covers loading and laying out the weights.
-    pub ready_timeout: Duration,
-    /// How long to wait for the driver to drain before abandoning it.
-    pub shutdown_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
-/// Which serving objective the driver's memory planner optimises for.
+/// Which serving objective the engine's memory planner optimises for.
 ///
 /// The planner searches a `(kv_page_size x decode_target x prefill_target)`
 /// lattice and scores each candidate. This picks the objective, and it exists
@@ -1326,7 +1344,7 @@ pub enum CudaMemoryProfile {
     Throughput,
 }
 
-impl Default for CudaNativeDriverOptions {
+impl Default for CudaNativeEngineOptions {
     fn default() -> Self {
         Self {
             model_id: None,
@@ -1339,7 +1357,6 @@ impl Default for CudaNativeDriverOptions {
             max_forward_tokens: None,
             max_forward_requests: None,
             calibrate_planner: false,
-            weight_dtype: "bfloat16".to_string(),
             device: String::new(),
             verbose: false,
             runtime_quant: String::new(),
@@ -1350,23 +1367,21 @@ impl Default for CudaNativeDriverOptions {
             expert_cache: None,
             expert_host_cache: None,
             enable_system_speculation: false,
-            ready_timeout: Duration::from_secs(600),
-            shutdown_timeout: Duration::from_secs(5),
         }
     }
 }
 
-/// `[model.driver.options]` for `type = "metal"` (Apple Silicon MLX/Metal
-/// driver) — page geometry, forward limits, and timeouts; the metal driver
-/// speaks the embedded in-process ABI. `device` is the `metal:N` selector
-/// filled from `model.driver.device`.
+/// `[model.engine.options]` for `type = "metal"` (Apple Silicon MLX/Metal
+/// engine) — page geometry and forward limits; the metal engine speaks the
+/// embedded in-process ABI. `device` is the `metal:N` selector filled from
+/// `model.engine.device`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct MetalDriverOptions {
+pub struct MetalEngineOptions {
     /// `[model] id`: the operator's answer to "which model is this".
     ///
-    /// Absent — the ordinary case — the driver identifies the checkpoint
-    /// from its TENSORS against the catalog every driver links. Present,
+    /// Absent — the ordinary case — the engine identifies the checkpoint
+    /// from its TENSORS against the catalog every engine links. Present,
     /// it names a row directly, for a checkpoint that is genuinely a
     /// known model under an unknown name: a fine-tune, a re-upload, a
     /// mirror that renamed the directory.
@@ -1376,12 +1391,12 @@ pub struct MetalDriverOptions {
     /// something it is not — which is the failure the whole arrangement
     /// exists to prevent.
     pub model_id: Option<String>,
-    /// KV page size in tokens. Used as given -- unlike the CUDA driver, the
-    /// Metal driver has no planner to derive one.
+    /// KV page size in tokens. Used as given -- unlike the CUDA engine, the
+    /// Metal engine has no planner to derive one.
     pub kv_page_size: u32,
     /// KV pages to allocate. Used directly, and 1024 is a real default.
     ///
-    /// The CUDA driver's nearest equivalent is `max_total_pages`, which is a
+    /// The CUDA engine's nearest equivalent is `max_total_pages`, which is a
     /// different quantity with a name that now says so: a ceiling over a
     /// derived number, usually absent.
     pub total_pages: u32,
@@ -1393,10 +1408,10 @@ pub struct MetalDriverOptions {
     /// Host-memory KV pages to swap into. `0` disables swapping.
     pub cpu_pages: u32,
     /// Tokens the KV ring holds across the whole resident fleet. Absent -- the
-    /// default -- keeps the driver's own constant, which is what a `pie serve`
+    /// default -- keeps the engine's own constant, which is what a `pie serve`
     /// fleet wants and what every run got before this existed.
     ///
-    /// The one knob that shrinks the KV, and it only shrinks: the driver
+    /// The one knob that shrinks the KV, and it only shrinks: the engine
     /// clamps to its own ceiling, so this cannot ask for a ring it will not
     /// build. `total_pages` is NOT that knob and never was -- the simple
     /// families derive their pool from this context and discard it.
@@ -1407,7 +1422,7 @@ pub struct MetalDriverOptions {
     /// Page routed MoE experts in from a mapping of the checkpoint instead of
     /// keeping every expert resident in the heap.
     ///
-    /// The same knob, spelled the same way, as the CUDA driver's -- because it
+    /// The same knob, spelled the same way, as the CUDA engine's -- because it
     /// is the same decision: a residency trade the operator makes about a
     /// model. What the two backends *do* with it differs (CUDA copies through
     /// a bounded slab, Metal binds over a file-backed mapping and lets the
@@ -1428,7 +1443,7 @@ pub struct MetalDriverOptions {
     /// admitted at all. It costs a submit-and-wait per mixture layer, so it is
     /// for when the alternative is not running.
     ///
-    /// `None` and not 0 for "unset", the way the CUDA driver spells
+    /// `None` and not 0 for "unset", the way the CUDA engine spells
     /// `expert_cache`: the C++ side already reads an absent key as "keep the
     /// bank resident", so a sentinel would be a second spelling of one thing.
     ///
@@ -1438,21 +1453,16 @@ pub struct MetalDriverOptions {
     /// binary's environment variable.
     pub expert_slab_bytes: Option<u64>,
     /// Metal device string, e.g. `"metal:0"`. Populated from
-    /// `model.driver.device` rather than written here.
+    /// `model.engine.device` rather than written here.
     #[serde(skip)]
     pub device: String,
-    /// Driver-side verbose logging. Populated from `server.verbose` rather
+    /// Engine-side verbose logging. Populated from `server.verbose` rather
     /// than written here.
     #[serde(skip)]
     pub verbose: bool,
-    /// How long to wait for the driver's caps handshake before giving up.
-    /// Generous because it covers loading the weights.
-    pub ready_timeout: Duration,
-    /// How long to wait for the driver to drain before abandoning it.
-    pub shutdown_timeout: Duration,
 }
 
-impl Default for MetalDriverOptions {
+impl Default for MetalEngineOptions {
     fn default() -> Self {
         Self {
             model_id: None,
@@ -1467,19 +1477,17 @@ impl Default for MetalDriverOptions {
             expert_slab_bytes: None,
             device: "metal:0".to_string(),
             verbose: false,
-            ready_timeout: Duration::from_secs(120),
-            shutdown_timeout: Duration::from_secs(5),
         }
     }
 }
 
-impl CudaNativeDriverOptions {
+impl CudaNativeEngineOptions {
     fn validate(&self) -> Result<()> {
         ensure!(
             self.gpu_mem_utilization.is_finite()
                 && self.gpu_mem_utilization > 0.0
                 && self.gpu_mem_utilization <= 1.0,
-            "driver.gpu_mem_utilization must be finite and in (0.0, 1.0]"
+            "engine.gpu_mem_utilization must be finite and in (0.0, 1.0]"
         );
         const MXFP4: &[&str] = &[
             "auto",
@@ -1492,12 +1500,12 @@ impl CudaNativeDriverOptions {
         ];
         ensure!(
             self.mxfp4_moe.is_empty() || MXFP4.contains(&self.mxfp4_moe.as_str()),
-            "driver.mxfp4_moe must be one of {:?}",
+            "engine.mxfp4_moe must be one of {:?}",
             MXFP4
         );
         ensure!(
             self.mtp_num_drafts <= 32,
-            "driver.mtp_num_drafts must be in 0..=32"
+            "engine.mtp_num_drafts must be in 0..=32"
         );
         // Present means the operator chose a size, so a present zero is a
         // contradiction rather than a way to say "derive" -- that is what
@@ -1505,28 +1513,28 @@ impl CudaNativeDriverOptions {
         if let Some(size) = self.expert_cache {
             ensure!(
                 size.as_bytes() > 0,
-                "driver.expert_cache must be > 0; \
+                "engine.expert_cache must be > 0; \
                  omit it to derive one at bootstrap"
             );
         }
         if let Some(size) = self.expert_host_cache {
             ensure!(
                 size.as_bytes() > 0,
-                "driver.expert_host_cache must be > 0; \
+                "engine.expert_host_cache must be > 0; \
                  omit it for no host tier"
             );
         }
         if let Some(pages) = self.max_total_pages {
             ensure!(
                 pages > 0,
-                "driver.max_total_pages must be > 0; \
+                "engine.max_total_pages must be > 0; \
                  omit it to derive from gpu_mem_utilization"
             );
         }
         if let Some(size) = self.kv_page_size {
             ensure!(
                 size > 0,
-                "driver.kv_page_size must be > 0; \
+                "engine.kv_page_size must be > 0; \
                  omit it to let the memory planner derive one"
             );
         }
@@ -1541,9 +1549,9 @@ mod tests {
     const MINIMAL_METAL: &str = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[model.driver]
+[model.engine]
 type = "metal"
 device = ["cpu"]
 "#;
@@ -1580,23 +1588,15 @@ device = ["cpu"]
         // Renamed, not aliased: deny_unknown_fields turns an old config into a
         // clear error naming the key, which is how this repo has handled every
         // other config rename (see the rejects_legacy_* tests below).
-        for legacy in [
-            "wasm_max_memory_mb = 4096",
-            "max_upload_mb = 256",
-            "wasm_warm_memory_mb = 0",
+        for (section, legacy) in [
+            ("sandbox", "wasm_max_memory_mb = 4096"),
+            ("sandbox", "wasm_warm_memory_mb = 0"),
+            ("server", "max_upload_mb = 256"),
+            ("runtime", "request_timeout_secs = 120"),
+            ("runtime", "submit_deadline_us = 50000"),
+            ("runtime", "silence_timeout_secs = 30"),
         ] {
-            let toml = format!("{MINIMAL_METAL}\n[runtime]\n{legacy}\n");
-            assert!(
-                toml::from_str::<Config>(&toml).is_err(),
-                "{legacy} should no longer parse"
-            );
-        }
-        for legacy in [
-            "request_timeout_secs = 120",
-            "submit_deadline_us = 50000",
-            "silence_timeout_secs = 30",
-        ] {
-            let toml = format!("{MINIMAL_METAL}\n[model.scheduler]\n{legacy}\n");
+            let toml = format!("{MINIMAL_METAL}\n[{section}]\n{legacy}\n");
             assert!(
                 toml::from_str::<Config>(&toml).is_err(),
                 "{legacy} should no longer parse"
@@ -1607,15 +1607,15 @@ device = ["cpu"]
     #[test]
     fn scheduler_durations_parse_from_their_units() {
         let toml = format!(
-            "{MINIMAL_METAL}\n[model.scheduler]\n\
+            "{MINIMAL_METAL}\n[runtime]\n\
              request_timeout = \"90s\"\nsubmit_deadline = \"25ms\"\n\
              silence_timeout = \"1m\"\n"
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.model.scheduler.request_timeout.as_secs(), 90);
-        assert_eq!(cfg.model.scheduler.submit_deadline.as_micros(), 25_000);
-        assert_eq!(cfg.model.scheduler.silence_timeout.as_secs(), 60);
+        assert_eq!(cfg.runtime.request_timeout.as_secs(), 90);
+        assert_eq!(cfg.runtime.submit_deadline.as_micros(), 25_000);
+        assert_eq!(cfg.runtime.silence_timeout.as_secs(), 60);
     }
 
     #[test]
@@ -1623,7 +1623,7 @@ device = ["cpu"]
         // The comparison is now between two Durations rather than between a
         // seconds count and a microseconds count.
         let toml = format!(
-            "{MINIMAL_METAL}\n[model.scheduler]\n\
+            "{MINIMAL_METAL}\n[runtime]\n\
              submit_deadline = \"5s\"\nsilence_timeout = \"1s\"\n"
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
@@ -1638,12 +1638,12 @@ device = ["cpu"]
     fn parses_minimal_metal_config() {
         let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.model.driver.kind, DriverKind::Metal);
-        assert_eq!(cfg.model.driver.device, vec!["cpu".to_string()]);
+        assert_eq!(cfg.model.engine.kind, EngineKind::Metal);
+        assert_eq!(cfg.model.engine.device, vec!["cpu".to_string()]);
         assert_eq!(cfg.server.port, 8080);
     }
 
-    /// Every driver kind's `as_str` is the word a config file spells it with.
+    /// Every engine kind's `as_str` is the word a config file spells it with.
     ///
     /// # What this is guarding
     ///
@@ -1654,28 +1654,28 @@ device = ["cpu"]
     /// `config_schema::default_values` builds a config by INTERPOLATING
     /// `as_str` into `type = "..."` and parsing it back, so a kind whose two
     /// spellings differed would make the schema listing silently fall back to
-    /// an empty table, and `pie config set` would offer no driver keys at all.
+    /// an empty table, and `pie config set` would offer no engine keys at all.
     ///
     /// Written as a walk over an explicit list rather than one assertion per
     /// kind, so that a kind added without a line here is a kind that fails
     /// this test's own count.
     #[test]
-    fn every_driver_kind_round_trips_through_its_config_string() {
-        const KINDS: &[(DriverKind, &str)] = &[
-            (DriverKind::CudaNative, "cuda_native"),
-            (DriverKind::Metal, "metal"),
-            (DriverKind::Vulkan, "vulkan"),
-            (DriverKind::Wgpu, "wgpu"),
+    fn every_engine_kind_round_trips_through_its_config_string() {
+        const KINDS: &[(EngineKind, &str)] = &[
+            (EngineKind::CudaNative, "cuda_native"),
+            (EngineKind::Metal, "metal"),
+            (EngineKind::Vulkan, "vulkan"),
+            (EngineKind::Wgpu, "wgpu"),
         ];
         for (kind, spelled) in KINDS {
             assert_eq!(kind.as_str(), *spelled, "{kind:?} names itself");
             let toml = format!(
-                "[model]\nname = \"default\"\nhf_repo = \"Qwen/Qwen3-0.6B\"\n\n\
-                 [model.driver]\ntype = \"{spelled}\"\ndevice = [\"cpu\"]\n"
+                "[model]\nname = \"default\"\nmodel = \"Qwen/Qwen3-0.6B\"\n\n\
+                 [model.engine]\ntype = \"{spelled}\"\ndevice = [\"cpu\"]\n"
             );
             let cfg: Config = toml::from_str(&toml)
                 .unwrap_or_else(|e| panic!("`type = \"{spelled}\"` does not parse: {e}"));
-            assert_eq!(cfg.model.driver.kind, *kind);
+            assert_eq!(cfg.model.engine.kind, *kind);
             cfg.validate()
                 .unwrap_or_else(|e| panic!("a minimal `{spelled}` config does not validate: {e}"));
             // And back out through serde, which is the direction
@@ -1686,85 +1686,64 @@ device = ["cpu"]
         assert_eq!(
             KINDS.len(),
             4,
-            "a driver kind was added without a line here, so nothing checks its \
+            "an engine kind was added without a line here, so nothing checks its \
              config spelling"
         );
     }
 
-    // `the_wgpu_options_refuse_a_key_this_driver_does_not_read` STOOD HERE,
+    // `the_wgpu_options_refuse_a_key_this_engine_does_not_read` STOOD HERE,
     // and `rejects_legacy_metal_kv_page_knob` and
-    // `rejects_options_for_wrong_embedded_driver_type` below it. All three
+    // `rejects_options_for_wrong_embedded_engine_type` below it. All three
     // asserted `deny_unknown_fields` on an option table that no longer
     // exists: only `cuda_native` names a struct now, and
     // `rejects_unknown_cuda_option` makes the same claim about the one that
     // does.
 
-    /// `model` is the name now, `hf_repo` still parses.
-    ///
-    /// Not politeness: the struct is `deny_unknown_fields` and the field is
-    /// required, so without the alias every config `pie config init` ever wrote
-    /// would fail at bootstrap with two errors at once — *unknown field
-    /// `hf_repo`* and *missing field `model`* — instead of booting.
-    #[test]
-    fn the_old_spelling_of_the_model_key_still_parses() {
-        let with_new = MINIMAL_METAL.replace("hf_repo =", "model =");
-        assert_ne!(
-            with_new, MINIMAL_METAL,
-            "the fixture should use the old key"
-        );
+    // `the_old_spelling_of_the_model_key_still_parses` STOOD HERE. It proved
+    // that the model key's retired spelling parsed to the same field as
+    // `model`, by parsing the fixture both ways. The alias is gone, so there
+    // is one spelling and no second parse to compare it against.
 
-        let old: Config = toml::from_str(MINIMAL_METAL).unwrap();
-        let new: Config = toml::from_str(&with_new).unwrap();
-        old.validate().unwrap();
-        new.validate().unwrap();
-        assert_eq!(old.model.model, new.model.model);
-        assert!(!new.model.model.is_empty());
-    }
-
-    /// An empty model is caught at parse rather than at driver boot, where it
+    /// An empty model is caught at parse rather than at engine boot, where it
     /// would surface as a path error.
     #[test]
     fn an_empty_model_is_refused() {
-        let blank = MINIMAL_METAL.replace("hf_repo = \"Qwen/Qwen3-0.6B\"", "hf_repo = \"\"");
+        let blank = MINIMAL_METAL.replace("model = \"Qwen/Qwen3-0.6B\"", "model = \"\"");
         let cfg: Config = toml::from_str(&blank).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("model.model"), "{err}");
     }
 
-    /// The key two drivers document as an override actually parses.
+    /// The key two engines document as an override actually parses.
     ///
-    /// `driver-vulkan` and `driver-wgpu` both read `[model] kv_pages` out of
-    /// the raw config bytes and both call it "a number the boot config can
-    /// override". It was not one: this struct is `deny_unknown_fields`, so
+    /// `engine-vulkan` and `engine-wgpu` both read `kv_pages` out of the raw
+    /// config bytes and both call it "a number the boot config can override".
+    /// It was not one: the struct that carried it is `deny_unknown_fields`, so
     /// the deserializer refused the key before either backend saw the bytes,
     /// and the only way to set it was to not use this type. Nothing noticed
     /// because nothing here reads it -- the field is declared to be
     /// ACCEPTED, and a test is the only thing that can say so.
+    ///
+    /// It sits in `[engine]` now, with the rest of the KV geometry.
     #[test]
-    fn the_kv_pages_override_two_drivers_read_is_one_this_config_accepts() {
+    fn the_kv_pages_override_two_engines_read_is_one_this_config_accepts() {
         let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
         assert_eq!(
-            cfg.model.kv_pages, None,
+            cfg.model.engine.kv_pages, None,
             "absent must stay absent, or every boot overrides a default it \
              never meant to"
         );
 
-        let with = MINIMAL_METAL.replace(
-            "hf_repo = \"Qwen/Qwen3-0.6B\"",
-            "hf_repo = \"Qwen/Qwen3-0.6B\"\nkv_pages = 8",
-        );
+        let with = MINIMAL_METAL.replace("device = [\"cpu\"]", "device = [\"cpu\"]\nkv_pages = 8");
         assert_ne!(with, MINIMAL_METAL, "the fixture should carry the key");
         let cfg: Config = toml::from_str(&with)
-            .expect("`[model] kv_pages` is the key driver-vulkan and driver-wgpu read");
+            .expect("`[engine] kv_pages` is the key engine-vulkan and engine-wgpu read");
         cfg.validate().unwrap();
-        assert_eq!(cfg.model.kv_pages, Some(8));
+        assert_eq!(cfg.model.engine.kv_pages, Some(8));
 
         // ...and the denial is still doing its job for everything else.
-        let typo = MINIMAL_METAL.replace(
-            "hf_repo = \"Qwen/Qwen3-0.6B\"",
-            "hf_repo = \"Qwen/Qwen3-0.6B\"\nkv_page = 8",
-        );
+        let typo = MINIMAL_METAL.replace("device = [\"cpu\"]", "device = [\"cpu\"]\nkv_page = 8");
         toml::from_str::<Config>(&typo)
             .expect_err("a near-miss of the key must still be refused by name");
     }
@@ -1775,15 +1754,15 @@ device = ["cpu"]
         cfg.validate().unwrap();
         // Empty means "derive $PIE_HOME/cache/weights" at the worker layer,
         // not "off":
-        // the driver only sees off when it is handed nothing at all.
+        // the engine only sees off when it is handed nothing at all.
         assert_eq!(cfg.model.weight_cache_dir, "");
     }
 
     #[test]
     fn weight_cache_dir_parses_when_set() {
         let toml = MINIMAL_METAL.replace(
-            "hf_repo = \"Qwen/Qwen3-0.6B\"",
-            "hf_repo = \"Qwen/Qwen3-0.6B\"\nweight_cache_dir = \"/mnt/big/pie-models\"",
+            "model = \"Qwen/Qwen3-0.6B\"",
+            "model = \"Qwen/Qwen3-0.6B\"\nweight_cache_dir = \"/mnt/big/pie-models\"",
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         cfg.validate().unwrap();
@@ -1792,11 +1771,11 @@ device = ["cpu"]
 
     #[test]
     fn rejects_a_relative_weight_cache_dir() {
-        // Relative resolves against the driver's cwd, which the operator did
-        // not choose and which differs between the worker and a spawned driver.
+        // Relative resolves against the engine's cwd, which the operator did
+        // not choose and which differs between the worker and a spawned engine.
         let toml = MINIMAL_METAL.replace(
-            "hf_repo = \"Qwen/Qwen3-0.6B\"",
-            "hf_repo = \"Qwen/Qwen3-0.6B\"\nweight_cache_dir = \"models\"",
+            "model = \"Qwen/Qwen3-0.6B\"",
+            "model = \"Qwen/Qwen3-0.6B\"\nweight_cache_dir = \"models\"",
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
@@ -1819,9 +1798,9 @@ device = ["cpu"]
     fn scheduler_frame_defaults_are_the_shipped_deployment() {
         let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.model.scheduler.frame_size, 2);
-        assert_eq!(cfg.model.scheduler.frame_submit_depth, 3);
-        assert_eq!(cfg.model.scheduler.frame_dispatch_depth, 2);
+        assert_eq!(cfg.runtime.frame_size, 2);
+        assert_eq!(cfg.runtime.frame_submit_depth, 3);
+        assert_eq!(cfg.runtime.frame_dispatch_depth, 2);
     }
 
     #[test]
@@ -1829,64 +1808,89 @@ device = ["cpu"]
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         // One frame submitted is the running frame alone — no run-ahead at
         // all, so the host round trip returns to the critical path.
-        cfg.model.scheduler.frame_submit_depth = 1;
+        cfg.runtime.frame_submit_depth = 1;
         assert!(
             cfg.validate()
                 .unwrap_err()
                 .to_string()
-                .contains("scheduler.frame_submit_depth must be at least 2")
+                .contains("runtime.frame_submit_depth must be at least 2")
         );
 
-        cfg.model.scheduler.frame_submit_depth = 2;
+        cfg.runtime.frame_submit_depth = 2;
         cfg.validate().unwrap();
     }
 
+    /// **THE DEPTHS ARE BOUNDED BY THE FORMULA, NOT BY A LITERAL** (alto
+    /// F2b).
+    ///
+    /// What this test used to assert was `frame_dispatch_depth * frame_size <
+    /// 13` — the product against a constant transcribed out of a deleted C++
+    /// header. The engine CARVES its staging ring from these two numbers now
+    /// (`frames_in_flight * STEPS_MAX + 1` pinned slots, allocated at load),
+    /// so there is no fixed pool for a product to overflow; what is left is
+    /// whether each factor is one the formula can be evaluated at.
     #[test]
-    fn rejects_more_steps_in_flight_than_the_driver_stages() {
+    fn the_depths_are_bounded_by_the_runahead_formula() {
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
-        let steps =
-            |c: &Config| c.model.scheduler.frame_dispatch_depth * c.model.scheduler.frame_size;
 
-        // The pool must strictly exceed steps in flight; equality is the case
-        // that blocks in `cudaEventSynchronize` on every submit.
-        cfg.model.scheduler.frame_dispatch_depth = 13;
-        cfg.model.scheduler.frame_size = 1;
-        assert_eq!(steps(&cfg), UPLOAD_STAGING_DEPTH);
+        // `frame_size` is `k`, and `STEPS_MAX` is what the frame scheduler
+        // was built and measured around.
+        cfg.runtime.frame_size = u32::from(Runahead::STEPS_MAX);
+        cfg.runtime.frame_dispatch_depth = 1;
+        cfg.validate().unwrap();
+        cfg.runtime.frame_size = u32::from(Runahead::STEPS_MAX) + 1;
         assert!(
             cfg.validate()
                 .unwrap_err()
                 .to_string()
-                .contains("must be < 13")
+                .contains("runtime.frame_size must be at most")
         );
 
-        cfg.model.scheduler.frame_dispatch_depth = 12;
-        assert_eq!(steps(&cfg), UPLOAD_STAGING_DEPTH - 1);
+        // The multiplier's ceiling is a fact about the engine's free-slot
+        // WORD: `frames * 4 + 1` has to fit in 64 bits of bitmask.
+        cfg.runtime.frame_size = 2;
+        cfg.runtime.frame_dispatch_depth = u32::from(Runahead::MAX_FRAMES);
         cfg.validate().unwrap();
+        assert!(
+            Runahead::of(Runahead::MAX_FRAMES).staging_depth() <= 64,
+            "the ceiling is the word's, so the deepest admissible depth must fit it"
+        );
+        cfg.runtime.frame_dispatch_depth = u32::from(Runahead::MAX_FRAMES) + 1;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("runtime.frame_dispatch_depth must be at most")
+        );
 
-        // The product is what matters, not either factor: 3 x 4 and 4 x 3 are
-        // the same 12 steps to the staging pool, and both are legal even
-        // though each exceeds the other field's historical clamp.
-        cfg.model.scheduler.frame_dispatch_depth = 3;
-        cfg.model.scheduler.frame_size = 4;
+        // And the combination the old check refused for being a product of
+        // twelve is simply a deeper ring now: 4 frames of 4 steps is
+        // `4 * 4 + 1 = 17` slots, carved at load, and nothing blocks.
+        cfg.runtime.frame_dispatch_depth = 4;
+        cfg.runtime.frame_size = 4;
         cfg.validate().unwrap();
-        cfg.model.scheduler.frame_dispatch_depth = 4;
-        cfg.model.scheduler.frame_size = 3;
-        cfg.validate().unwrap();
+        assert_eq!(Runahead::of(4).staging_depth(), 17);
+    }
 
-        // ...and 2 x 7 = 14 is refused even though each factor looks modest.
-        cfg.model.scheduler.frame_dispatch_depth = 2;
-        cfg.model.scheduler.frame_size = 7;
-        assert!(cfg.validate().is_err());
+    /// The default deployment is article 1's floor: two frames in flight, and
+    /// the ring the engine carves for it is nine slots.
+    #[test]
+    fn the_default_deployment_keeps_two_frames_in_flight() {
+        let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        assert_eq!(cfg.runtime.frame_dispatch_depth, 2);
+        let depth = u8::try_from(cfg.runtime.frame_dispatch_depth).unwrap();
+        assert_eq!(Runahead::of(depth).frames_in_flight, 2);
+        assert_eq!(Runahead::of(depth).staging_depth(), 9);
     }
 
     #[test]
     fn rejects_zero_frame_geometry() {
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
-        cfg.model.scheduler.frame_size = 0;
+        cfg.runtime.frame_size = 0;
         assert!(cfg.validate().is_err());
 
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
-        cfg.model.scheduler.frame_dispatch_depth = 0;
+        cfg.runtime.frame_dispatch_depth = 0;
         assert!(cfg.validate().is_err());
     }
 
@@ -1905,11 +1909,11 @@ device = ["cpu"]
         cfg.validate().unwrap();
     }
 
-    // `rejects_public_driver_capacity_knobs` was here, and it went with
-    // the driver it was about. It asserted that `max_forward_tokens`,
-    // `max_forward_requests` and `max_model_len` are the DRIVER's to
+    // `rejects_public_engine_capacity_knobs` was here, and it went with
+    // the engine it was about. It asserted that `max_forward_tokens`,
+    // `max_forward_requests` and `max_model_len` are the ENGINE's to
     // derive rather than the operator's to set -- a rule that read as
-    // general and was not: it held only for the dummy driver, whose
+    // general and was not: it held only for the dummy engine, whose
     // options struct listed none of the three. Both surviving kinds
     // accept all three as declared fields, so retargeting the test onto
     // one of them asserts a rule this schema does not have.
@@ -1919,13 +1923,13 @@ device = ["cpu"]
         let one = r#"
 [model]
 name = "m"
-hf_repo = "x"
-[model.driver]
+model = "x"
+[model.engine]
 type = "metal"
 device = "cuda:0"
 "#;
         let cfg: Config = toml::from_str(one).unwrap();
-        assert_eq!(cfg.model.driver.device, vec!["cuda:0".to_string()]);
+        assert_eq!(cfg.model.engine.device, vec!["cuda:0".to_string()]);
     }
 
     #[test]
@@ -1984,8 +1988,8 @@ device = "cuda:0"
         let legacy = r#"
 [model]
 name = "a"
-hf_repo = "x"
-[driver]
+model = "x"
+[engine]
 type = "cuda_native"
 device = ["cuda:0"]
 total_pages = 512
@@ -1999,19 +2003,19 @@ total_pages = 512
 
     #[test]
     fn rejects_legacy_binary_path() {
-        // Every driver option struct carried it "for compatibility with the
-        // Python wrapper", and nothing anywhere read it -- the drivers are
+        // Every engine option struct carried it "for compatibility with the
+        // Python wrapper", and nothing anywhere read it -- the engines are
         // linked in, so there has never been an executable to point at. An
-        // unknown `[driver]` key is reshaped into the options table, so what
+        // unknown `[engine]` key is reshaped into the options table, so what
         // refuses it is the kind's own `deny_unknown_fields`.
         let legacy = r#"
 [model]
 name = "a"
-hf_repo = "x"
-[driver]
+model = "x"
+[engine]
 type = "cuda_native"
 device = ["cuda:0"]
-binary_path = "/opt/pie/driver"
+binary_path = "/opt/pie/engine"
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
         assert!(err.contains("binary_path"), "got: {err}");
@@ -2035,8 +2039,8 @@ enabled = true
 
 [model]
 name = "a"
-hf_repo = "x"
-[driver]
+model = "x"
+[engine]
 type = "metal"
 device = ["metal:0"]
 "#;
@@ -2052,15 +2056,15 @@ device = ["metal:0"]
         let legacy = r#"
 [[model]]
 name = "a"
-hf_repo = "x"
+model = "x"
 
 [[model]]
 name = "b"
-hf_repo = "y"
+model = "y"
 "#;
         let err = Config::parse(legacy).unwrap_err().to_string();
         assert!(
-            err.contains("no longer an array") && err.contains("[[model]]"),
+            err.contains("exactly one model") && err.contains("[[model]]"),
             "got: {err}"
         );
     }
@@ -2072,8 +2076,8 @@ nonsense = true
 
 [model]
 name = "m"
-hf_repo = "x"
-[model.driver]
+model = "x"
+[model.engine]
 type = "metal"
 device = ["cpu"]
 "#;
@@ -2085,13 +2089,13 @@ device = ["cpu"]
         let cuda = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[model.driver]
+[model.engine]
 type = "cuda_native"
 device = ["cuda:0"]
 
-[model.driver.options]
+[model.engine.options]
 gpu_mem_utilization = 0.90
 memory_profile = "throughput"
 runtime_quant = "fp8"
@@ -2101,8 +2105,8 @@ mtp_num_drafts = 6
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.model.driver.kind, DriverKind::CudaNative);
-        let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
+        assert_eq!(cfg.model.engine.kind, EngineKind::CudaNative);
+        let opts: CudaNativeEngineOptions = cfg.model.engine.options.clone().try_into().unwrap();
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Throughput);
         assert_eq!(opts.runtime_quant, "fp8");
@@ -2112,7 +2116,7 @@ mtp_num_drafts = 6
             Some("/models/gemma4-mtp")
         );
         assert_eq!(opts.mtp_num_drafts, 6);
-        assert_eq!(opts.weight_dtype, "bfloat16"); // default
+        assert_eq!(cfg.model.weight_dtype, "bfloat16"); // default
         // Absent = derive: the planner scores candidates unless pinned.
         assert_eq!(opts.kv_page_size, None);
         assert_eq!(opts.kv_cache_dtype, "auto"); // default
@@ -2120,25 +2124,25 @@ mtp_num_drafts = 6
 
     #[test]
     fn kv_page_size_pins_the_planner_when_set() {
-        // Before this landed the field reached the driver and the planner
+        // Before this landed the field reached the engine and the planner
         // ignored it: only PIE_CUDA_KV_PAGE_SIZE could pin a page size. A
         // non-zero value now means the operator has made the choice the
         // planner's candidate search exists to make.
         let toml = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[model.driver]
+[model.engine]
 type = "cuda_native"
 device = ["cuda:0"]
 
-[model.driver.options]
+[model.engine.options]
 kv_page_size = 16
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         cfg.validate().unwrap();
-        let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
+        let opts: CudaNativeEngineOptions = cfg.model.engine.options.clone().try_into().unwrap();
         assert_eq!(opts.kv_page_size, Some(16));
     }
 
@@ -2147,22 +2151,22 @@ kv_page_size = 16
         let cuda = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[model.driver]
+[model.engine]
 type = "cuda_native"
 device = ["cuda:0"]
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
-        let opts: CudaNativeDriverOptions = cfg.model.driver.options.clone().try_into().unwrap();
+        let opts: CudaNativeEngineOptions = cfg.model.engine.options.clone().try_into().unwrap();
         assert_eq!(opts.swap_pool_size, 0);
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Auto);
         assert_eq!(opts.mxfp4_moe, "auto");
         assert!(opts.mtp_assistant_snapshot_dir.is_none());
         assert_eq!(opts.mtp_num_drafts, 3);
-        assert_eq!(opts.ready_timeout, Duration::from_secs(600));
+        assert_eq!(cfg.model.engine.ready_timeout, Duration::from_secs(600));
         assert_eq!(opts.kv_cache_dtype, "auto");
     }
 
@@ -2171,13 +2175,13 @@ device = ["cuda:0"]
         let bad = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[model.driver]
+[model.engine]
 type = "cuda_native"
 device = ["cuda:0"]
 
-[model.driver.options]
+[model.engine.options]
 kv_cache_dtype = "turboquant"
 "#;
         let cfg: Config = toml::from_str(bad).unwrap();
@@ -2197,19 +2201,19 @@ kv_cache_dtype = "turboquant"
                 r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[model.driver]
+[model.engine]
 type = "cuda_native"
 device = ["cuda:0"]
 
-[model.driver.options]
+[model.engine.options]
 memory_profile = "{retired}"
 "#
             );
-            // Note where this fails: `[model.driver.options]` is a free-form
+            // Note where this fails: `[model.engine.options]` is a free-form
             // `toml::Table` in the schema, so the enum is only checked when
-            // `validate()` converts it per driver kind -- not at parse.
+            // `validate()` converts it per engine kind -- not at parse.
             let cfg: Config = toml::from_str(&cuda).unwrap();
             let err = cfg.validate().unwrap_err().to_string();
             assert!(
@@ -2224,13 +2228,13 @@ memory_profile = "{retired}"
         let cuda = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[model.driver]
+[model.engine]
 type = "cuda_native"
 device = ["cuda:0"]
 
-[model.driver.options]
+[model.engine.options]
 memory_profile = "aggressive"
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
@@ -2244,13 +2248,13 @@ memory_profile = "aggressive"
         let cuda = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
-[model.driver]
+[model.engine]
 type = "cuda_native"
 device = ["cuda:0"]
 
-[model.driver.options]
+[model.engine.options]
 manual_capacity = 1
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
@@ -2263,13 +2267,13 @@ manual_capacity = 1
         let cuda = r#"
 [model]
 name = "default"
-hf_repo = "openai/gpt-oss-20b"
+model = "openai/gpt-oss-20b"
 
-[model.driver]
+[model.engine]
 type = "cuda_native"
 device = ["cuda:0"]
 
-[model.driver.options]
+[model.engine.options]
 mxfp4_moe = "mystery"
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();

@@ -28,7 +28,7 @@
 #           tensor -- and `layout.embed` binds it whole. Splitting the arena
 #           cannot help: this is one bank past what one allocation may be
 #           BOUND at, and the largest ceiling any shader plane states is 4 GiB.
-#           Closing it is a change to the POINT, not to a driver.
+#           Closing it is a change to the POINT, not to an engine.
 #
 #   vulkan  SERVES BOTH. `gptoss-20b-bf16-mxfp4-kv-bf16` walks 555 statements
 #           into 579 dispatches on one submission with 240 staged `InOut`
@@ -130,15 +130,15 @@ if ! have_slangc; then
 elif [ ! -e /lib/x86_64-linux-gnu/libvulkan.so.1 ] && ! ldconfig -p 2>/dev/null | grep -q libvulkan; then
     plane vulkan "no Vulkan loader on this box"
 else
-    plane vulkan "" cargo test --quiet -p driver-vulkan --features device
+    plane vulkan "" cargo test --quiet -p engine-vulkan --features device
 fi
 
 # ── wgpu ────────────────────────────────────────────────────────────────
-plane wgpu "" cargo test --quiet -p driver-wgpu --features native
+plane wgpu "" cargo test --quiet -p engine-wgpu --features native
 
 # ── metal ───────────────────────────────────────────────────────────────
 if [ "$(uname -s)" = "Darwin" ]; then
-    plane metal "" cargo test --quiet -p driver-metal --features metal-4
+    plane metal "" cargo test --quiet -p engine-metal --features metal-4
 else
     plane metal "not an Apple machine; \`scripts/check-metal-4.sh\` only TYPE-CHECKS the gated half"
 fi

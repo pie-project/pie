@@ -627,7 +627,7 @@ fn broadcast_neg_inf_normalizes_to_the_same_nucleus_plan() {
             .find(|region| region.kind == RegionKind::Library(LibraryOp::NucleusSample))
             .expect("nucleus library region");
         // The 13-node/5-input shape is the wire ABI every backend asserts
-        // (e.g. `grouped_nucleus_region_supported` in the CUDA driver).
+        // (e.g. `grouped_nucleus_region_supported` in the CUDA engine).
         assert_eq!(nucleus.nodes.len(), 13);
         assert_eq!(nucleus.inputs.len(), 5);
     }
@@ -1066,7 +1066,7 @@ fn explicit_candidate_batch_does_not_inherit_sampled_rows() {
 
 /// The rendering a plan reaches humans through is a pure function of the plan.
 ///
-/// `debug_stage_plan` is what `crates/engine/src/pipeline/program.rs` prints
+/// `debug_stage_plan` is what `crates/runtime/src/pipeline/program.rs` prints
 /// when a program is registered under a debug flag, and what the extended
 /// golden pins. Both uses assume it does not vary run to run.
 #[test]

@@ -74,7 +74,7 @@ impl DType {
 /// `checkpoint_format` has a test that keeps it unreachable until then.
 ///
 /// New variants are appended rather than slotted in beside their siblings:
-/// these numbers cross the C ABI, so a driver compiled against an older header
+/// these numbers cross the C ABI, so an engine compiled against an older header
 /// must keep reading every value it knew as the number it knew.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CheckpointFormat {
@@ -537,7 +537,7 @@ pub fn normalize_encoding(encoding: &Encoding) -> Encoding {
     }
 }
 
-/// Whether a declared tensor is something the driver binds, or a name the
+/// Whether a declared tensor is something the engine binds, or a name the
 /// contract needed for itself.
 ///
 /// The algebra has no `let`: the only way to use a subexpression twice, or to
@@ -549,11 +549,11 @@ pub fn normalize_encoding(encoding: &Encoding) -> Encoding {
 ///
 /// `Internal` is that name without those consequences. It resolves through
 /// [`Expr::Out`](crate::contract::Expr::Out) like any other, but the plan emits no `Finalize` for it, so the
-/// driver never sees it and its buffer stays a temporary the memory planner may
+/// engine never sees it and its buffer stays a temporary the memory planner may
 /// reuse.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Visibility {
-    /// A runtime weight. The driver binds it by name.
+    /// A runtime weight. The engine binds it by name.
     #[default]
     Public,
     /// A name for the contract's own use. Not bound, not persistent.
@@ -570,7 +570,7 @@ pub struct TensorDecl {
     pub shape: Vec<i64>,
     pub encoding: Encoding,
     pub alignment: u32,
-    /// Whether the driver binds this name. See [`Visibility`].
+    /// Whether the engine binds this name. See [`Visibility`].
     #[serde(default, skip_serializing_if = "Visibility::is_public")]
     pub visibility: Visibility,
 }
@@ -681,12 +681,12 @@ pub enum QuantGranularity {
     PerGroup,
 }
 
-/// What the driver's kernels expect a scale tensor to hold by the time they read
+/// What the engine's kernels expect a scale tensor to hold by the time they read
 /// it.
 ///
 /// Not derivable from the scale tensor itself — its dtype says how the bytes are
 /// stored, not how the kernel wants them — so whoever declared the scale states
-/// it. The driver used to infer it from `group_size == 32`, which was true only
+/// it. The engine used to infer it from `group_size == 32`, which was true only
 /// because MXFP4 is the one scheme with that group size today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScaleForm {

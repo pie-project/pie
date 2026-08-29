@@ -10,8 +10,8 @@
 //! arms run and agree on the token stream, and PRINTS the cost. A regression
 //! in the buffer write path shows up as a widening gap in the printed numbers.
 //!
-//! `#[ignore]`, driver-cuda. Run:
-//!   cargo test -p pie-gpu-tests --features driver-cuda-13 --test cuda_rs_buffer_bench \
+//! `#[ignore]`, engine-cuda. Run:
+//!   cargo test -p pie-gpu-tests --features engine-cuda-13 --test cuda_rs_buffer_bench \
 //!     -- --ignored --nocapture
 
 use std::path::Path;
@@ -40,7 +40,7 @@ fn build_inferlet() -> Result<std::path::PathBuf> {
     Ok(ws)
 }
 
-/// Boot once and run BOTH arms against the same engine: a per-arm boot would
+/// Boot once and run BOTH arms against the same runtime: a per-arm boot would
 /// price CUDA graph capture and allocator warmth differences into the delta.
 async fn run_arms(inputs: &[&str]) -> Result<Vec<std::result::Result<String, String>>> {
     common::init_trace();
@@ -84,7 +84,7 @@ async fn run_arms(inputs: &[&str]) -> Result<Vec<std::result::Result<String, Str
             .await
             .context("launch rs-buffer-bench")?;
         // Per-arm, not fail-fast: one arm is EXPECTED to be refused, and the
-        // engine can only be booted once per process.
+        // runtime can only be booted once per process.
         let result = proc.wait_for_return().await.map_err(|e| e.to_string());
         eprintln!("[rs-buffer-bench] {input} -> {result:?}");
         out.push(result);
@@ -113,13 +113,13 @@ fn head(result: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and no driver in \
+            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and no engine in \
             this tree serves a bit of it, so a recurrent fold that reads its \
             length off a buffered slot has no port to read. The \
             `rs-buffer-bench` guest is gone with the workspace move to \
             `tests/inferlets` besides"]
 async fn buffering_a_token_costs_what_it_costs() -> Result<()> {
-    // A warm arm first: the very first arm on a fresh engine pays for lazy
+    // A warm arm first: the very first arm on a fresh runtime pays for lazy
     // graph capture and first-touch allocation, and charging that to whichever
     // arm happens to run first would be the whole measurement.
     // `hostfold` vs `hostbuffer` is the APPLES-TO-APPLES pair: the buffered
@@ -140,7 +140,7 @@ async fn buffering_a_token_costs_what_it_costs() -> Result<()> {
     // unbuffered fold-all recurrent fire take the device-composed template,
     // which resolves descriptor ports at KERNEL time rather than at frame
     // entry — so the chained value is there by the time the consumer reads it.
-    // The engine-side refusal (`validate_frame` in `crates/engine/src/
+    // The runtime-side refusal (`validate_frame` in `crates/runtime/src/
     // pipeline/fire.rs`) was narrowed to the two shapes the template still
     // refuses: a buffered row, and a device-resident fold length.
     //

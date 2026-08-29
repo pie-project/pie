@@ -21,7 +21,7 @@ path = "src/lib.rs"
 default = ["std"]
 std = []
 
-# `serde` is OFF by default and exists for ONE consumer: `driver-api`, whose
+# `serde` is OFF by default and exists for ONE consumer: `engine-api`, whose
 # nouns all have to serialize (palo design §7, decision 4 — "remote is a
 # property, not an encoding"). The contract's guest-program half is spelled in
 # THIS crate's vocabulary rather than in a second copy of it — `DType`,

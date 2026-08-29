@@ -116,7 +116,7 @@ fn parse_tokens(json: &str) -> Option<Vec<i64>> {
 /// Launch every lane at once and wait for all of them.
 ///
 /// Concurrent rather than sequential because the quantity under measurement is
-/// what the engine does with a fleet: batch composition, frame overlap and
+/// what the runtime does with a fleet: batch composition, frame overlap and
 /// admission all only exist when lanes contend.
 pub async fn run(addr: &str, program: &str, inputs: &[String]) -> FleetRun {
     let started = Instant::now();
