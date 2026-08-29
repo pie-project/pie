@@ -21,6 +21,17 @@
 //!    the acceptance test for the read path, and it flips from "refused for
 //!    the right reason" to "runs and is correct" when the read path lands.
 //!
+//! **WHAT F3b LANDED, AND WHY THIS FILE IS STILL BLOCKED** (alto design §6).
+//! The two cases below that describe an interior fold boundary —
+//! `the_fold_boundary_can_land_inside_a_fires_own_tokens` and
+//! `a_fire_may_fold_behind_the_tokens_it_is_writing` — are the 2R-segment
+//! split, and the engine builds it now: `RsVerb::Buffer` with a non-zero fold
+//! runs the head `[0, n)` folding and the tail `[n, rows)` continuing from
+//! what the head wrote, gated at the engine door by claim 5 of
+//! `engine-cuda/tests/a_buffered_fold_is_the_fold_it_replaces`. What still
+//! blocks THIS file is upstream of the engine and unchanged: the `RS_BUFFER`
+//! port set has no reader, and the guest these cases drive is gone.
+//!
 //! `#[ignore]`, engine-cuda. Run:
 //!   cargo test -p pie-gpu-tests --features engine-cuda-13 --test cuda_gdn_foldcommit \
 //!     -- --ignored --nocapture

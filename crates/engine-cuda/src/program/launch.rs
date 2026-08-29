@@ -69,6 +69,26 @@ pub const INTRINSIC_STORAGE_F32: u32 = 0;
 /// elements the kernel widens as it reads.
 pub const INTRINSIC_STORAGE_RAW_BF16: u32 = 1;
 
+/// `IntrinsicStorageMode::RowPointers` — the bound buffer is a TABLE OF ROW
+/// ADDRESSES, one `u64` per row of the value the guest declared, and each
+/// entry addresses one `bf16` row of the real rectangle.
+///
+/// **WHAT IT IS FOR: A READOUT WHOSE ROWS ARE NOT CONSECUTIVE.**
+/// [`INTRINSIC_STORAGE_RAW_BF16`] addresses row `r` as
+/// `base + (row_offset + r) * row_stride`, which can name any contiguous run
+/// and nothing else. A lane that states `Readout::Rows([0, 7, 3])` is asking
+/// for three rows in that order, and the only shape that expresses it is a
+/// list. The emitted kernel has read this mode since the runtime prologue was
+/// written (`m1_intrinsic_row_base`'s `mode == 2` arm, and
+/// `ptir_fast_argmax_intrinsic` beside it); what did not exist until the
+/// row-selected readout landed was a producer.
+///
+/// `row_offset` still applies — it indexes the TABLE — and `row_stride` is
+/// ignored, because each entry carries its own address. The element type is
+/// `bf16`, the same as [`INTRINSIC_STORAGE_RAW_BF16`]: a row pointer says
+/// where a row is and not what it holds.
+pub const INTRINSIC_STORAGE_ROW_POINTERS: u32 = 2;
+
 /// `BoolStorageMode::NativeBytes` — one byte per lane, which is what every
 /// device-side bool cell is.
 pub const BOOL_STORAGE_NATIVE_BYTES: u32 = 0;

@@ -692,10 +692,132 @@ pub struct ModelConfig {
     /// `[engine]`.
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
+    /// **The correction class's two operator decisions** (alto design §8):
+    /// how many adapter seats this deployment intends to use, and which
+    /// adapters to write into them at boot.
+    ///
+    /// A `[model]` key rather than an engine option because it is portable:
+    /// every shell that seats banks seats them the same way, and debt 6's
+    /// complaint about `[model.engine.options]` was precisely that no
+    /// configuration crossed backends. Absent means what it has always
+    /// meant — zero seats, no adapters, and the correction op never launches.
+    #[serde(default)]
+    pub adapters: AdapterConfig,
 }
 
 fn default_weight_dtype() -> String {
     "bfloat16".to_string()
+}
+
+// -----------------------------------------------------------------------------
+// [model.adapters]
+// -----------------------------------------------------------------------------
+
+/// What an operator states about LoRA adapters: a capacity and a roster.
+///
+/// **THE CAPACITY IS AN INTENT, NOT A POOL SIZE** (design §8, decision 17).
+/// Every bank a plan carries is reserved at load whatever this number is —
+/// the capacity is a SHAPE the model text declares — so `seats` states how
+/// many the DEPLOYMENT intends to register, and `model_compiler::compile`
+/// refuses a load whose intent is bigger than what the text seats. That
+/// refusal is the reason to state it at all: an operator who asks for
+/// sixteen seats from a model that declares eight finds out at boot, by
+/// name, rather than at the ninth registration.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterConfig {
+    /// How many adapter rows this deployment intends to use.
+    ///
+    /// Omit to derive it from [`registered`](AdapterConfig::registered): a
+    /// roster of three adapters needs three seats and nobody should have to
+    /// say so twice. State it to reserve room for adapters that arrive later.
+    #[serde(default)]
+    pub seats: Option<u32>,
+    /// The adapters to write into those seats at boot, in the order given.
+    ///
+    /// Registration is a control-plane residency verb — once per adapter,
+    /// never on the fire path (`engine_api::adapter`) — so boot is exactly
+    /// where it belongs.
+    #[serde(default)]
+    pub registered: Vec<RegisteredAdapter>,
+}
+
+/// One adapter, as an operator names it.
+///
+/// **THE PLANES ARE RAW BYTES AND THE PADDING IS THE CALLER'S**, which is the
+/// contract's own rule (`engine_api::adapter`): an adapter trained at rank 4
+/// in a bank declared at rank 16 is submitted zero-padded, because `A`'s
+/// unused ranks are trailing ROWS and `B`'s are a stride inside every row, and
+/// a shell that padded a short plane's prefix would be right for one and wrong
+/// for the other. So a file here is one bank's slot, exactly, in the bank's
+/// declared dtype and layout — the same bytes
+/// [`AdapterPlane::bytes`](engine_api::AdapterPlane) carries. A file of the
+/// wrong length is refused by the engine, by name, with both numbers.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredAdapter {
+    /// Which row of every named bank this fills — the id a lane routes to.
+    pub id: u32,
+    /// Bank name (the plan's own `Param` spelling) -> the file holding one
+    /// slot of it. A bank this map omits keeps what it held, which is what
+    /// makes registering one site at a time expressible.
+    #[serde(default)]
+    pub planes: std::collections::BTreeMap<String, String>,
+}
+
+impl AdapterConfig {
+    /// The capacity to bake against: what the operator stated, else what the
+    /// roster needs.
+    ///
+    /// One number with one owner (article 8). A roster whose highest id is
+    /// `n` needs `n + 1` seats, because ids are rows and rows are counted
+    /// from zero.
+    #[must_use]
+    pub fn seats(&self) -> u32 {
+        self.seats.unwrap_or_else(|| {
+            self.registered
+                .iter()
+                .map(|adapter| adapter.id.saturating_add(1))
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    /// Nothing to seat and nothing to register — the shape every deployment
+    /// had before this section existed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.seats() == 0 && self.registered.is_empty()
+    }
+
+    /// The two things this layer can answer without a device.
+    ///
+    /// Everything else about an adapter — does the bank exist, is the slot
+    /// this many bytes — is the engine's, and it refuses by name. What is
+    /// answerable here is whether the roster fits the capacity the operator
+    /// asked for, and whether a plane path resolves the same way from the
+    /// worker and from an engine launched with a working directory the
+    /// operator did not choose.
+    fn validate(&self) -> Result<()> {
+        let seats = self.seats();
+        for adapter in &self.registered {
+            ensure!(
+                adapter.id < seats,
+                "model.adapters: adapter id {} is past the {seats} seat(s) this \
+                 deployment asks for; raise `[model.adapters] seats` or renumber it",
+                adapter.id
+            );
+            for (bank, path) in &adapter.planes {
+                ensure!(
+                    Path::new(path).is_absolute(),
+                    "model.adapters: the plane for bank {bank:?} of adapter {} must be \
+                     an absolute path (got {path:?})",
+                    adapter.id
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ModelConfig {
@@ -719,6 +841,7 @@ impl ModelConfig {
              leave it empty for $PIE_HOME/cache/weights",
             self.weight_cache_dir
         );
+        self.adapters.validate()?;
         Ok(())
     }
 }
@@ -757,7 +880,9 @@ pub struct RuntimeConfig {
     /// frame is not blocking), by an unretired dispatch (the runtime owes it a
     /// result, so the whole GPU wave is free), by a bind in flight, and by
     /// `forward.park()`. The host resubmit round trip already has its own
-    /// headroom in [`RuntimeConfig::frame_submit_depth`].
+    /// headroom in the run-ahead window
+    /// ([`engine::runahead::Runahead::submit_depth`], derived from
+    /// [`RuntimeConfig::frame_dispatch_depth`]).
     ///
     /// Measured: on the contention suite a breach happens roughly once in
     /// several thousand requests, and when it does the lane is 0.1-3ms over
@@ -794,31 +919,24 @@ pub struct RuntimeConfig {
     /// Bounded above by the CUDA engine, not by taste — see [`Self::validate`].
     #[serde(default = "default_frame_size")]
     pub frame_size: u32,
-    /// Frames a guest keeps submitted into the runtime: one running, plus the
-    /// rest queued behind it so the device always has work while the guest is
-    /// back on the host deciding what to submit next. Too few and the pipeline collapses
-    /// to lockstep — submit, wait, submit, wait — because the host resubmit
-    /// round trip lands squarely in the critical path.
-    ///
-    /// Three, sized for the default `frame_size = 2`, where it covers the
-    /// round trip with one frame to spare. **A frame is k waves of device
-    /// time, so this and `frame_size` are not independent: a deployment that
-    /// moves k must re-measure this.** Three frames at k=1 cover half the real
-    /// time they cover at k=2, and undersizing this window is what collapsed
-    /// k=1 throughput (CONTENTION_FOLLOWUP §20.11).
-    ///
-    /// Guests never read this directly — they get `model.channel-capacity()`,
-    /// which is derived from it — so it can move without touching the guest
-    /// contract. Not to be confused with `frame_dispatch_depth`, which is the
-    /// runtime running ahead of the ENGINE rather than the guest running ahead
-    /// of the runtime.
-    #[serde(default = "default_frame_submit_depth")]
-    pub frame_submit_depth: u32,
+    // `frame_submit_depth` STOOD HERE AND IS DERIVED NOW (alto E, survey
+    // debt 8). It was "frames a guest keeps submitted into the runtime: one
+    // running, plus the rest queued behind it", defaulting to 3 beside a
+    // `frame_dispatch_depth` of 2 — and its own documentation had to explain
+    // that the two were not independent. They are one number:
+    // `engine::runahead::Runahead::submit_depth` is `frames_in_flight + 1`,
+    // which answers 3 at the shipped default, and
+    // `Runahead::channel_capacity(k)` is what a guest reads as
+    // `model.channel-capacity()`. A deployment that wants a longer window
+    // moves `frame_dispatch_depth`, which is the number the engine also
+    // carves its staging ring from — one number, one owner (article 8).
     /// Frames the runtime keeps POSTED to the engine but not yet retired: the
-    /// dispatch loop's enqueue horizon. Where `frame_submit_depth` is the
-    /// guest running ahead of the runtime, this is the runtime running ahead of
-    /// the device, and it is what keeps the GPU from idling between frames —
-    /// at 2 one frame executes while the next is already uploaded.
+    /// dispatch loop's enqueue horizon — the runtime running ahead of the
+    /// device, and what keeps the GPU from idling between frames: at 2 one
+    /// frame executes while the next is already uploaded. The guest's own
+    /// window is this plus one
+    /// ([`engine::runahead::Runahead::submit_depth`]), so this is the single
+    /// knob behind both.
     ///
     /// **This is a real two-sided trade-off, not a value with one right
     /// answer.** Dispatching is the allocation-credit gate, so each frame of
@@ -850,13 +968,11 @@ impl Default for RuntimeConfig {
             submit_deadline: default_submit_deadline(),
             silence_timeout: default_silence_timeout(),
             frame_size: default_frame_size(),
-            frame_submit_depth: default_frame_submit_depth(),
             frame_dispatch_depth: default_frame_dispatch_depth(),
             max_concurrent_processes: None,
         }
     }
 }
-
 
 impl RuntimeConfig {
     fn validate(&self) -> Result<()> {
@@ -881,12 +997,6 @@ impl RuntimeConfig {
         ensure!(
             self.frame_dispatch_depth >= 1,
             "runtime.frame_dispatch_depth must be >= 1"
-        );
-        ensure!(
-            self.frame_submit_depth >= 2,
-            "runtime.frame_submit_depth must be at least 2: one frame runs while the rest \
-             stay queued, so a value of 1 leaves nothing queued and puts the host resubmit \
-             round trip back in the critical path — the lockstep this window exists to prevent"
         );
         // ── THE ENGINE COUPLING, DERIVED RATHER THAN TRANSCRIBED (alto F2b).
         //
@@ -943,10 +1053,6 @@ fn default_silence_timeout() -> Duration {
 
 fn default_frame_size() -> u32 {
     2
-}
-
-fn default_frame_submit_depth() -> u32 {
-    3
 }
 
 fn default_frame_dispatch_depth() -> u32 {
@@ -1313,6 +1419,61 @@ pub struct CudaNativeEngineOptions {
     /// latency-regime win (helps at low batch, costs at compute saturation), so
     /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
     pub enable_system_speculation: bool,
+    /// **HOW MUCH OF A FIRE THE SHELL RECORDS**: `"off"` (the golden eager
+    /// path), `"shaped"` (eager, with graph-shaped padded schedules — the
+    /// attribution arm) or `"on"` (captured once per shape key, replayed
+    /// after). **Omit for the shell's own default**, which is `"off"`.
+    ///
+    /// Written into the boot document as `[engine] graphs`, which the runtime
+    /// has read since the palo rewrite and which nothing wrote until now.
+    pub graphs: Option<String>,
+    /// **D4's PAD.** Before each walk the CUDA shell stamps the fire's rows and
+    /// its bucket onto every stream context, and the entries that hand a shape
+    /// to cuBLASLt round their `M` up to the bucket, so the library's
+    /// unpublished arm table stops being a function of the batch. **Omit for
+    /// on**, which is what every deployment has been getting.
+    ///
+    /// `false` is the A/B arm the tail-waste measurement needs. The tokens are
+    /// byte-identical across it: everything the padding computes lands in rows
+    /// no reader has.
+    pub pad: Option<bool>,
+    /// **THE FOLD** (D5-lite): under `graphs = "on"`, one exec per BUCKET,
+    /// captured once at a synthetic full composition and rebound on the host
+    /// per fire. **Omit for off**, which is the keyed path every fold gate
+    /// diffs against.
+    pub fold: Option<bool>,
+    /// **THE FOLD'S PIPELINE**: a hot bucket lazily instantiates a twin exec,
+    /// a fire whose composition a seat already holds launches with zero host
+    /// writing, and a stated successor's binding is applied to the idle exec
+    /// after the launch and before the sync. **Omit for on.** Ignored unless
+    /// `fold` is set.
+    pub pipeline: Option<bool>,
+    /// **WHICH ABSENT-WINDOW NODES A FOLDED EXEC DISABLES**: `"all"` disables
+    /// every one of them; `"library"` keeps pie windowed nodes enabled at
+    /// fitted zero rows and disables only the library residue. **Omit for
+    /// `"all"`**, which steady decode measured at parity with the other arm
+    /// (3.439 against 3.440 ms/fire, byte-identical tokens) and which has the
+    /// simpler failure story. Ignored unless `fold` is set.
+    pub fold_disable: Option<String>,
+    /// **`Fallback::Copy` WHERE THE COMPILER'S TABLE ASKS FOR ONE.** Below the
+    /// copy/split crossover — every bucket a decode fire lands in — a copy
+    /// measured 1.07x the ideal against a split's 1.82x. **Omit for on.**
+    /// `false` is the A/B arm and the free oracle: a copy computes the same
+    /// bytes over the same rows, and only a byte-for-byte diff against a split
+    /// can settle that.
+    pub fallback_copy: Option<bool>,
+    /// **THE GROUPED ARM**: the ops whose kernels walk a segment list are named
+    /// to the compiler, so a withdrawn consumer is served as ONE launch over
+    /// that list instead of one per rectangle. **Omit for on.** `false` names
+    /// none of them, which is the off arm of a Grouped-versus-Split
+    /// measurement — the same row order, a different answer on it.
+    pub grouped: Option<bool>,
+    /// **HOW MANY SIDE STREAMS THE COMPILER MAY HAND OUT.** `0` bakes an
+    /// artifact with no fork group, no event point and stream 0 on every
+    /// region — the artifact this compiler produced before concurrency
+    /// existed, which is the only honest off arm for a streams measurement.
+    /// **Omit for the device profile's own figure.**
+    pub side_streams: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -1367,6 +1528,14 @@ impl Default for CudaNativeEngineOptions {
             expert_cache: None,
             expert_host_cache: None,
             enable_system_speculation: false,
+            graphs: None,
+            pad: None,
+            fold: None,
+            pipeline: None,
+            fold_disable: None,
+            fallback_copy: None,
+            grouped: None,
+            side_streams: None,
         }
     }
 }
@@ -1769,6 +1938,80 @@ device = ["cpu"]
         assert_eq!(cfg.model.weight_cache_dir, "/mnt/big/pie-models");
     }
 
+    /// **`[model.adapters]` IS ABSENT IN EVERY DEPLOYMENT THAT HAS ONE
+    /// TODAY**, and absent means the shape that was hard-coded before it
+    /// existed: zero seats, no roster, and the correction op never launches.
+    #[test]
+    fn adapters_are_absent_by_default_and_that_is_zero_seats() {
+        let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.model.adapters.is_empty());
+        assert_eq!(cfg.model.adapters.seats(), 0);
+        assert!(cfg.model.adapters.registered.is_empty());
+    }
+
+    /// The capacity is stated once: either the operator says it, or the
+    /// roster does (article 8 — one number, one owner).
+    #[test]
+    fn the_seat_count_is_stated_once_or_derived_from_the_roster() {
+        let toml = MINIMAL_METAL.replace(
+            "model = \"Qwen/Qwen3-0.6B\"",
+            "model = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
+             [[model.adapters.registered]]\n\
+             id = 2\n\
+             planes = { \"layer.0.lora_a\" = \"/adapters/0/a.bin\" }\n",
+        );
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.validate().unwrap();
+        // Highest id 2 means three rows, because ids are rows counted from
+        // zero.
+        assert_eq!(cfg.model.adapters.seats(), 3);
+        assert_eq!(cfg.model.adapters.registered.len(), 1);
+        assert_eq!(
+            cfg.model.adapters.registered[0].planes["layer.0.lora_a"],
+            "/adapters/0/a.bin"
+        );
+
+        // Stated wins, and states room the roster does not need yet.
+        let stated = toml.replace("[model.adapters]", "[model.adapters]\nseats = 8");
+        let cfg: Config = toml::from_str(&stated).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.model.adapters.seats(), 8);
+    }
+
+    /// The two refusals this layer can make without a device.
+    #[test]
+    fn an_adapter_past_its_seats_or_on_a_relative_path_is_refused_by_name() {
+        let past = MINIMAL_METAL.replace(
+            "model = \"Qwen/Qwen3-0.6B\"",
+            "model = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\nseats = 2\n\
+             [[model.adapters.registered]]\n\
+             id = 5\n",
+        );
+        let cfg: Config = toml::from_str(&past).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("adapter id 5 is past the 2 seat"), "got: {err}");
+
+        let relative = MINIMAL_METAL.replace(
+            "model = \"Qwen/Qwen3-0.6B\"",
+            "model = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\n\
+             [[model.adapters.registered]]\n\
+             id = 0\n\
+             planes = { \"layer.0.lora_a\" = \"a.bin\" }\n",
+        );
+        let cfg: Config = toml::from_str(&relative).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("must be \n             an absolute path") || err.contains("absolute path"), "got: {err}");
+
+        // And a near-miss of a key is still refused, as everywhere else.
+        let typo = MINIMAL_METAL.replace(
+            "model = \"Qwen/Qwen3-0.6B\"",
+            "model = \"Qwen/Qwen3-0.6B\"\n\n[model.adapters]\nseat = 2\n",
+        );
+        toml::from_str::<Config>(&typo)
+            .expect_err("a near-miss of `seats` must be refused by name");
+    }
+
     #[test]
     fn rejects_a_relative_weight_cache_dir() {
         // Relative resolves against the engine's cwd, which the operator did
@@ -1799,25 +2042,40 @@ device = ["cpu"]
         let cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.runtime.frame_size, 2);
-        assert_eq!(cfg.runtime.frame_submit_depth, 3);
         assert_eq!(cfg.runtime.frame_dispatch_depth, 2);
+        // AND THE GUEST'S WINDOW IS THAT NUMBER'S ARITHMETIC (alto E). It was
+        // `frame_submit_depth = 3`, configured beside this one; the shipped
+        // deployment's answer is unchanged, and there is no second knob that
+        // can be set to disagree with it.
+        assert_eq!(
+            Runahead::of(cfg.runtime.frame_dispatch_depth as u8).submit_depth(),
+            3
+        );
     }
 
+    /// A run-ahead window that leaves the guest nothing queued is now
+    /// UNREPRESENTABLE rather than refused.
+    ///
+    /// `runtime.frame_submit_depth = 1` used to be a config a `validate`
+    /// clause had to catch: one frame submitted is the running frame alone,
+    /// so the host round trip returns to the critical path. The window is
+    /// `frame_dispatch_depth + 1` now and `frame_dispatch_depth >= 1` is
+    /// already enforced above, so the smallest window a config can express is
+    /// two — one running, one being built.
     #[test]
-    fn rejects_a_run_ahead_window_that_leaves_nothing_queued() {
+    fn the_smallest_expressible_window_still_leaves_one_frame_queued() {
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
-        // One frame submitted is the running frame alone — no run-ahead at
-        // all, so the host round trip returns to the critical path.
-        cfg.runtime.frame_submit_depth = 1;
+        cfg.runtime.frame_dispatch_depth = 1;
+        cfg.validate().unwrap();
+        assert_eq!(Runahead::of(1).submit_depth(), 2);
+
+        cfg.runtime.frame_dispatch_depth = 0;
         assert!(
             cfg.validate()
                 .unwrap_err()
                 .to_string()
-                .contains("runtime.frame_submit_depth must be at least 2")
+                .contains("runtime.frame_dispatch_depth must be >= 1")
         );
-
-        cfg.runtime.frame_submit_depth = 2;
-        cfg.validate().unwrap();
     }
 
     /// **THE DEPTHS ARE BOUNDED BY THE FORMULA, NOT BY A LITERAL** (alto

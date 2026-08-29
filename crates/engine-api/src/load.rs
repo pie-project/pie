@@ -105,6 +105,143 @@ pub enum Checkpoint {
     None,
 }
 
+/// **How much of the weight table this load may keep, stated as two budgets
+/// rather than a mode** (alto design §7).
+///
+/// Weights are a cache hierarchy and not a setting:
+///
+/// ```text
+/// T2 SSD      the checkpoint on disk, plus the warm-boot artifact cache
+/// T1 pinned   host cache, budgeted   <- `host_weight_budget`
+/// T0 device   slab, budgeted         <- `device_weight_budget`
+/// ```
+///
+/// "Full residency" is the DEGENERATE CASE of that hierarchy — the T0 budget
+/// covers everything — and not a separate arm, which is why there is no
+/// `enum ResidencyMode` here. A mode would have had to name every combination
+/// the tiers can be in, and the tiers are two numbers; two numbers name them
+/// all, including the ones nobody has built yet.
+///
+/// `None` is UNCAPPED, and uncapped on both is exactly today's behaviour: the
+/// whole table lands on the device at load and never moves. A caller that
+/// states neither budget gets the engine it had before this field existed,
+/// which is why [`Default`] is both-`None` and why the field is
+/// `#[serde(default)]` on [`LoadRequest`].
+///
+/// # A budget an engine cannot meet by holding less refuses; it never
+/// silently holds more
+///
+/// Which planes an engine can hold LESS of is a property of the planes, not a
+/// setting. The CUDA shell streams the demand shape design §7 calls dynamic —
+/// ROUTED EXPERT BANKS, whose residency is a performance promotion because
+/// routing is computed on device and no host decision precedes a fire — by
+/// keeping a device slab of a few experts over a pinned host copy of all of
+/// them, behind a device-resident indirection table the kernels read. Under
+/// such a budget the load SERVES, [`LoadFacts::weights_resident`] answers
+/// `false`, and the numbers are the numbers full residency would have
+/// produced.
+///
+/// Everything else still refuses. The static demand shape — dense overflow,
+/// whose prefetch schedule the compiler emits — is design §7's other half and
+/// is not built; the Metal shell holds one tier and streams nothing. So a
+/// budget under a plan's dense planes, or under a plan with no routed bank at
+/// all, is [`Error::Impossible`](crate::Error::Impossible), naming BOTH
+/// numbers: what was asked for and what must stay resident. That is F1's
+/// doctrine — an unbuilt combination refuses loudly rather than being rounded
+/// to the nearest built one — and it is why the noun landed before the
+/// machinery: the same field that refused every budget in wave D1 now admits
+/// the ones a tier can meet, and nothing above this line changed to let it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Residency {
+    /// The most weight bytes this load may hold on the DEVICE (tier T0).
+    ///
+    /// `None` is uncapped: land the whole table. `Some(n)` is a ceiling met
+    /// by holding fewer ROUTED EXPERTS, which is the one thing an engine here
+    /// can hold fewer of; an engine that cannot reach `n` that way refuses the
+    /// load rather than pretending.
+    pub device_weight_budget: Option<u64>,
+    /// The most weight bytes this load may hold in the PINNED HOST cache
+    /// (tier T1) — the tier a device miss reads over UVA instead of stalling
+    /// on the checkpoint.
+    ///
+    /// `None` is uncapped. An engine that holds everything on the device
+    /// keeps zero host-resident weight bytes and every host budget admits it;
+    /// one that streams routed experts pins EVERY expert of every streamed
+    /// bank — the pinned copy is authoritative and the device slab is a cache
+    /// over it, which is what makes a demotion a table entry rather than a
+    /// write-back — so its host demand is those banks whole, and a budget
+    /// under that refuses like any other.
+    pub host_weight_budget: Option<u64>,
+}
+
+impl Residency {
+    /// Both budgets uncapped — the whole table resident, which is what every
+    /// load in this workspace does today.
+    #[must_use]
+    pub const fn uncapped() -> Residency {
+        Residency {
+            device_weight_budget: None,
+            host_weight_budget: None,
+        }
+    }
+
+    /// True when neither tier is capped, i.e. the degenerate full-residency
+    /// case a shell may serve by doing nothing special.
+    #[must_use]
+    pub const fn is_uncapped(&self) -> bool {
+        self.device_weight_budget.is_none() && self.host_weight_budget.is_none()
+    }
+
+    /// **Does this policy admit a checkpoint that demands these bytes
+    /// resident?**
+    ///
+    /// The one gate a shell calls, with the demand it has ALREADY PLANNED —
+    /// what the tiers it has will actually hold, not what the checkpoint
+    /// contains. A shell that streams routed experts asks about the slab plus
+    /// the dense planes and about the pinned tier beside it; a shell that
+    /// streams nothing asks about the whole table and zero. Uncapped admits
+    /// everything; a stated budget admits what fits under it and refuses what
+    /// does not, by name and with both numbers in the message.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Impossible`](crate::Error::Impossible) when either demand is
+    /// past its budget. `Impossible` and not
+    /// [`Exhausted`](crate::Error::Exhausted) on purpose: nothing the
+    /// deployment frees changes the answer, because the refusal is about a
+    /// tier this build does not have rather than about a pool that is full.
+    pub fn admit(&self, device_demand: u64, host_demand: u64) -> crate::Result<()> {
+        for (budget, demand, tier, field) in [
+            (
+                self.device_weight_budget,
+                device_demand,
+                "device",
+                "device_weight_budget",
+            ),
+            (
+                self.host_weight_budget,
+                host_demand,
+                "pinned host",
+                "host_weight_budget",
+            ),
+        ] {
+            if let Some(budget) = budget {
+                if demand > budget {
+                    return Err(crate::Error::Impossible(format!(
+                        "weight residency: `{field}` is {budget} bytes and this load demands \
+                         {demand} bytes on the {tier} tier. That demand is what the engine \
+                         has already reduced to as far as its tiers allow — routed expert \
+                         banks stream, dense planes do not (alto design §7) — so the budget \
+                         cannot be met by holding less of it. Raise the budget, or state \
+                         `None` for uncapped."
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Everything a load states.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadRequest {
@@ -114,6 +251,13 @@ pub struct LoadRequest {
     pub checkpoint: Checkpoint,
     /// The ceilings every fire is baked against.
     pub budgets: Budgets,
+    /// **How much of the weight table this load may keep resident**, per tier
+    /// (alto design §7). Both budgets `None` — the [`Default`] — is the
+    /// uncapped, whole-table-on-the-device load every caller had before the
+    /// field existed, which is why it is `#[serde(default)]`: an older
+    /// caller's request still parses and still means what it meant.
+    #[serde(default)]
+    pub residency: Residency,
     /// Which device to bind, when the shell serves more than one.
     pub ordinal: i32,
     /// **How many frames the caller will keep in flight** — the one run-ahead
@@ -149,10 +293,64 @@ pub struct LoadFacts {
     pub trace_name: String,
     /// Bytes the weight tables occupy on the device.
     pub weight_bytes: u64,
+    /// **Is the WHOLE weight table device-resident?** (alto design §7.)
+    ///
+    /// The residency half of the answer
+    /// [`weight_bytes`](LoadFacts::weight_bytes) gives the size of. `true`
+    /// says every param this plan names is on the device and no fire will
+    /// ever wait on a promotion; `false` says the load is streaming some tier
+    /// of it, and `weight_bytes` is then what is RESIDENT rather than what the
+    /// checkpoint holds.
+    ///
+    /// `true` whenever the request's [`Residency`] budgets are uncapped, or
+    /// cover the whole table — the degenerate case design §7 calls full
+    /// residency. `false` is what the CUDA shell answers for a load whose
+    /// `device_weight_budget` it met by streaming routed expert banks: the
+    /// logits are the logits full residency would have produced, and what
+    /// differs is only how much of the table is on the device at once.
+    pub weights_resident: bool,
+    /// **Did this load's weight table come off a warm-boot artifact cache
+    /// instead of the checkpoint?** (alto design §7's T2 tier.)
+    ///
+    /// The materialized device weight table is a deterministic function of
+    /// the checkpoint, the load contract compiled against it, and the layout
+    /// the shell chose — so an engine may snapshot it after a cold load and
+    /// read it straight back on the next boot, skipping the host-side
+    /// transform pipeline entirely. `true` says that is what happened.
+    ///
+    /// **`false` IS ALSO WHAT AN ENGINE WITH NO CACHE SAYS**, and it says it
+    /// honestly rather than by omission: a shell that has no artifact cache
+    /// answers `false` on every load, which is the same answer a shell with
+    /// one gives on a cold boot. A caller reading this learns what happened
+    /// to THIS load, not what the engine is capable of — which is the
+    /// division [`Capabilities`] and [`LoadFacts`] have from the start.
+    ///
+    /// `#[serde(default)]` so an engine written before the tier existed still
+    /// deserializes, reporting the truth about itself.
+    #[serde(default)]
+    pub weights_from_cache: bool,
     /// Bytes the activation arena occupies.
     pub arena_bytes: u64,
     /// Bytes the pools occupy.
     pub pool_bytes: u64,
     /// Bytes the resident fire inputs occupy.
     pub input_bytes: u64,
+    /// **Bytes of the pools actually under a physical mapping** (alto design
+    /// §8, article 8: one number, one owner).
+    ///
+    /// `pool_bytes` is the CEILING the pools' address space was reserved at;
+    /// this is what is backed right now. On an engine whose pools are elastic
+    /// the two differ by design — the load commits to demand and grows — and
+    /// on one whose pools are a single reservation they are equal.
+    ///
+    /// The engine owns physical commit and trim, so the engine is what
+    /// answers this. It replaced a runtime-side scan of its own page free
+    /// list, which was a policy structure being asked a supply question.
+    #[serde(default)]
+    pub pool_committed_bytes: u64,
+    /// **The most that has ever been mapped**, since load. What a trim is
+    /// measured against, and what an operator sizing the next machine wants
+    /// rather than either the ceiling or the instantaneous figure.
+    #[serde(default)]
+    pub pool_high_water_bytes: u64,
 }

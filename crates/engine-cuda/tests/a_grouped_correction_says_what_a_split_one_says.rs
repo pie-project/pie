@@ -28,7 +28,7 @@
 //!
 //! `DeviceProfile::grouped` (a labelled PoC scaffold — read its doc)
 //! names the op whose windowed consumer P4 should withdraw, and both arms name
-//! the correction. `PIE_CUDA_GROUPED=off` empties `DeviceProfile::grouped`,
+//! the correction. `Knobs::grouped` off empties `DeviceProfile::grouped`,
 //! which is what this shell can SERVE. So the two bakes withdraw the same
 //! consumer onto the same frontier and differ only in the answer written for
 //! it: `Copy`/`Split { r }` in one, `Grouped` in the other. Two profile lists
@@ -332,28 +332,31 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         .expect("the import contract fits its own checkpoint");
     drop(source);
 
-    // SAFETY: the caller holds `ONE_AT_A_TIME`, no other thread of this
-    // process is loading a shell, and `Shell::load` reads the variable once
-    // before it returns.
-    unsafe {
-        if grouped {
-            std::env::remove_var("PIE_CUDA_GROUPED");
-        } else {
-            std::env::set_var("PIE_CUDA_GROUPED", "off");
-        }
-        // **AND NEITHER ARM COPIES, BECAUSE THIS FILE PRICES GROUPED AGAINST
-        // SPLIT.** `Fallback::Copy` is on by default now and is the menu's
-        // answer below the crossover, so an arm that left it on would serve
-        // its withdrawn consumer as a gather plus one launch — a third thing,
-        // agreeing with neither arm, and the launch delta below would be
-        // measuring Grouped against Copy under a name that says otherwise.
-        // (The grouped arm never reaches it — `walk` gives `Grouped` the tie —
-        // but it is set on both so that ONE word differs between them.)
-        std::env::set_var("PIE_CUDA_FALLBACK_COPY", "off");
-    }
+    // **THE TWO WORDS, STATED** (alto wave P). This was
+    // `std::env::set_var("PIE_CUDA_GROUPED", ...)` inside an `unsafe` block,
+    // with a safety argument about which thread was loading a shell; article 9
+    // made both words `Knobs` fields, so the arm is a value and the process
+    // environment is not involved.
+    //
+    // **AND NEITHER ARM COPIES, BECAUSE THIS FILE PRICES GROUPED AGAINST
+    // SPLIT.** `Fallback::Copy` is on by default now and is the menu's answer
+    // below the crossover, so an arm that left it on would serve its withdrawn
+    // consumer as a gather plus one launch — a third thing, agreeing with
+    // neither arm, and the launch delta below would be measuring Grouped
+    // against Copy under a name that says otherwise. (The grouped arm never
+    // reaches it — `walk` gives `Grouped` the tie — but it is off on both so
+    // that ONE word differs between them.)
+    let knobs = engine_cuda::Knobs {
+        grouped,
+        copies: false,
+        ..engine_cuda::Knobs::default()
+    };
 
     let budget = budget(u32::try_from(seats).expect("a capacity fits a u32"));
     let mut shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
@@ -381,10 +384,15 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         slots: 8,
         ordinal: 0,
         graphs: Graphs::Off,
+        knobs,
+        program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
         runahead: engine::runahead::Runahead::F1,
+        // The warm-boot weight artifact cache is off for a gate: a test
+        // that shared one would be asserting about the last run.
+        weight_cache_dir: None,
     })
     .expect("the shell loads");
     let planes = loud(&shell);

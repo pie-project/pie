@@ -298,6 +298,63 @@ impl Model {
         )
     }
 
+    /// **A ROUTED MoE THIS FAMILY'S SHAPE, SMALL ENOUGH TO HOLD TWICE** — the
+    /// text the weight-residency gate loads (alto design §7, wave D2).
+    ///
+    /// Not a catalog row and deliberately not one: no checkpoint ships it, no
+    /// deployment selects it, and adding it to `CATALOG` would oblige an
+    /// import contract and a chat template for a model nobody serves. What it
+    /// is for is the one claim `a3b` cannot be used to make on a single card —
+    /// that a load whose `device_weight_budget` holds HALF the experts
+    /// produces the logits full residency produces — because that claim needs
+    /// BOTH loads on one device and `a3b` is sixty-four gibibytes.
+    ///
+    /// Every number below is `a3b`'s, divided until two copies fit in a
+    /// gate's patience, with two deliberate exceptions:
+    ///
+    /// * `attn_every: 1` — every layer is a gated-attention layer rather than
+    ///   one in four. The residency tier is about the MLP's expert banks and
+    ///   the GDN mixer is orthogonal to it; holding the mixer fixed is what
+    ///   makes a difference in the logits a difference in the weights.
+    /// * `tied: true` — no `lm_head` plane, because a second 
+    ///   `[vocab, hidden]` rectangle is the largest dense thing here and the
+    ///   dense floor is not what is under test.
+    ///
+    /// It is built through the same `Model::new` every shipped size is, so
+    /// nothing about its banks, cuts or names can drift from `a3b`'s.
+    pub fn a3b_micro(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 512,
+                layers: 4,
+                attn_every: 1,
+                q_heads: 8,
+                kv_heads: 2,
+                head_dim: 64,
+                rotary_dim: 64,
+                theta: 10_000_000.0,
+                k_heads: 8,
+                v_heads: 8,
+                k_dim: 64,
+                v_dim: 64,
+                conv_kernel: 4,
+                mlp: MlpDims::Routed(MoeDims {
+                    experts: 32,
+                    top_k: 4,
+                    inter: 128,
+                    shared_inter: 128,
+                }),
+                vocab: 2048,
+                tied: true,
+                norm_eps: 1e-6,
+                mtp: false,
+            },
+        )
+    }
+
     pub fn d0_8b(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(
             w,

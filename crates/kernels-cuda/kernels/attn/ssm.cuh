@@ -115,15 +115,26 @@ __global__ void ssm_causal_conv1d_chunked_batched(
     long long slot_stride_elems,
     int C, int K, bool write_state,
     const u8* __restrict__ write_state_mask,
-    const int* commit_len)
+    const int* commit_len,
+    const int* begin_at)
 {
     const int c = blockIdx.x;
     const int r = blockIdx.y;
     if (c >= C) return;
 
-    const int t0 = static_cast<int>(qo_indptr[r]);
+    int t0 = static_cast<int>(qo_indptr[r]);
     int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
 
+    // THE SEGMENT THIS LAUNCH OWNS (the 2R split): `begin_at` cuts the front
+    // and `commit_len` cuts the back, and the two are never bound together —
+    // the head runs `[0, n)` and folds, the tail runs `[n, rows)` and does
+    // not. The front cut moves the row origin, so every index below is the
+    // segment's own.
+    if (begin_at != nullptr) {
+        int b = begin_at[r];
+        if (b > Nr) b = Nr;
+        if (b > 0) { t0 += b; Nr -= b; }
+    }
     if (commit_len != nullptr) {
         const int c = commit_len[r];
         if (c < Nr) Nr = c;
@@ -185,15 +196,22 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
     long long slot_stride_elems,
     int C, int K, bool write_state,
     const u8* __restrict__ write_state_mask,
-    const int* commit_len)
+    const int* commit_len,
+    const int* begin_at)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int r = blockIdx.y;
     if (c >= C) return;
 
-    const int t0 = static_cast<int>(qo_indptr[r]);
+    int t0 = static_cast<int>(qo_indptr[r]);
     int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
 
+    // The segment this launch owns — see the per-channel form above.
+    if (begin_at != nullptr) {
+        int b = begin_at[r];
+        if (b > Nr) b = Nr;
+        if (b > 0) { t0 += b; Nr -= b; }
+    }
     if (commit_len != nullptr) {
         const int c = commit_len[r];
         if (c < Nr) Nr = c;
@@ -1613,7 +1631,9 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
     int K_h, int V_h, int K_d, int V_d,
     bool write_state,
     const int* __restrict__ commit_len,
-    const u8* __restrict__ write_state_mask)
+    const u8* __restrict__ write_state_mask,
+    const int* __restrict__ begin_at,
+    bool fused_decay)
 {
 
     const int gqa_repeat = V_h / K_h;
@@ -1625,9 +1645,16 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
     const int v_idx = vt * BV + threadIdx.x;
     if (v_idx >= V_d) return;
 
-    const int t0 = static_cast<int>(qo_indptr[r]);
+    int t0 = static_cast<int>(qo_indptr[r]);
     int T  = static_cast<int>(qo_indptr[r + 1]) - t0;
 
+    // THE SEGMENT THIS LAUNCH OWNS (the 2R split), exactly as the chunked
+    // conv reads it: `begin_at` cuts the front, `commit_len` cuts the back.
+    if (begin_at != nullptr) {
+        int b = begin_at[r];
+        if (b > T) b = T;
+        if (b > 0) { t0 += b; T -= b; }
+    }
     if (commit_len != nullptr) {
         const int c = commit_len[r];
         if (c < T) T = c;
@@ -1657,7 +1684,17 @@ __global__ void ssm_gated_delta_chunked_batched_fla(
         bh_state[j] = __floats2bfloat162_rn(s0, s1);
     }
 
-    const bool single_round = (commit_len != nullptr);
+    // **THE ROUNDING POLICY IS ITS OWN ARGUMENT** (alto F3b).
+    //
+    // This was `commit_len != nullptr`, which read a LENGTH as a rounding:
+    // `single_round` folds the decay into the update instead of rounding the
+    // decayed state to bf16 first, so binding the length seat changed the
+    // NUMBERS as well as the count and a replay that accepted its whole
+    // window stopped being the fold it replaced. The two are now two
+    // arguments, and the shell binds the fold's own policy on every path —
+    // which is what makes a bound-but-non-truncating seat exact and a
+    // truncated fold exact against a shorter buffer.
+    const bool single_round = fused_decay;
 
     for (int t = 0; t < T; ++t) {
         const long long bh = (long long)(t0 + t) * V_h + h;

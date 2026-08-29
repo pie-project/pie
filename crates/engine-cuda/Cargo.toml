@@ -14,6 +14,16 @@ path = "src/lib.rs"
 [dependencies]
 # The vocabulary the resolver routes on: `ValueDecl`, `Def`, `RuntimeInput`,
 # `StructKind` — and the 15 family enums the dispatch arms destructure.
+# `statvfs`, for the one question the standard library cannot answer:
+# how much room is left on the disk the weight artifact cache writes to. The
+# cache DECLINES a write it has no room for rather than filling the operator's
+# disk (dev's `weight_artifact_cache.hpp`), and that refusal needs the number.
+libc = "0.2"
+# The weight artifact cache hashes the WHOLE `LoadPlan` — the plan IS the
+# recipe, so hashing it whole is the only formulation that cannot go stale
+# when a plan grows a field (dev's `cache_key.rs`). `serde_json` is the
+# serializer the plan already derives for.
+serde_json = "1"
 model-ir = { path = "../model-ir" }
 # The contract implemented — the 15 `Dispatch*` traits and `KernelError`.
 # Contract only: the walk written over it lives in the engine substrate
@@ -58,11 +68,22 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
 ] }
 
 [features]
-# Nothing by default. Every item below compiles with no runtime selected and
-# every device call answers `Fault::Runtimeless` — the same property
-# `kernels-cuda` keeps, and what lets a plain workspace check carry this
-# crate's host tests on a machine with no GPU in it.
-default = []
+# `probe` only. Every item below compiles with no runtime selected and every
+# device call answers `Fault::Runtimeless` — the same property `kernels-cuda`
+# keeps, and what lets a plain workspace check carry this crate's host tests on
+# a machine with no GPU in it.
+default = ["probe"]
+
+# **THE GATE-ONLY HOOKS**, on the `model-loader/testkit` pattern: on by default
+# so this crate's own gates build with a plain `cargo test`, and dropped by a
+# serving binary with `default-features = false` (which `runtime` does), so
+# nothing a serving path could call is compiled into one.
+#
+# It carries `Session::skew_prediction` — "state a prediction the device will
+# refuse", which exists because alto's channel protocol says a pass whose
+# prediction disagrees with the ring must be unobservable, and a correct engine
+# never disagrees with itself, so a gate has to make it disagree on purpose.
+probe = []
 
 # Exactly one of these turns the runtime on, and it must name the libcudart
 # this binary will LOAD. Forwarded to `kernels-cuda`, whose manifest explains

@@ -304,6 +304,19 @@ fn fault(fault: Fault) -> Error {
         Fault::Mask { .. } | Fault::Maskless { .. } | Fault::MaskWord { .. } => {
             Error::Invalid(fault.to_string())
         }
+        // THE PER-ROW MASK IS `Unsupported`, NOT `Invalid`, AND THE
+        // DIFFERENCE IS WHOSE PROBLEM IT IS. Every refusal above is about a
+        // mask the caller could state differently — a wrong extent, a word
+        // that disagrees, an artifact with no arm. `Masking::Rows` is a
+        // well-formed submission this ENGINE has no expansion for
+        // (`crate::mask`'s last section), and the caller's answer is another
+        // engine, not another mask. `Unsupported` is the word the contract
+        // reserves for exactly that, and it names the verb the way
+        // `Lane::validate_for`'s refusals do.
+        Fault::MaskRows { .. } => Error::Unsupported {
+            verb: "Lane::mask as Masking::Rows (a per-query-row attention mask)",
+            engine: "metal",
+        },
         // An adapter registration this load's banks cannot seat is the
         // CALLER's too, and for the same reason the mask arms are: the bank
         // is a shape the model text declared and the planes are bytes the
@@ -448,6 +461,7 @@ impl Engine for Metal {
             trace,
             checkpoint,
             budgets,
+            residency,
             ordinal,
             // **STATED AND NOT SPENT, AND THAT IS THE HONEST ANSWER HERE.**
             // The run-ahead depth sizes an asynchronous shell's staging ring;
@@ -505,6 +519,20 @@ impl Engine for Metal {
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
+
+        // ── RESIDENCY (alto design §7). One tier: the whole table lands in
+        //    one shared buffer and never moves. A stated `device_weight_budget`
+        //    under what the table needs is a load this shell cannot serve, and
+        //    `Residency::admit` refuses it with both numbers in the message
+        //    rather than landing the whole thing anyway.
+        //
+        //    It is checked AFTER the shell lands rather than before, and the
+        //    CUDA twin checks it before: there the demand is read off the plan
+        //    (`weights::device_demand`) so the refusal costs no device work,
+        //    and here the equivalent arithmetic is not exposed. The answer is
+        //    the same, and a load that refuses has done work it will throw
+        //    away — which is a cost, not a lie.
+        residency.admit(weight_bytes, 0)?;
         let paging = shell.paging();
         let profile = profile(&shell, &budgets)?;
 
@@ -635,6 +663,14 @@ impl Engine for Metal {
             // — `publish_channel`/`take_channel` at the fire's boundary —
             // until the MSL half of the two kernels exists.
             device_channel_commit: false,
+            // **FALSE FOR THE SAME KIND OF REASON** (alto design §6, wave
+            // F3). This shell allocates no buffered-activation pool and its
+            // `ssm` entries seat neither `commit_len` nor a fold predicate,
+            // so `RsVerb::Buffer` and `RsVerb::FoldBuffered` are things it
+            // could only serve as a destructive fold — which is the one
+            // outcome a speculating caller must never be handed. Refused by
+            // name at `Lane::validate_for` until the MSL half exists.
+            rs_verbs: false,
         };
 
         self.shell = Some(shell);
@@ -643,9 +679,30 @@ impl Engine for Metal {
             facts: LoadFacts {
                 trace_name,
                 weight_bytes,
+                // ONE TIER, AND `Residency::admit` REFUSED ANY REQUEST FOR A
+                // SECOND (alto design §7): this shell lands the whole table
+                // in one shared buffer and never moves it.
+                weights_resident: true,
+                // **THIS PLANE HAS NO WARM-BOOT ARTIFACT CACHE, AND IT SAYS
+                // SO RATHER THAN LEAVING THE FIELD OUT** — the same
+                // capability honesty `sms: 0` and `fp8_native: false` are
+                // stated with a few lines above. The CUDA shell's cache buys
+                // a warm boot by skipping host-side dequant/repack and a
+                // per-tensor upload; on unified memory the upload is the
+                // small half, and `kernels-metal` stamps one dtype, so there
+                // is much less transform to amortize. Whether it is worth
+                // building here is a measurement nobody has taken, and until
+                // someone does, every Metal load is a cold one and reports it.
+                weights_from_cache: false,
                 arena_bytes,
                 pool_bytes,
                 input_bytes,
+                // **THIS PLANE'S POOLS ARE ONE RESERVATION**, so what is
+                // committed IS the ceiling and there is no high water to
+                // report separately. Stated as `pool_bytes` rather than left
+                // at zero, because zero would read as "nothing is backed".
+                pool_committed_bytes: pool_bytes,
+                pool_high_water_bytes: pool_bytes,
             },
             caps,
         })
@@ -857,16 +914,6 @@ impl Metal {
                     // rejected positions or an mRoPE lane, and both need a
                     // staged `positions` vector this fire path does not take.
                     return Err(Error::unsupported("metal", "explicit lane positions"));
-                }
-                if !lane.kv.translation.is_empty() {
-                    // A fork moved this lane's pages, and the runtime states
-                    // both the old ids and the new. The shell reads the page
-                    // table it is given and never the one before it, so a
-                    // translation is either already applied to `pages` — in
-                    // which case stating it is redundant — or it is not, in
-                    // which case honouring it needs a page mover this shell
-                    // does not have (`copy_kv`, unsupported above).
-                    return Err(Error::unsupported("metal", "kv page translation"));
                 }
                 // THE THREE AXES THE METAL `Seated` DOES NOT CARRY, REFUSED
                 // ONE BY ONE RATHER THAN DROPPED. On the CUDA plane each of

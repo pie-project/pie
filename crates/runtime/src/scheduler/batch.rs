@@ -13,8 +13,11 @@
 //! shape gate, the per-request capacity accounting, the grouping rules that
 //! decide which fires may share a step, and the fire planner's seriation.
 
+use std::collections::HashSet;
+
 use crate::engine::completion::TerminalCell;
 use crate::engine::{FrameFire, SchedulerLimits, StepFire};
+use crate::scheduler::ProcessId;
 
 use super::fire_plan;
 use super::stats::SchedulerStats;
@@ -46,10 +49,15 @@ pub(crate) struct RequestCapacityUsage {
 }
 
 pub(crate) fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapacityUsage {
-    let forward_requests = req
-        .wire_row_count()
-        .max(req.request.rs.slot_ids.len())
-        .max(1);
+    // **THE LANES ARE THE BOUND** (wave F3-tail). This used to take the max of
+    // the lane count and `RsPlan::slot_ids.len()`, back when the recurrent
+    // half of a request was eleven parallel arms hanging off the request. It
+    // was never a second number: `rs::validate_count` refuses a fire whose
+    // bound recurrent working sets and resolved `qo_indptr` rows disagree, and
+    // a request's `qo_indptr` is cut from its own lanes — so the two counts
+    // were equal by construction and the max was reading one of them twice.
+    // The verb lives on the lane now, and a lane is one forward request.
+    let forward_requests = req.wire_row_count().max(1);
     let _ = page_size;
 
     RequestCapacityUsage {
@@ -95,13 +103,129 @@ impl AdmissionLimits {
         // NOW, which is the whole reason they were checks. "per-fire KV
         // containment bounds must be empty or scalar" guarded two parallel
         // `Vec<u64>`s that had to be the same length and at most one entry —
-        // it is `Option<(u64, u64)>` (`FireRequest::kv_write_bounds`). "a
+        // it became one `Option<(u64, u64)>` and then nothing at all, since
+        // no engine ever read the span (alto E deleted the field). "a
         // multi-row fire carries masks without a row CSR" guarded a flat
         // `masks` vector against a `mask_indptr` that cut it per lane — a
         // mask lives on its lane (`Lane::mask`), so a mask row that belongs
         // to no lane cannot be built. Both refusals are gone with the shapes
         // that could fail them.
         None
+    }
+}
+
+/// What one step may hold — the whole of the predicate.
+///
+/// # The ghost this replaced
+///
+/// `LaunchGrouping::accepts` stood in `scheduler::worker`: ~180 lines of
+/// co-batch policy written in the vocabulary of a C++ driver that no longer
+/// exists in this tree. Banded walks serving at most three distinct finite
+/// `set-max-layers` truncations. An "envelope-compose suffix" the submission
+/// order had to keep so a banded walk's fulls-first invariant held. A
+/// `RetryableLaunchError("dense device mask in a multi-program batch")`. One
+/// hook program per launch, because the sideband arena was singular, and a
+/// paged-decode path a multi-token row would lose. RS slot arrays that were
+/// one-per-request across a whole composed batch.
+///
+/// Not one of those refusals exists in any engine crate here. What
+/// [`engine::fire::compose`](engine::fire) refuses is a lane whose WORD no
+/// class of the artifact admits, a lane of no rows, a fire past the arena's
+/// lane and row ceilings, and a fire above the bucket lattice — and nothing
+/// else. Masks are per lane and seriated with everything else; attachments
+/// are per instance; mid-graph hooks are abolished at the contract (design
+/// §9 — a guest program runs at a BOUNDARY); no shell in this workspace can
+/// truncate depth at all; and the recurrent verb is per LANE
+/// (`engine_api::RsVerb`, wave F3-tail), so a fire whose rows fold, scatter
+/// and replay in any mixture is one submission rather than a co-batching
+/// rule.
+///
+/// # The three clauses that are left, and what refuses each
+///
+/// * **One lane per seat.** `Step::validate` refuses "slot N appears twice in
+///   one fire". A bound instance seats its lanes out of its own working set,
+///   so admitting one instance into a step twice is exactly how a step
+///   reaches that refusal — and `serve::prepare` refuses the same shape a
+///   second time for attachments ("instance N is attached twice to one
+///   fire; a program's stages are one pass with one commit").
+/// * **One fire per pipeline.** A pipeline's fires are ORDERED, and every
+///   lane of one fire addresses its KV as of fire entry. A decode composed
+///   into the same step as the prefill it continues would read pages the
+///   prefill has not written. Same-instance dedup covered this within an
+///   instance; a pipeline with two bound passes makes the cross-instance
+///   case reachable.
+/// * **The shape caps.** `max_forward_requests` / `max_forward_tokens` /
+///   `max_page_refs` — the same three [`AdmissionLimits`] refuses a single
+///   fire against, accumulated over the group. They are the host's mirror of
+///   compose's `TooManyLanes` / `TooManyRows` / `NoBucket`, which are the
+///   ceilings the arena was actually cut at.
+///
+/// A fourth clause is structural rather than checked: every member of a wave
+/// reaches one `BatchScheduler`, one scheduler serves one engine index, and
+/// one engine index is one loaded model. So a step's lanes are already one
+/// (model, engine) and therefore one artifact. Were that ever false, compose
+/// would say so by name on the first fire (`Fault::UnknownWord`) rather than
+/// execute something wrong.
+#[derive(Default)]
+pub(crate) struct StepGroup {
+    /// Bound instances already in this step. See clause one.
+    instances: HashSet<u64>,
+    /// Tracked pipelines already in this step. See clause two.
+    pipelines: HashSet<ProcessId>,
+    forward_requests: usize,
+    forward_tokens: usize,
+    page_refs: usize,
+}
+
+impl StepGroup {
+    /// May `request` join this step?
+    ///
+    /// An empty group admits anything: a fire the caps refuse on its own was
+    /// already refused at admission ([`AdmissionLimits`]), so the head of a
+    /// group is never the thing that does not fit.
+    pub(crate) fn accepts(
+        &self,
+        request: &PendingRequest,
+        limits: SchedulerLimits,
+        page_size: u32,
+    ) -> bool {
+        if self.instances.contains(&request.instance_id) {
+            return false;
+        }
+        if request
+            .pipeline_id
+            .is_some_and(|pid| self.pipelines.contains(&pid))
+        {
+            return false;
+        }
+        if self.forward_requests == 0 {
+            return true;
+        }
+        let usage = request_capacity_usage(request, page_size);
+        self.forward_requests.saturating_add(usage.forward_requests) <= limits.max_forward_requests
+            && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
+            && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
+    }
+
+    /// Take `request` into this step. Answers whether the step is now full —
+    /// the caller stops offering it members.
+    pub(crate) fn push(
+        &mut self,
+        request: &PendingRequest,
+        limits: SchedulerLimits,
+        page_size: u32,
+    ) -> bool {
+        let usage = request_capacity_usage(request, page_size);
+        self.instances.insert(request.instance_id);
+        if let Some(pid) = request.pipeline_id {
+            self.pipelines.insert(pid);
+        }
+        self.forward_requests = self.forward_requests.saturating_add(usage.forward_requests);
+        self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
+        self.page_refs = self.page_refs.saturating_add(usage.page_refs);
+        self.forward_requests >= limits.max_forward_requests
+            || self.forward_tokens >= limits.max_forward_tokens
+            || self.page_refs >= limits.max_page_refs
     }
 }
 
@@ -150,10 +274,8 @@ pub(crate) fn build_batch_request(
 /// order. Returns the frame plus the flattened requests in POST order (step
 /// order, member order within a step) — the retirement set.
 ///
-/// Step formation preserves the old per-wave batch semantics exactly: within
-/// a wave, requests group under [`LaunchGrouping`](super::worker::LaunchGrouping)'s
-/// compatibility rules (instance/pipeline dedup, geometry-class homogeneity,
-/// mask/solo exclusions, structural budgets); each group becomes one step.
+/// Within a wave, requests group under [`StepGroup`] — one lane per seat, one
+/// fire per pipeline, the shape caps — and each group becomes one step.
 ///
 /// # What the frame stopped carrying
 ///
@@ -163,12 +285,14 @@ pub(crate) fn build_batch_request(
 ///   the fire's boundary become [`Attachment`](engine_api::fire::Attachment)s
 ///   of the submission itself.
 /// * **`kv_translation` / `kv_translation_indptr`** — a per-roster-lane page
-///   rewrite, gathered from each lane's LAST fire in the frame. It is
-///   [`KvDelta::translation`](engine_api::KvDelta), on the lane it is about.
+///   rewrite, gathered from each lane's LAST fire in the frame, for a fork
+///   mover no shell in this tree has. Both spellings are deleted (alto E);
+///   see `engine_api::KvDelta` for what replaces it when one lands.
 /// * **`required_kv_pages`** — the frame-union page high-water, so an engine
 ///   could refuse before it started. An engine makes that check for itself and
-///   answers [`Exhausted`](engine_api::Error::Exhausted) with the two
-///   numbers in it.
+///   answers [`Exhausted`](engine_api::Error::Exhausted) with the two numbers
+///   in it. The per-request field that fed the union had no reader either and
+///   is deleted (alto E).
 /// * **`sub_batch_indptr` / `sub_batch_class`** — the runs of equal geometry
 ///   class, which the fire planner's own sort key already produced and this
 ///   table described a second time.
@@ -201,7 +325,7 @@ pub(crate) fn build_frame_submission(
         // Repeated passes: incompatible members defer to the wave's next
         // step, exactly like the old deferred-class re-dispatch.
         while !deferred.is_empty() {
-            let mut grouping = super::worker::LaunchGrouping::default();
+            let mut grouping = StepGroup::default();
             let mut group: Vec<Box<PendingRequest>> = Vec::new();
             let mut rest: Vec<Box<PendingRequest>> = Vec::new();
             let mut closed = false;
@@ -284,37 +408,12 @@ pub(crate) fn build_frame_submission(
         // did not say it runs a pass at the boundary contributes nothing, so
         // a prebuilt rider's submission is byte-identical to what it was.
         let mut attachments = Vec::new();
-        let mut lanes = build.lanes;
+        let lanes = build.lanes;
         for (member, &instance) in build.instance_ids.iter().enumerate() {
             if !build.boundary_programs[member] {
                 continue;
             }
             let lane = build.member_lane_indptr[member];
-            // ── THE PREDICTIONS, ONTO THE LANE THAT CARRIES THE PASS (alto
-            //    design §1 article 3). The reservation this member's submit
-            //    minted — one `(head, tail)` per channel, counted, never read
-            //    off a device — travels on the ATTACHED lane, because that is
-            //    the lane whose instance the tickets are about.
-            //
-            //    Only for an engine that adopted the instance's channels:
-            //    `device_channel_tickets` is the runtime's own per-channel
-            //    spelling of `Capabilities::device_channel_commit`, and an
-            //    engine without the two control kernels refuses a stated
-            //    prediction by name rather than ignoring it.
-            if let Some(target) = lanes.get_mut(lane as usize)
-                && group[member].request.device_channel_tickets
-            {
-                target.channels = group[member]
-                    .request
-                    .tickets
-                    .iter()
-                    .map(|ticket| engine_api::Ticket {
-                        channel: ticket.channel,
-                        expected_head: ticket.head,
-                        expected_tail: ticket.tail,
-                    })
-                    .collect();
-            }
             attachments.push(crate::engine::Attachment {
                 lane,
                 instance,
@@ -342,7 +441,7 @@ mod tests {
     use crate::engine::{FireRequest, WorkItemCompletion};
     use tensor_ir::registry::GeometryClass;
 
-    fn pending(request: FireRequest, instance_id: u64, prebuilt: bool) -> Box<PendingRequest> {
+    fn pending(request: FireRequest, instance_id: u64) -> Box<PendingRequest> {
         Box::new(PendingRequest {
             hook_program: false,
             lora_program: false,
@@ -352,7 +451,6 @@ mod tests {
             completion: WorkItemCompletion::new(instance_id, 0),
             process_id: None,
             pipeline_id: None,
-            prebuilt,
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
@@ -387,9 +485,9 @@ mod tests {
     fn every_member_owns_a_span_of_the_steps_lanes() {
         let placeholder = FireRequest::default();
         let requests = vec![
-            pending(decode(11, 3), 1, false),
-            pending(placeholder, 2, true),
-            pending(decode(22, 4), 3, false),
+            pending(decode(11, 3), 1),
+            pending(placeholder, 2),
+            pending(decode(22, 4), 3),
         ];
         let step = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(step.member_lane_indptr, vec![0, 1, 1, 2]);
@@ -415,11 +513,12 @@ mod tests {
             ],
             ..FireRequest::default()
         };
-        two.rs.slot_ids = vec![31, 32];
-        two.rs.slot_flags = vec![0, crate::engine::RS_FLAG_RESET];
+        // The recurrent half is the LANE's since wave F3-tail: a verb and a
+        // reset fact, carried through the merge like every other lane field.
+        two.lanes[1].rs_reset = engine_api::fire::RsReset::Fresh;
         let expected = two.lanes.clone();
 
-        let step = build_batch_request(&[pending(two, 1, true)], 16, &SchedulerStats::default());
+        let step = build_batch_request(&[pending(two, 1)], 16, &SchedulerStats::default());
         assert_eq!(step.member_lane_indptr, vec![0, 2]);
         assert_eq!(step.lanes, expected);
     }
@@ -434,7 +533,7 @@ mod tests {
             ],
             ..FireRequest::default()
         };
-        let requests = [pending(two, 9, false), pending(decode(33, 5), 10, false)];
+        let requests = [pending(two, 9), pending(decode(33, 5), 10)];
         let step = build_batch_request(&requests, 16, &SchedulerStats::default());
 
         assert_eq!(step.member_lane_indptr, vec![0, 2, 3]);
@@ -460,14 +559,18 @@ mod tests {
         let mut masked = decode(11, 3);
         masked.has_user_mask = true;
         masked.single_token_mode = false;
-        masked.device_resolved_geometry = true;
-        masked.lanes[0].mask = Some(crate::engine::Mask::new(vec![0, 1], 1));
+        masked.lanes[0].mask = Some(crate::engine::Masking::Extent(
+            crate::engine::Mask::new(vec![0, 1], 1),
+        ));
 
-        let requests = [pending(masked, 20, false), pending(decode(22, 4), 21, false)];
+        let requests = [pending(masked, 20), pending(decode(22, 4), 21)];
         let step = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(
             step.lanes[0].mask,
-            Some(crate::engine::Mask::new(vec![0, 1], 1))
+            Some(crate::engine::Masking::Extent(crate::engine::Mask::new(
+                vec![0, 1],
+                1
+            )))
         );
         assert_eq!(step.lanes[1].mask, None, "an unmasked peer stays unmasked");
     }
@@ -511,7 +614,7 @@ mod tests {
             .expect("and its peer");
 
         let (frame, _) = build_frame_submission(
-            vec![vec![pending(first, 41, false), pending(second, 42, false)]],
+            vec![vec![pending(first, 41), pending(second, 42)]],
             limits(),
             16,
             &SchedulerStats::default(),
@@ -544,7 +647,7 @@ mod tests {
         pooled.lanes[0].kv.pages.clear();
 
         let (frame, flattened) = build_frame_submission(
-            vec![vec![pending(pooled, 13, false), pending(decode(22, 4), 12, false)]],
+            vec![vec![pending(pooled, 13), pending(decode(22, 4), 12)]],
             limits(),
             16,
             &SchedulerStats::default(),
@@ -568,8 +671,8 @@ mod tests {
     fn a_frames_cells_are_one_per_member_and_never_shared() {
         let (frame, flattened) = build_frame_submission(
             vec![
-                vec![pending(decode(11, 3), 1, false)],
-                vec![pending(decode(22, 4), 2, false)],
+                vec![pending(decode(11, 3), 1)],
+                vec![pending(decode(22, 4), 2)],
             ],
             limits(),
             16,

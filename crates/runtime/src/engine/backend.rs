@@ -65,21 +65,6 @@ pub struct EngineSpec {
     /// port registry's own; it is `tensor_ir::registry`'s mask now
     /// (decision 19), so the two cannot drift.
     pub device_geometry_port_mask: PortMask,
-    /// Does this engine resolve a step's descriptor ports when the step RUNS,
-    /// rather than for the whole frame before any of it runs?
-    ///
-    /// False is the safe answer and the CUDA one: `FramePrepare` does every
-    /// step's host work at frame entry, so a slot chained behind an earlier
-    /// slot of the same frame asks for a cell nobody has produced yet, and
-    /// `pipeline::fire` refuses that frame by name.
-    ///
-    /// True says the engine's `launch` interleaves the two halves -- convert
-    /// one step, fire it, let its program run, then convert the next -- which
-    /// is what makes a chained slot's tokens exist by the time they are read.
-    /// `engine-vulkan` does this: its `launch` calls `envelope::fill` inside
-    /// the per-step loop and answers `Filled::Early` for a channel that is
-    /// still empty, rather than reading every step up front.
-    pub resolves_geometry_per_step: bool,
     /// Which memory a KV page of this engine's lives in.
     ///
     /// Set by [`register_engine_backend`] from the BACKEND, not by whoever

@@ -94,24 +94,10 @@ impl ExecPlan {
     }
 }
 
-#[must_use]
-pub fn bounded_mtp_row_base(plan: &ExecPlan, vocab: u32) -> Option<u32> {
-    if !plan.needs_mtp_logits || vocab == 0 {
-        return None;
-    }
-    let mut rows: u64 = 0;
-    for value in &plan.package.values {
-        if value.intrinsic != Some(IntrinsicId::Logits) {
-            continue;
-        }
-        let numel = shape_numel(&value.shape);
-        if !numel.is_multiple_of(u64::from(vocab)) {
-            return None;
-        }
-        rows = rows.max(numel / u64::from(vocab));
-    }
-    u32::try_from(rows).ok()
-}
+// `bounded_mtp_row_base` stood here: the draft column's row bound, derived
+// from the logits values' shapes and a vocabulary, for a caller that had to
+// size an MTP readout before binding it. The shells bind `MtpLogits` at the
+// `mtp` export and read the rectangle's own extent, so nothing asks (alto E).
 
 #[must_use]
 pub fn const_port_value(port: &engine_api::program::LaunchPort) -> Value {

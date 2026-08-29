@@ -624,3 +624,238 @@ impl Drop for Pinned {
         }
     }
 }
+
+/// **One device-to-device copy, on `stream`** (alto F3).
+///
+/// A free function rather than a [`Buffer`] method because the two callers do
+/// not hold one: the buffered-activation scatter moves bytes between an ARENA
+/// rectangle and a POOL slab, and `copy_state` moves them between two slots of
+/// the same slab. Both hold resolved device addresses, which is what this
+/// takes.
+///
+/// On the stream, never synchronous, for the reason
+/// [`Buffer::zero_span_on`] gives: a synchronous copy is ordered against every
+/// stream in the process, which is a host wait between two waves (article 2)
+/// and a lie about what this fire depends on.
+///
+/// # Errors
+///
+/// [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime
+/// selected.
+pub fn copy_d2d(
+    stream: *mut core::ffi::c_void,
+    dst: u64,
+    src: u64,
+    bytes: usize,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    #[cfg(feature = "_cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        // SAFETY: both addresses are resolutions the caller made against
+        // allocations this shell owns for the load's lifetime, and the copy is
+        // enqueued on the same stream as the launches around it.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemcpyAsync",
+                rt::cudaMemcpyAsync(
+                    dst as *mut core::ffi::c_void,
+                    src as *const core::ffi::c_void,
+                    bytes,
+                    rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                    stream.cast(),
+                ),
+            )
+        }
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        let _ = (stream, dst, src);
+        Err(Fault::Runtimeless)
+    }
+}
+
+/// **Copy `bytes` between two addresses of ANY kind, on `stream`** — the
+/// transfer whose ends the caller resolved and whose direction the driver
+/// works out.
+///
+/// [`copy_d2d`]'s twin for the one pair that is not device-to-device: a
+/// routed expert's promotion reads MAPPED PINNED HOST memory (alto design
+/// §7's T1) and writes the device slab, and both ends are plain `u64`
+/// addresses under UVA. `cudaMemcpyDefault` is the kind that reads the
+/// direction off the addresses themselves, which is the only honest spelling
+/// when one end is a `cudaHostAlloc`ed page and the other is a `cudaMalloc`ed
+/// one — naming `DeviceToDevice` for that pair would be a claim about the
+/// allocations that this module cannot make.
+///
+/// Asynchronous, like everything the promotion path enqueues: the source must
+/// stay unwritten until the copy completes, which for the tier means the
+/// pinned mirror it owns for the load's whole life.
+///
+/// # Errors
+///
+/// [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime
+/// selected.
+pub fn copy_any(
+    stream: *mut core::ffi::c_void,
+    dst: u64,
+    src: u64,
+    bytes: usize,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    #[cfg(feature = "_cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        // SAFETY: both addresses are resolutions the caller made against
+        // allocations this shell owns for the load's lifetime, and the copy is
+        // enqueued on a stream the caller keeps ordered around it.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemcpyAsync",
+                rt::cudaMemcpyAsync(
+                    dst as *mut core::ffi::c_void,
+                    src as *const core::ffi::c_void,
+                    bytes,
+                    rt::cudaMemcpyKind::cudaMemcpyDefault,
+                    stream.cast(),
+                ),
+            )
+        }
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        let _ = (stream, dst, src);
+        Err(Fault::Runtimeless)
+    }
+}
+
+/// **Zero `len` bytes at a device address, and wait.**
+///
+/// [`Buffer::zero_span`]'s free-function twin, for the bytes whose bounds
+/// were checked somewhere else: an [`Arena`](crate::device::Arena) span
+/// checks against what is COMMITTED rather than against a fixed length, and
+/// that check cannot live in a method on a `Buffer` that no longer owns the
+/// bytes.
+///
+/// # Errors
+///
+/// [`Fault::Device`] for the fill, [`Fault::Runtimeless`] with no runtime.
+pub fn zero_span(at: u64, len: usize) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(feature = "_cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        // SAFETY: the address is a span the caller resolved against an
+        // allocation this shell owns.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemset",
+                rt::cudaMemset(at as *mut core::ffi::c_void, 0, len),
+            )
+        }
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        let _ = at;
+        Err(Fault::Runtimeless)
+    }
+}
+
+/// **Zero `len` bytes at a device address on `stream`**, ordered with the
+/// fire — [`Buffer::zero_span_on`]'s free-function twin.
+///
+/// # Errors
+///
+/// As [`zero_span`].
+pub fn zero_span_on(stream: *mut core::ffi::c_void, at: u64, len: usize) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    #[cfg(feature = "_cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        // SAFETY: as `zero_span`, and the caller keeps the span alive past
+        // the enqueue.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemsetAsync",
+                rt::cudaMemsetAsync(at as *mut core::ffi::c_void, 0, len, stream.cast()),
+            )
+        }
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        let _ = (stream, at);
+        Err(Fault::Runtimeless)
+    }
+}
+
+/// **Copy `into.len()` bytes back from a device address, and wait** —
+/// [`Buffer::read`]'s free-function twin.
+///
+/// # Errors
+///
+/// [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime.
+pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
+    if into.is_empty() {
+        return Ok(());
+    }
+    #[cfg(feature = "_cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        // SAFETY: the address is a checked span and `into` is a live host
+        // slice of exactly the length copied.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemcpy",
+                rt::cudaMemcpy(
+                    into.as_mut_ptr().cast(),
+                    at as *const core::ffi::c_void,
+                    into.len(),
+                    rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                ),
+            )
+        }
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        let _ = at;
+        Err(Fault::Runtimeless)
+    }
+}
+
+/// **What the card says is free, in bytes**, or `None` with no runtime.
+///
+/// The one observation that can settle whether an elastic commit actually put
+/// physical pages on the device rather than only moving a counter: a gate
+/// reads it either side of a fire and diffs. Not on any serving path — a
+/// `cudaMemGetInfo` is a driver round trip, and the only production caller is
+/// [`PhysicalPool`](crate::device::PhysicalPool)'s budget, which asks once at
+/// load and again only when a commit has to grow.
+#[must_use]
+pub fn free_bytes() -> Option<u64> {
+    #[cfg(feature = "_cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: two live locals; the call only writes them.
+        let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
+        (asked == rt::cudaError::cudaSuccess).then_some(free as u64)
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        None
+    }
+}

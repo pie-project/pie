@@ -53,8 +53,13 @@ pub struct Pricing {
     pub channel_bytes: u64,
     /// Number of declared channels.
     pub num_channels: usize,
-    /// Read-out row count (from the `embed` indptr lanes, else 1) — the sampling
-    /// row count thrust-2 prices the fire on.
+    /// Read-out row count — the `SampledRows` extent an instance's stage
+    /// buffers are carved at, and the row count thrust-2 prices the fire on.
+    ///
+    /// From the `readout` PORT, which is where a pass states how many rows it
+    /// reads back; from the `embed` indptr's lane count for a pass that states
+    /// no readout (each lane then reads its last row, so the two numbers are
+    /// the same one); one otherwise.
     pub rows: u32,
 }
 
@@ -320,19 +325,46 @@ fn price(c: &TraceContainer) -> Pricing {
             ch.shape.numel() * elem * cells
         })
         .sum();
-    // Rows = embed indptr lanes (numel - 1) when the indptr folds to a constant.
-    let rows = c
-        .ports
-        .iter()
-        .find(|p| p.port == tensor_ir::registry::Port::EmbedIndptr)
-        .and_then(|p| match &p.source {
-            container::PortSource::Const { shape, .. } => {
-                Some((shape.numel() as u32).saturating_sub(1).max(1))
-            }
-            container::PortSource::Channel(channel) => c
-                .channels
-                .get(*channel as usize)
-                .map(|decl| (decl.shape.numel() as u32).saturating_sub(1).max(1)),
+    // **ROWS IS THE `SampledRows` EXTENT, AND THE READOUT PORT IS WHERE IT IS
+    // STATED.** This number is bound as `BindExtents::sampled_rows`, which the
+    // contract defines as "how many readout rows the epilogue reads"; the
+    // compiler agrees and says so structurally —
+    // `tensor_compiler::plan::compile::symbolic` lifts `Port::Readout`'s first
+    // dim AND `IntrinsicId::Logits`'s first dim to the same
+    // `SymbolicExtent::SampledRows`, and gives `Port::EmbedIndptr` a different
+    // extent entirely (`RowCount`).
+    //
+    // It used to be read off the embed indptr's LANES alone, which is the same
+    // number only while every lane reads exactly one row. A speculative
+    // verifier is the shape that breaks the coincidence: one lane, `k` readout
+    // rows, and a `sampled_rows` of 1 carved the epilogue's logits value at one
+    // row — so `reduce_argmax(logits())` answered one token and the guest read
+    // `k - 1` cells of zeroes after it, which is token 0 at every rejected
+    // position. `engine_api::BindExtents`'s own doc names that failure mode:
+    // "a buffer carved for one row when the fire hands it four leaves three
+    // rows of zeroes that no launch faults on".
+    //
+    // The indptr remains the fallback, unchanged, for a container that states
+    // no readout — and for one that reads a row per lane the two agree, so
+    // nothing that worked answers differently.
+    let port_len = |port| {
+        c.ports
+            .iter()
+            .find(|p| p.port == port)
+            .and_then(|p| match &p.source {
+                container::PortSource::Const { shape, .. } => Some(shape.numel() as u32),
+                container::PortSource::Channel(channel) => c
+                    .channels
+                    .get(*channel as usize)
+                    .map(|decl| decl.shape.numel() as u32),
+            })
+    };
+    let rows = port_len(tensor_ir::registry::Port::Readout)
+        .map(|readout| readout.max(1))
+        .or_else(|| {
+            // A CSR of `lanes + 1` bounds, so the lane count is one less.
+            port_len(tensor_ir::registry::Port::EmbedIndptr)
+                .map(|indptr| indptr.saturating_sub(1).max(1))
         })
         .unwrap_or(1);
     Pricing {
@@ -777,6 +809,47 @@ mod tests {
             .unwrap()
             .source = PortSource::Channel(2);
         assert_eq!(price(&container).rows, 2);
+    }
+
+    /// **AND THE READOUT PORT WINS WHERE IT DISAGREES**, which is the
+    /// speculative verifier's shape: ONE lane, `k` readout rows. The extent
+    /// this prices is `SampledRows` — the one the compiler gives both
+    /// `Port::Readout` and `IntrinsicId::Logits` — and reading it off the
+    /// indptr answered 1, which carved the epilogue's logits value at one row
+    /// and left the guest reading zeroes for every row after the first.
+    #[test]
+    fn pricing_reads_rows_from_the_readout_port_where_it_states_one() {
+        let mut container = greedy(VOCAB);
+        // One lane spanning the fire's rows: a `[0, n]` CSR, which is what a
+        // verifier's `embed_indptr` is and what used to price this at 1.
+        container
+            .channels
+            .push(chan(Shape::vector(2), DType::U32, HostRole::None, true));
+        container
+            .ports
+            .iter_mut()
+            .find(|binding| binding.port == Port::EmbedIndptr)
+            .unwrap()
+            .source = PortSource::Channel(2);
+        assert_eq!(
+            price(&container).rows,
+            1,
+            "one lane and no readout is one row, which is what it always was"
+        );
+
+        // The same container, now stating the four rows it reads back.
+        container
+            .channels
+            .push(chan(Shape::vector(4), DType::U32, HostRole::None, true));
+        container.ports.push(container::PortBinding {
+            port: Port::Readout,
+            source: PortSource::Channel(3),
+        });
+        assert_eq!(
+            price(&container).rows,
+            4,
+            "a lane that names four readout rows carves its epilogue for four"
+        );
     }
 
     #[test]

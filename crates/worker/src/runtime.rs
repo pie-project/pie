@@ -1098,6 +1098,7 @@ fn create_engine_group(
                 &tp_launches,
                 component,
                 frames_in_flight,
+                &m.adapters,
             )
             .with_context(|| {
                 format!(
@@ -1129,6 +1130,7 @@ fn create_engine_group(
         None,
         component,
         frames_in_flight,
+        &m.adapters,
     )
     .with_context(|| format!("creating engine for model {:?} group {group_idx}", m.name,))
 }

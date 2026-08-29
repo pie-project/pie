@@ -24,6 +24,11 @@
 
 pub mod alloc;
 pub mod ctx;
+/// **The elastic supply** (alto design §8, wave C): a budgeted pool of
+/// physical pages, and virtual ranges whose backing grows and trims under a
+/// fixed address. The one module in this crate that maps memory rather than
+/// allocating it.
+pub mod elastic;
 pub mod graph;
 /// The load-time rebind table one capture publishes (`palo cuda-abi` §7,
 /// step 3), and the diff between two of them.
@@ -32,6 +37,7 @@ pub mod map;
 /// write-side probes that are still only probes.
 pub mod nodes;
 
-pub use alloc::{Buffer, Pinned};
+pub use alloc::{Buffer, Pinned, copy_any, copy_d2d, copy_d2h, free_bytes, zero_span, zero_span_on};
+pub use elastic::{Arena, PhysicalPool};
 pub use ctx::{Context, present};
 pub use graph::{Graph, GraphExec};

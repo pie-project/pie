@@ -258,12 +258,13 @@ fn the_per_stream_slab_gives_back_the_arms_the_name_key_silenced() {
     eprintln!("{}", table.join("\n"));
 }
 
-/// The off arm, through the shell's own door: `PIE_CUDA_STREAMS=off` is the
-/// artifact P6 never ran on, not a shell that declines to use one it baked.
+/// The off arm, through the shell's own door: `Knobs::side_streams = Some(0)`
+/// is the artifact P6 never ran on, not a shell that declines to use one it
+/// baked.
 ///
-/// The env read itself is `serve::streams_from_env` and is private; what this
-/// asserts is the property it exists to produce, which is the one a
-/// measurement's off arm depends on.
+/// The word was `PIE_CUDA_STREAMS` and is a typed `Boot` field now (alto wave
+/// P, article 9); what this asserts is the property it exists to produce,
+/// which is the one a measurement's off arm depends on.
 #[test]
 fn the_off_arm_is_the_artifact_and_not_a_flag() {
     let off = DeviceProfile {

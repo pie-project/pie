@@ -1,4 +1,4 @@
-//! The fold's gate (`PIE_CUDA_FOLD`, `.wiki/palo/cuda-abi.md` §7 steps 4-5):
+//! The fold's gate (`Knobs::fold`, `.wiki/palo/cuda-abi.md` §7 steps 4-5):
 //! what the keyed path says, the folded path must say — token for token,
 //! over a real checkpoint, with the fold's own counters saying it actually
 //! folded rather than quietly running the arm it is diffed against.
@@ -166,6 +166,9 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     drop(source);
 
     let mut shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
@@ -178,15 +181,22 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         // Both arms below run under On; the load states it once so a test
         // that forgot would still be diffing two graph paths, not eager.
         graphs: Graphs::On,
+        knobs: engine_cuda::Knobs::default(),
+        program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
         runahead: engine::runahead::Runahead::F1,
+        // The warm-boot weight artifact cache is off for a gate: a test
+        // that shared one would be asserting about the last run.
+        weight_cache_dir: None,
     })
     .expect("the shell loads");
-    // The fold is stated per ARM by the tests (`set_fold`), never inherited
-    // from the environment: an inherited `PIE_CUDA_FOLD=on` would make the
-    // keyed arm folded too, and the diff would be the fold against itself.
+    // The fold is stated per ARM by the tests (`set_fold`). It cannot be
+    // inherited any more — `Knobs::fold` above is this `Boot`'s own word, and
+    // there is no environment left to inherit it from (alto wave P) — but the
+    // arm is still stated here, because what this file diffs is the keyed path
+    // against the folded one and both start from the same load.
     shell.set_fold(false);
     Some((shell, tokenizer))
 }

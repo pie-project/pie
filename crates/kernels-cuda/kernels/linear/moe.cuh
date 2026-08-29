@@ -753,13 +753,58 @@ __global__ void moe_matmul_select_wmma_by_route(
                                    top_k, K, N, expert_stride);
 }
 
+// **WHERE ONE EXPERT'S WEIGHTS ARE** (alto design §7, wave D2).
+//
+// `expert_table` is the bank's device-resident indirection table: entry `e`
+// is the base address of expert `e`'s slot, wherever it lives — inside the
+// device slab if it is resident, or in pinned host memory over UVA if it is
+// not. It is DATA (article 5), so promoting an expert changes an entry and
+// never an address a captured graph holds.
+//
+// `nullptr` is the fully-resident load, and it is not a slow arm of a fast
+// one: the table is not read at all, the arithmetic is the
+// `weight_base + expert * expert_stride` this kernel always did, and the
+// generated code for that arm is what it was before D2 existed. That is
+// dev's `place_all()` degeneration, spelled as a branch on a pointer the
+// whole grid loads uniformly.
+template <class T>
+__device__ __forceinline__ const T* moe_expert_base(
+    const T* __restrict__ weight_base,
+    const T* const* __restrict__ expert_table,
+    int expert,
+    long long expert_stride)
+{
+    return expert_table != nullptr
+        ? expert_table[expert]
+        : weight_base + static_cast<long long>(expert) * expert_stride;
+}
+
+// **THE ONE STATISTIC THE FIRE PATH PUBLISHES** (article 3, applied to
+// weights). One `atomicAdd` per routed expert per fire, into a device buffer
+// at a fixed address; the host reads it between fires and promotes. No
+// callback, no sync, and no host decision on the fire path — the count is
+// device data that the settle-side readback carries out, exactly as the
+// channel plane carries a commit word out.
+//
+// `nullptr` — the fully-resident load — costs the same uniform branch the
+// table does and nothing else.
+__device__ __forceinline__ void moe_note_expert(
+    unsigned int* __restrict__ expert_hits, int expert)
+{
+    if (expert_hits != nullptr) {
+        atomicAdd(&expert_hits[expert], 1u);
+    }
+}
+
 template <class T, bool ActByToken, int kWarps, int kUnroll>
 __device__ __forceinline__ void moe_matmul_select_gemv_body(
     const i32* __restrict__ topk_idx,
     const T* __restrict__ act,
     const T* __restrict__ weight_base,
     T* __restrict__ out,
-    int top_k, int K, int N, long long expert_stride)
+    int top_k, int K, int N, long long expert_stride,
+    const T* const* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits)
 {
     const int route = blockIdx.y;
     const int row = blockIdx.x * kWarps + threadIdx.y;
@@ -771,7 +816,14 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
         if (lane == 0) out[(long long)route * N + row] = Elem<T>::from_f32(0.f);
         return;
     }
-    const T* w = weight_base + expert * expert_stride + (long long)row * K;
+    // One thread of one block per route does the counting: `blockIdx.x == 0`
+    // picks the block that owns the first row tile and `threadIdx` picks its
+    // first thread, so the count is per (route, fire) and not per block.
+    if (blockIdx.x == 0 && threadIdx.y == 0 && lane == 0) {
+        moe_note_expert(expert_hits, expert);
+    }
+    const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride)
+        + (long long)row * K;
     const T* x = act + (long long)(ActByToken ? route / top_k : route) * K;
 
     float acc = 0.f;
@@ -820,10 +872,13 @@ __global__ void moe_matmul_select_gemv(
     const T* __restrict__ act,
     const T* __restrict__ weight_base,
     T* __restrict__ out,
-    int top_k, int K, int N, long long expert_stride)
+    int top_k, int K, int N, long long expert_stride,
+    const T* const* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits)
 {
     moe_matmul_select_gemv_body<T, ActByToken, kWarps, kUnroll>(
-        topk_idx, act, weight_base, out, top_k, K, N, expert_stride);
+        topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
+        expert_table, expert_hits);
 }
 
 template <class T>
@@ -832,10 +887,13 @@ __global__ void moe_matmul_select_gemv_by_token(
     const T* __restrict__ act,
     const T* __restrict__ weight_base,
     T* __restrict__ out,
-    int top_k, int K, int N, long long expert_stride)
+    int top_k, int K, int N, long long expert_stride,
+    const T* const* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits)
 {
     moe_matmul_select_gemv_body<T, true, kGemvWarps, 1>(
-        topk_idx, act, weight_base, out, top_k, K, N, expert_stride);
+        topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
+        expert_table, expert_hits);
 }
 
 template <class T>
@@ -844,10 +902,13 @@ __global__ void moe_matmul_select_gemv_by_route(
     const T* __restrict__ act,
     const T* __restrict__ weight_base,
     T* __restrict__ out,
-    int top_k, int K, int N, long long expert_stride)
+    int top_k, int K, int N, long long expert_stride,
+    const T* const* __restrict__ expert_table,
+    unsigned int* __restrict__ expert_hits)
 {
     moe_matmul_select_gemv_body<T, false, kGemvWarps, 1>(
-        topk_idx, act, weight_base, out, top_k, K, N, expert_stride);
+        topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
+        expert_table, expert_hits);
 }
 
 template <class T>

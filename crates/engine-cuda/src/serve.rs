@@ -82,48 +82,46 @@
 //!          after.
 //! ```
 //!
-//! `PIE_CUDA_GRAPHS=off|shaped|on` overrides what a [`Boot`] asked for, in
-//! the idiom `Toggles::from_env` already set on this plane: read once, at
-//! load, never on the fire path.
+//! [`Boot::graphs`] states which of the three, and nothing overrides it: the
+//! word arrives typed from the boot document (`[engine] graphs`) and is read
+//! once, at load, never on the fire path.
 //!
-//! **`PIE_CUDA_STREAMS=off|0|<n>` is P6's cap, and it is read into the
-//! COMPILER rather than into a flag here.** `off` bakes an artifact with no
-//! fork group, no event point and stream 0 on every region — byte for byte
-//! what this shell recorded before P6 existed — rather than a shell that
-//! declines to use a graph it baked, which is the only arrangement in which
-//! the streams-off arm of a measurement is an arm. A number sets how many
-//! side streams the compiler may hand out; unset leaves the profile's own
-//! figure (2).
+//! # The knobs, and where they stopped coming from
 //!
-//! **`PIE_CUDA_BUCKETS=off|<ascending list>` is the shape lattice**, and it is
-//! read into the COMPILER's `Budget` for `PIE_CUDA_STREAMS`'s reason: which
-//! buckets exist decides P4's fallback menu (`FallbackRow::buckets` is a range
-//! of lattice POSITIONS), so a shell that invented a lattice after the bake
-//! would be answering questions the artifact was not asked. A `Boot` that
-//! states its own lattice keeps it; one that states none gets
-//! [`default_lattice`] — and `off` is how a caller asks for the empty lattice
-//! back, which is one graph per exact size and a bucket that is the fire's own
-//! row count.
+//! **ARTICLE 9: SHELLS READ NO ENVIRONMENT** (alto design §1). Nine
+//! `PIE_CUDA_*` words were read in this file — at load, never on the fire
+//! path, which was the disciplined form of the mistake and still the mistake:
+//! a word a shell reads out of its own process environment is a word that is
+//! not in the boot document, does not travel to the other shell, and is
+//! invisible to every reader of the config. They are typed now, and they land
+//! in three places:
 //!
-//! **`PIE_CUDA_PAD=off|0|false` is D4's off switch** (`.wiki/palo/cuda-abi.md`
-//! §3). ON by default: before each walk this shell stamps the fire's rows and
-//! its bucket onto every stream context (`Ctx::arm`), and the entries that
-//! hand a shape to cuBLASLt round their `M` up to the bucket so the library's
-//! unpublished arm table stops being a function of the batch
-//! (`kernels_cuda::Ctx::opaque_rows` carries the whole safety argument). `off`
-//! arms nothing, which is the A/B arm the tail-waste measurement needs — the
-//! tokens must be byte-identical across it, because everything the padding
-//! computes lands in rows no reader has.
+//! ```text
+//! PIE_CUDA_GRAPHS         -> Boot::graphs                [engine] graphs
+//! PIE_CUDA_BUCKETS        -> Budget::buckets             (the load door)
+//! PIE_CUDA_STREAMS        -> Knobs::side_streams         [engine] side_streams
+//! PIE_CUDA_GROUPED        -> Knobs::grouped              [engine] grouped
+//! PIE_CUDA_PAD            -> Knobs::pad                  [engine] pad
+//! PIE_CUDA_FOLD           -> Knobs::fold                 [engine] fold
+//! PIE_CUDA_PIPELINE       -> Knobs::pipeline             [engine] pipeline
+//! PIE_CUDA_FOLD_DISABLE   -> Knobs::fold_disable_library [engine] fold_disable
+//! PIE_CUDA_FALLBACK_COPY  -> Knobs::copies               [engine] fallback_copy
+//! ```
 //!
-//! **`PIE_CUDA_FOLD=on` is D5-lite** (`.wiki/palo/cuda-abi.md` §6b, §7 step
-//! 4), OFF by default: under `Graphs::On`, one exec per BUCKET, captured once
-//! at a synthetic full composition and rebound on the host per fire — empty
-//! windows become `cudaGraphNodeSetEnabled` bits (the correctness mechanism
-//! for library launches, which own no zero-row contract), moving arguments
-//! become `cudaGraphExecKernelNodeSetParams` restatements derived from a
-//! throwaway capture of the real walk and CACHED per composition. Off is
-//! today's keyed path exactly, which is what every fold gate diffs against;
-//! see [`fold_from_env`] and `record.rs`'s fold section for the policy.
+//! Two of them are COMPILER inputs and not shell flags, and they are the two
+//! that do not appear on [`Knobs`] as booleans. The shape lattice is baked —
+//! which buckets exist decides P4's fallback menu (`FallbackRow::buckets` is a
+//! range of lattice POSITIONS), so a shell that invented a lattice after the
+//! bake would be answering questions the artifact was not asked — and it
+//! reaches the compiler as `Budget::buckets`, filled by
+//! `crate::api::lattice` at the load door for a budget that states none.
+//! The capture mode is [`Boot::graphs`]. [`Knobs::side_streams`] is the third
+//! of that family: it moves `DeviceProfile::side_streams` rather than a flag
+//! here, because the streams-off arm of a measurement has to be the artifact
+//! P6 never ran on and not a shell declining to use a graph it baked.
+//!
+//! [`Knobs`]'s own docs carry each word's argument and its default, and every
+//! default is what the absent variable meant, byte for byte.
 //!
 //! # What v1 does not do
 //!
@@ -134,6 +132,12 @@
 //! own CORRECTION argues why D4 alone collapses nothing). The PTIR prologue
 //! and epilogue are wired ([`Shell::fire_attached`]); what is not is a guest
 //! program INSIDE the graph, which design §9 rules out rather than defers.
+
+// THE READ-BACK SURFACE, NEXT DOOR (alto wave P). A child module because it
+// is `Shell`'s own methods on `Shell`'s own private fields: what moved out of
+// this file is thirty-seven accessors, counters and between-fire toggles —
+// none of it call order, which is the only thing this file claims to be.
+mod stats;
 
 use std::cell::Cell;
 use std::path::Path;
@@ -148,156 +152,32 @@ use engine::frame::{
 };
 use kernels_cuda::attn::plan::Shape;
 use model_compiler::{CompiledModel, Budget, DeviceProfile, compile};
-use model_ir::{Dtype, Trace, ValueId};
+use model_ir::{Dtype, Trace};
 use model_loader::contract::ModelContract;
 
 use crate::arena::Arena;
 use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
-use engine::engine_api::fire::{Boundary, LayerScores, Mask};
+use engine::engine_api::fire::{
+    Boundary, FoldLen, LayerScores, Mask, Masking, Readout, RsReset, RsVerb,
+};
 
 use crate::program::launch::INTRINSIC_STORAGE_RAW_BF16;
 use crate::program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
 use crate::record::{self, Graphs as GraphCache};
-use crate::run::{CacheGeometry, CachePlanning, FireBindings, FireTables, Run, ScheduleSeat};
+use crate::run::{
+    CacheGeometry, CachePlanning, FireBindings, FireTables, RsMove, RsSeat, Run, ScheduleSeat,
+};
 use crate::store::kv::{self, Paging, Seat};
 use crate::store::Pools;
+use crate::store::rs::Buffers;
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::{At, Cursor, Lanes, Windows};
-
-/// The names `model_dsl::seam` states for the values a reader touches after
-/// the graph has run — `out`, `mtp`, `attn.scores`, in that order.
-///
-/// **READ FROM THE COMPILER, NOT SPELLED AGAIN** (palo C3b). This crate does
-/// not depend on the authoring surface, and until this wave it kept its own
-/// copy of the literal `"out"` with a comment in each place saying the other
-/// one existed. `model_compiler::arena` is what gives these values their
-/// delivery tail, so it is the honest place for the list to live: a shell
-/// reading a name the carve does not pin would be reading bytes the carve was
-/// free to give away.
-const OUT_SEAM: &str = model_compiler::EXPORT_SEAMS[0];
-const MTP_SEAM: &str = model_compiler::EXPORT_SEAMS[1];
-const SCORES_SEAM: &str = model_compiler::EXPORT_SEAMS[2];
-
-/// One declared export, resolved against this load's plan and bake.
-///
-/// **A VALUE AND THE CLASSES THAT FILL IT, AND BOTH HALVES ARE USED.** The
-/// value is what the fire's carve turns into a rectangle; the class set is
-/// what a lane's word is checked against, because an export is written by an
-/// ARM and an arm runs over a window. `Shell::masked` and `Shell::corrected`
-/// are the same reading taken from the op vocabulary; this one is taken from
-/// the seam, because a draft head's attention and a trunk layer's attention
-/// are the same `Attention::Prefill` variant and only the export tells them
-/// apart.
-#[derive(Debug, Clone)]
-pub struct Export {
-    /// The exported value, as the plan's `Seam` row names it.
-    pub value: ValueId,
-    /// Which transformer layer it came from, for a per-layer export.
-    pub layer: u32,
-    /// The classes whose window runs the node that writes it.
-    pub classes: model_ir::ClassSet,
-}
-
-/// This load's declared exports (design §9), resolved once at boot.
-#[derive(Debug, Clone)]
-struct Exports {
-    /// The trunk's logits. Required: a plan with no `out` seam computes
-    /// nothing a reader can take.
-    out: ValueId,
-    /// The draft head's logits over the draft window, for a SKU whose model
-    /// text declares one (palo C3).
-    mtp: Option<Export>,
-    /// The attention's per-query mass, one entry per attention layer that
-    /// exports it, in the plan's own order (palo C4).
-    scores: Vec<Export>,
-    /// The union of every capture column's classes — the set a capturing
-    /// lane's word must land in, and empty for an artifact with no capture
-    /// arm at all.
-    capturing: model_ir::ClassSet,
-}
-
-impl Exports {
-    /// Resolve the export seams against a plan and the bake that placed them.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`] for a plan with no `out` seam.
-    fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Exports> {
-        let out = trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == OUT_SEAM)
-            .and_then(|seam| seam.values.first().copied())
-            .ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "no `{OUT_SEAM}` seam, so a fire would compute nothing a reader can take"
-                ),
-            })?;
-        let named = |name: &str| -> Vec<Export> {
-            trace.seams
-                .iter()
-                .filter(|seam| seam.seam == name)
-                .flat_map(|seam| {
-                    let layer = seam.layer.unwrap_or(0);
-                    seam.values
-                        .iter()
-                        .map(move |value| (layer, *value))
-                })
-                .map(|(layer, value)| Export {
-                    value,
-                    layer,
-                    classes: writer_classes(trace, compiled, value),
-                })
-                .collect()
-        };
-        let scores = named(SCORES_SEAM);
-        let mut capturing = model_ir::ClassSet::default();
-        for export in &scores {
-            for class in export.classes.iter() {
-                capturing.insert(class);
-            }
-        }
-        Ok(Exports {
-            out,
-            mtp: named(MTP_SEAM).into_iter().next(),
-            scores,
-            capturing,
-        })
-    }
-}
-
-/// The classes whose window runs the node that writes `value`.
-///
-/// **THE NODE, NOT THE OP NAME.** An export is told apart from the trunk by
-/// WHAT IT IS, not by which kernel wrote it: the draft head's readout and the
-/// trunk's are both `linear.lm_head`, and the capture arm's output and a
-/// pooled attention's are both `[rows, heads]` F32. Asking which regions hold
-/// the writing node is the one reading that cannot be fooled by a model text
-/// reusing an op.
-fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> model_ir::ClassSet {
-    use model_ir::Operands;
-    let mut outputs: Vec<ValueId> = Vec::new();
-    let mut writers: Vec<u32> = Vec::new();
-    for (at, node) in trace.nodes.iter().enumerate() {
-        outputs.clear();
-        node.op.outputs(&mut outputs);
-        if outputs.contains(&value) {
-            writers.push(u32::try_from(at).unwrap_or(u32::MAX));
-        }
-    }
-    let mut classes = model_ir::ClassSet::default();
-    for region in compiled.template() {
-        if !region.nodes.clone().any(|node| writers.contains(&node)) {
-            continue;
-        }
-        for class in region.mask.iter() {
-            classes.insert(class);
-        }
-    }
-    classes
-}
+// THE EXPORT SEAM AND THE TWO OP SCANS, FROM THEIR OWN MODULE (alto wave P).
+// Pure IR analysis: what `Shell::load` does with them is call order, and what
+// they compute is not.
+use crate::exports::{Exports, MTP_SEAM, SCORES_SEAM, corrected_classes, masked_classes};
 
 /// How much of a fire this shell records.
 ///
@@ -331,259 +211,170 @@ impl Graphs {
     pub fn records(self) -> bool {
         matches!(self, Graphs::On)
     }
+}
 
-    /// `PIE_CUDA_GRAPHS`, if it names one of the three; otherwise `stated`.
+/// **THE NINE WORDS THAT WERE NINE `PIE_CUDA_*` ENVIRONMENT READS** (alto
+/// design §1, article 9: *shells read no environment*).
+///
+/// Every one of them was read here, once, at load — which was already the
+/// disciplined form of the mistake: an environment read on the fire path is a
+/// syscall between two launches, so this file read them all at boot and never
+/// again. Article 9 says the boot read is the mistake. A knob a shell reads
+/// out of its own process environment is a knob that is not in the boot
+/// document, does not travel to the other shell, cannot be diffed against
+/// what a deployment asked for, and is invisible to every reader of the
+/// config — so the words are typed here and the deployment states them.
+///
+/// **WHERE THE OTHER TWO WENT, AND WHY THEY ARE NOT FIELDS HERE.** Two of
+/// the nine were never shell flags at all: `PIE_CUDA_BUCKETS` is the shape
+/// lattice and `PIE_CUDA_GRAPHS` is the capture mode. The lattice is baked —
+/// P4 writes one fallback row per bucket RANGE, so moving it moves which
+/// consumer is withdrawn — and it therefore reaches the compiler as
+/// [`Budget::buckets`] through the load door, where `crate::api::lattice`
+/// is the policy that fills a budget stating none. The capture mode was
+/// already [`Boot::graphs`].
+///
+/// Every default below is what this shell did with the variable ABSENT, byte
+/// for byte, so a deployment that states nothing gets exactly what it got
+/// before the words died.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Knobs {
+    /// **D4's PAD** (`PIE_CUDA_PAD`, `.wiki/palo/cuda-abi.md` §3). ON.
     ///
-    /// Read ONCE, at load, like `Device::probe` and `Toggles::from_env`
-    /// beside it: an environment read on the fire path would be a syscall
-    /// between two launches.
-    #[must_use]
-    pub fn from_env(stated: Graphs) -> Graphs {
-        match std::env::var("PIE_CUDA_GRAPHS").ok().as_deref() {
-            Some("off" | "0" | "eager") => Graphs::Off,
-            Some("shaped") => Graphs::Shaped,
-            Some("on" | "1" | "graph") => Graphs::On,
-            _ => stated,
+    /// Before each walk this shell stamps the fire's rows and its bucket onto
+    /// every stream context (`Ctx::arm`), and the entries that hand a shape to
+    /// cuBLASLt round their `M` up to the bucket so the library's unpublished
+    /// arm table stops being a function of the batch
+    /// (`kernels_cuda::Ctx::opaque_rows` carries the whole safety argument).
+    ///
+    /// **IT IS THE ARMING THAT IS OPTIONAL, NOT THE NUMBER.**
+    /// `Composition::bucket` is computed on both arms and the entries read
+    /// `Ctx::opaque_rows` on both; `false` simply never stamps the pair onto a
+    /// context, so `opaque_rows` answers the extent it was handed and every
+    /// launch is the one this shell made before D4. That is the A/B arm the
+    /// tail-waste measurement needs, and the tokens must be byte-identical
+    /// across it, because everything the padding computes lands in rows no
+    /// reader has.
+    pub pad: bool,
+    /// **D5-LITE'S FOLD** (`PIE_CUDA_FOLD`, `.wiki/palo/cuda-abi.md` §6b, §7
+    /// step 4). OFF.
+    ///
+    /// Under [`Graphs::On`], one exec per BUCKET, captured once at a synthetic
+    /// full composition and rebound on the host per fire — empty windows
+    /// become `cudaGraphNodeSetEnabled` bits, moving arguments become
+    /// `cudaGraphExecKernelNodeSetParams` restatements derived from a
+    /// throwaway capture of the real walk and cached per composition. Off is
+    /// today's keyed path exactly, which is the A/B arm every fold gate diffs
+    /// against; [`Shell::set_fold`] flips it between fires so the A/B is one
+    /// load, like [`Shell::set_mode`]'s.
+    ///
+    /// OFF by default because the fold's off arm is today's shipping answer
+    /// until the gates say otherwise — the same posture the capture mode took
+    /// while capture was landing. A fold-path refusal is never silent: every
+    /// one lands in [`record::FoldStats::refusals`] by name, and the refused
+    /// bucket or composition serves the keyed path.
+    pub fold: bool,
+    /// **THE FOLD'S PIPELINE** (`PIE_CUDA_PIPELINE`, step 5). ON.
+    ///
+    /// Off restores step 4's fold exactly: one exec per bucket, every rebind
+    /// on the critical path between prepare and launch. On, a hot bucket
+    /// lazily instantiates a TWIN exec on its first back-to-back fire, a fire
+    /// whose composition some seat already holds launches with zero host
+    /// writing (the ping-pong swap), and a fire whose successor the caller
+    /// stated ([`Shell::expect`]) applies that successor's binding to the idle
+    /// exec AFTER its own launch and BEFORE its sync — host work the GPU never
+    /// waits on. On by default because it changes nothing a fire computes —
+    /// the same bindings land on an exec that is not in flight (poc-c measured
+    /// the overlap legal and hidden) — and the off arm exists for the A/B, not
+    /// as a safety hatch.
+    pub pipeline: bool,
+    /// **THE DISABLE POLICY** (`PIE_CUDA_FOLD_DISABLE=all|library`, §6c
+    /// finding 2). `false` is `all`.
+    ///
+    /// `all` disables every absent-window node of a folded exec, step 4's
+    /// answer: correct for library nodes (which own no zero-row contract) and
+    /// pie nodes alike, at ~1.3 µs of dispatch per disabled node. `true` is
+    /// `library`: pie windowed nodes stay ENABLED at zero rows — their count
+    /// cells written to zero by a fitted zero form, an empty launch on the
+    /// zero-row contract (~1 µs) — and only the library residue is disabled.
+    ///
+    /// The default is `all` because the measurement said so: of the
+    /// all-decode binding's 120 absent-window nodes, 36 are pie nodes the fit
+    /// can zero and 84 are library nodes that must disable either way, and
+    /// steady decode measured the two policies at parity — 3.439 against 3.440
+    /// ms/fire, byte-identical tokens (the policy gate in `tests/fold_gate.rs`;
+    /// the full numbers ride in `.wiki/palo/cuda-abi.md` §6d). A 0.3 µs/node
+    /// rate difference across 36 nodes is ~11 µs, under this workload's noise
+    /// floor — so the arm with the structurally simpler failure story ships (a
+    /// disabled node cannot compute; a zero form is a fitted claim), and the
+    /// other stays one boot key away for the SKU where the pie share is large
+    /// enough to read.
+    pub fold_disable_library: bool,
+    /// **`Fallback::Copy` WHERE P4'S TABLE ASKS FOR ONE**
+    /// (`PIE_CUDA_FALLBACK_COPY`). ON.
+    ///
+    /// Below the copy/split crossover — ten of a fourteen-point lattice, which
+    /// is every bucket a decode fire lands in — the table asks for a copy and
+    /// tart measured 1.07x the ideal against a split's 1.82x. `false` is the
+    /// A/B arm and the free oracle: `Fallback::Split` is green on device and
+    /// is what every existing gate in this crate was written against, and a
+    /// copy computing the same bytes over the same rows is a claim only a
+    /// byte-for-byte diff against a split can settle. One shell, one set of
+    /// addresses, one word changed — the same argument [`Shell::set_mode`]
+    /// makes about graphs, and [`Shell::set_copies`] flips it between fires.
+    pub copies: bool,
+    /// **THE GROUPED ARM** (`PIE_CUDA_GROUPED`). ON.
+    ///
+    /// [`crate::GROUPED`] — the ops whose kernels walk a segment list — is
+    /// named to the compiler as `DeviceProfile::grouped`, so a consumer P4
+    /// withdraws is served as ONE launch over that list instead of `r` launches
+    /// over `r` rectangles. `false` names none of them.
+    ///
+    /// **IT MOVES THE WITHDRAWAL AS WELL AS THE ANSWER.** Naming an op does
+    /// not only change how a withdrawn consumer is served: the withdrawal
+    /// itself is chosen by cost (`model_compiler::layout::choose`) and a
+    /// groupable consumer is nearly free to lose, so naming one MOVES WHICH
+    /// CONSUMER IS WITHDRAWN. On today's catalog that is the whole point — the
+    /// score window keeps its interval, the correction takes a segment list,
+    /// and the qwen texts go from twelve fallback rows that cost launches to
+    /// twenty-four that cost none. The off arm stays because a measurement
+    /// needs one, not because the kernels are in doubt: the two arms of a
+    /// Grouped-versus-Split measurement must be the same ROW ORDER with a
+    /// different answer on it, and the row order is baked, so this is a
+    /// BOOLEAN and not a list. WHICH ops this shell can group is not the
+    /// caller's to state — a profile may carry its own microseconds, it may
+    /// not claim a kernel this crate does not ship — so the answer is
+    /// [`crate::GROUPED`] either way and this only says whether to state it.
+    pub grouped: bool,
+    /// **P6's CAP** (`PIE_CUDA_STREAMS`), overriding
+    /// `DeviceProfile::side_streams`. `None` leaves the profile's own figure.
+    ///
+    /// `Some(0)` bakes an artifact with no fork group, no event point and
+    /// stream 0 on every region — byte for byte what this shell recorded
+    /// before P6 existed — rather than a shell that declines to use a graph it
+    /// baked, which is the only arrangement in which the streams-off arm of a
+    /// measurement is an arm. A number sets how many side streams the compiler
+    /// may hand out.
+    ///
+    /// An `Option` rather than a `u32` because the figure it overrides is the
+    /// PROFILE's, and a deployment that states its own profile has already
+    /// answered: a plain number here would silently outrank it.
+    pub side_streams: Option<u32>,
+}
+
+impl Default for Knobs {
+    /// Every field at the value the absent environment variable meant.
+    fn default() -> Knobs {
+        Knobs {
+            pad: true,
+            fold: false,
+            pipeline: true,
+            fold_disable_library: false,
+            copies: true,
+            grouped: true,
+            side_streams: None,
         }
     }
-}
-
-/// **P6's CAP, OFF THE ENVIRONMENT.** `PIE_CUDA_STREAMS=off|0` bakes an
-/// artifact with no fork group at all; a number sets how many side streams the
-/// compiler may hand out; anything else leaves the profile's own figure alone.
-///
-/// Read ONCE, at load, like `PIE_CUDA_GRAPHS` and `Toggles::from_env` beside
-/// it. And read into the COMPILER's input rather than into a shell flag,
-/// because the off arm has to be the artifact P6 never ran on — not a shell
-/// that declines to use one it baked. See `model_compiler::stream`.
-#[must_use]
-fn streams_from_env(stated: u32) -> u32 {
-    match std::env::var("PIE_CUDA_STREAMS").ok().as_deref() {
-        Some("off" | "0" | "none") => 0,
-        Some(text) => text.parse().unwrap_or(stated),
-        None => stated,
-    }
-}
-
-/// **THE GROUPED ARM'S OFF SWITCH.** [`crate::GROUPED`] — the ops whose
-/// kernels walk a segment list — is named to the compiler by default, so a
-/// consumer P4 withdraws is served as ONE launch over that list instead of `r`
-/// launches over `r` rectangles. `PIE_CUDA_GROUPED=off|0|none` empties it.
-///
-/// **ON BY DEFAULT, AND IT MOVES THE WITHDRAWAL AS WELL AS THE ANSWER.**
-/// Naming an op here does not only change how a withdrawn consumer is served:
-/// the withdrawal itself is chosen by cost (`model_compiler::layout::choose`)
-/// and a groupable consumer is nearly free to lose, so naming one MOVES WHICH
-/// CONSUMER IS WITHDRAWN. On today's catalog that is the whole point — the
-/// score window keeps its interval, the correction takes a segment list, and
-/// the qwen texts go from twelve fallback rows that cost launches to
-/// twenty-four that cost none. The off switch stays because a measurement
-/// needs an off arm, not because the kernels are in doubt.
-///
-/// Read ONCE, at load, beside `PIE_CUDA_STREAMS`, into the COMPILER's input
-/// and not into a shell flag — for exactly that switch's reason. The two arms
-/// of a Grouped-versus-Split measurement must be the same ROW ORDER with a
-/// different answer on it, and the row order is baked: a shell that declined
-/// at dispatch time to use a `Grouped` row it had baked would be a third
-/// thing, agreeing with neither arm and with `engine::fire::walk`'s launch
-/// count least of all.
-#[must_use]
-fn grouped_from_env() -> Vec<String> {
-    match std::env::var("PIE_CUDA_GROUPED").ok().as_deref() {
-        Some("off" | "0" | "none") => Vec::new(),
-        _ => crate::GROUPED.iter().map(|op| (*op).to_string()).collect(),
-    }
-}
-
-/// **THE LATTICE A DEPLOYMENT GETS WHEN IT STATES NONE**: the powers of two
-/// from [`LATTICE_FLOOR`] up to and including `max_tokens`.
-///
-/// `Budget::buckets` is a deployment's dial and `Budget::new` leaves it
-/// empty, which `compose::bucket_of` reads — correctly — as "one graph per
-/// exact size, and the honest bucket for a fire of `rows` rows is `rows`".
-/// That answer makes every consumer of the lattice a no-op: P4's fallback menu
-/// collapses to one bucket at position 0, and D4's padding rounds a fire up to
-/// itself. A shell whose whole business is firing on a real device should not
-/// ship that as its default, because a dial nobody set is not a measurement of
-/// the dial's zero.
-///
-/// **POWERS OF TWO, BECAUSE GEOMETRIC IS WHAT BOUNDS THE TAIL.** Above the
-/// floor a fire never computes more than twice its own rows, which is D4's
-/// whole cost argument stated as a ratio rather than as a hope. It is also the
-/// spacing of the fourteen-point lattice `crate::window`'s header prices the
-/// copy/split crossover on and `every_sku_walks_its_classes` walks, so the two
-/// consumers of `Budget::buckets` are looking at the same kind of object.
-///
-/// The ceiling is included even when it is not a power of two, because a fire
-/// AT `max_tokens` must have a bucket and `Fault::NoBucket` is the refusal for
-/// a fire above the lattice, not for the largest one the budget admits.
-#[must_use]
-fn default_lattice(max_tokens: u32) -> Vec<u32> {
-    let mut lattice: Vec<u32> =
-        core::iter::successors(Some(LATTICE_FLOOR), |point| point.checked_mul(2))
-            .take_while(|point| *point < max_tokens)
-            .collect();
-    lattice.push(max_tokens);
-    lattice
-}
-
-/// **WHERE THE DEFAULT LATTICE STARTS, AND WHY IT IS NOT 1.**
-///
-/// A lattice is free to name every small size, and the fourteen-point one this
-/// tree quotes does. D4 asks for the opposite at the bottom, for two reasons
-/// the census measured:
-///
-/// * **The arm flip at one row is the whole point.** `.wiki/palo/cuda-abi.md`
-///   §1: a one-lane decode takes the gemv arm and a two-lane one does not —
-///   127 launches change kernel across that boundary, and the 423-node
-///   topology it produces is a shape of its own. §3's promise is that "the
-///   gemv↔gemm arm flip at ×1 dies (M ≥ 2 always)", and a lattice naming 1
-///   keeps it alive. §3's own worked example — "decode 3 lanes padded to 8" —
-///   is a lattice whose first point is this one.
-/// * **A boundary is where two fires stop agreeing.** Padding does not remove
-///   the arithmetic drift between two compositions; it QUANTIZES it (two fires
-///   compute the same numbers iff they share a bucket — see
-///   `a_padded_fire_is_in_bounds_and_says_something_true`). Every extra point
-///   at the bottom is one more place where a lane fired alone and the same
-///   lane fired beside two others land on different sides, and at decode
-///   scale that is the commonest pair a deployment has.
-///
-/// What it costs is the tail on the smallest fires, where the cost argument is
-/// strongest rather than weakest: a decode fire's linear layers are
-/// weight-bound — 1.40 GiB of weight reads against eight rows of activation —
-/// so the rows below the floor ride reads that were happening anyway.
-/// `the_tail_a_padded_decode_computes_rides_the_weight_reads` is that claim
-/// with a number on it, and a deployment that measures otherwise on its own
-/// hardware states its own `Budget::buckets`.
-const LATTICE_FLOOR: u32 = 8;
-
-/// **THE LATTICE, OFF THE ENVIRONMENT.** `PIE_CUDA_BUCKETS=off` restores the
-/// empty lattice (`bucket == rows`, which is what a `Budget::new` test asks
-/// for); a comma-separated ascending list states one outright; anything else
-/// leaves what the `Boot` stated, and a `Boot` that stated nothing gets
-/// [`default_lattice`].
-///
-/// **READ INTO THE COMPILER'S INPUT, NOT INTO A SHELL FLAG**, for the reason
-/// `PIE_CUDA_STREAMS` and `PIE_CUDA_GROUPED` are: the lattice is baked. P4
-/// writes one fallback row per bucket RANGE, so moving the lattice moves which
-/// consumer is withdrawn and how it is served, and a shell that re-bucketed a
-/// fire after the bake would be reading a table whose index means something
-/// else. The two arms of a lattice measurement have to be two artifacts.
-///
-/// A list this function cannot parse, or one P0 refuses (not strictly
-/// ascending, or a bucket past the token ceiling), is not silently repaired:
-/// an unparseable entry falls back to the stated lattice and a lattice P0
-/// dislikes comes back as `Fault::Bake` with the compiler's own sentence in
-/// it. Nothing here invents a third lattice nobody asked for.
-#[must_use]
-fn lattice_from_env(stated: Vec<u32>, max_tokens: u32) -> Vec<u32> {
-    match std::env::var("PIE_CUDA_BUCKETS").ok().as_deref() {
-        Some("off" | "0" | "none") => Vec::new(),
-        Some(text) if text.contains(|c: char| c.is_ascii_digit()) => {
-            let parsed: Option<Vec<u32>> = text
-                .split(',')
-                .map(|point| point.trim().parse::<u32>().ok())
-                .collect();
-            match parsed {
-                Some(lattice) if !lattice.is_empty() => lattice,
-                _ => stated,
-            }
-        }
-        _ if stated.is_empty() => default_lattice(max_tokens),
-        _ => stated,
-    }
-}
-
-/// **D4'S OFF SWITCH.** `PIE_CUDA_PAD=off|0|false` stops this shell arming the
-/// pad, so every entry sees the extent the walk resolved and cuBLASLt's
-/// heuristic follows the batch again — today's behaviour, exactly.
-///
-/// **ON BY DEFAULT, AND UNLIKE ITS NEIGHBOURS IT IS A SHELL FLAG AND NOT A
-/// COMPILER INPUT.** `PIE_CUDA_STREAMS` and `PIE_CUDA_GROUPED` bake different
-/// artifacts because what they move is a baked decision; padding moves no
-/// baked byte at all. `Composition::bucket` is computed either way, no window
-/// changes, no row is staged differently, and the key a capture is filed under
-/// is the same exact per-class vector. The only difference between the two
-/// arms is the integer one entry hands a library — which is precisely why the
-/// A/B is worth running: byte-identical tokens across it is the claim that the
-/// tail rows belong to nobody.
-///
-/// Read ONCE, at load, beside every other environment word this shell reads.
-#[must_use]
-fn pad_from_env() -> bool {
-    !matches!(
-        std::env::var("PIE_CUDA_PAD").ok().as_deref(),
-        Some("off" | "0" | "false")
-    )
-}
-
-/// **D5-LITE'S SWITCH, OFF BY DEFAULT** (`.wiki/palo/cuda-abi.md` §6b, §7
-/// step 4). `PIE_CUDA_FOLD=on|1|true` folds the composition axis: one exec
-/// per bucket, captured once at a synthetic full composition, rebound on the
-/// host per fire — empty windows as `cudaGraphNodeSetEnabled` bits, moving
-/// arguments as `cudaGraphExecKernelNodeSetParams` restatements derived from
-/// a throwaway capture of the real walk. Off is today's keyed path, exactly,
-/// which is the A/B arm every fold gate diffs against; [`Shell::set_fold`]
-/// flips it between fires so the A/B is one load, like `set_mode`'s.
-///
-/// OFF by default because the fold's default arm is today's shipping answer
-/// until the gates say otherwise — the same posture `PIE_CUDA_GRAPHS` took
-/// while capture was landing. A fold-path refusal is never silent: every one
-/// lands in [`record::FoldStats::refusals`] by name, and the refused bucket
-/// or composition serves the keyed path.
-#[must_use]
-fn fold_from_env() -> bool {
-    matches!(
-        std::env::var("PIE_CUDA_FOLD").ok().as_deref(),
-        Some("on" | "1" | "true")
-    )
-}
-
-/// **THE PIPELINE'S SWITCH, ON BY DEFAULT** (step 5). `PIE_CUDA_PIPELINE=off`
-/// restores step 4's fold exactly: one exec per bucket, every rebind on the
-/// critical path between prepare and launch. On, a hot bucket lazily
-/// instantiates a TWIN exec on its first back-to-back fire, a fire whose
-/// composition some seat already holds launches with zero host writing (the
-/// ping-pong swap), and a fire whose successor the caller stated
-/// ([`Shell::expect`]) applies that successor's binding to the idle exec
-/// AFTER its own launch and BEFORE its sync — host work the GPU never waits
-/// on. On by default because it changes nothing a fire computes — the same
-/// bindings land on an exec that is not in flight (poc-c measured the
-/// overlap legal and hidden) — and the off arm exists for the A/B, not as a
-/// safety hatch.
-#[must_use]
-fn pipeline_from_env() -> bool {
-    !matches!(
-        std::env::var("PIE_CUDA_PIPELINE").ok().as_deref(),
-        Some("off" | "0" | "false")
-    )
-}
-
-/// **THE DISABLE POLICY** (§6c finding 2), `PIE_CUDA_FOLD_DISABLE=all|library`.
-///
-/// `all` — the default — disables every absent-window node of a folded
-/// exec, step 4's answer: correct for library nodes (which own no zero-row
-/// contract) and pie nodes alike, at ~1.3 µs of dispatch per disabled node.
-/// `library` keeps pie windowed nodes ENABLED at zero rows — their count
-/// cells written to zero by a fitted zero form, an empty launch on the
-/// zero-row contract (~1 µs) — and disables only the library residue. The
-/// default is `all` because the measurement said so: of the all-decode
-/// binding's 120 absent-window nodes, 36 are pie nodes the fit can zero and
-/// 84 are library nodes that must disable either way, and steady decode
-/// measured the two policies at parity — 3.439 against 3.440 ms/fire,
-/// byte-identical tokens (the policy gate in `tests/fold_gate.rs`; the full
-/// numbers ride in `.wiki/palo/cuda-abi.md` §6d). A 0.3 µs/node rate
-/// difference across 36 nodes is ~11 µs, under this workload's noise floor
-/// — so the arm with the structurally simpler failure story ships (a
-/// disabled node cannot compute; a zero form is a fitted claim), and the
-/// other stays one environment word away for the SKU where the pie share
-/// is large enough to read.
-#[must_use]
-fn fold_disable_from_env() -> bool {
-    matches!(
-        std::env::var("PIE_CUDA_FOLD_DISABLE").ok().as_deref(),
-        Some("library" | "lib")
-    )
 }
 
 /// Everything a load states.
@@ -612,8 +403,34 @@ pub struct Boot<'a> {
     pub slots: u32,
     /// Which device to bind.
     pub ordinal: i32,
-    /// How much of a fire to record — overridden by `PIE_CUDA_GRAPHS`.
+    /// How much of a fire to record. `[engine] graphs` in the boot document,
+    /// and nothing overrides it any more (article 9).
     pub graphs: Graphs,
+    /// **THE SHELL'S OWN WORDS**, typed — what nine `PIE_CUDA_*` environment
+    /// reads were before article 9. [`Knobs::default`] is what an absent
+    /// environment meant, byte for byte, so a caller that states nothing
+    /// fires exactly what it fired before.
+    pub knobs: Knobs,
+    /// **Where the warm-boot weight artifacts live** (alto design §7's T2
+    /// tier), typed from the boot config rather than read from the
+    /// environment (article 9: shells read no environment).
+    ///
+    /// `None` is the feature off: the load reads no artifact and writes none.
+    /// With a directory, a load whose recipe matches an artifact there reads
+    /// the device table straight off the disk and never runs the host-side
+    /// transform pipeline; a load that does not, writes one on its way out —
+    /// unless the disk has no room, in which case it declines and says so.
+    pub weight_cache_dir: Option<&'a Path>,
+    /// **Where the guest-program plane keeps its compiled cubins** — the
+    /// PTIR cache, typed from the boot document's `[cache] dir` rather than
+    /// discovered from `$PIE_HOME`/`$XDG_CACHE_HOME`/`$HOME` inside the shell
+    /// (article 9: shells read no environment).
+    ///
+    /// `None` is the feature off: every program compiles through NVRTC and
+    /// nothing is stored. That costs time and never an answer — a cubin cache
+    /// miss is a miss, and `program::compile`'s own header says every failure
+    /// of it is one.
+    pub program_cache_dir: Option<&'a Path>,
     /// **How many frames the caller will keep in flight** — the one run-ahead
     /// number, arriving from `[runtime] frame_dispatch_depth` by way of
     /// `LoadRequest::frames_in_flight` (article 8: one number, one owner).
@@ -621,6 +438,16 @@ pub struct Boot<'a> {
     /// The shell DERIVES from it and never re-declares: the staging ring's
     /// depth, the settlement event pool's, and nothing else.
     pub runahead: engine::runahead::Runahead,
+    /// **How much of the weight table this load may hold on the device**
+    /// (alto design §7), already turned into a residency plan by the door
+    /// that read the contract's two budgets.
+    ///
+    /// [`Plan::default`](crate::experts::Plan::default) — which is what every
+    /// caller that states nothing gets — is FULL RESIDENCY: the store holds
+    /// every plane whole, no tier is opened, and every line below that names
+    /// the tier is a `None` that costs a branch at load and nothing at all
+    /// afterwards.
+    pub residency: crate::experts::Plan,
 }
 
 /// One request inside a fire.
@@ -654,7 +481,7 @@ pub struct Lane<'a> {
 /// So the contract's [`KvDelta`](engine_api::KvDelta) states both, and this is
 /// its shell-side shape: `pages` empty means the shell owns the table (and
 /// `held` is the shell's own count), non-empty means the caller does.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Seated<'a> {
     /// The request.
     pub lane: Lane<'a>,
@@ -663,6 +490,19 @@ pub struct Seated<'a> {
     /// How many kv tokens the slot already holds. `None` asks the shell,
     /// which is the only honest answer when the shell owns the table.
     pub held: Option<u32>,
+    /// **The working set's flat table** — entry `i` is the pool page backing
+    /// the guest's relative index `i` ([`KvDelta::translation`]). Empty for
+    /// every lane whose page references arrived already resolved, which is
+    /// every lane but a device-geometry one.
+    ///
+    /// A guest holds relative indexes and only relative indexes, and for a
+    /// device-geometry lane its `pages` and `w_slot` cells reach this shell
+    /// unresolved because no host read them. This is what resolves them, and
+    /// [`Seated::pages`] beside it is the OTHER space — pool ids, translated
+    /// by the runtime before it submitted.
+    ///
+    /// [`KvDelta::translation`]: engine::engine_api::KvDelta::translation
+    pub translation: &'a [u32],
     /// An explicit attention mask over the lane's readable extent, replacing
     /// the causal bound `attention.prefill` derives — `Some` is what makes
     /// the lane's `masked` fact true, and the word the caller stamped has to
@@ -672,7 +512,14 @@ pub struct Seated<'a> {
     /// a mask is per-fire state the CALLER holds, and a deployment whose
     /// sequences are seats submits neither. [`crate::mask`] is what turns it
     /// into the bits `attention.masked` reads.
-    pub mask: Option<&'a Mask>,
+    ///
+    /// **A [`Masking`], NOT A [`Mask`]**: one restriction over the lane's
+    /// extent (`Masking::Extent`, every mask this shell served before the
+    /// per-row form existed) or one per query row (`Masking::Rows`, the
+    /// windowed prefill). Both expand to the same `rows x kv` rectangle of
+    /// bits and no launch below can tell them apart — the SHAPE is a fact
+    /// about the submission and the SLAB is what the kernel reads.
+    pub mask: Option<&'a Masking>,
     /// Which adapter bank this lane's rows route to (design §8), or `None`
     /// for the base model.
     ///
@@ -706,6 +553,53 @@ pub struct Seated<'a> {
     /// [`Shell::fire_captured`]'s `scores`, one entry per exported attention
     /// layer.
     pub captures_scores: bool,
+    /// **What this lane's pass does to its recurrent state** (alto design §6,
+    /// wave F3) — the contract's [`RsVerb`], carried unchanged.
+    ///
+    /// Beside `mask` and `adapter` for the same reason both are here rather
+    /// than on [`Lane`]: the verb is per-fire state the CALLER holds, and a
+    /// deployment whose sequences are seats submits none of it.
+    /// [`RsVerb::Fold`] is the default and is every fire this tree fired
+    /// before F3 — the plain path, unchanged, down to the null seats the
+    /// launches bind.
+    pub rs: RsVerb,
+    /// **Whether this lane's recurrent slot arrives fresh** (survey §9's gap
+    /// list) — the contract's [`RsReset`], carried unchanged.
+    ///
+    /// [`RsReset::Inferred`] keeps the rule this shell had: `have == 0` is a
+    /// sequence beginning. The other two are the RS store's own
+    /// classification, which is the store that owns the fact.
+    pub rs_reset: RsReset,
+    /// **Which of this lane's rows the DEVICE readout is pointed at**, by
+    /// index within the lane — `None` for the lane's last row, which is what
+    /// every fire meant before a row list could be stated.
+    ///
+    /// # Why the shell needs this at all, when `Readout` is a host word
+    ///
+    /// Because there are TWO readers of a fire's logits and only one of them
+    /// is the host mirror. [`Shell::read_out_rows`] indexes the arena
+    /// rectangle from the host and needs nothing from the shell but the
+    /// rectangle. The other reader is a GUEST: an epilogue that reads
+    /// `IntrinsicId::Logits` and argmaxes on the device, which is how every
+    /// speculative verifier in the corpus gets its tokens (design §9 — the
+    /// numbers never reach the host at all). That reader is pointed at a base
+    /// and a row offset by [`Plane::bind_intrinsic`], and a shell that did not
+    /// know which rows the lane asked for could only ever point it at one:
+    /// the last. A `k`-row verifier then read its own last row followed by
+    /// `k - 1` rows PAST the fire's rectangle, which is a table of zeros —
+    /// accepted-then-ignored in the one shape article 3 exists to forbid.
+    ///
+    /// **BY INDEX WITHIN THE LANE, WHICH IS THE CONTRACT'S OWN NUMBERING**
+    /// (`Readout::Rows`: "these rows of this lane, by index within the
+    /// lane"). Row `r` is arena row `first_row[lane] + r`.
+    ///
+    /// `None` covers both [`Readout::Last`] and [`Readout::None`], and they
+    /// collapse here on purpose: a lane that asked for no HOST mirror may
+    /// still carry an epilogue that reads its logits, and the row that
+    /// epilogue has always been given is the lane's last one.
+    ///
+    /// [`Plane::bind_intrinsic`]: crate::program::Plane::bind_intrinsic
+    pub readout: Option<&'a [u32]>,
 }
 
 /// One lane of the fold's SYNTHETIC composition — the owned side of a
@@ -721,7 +615,12 @@ struct Synthetic {
     /// Placeholder ids, one per row.
     tokens: Vec<u32>,
     /// An all-allowed mask, for a class whose window runs the masked arm.
-    mask: Option<Mask>,
+    ///
+    /// `Masking::Extent`, and it stays that way: the arming pass plans the
+    /// SHAPES a class's launches take, and both mask forms expand to one
+    /// `rows x kv` rectangle, so the per-row form has no plan of its own to
+    /// arm (`crate::mask`'s own argument).
+    mask: Option<Masking>,
     /// Adapter row 0, for a class inside the correction's window.
     adapter: Option<u32>,
     /// The word's draft bit, mirrored (`Fault::DraftWord` is checked per
@@ -742,16 +641,20 @@ impl<'a> Seated<'a> {
             lane,
             pages: &[],
             held: None,
+            translation: &[],
             mask: None,
             adapter: None,
             drafts: false,
             captures_scores: false,
+            rs: RsVerb::Fold,
+            rs_reset: RsReset::Inferred,
+            readout: None,
         }
     }
 
     /// The same lane, reading only `mask`'s positions of its slot.
     #[must_use]
-    pub fn masked(lane: Lane<'a>, mask: &'a Mask) -> Seated<'a> {
+    pub fn masked(lane: Lane<'a>, mask: &'a Masking) -> Seated<'a> {
         Seated {
             mask: Some(mask),
             ..Seated::of(lane)
@@ -829,6 +732,15 @@ pub struct Shell {
     weights: Weights,
     arena: Arena,
     pools: Pools,
+    /// **The buffered-activation pool** (alto design §6, wave F3), or `None`
+    /// for a plan with no chunked recurrent layer to buffer — which is every
+    /// dense text and is what makes the whole plane cost such a load nothing.
+    buffers: Option<Buffers>,
+    /// The fold predicate and the accepted lengths, resident at the lane
+    /// ceiling. Carved whether or not this plan has a recurrence, because it
+    /// is two hundred bytes and a conditional carve would make an address
+    /// depend on the plan.
+    predicate: crate::store::rs::Predicate,
     inputs: Inputs,
     /// What the plan restates about its own caches: per cache ROW (the bytes
     /// one page holds) and per PLAN VALUE (the reading one schedule carves).
@@ -853,6 +765,24 @@ pub struct Shell {
     corrected: model_ir::ClassSet,
     /// Per slot: how many kv tokens it holds.
     held: Vec<u32>,
+    /// **The row-pointer tables a non-consecutive readout binds through**
+    /// ([`INTRINSIC_STORAGE_ROW_POINTERS`]), one `max_tokens`-entry block per
+    /// lane.
+    ///
+    /// **RESERVED AT LOAD AND ONLY STAGED ON THE FIRE PATH** (article 7: the
+    /// fire path allocates nothing). `max_lanes * max_tokens` `u64`s is the
+    /// ceiling by construction — a lane cannot ask for more rows than it
+    /// carries, and it cannot carry more than the token ceiling — and at this
+    /// tree's serving budgets it is single-digit megabytes.
+    ///
+    /// **AND MOST FIRES NEVER TOUCH IT.** A readout whose rows are
+    /// consecutive — every `Readout::Last`, and every speculative verifier in
+    /// the corpus, which reads `start .. start + k` — is expressible as a base
+    /// and an offset, so it binds the rectangle directly and this buffer stays
+    /// cold. It exists for the shape a base and a stride cannot spell.
+    ///
+    /// [`INTRINSIC_STORAGE_ROW_POINTERS`]: crate::program::launch::INTRINSIC_STORAGE_ROW_POINTERS
+    readout_rows: crate::device::Buffer,
     /// This load's declared exports (design §9): the trunk's readout, the
     /// draft readout when the model text states one, and the capture columns.
     exports: Exports,
@@ -870,8 +800,8 @@ pub struct Shell {
     /// ON BY DEFAULT: below the copy/split crossover — ten of a fourteen-point
     /// lattice, which is every bucket a decode fire lands in — the table asks
     /// for a copy and tart measured 1.07x the ideal against a split's 1.82x.
-    /// `PIE_CUDA_FALLBACK_COPY=off|0|false` turns it off at load;
-    /// [`Shell::set_copies`] flips it between fires.
+    /// [`Knobs::copies`] states it at load; [`Shell::set_copies`] flips it
+    /// between fires.
     copies: bool,
     /// Does this shell arm D4's pad before each walk?
     ///
@@ -880,10 +810,10 @@ pub struct Shell {
     /// entries read `Ctx::opaque_rows` on both; `false` simply never stamps
     /// the pair onto a context, so `opaque_rows` answers the extent it was
     /// handed and every launch is the one this shell made before D4.
-    /// `PIE_CUDA_PAD=off|0|false` at load — see [`pad_from_env`].
+    /// [`Knobs::pad`] states it at load.
     pad: bool,
-    /// Does this shell fold the composition axis (`PIE_CUDA_FOLD`)? See
-    /// [`fold_from_env`]; [`Shell::set_fold`] flips it between fires.
+    /// Does this shell fold the composition axis? [`Knobs::fold`] states it
+    /// at load; [`Shell::set_fold`] flips it between fires.
     fold: bool,
     /// Is the fire currently running the SYNTHETIC arming pass? Set by
     /// [`Shell::maybe_arm_fold`] around its recursive `fire_captured` call
@@ -942,16 +872,17 @@ impl Shell {
         let mut boot = boot;
         let mut device = Context::bind(boot.ordinal)?;
 
-        // **THE SHAPE LATTICE, BEFORE THE BAKE AND NOWHERE ELSE.** A `Boot`
-        // that stated one keeps it; one that stated none — which is every
-        // `Budget::new` caller, and so every test and the worker's own
-        // embedded engine — gets the powers of two up to its ceiling rather
-        // than the empty lattice, because an empty lattice makes P4's bucket
-        // ranges collapse to one position and D4's padding round every fire up
-        // to itself. `lattice_from_env` argues why this is the compiler's
-        // input and not a shell flag, and `PIE_CUDA_BUCKETS=off` is how a
-        // caller asks for the empty lattice back.
-        boot.budget.buckets = lattice_from_env(boot.budget.buckets, boot.budget.max_tokens);
+        // **THE SHAPE LATTICE, BEFORE THE BAKE AND NOWHERE ELSE**, and the
+        // policy is READ BACK from the load door rather than decided here
+        // (alto wave P): which buckets exist is a compiler input, so
+        // [`crate::api::lattice`] states it beside the `Budget` the door
+        // builds and this line is the one call. A `Boot` that stated a lattice
+        // keeps it; one that stated none — which is every `Budget::new`
+        // caller, and so every gate and the worker's own embedded engine —
+        // gets the powers of two up to its ceiling rather than the empty
+        // lattice, because an empty lattice makes P4's bucket ranges collapse
+        // to one position and D4's padding round every fire up to itself.
+        boot.budget.buckets = crate::api::lattice(boot.budget.buckets, boot.budget.max_tokens);
 
         // Costs are input (design §6's `layout/` lineage row): the shell
         // measured the device once at bind, and hands the numbers to a
@@ -960,15 +891,17 @@ impl Shell {
             sms: device.device().num_sm,
             ..DeviceProfile::default()
         });
-        // **P6's OFF ARM IS FIRST CLASS AND THIS IS WHERE IT LIVES.**
-        // `PIE_CUDA_STREAMS` is read once, at load, in the idiom
-        // `PIE_CUDA_GRAPHS` and `Toggles::from_env` already set on this plane;
-        // what it sets is the compiler's own cap, so `off` does not disable a
-        // shell feature — it bakes an artifact with no fork group, no event
-        // point and stream 0 on every region, which is the artifact this
-        // compiler produced before P6 existed. A measurement whose off arm is
-        // a different artifact is a measurement of two things.
-        profile.side_streams = streams_from_env(profile.side_streams);
+        // **P6's OFF ARM IS FIRST CLASS AND THIS IS WHERE IT LIVES.** What
+        // [`Knobs::side_streams`] sets is the compiler's own cap, so zero does
+        // not disable a shell feature — it bakes an artifact with no fork
+        // group, no event point and stream 0 on every region, which is the
+        // artifact this compiler produced before P6 existed. A measurement
+        // whose off arm is a different artifact is a measurement of two
+        // things. `None` leaves the profile's own figure, because a
+        // deployment that states a profile has already answered.
+        if let Some(streams) = boot.knobs.side_streams {
+            profile.side_streams = streams;
+        }
         // And the one device fact a pure compiler cannot derive: which
         // entries claim a workspace no second launch may be inside. See
         // [`crate::EXCLUSIVE`] — the profile's own doc argues why it is data
@@ -979,24 +912,21 @@ impl Shell {
         // launch, which is what lets P4 answer `Fallback::Grouped` for a
         // consumer it could not seat. See [`crate::GROUPED`].
         //
-        // **WITH AN OFF ARM, FOR THE REASON `PIE_CUDA_STREAMS` HAS ONE.** A
-        // measurement whose off arm is a different artifact is a measurement
+        // **WITH AN OFF ARM, FOR THE REASON [`Knobs::side_streams`] HAS ONE.**
+        // A measurement whose off arm is a different artifact is a measurement
         // of two things, and the only honest way to price `Grouped` against
         // `Split` is to bake the SAME row order twice and move only the
-        // answer. `PIE_CUDA_GROUPED=off` empties the list, which withdraws the
-        // same consumer and serves it as `r` launches; anything else is this
-        // shell's real capability. That is not the caller's to state — a
-        // profile may carry its own microseconds, it may not claim a kernel
-        // this crate does not ship — which is why the switch is beside the
-        // stream one rather than on `Boot`.
-        //
-        // WHICH CONSUMER GETS WITHDRAWN IS THE CALLER'S, and by default it is
-        // nobody: `DeviceProfile::grouped` is empty unless a `Boot`
-        // profile names an op, so on this catalog the correction is seated,
-        // this list is consulted for a mask that is never withdrawn, and no
-        // baked byte moves. That field is a PoC scaffold and reading its doc
-        // is the only way to know what setting it means.
-        profile.grouped = grouped_from_env();
+        // answer. [`Knobs::grouped`] off names none of them, which withdraws
+        // the same consumer and serves it as `r` launches; on is this shell's
+        // real capability. WHICH ops those are is not the caller's to state —
+        // a profile may carry its own microseconds, it may not claim a kernel
+        // this crate does not ship — which is why the knob is a boolean and
+        // the list is [`crate::GROUPED`] either way.
+        profile.grouped = if boot.knobs.grouped {
+            crate::GROUPED.iter().map(|op| (*op).to_string()).collect()
+        } else {
+            Vec::new()
+        };
         let compiled = compile(&boot.trace, &boot.budget, &profile)?;
         // The streams and the events the artifact asked for, opened once,
         // here: a `cudaStreamCreate` on the fire path would be host work
@@ -1017,58 +947,34 @@ impl Shell {
         // model text rather than the fire.
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
-        // Whether this artifact has anywhere for a mask to GO. `masked` is a
-        // fact the model declares (design §8), so a plan with no
-        // `attention.masked` arm cannot serve one, and accepting the bits
-        // anyway would answer with the unmasked continuation.
-        //
-        // Kept as a CLASS SET rather than a boolean, because the question a
-        // fire asks is per lane: does the class this lane's word resolved to
-        // run the masked arm? The word and the mask are stamped at two
-        // instants by two parties — the runtime computes the word from the
-        // model's `Classify::of`, the caller states the mask — and this set
-        // is what lets the shell check that they agree
-        // (`Fault::{Maskless, MaskWord}`).
-        let mut masked = model_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_masked = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(model_ir::Operation::Attention(model_ir::Attention::Masked { .. }))
-                )
-            });
-            if runs_masked {
-                for class in region.mask.iter() {
-                    masked.insert(class);
-                }
-            }
-        }
-        // The same reading for the adapter axis, and the same three
-        // consequences: an artifact with no correction op has nowhere for an
-        // adapter id to go (`Fault::Adapterless`), a lane whose word puts it
-        // outside the correction's window may not carry one and a lane whose
-        // word puts it inside must (`Fault::AdapterWord`), and a fire in whose
-        // composition NO class of this set has rows never stages the routes
-        // vector, never binds the seat, and never launches the arm.
-        let mut corrected = model_ir::ClassSet::default();
-        for region in compiled.template() {
-            let runs_correction = region.nodes.clone().any(|node| {
-                matches!(
-                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(model_ir::Operation::Linear(model_ir::Linear::LoraCorrect { .. }))
-                )
-            });
-            if runs_correction {
-                for class in region.mask.iter() {
-                    corrected.insert(class);
-                }
-            }
-        }
+        // The two op-vocabulary scans, from `crate::exports` — which classes'
+        // windows run an `attention.masked` arm and which run a
+        // `linear.lora_correct` one. Read ONCE here because the answer is a
+        // fact about the bake; the passes themselves are IR analysis and live
+        // with the export seam rather than in this file (alto wave P).
+        let masked = masked_classes(&boot.trace, &compiled);
+        let corrected = corrected_classes(&boot.trace, &compiled);
         let paging = Paging::of(boot.page_size, boot.context, boot.slots)?;
 
-        let weights = Weights::resident(&boot.trace, boot.contract, boot.checkpoint)?;
+        let weights = Weights::resident(
+            &boot.trace,
+            boot.contract,
+            boot.checkpoint,
+            boot.weight_cache_dir,
+            boot.residency.clone(),
+            device.stream(),
+        )?;
         let arena = Arena::reserve(&compiled.arena)?;
-        let pools = Pools::reserve(&boot.trace, paging, &facts)?;
+        let pools = Pools::reserve(device.ordinal(), &boot.trace, paging, &facts)?;
+        // **THE BUFFER IS SIZED BY THE PLAN AND THE BUDGET, AND BY NOTHING
+        // ELSE** (design §6, dev's `configure_rs_buffer_pool`): per-token
+        // bytes come off the recurrent ops' own in-projection widths,
+        // `page_tokens` is the kv page size (dev's rule, so a buffer page and
+        // a kv page are one number), and the page-slot count is the state-slot
+        // count the recurrent banks were already sized by. One allocation,
+        // pointer-stable for the load (article 7).
+        let buffers = Buffers::reserve(&boot.trace, paging)?;
+        let predicate = crate::store::rs::Predicate::reserve(boot.budget.max_lanes)?;
         let spaces = boot
             .trace
             .caches
@@ -1102,6 +1008,23 @@ impl Shell {
         // handed a clone: `record::Graphs` asks them the one question the
         // per-fire sync used to answer for it.
         let airborne = crate::settle::Airborne::new();
+        // **THE POOLS LEARN TO ASK TOO** (wave C). `Supply::trim` unmaps
+        // arena tails, and an unmap is immediate — so it needs the same
+        // "is anything still on the stream?" answer the graph cache reads,
+        // out of the same counter.
+        let mut pools = pools;
+        pools.watch(airborne.clone());
+        // **RESERVED BEFORE THE STRUCT, BECAUSE THE STRUCT MOVES THE BUDGET**
+        // (article 7: the fire path allocates nothing, so the readout's
+        // row-pointer tables are cut here). One `max_tokens`-entry block of
+        // row addresses per lane: a lane cannot name more readout rows than it
+        // carries and cannot carry more than the token ceiling, so this is the
+        // ceiling by construction rather than by a guess.
+        let readout_rows = crate::device::Buffer::zeroed(
+            (boot.budget.max_lanes as usize)
+                .saturating_mul(boot.budget.max_tokens as usize)
+                .saturating_mul(size_of::<u64>()),
+        )?;
         Ok(Shell {
             device,
             trace: boot.trace,
@@ -1110,31 +1033,31 @@ impl Shell {
             weights,
             arena,
             pools,
+            buffers,
+            predicate,
             inputs,
             facts,
             spaces,
             masked,
             corrected,
             held: vec![0; boot.slots as usize],
+            readout_rows,
             exports,
-            graphs: Graphs::from_env(boot.graphs),
-            // Read once, at load, beside every other environment word this
-            // shell reads: a `getenv` between two launches is a syscall on
-            // the fire path.
-            copies: !matches!(
-                std::env::var("PIE_CUDA_FALLBACK_COPY").ok().as_deref(),
-                Some("off" | "0" | "false")
-            ),
-            pad: pad_from_env(),
-            fold: fold_from_env(),
+            graphs: boot.graphs,
+            // Stated, not read: every word below arrived typed on the `Boot`
+            // (article 9), and [`Knobs::default`] is what the absent
+            // environment variable meant.
+            copies: boot.knobs.copies,
+            pad: boot.knobs.pad,
+            fold: boot.knobs.fold,
             arming: false,
             probing: false,
             seen_classes: model_ir::ClassSet::default(),
             last: FireCost::default(),
             cache: {
                 let mut cache = GraphCache::new();
-                cache.set_pipeline(pipeline_from_env());
-                cache.set_fold_library(fold_disable_from_env());
+                cache.set_pipeline(boot.knobs.pipeline);
+                cache.set_fold_library(boot.knobs.fold_disable_library);
                 // **THE GRAPH CACHE LEARNS TO ASK** (F2b). Eviction and every
                 // rebind used to rest on "every fire ends synchronized"; they
                 // rest on this counter now, and the bucket's seat cap derives
@@ -1142,13 +1065,75 @@ impl Shell {
                 cache.watch(airborne.clone(), boot.runahead.frames_in_flight);
                 cache
             },
-            programs: ProgramPlane::default(),
+            // The deployment's cubin directory, stated (article 9). `None`
+            // is a plane that stores nothing and recompiles.
+            programs: ProgramPlane::new(crate::program::compile::Disk::rooted(
+                boot.program_cache_dir,
+            )),
             // One event per in-flight step: the same depth as the staging
             // ring, because a step holds exactly one of each between `settle`
             // and its callback.
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             airborne,
         })
+    }
+
+    /// **Move one sequence's recurrent state onto another slot** (alto survey
+    /// §9's gap list, wave F3).
+    ///
+    /// The device half of a copy-on-write RS fork. Enqueued on the fire
+    /// stream and synchronized, because it is control plane: a caller that
+    /// forks a sequence has to know the copy landed before it submits a fire
+    /// against either half.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`] for a slot past the pool, [`Fault::Device`] for the
+    /// copy.
+    pub fn copy_state(&mut self, src: u32, dst: u32) -> Result<()> {
+        self.pools.copy_slot(self.device.stream(), src, dst)?;
+        self.device.synchronize()
+    }
+
+    /// **Graft kv cells onto other pages of this load's pools** — see
+    /// [`Pools::copy_kv`](crate::store::Pools::copy_kv).
+    ///
+    /// **ENQUEUED AND NOT SYNCHRONIZED**, which is where it parts company with
+    /// [`Shell::copy_state`] one method up. Both are control plane; the
+    /// difference is what orders them against the fires around them. A kv
+    /// graft's whole audience is the compute stream — the steps already
+    /// airborne that may still be reading the source pages, and the fires the
+    /// caller submits next against the destination ones — and both sit on
+    /// THIS stream, so the copy is ordered against them by construction. A
+    /// `cudaStreamSynchronize` would add a host wait between two waves
+    /// (article 2) and buy an ordering the stream already gives.
+    ///
+    /// # Errors
+    ///
+    /// As [`Pools::copy_kv`](crate::store::Pools::copy_kv).
+    pub fn copy_kv(&mut self, moves: &[crate::store::Move]) -> Result<()> {
+        self.pools.copy_kv(self.device.stream(), moves)
+    }
+
+    /// **One slot's recurrent banks, read back** — see
+    /// [`Pools::state_bytes`](crate::store::Pools::state_bytes).
+    ///
+    /// # Errors
+    ///
+    /// As [`Pools::state_bytes`](crate::store::Pools::state_bytes).
+    pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
+        self.pools.state_bytes(slot)
+    }
+
+    /// **The fold predicate this shell's last predicated fire wrote** — one
+    /// byte per lane, for a gate that has to see what
+    /// `channel::mask_from_commit` decided.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Device`] for the read.
+    pub fn fold_predicate(&self, lanes: u32) -> Result<Vec<u8>> {
+        self.predicate.read_mask(lanes)
     }
 
     /// Write one adapter's planes into this load's banks (design §8).
@@ -1171,12 +1156,6 @@ impl Shell {
     /// [`Fault::Device`] for the copy.
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
         self.weights.register_adapter(id, planes)
-    }
-
-    /// The banks this load declared: name, capacity, bytes per adapter slot.
-    #[must_use]
-    pub fn banks(&self) -> Vec<(&str, u32, u64)> {
-        self.weights.banks()
     }
 
     /// Open a slot for a fresh sequence.
@@ -1206,42 +1185,6 @@ impl Shell {
         Ok(())
     }
 
-    /// How many kv tokens a slot holds.
-    #[must_use]
-    pub fn held(&self, slot: u32) -> u32 {
-        self.held.get(slot as usize).copied().unwrap_or(0)
-    }
-
-    /// The trace this shell serves.
-    #[must_use]
-    pub fn trace(&self) -> &Trace {
-        &self.trace
-    }
-
-    /// The artifact it was baked into.
-    #[must_use]
-    pub fn compiled_model(&self) -> &CompiledModel {
-        &self.compiled
-    }
-
-    /// The ceilings it was baked against.
-    #[must_use]
-    pub fn budget(&self) -> &Budget {
-        &self.budget
-    }
-
-    /// How its pools hand pages out.
-    #[must_use]
-    pub fn paging(&self) -> Paging {
-        self.pools.paging()
-    }
-
-    /// Which device it bound.
-    #[must_use]
-    pub fn ordinal(&self) -> i32 {
-        self.device.ordinal()
-    }
-
     /// Bind the CALLING thread to this shell's device — see
     /// [`Context::bind_thread`](crate::device::Context::bind_thread).
     ///
@@ -1250,130 +1193,6 @@ impl Shell {
     /// [`Fault::Device`] when the runtime refuses the ordinal.
     pub fn bind_thread(&self) -> Result<()> {
         self.device.bind_thread()
-    }
-
-    /// That device's parallel width, probed once at bind.
-    #[must_use]
-    pub fn sms(&self) -> u32 {
-        self.device.device().num_sm
-    }
-
-    /// The `out` seam's row width — the vocabulary, for a plan whose out seam
-    /// is logits.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Unbound`] for an out value whose width is symbolic.
-    pub fn out_width(&self) -> Result<u64> {
-        kv::width_of(&self.trace, self.exports.out)
-    }
-
-    /// Does this load's model text declare a draft head (design §8's MTP
-    /// row, palo C3)?
-    ///
-    /// What `engine_cuda::api::profile` answers `ModelProfile::has_mtp_logits`
-    /// with, and therefore what decides whether a guest program may declare
-    /// `IntrinsicId::MtpLogits` at all. A bind-time contract has to be true at
-    /// the FIRST fire, and it is true exactly when the plan states the export
-    /// this shell binds the intrinsic at.
-    #[must_use]
-    pub fn drafts(&self) -> bool {
-        self.exports.mtp.is_some()
-    }
-
-    /// Does this load's model text declare a capture arm (design §9, palo C4)?
-    ///
-    /// Empty means a `Lane::captures_scores` has nowhere to go, and the fire
-    /// says so by name rather than answering with an uncaptured continuation.
-    #[must_use]
-    pub fn captures_scores(&self) -> bool {
-        !self.exports.scores.is_empty()
-    }
-
-    /// The attention layers this load exports a capture column for, in the
-    /// plan's own order.
-    #[must_use]
-    pub fn score_layers(&self) -> Vec<u32> {
-        self.exports.scores.iter().map(|e| e.layer).collect()
-    }
-
-    /// Which mode it is firing in.
-    #[must_use]
-    pub fn mode(&self) -> Graphs {
-        self.graphs
-    }
-
-    /// Change the mode between fires.
-    ///
-    /// **THE A/B IS ONE LOAD, NOT TWO**: 1.7 GB of weights landed twice would
-    /// be two residencies, two arenas and two tuner histories, and a
-    /// difference between the runs could be any of those. One shell, one set
-    /// of addresses, one word changed — then the tokens either match or the
-    /// graph is wrong.
-    ///
-    /// Execs already captured stay cached: their key still means what it
-    /// meant, and going Off and back On is a policy change, not an
-    /// invalidation.
-    pub fn set_mode(&mut self, graphs: Graphs) {
-        self.graphs = graphs;
-    }
-
-    /// Does this shell serve `Fallback::Copy`? See [`Shell::copies`]'s field.
-    #[must_use]
-    pub fn copying(&self) -> bool {
-        self.copies
-    }
-
-    /// Turn the copy path on or off between fires — the other A/B, and the
-    /// one whose oracle is free.
-    ///
-    /// A copy and a split compute the same numbers over the same rows by
-    /// construction (a gather moves bytes), so flipping this word between two
-    /// otherwise identical fires and diffing the logits is a complete test of
-    /// the claim. One shell, for `set_mode`'s reason: two loads would be two
-    /// residencies and two tuner histories, and a difference could be either.
-    pub fn set_copies(&mut self, copies: bool) {
-        // The graph cache is keyed on this (`record::Key`), so flipping it
-        // misses rather than replaying a body recorded under the other policy.
-        self.copies = copies;
-    }
-
-    /// Does this shell fold the composition axis? See [`Shell::fold`]'s field.
-    #[must_use]
-    pub fn folding(&self) -> bool {
-        self.fold
-    }
-
-    /// Turn the fold on or off between fires — the third A/B, and it is one
-    /// load for [`Shell::set_mode`]'s reason: two loads would be two
-    /// residencies and two tuner histories, and a difference could be either.
-    /// Buckets already armed stay armed; turning the fold off simply stops
-    /// routing fires through them, exactly as `set_mode(Off)` leaves keyed
-    /// execs resident.
-    pub fn set_fold(&mut self, fold: bool) {
-        self.fold = fold;
-    }
-
-    /// Turn the fold's pipeline on or off between fires — the twin exec and
-    /// the ahead-of-sync prebind (`PIE_CUDA_PIPELINE`, [`pipeline_from_env`]).
-    /// Off is step 4's fold exactly, which is what the pipelined revisit
-    /// gate diffs against; one load, for [`Shell::set_mode`]'s reason.
-    pub fn set_pipeline(&mut self, pipeline: bool) {
-        self.cache.set_pipeline(pipeline);
-    }
-
-    /// Is the fold's pipeline on?
-    #[must_use]
-    pub fn pipelining(&self) -> bool {
-        self.cache.pipelined()
-    }
-
-    /// Choose the fold's disable policy between fires
-    /// (`PIE_CUDA_FOLD_DISABLE`, [`fold_disable_from_env`]): `false`
-    /// disables every absent-window node, `true` keeps pie windowed nodes
-    /// enabled at fitted zero rows and disables only the library residue.
-    pub fn set_fold_library(&mut self, library: bool) {
-        self.cache.set_fold_library(library);
     }
 
     /// **THE NEXT FIRE, STATED** — the pipeline's hint, and the seam the
@@ -1417,57 +1236,6 @@ impl Shell {
                 )
             });
         self.cache.fold_expect(hint);
-    }
-
-    /// What this load's fold has done. See [`record::FoldStats`].
-    #[must_use]
-    pub fn fold_stats(&self) -> record::FoldStats {
-        self.cache.fold_stats()
-    }
-
-    /// What the last fire's window table cost. See [`FireCost`].
-    #[must_use]
-    pub fn last_fire_cost(&self) -> FireCost {
-        self.last
-    }
-
-    /// What this load's graph cache has done.
-    #[must_use]
-    pub fn graph_stats(&self) -> record::Stats {
-        self.cache.stats()
-    }
-
-    /// **PROBE SEAM (`palo cuda-abi` wave), off by default.** Ask this load's
-    /// captures to keep their `cudaGraph_t` so a probe can walk the recorded
-    /// kernel nodes. The fire path does not read it.
-    pub fn keep_graphs(&mut self, keep: bool) {
-        self.cache.keep_graphs(keep);
-    }
-
-    /// The graphs kept by [`Shell::keep_graphs`], in capture order.
-    #[must_use]
-    pub fn kept_graphs(&self) -> &[(record::Key, crate::device::Graph)] {
-        self.cache.kept()
-    }
-
-    /// **WHAT P6 BAKED FOR THIS LOAD, AND WHAT THIS SHELL OPENED FOR IT**:
-    /// `(streams, events, forked regions, side streams open)`.
-    ///
-    /// The one observable of a fork from outside. A recorded graph does not
-    /// carry its event points as NODES — stream capture turns a
-    /// `cudaEventRecord` and the `cudaStreamWaitEvent` behind it into an edge
-    /// between the launches on either side, which is exactly what one wants
-    /// and exactly what makes `cudaGraphGetNodes` unable to tell a forked
-    /// graph from a sequential one. So a measurement that wants to say its two
-    /// arms are two different artifacts asks here.
-    #[must_use]
-    pub fn streams(&self) -> (u32, u32, usize, usize) {
-        (
-            self.compiled.streams.streams,
-            self.compiled.streams.events,
-            self.compiled.regions.iter().filter(|r| r.stream != 0).count(),
-            self.device.lanes(),
-        )
     }
 
     // ── The guest-program plane (design §9) ──
@@ -1533,32 +1301,17 @@ impl Shell {
         self.programs.disagreeing_ticket(instance_id, tickets)
     }
 
-    /// How many descriptor-port envelopes have been resolved off guest device
-    /// rings in this process. See [`crate::program::ports::resolved`], which
-    /// is where the counter lives and why it is process-global.
-    #[must_use]
-    pub fn envelopes_resolved() -> u64 {
-        crate::program::ports::resolved()
-    }
-
-    /// The fold's process-global motion mirror —
-    /// `(folds, rebinds, rebind_us, swaps, prebinds, prebind_us, twins)` —
-    /// for a caller that cannot reach a shell instance: the serving runtime's
-    /// gates, which hold the engine behind `Box<dyn Engine>` on a lane
-    /// thread. See [`record::fold_observed`] for what is published, where,
-    /// and why process-global is the honest scope. An instance in hand
-    /// should ask [`Shell::fold_stats`] instead — it answers the full
-    /// census.
-    #[must_use]
-    pub fn fold_observed() -> (u64, u64, u64, u64, u64, u64, u64) {
-        record::fold_observed()
-    }
-
     /// The first channel of instance `instance_id` whose declared requirement
     /// a fire right now would not meet, or `None` when it is ready.
     ///
-    /// The gate [`Shell::fire_attached`] opens over every attached instance
-    /// before it launches anything. See [`ProgramPlane::ready`].
+    /// **THE FIRE PATH NO LONGER ASKS THIS** (alto E). It was the prepare
+    /// phase's readiness gate, answering a scheduling refusal for a frame the
+    /// runtime had already admitted; static admission
+    /// (`runtime::pipeline::fire::validate_frame`) proves the same thing over
+    /// the whole frame before submit, and past that door a miss is a fault
+    /// rather than a retry. What is left here is an observation verb: ask an
+    /// instance whether it could fire right now, without firing it. See
+    /// [`ProgramPlane::ready`].
     ///
     /// # Errors
     ///
@@ -1592,15 +1345,16 @@ impl Shell {
         self.programs.fire(&self.device, instance_id)
     }
 
-    /// What this load holds on the device: `(weights, arena, pools, inputs)`.
-    #[must_use]
-    pub fn footprint(&self) -> (u64, u64, u64, u64) {
-        (
-            self.weights.bytes(),
-            self.arena.bytes(),
-            self.pools.bytes(),
-            self.inputs.bytes(),
-        )
+    /// **Hand back what the pools no longer need** —
+    /// [`Supply::trim`](engine::frame::Supply::trim), reachable.
+    ///
+    /// **THE HINT IS A RESIDENCY STATEMENT** and its truth is the caller's: a
+    /// kv page holds somebody's cached prefix until the party that owns the
+    /// page ids says otherwise, and that party is the runtime (article 8).
+    /// The engine unmaps exactly what it is told to, only while the device is
+    /// idle, and invents no watermark of its own.
+    pub fn trim(&mut self, hint: engine::frame::Demand) {
+        Supply::trim(&mut self.pools, hint);
     }
 
     /// Run one fire, and hand back each lane's last row of logits.
@@ -1645,21 +1399,24 @@ impl Shell {
     /// attachments add is inside a loop over an empty slice.
     ///
     /// ```text
-    /// gate       program_ready over EVERY attached instance   ← nothing launched
+    /// gate       the submission's shape: every attachment names a lane this
+    ///            fire has, and no instance is attached twice ← nothing launched
     /// prologue   Boundary::Prologue attachments, in order
     /// forward    steps 1..9 below
     /// bind       IntrinsicId::Logits -> this lane's readout ROW of the arena
     /// epilogue   Boundary::Epilogue attachments, in order
     /// ```
     ///
-    /// **THE GATE IS THE WHOLE ARGUMENT FOR THE ORDER.** An epilogue fires
-    /// after the forward has written the lane's KV. A readiness refusal
-    /// discovered there would be a fire nobody can retry — the tokens are in
-    /// the cache and the guest's pass never happened — so every attached
-    /// instance is asked BEFORE anything launches, and a blocked one refuses
-    /// the fire while refusing is still free. That refusal is
-    /// [`Fault::Program`] naming the instance and the channel; the caller's
-    /// contract layer is what turns it into a scheduling answer.
+    /// **AN EPILOGUE THAT CANNOT COMMIT IS LOUD, NOT RETRIED.** An epilogue
+    /// fires after the forward has written the lane's KV, so a refusal
+    /// discovered there is a fire nobody can replay — the tokens are in the
+    /// cache and the guest's pass never happened. The answer is not a gate
+    /// here (a host pre-check is exactly the fire-path branch article 4
+    /// forbids): it is static admission at the runtime's `submit`, which
+    /// proves every ring's occupancy against its declared capacity before the
+    /// frame is admitted. Past that, a pass that does not commit is a
+    /// contract violation and [`committed_or`] names the instance, the
+    /// boundary and the channel.
     ///
     /// **A PROLOGUE IS NOT HANDED A READOUT**, because before the graph there
     /// is none. A program that reads `logits` and is attached at
@@ -1889,7 +1646,7 @@ impl Shell {
                 // everything" is the plausible geometry that plans like any
                 // real mask.
                 mask: self.masked.contains(class).then(|| {
-                    Mask::new(vec![0, rows + 1], u64::from(rows) + 1)
+                    Masking::Extent(Mask::new(vec![0, rows + 1], u64::from(rows) + 1))
                 }),
                 adapter: self.corrected.contains(class).then_some(0),
                 drafts: self
@@ -1915,10 +1672,22 @@ impl Shell {
                 },
                 pages: &[],
                 held: Some(1),
+                // The arming pass resolves no port, so it crosses no space.
+                translation: &[],
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,
                 drafts: lane.drafts,
                 captures_scores: lane.captures,
+                // The arming pass computes nothing and plans no readback, so
+                // there is no row list to carry and nothing that would read
+                // one.
+                readout: None,
+                // The arming pass is SYNTHETIC and nothing it carries
+                // executes: the plain fold is the one RS shape that
+                // graph-replays (design §6), so it is also the only one a
+                // template can be armed for.
+                rs: RsVerb::Fold,
+                rs_reset: RsReset::Inferred,
             })
             .collect();
 
@@ -2067,7 +1836,12 @@ pub struct Prepared<'a> {
     seats: Vec<Seat>,
     /// Each lane's stated page table, parallel to [`Prepared::seats`]; empty
     /// for a lane whose pages are the shell's.
-    tables: Vec<&'a [u32]>,
+    ///
+    /// **BORROWED FROM THE SUBMISSION OR OWNED FROM THE RINGS.** A lane that
+    /// states its pages in `KvDelta::pages` is borrowed and costs nothing; a
+    /// device-geometry lane's table was resolved off its own `pages` port a
+    /// phase ago and is in no submission, so it is carried here.
+    tables: Vec<std::borrow::Cow<'a, [u32]>>,
     /// Page arithmetic, once per kv space.
     geometries: Vec<kv::Geometry>,
     /// How many page ids the first space carved.
@@ -2082,6 +1856,15 @@ pub struct Prepared<'a> {
     /// `have > 0`) and is exactly what the lane loop used to call
     /// `Pools::clear` for, in the same order.
     fresh: Vec<u32>,
+    /// **This step's recurrent-state plan** (alto design §6, wave F3) — the
+    /// three verbs resolved to addressing, the fold lengths resolved off the
+    /// descriptor ports, and the three questions the seats are bound by.
+    ///
+    /// A DECISION here and copies in `enqueue`, for the reason [`fresh`] is:
+    /// a copy is a stream touch and a stream touch is not this phase's.
+    ///
+    /// [`fresh`]: Prepared::fresh
+    rs: RsFire<'a>,
     /// What this step will take from supply (article 4).
     demand: Demand,
     /// **This step's staging slot**, claimed at the bottom of `prepare` and
@@ -2176,9 +1959,23 @@ struct Readback {
 /// bench) walk through it; the serving path never does.
 #[derive(Debug, Default)]
 pub struct Settled {
-    /// Each SUBMITTED lane's last row of logits, in submission order. Filled
+    /// Each SUBMITTED lane's logits, in submission order: the rows
+    /// [`Shell::read_out_rows`] was asked for, concatenated row-major. Filled
     /// by [`Shell::read_out`], empty until then.
+    ///
+    /// **ONE VECTOR PER LANE AND NOT ONE PER ROW**, because the width is the
+    /// same vocabulary for every row of every lane and [`Settled::rows`] says
+    /// how many rows are in here. A `Vec<Vec<Vec<f32>>>` would spell the same
+    /// fact with a third allocation per row.
     pub logits: Vec<Vec<f32>>,
+    /// How many rows of [`Settled::logits`] each SUBMITTED lane's entry holds.
+    ///
+    /// One under [`Readout::Last`], `n` under [`Readout::Rows`] of `n`, zero
+    /// under [`Readout::None`] and zero for a lane this fire gave no rows. It
+    /// is a field rather than an arithmetic on `logits.len() / vocab` because
+    /// the vocabulary is not a number this struct carries, and rederiving it
+    /// is how the two would come to disagree.
+    pub rows: Vec<u32>,
     /// Each submitted lane's captured attention mass, empty for a lane that
     /// asked for none. Filled by [`Shell::read_out`].
     pub scores: Vec<Vec<LayerScores>>,
@@ -2238,13 +2035,22 @@ impl FrameShell for Shell {
         // forward would leave the lane's tokens in the cache with the guest's
         // pass unrun, which is a fire the caller cannot retry.
         //
-        // **AND IT IS ASKED HERE AND NOWHERE ELSE** (design §9, the double
-        // door). `Cuda::fire` asked `program_ready` over these same
-        // instances before calling in, purely so that a block could be
-        // answered as `Error::Exhausted`; the shell then asked again. The
-        // refusal is typed now (`Fault::Blocked`) and `fault()` does that
-        // translation, so the second door is gone and the question is asked
-        // once.
+        // **AND WHAT IT NO LONGER ASKS IS READINESS** (alto E, article 4).
+        // A third clause stood below: `programs.ready` over every attached
+        // instance, answering `Fault::Blocked` -> `Error::Exhausted` so the
+        // runtime's lane could sleep and re-submit the identical frame. That
+        // was F2a's bridge — an approximation of static admission, asked per
+        // instance rather than over the frame's union — and
+        // `pipeline::fire::validate_frame` is the real thing now: ring
+        // occupancy in slot order, host-writer staging, reader pressure,
+        // proved against declared capacities before the frame is admitted.
+        // Past that door a readiness miss is a CONTRACT VIOLATION, and the
+        // device is what discovers it: `channel::pull_validate` compares each
+        // prediction against the live pinned words and clears the commit
+        // word, and `committed_or` turns the resulting non-commit into a
+        // fault naming the instance and the channel. The two clauses left
+        // here are about the SUBMISSION's shape — a lane that does not exist,
+        // an instance attached twice — which no amount of draining fixes.
         for (index, attached) in attachments.iter().enumerate() {
             if attached.lane as usize >= lanes.len() {
                 return Err(Fault::program(
@@ -2271,12 +2077,6 @@ impl FrameShell for Shell {
                     ),
                 ));
             }
-            if let Some(channel) = self.programs.ready(attached.instance)? {
-                return Err(Fault::Blocked {
-                    instance: attached.instance,
-                    channel,
-                });
-            }
         }
 
         // ── 0b. THE DESCRIPTOR PORTS, read off the rings the gate just
@@ -2298,10 +2098,183 @@ impl FrameShell for Shell {
         //    what makes the host-carried fixture the parity leverage for the
         //    device-carried one — same program, same channels, one class
         //    apart.
-        let mut envelope_of: Vec<Option<crate::program::Envelope>> = vec![None; lanes.len()];
+        //
+        //    **AND AN ATTACHMENT NAMES A MEMBER, NOT A LANE.** The runtime
+        //    attaches one instance per MEMBER and points it at the member's
+        //    FIRST lane, because a program's stages are one pass with one
+        //    commit however many row groups it fires. A decode-envelope member
+        //    is one lane and the two readings coincided; a device-geometry one
+        //    need not be — a beam search binds `B` lanes through one program —
+        //    and the instance's own `embed_indptr` port is what says how many
+        //    and where each one's rows lie. So the map below is per lane and
+        //    carries the lane's INDEX WITHIN ITS MEMBER beside the envelope.
+        let mut resolved: Vec<crate::program::Envelope> = Vec::new();
+        let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         for attached in attachments {
-            if let Some(envelope) = self.programs.envelope(attached.instance)? {
-                envelope_of[attached.lane as usize] = Some(envelope);
+            let Some(envelope) = self.programs.envelope(attached.instance)? else {
+                continue;
+            };
+            let first = attached.lane as usize;
+            let carried = envelope.lanes();
+            if first + carried > lanes.len() {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "instance {} is attached at lane {first} and its `embed_indptr` \
+                         port describes {carried} lane(s), which runs past the {} this \
+                         fire carries",
+                        attached.instance,
+                        lanes.len()
+                    ),
+                ));
+            }
+            let held = resolved.len();
+            for lane in 0..carried {
+                if envelope_of[first + lane].is_some() {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {} is claimed by two attached instances; a lane's \
+                             descriptor ports have one author",
+                            first + lane
+                        ),
+                    ));
+                }
+                envelope_of[first + lane] = Some((held, lane));
+            }
+            resolved.push(envelope);
+        }
+
+        // ── 0c. THE TWO DEVICE-RESOLVED PAYLOADS, LIFTED OUT OF THE RINGS AND
+        //    OWNED HERE. A page table and a masking are the only two things a
+        //    port resolves that the fire path holds by REFERENCE — `tables`
+        //    borrows the submission's page list, `mask::LaneMask` borrows the
+        //    submission's `Masking` — and a device-resolved one is in neither
+        //    submission nor rings by the time `stage` and `geometry_with` want
+        //    it. So they are built once, here, indexed by SUBMISSION lane, and
+        //    the composition loop below borrows out of these vectors exactly
+        //    as it borrows out of the submission.
+        //
+        //    **THE MASK IS RUN-LENGTH ENCODED AND NOT SEPARATELY PACKED**
+        //    (`crate::mask::from_dense`): the whole claim a device mask has to
+        //    answer is that it reaches the attention arm as the same slab a
+        //    host-stated mask of the same bools reaches it as, and sharing the
+        //    expansion is how that stops being a thing to test and starts
+        //    being a thing that is true.
+        //
+        //    **AND THE ROW COUNT COMES WITH THEM, FOR THIS CLASS ONLY.** A
+        //    decode-envelope lane's submission carries placeholder ids and
+        //    therefore carries its own row count, which is why nothing about
+        //    that class changes. A device-GEOMETRY submission carries no row
+        //    split at all — the runtime ships `Lane::tokens` empty for every
+        //    lane, because the split is the instance's own `embed_indptr`
+        //    port and the runtime has no more claim on it than it has on the
+        //    page table beside it. dev says the same thing by building the
+        //    CSR inside the compose kernel (`compose_fixed_decode` writes
+        //    `qo_indptr[i + 1] = row_base + i + 1`). So the count is read off
+        //    the port HERE, before `compose`, because `compose` is what turns
+        //    counts into windows and row offsets and there is no later
+        //    instant at which a row can appear.
+        //
+        //    **AND THIS IS WHERE THE TWO PAGE SPACES MEET.** A guest holds
+        //    WORKING-SET-RELATIVE indexes and never a pool page id — that is
+        //    `kv-working-set`'s whole surface, and it is what makes an O(1)
+        //    copy-on-write fork possible, because a relative index survives
+        //    the copy that moves the physical page under it. Everything below
+        //    this line is in the POOL's space: `store::kv::geometry_with`
+        //    pushes a table entry straight into the page CSR and the append
+        //    writes through `w_slot` with no lookup. For every host-resolved
+        //    geometry the runtime crosses between them before it submits
+        //    (`pipeline::fire::map_lane_pages`); for THIS class it cannot,
+        //    because the values are in a cell no host read, so it ships the
+        //    table (`Seated::translation`) and the crossing happens here —
+        //    once, on the two ports that carry page references.
+        let mut device_pages: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
+        let mut device_writes: Vec<Option<(Vec<u32>, Vec<u32>)>> = vec![None; lanes.len()];
+        let mut device_masks: Vec<Option<Masking>> = vec![None; lanes.len()];
+        let mut lane_rows: Vec<u32> = lanes
+            .iter()
+            .map(|seated| seated.lane.tokens.len() as u32)
+            .collect();
+        for source in 0..lanes.len() {
+            let Some((held, at)) = envelope_of[source] else {
+                continue;
+            };
+            let ports = resolved[held].lane(at, source)?;
+            let table = lanes[source].translation;
+            // A RELATIVE INDEX THE TABLE DOES NOT COVER IS A REFUSAL, and so
+            // is a lane with page references and no table at all: "translate
+            // by identity" is the bug this crossing exists to end, and an
+            // empty table would spell it silently.
+            let translate = |page: u32, port: &str| -> Result<u32> {
+                table.get(page as usize).copied().ok_or_else(|| {
+                    Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source}'s `{port}` port names working-set page {page}                              and the table this fire was handed maps {} page(s); a guest                              holds relative indexes and the pool's ids are the runtime's,                              so an index past the table addresses somebody else's cache",
+                            table.len()
+                        ),
+                    )
+                })
+            };
+            device_pages[source] = ports
+                .pages()?
+                .map(|relative| {
+                    relative
+                        .iter()
+                        .map(|&page| translate(page, "pages"))
+                        .collect::<Result<Vec<u32>>>()
+                })
+                .transpose()?;
+            if ports.owns_pages() {
+                lane_rows[source] = ports.rows();
+            }
+            let rows = lane_rows[source] as usize;
+            // The write descriptor crosses with them: `w_slot` is a page
+            // reference like `pages` is — a beam search builds it as
+            // `gather(pool_ids, wpos / page_size)` out of the same
+            // `ws.reserve` grant — while `w_off` is an offset inside a page
+            // and is in no space at all.
+            device_writes[source] = ports
+                .writes(rows)?
+                .map(|(slots, offsets)| {
+                    Ok::<(Vec<u32>, Vec<u32>), Fault>((
+                        slots
+                            .iter()
+                            .map(|&page| translate(page, "w_slot"))
+                            .collect::<Result<Vec<u32>>>()?,
+                        offsets.to_vec(),
+                    ))
+                })
+                .transpose()?;
+            if let Some((cells, stride)) = ports.mask(rows)? {
+                // **ONE ROW A LANE, AND THE REFUSAL IS THE CAUSAL BOUND.**
+                // `mask::stage` intersects every restriction with `k <= have +
+                // q`, which is the order the cache is written in — and a
+                // device-geometry lane's write order is the guest's
+                // (`w_slot`/`w_off`), so for `q > 0` this shell has no bound
+                // it can honestly derive. On a ONE-row lane the term is
+                // vacuous (`have + 0` is the whole extent, because `have` is
+                // `kv_len - 1`), which is exactly what dev's
+                // `pack_dense_mask` does — it transcribes the guest's cells
+                // and applies no causality of its own. Every device-geometry
+                // shape this tree admits is one row a lane
+                // (`lease::detect_pooled_device_geometry` requires a rank-1
+                // `[lanes]` token channel), so the wider case is refused by
+                // name rather than served with a bound nobody stated.
+                if rows != 1 {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source} resolves its attention mask from a channel and \
+                             carries {rows} query rows; the expansion intersects each row \
+                             with the order the cache is written in, and a lane whose \
+                             write descriptor is the guest's has no such order this shell \
+                             can derive"
+                        ),
+                    ));
+                }
+                device_masks[source] = Some(crate::mask::from_dense(cells, stride));
             }
         }
 
@@ -2309,7 +2282,8 @@ impl FrameShell for Shell {
         //    words to classes, classes to an order, counts to prefix sums.
         let submitted: Vec<FireLane> = lanes
             .iter()
-            .map(|seated| FireLane::new(seated.lane.word, seated.lane.tokens.len() as u32))
+            .zip(&lane_rows)
+            .map(|(seated, &rows)| FireLane::new(seated.lane.word, rows))
             .collect();
         let composition = compose(&self.compiled, &self.budget, &submitted)?;
         // The fold's traffic memory: which classes real fires have exercised
@@ -2326,7 +2300,7 @@ impl FrameShell for Shell {
         // 2. The fire's own vectors, in fire order — which is the seriated
         //    order the composition chose, not the order the runtime submitted.
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
-        let mut tables: Vec<&[u32]> = Vec::with_capacity(lanes.len());
+        let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         // THE MASKED AXIS, IN FIRE ORDER. One entry per lane, seriated with
         // the rest — the span table is indexed by the schedule's request
         // number, which is a position in the class order and not the order
@@ -2334,9 +2308,21 @@ impl FrameShell for Shell {
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
+        // THE EXPLICIT WRITE DESCRIPTOR, ONE ENTRY PER TOKEN ROW IN FIRE
+        // ORDER: `Some((page, offset))` for a row whose lane resolved
+        // `w_slot`/`w_off` off its rings, `None` for every row whose landing
+        // place `store::kv::geometry_with` derives. All `None` is every fire
+        // this shell fired before the device-geometry class.
+        let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
         // THE SLOTS THAT ARRIVE FRESH, DECIDED HERE AND ZEROED IN `enqueue`.
         let mut fresh: Vec<u32> = Vec::new();
+        // THE RECURRENT PLAN, IN FIRE ORDER — see [`RsFire`]. Empty vectors
+        // for a fire whose every lane folds, which is every fire this shell
+        // fired before F3.
+        let mut rs_moves: Vec<RsMove<'a>> = Vec::with_capacity(lanes.len());
+        let mut rs_lens: Vec<i32> = Vec::with_capacity(lanes.len());
+        let mut rs_order: Vec<u32> = vec![0; lanes.len()];
         // THE ADAPTER AXIS, IN FIRE ROW ORDER. One entry per token ROW —
         // `linear.lora_correct` reads `routes[row]` beside `x[row]`, so this
         // is the shape `tokens` and `positions` have and not the shape
@@ -2350,24 +2336,76 @@ impl FrameShell for Shell {
             adapter_routes.reserve(rows as usize);
         }
         for row in composition.lanes() {
-            let seated = &lanes[row.source as usize];
+            let source = row.source as usize;
+            let seated = &lanes[source];
             let lane = &seated.lane;
+            // THIS LANE'S RESOLVED PORTS, CUT TO ITS OWN ROWS — `None` for a
+            // lane whose instance was bound `GeometryClass::Host` and for one
+            // with no attachment at all, and then every line below reads the
+            // submission exactly as it always did, byte for byte.
+            let ports = match envelope_of[source] {
+                Some((held, at)) => Some(resolved[held].lane(at, source)?),
+                None => None,
+            };
             // WHO KNOWS HOW LONG THE SEQUENCE IS depends on who owns its
             // pages. A shell-owned slot is one the shell opened and has been
             // counting ever since; a caller-owned one is a page table the
             // caller forked, trimmed or restored between fires, and its own
             // count is the only one that is right.
-            let have = match seated.held {
-                Some(held) => held,
-                None => self
-                    .held
-                    .get(lane.slot as usize)
-                    .copied()
-                    .ok_or(Fault::Ceiling {
-                        what: "slots",
-                        need: u64::from(lane.slot) + 1,
-                        have: self.held.len() as u64,
-                    })?,
+            //
+            // **AND A DEVICE-GEOMETRY LANE'S IS ITS OWN `kv_len` PORT, MINUS
+            // THIS FIRE'S ROWS.** `have` is not a fact this shell can hold for
+            // such a lane: `self.held` counts the slots whose page table is
+            // the shell's, and the runtime's `KvDelta::held` is zero because
+            // the runtime could not know it either — the extent is device
+            // data, computed by the epilogue that decided where the rows land.
+            // What the fire actually needs `have` for is `after = have + rows`
+            // (the page count, the last page's fill, the stated kv length),
+            // so the honest reading is to take the extent the guest states and
+            // derive `have` back from it. That is dev's own arithmetic
+            // (`compose_fixed_decode`: `last_page_len = ((kv_len - 1) %
+            // page_size) + 1`) reached from the other end, and
+            // `store::kv::geometry_with` then computes exactly the same three
+            // numbers it computes for every other lane.
+            let have = match ports.as_ref().filter(|ports| ports.owns_pages()) {
+                Some(ports) => {
+                    let after = ports.extent().ok_or_else(|| {
+                        Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "lane {source} states its own page table and binds no \
+                                 `kv_len` port; the page count, the last page's fill and \
+                                 the attention schedules are all carved from the extent, \
+                                 and no seat in this shell knows it"
+                            ),
+                        )
+                    })?;
+                    if after < row.rows {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "lane {source} states a readable KV extent of {after} on \
+                                 its `kv_len` port and this fire writes {} row(s) into \
+                                 it; the extent is AFTER the append, so it can never be \
+                                 shorter than what the append adds",
+                                row.rows
+                            ),
+                        ));
+                    }
+                    after - row.rows
+                }
+                None => match seated.held {
+                    Some(held) => held,
+                    None => self
+                        .held
+                        .get(lane.slot as usize)
+                        .copied()
+                        .ok_or(Fault::Ceiling {
+                            what: "slots",
+                            need: u64::from(lane.slot) + 1,
+                            have: self.held.len() as u64,
+                        })?,
+                },
             };
             debug_assert_eq!(
                 row.row_offset as usize,
@@ -2407,7 +2445,22 @@ impl FrameShell for Shell {
             // split doing its one job: this loop refuses fires, and a fire
             // that refuses after a slot was zeroed would have destroyed
             // state it then declined to rebuild.
-            if have == 0 {
+            //
+            // **AND WHOSE FACT IT IS, SINCE F3.** `have == 0` is the KV
+            // store's answer to a question the RS store owns (survey §9's gap
+            // list): a runtime that forks a sequence, restores a prefix or
+            // recycles a seat can hand a slot whose recurrence must be zeroed
+            // while its KV count is not zero, and one whose KV was trimmed to
+            // nothing while its recurrence must continue. So the LANE carries
+            // the classification now, and `RsReset::Inferred` — the default,
+            // and every caller that has not been taught to state it — is
+            // exactly the old rule, restated where it can be seen.
+            let begins = match seated.rs_reset {
+                RsReset::Inferred => have == 0,
+                RsReset::Fresh => true,
+                RsReset::Held => false,
+            };
+            if begins {
                 fresh.push(lane.slot);
             }
             seats.push(Seat {
@@ -2415,18 +2468,35 @@ impl FrameShell for Shell {
                 have,
                 rows: row.rows,
             });
-            tables.push(seated.pages);
+            // THE PAGE TABLE, FROM WHICHEVER AUTHOR HAS ONE. A
+            // device-geometry lane's is the cell its `pages`/`page_indptr`
+            // ports resolved to and the submission's is empty; every other
+            // lane's is the submission's, unchanged, and an empty table is
+            // still the shell's own block-per-slot paging.
+            tables.push(match &device_pages[source] {
+                Some(pages) => std::borrow::Cow::Owned(pages.clone()),
+                None => std::borrow::Cow::Borrowed(seated.pages),
+            });
             // THE WORD AND THE MASK, CHECKED AGAINST EACH OTHER, ONCE.
             // `compose` already refused a word this artifact has no class
             // for; what it cannot know is whether the class it resolved to
             // reads a mask. Both directions are a wrong answer that looks
             // like a right one, so both are refused (`Fault::MaskWord`
             // argues each).
+            //
+            // **AND THE MASK IT ASKS ABOUT IS THE EFFECTIVE ONE.** A
+            // device-resolved mask reaches this shell on a channel and NOT on
+            // `Seated::mask`, while the lane's word says `masked` all the same
+            // — the runtime stamps it from the same lowering that decided the
+            // mask was device-carried. Asking `seated.mask` alone would refuse
+            // every such fire by name for the one reason that is not true of
+            // it: that nobody stated a mask.
+            let masking = device_masks[source].as_ref().or(seated.mask);
             let runs_masked_arm = self.masked.contains(row.class as usize);
-            if seated.mask.is_some() && self.masked.is_empty() {
+            if masking.is_some() && self.masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            if seated.mask.is_some() != runs_masked_arm {
+            if masking.is_some() != runs_masked_arm {
                 return Err(Fault::MaskWord {
                     lane: row.source,
                     word: lane.word,
@@ -2434,11 +2504,92 @@ impl FrameShell for Shell {
                 });
             }
             masks.push(crate::mask::LaneMask {
-                mask: seated.mask,
+                mask: masking,
                 have,
                 rows: row.rows,
             });
             slot_ids.push(lane.slot as i32);
+            // ── THE RECURRENT VERB, RESOLVED TO ADDRESSING (design §6).
+            //
+            //    The fold length is resolved HERE, in compose, and not one
+            //    line later: a `FoldLen::Device` row's count comes out of the
+            //    descriptor port this fire already read (step 0b), is clamped
+            //    to the host's bound and refuses zero — and past this point
+            //    nothing can tell the two spellings apart, which is dev
+            //    clearing the flag at the same instant so that no downstream
+            //    reader can branch on it.
+            let fire_lane = rs_moves.len();
+            rs_order[row.source as usize] = fire_lane as u32;
+            let port = envelope_of[source]
+                .and_then(|(held, _)| resolved[held].fold_len.as_deref());
+            let (verb, folded) = match &seated.rs {
+                RsVerb::Fold => (RsMove::None, row.rows),
+                // **THE MIXED ROW, LOWERED** (wave F3b). A zero fold is
+                // the pure scatter: it truncates nothing, so its boundary
+                // entry is its own row count — "at the end", which is what
+                // makes it invisible to both the length seat and the split.
+                // Anything else lands the durable state on that row while
+                // every row is still written into the buffer, and the
+                // boundary entry IS the fold. Resolved here for the same
+                // reason a replay's length is: past this point nothing may
+                // tell the two spellings apart.
+                RsVerb::Buffer { pages, at, fold } => {
+                    let fold = match fold {
+                        FoldLen::Host(0) => 0,
+                        stated => resolve_fold_len(*stated, row.rows, fire_lane, port)?,
+                    };
+                    (
+                        RsMove::Scatter {
+                            pages: pages.as_slice(),
+                            at: *at,
+                            fold,
+                        },
+                        if fold == 0 { row.rows } else { fold },
+                    )
+                }
+                RsVerb::FoldBuffered {
+                    pages,
+                    at,
+                    bound,
+                    len,
+                } => {
+                    let (bound, len) = (*bound, *len);
+                    if bound != row.rows {
+                        return Err(Fault::program(
+                            "serve::rs",
+                            format!(
+                                "lane {} replays a buffer bounded at {bound} tokens in a fire \
+                                 that gave it {} rows — the bound IS what sizes the launch, so \
+                                 the two are one number",
+                                row.source, row.rows
+                            ),
+                        ));
+                    }
+                    (
+                        RsMove::Gather {
+                            pages: pages.as_slice(),
+                            // The buffer's head: a mid-page fold leaves the
+                            // survivors offset inside the page they share
+                            // with the tokens it absorbed, and a replay from
+                            // buffer token zero would fold those a second
+                            // time (wave F3b).
+                            at: *at,
+                        },
+                        resolve_fold_len(len, bound, fire_lane, port)?,
+                    )
+                }
+            };
+            if verb != RsMove::None && self.buffers.is_none() {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "lane {}'s recurrent verb, against a plan that declares no chunked \
+                         recurrence to buffer",
+                        row.source
+                    ),
+                });
+            }
+            rs_moves.push(verb);
+            rs_lens.push(narrow(u64::from(folded)));
             // THE ADAPTER AND THE WORD, CHECKED AGAINST EACH OTHER, ONCE —
             // the mask's rule above, restated for the axis beside it, and it
             // is the same two wrong answers that look right. A lane that
@@ -2516,18 +2667,44 @@ impl FrameShell for Shell {
             // not know and did not state — its `Lane::tokens` carries the row
             // COUNT and placeholders, and `tokens_for` refuses a port that
             // disagrees with the count the composition already carved for.
-            let source = row.source as usize;
-            let rows_here = lane.tokens.len();
-            match envelope_of[source].as_ref() {
-                Some(envelope) => {
-                    envelope.check_extent(source, have.saturating_add(row.rows))?;
-                    for &token in envelope.tokens_for(source, rows_here)? {
+            // THE ROW COUNT THE COMPOSITION PLACED, which for a
+            // device-geometry lane is the port's and for every other is the
+            // submission's — one number either way, decided at step 0c.
+            let rows_here = row.rows as usize;
+            match ports.as_ref() {
+                Some(ports) => {
+                    // The extent is a CHECK where the seat owns it and the
+                    // SOURCE `have` was derived from where the guest does; the
+                    // check is therefore an identity in the second case and is
+                    // made anyway, because an identity that stopped holding is
+                    // the first thing anybody would want to hear about.
+                    ports.check_extent(have.saturating_add(row.rows))?;
+                    for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
                     }
-                    match envelope.positions_for(source, have, rows_here)? {
+                    match ports.positions_for(have, rows_here)? {
                         Some(stated) => positions.extend(stated.iter().map(|&p| p as i32)),
                         None => positions
                             .extend((0..rows_here).map(|at| narrow(u64::from(have) + at as u64))),
+                    }
+                    // THE WRITE DESCRIPTOR, KEPT IN FIRE ROW ORDER FOR THE
+                    // PATCH BELOW — already translated into pool pages at step
+                    // 0c, which is the one place a page reference crosses
+                    // spaces. It cannot be applied here: the vectors it
+                    // overwrites are `kv::geometry_with`'s, and that call
+                    // wants the whole seat list. `None` for a lane that binds
+                    // no `w_slot`/`w_off`, and then the seat's own
+                    // `have + row` arithmetic stands for its rows.
+                    match &device_writes[source] {
+                        Some((slots, offsets)) => writes.extend(
+                            slots
+                                .iter()
+                                .zip(offsets)
+                                .map(|(&page, &off)| {
+                                    Some((narrow(u64::from(page)), narrow(u64::from(off))))
+                                }),
+                        ),
+                        None => writes.extend(std::iter::repeat_n(None, rows_here)),
                     }
                 }
                 None => {
@@ -2535,6 +2712,7 @@ impl FrameShell for Shell {
                         tokens.push(*token as i32);
                         positions.push(narrow(u64::from(have) + at as u64));
                     }
+                    writes.extend(std::iter::repeat_n(None, rows_here));
                 }
             }
         }
@@ -2542,31 +2720,52 @@ impl FrameShell for Shell {
         // ── 2b. ADMISSION (article 4). The union demand of this step,
         //    committed atomically before any of it runs.
         //
-        //    **F1's SUPPLY IS THE RESERVATION MODEL AND `commit` IS THE
-        //    CEILING THAT WAS ALREADY THERE** — `Pools` carves fixed blocks at
-        //    load and grows nothing, so this refuses exactly what
-        //    `kv::geometry_with` refuses a dozen lines below, with the
-        //    identical `Fault::Ceiling`. What it buys today is that the number
-        //    a frame wants is a VALUE with a name; what it buys in wave C is
-        //    that the elastic pool's atomic multi-arena commit lands at this
-        //    line and nowhere else.
+        //    **A DEMAND IS A WATERMARK, NOT A COUNT** (wave C; dev's
+        //    `required_kv_pages`/`required_state_slots`,
+        //    context.cpp:2087-2127). The elastic arenas grow at the tail, so
+        //    what admission has to commit is the HIGHEST addressed page and
+        //    slot plus one — not how many of them this step happens to touch.
+        //    The two readings agree for the shell's own block-per-slot paging
+        //    and diverge the moment a lane brings the runtime's page ids,
+        //    where page 900 may be the only page in the fire: a count would
+        //    have committed one page and let the append write into address
+        //    space with nothing behind it.
+        //
+        //    Both axes therefore run over EVERY lane, the runtime-tabled ones
+        //    included. A page id is a page id whoever minted it (article 8 —
+        //    the ids are the runtime's, the bytes under them are the
+        //    engine's), and the fault a slot past the pool earns is the same
+        //    `Fault::Ceiling` `kv::geometry_with` raises a dozen lines below.
+        let page_size = u64::from(self.pools.paging().page_size).max(1);
         let demand = Demand {
             kv_pages: seats
                 .iter()
                 .zip(&tables)
-                .filter(|(_, table)| table.is_empty())
-                .map(|(seat, _)| {
-                    u64::from(seat.have)
-                        .saturating_add(u64::from(seat.rows))
-                        .div_ceil(u64::from(self.pools.paging().page_size).max(1))
-                        .max(1) as u32
+                .map(|(seat, table)| {
+                    let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
+                    let pages = after.div_ceil(page_size).max(1);
+                    if table.is_empty() {
+                        // The shell's own block: `base(slot) + pages` is one
+                        // past this lane's last page id.
+                        self.pools.paging().base(seat.slot).saturating_add(pages)
+                    } else {
+                        // The runtime's ids: one past the highest this lane
+                        // will address. `geometry_with` reads exactly
+                        // `table[..pages]` and refuses a shorter table, so
+                        // the same prefix is what is scanned here.
+                        table
+                            .iter()
+                            .take(pages as usize)
+                            .copied()
+                            .max()
+                            .map_or(0, |page| u64::from(page).saturating_add(1))
+                    }
                 })
-                .sum(),
+                .max()
+                .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
             state_slots: seats
                 .iter()
-                .zip(&tables)
-                .filter(|(_, table)| table.is_empty())
-                .map(|(seat, _)| seat.slot.saturating_add(1))
+                .map(|seat| seat.slot.saturating_add(1))
                 .max()
                 .unwrap_or(0),
             workspace: 0,
@@ -2580,9 +2779,52 @@ impl FrameShell for Shell {
         //    nothing above it.
         let indptr_host = kv::indptr(&seats);
         let paging = self.pools.paging();
-        let geometries = (0..self.spaces)
-            .map(|_| kv::geometry_with(&paging, &seats, &tables))
+        let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut geometries = (0..self.spaces)
+            .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
             .collect::<Result<Vec<_>>>()?;
+        // ── 3b. THE EXPLICIT WRITE DESCRIPTOR, OVER THE DERIVED ONE.
+        //
+        //    `geometry_with` lands row `r` of a lane at flat position
+        //    `have + r` of that lane's page run, which is right for every
+        //    sequence that appends to its own tail and WRONG the moment
+        //    several lanes append into one shared pool: a beam search's `B`
+        //    lanes all state the same extent, so `have + 0` names one cell for
+        //    all of them and `B - 1` beams would overwrite the first. The
+        //    guest computes `w_slot`/`w_off` in its own epilogue for exactly
+        //    that reason, and this is where its answer replaces the derived
+        //    one — after the page CSR and the last-page fill, which are still
+        //    the extent's and are still carved the same way, and before
+        //    anything reads them.
+        //
+        //    The rows are parallel: `writes` was filled in the composition's
+        //    own lane order, one entry per token row, which is the order
+        //    `geometry_with` fills `write_page`/`write_offset` in.
+        if writes.iter().any(Option::is_some) {
+            for geometry in &mut geometries {
+                for (row, stated) in writes.iter().enumerate() {
+                    let Some((page, offset)) = *stated else {
+                        continue;
+                    };
+                    let (Some(write_page), Some(write_offset)) = (
+                        geometry.write_page.get_mut(row),
+                        geometry.write_offset.get_mut(row),
+                    ) else {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "row {row} states an explicit write descriptor and the \
+                                 page arithmetic placed {} row(s)",
+                                geometry.write_page.len()
+                            ),
+                        ));
+                    };
+                    *write_page = page;
+                    *write_offset = offset;
+                }
+            }
+        }
+        let geometries = geometries;
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
@@ -2669,6 +2911,19 @@ impl FrameShell for Shell {
             },
         )?;
 
+        // Bound only when it would truncate something — see `RsFire::truncates`.
+        let rs_truncates = rs_lens
+            .iter()
+            .zip(&seats)
+            .any(|(len, seat)| *len < narrow(u64::from(seat.rows)));
+        // **AND SPLIT ONLY WHEN A BOUNDARY IS STRICTLY INSIDE A ROW** — see
+        // `RsFire::splits`. `fold == rows` is the fire that buffers a window
+        // and folds all of it, which is the single-call folding path; `fold
+        // == 0` is the pure scatter, which is the single-call buffered one.
+        // Only the interior boundary costs a second launch.
+        let rs_splits = rs_moves.iter().zip(&seats).any(|(verb, seat)| {
+            matches!(verb, RsMove::Scatter { fold, .. } if *fold > 0 && *fold < seat.rows)
+        });
         Ok(Prepared {
             slot: Some(slot),
             lengths: staged_lens,
@@ -2683,6 +2938,47 @@ impl FrameShell for Shell {
             pages,
             fresh,
             demand,
+            rs: RsFire {
+                // **NOTHING AT ALL FOR THE PLAIN PATH.** A fire whose every
+                // lane folds and whose lanes carry no prologue attachment
+                // keeps the empty vectors and the two false questions, and
+                // `enqueue` then binds the null seats every launch here has
+                // always been handed.
+                // `fold: 0` and not `Scatter { .. }`, because a mixed row
+                // is a scatter that FOLDS (wave F3b): it moves buffered bytes
+                // like a draft and lands the boundary like a commit, so it
+                // answers this question the way a fold does.
+                write_state: rs_moves
+                    .iter()
+                    .any(|verb| !matches!(verb, RsMove::Scatter { fold: 0, .. })),
+                predicated: {
+                    let scatters = rs_moves
+                        .iter()
+                        .filter(|verb| matches!(verb, RsMove::Scatter { fold: 0, .. }))
+                        .count();
+                    let prologue = attachments.iter().any(|attached| {
+                        attached.at == Boundary::Prologue
+                    });
+                    (scatters != 0 && scatters != rs_moves.len()) || prologue
+                },
+                // **BOUND ONLY WHEN IT WOULD TRUNCATE SOMETHING**, which
+                // since F3b is tidiness and no longer a correctness rule.
+                // `attn/ssm.cuh`'s fla scan used to read `commit_len !=
+                // nullptr` as a second thing besides the truncation —
+                // `single_round`, a different bf16 rounding of the decay — so
+                // a seat bound where it could change no length still changed
+                // the numbers, and a replay that accepted its whole window
+                // stopped being the fold it replaced. The rounding is its own
+                // argument now (`RecurrentPool::fused_decay`) and the two
+                // spellings agree to the bit; what is left is the same
+                // "bind nothing that can do nothing" the mask above obeys.
+                truncates: rs_truncates,
+                splits: rs_splits,
+                buffered: rs_moves.iter().any(|verb| !matches!(verb, RsMove::None)),
+                moves: rs_moves,
+                lens: rs_lens,
+                order: rs_order,
+            },
         })
     }
 
@@ -2708,6 +3004,33 @@ impl FrameShell for Shell {
         Self: 'a,
     {
         let mut p = prepared;
+        // ── **THE PROMOTION INSTANT** (alto design §7, wave D2; article 3
+        //    applied to weights). Between two fires, and on THIS side of the
+        //    phase boundary rather than in `prepare`, because `Prepared` is
+        //    the type that cannot reach a stream and a promotion is three
+        //    enqueues. It stands before the first launch of this step and
+        //    after every launch of the last, which is exactly the window a
+        //    slab may be overwritten in.
+        //
+        //    Nothing here waits. The copies ride the notify stream behind an
+        //    event recorded on the compute stream (so no airborne fire is
+        //    still reading the slot being replaced), and the compute stream
+        //    waits on their completion before the launches below (so no fire
+        //    reads a table entry naming bytes in flight). A round whose
+        //    predecessor has not finished simply does not happen — residency
+        //    is a promotion, and a promotion that would have to wait is not
+        //    one. A load that streams nothing has no tier and this is a
+        //    `None` check.
+        //
+        //    The ARMING pass is held out: it computes nobody's numbers, and
+        //    letting a synthetic fire move experts would make the working set
+        //    a function of when the fold armed.
+        if !self.arming {
+            let (compute, notify) = (self.device.stream(), self.device.notify_stream());
+            if let Some(tier) = self.weights.experts_mut() {
+                tier.promote(compute, notify)?;
+            }
+        }
         // The slot leaves the `Prepared` for the length of this call, so that
         // a `?` inside the body cannot release it behind our back.
         let slot = p
@@ -2789,6 +3112,17 @@ impl Shell {
             programs,
             exports,
             held,
+            // NAMED FOR THE SAME REASON: the recurrent plane is touched at
+            // exactly two instants — the predicate, before the walk, and the
+            // scatter/gather, inside it — and spelling the two fields out is
+            // what makes that a statement rather than an omission.
+            buffers,
+            predicate,
+            // NAMED FOR THE THIRD TIME AND FOR THE SAME REASON: the readout's
+            // row-pointer tables are staged at ONE instant — the epilogue
+            // binding, below — and by one writer.
+            readout_rows,
+            budget,
             ..
         } = self;
         let graphs = *graphs;
@@ -2800,13 +3134,66 @@ impl Shell {
 
         // ── The prologue. Channel reads, state, token prep — never the
         //    readout, which does not exist yet.
-        for attached in p
-            .attachments
-            .iter()
-            .filter(|a| a.at == Boundary::Prologue)
-        {
-            let fired = programs.fire(device, attached.instance)?;
-            committed_or(fired, attached, "prologue")?;
+        //
+        //    **THE VERDICTS ARE COLLECTED AND THE PREDICATE IS WRITTEN
+        //    BEFORE ANY OF THEM IS JUDGED** (alto design §6's change (a)).
+        //    `channel::pull_validate` — inside each pass — is what seeds the
+        //    commit word, and the recurrent fold has to be predicated on that
+        //    same word, so the mask kernel stands between the pull and the
+        //    forward and not on the far side of a refusal. This shell's own
+        //    policy also ABORTS a fire whose prologue did not commit
+        //    (`committed_or`), so today the two agree twice over; the order
+        //    below is what keeps the fold's predicate true on its own terms
+        //    the day the policy softens, which is what article 3 asks of it.
+        let mut verdicts: Vec<(usize, Fired)> = Vec::new();
+        for (at, attached) in p.attachments.iter().enumerate() {
+            if attached.at != Boundary::Prologue {
+                continue;
+            }
+            verdicts.push((at, programs.fire(device, attached.instance)?));
+        }
+
+        // ── The fold predicate, as device data (design §6, §12 finding 4).
+        //
+        //    One byte per lane: the lane's own pass commit word where it has
+        //    a prologue, the standing ONE where it has none — an unattached
+        //    lane folds, which is what keeps the plain path plain — and the
+        //    standing ZERO where the lane's verb is a buffered scatter, which
+        //    is the verb's own predicate riding the same kernel.
+        let lane_count = p.composition.lane_count();
+        if p.rs.predicated || p.rs.truncates {
+            let mut commits: Vec<u64> = vec![predicate.always(); lane_count as usize];
+            for (at, verb) in p.rs.moves.iter().enumerate() {
+                if matches!(verb, RsMove::Scatter { fold: 0, .. }) {
+                    commits[at] = predicate.never();
+                }
+            }
+            for attached in p.attachments.iter().filter(|a| a.at == Boundary::Prologue) {
+                let Some(&lane) = p.rs.order.get(attached.lane as usize) else {
+                    continue;
+                };
+                let Some(session) = programs.instance(attached.instance) else {
+                    continue;
+                };
+                if let Some(slot) = commits.get_mut(lane as usize) {
+                    *slot = session.commit_word();
+                }
+            }
+            predicate.write(device.stream(), &commits, &p.rs.lens)?;
+            if p.rs.predicated {
+                kernels_cuda::channel::mask_from_commit(
+                    device.ctx(),
+                    predicate.commits(),
+                    predicate.indptr(),
+                    predicate.mask(lane_count).ptr,
+                    lane_count,
+                )
+                .map_err(Fault::from)?;
+            }
+        }
+
+        for (at, fired) in verdicts {
+            committed_or(fired, &p.attachments[at], "prologue")?;
         }
 
         // ── The fresh slots' recurrent banks, zeroed. `prepare` decided
@@ -2824,7 +3211,6 @@ impl Shell {
         }
 
         let rows = p.composition.rows();
-        let lane_count = p.composition.lane_count();
 
         // 5. Commit the slot `prepare` wrote onto the fire's stream, in front
         //    of the launches that read it.
@@ -2846,7 +3232,37 @@ impl Shell {
         //    rectangles at this fire's rows, the pools' storage under this
         //    fire's page tables, and the loader's weights, which never move.
         let slots = arena.slots(&compiled.arena, u64::from(rows), u64::from(lane_count));
-        let caches = pools.table(&inputs.seats(&handles, p.pages, rows, lane_count))?;
+        let caches = pools.table(
+            &inputs
+                .seats(&handles, p.pages, rows, lane_count)
+                // **THE THREE RS SEATS, AND THE PLAIN FIRE BINDS NONE OF
+                // THEM.** `Tensor::ABSENT` is the null pointer every optional
+                // seat in `attn/ssm.cuh` already tests for, so a fire that
+                // predicates nothing and truncates nothing hands the launches
+                // exactly the arguments they took before F3.
+                .rs(
+                    p.rs.write_state,
+                    if p.rs.predicated {
+                        predicate.mask(lane_count)
+                    } else {
+                        kernels_cuda::Tensor::ABSENT
+                    },
+                    if p.rs.truncates {
+                        predicate.commit_len(lane_count)
+                    } else {
+                        kernels_cuda::Tensor::ABSENT
+                    },
+                )
+                // **THE SAME VECTOR, READ FROM THE OTHER END** (wave F3b's
+                // 2R split): a row's fold boundary is one number, the head
+                // launch stops at it and the tail launch starts at it. A
+                // fire no row splits binds nothing and makes one launch.
+                .splitting(if p.rs.splits {
+                    predicate.commit_len(lane_count)
+                } else {
+                    kernels_cuda::Tensor::ABSENT
+                }),
+        )?;
         let paging = pools.paging();
 
         // 7. The geometry seats, and their host twins. THE DUALITY: the IR
@@ -3016,13 +3432,33 @@ impl Shell {
         )
         .across(&side_ctx, &stream)
         .quantized(armed);
+        // **THE BUFFERED PLANE, SEATED ONLY WHEN A LANE MOVES BYTES.** A fire
+        // whose every lane folds hands the walk nothing, so the two dispatch
+        // arms that could scatter or gather test one `Option` and return.
+        if p.rs.buffered
+            && let Some(pool) = buffers.as_ref()
+        {
+            run = run.buffered(RsSeat {
+                buffers: pool,
+                lanes: &p.rs.moves,
+            });
+        }
         // TWO MODES, ONE WALK (design §6, decision #11). Off and Shaped run
         // it whole; On splits it at the phase boundary — prepare on the open
         // stream, then the capture regions either replayed from this shape's
         // graph or run and recorded into one. Which is why `record::fire`
         // takes the same arguments `walk` does and answers the same errors:
         // it is not another path, it is the same one at two instants.
-        let walked = if graphs.records() {
+        // **A BUFFERED FIRE IS NOT GRAPH-REPLAYABLE, AND THAT IS DESIGN §6'S
+        // OWN SENTENCE** ("the default is the only RS shape that
+        // graph-replays"). The scatter and the gather are copies whose page
+        // slots, in-page offsets and lengths are THIS fire's — not this
+        // shape's — so baking them into a captured graph would replay one
+        // window's addressing over another window's tokens. So a fire that
+        // moves buffered bytes takes the eager walk, whatever mode the shell
+        // is in: the same walk, the same launches, nothing recorded.
+        let records = graphs.records() && !p.rs.buffered;
+        let walked = if records {
             let fire = record::Fire {
                 trace,
                 compiled,
@@ -3208,16 +3644,99 @@ impl Shell {
                 .iter()
                 .filter(|a| a.at == Boundary::Epilogue)
             {
-                programs.bind_intrinsic(
-                    device,
-                    attached.instance,
-                    engine::tensor_ir::op::IntrinsicId::Logits,
-                    logits.ptr,
-                    INTRINSIC_STORAGE_RAW_BF16,
-                    vocab,
-                    vocab,
-                    last_row[attached.lane as usize],
-                )?;
+                // ── **THE GUEST'S OWN ROWS, AND NOT THE LAST ONE THREE
+                //    TIMES** (`palo B-readout`, the device half).
+                //
+                //    A lane's readout has two readers and this is the one the
+                //    host never sees: an epilogue that reads
+                //    `IntrinsicId::Logits` and argmaxes on the device, which
+                //    is how every speculative verifier in the corpus gets its
+                //    tokens. It reads `k` rows from wherever this call points
+                //    it, `k` being the extent the GUEST declared — so a shell
+                //    that pointed it at `last_row` handed a `k`-row verifier
+                //    its own last row followed by `k - 1` rows past the end of
+                //    the fire's rectangle. Zeros, and an argmax over zeros is
+                //    token 0: the verifier then rejected every draft it made
+                //    and speculation ran strictly more forward passes than no
+                //    speculation at all.
+                //
+                //    `Seated::readout` is the lane's own list, by index within
+                //    the lane, and `first_row` is where the lane's run starts.
+                let lane = attached.lane as usize;
+                let owned = lane_rows.get(lane).copied().unwrap_or(0);
+                let stated = p.lanes.get(lane).and_then(|seated| seated.readout);
+                let wanted: Vec<u32> = match stated {
+                    // `Readout::Last` and `Readout::None` both arrive as
+                    // `None`, and both mean the row every epilogue has been
+                    // given since there were epilogues.
+                    None => vec![last_row[lane]],
+                    Some(rows) => {
+                        let mut arena_rows = Vec::with_capacity(rows.len());
+                        for &row in rows {
+                            if row >= owned {
+                                return Err(Fault::Ceiling {
+                                    what: "rows in the lane a readout names",
+                                    need: u64::from(row) + 1,
+                                    have: u64::from(owned),
+                                });
+                            }
+                            arena_rows.push(first_row[lane] + row);
+                        }
+                        // A stated-but-empty list is `Readout::None` reaching
+                        // here as `Some(&[])`; the epilogue still runs and
+                        // still reads a row, so it gets the one it always had.
+                        if arena_rows.is_empty() {
+                            arena_rows.push(last_row[lane]);
+                        }
+                        arena_rows
+                    }
+                };
+                // **A CONSECUTIVE RUN IS STILL A BASE AND AN OFFSET**, which
+                // is every `Readout::Last` and every verifier in the corpus
+                // (`start .. start + k`). Only the shape a stride cannot spell
+                // — a list that skips or descends — pays for a pointer table,
+                // and `readout_rows` stays cold on every other fire.
+                let consecutive = wanted
+                    .windows(2)
+                    .all(|pair| pair[1] == pair[0].wrapping_add(1));
+                if consecutive {
+                    programs.bind_intrinsic(
+                        device,
+                        attached.instance,
+                        engine::tensor_ir::op::IntrinsicId::Logits,
+                        logits.ptr,
+                        INTRINSIC_STORAGE_RAW_BF16,
+                        vocab,
+                        vocab,
+                        wanted[0],
+                    )?;
+                } else {
+                    // One `u64` per requested row, in REQUEST order — the
+                    // kernel's `mode == 2` arm indexes this table and reads
+                    // the row it finds, so the order the caller wrote is the
+                    // order the guest sees.
+                    let row_bytes = u64::from(vocab) * 2;
+                    let table: Vec<u8> = wanted
+                        .iter()
+                        .flat_map(|row| {
+                            (logits.ptr + u64::from(*row) * row_bytes).to_le_bytes()
+                        })
+                        .collect();
+                    let at = u64::from(budget.max_tokens)
+                        .saturating_mul(8)
+                        .saturating_mul(lane as u64);
+                    readout_rows.stage(device.stream(), at, &table)?;
+                    programs.bind_intrinsic(
+                        device,
+                        attached.instance,
+                        engine::tensor_ir::op::IntrinsicId::Logits,
+                        readout_rows.ptr() + at,
+                        crate::program::launch::INTRINSIC_STORAGE_ROW_POINTERS,
+                        vocab,
+                        vocab,
+                        0,
+                    )?;
+                }
                 if let Some(column) = draft {
                     programs.bind_intrinsic(
                         device,
@@ -3347,6 +3866,21 @@ impl Shell {
             return Err(fault);
         }
 
+        // ── **THE USAGE COUNTS, CARRIED OUT** (alto design §7, wave D2).
+        //    One asynchronous D2H behind the event this step's work was just
+        //    ordered against, on the NOTIFY stream — so it is not on the fire
+        //    path, does not gate a wave transition (article 2) and does not
+        //    block this thread. Nothing waits for it: the host reads whatever
+        //    has landed at the next promotion instant, and a torn read is a
+        //    slightly stale hint about which experts are hot, which is all a
+        //    promotion ever needed. A refusal is not this step's outcome —
+        //    the fire has already been enqueued and its numbers are correct
+        //    whatever the tier learns — so it is counted by being dropped
+        //    rather than turned into a fault.
+        if let Some(tier) = self.weights.experts() {
+            let _ = tier.drain(self.device.notify_stream());
+        }
+
         // **EVERYTHING THE CALLBACK TOUCHES IS ALREADY A VALUE.** It runs on
         // the driver's host-function thread, where a CUDA call is forbidden
         // and a long block is a hazard, so the payload is: one `SlotGuard`
@@ -3377,6 +3911,7 @@ impl Shell {
 
         Ok(Settled {
             logits: Vec::new(),
+            rows: Vec::new(),
             scores: Vec::new(),
             readback,
         })
@@ -3403,6 +3938,52 @@ impl Shell {
     /// blocking call an asynchronous fault surfaces at — and
     /// [`Fault::Unbound`] for a rectangle the carve did not place.
     pub fn read_out(&mut self, settled: &mut Settled) -> Result<()> {
+        self.read_out_rows(settled, &[])
+    }
+
+    /// **[`Shell::read_out`], told WHICH rows of each lane's run to mirror**
+    /// (`palo B-readout`, closed).
+    ///
+    /// # Why the row list had to reach this loop, and nothing else did
+    ///
+    /// The logits rectangle is addressable after the walk — the carve holds
+    /// the out seam open past the last node, which is what makes any readback
+    /// possible at all — and this shell has always known where each lane's row
+    /// run STARTS (`Readback::first_row`) and how long it is
+    /// (`Readback::lane_rows`), because the capture columns are read by that
+    /// same pair. What it did not know was which of those rows a caller
+    /// wanted: `Readout` is a SUBMISSION word, the shell composes fires and
+    /// not contracts, and one row per lane was the answer that needed no
+    /// question. So the only thing this method adds over its one-row twin is
+    /// the question, passed down as data.
+    ///
+    /// **AN INDEX IS WITHIN THE LANE, NOT WITHIN THE FIRE** (the contract's
+    /// own words: "these rows of this lane, by index within the lane"). Row
+    /// `r` of lane `l` is arena row `first_row[l] + r`, and the fire order is
+    /// the seriated one, so a lane's run is contiguous and this is the whole
+    /// of the arithmetic.
+    ///
+    /// **THE ROWS COME BACK IN THE ORDER THEY WERE ASKED FOR**, not in
+    /// ascending order and not deduplicated, because the contract says the
+    /// values are "row-major, `rows * width` of them" against a list the
+    /// caller wrote: a spec-decode verifier that names `[0, n-2, n-1]` reads
+    /// its three rows off `values` in that order, and a shell that sorted them
+    /// would hand back the right numbers under the wrong names.
+    ///
+    /// `want` is indexed by SUBMITTED lane and a lane past its end — an empty
+    /// slice, which is what [`Shell::read_out`] passes — reads
+    /// [`Readout::Last`], the behaviour every caller had before this method
+    /// existed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::read_out`], plus [`Fault::Ceiling`] for a stated row past
+    /// the rows its lane owns. The contract refuses that one first
+    /// ([`Lane::validate_for`](engine::engine_api::fire::Lane)), so reaching
+    /// it here means a caller that skipped its own validation — and reading
+    /// somebody else's lane's logits under this lane's name is not a failure
+    /// mode worth saving a bounds check over.
+    pub fn read_out_rows(&mut self, settled: &mut Settled, want: &[Readout]) -> Result<()> {
         // **THE WAIT IS UNCONDITIONAL AND THE READ IS NOT.** A caller that
         // walked through this door asked for the fire to be over, and the
         // arming pass — which computes nothing and so plans no readback — is
@@ -3419,18 +4000,45 @@ impl Shell {
         let width = logits.width as usize;
         let lanes = readback.last_row.len();
         let mut taken = vec![Vec::new(); lanes];
+        let mut counts = vec![0u32; lanes];
         let mut raw = vec![0u8; width * 2];
         for lane in 0..lanes {
-            if readback.lane_rows[lane] == 0 {
+            let owned = readback.lane_rows[lane];
+            if owned == 0 {
                 continue;
             }
-            let last = readback.last_row[lane];
-            self.arena
-                .read(logits.ptr + u64::from(last) * width as u64 * 2, &mut raw)?;
-            taken[lane] = raw
-                .chunks_exact(2)
-                .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]])))
-                .collect();
+            // Which ARENA rows this lane's readout names. `Last` is the one
+            // row this loop has always taken, spelled through the same list so
+            // that the two answers cannot drift.
+            let chosen: Vec<u32> = match want.get(lane) {
+                None | Some(Readout::Last) => vec![readback.last_row[lane]],
+                Some(Readout::None) => Vec::new(),
+                Some(Readout::Rows(rows)) => {
+                    let mut arena_rows = Vec::with_capacity(rows.len());
+                    for &row in rows {
+                        if row >= owned {
+                            return Err(Fault::Ceiling {
+                                what: "rows in the lane a readout names",
+                                need: u64::from(row) + 1,
+                                have: u64::from(owned),
+                            });
+                        }
+                        arena_rows.push(readback.first_row[lane] + row);
+                    }
+                    arena_rows
+                }
+            };
+            let mut values = Vec::with_capacity(chosen.len() * width);
+            for row in &chosen {
+                self.arena
+                    .read(logits.ptr + u64::from(*row) * width as u64 * 2, &mut raw)?;
+                values.extend(
+                    raw.chunks_exact(2)
+                        .map(|pair| bf16(u16::from_le_bytes([pair[0], pair[1]]))),
+                );
+            }
+            counts[lane] = u32::try_from(chosen.len()).unwrap_or(u32::MAX);
+            taken[lane] = values;
         }
 
         // ── THE CAPTURE COLUMNS (design §9, palo C4b). One rectangle per
@@ -3473,6 +4081,7 @@ impl Shell {
         }
 
         settled.logits = taken;
+        settled.rows = counts;
         settled.scores = scores;
         Ok(())
     }
@@ -3499,13 +4108,6 @@ impl Shell {
         self.device.synchronize()
     }
 
-    /// How many steps this shell has registered a settlement for and not yet
-    /// seen a callback from — the run-ahead, as the shell sees it. Read by the
-    /// saturation gates and by nothing on the fire path.
-    #[must_use]
-    pub fn airborne_steps(&self) -> u64 {
-        self.airborne.count()
-    }
 }
 
 impl Drop for Shell {
@@ -3525,6 +4127,133 @@ impl Drop for Shell {
     fn drop(&mut self) {
         let _ = self.device.synchronize();
     }
+}
+
+/// **One fire's recurrent-state plan**, resolved on the host and read on the
+/// stream (alto design §6, wave F3).
+///
+/// Everything the three verbs turn into once the fold lengths are resolved
+/// and the lanes are seriated: what each lane moves, where its accepted
+/// prefix ends, and the three questions the seats are bound by. In FIRE
+/// order, like every other per-lane vector a `Prepared` carries.
+///
+/// **`RsFire::default()` IS THE PLAIN PATH AND COSTS NOTHING.** Every vector
+/// is empty, `predicated` and `truncates` are false, and `enqueue` binds the
+/// null seats a launch has always been handed — so a load with no recurrence,
+/// and a fire whose every lane folds, reach exactly the launches this shell
+/// made before F3.
+#[derive(Debug, Default, Clone)]
+struct RsFire<'a> {
+    /// What each lane moves between the arena and the buffer.
+    moves: Vec<RsMove<'a>>,
+    /// Where each lane's accepted prefix ends — its own row count when it
+    /// truncates nothing, because `attn/ssm.cuh` MINIMISES against this and a
+    /// zero would fold nothing at all.
+    lens: Vec<i32>,
+    /// Submission index to fire lane, for the attachment walk: an attachment
+    /// names a SUBMITTED lane and the seats are in the seriated order
+    /// `compose` chose.
+    order: Vec<u32>,
+    /// Does any lane fold at all? `false` is the pure buffered scatter.
+    write_state: bool,
+    /// Must the fold predicate be bound this fire?
+    ///
+    /// **ONLY WHEN IT CAN CHANGE SOMETHING**, which is the whole of "do not
+    /// regress the plain path": a fire whose every lane folds and whose lanes
+    /// carry no PROLOGUE attachment has an all-ones predicate by
+    /// construction, and binding one would cost every decode-shaped recurrent
+    /// fire a refusal (`attn/ssm.cuh`'s step kernels carry no mask seat).
+    ///
+    /// A prologue and not any attachment, and that is an ordering fact rather
+    /// than an omission: the predicate is the pull-validate's verdict, and an
+    /// epilogue's pull runs on the far side of the forward this fire is
+    /// about to launch.
+    predicated: bool,
+    /// Must the accepted lengths be bound this fire?
+    truncates: bool,
+    /// **Does some row's fold boundary fall strictly inside its own tokens?**
+    /// (alto design §6's 2R interior split, wave F3b.)
+    ///
+    /// `commit_len` TRUNCATES, so a single launch over such a row would give
+    /// the tokens past the boundary no outputs at all. The recurrent arms
+    /// therefore fire twice on the one stream — the head `[0, n)` folding,
+    /// the tail `[n, rows)` continuing from what the head wrote — and this is
+    /// the word that arms the second launch, through the origin seat
+    /// `Seats::splitting` binds.
+    ///
+    /// **A BOUNDARY AT EITHER END IS NOT A SPLIT.** `fold == rows` is the
+    /// single-call folding path and `fold == 0` the single-call buffered one,
+    /// byte for byte, which is what keeps the fused collapse from costing a
+    /// launch it does not need.
+    splits: bool,
+    /// Does any lane move buffered bytes? A fire that does cannot be
+    /// graph-replayed — the copies' offsets are this fire's, not this
+    /// shape's — which is design §6's "the only shape that graph-replays",
+    /// enforced rather than remembered.
+    buffered: bool,
+}
+
+/// **Resolve one lane's fold length** (dev `batch_compose.hpp:726-768`).
+///
+/// Three rules, and the third is the one that matters:
+///
+/// 1. a host-stated length is itself,
+/// 2. a device-stated one is the descriptor port's cell for this lane,
+/// 3. **both are clamped to the verb's `bound` and both refuse zero** — and
+///    past this function nothing can tell which spelling arrived, which is
+///    dev clearing `PIE_RS_FLAG_FOLD_LEN_DEVICE` at the same instant so that
+///    the replay CSR, the classifier and the kernels' `commit_len` never see
+///    a placeholder.
+///
+/// The clamp is what makes the scheme safe: the device may name a count the
+/// host never saw, but it can never name one the buffer cannot supply.
+/// Refusing zero is what makes it dispatchable: a speculative commit folds at
+/// least the bonus token it is guaranteed to accept, and a zero-length fold
+/// is a launch that would compute nothing while claiming to have committed.
+fn resolve_fold_len(
+    len: FoldLen,
+    bound: u32,
+    lane: usize,
+    port: Option<&[u32]>,
+) -> Result<u32> {
+    let stated = match len {
+        FoldLen::Host(n) => n,
+        FoldLen::Device(which) => {
+            let cells = port.ok_or_else(|| {
+                Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {lane} states a device-resident fold length on port {}, and the \
+                         program attached to it resolved no such port",
+                        which.name()
+                    ),
+                )
+            })?;
+            *cells.get(lane).or_else(|| cells.first()).ok_or_else(|| {
+                Fault::program(
+                    "serve::rs",
+                    format!(
+                        "lane {lane} states a device-resident fold length on port {} whose \
+                         cell carries {} entries",
+                        which.name(),
+                        cells.len()
+                    ),
+                )
+            })?
+        }
+    };
+    let folded = stated.min(bound);
+    if folded == 0 {
+        return Err(Fault::program(
+            "serve::rs",
+            format!(
+                "lane {lane}'s fold length resolved to 0 against a bound of {bound}, which is \
+                 not a dispatchable commit — a speculative commit must fold at least the \
+                 bonus token it is guaranteed to accept"
+            ),
+        ));
+    }
+    Ok(folded)
 }
 
 /// A guest pass that ran, or the sentence for the one that did not.
@@ -3579,73 +4308,116 @@ fn narrow(n: u64) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LATTICE_FLOOR, default_lattice};
+    use super::{Attached, Boundary, Fired, FoldLen, committed_or, resolve_fold_len};
 
-    /// The lattice a `Boot` that stated none is served, spelled out: geometric
-    /// above a floor of eight, so that no fire computes more than twice its own
-    /// rows and no decode fire lands on a bucket boundary its solo twin missed.
+    /// The port a device-resident fold length would be read from. Any
+    /// consuming geometry port serves: what the resolver takes is the CELL,
+    /// and the port name only ever reaches a refusal's sentence.
+    const PORT: engine::tensor_ir::registry::Port =
+        engine::tensor_ir::registry::Port::RsFoldLen;
+
+    /// **THE CLAMP IS WHAT MAKES A DEVICE-RESIDENT FOLD LENGTH SAFE** (alto
+    /// design §6; dev `batch_compose.hpp:726-768`).
+    ///
+    /// The accepted count of a speculative pass is computed by the verifier on
+    /// the stream, so the host cannot know it — but the host DOES know the
+    /// upper bound, because it is the host that decided how many drafts the
+    /// buffer holds. Clamping the resolved value to that bound is the whole
+    /// safety argument: the device may name a count the host never saw, and it
+    /// can never name one the buffer cannot supply.
+    ///
+    /// Three readings, and the third is the one a wrong implementation would
+    /// get wrong:
+    ///
+    /// 1. a length inside the bound is itself,
+    /// 2. a length past it is the bound — not a refusal, because a verifier
+    ///    that accepted everything is a legal outcome and the bound is the
+    ///    whole window,
+    /// 3. **a host-stated length is clamped by the same line**, so the two
+    ///    spellings cannot disagree about what "past the bound" means. dev
+    ///    clears `FOLD_LEN_DEVICE` at exactly this point for the same reason:
+    ///    past resolution, nothing downstream may branch on which spelling
+    ///    arrived.
     #[test]
-    fn the_default_lattice_is_geometric_above_the_floor() {
-        assert_eq!(
-            default_lattice(8192),
-            vec![8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
-        );
+    fn a_device_fold_length_is_clamped_to_the_bound_it_was_promised() {
+        let cells = [3u32, 9, 5];
+        let port = Some(&cells[..]);
+        assert_eq!(resolve_fold_len(FoldLen::Device(PORT), 8, 0, port).unwrap(), 3);
+        assert_eq!(resolve_fold_len(FoldLen::Device(PORT), 8, 1, port).unwrap(), 8);
+        assert_eq!(resolve_fold_len(FoldLen::Host(9), 8, 0, port).unwrap(), 8);
+        assert_eq!(resolve_fold_len(FoldLen::Host(4), 8, 0, None).unwrap(), 4);
     }
 
-    /// **THE ARM FLIP AT ONE ROW IS WHAT THE FLOOR EXISTS TO KILL** (the
-    /// cuda-abi census: a one-lane decode takes the gemv arm, a two-lane one
-    /// does not, and 127 launches change kernel across that boundary). A
-    /// lattice naming 1 would leave it exactly where it was.
+    /// **A FOLD OF ZERO IS NOT A DISPATCHABLE COMMIT** (dev
+    /// `batch_compose.hpp:759-763`, verbatim in intent).
+    ///
+    /// A speculative verify accepts at least the bonus token it is guaranteed
+    /// to accept, so a resolved zero is not "nothing was accepted" — it is a
+    /// port that carried a placeholder, a verifier that never ran, or a
+    /// program that resolved the wrong channel. Serving it would launch a
+    /// replay that folds nothing while the host advances its accepted
+    /// boundary as if it had, which is the one failure the whole scheme
+    /// exists to make impossible. Refused by name, in both spellings.
     #[test]
-    fn no_default_lattice_names_a_bucket_that_keeps_the_gemv_arm_alive() {
-        for ceiling in [8u32, 16, 64, 256, 8192] {
-            assert!(
-                default_lattice(ceiling).iter().all(|point| *point > 1),
-                "a lattice for {ceiling} rows puts a fire on M=1"
-            );
+    fn a_fold_length_that_resolves_to_zero_is_refused_by_name() {
+        let cells = [0u32];
+        for len in [FoldLen::Device(PORT), FoldLen::Host(0)] {
+            let error = resolve_fold_len(len, 8, 0, Some(&cells[..])).unwrap_err();
+            let said = error.to_string();
+            assert!(said.contains("bonus token"), "{said}");
         }
+        // The bound clamps to zero just as loudly: a verb that promised no
+        // room cannot be handed a length that fits in it.
+        let error = resolve_fold_len(FoldLen::Host(4), 0, 0, None).unwrap_err();
+        assert!(error.to_string().contains("bonus token"), "{error}");
     }
 
-    /// Two properties P0 refuses a lattice for (`model_compiler`'s `accept`):
-    /// it must strictly ascend, and no point may pass the token ceiling. A
-    /// default that could not be baked would turn every unstated lattice into
-    /// `Fault::Bake`.
+    /// **A DEVICE-RESIDENT LENGTH AGAINST NO RESOLVED PORT IS A REFUSAL, NOT A
+    /// GUESS.** The lane said the count lives on the device; if the program
+    /// attached to it bound no such port there is no count anywhere, and
+    /// falling back to the bound would fold the whole speculative window
+    /// including the tokens the verifier rejected.
     #[test]
-    fn the_default_lattice_ascends_and_stops_at_the_ceiling() {
-        for ceiling in [1u32, 2, 3, 4, 63, 64, 65, 256, 511, 8192] {
-            let lattice = default_lattice(ceiling);
-            assert_eq!(
-                *lattice.last().expect("a lattice is never empty"),
-                ceiling,
-                "a fire AT the ceiling must have a bucket"
-            );
-            assert!(
-                lattice.windows(2).all(|pair| pair[0] < pair[1]),
-                "{lattice:?} does not strictly ascend"
-            );
-            assert!(
-                lattice.iter().all(|point| *point <= ceiling),
-                "{lattice:?} names a bucket past the token ceiling"
-            );
-        }
+    fn a_device_fold_length_with_no_resolved_port_is_refused() {
+        let error = resolve_fold_len(FoldLen::Device(PORT), 8, 0, None).unwrap_err();
+        assert!(error.to_string().contains("resolved no such port"), "{error}");
     }
 
-    /// The waste D4 pays is bounded by the lattice's ratio, and a geometric
-    /// lattice is what makes that a sentence with a number in it: no fire ever
-    /// computes more than twice the rows it has.
+    /// **A PASS THAT DID NOT COMMIT IS AN ERROR BY NAME, NEVER A REPLAY**
+    /// (alto E; design §1 article 4, and the retry-fails-loudly gate).
+    ///
+    /// The readiness gate that used to stand in `prepare` answered
+    /// `Fault::Blocked`, which `api::fault()` crossed as `Error::Exhausted`
+    /// and the runtime's lane slept on and re-offered. Both are gone: static
+    /// admission (`runtime::pipeline::fire::validate_frame`) proves ring
+    /// occupancy, host-writer staging and reader pressure over the whole
+    /// frame before it is admitted, so a pass that reaches its boundary and
+    /// cannot commit means something moved cursors the admission had already
+    /// proved — and an epilogue fires AFTER the forward wrote the lane's KV,
+    /// so there is nothing to replay anyway.
+    ///
+    /// All three non-commit verdicts must therefore name the instance and say
+    /// which one happened.
     #[test]
-    fn no_fire_above_the_floor_is_padded_past_twice_its_own_rows() {
-        let lattice = default_lattice(8192);
-        for rows in LATTICE_FLOOR..=8192 {
-            let bucket = lattice
-                .iter()
-                .copied()
-                .find(|point| *point >= rows)
-                .expect("every row count up to the ceiling has a bucket");
-            assert!(
-                u64::from(bucket) < 2 * u64::from(rows),
-                "a fire of {rows} rows pads to {bucket}"
-            );
+    fn a_pass_that_does_not_commit_on_an_admitted_fire_errors_by_name() {
+        let attached = Attached {
+            lane: 0,
+            instance: 77,
+            at: Boundary::Epilogue,
+        };
+        committed_or(Fired::Committed, &attached, "epilogue")
+            .expect("a committed pass is the ordinary answer");
+
+        for (fired, expected) in [
+            (Fired::Blocked(3), "blocked on channel 3"),
+            (Fired::Declined, "declined"),
+            (Fired::Faulted("bad table".into()), "faulted"),
+        ] {
+            let fault = committed_or(fired, &attached, "epilogue")
+                .expect_err("a pass that did not commit is not an outcome to retry");
+            let said = fault.to_string();
+            assert!(said.contains("77"), "the instance must be named: {said}");
+            assert!(said.contains(expected), "{said}");
         }
     }
 }

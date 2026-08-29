@@ -1,6 +1,7 @@
 # oracle dump: pie_cuda_driver::pipeline::generated::emit_fused_region_cuda
 # source of truth: compiler/codegen/src/cuda/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 22
+# emitter_version: 24
+# emitter_version 22 -> 24 WITHOUT a body change, over two waves. 23: `codegen::cuda::order` gives the single-node `top_k` library region a generated kernel of its own. 24: the same emitter took `sort_desc` (it is `top_k` at k = n) and `codegen::cuda::scan` took `cumsum`/`cumprod`. In both waves `emit_program` emits source where it used to emit a refusal. None of these dumps records those emitters -- they record `emit_fused_region_cuda`, whose bytes did not move -- but the CONSTANT keys every engine's compile cache and its NEGATIVE tier, and a shell that had already remembered `this guest program does not compile here` for a ranking or scanning program answers from that memory until the key changes.
 # @runtime: bytes=45277 fnv1a64=0x41b1d45aaef71184
 # cases: 320
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above

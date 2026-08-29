@@ -60,8 +60,10 @@ use tensor_ir::types::DType;
 ///
 /// Was `engine_api::plan::CHANNEL_TICKET_NONE`, and it moved for the reason
 /// every sentinel in the rewrite moved: it is the runtime's own bookkeeping —
-/// the run-ahead cursor a fire reserves and rolls back — and the contract has
-/// no field carrying it (see `crate::engine::fire::ChannelTicket`).
+/// the run-ahead cursor a fire reserves and rolls back. What DOES cross is a
+/// stated prediction on the lane that carries the pass
+/// ([`engine_api::Ticket`] via `Lane::channels`), and it crosses only for an
+/// engine whose control kernels check it; this sentinel never travels.
 pub const TICKET_NONE: u64 = u64::MAX;
 
 /// Process-wide monotonic source of GLOBAL channel identities (0 reserved as a

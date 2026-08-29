@@ -43,7 +43,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use engine_api::load::{Budgets, Checkpoint, LoadRequest};
+use engine_api::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine_api::model_ir::Trace;
 use model_loader::contract::ModelContract;
 
@@ -317,6 +317,11 @@ pub fn contract_for(trace: &Trace, checkpoint: &Path) -> std::result::Result<Mod
 /// asynchronously carves its staging ring and its settlement event pool from
 /// it, and one that does not ignores it.
 ///
+/// `residency` is the weight policy — two budgets, uncapped by default (alto
+/// design §7). It is stated HERE, beside the budgets, because it is the same
+/// kind of thing: a ceiling the deployment sets and the shell bakes against,
+/// not a per-fire decision.
+///
 /// # Errors
 ///
 /// A checkpoint no SKU claims, or a SKU whose trace this build does not ship.
@@ -324,6 +329,7 @@ pub fn request(
     checkpoint: &Path,
     platform: Platform,
     budgets: Budgets,
+    residency: Residency,
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
@@ -332,6 +338,7 @@ pub fn request(
         trace: trace(sku, platform)?,
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
         budgets,
+        residency,
         ordinal,
         frames_in_flight,
     })
@@ -350,6 +357,7 @@ pub fn request_for(
     checkpoint: &Path,
     platform: Platform,
     budgets: Budgets,
+    residency: Residency,
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
@@ -357,6 +365,7 @@ pub fn request_for(
         trace: trace(sku, platform)?,
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
         budgets,
+        residency,
         ordinal,
         frames_in_flight,
     })

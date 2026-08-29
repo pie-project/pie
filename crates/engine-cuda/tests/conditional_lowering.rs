@@ -126,6 +126,9 @@ fn ready(what: &str, profile: Option<DeviceProfile>) -> Option<(Shell, tokenizer
     drop(source);
 
     let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
@@ -136,10 +139,15 @@ fn ready(what: &str, profile: Option<DeviceProfile>) -> Option<(Shell, tokenizer
         slots: 4,
         ordinal: 0,
         graphs: Graphs::Off,
+        knobs: engine_cuda::Knobs::default(),
+        program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
         runahead: engine::runahead::Runahead::F1,
+        // The warm-boot weight artifact cache is off for a gate: a test
+        // that shared one would be asserting about the last run.
+        weight_cache_dir: None,
     })
     .expect("the shell loads");
     Some((shell, tokenizer))
@@ -329,7 +337,7 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
 /// Claim 3: a conditionalized artifact reaches the capture and is refused
 /// there, by name.
 ///
-/// The profile is the lever, exactly as `PIE_CUDA_STREAMS=off` is P6's:
+/// The profile is the lever, exactly as `Knobs::side_streams` is P6's:
 /// costs are DATA the caller passes, so a deployment that states a zero
 /// fatness floor gets conditionals on every windowed region — and this shell
 /// says so rather than recording their bodies outside their nodes.

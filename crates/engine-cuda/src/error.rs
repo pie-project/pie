@@ -91,6 +91,18 @@ pub enum Fault {
         why: &'static str,
     },
 
+    /// **A weight-residency budget this plan cannot be served under** (alto
+    /// design §7).
+    ///
+    /// `Impossible`, never `Exhausted`: nothing the deployment frees changes
+    /// the answer, because the refusal is about a TIER this build does not
+    /// have for those planes rather than about a pool that is full. The one
+    /// tier that exists is the routed-expert one — a device slab smaller than
+    /// a bank, over pinned host bytes — so a budget under the DENSE planes,
+    /// or a budget under a plan with no routed bank at all, lands here with
+    /// both numbers in the sentence.
+    Residency(String),
+
     /// A count past a ceiling the shell reserved bytes for.
     Ceiling {
         /// What overflowed.
@@ -118,14 +130,25 @@ pub enum Fault {
         key: String,
     },
 
-    /// A lane's mask does not describe the lane.
+    /// A lane's mask does not REACH the lane's readable extent.
     ///
-    /// **THE SHORT DIRECTION IS THE DANGEROUS ONE.** A mask states `total`
-    /// positions and the lane's readable extent after this fire's append is
-    /// `held + rows`; a mask that covers fewer positions than that would
-    /// expand into a rectangle whose tail bits are zero, and zero is
-    /// MASKED-OUT — a silently truncated attention rather than a fault. A
-    /// longer one is somebody else's mask. Neither is repaired.
+    /// **THE SHORT DIRECTION IS THE ONLY DANGEROUS ONE.** A mask states
+    /// `total` positions and the lane's readable extent after this fire's
+    /// append is `held + rows`; a mask that covers fewer positions than that
+    /// expands into a rectangle whose tail bits are zero, and zero is
+    /// MASKED-OUT — a silently truncated attention rather than a fault. So a
+    /// short mask is refused and is not padded.
+    ///
+    /// **A LONGER MASK IS NOT THIS FAULT** and was, until the per-row wave,
+    /// wrongly folded into it. A guest builds its mask over the pages it
+    /// RESERVED — 48 keys for a 3-page pool holding 23 tokens — because that
+    /// is the width it knows before the sequence has a length, and every
+    /// masked inferlet in `tests/inferlets` states one that way. The surplus
+    /// is unambiguous: a position past `held + rows` is one this fire has not
+    /// written, so the causal bound drops it for every query row whatever its
+    /// bit says. It is clipped rather than refused, which is also how the C++
+    /// engine this replaced read one (`brle::decode` walked `0..kv_len` and
+    /// read past the row's words as false).
     Mask {
         /// Which lane of the fire, in submission order.
         lane: u32,
@@ -133,6 +156,30 @@ pub enum Fault {
         stated: u64,
         /// How many the lane will hold once this fire's tokens are written.
         extent: u64,
+    },
+
+    /// A lane's per-row mask does not have one mask per query row.
+    ///
+    /// **THE ROW AXIS IS THE POINT OF THE FORM, SO A SHORT ONE IS NOT A
+    /// MASK.** `Masking::Rows` states one restriction per query row and this
+    /// shell walks them in step with the rows — row `q`'s runs under row
+    /// `q`'s causal bound. A list that is not the lane's length leaves some
+    /// row with no restriction of its own, and the only ways to proceed are
+    /// to invent one (which is the silent row-ZERO substitution the per-row
+    /// form exists to end) or to leave the row's bits clear (which is an
+    /// empty softmax, MASKED-OUT everywhere, and a blanked logit rather than
+    /// a fault). Neither is served.
+    ///
+    /// `Lane::validate` refuses the same shape at the contract door; this is
+    /// the same rule where the expansion is, because a `Seated` can be built
+    /// without a `Lane` ever crossing the api.
+    MaskRows {
+        /// Which lane of the fire, in submission order.
+        lane: u32,
+        /// How many per-row masks the lane stated.
+        stated: u64,
+        /// How many token rows this fire feeds the lane.
+        rows: u32,
     },
 
     /// A masked lane in a fire whose loaded artifact bakes no masked class.
@@ -342,29 +389,16 @@ pub enum Fault {
     /// retry a syntax error forever or give up on a transient.
     Compile(engine::Failure),
 
-    /// **An attached instance is not ready to fire, and that is a SCHEDULING
-    /// answer rather than a failure** (alto design §9's "double door", closed).
-    ///
-    /// The gate this comes from is asked once, in `serve`'s prepare phase,
-    /// over every attached instance before anything launches — an epilogue
-    /// that discovered its rings were not ready AFTER the forward would leave
-    /// the lane's tokens in the cache with the guest's pass unrun, which is a
-    /// fire nobody can retry.
-    ///
-    /// It has its own variant, and not [`Fault::Program`]'s sentence, because
-    /// of who reads it: `api.rs` used to ask this same question a second time
-    /// on its own side of the boundary purely so that it could answer
-    /// `Error::Exhausted` — the shell spoke `Fault` and `Exhausted` is a
-    /// contract word, so the question was asked twice to be answered once.
-    /// Typing the refusal is what lets `fault()` do that translation, and what
-    /// let the second door go. The ring will have room once the host drains
-    /// what the guest published, which is the run-ahead's own retry shape.
-    Blocked {
-        /// Which bound instance is blocked.
-        instance: u64,
-        /// Which of its channels does not meet the program's requirement.
-        channel: u32,
-    },
+    // A `Blocked { instance, channel }` variant stood here: an attached
+    // instance whose ring was not ready, typed so `fault()` could answer
+    // `Error::Exhausted` and the runtime's lane could sleep and re-submit the
+    // identical frame. It was F2a's bridge to article 4 and wave E is the far
+    // bank. `pipeline::fire::validate_frame` now proves ring occupancy,
+    // host-writer staging and reader pressure statically at submit, so a
+    // readiness miss past that door is not a scheduling answer — it is a
+    // contract violation, and `serve::committed_or` says so by name. Nothing
+    // in this crate answers `Exhausted` for a channel any more; `Fault::
+    // OutOfMemory` remains the only exhaustion, and it is about device bytes.
 
     /// The guest-program plane refused this call.
     ///
@@ -440,16 +474,11 @@ impl fmt::Display for Fault {
                 "this build carries no CUDA runtime: enable `cuda-12` or \
                  `cuda-13`, matching the libcudart it will load"
             ),
-            Self::Blocked { instance, channel } => write!(
-                f,
-                "instance {instance} is not ready to fire: channel {channel} does not \
-                 meet its program's declared requirement, and an epilogue cannot block \
-                 after the forward has written the lane's kv"
-            ),
             Self::Device { call, code } => {
                 write!(f, "{call} answered {code}")
             }
             Self::Bake(refusal) => write!(f, "this plan does not bake: {refusal:?}"),
+            Self::Residency(why) => write!(f, "weight residency: {why}"),
             Self::Load(error) => write!(f, "this checkpoint does not land: {error}"),
             Self::Fire(error) => write!(f, "{error}"),
             Self::Fragmented {
@@ -490,9 +519,19 @@ impl fmt::Display for Fault {
             } => write!(
                 f,
                 "lane {lane}'s mask covers {stated} positions and the lane will hold \
-                 {extent} once this fire's tokens are written; a mask is over the \
-                 lane's whole readable extent, and a short one masks out the tail \
-                 rather than leaving it alone"
+                 {extent} once this fire's tokens are written; a mask must REACH the \
+                 lane's whole readable extent, because a short one masks out the tail \
+                 rather than leaving it alone (a LONGER one is fine and is clipped)"
+            ),
+            Self::MaskRows {
+                lane,
+                stated,
+                rows,
+            } => write!(
+                f,
+                "lane {lane} states {stated} per-row masks and this fire feeds it \
+                 {rows} token rows; `Masking::Rows` is one restriction PER query row \
+                 and a row with none of its own has no mask this shell may invent"
             ),
             Self::Maskless { lane } => write!(
                 f,

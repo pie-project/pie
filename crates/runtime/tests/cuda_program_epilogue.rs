@@ -33,11 +33,29 @@
 //! 1. **Parity.** Every fire, the device's rings and the host interpreter's
 //!    hold the same bytes, and what a reader takes out is cell for cell the
 //!    same. Given the same logits, `engine::program::step` is the golden.
-//! 2. **A blocked round retries.** A reader channel nobody drains fills, its
-//!    `NEEDS_EMPTY` requirement fails, and the next fire answers
-//!    [`Error::Exhausted`] — a *scheduling* answer the run-ahead lane
-//!    retries, not a failure — with nothing launched and nothing written.
-//!    Drain it and the same submission commits.
+//! 2. **A blocked round is LOUD, not retried** (alto E; design §1 article 4).
+//!    A reader channel nobody drains fills and its `NEEDS_EMPTY` requirement
+//!    fails, and the fire that meets it answers a `Program` fault naming the
+//!    instance and the channel — never [`Error::Exhausted`].
+//!
+//!    It used to be the other answer: a readiness gate in the shell's
+//!    `prepare` refused before anything launched, crossed the contract as
+//!    `Exhausted`, and the runtime's lane slept 200 us and re-offered the
+//!    identical frame. Article 4 has no such outcome. Everything a device
+//!    gate could refuse is proved impossible at submit —
+//!    `runtime::pipeline::fire::validate_frame` walks a frame's steps in slot
+//!    order and proves device-only ring occupancy, host-writer staged cells
+//!    and reader-ring worst-case pressure against the channels' declared
+//!    capacities — so a surviving refusal is a contract violation.
+//!
+//!    **AND THIS TEST IS A CALLER THAT SKIPPED THAT PROOF**, deliberately: it
+//!    drives `Engine::submit` directly, with no runtime above it to admit the
+//!    frame, and holds the drain at [`HOLD_THE_DRAIN`] so the next round is
+//!    one static admission would have refused. What it pins is the answer
+//!    such a caller gets. Note what it costs, because it is the whole
+//!    argument for admitting statically: the forward RAN, the lane's kv
+//!    moved, and the guest's pass did not happen — there is nothing to
+//!    replay.
 //! 3. **No attachment is byte-identical.** The first fire carries none and
 //!    pins the same continuation the boot smoke does.
 //! 4. **A replayed fire still fires the program.** Attachments are outside
@@ -104,7 +122,14 @@ const CAPTURE_FROM: usize = 3;
 /// round that pushes one token far above the rest proves the other direction:
 /// the guest read the cell the host put into its ring this fire, rather than
 /// a stale one, an empty one, or none.
-const BIAS_ROUND: usize = 4;
+///
+/// **IT SITS BEFORE [`HOLD_THE_DRAIN`] AND THAT IS DELIBERATE** (alto E). A
+/// blocked round's pass never mints, so it never consumes the bias cell it
+/// was published with, and the capacity-one ring is then full for the round
+/// after it — a whole round whose bias `publish_channel` is refused. While a
+/// block was a retry the two never interfered; now that it is a fault the
+/// biased cell has to be published somewhere the ring is known to be clear.
+const BIAS_ROUND: usize = 1;
 const BIAS_TOKEN: u32 = 1234;
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -402,7 +427,13 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
     let mut engine = Cuda::new(
         DeviceBoot {
             ordinal: 0,
+            weight_cache_dir: None,
+            // The guest-program plane's cubin cache is off for a gate, like
+            // the weight artifact cache above it: a test that shared one would
+            // be asserting about the last run.
+            program_cache_dir: None,
             graphs: Graphs::Off,
+            knobs: engine_cuda::Knobs::default(),
         },
         runtime::engine::load::contract_for,
     );
@@ -422,7 +453,16 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
     // waited for — by name. One frame in flight because that is what this
     // gate does; a deeper ring would carve slots nothing ever claims.
     let request =
-        runtime::engine::load::request(&checkpoint, Platform::Cuda, budgets.clone(), 0, 1)
+        runtime::engine::load::request(
+            &checkpoint,
+            Platform::Cuda,
+            budgets.clone(),
+            // Uncapped: every load in this workspace is fully resident
+            // (alto design §7 — the tiers are D2's).
+            engine_api::Residency::uncapped(),
+            0,
+            1,
+        )
             .expect("the checkpoint identifies and its SKU traces");
     assert_eq!(request.trace.name, SKU);
     let loaded = engine.load(request).expect("the checkpoint lands");
@@ -494,6 +534,16 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
     let mut committed = 0usize;
     let mut blocked = 0usize;
     let mut guest_tokens: Vec<u32> = Vec::new();
+    // **WHICH PUBLISHED CELL THE PASS IS ABOUT TO EAT**, one entry per cell
+    // still in the bias ring, in ring order.
+    //
+    // It was `round == BIAS_ROUND` read straight off the loop counter, and
+    // that only worked while every round's pass consumed that round's cell.
+    // A blocked round does not (alto E: it is a fault, not a retry — the
+    // forward ran, the epilogue never reached its mint), so the cell it
+    // published stays at the ring's head and the NEXT round's pass takes it.
+    // The claim was always about the cell rather than the round; this says so.
+    let mut bias_queue: std::collections::VecDeque<bool> = std::collections::VecDeque::new();
     let bias_lanes = numel(&package.channels[BIAS as usize]);
     let bias_dtype = concrete_dtype(package.channels[BIAS as usize].dtype);
     for round in 0..DECODES {
@@ -529,28 +579,40 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
             host, device,
             "round {round}: the host {host} the bias channel and the device {device}"
         );
+        if device {
+            bias_queue.push_back(round == BIAS_ROUND);
+        }
 
         let submission = FrameSubmission::of(submission);
         let mut ticket = match engine.submit(&submission) {
             Ok(ticket) => ticket,
             Err(error) => {
-                // CLAIM 2. A guest program whose ring has no room is a
-                // SCHEDULING answer the run-ahead lane retries in place — not
-                // a failure, and not a fire that half-happened.
+                // CLAIM 2 (alto E). A guest program whose ring has no room is
+                // a CONTRACT VIOLATION named out loud — not a scheduling
+                // answer, and not something to re-offer.
                 assert!(
-                    error.is_scheduling(),
-                    "round {round}: a blocked guest program must be a scheduling \
-                     answer the lane retries, and this was {error}"
+                    !error.is_scheduling(),
+                    "round {round}: a readiness miss past static admission is a \
+                     contract violation, not back-pressure to retry: {error}"
                 );
                 assert!(
-                    matches!(error, Error::Exhausted { .. }),
-                    "round {round}: and `Exhausted` rather than `Impossible`, because \
-                     draining the ring is exactly what makes it fit: {error}"
+                    matches!(error, Error::Program(_)),
+                    "round {round}: and it must be a `Program` fault, because the \
+                     party at fault is whoever admitted this frame: {error}"
+                );
+                let said = error.to_string();
+                assert!(
+                    said.contains(&format!("instance {}", bound.id)) && said.contains("channel"),
+                    "round {round}: the fault must name the instance and the channel, \
+                     which is what an operator needs to size the ring: {said}"
                 );
                 blocked += 1;
-                // Drain both halves and retry the SAME submission: the
-                // refused fire launched nothing, so `held` has not moved and
-                // the lane's kv is untouched.
+                // **AND THERE IS NOTHING TO REPLAY**, which is the price this
+                // claim exists to show. The forward ran and wrote this lane's
+                // kv before the epilogue reached its gate, so `held` HAS
+                // moved; re-offering the same submission would write those
+                // tokens twice. Drain the ring the pass could not write into,
+                // advance past the fire that happened, and go on.
                 let late = take_both(
                     &mut engine,
                     bound.id,
@@ -565,9 +627,8 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
                      have held the cell that filled it"
                 );
                 guest_tokens.push(late.expect("just checked"));
-                engine
-                    .submit(&submission)
-                    .expect("the same fire commits once the ring has room")
+                held += 1;
+                continue;
             }
         };
         committed += 1;
@@ -576,6 +637,11 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
         engine
             .settle_frame(&mut ticket)
             .unwrap_or_else(|error| panic!("round {round}: the numbers door: {error}"));
+        // The pass committed, so it consumed exactly one bias cell: the one at
+        // the ring's head.
+        let biased_now = bias_queue
+            .pop_front()
+            .unwrap_or_else(|| panic!("round {round}: a pass consumed a cell nobody published"));
 
         // The interpreter, over the readout the caller was handed. This is
         // the P7 parity's whole substance: the shell read the arena's out
@@ -622,10 +688,10 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
         .unwrap_or_else(|| panic!("round {round}: the fire committed and published nothing"));
         assert!(chose < vocab, "round {round}: token {chose} of {vocab}");
         guest_tokens.push(chose);
-        if round == BIAS_ROUND {
+        if biased_now {
             // THE HOST'S CELL REACHED THE DEVICE THIS FIRE. Nothing about the
             // model says this token; only the bias the host published into
-            // the ring a moment ago does.
+            // the ring does.
             assert_eq!(
                 chose, BIAS_TOKEN,
                 "round {round}: the host pushed token {BIAS_TOKEN} to +1e4 and the \
@@ -668,8 +734,10 @@ fn a_guest_program_fires_at_the_boundary_of_a_real_model_fire() {
     );
     assert_eq!(
         guest_tokens.len(),
-        DECODES,
-        "the guest published on every round, blocked or not"
+        DECODES - blocked,
+        "every round published exactly one cell except the blocked ones, whose \
+         pass never ran — the cell they contributed is the held-back one their \
+         drain recovered"
     );
 
     engine.close_instance(bound.id).expect("the instance closes");

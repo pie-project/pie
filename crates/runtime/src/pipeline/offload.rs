@@ -505,14 +505,18 @@ pub fn counters() -> OffloadCounterSnapshot {
 ///    `embed_anchor_rows`, `embed_block_indptr` — and the contract does not:
 ///    what a fire needs after an encode is ROWS IN THE ARENA, which is a seam
 ///    the shell resolves (design §9's export ops), not a payload the
-///    submission carries. `crate::engine::Media` is where the runtime holds
-///    the payload meanwhile.
+///    submission carries. A `crate::engine::Media` struct held the payload
+///    meanwhile and nothing ever wrote one, so alto E deleted it: the
+///    payload arrives with the verb that produces it.
 ///
 /// The check that the module is even configured for it is kept, so an
 /// operator who turns encode injection on and sees nothing happen gets the
 /// refusal from the partner rather than silence from here.
 pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool {
-    if !ENCODE_INJECTION_ENABLED.load(Ordering::Acquire) || request.media.is_empty() {
+    // The request is the seam the injected rows land on; nothing reads it
+    // until there are rows to land.
+    let _ = request;
+    if !ENCODE_INJECTION_ENABLED.load(Ordering::Acquire) {
         return false;
     }
     let Some(guard) = select_partner(PartnerRole::Encode) else {

@@ -20,14 +20,19 @@
 //!
 //! Both analyses only ever elide a node whose value some *other* emission still
 //! produces — the alias, or `ptir_fast_argmax_intrinsic`'s direct read. There
-//! is no third: a `RegionKind::Library` region has no CUDA kernel of its own
-//! (`emit_cuda_stage` sends every region through this emitter, where Metal
-//! picks `emit_grouped_nucleus`), so a nucleus region's operands are ordinary
-//! scratch values that ordinary emitted ops must write. Eliding them on the
+//! is no third: the NUCLEUS region has no CUDA kernel of its own, so
+//! `cuda::emit_region` sends it here to be emitted as the ordinary ops it
+//! holds, where Metal picks `emit_grouped_nucleus`. Its operands are therefore
+//! ordinary scratch values that ordinary emitted ops must write. Eliding them on the
 //! grounds that "the library kernel reads the intrinsic" describes Metal, and
 //! costs a nonzero temperature every token: the slot stays zeroed, the softmax
 //! over it is uniform, and the draw returns token 0. `.wiki/migration.md`
 //! §11.21 is the account.
+//!
+//! The `Order` and scan regions ARE library regions `emit_region` routes
+//! elsewhere — to [`super::order`] and [`super::scan`] — and they do not
+//! weaken the paragraph above: each wraps a single op, reads no intrinsic, and
+//! never reaches either analysis here.
 
 use crate::codegen::error::{EmitError, EmitterKind, ValueLayoutSite};
 use alloc::format;
@@ -46,9 +51,19 @@ use super::runtime::singleton_runtime_source;
 use super::singleton::valid_identifier;
 use super::validate::validate_generated_region;
 
-const PROLOGUE: &str = include_str!("../../../runtime/cuda/fused_block0.cuh");
-const SIGNATURE: &str = include_str!("../../../runtime/cuda/fused_block1.cuh");
-const PREAMBLE: &str = include_str!("../../../runtime/cuda/fused_block2.cuh");
+/// Everything above the entry point: the lane-table records and every
+/// block-parallel helper, ending on `extern "C" __global__ void` so the entry
+/// name follows.
+///
+/// Shared with [`super::topk`], which emits a different body into the same
+/// `KernelKind::Fused` slot and therefore has to carry the identical ABI.
+pub(super) const PROLOGUE: &str = include_str!("../../../runtime/cuda/fused_block0.cuh");
+/// The parameter list, ending mid-comparison against the lane-table ABI
+/// version the caller writes next.
+pub(super) const SIGNATURE: &str = include_str!("../../../runtime/cuda/fused_block1.cuh");
+/// The per-lane preamble: the commit-slot bail-out, the shared status word,
+/// and the `descriptors` / `scratch` / `temporary` pointers a body indexes.
+pub(super) const PREAMBLE: &str = include_str!("../../../runtime/cuda/fused_block2.cuh");
 
 /// `kPtirIntrinsicSlots` — per-lane intrinsic descriptor slots.
 ///

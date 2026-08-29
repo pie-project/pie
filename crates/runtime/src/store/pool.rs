@@ -14,8 +14,6 @@
 //! deleted, allowed rather than silently masked.
 #![allow(dead_code)]
 
-use std::collections::HashSet;
-
 /// A typed physical id backed by a pool slot. Implemented by
 /// `PhysicalKvPageId` and RS-specific ids.
 pub trait PoolId: Copy {
@@ -111,12 +109,12 @@ impl<I: PoolId> Pool<I> {
         self.capacity
     }
 
-    pub fn highest_in_use_exclusive(&self) -> u32 {
-        let free: HashSet<u32> = self.free.iter().map(|id| id.index()).collect();
-        let end = self.base.saturating_add(self.capacity);
-        (self.base..end)
-            .rev()
-            .find(|index| !free.contains(index))
-            .map_or(0, |index| index - self.base + 1)
-    }
+    // `highest_in_use_exclusive` stood here: an O(capacity) scan of the free
+    // set, allocating a `HashSet` per call, that answered "how many low ids
+    // are in use right now". Its only reader was the runtime's 10-second
+    // elastic-trim poll, which fed the number to `resize_pool`. Both are gone
+    // (alto design §8, wave C): committed and high-water bytes are a SUPPLY
+    // question and the engine owns and reports them
+    // (`LoadFacts::pool_high_water_bytes`), rather than a policy free list
+    // being scanned for an answer it only approximated.
 }

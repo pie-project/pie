@@ -143,13 +143,25 @@ impl DispatchLinear for Run<'_> {
                 &mut self.tensor(*routes),
                 &mut self.tensor(*weights),
             ),
-            Linear::MoeMatmulSelect { x, bank, routes, y } => linear::moe::matmul_select(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*bank),
-                self.tensor(*routes),
-                &mut self.tensor(*y),
-            ),
+            // **THE ROUTED SELECT RESOLVES ITS BANK THROUGH THE TIER** (alto
+            // design §7, wave D2). `Run::expert_bank` answers the same
+            // rectangle `Run::tensor` would, plus the two device addresses a
+            // STREAMED bank needs: the indirection table the kernel reads each
+            // expert's base out of, and the counters it notes the routing in.
+            // A resident bank answers `ExpertTable::RESIDENT` — two nulls —
+            // and the launch below is byte for byte the launch this arm made
+            // before the tier existed.
+            Linear::MoeMatmulSelect { x, bank, routes, y } => {
+                let (bank, experts) = self.expert_bank(*bank);
+                linear::moe::matmul_select(
+                    self.ctx(),
+                    self.tensor(*x),
+                    bank,
+                    self.tensor(*routes),
+                    &mut self.tensor(*y),
+                    experts,
+                )
+            }
             // MENLO-SEAM: the IR's one `bank` id is two device planes — the
             // (codes, scales) pair the entry reads. The metal shell's
             // one-handle weight rows refused this form; here the weight

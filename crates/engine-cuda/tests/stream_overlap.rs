@@ -272,7 +272,7 @@ mod gemma {
     use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::time::Instant;
 
-    use engine::engine_api::fire::Mask;
+    use engine::engine_api::fire::{Mask, Masking};
     use engine_cuda::{Boot, Seated, Shell};
     use model_compiler::{Budget, DeviceProfile};
     use model_dsl::{Classify, Platform, Request};
@@ -369,6 +369,9 @@ mod gemma {
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
             trace,
             contract: &contract,
             checkpoint: &checkpoint,
@@ -387,10 +390,15 @@ mod gemma {
             // (`engine::fire::EagerSink`), so an eager arm would measure
             // nothing and prove nothing.
             graphs: engine_cuda::Graphs::On,
+            knobs: engine_cuda::Knobs::default(),
+            program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
             // claims. `Runahead::of` is the door a deployment comes through.
             runahead: engine::runahead::Runahead::F1,
+            // The warm-boot weight artifact cache is off for a gate: a test
+            // that shared one would be asserting about the last run.
+            weight_cache_dir: None,
         })
         .expect("the shell loads");
         (shell, tokenizer)
@@ -422,7 +430,8 @@ mod gemma {
             tok.encode(&turn("What is the capital of France? Answer in one word."));
         let fresh = padded(&tok, "Name the largest planet. One word.", rows);
         let masked = padded(&tok, "What colour is the sky on a clear day? One word.", rows);
-        let keep = Mask::new(vec![0, masked.len() as u32], masked.len() as u64);
+        let keep =
+            Masking::Extent(Mask::new(vec![0, masked.len() as u32], masked.len() as u64));
 
         shell.open(0).expect("slot 0 opens");
         let seated = shell
@@ -576,6 +585,9 @@ mod qwen {
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
             trace,
             contract: &contract,
             checkpoint: &checkpoint,
@@ -590,10 +602,15 @@ mod qwen {
             slots: 4,
             ordinal: 0,
             graphs: engine_cuda::Graphs::On,
+            knobs: engine_cuda::Knobs::default(),
+            program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
             // claims. `Runahead::of` is the door a deployment comes through.
             runahead: engine::runahead::Runahead::F1,
+            // The warm-boot weight artifact cache is off for a gate: a test
+            // that shared one would be asserting about the last run.
+            weight_cache_dir: None,
         })
         .expect("the shell loads");
         (shell, tokenizer)

@@ -81,8 +81,33 @@ use tensor_compiler::codegen::program::{Backend, emit_program};
 // are exactly the ones that emit nothing at all. A cache keyed on version 22
 // therefore cannot hand back a cubin built from anything: there is no cubin.
 // Bumping would discard both engines' caches to re-emit identical sources.
+// Re-pinned a fourth and fifth time, WITH a cuda bump each, and both are
+// changes in what an engine runs rather than in how its output is spelled.
+// `emit_program` now writes source into slots that used to carry `generated
+// region contains a non-generated boundary (...)` -- regions the CUDA shell
+// had no way to run at all:
+//
+//   22 -> 23  `codegen::cuda::order` (then `topk`) took the single-node
+//             `top_k` library region. `beam-search` routes every token
+//             through one.
+//   23 -> 24  the same emitter took `sort_desc`, which is `top_k` at `k = n`
+//             and shares its kernel, and `codegen::cuda::scan` took
+//             `cumsum`/`cumprod`. `locally-typical-sampling` and
+//             `tail-free-sampling` cut their candidate set with `cumsum(p) -
+//             p`; `mtp-speculative-decoding` builds its accept prefix with
+//             `cumprod`.
+//
+// Nothing else moved in either: `emit_fused_region`'s bytes are unchanged
+// (`golden-cuda/` needed no regeneration, only its version stamp), and metal is
+// untouched, which is why only the cuda row moves.
+//
+// The bump is not bookkeeping here. `engine::cache_identity` folds the emitter
+// version into the key `engine_cuda::program::Cache` files its NEGATIVE tier
+// under, so the old version is the key a shell already remembers "this guest
+// program does not compile here" for. Without the bump those remembered
+// refusals outlive the fix for the life of the process.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 22, 0x5d98_7c38_15e8_2c41),
+    ("cuda", 24, 0x1ccb_6672_9ade_d1e0),
     ("metal", 36, 0x0f81_7250_caff_2a71),
 ];
 

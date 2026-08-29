@@ -1074,10 +1074,6 @@ impl ProcessCtx {
                     return Ok(Err(format!("pipeline: writer staging flush: {error}")));
                 }
             }
-            let dense_mask = instance.program.bound.container.ports.iter().any(|p| {
-                matches!(p.port, tensor_ir::registry::Port::AttnMask)
-                    && matches!(p.source, tensor_ir::container::PortSource::Channel(_))
-            });
             let host_shadow = crate::pipeline::fire::shadow::HostShadow::new(
                 &instance.program.bound,
                 instance.program.shadow_plan(),
@@ -1099,7 +1095,6 @@ impl ProcessCtx {
                 failed: None,
                 devgeo,
                 decode_envelope,
-                dense_mask,
                 host_shadow,
                 closed: false,
             };

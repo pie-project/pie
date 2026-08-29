@@ -206,7 +206,6 @@ async fn run_arm(
                 - before.host_submit.drain_settled_us,
             geometry_us: after.host_submit.geometry_us - before.host_submit.geometry_us,
             kv_prepare_us: after.host_submit.kv_prepare_us - before.host_submit.kv_prepare_us,
-            translation_us: after.host_submit.translation_us - before.host_submit.translation_us,
             scheduler_submit_us: after.host_submit.scheduler_submit_us
                 - before.host_submit.scheduler_submit_us,
             shadow_advance_us: after.host_submit.shadow_advance_us
@@ -258,7 +257,7 @@ fn report(arm: &Arm) {
     let n = h.submits.max(1) as f64;
     eprintln!(
         "[d0]   {:<16}       submit={:>6.1} us/fire over {} = drain {:>5.1} + geometry {:>5.1} \
-         + kv {:>6.1} + xlat {:>5.1} + sched {:>5.1} + shadow {:>5.1}   \
+         + kv {:>6.1} + sched {:>5.1} + shadow {:>5.1}   \
          validate_frame={:>5.1} us x{}",
         "",
         h.total_us as f64 / n,
@@ -266,7 +265,6 @@ fn report(arm: &Arm) {
         h.drain_settled_us as f64 / n,
         h.geometry_us as f64 / n,
         h.kv_prepare_us as f64 / n,
-        h.translation_us as f64 / n,
         h.scheduler_submit_us as f64 / n,
         h.shadow_advance_us as f64 / n,
         h.validate_frame_us as f64 / h.validate_frame_calls.max(1) as f64,

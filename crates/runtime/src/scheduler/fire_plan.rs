@@ -1,7 +1,7 @@
 //! Fire planning: the device-independent half of "how do these co-batch".
 //!
-//! [`LaunchGrouping::accepts`](super::worker::LaunchGrouping) answers *can*
-//! these members share one step; this module answers *how* — the row order
+//! [`StepGroup::accepts`](super::batch::StepGroup) answers *can* these
+//! members share one step; this module answers *how* — the row order
 //! and, per divergence site, a lowering. It is the port of the tart
 //! prototype's planner vocabulary (`tart/plan.py` + `tart/ir.py`,
 //! re-measured on L40S in `stage0-l40s.md`) into the home plan.md Part 2 and
@@ -11,7 +11,7 @@
 //!
 //! v0 was deliberately narrow: [`plan_fire`] re-derives, as data, exactly
 //! the decisions the scheduler already makes in scattered places — the
-//! `(device_resolved_geometry, hook_program)` stable sort in
+//! `(geometry class, hook_program)` stable sort in
 //! `batch::build_frame_submission` and the two per-site fast-path choices
 //! the engine used to re-derive on its own (see [`SITE_QKV_POSTPROCESS`]
 //! and [`SITE_PROJECTION_WEIGHTS`]). The member order is consumed and
@@ -308,9 +308,9 @@ pub(crate) struct MemberFacts {
     pub(crate) multi_token: bool,
     /// `PIE_GEOMETRY_CLASS_*`, the sort's primary term: a device-resolved
     /// member composes as the ordered suffix sub-batch, never interleaved
-    /// with wire members. Order-identical to
-    /// `device_resolved_geometry` for the two classes that existed when this
-    /// sort was measured (0 where the bool is false, 1 where it is true), and
+    /// with wire members. Order-identical to the `device_resolved_geometry`
+    /// bool this replaced (0 where it was false, 1 where it was true) for the
+    /// two classes that existed when this sort was measured, and
     /// it puts a pooled device-geometry member in its own suffix run instead
     /// of scattering it through the wire members -- which is what lets the
     /// sub-batch table say which class each run is.
@@ -323,8 +323,8 @@ pub(crate) struct MemberFacts {
 #[derive(Clone, Debug)]
 pub(crate) struct FirePlan {
     /// Indices into the planned members, in submission order. The existing
-    /// sort key generalized: `(device_resolved_geometry, hook_program,
-    /// custom_mask, arrival)`, stable. Device-geometry members last is PRIMARY (the
+    /// sort key generalized: `(geometry class, hook_program, custom_mask,
+    /// arrival)`, stable. Device-geometry members last is PRIMARY (the
     /// engine's offset fixed-decode compose needs the envelope lanes as a
     /// contiguous program suffix); hooks-last within each class is what
     /// makes the qkv_postprocess prefix maximal.

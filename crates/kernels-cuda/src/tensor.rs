@@ -55,6 +55,22 @@ impl Tensor {
     pub const fn elements(&self) -> u64 {
         self.rows as u64 * self.width as u64
     }
+
+    /// **The seat nobody filled**, as a handle rather than an `Option`.
+    ///
+    /// A null address is what a device text reads as `nullptr`, and every
+    /// optional pointer seat in `attn/ssm.cuh` already spells its absence that
+    /// way (`commit_len != nullptr`, `row_persists`'s `mask == nullptr`). So
+    /// an unbound seat is this handle and the marshalling is unchanged —
+    /// wrapping it in an `Option` would put a branch in every entry to
+    /// re-derive the zero the kernel already tests for.
+    pub const ABSENT: Tensor = Tensor::new(0, 0, 0, Dtype::U8);
+
+    /// Is this the seat nobody filled?
+    #[must_use]
+    pub const fn is_absent(&self) -> bool {
+        self.ptr == 0
+    }
 }
 
 /// A fire-aligned value paired with the fire's shared boundaries (design §5).
@@ -163,4 +179,74 @@ pub struct RecurrentPool {
 
     /// Elements from one slot's convolution state to the next.
     pub conv_stride: i64,
+
+    /// **Does this launch fold its boundary into the state at all?** (alto
+    /// design §6.)
+    ///
+    /// `true` is the plain path: the recurrence's end-of-sequence writeback
+    /// IS the fold. `false` is the buffered scatter — the pass computes its
+    /// outputs and leaves the folded state exactly where it was, which is
+    /// what makes a rejected draft pure host bookkeeping.
+    pub write_state: bool,
+
+    /// **The per-REQUEST fold predicate** — `u8`, `[requests]`, or the zero
+    /// tensor for "every request folds".
+    ///
+    /// `attn/ssm.cuh`'s `row_persists(mask, r)` takes `r = blockIdx` over
+    /// REQUESTS, not over token rows, so this is one byte per lane of the
+    /// window the launch runs in — sliced by `lane_offset` exactly as
+    /// [`RecurrentPool::slot_ids`] is. A refused pass's byte is zero and its
+    /// fold is a no-op, which is what makes the fold a predicated commit like
+    /// every other durable advance (design §1 article 3).
+    pub write_state_mask: Tensor,
+
+    /// **Where the accepted prefix ends** — `i32`, `[requests]`, or the zero
+    /// tensor for "the whole request".
+    ///
+    /// The chunked scans truncate request `r` at `commit_len[r]` tokens
+    /// (`ssm.cuh:127-128, 197-198, 1631-1632`), which is what turns a replay
+    /// of a buffered window into a fold of the accepted prefix of it. Sliced
+    /// per window beside the mask.
+    ///
+    /// **A LENGTH AND NOTHING ELSE, SINCE F3b.** The fla scan used to read
+    /// `commit_len != nullptr` as a second thing — a different bf16 rounding
+    /// of the decay — so binding a seat that truncated nothing still moved
+    /// bytes. The rounding is [`RecurrentPool::fused_decay`] now, and this
+    /// seat means only what it says.
+    pub commit_len: Tensor,
+
+    /// **Where the segment this launch owns BEGINS** — `i32`, `[requests]`,
+    /// or the zero tensor for "at the row's own first token" (alto design
+    /// §6's 2R interior split, wave F3b).
+    ///
+    /// [`RecurrentPool::commit_len`]'s mirror: that one cuts a request at the
+    /// back, this one cuts it at the front, and a row whose fold boundary
+    /// falls INSIDE its own tokens is run as two ordered launches over the
+    /// same rows — the head `[0, n)` with the length seat and the fold, the
+    /// tail `[n, rows)` with this one and no fold. Never bound together with
+    /// `commit_len` on one launch; the front cut is applied first, so what
+    /// `commit_len` would count is the segment and not the row.
+    ///
+    /// Only the arms that can carry an interior boundary have a seat for it
+    /// (the chunked conv and the fla delta scan); every other arm refuses a
+    /// bound one by name rather than folding a segment it cannot address.
+    pub begin_at: Tensor,
+
+    /// **How the decay is rounded** — dev's `single_round` (`ssm.cuh:1660`),
+    /// promoted out of `commit_len`'s null test into an argument of its own.
+    ///
+    /// `false` is the fold's own policy and the default everywhere in this
+    /// tree: the decayed state is rounded to bf16 before the update reads it,
+    /// which is what the plain fold-per-token forward does. `true` folds the
+    /// decay into the update instead — the same arithmetic, different bits.
+    ///
+    /// **IT IS A POLICY AND NOT A CONSEQUENCE**, which is the whole of the
+    /// F3b finding: while it rode `commit_len`'s presence, a replay that
+    /// accepted its whole window and a fold over the same tokens differed by
+    /// 3,115,437 of 10,321,884 state bytes for no reason but the rounding,
+    /// and a truncated fold could not be compared against a shorter buffer at
+    /// all.
+    pub fused_decay: bool,
 }
+
+

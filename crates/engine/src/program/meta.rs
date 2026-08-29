@@ -4,12 +4,10 @@ use tensor_ir::validate::Direction;
 
 use super::readiness::Effect;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpMeta {
-    pub node: u32,
-
-    pub result_base: u32,
-}
+// `OpMeta` — one op's node index and result base — stood here with the
+// `op_metadata` that computed a stage's whole table. Its consumer was the
+// deleted device lane table's op side; `Malformed` below outlived it because
+// `channel_effects` answers with it (alto E).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Malformed {
@@ -28,28 +26,6 @@ impl Malformed {
             }
         }
     }
-}
-
-pub fn op_metadata(ops: &[LaunchOp], values: usize) -> Result<Vec<OpMeta>, Malformed> {
-    let mut out = Vec::with_capacity(ops.len());
-    let mut result_base: u32 = 0;
-    for (node, op) in ops.iter().enumerate() {
-        out.push(OpMeta {
-            node: u32::try_from(node).map_err(|_| Malformed::ResultBaseOverflowed)?,
-            result_base,
-        });
-        result_base = result_base
-            .checked_add(u32::from(op.result_count))
-            .ok_or(Malformed::ResultBaseOverflowed)?;
-    }
-    let values = u32::try_from(values).unwrap_or(u32::MAX);
-    if result_base > values {
-        return Err(Malformed::ResultsExceedValues {
-            results: result_base,
-            values,
-        });
-    }
-    Ok(out)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

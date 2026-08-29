@@ -38,23 +38,13 @@ fn container_has_attention_stages(container: &tensor_ir::container::TraceContain
         .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
 }
 
-/// Whether the pass carries a `lora` sink — the region table's LORA
-/// signature (an adapter fire batches, but its region must say so, so the
-/// engine's plans see the axis).
-fn container_writes_page_mask(container: &tensor_ir::container::TraceContainer) -> bool {
-    container
-        .stages
-        .iter()
-        .flat_map(|s| s.ops.iter())
-        .any(|op| {
-            matches!(
-                op,
-                tensor_ir::op::Op::SinkCall { name, .. }
-                    if container.names.get(*name as usize).map(String::as_str)
-                        == Some("attn_page_mask")
-            )
-        })
-}
+// `container_writes_page_mask` stood here: does the pass write the
+// `attn_page_mask` sink? Its one consumer was `LaunchGrouping`, which kept
+// such a fire out of a group that carried a multi-token row because the
+// deleted driver's page-list substitution needed the paged decode path. The
+// palo shells have no such path and no such refusal (grep: `attn_page_mask`
+// appears in engine-metal only as a capability bit it answers `false` to), so
+// the question has no asker. Deleted with the rule (alto E).
 
 fn container_has_lora_sink(container: &tensor_ir::container::TraceContainer) -> bool {
     container
@@ -1159,6 +1149,113 @@ pub(crate) fn stamp_lane_slots(
     Ok(())
 }
 
+/// **REWRITE EVERY LANE'S PAGE TABLE FROM WORKING-SET INDEXES TO POOL PAGE
+/// IDS**, which is the only spelling [`KvDelta::pages`] has.
+///
+/// A guest states its `pages` channel in WorkingSet-RELATIVE indexes — it
+/// asked for `ws.reserve(n)` and holds `0..n`, and `crate::store::kv` is what
+/// maps those onto the pool. [`KvDelta::pages`] is the other thing:
+/// `engine::store::kv::geometry_with` pushes each entry it is given STRAIGHT
+/// into the page CSR, with no per-slot base and no lookup, because "the ids
+/// are the runtime's and the bytes under them are the engine's" (article 8).
+/// Between the guest's spelling and the engine's there was no translation, so
+/// every lane in the system addressed pool pages `0, 1, …`:
+///
+/// * **alone it is invisible** — a lane reads back the pages it wrote, so a
+///   sequence that never shares a fire is self-consistent whatever ids it used;
+/// * **under a HOMOGENEOUS load it is invisible** — colliding lanes write the
+///   same prompt and the same continuation, so the bytes they overwrite each
+///   other with are the bytes that were there;
+/// * **under a heterogeneous one it is a wrong answer** — a fresh sequence
+///   prefilling six tokens over pool page 0 walks over the first six positions
+///   of every other live sequence's cache, and the lane decoding beside it
+///   attends a prompt it never had. Measured: a greedy lane over "The capital
+///   of France is" answers " Paris.\nThe capital of France is Paris." alone and
+///   " Paris.\nThe following are the results of the following:" with any
+///   two-token neighbour co-resident, deterministically, from the fifth token.
+///
+/// **IT RUNS AFTER THE FIRE'S KV PREPARE.** `flat_table` answers the committed
+/// mapping overlaid with the write targets this fire has just reserved, and a
+/// first prefill's own pages are in it only then — which is also why this is
+/// not folded into [`stamp_lane_slots`], whose instant is before the acquire.
+///
+/// A page a lane names and the working set has not mapped is a refusal: the
+/// alternative is addressing a pool page belonging to somebody else, which is
+/// the failure this function exists to end.
+///
+/// [`KvDelta::pages`]: crate::engine::KvDelta::pages
+pub(crate) fn map_lane_pages(
+    req: &mut crate::engine::FireRequest,
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+) -> Result<(), String> {
+    if req.lanes.iter().all(|lane| lane.kv.pages.is_empty()) {
+        return Ok(());
+    }
+    let table = working_set_flat_table(stores, ws)?;
+    for lane in &mut req.lanes {
+        for page in &mut lane.kv.pages {
+            let Some(&pool) = table.get(*page as usize) else {
+                return Err(format!(
+                    "pipeline: KV page {page} escapes the working set's {} mapped page(s)",
+                    table.len()
+                ));
+            };
+            *page = pool;
+        }
+    }
+    Ok(())
+}
+
+/// The working set's flattened logical-to-physical table: entry `i` is the
+/// pool page backing WorkingSet-relative index `i`.
+///
+/// **ONE READER, BECAUSE ONE MAPPING** (article 8). [`map_lane_pages`] applies
+/// it and [`stamp_lane_translation`] quotes it, and the two must be the same
+/// bytes at the same instant or the host path and the device path would be
+/// translating through two tables.
+fn working_set_flat_table(
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+) -> Result<Vec<u32>, String> {
+    crate::store::registry::with_kv_lock(&stores.kv, "host-pages", |kv| {
+        Ok::<Vec<u32>, crate::store::kv::KvStoreError>(
+            kv.flat_table(ws)?.1.iter().map(|page| page.0).collect(),
+        )
+    })
+    .map_err(|error| format!("pipeline: KV page translation: {error}"))
+}
+
+/// **HAND THE ENGINE THE TABLE, FOR THE ONE CLASS WHOSE PAGE REFERENCES THE
+/// RUNTIME CANNOT REACH.**
+///
+/// [`map_lane_pages`] is the same rule applied one step earlier: for a
+/// host-resolved geometry the runtime folds the guest's `Pages` port itself,
+/// so it can rewrite the relative indexes into pool ids and ship the RESULT.
+/// A device-geometry pass states its pages, its page CSR and its write
+/// descriptor in channel cells its own epilogue wrote — `gather(pool_ids, ..)`
+/// over a `ws.reserve` grant, which is relative like every other guest's — and
+/// the host never reads them. There is nothing to rewrite, so the TABLE
+/// crosses instead and the engine applies it where it resolves the cells.
+///
+/// The mapping still has one owner: this is `kv::build_translation`'s vector,
+/// quoted onto the lanes, and the engine may only index it.
+///
+/// **AT THE SAME INSTANT [`map_lane_pages`] RUNS**, and for its reason: a
+/// pooled pass prepares its whole writable span before this point, so the
+/// table answered here already covers every cell the device may pick.
+fn stamp_lane_translation(
+    req: &mut crate::engine::FireRequest,
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+) -> Result<(), String> {
+    let table = working_set_flat_table(stores, ws)?;
+    for lane in &mut req.lanes {
+        lane.kv.translation.clone_from(&table);
+    }
+    Ok(())
+}
+
 /// Poison every host-reader cell of a pass with the failed fire's error —
 /// under run-ahead this IS the error channel (`take`/`read` surface it).
 fn poison_readers(cells: &BoundCells, reason: &str) {
@@ -1198,7 +1295,8 @@ impl TicketReservation {
         }
     }
 
-    /// **AND NOW IT CROSSES** (alto design §1 article 3, wave F2a).
+    /// **AND NOW IT CROSSES, ONTO THE LANE** (alto design §1 article 3,
+    /// waves F2a and E).
     ///
     /// These heads and tails were `channel_expected_head` /
     /// `channel_expected_tail` on the old wire plan — a per-fire assertion,
@@ -1209,11 +1307,18 @@ impl TicketReservation {
     ///
     /// An engine with the pull-validate and commit-bump kernels checks them
     /// where the data is, and that is the whole of article 3: the host owns a
-    /// prediction and the device owns the truth. So the reservation is stated
-    /// on the request again, and [`crate::scheduler::batch`] carries it onto
-    /// the attached lane as [`Lane::channels`](engine_api::Lane) — but ONLY
-    /// for an engine that adopted this instance's channels, because an engine
-    /// with no device half refuses a stated prediction by name rather than
+    /// prediction and the device owns the truth. F2a stated the reservation
+    /// on the REQUEST and had `scheduler::batch` transcribe it onto the
+    /// attached lane; wave E stamps it here instead, because this is the one
+    /// place that mints the prediction and the one place that knows whether
+    /// the instance's channels were ADOPTED — and two spellings of one number
+    /// is what article 8 forbids.
+    ///
+    /// It lands on the request's FIRST lane, which is the lane the batcher's
+    /// attachment names: a member that fires three row groups is one bound
+    /// instance running one pass with one commit. And it lands only when
+    /// every channel was adopted, because an engine with no device half
+    /// refuses a stated prediction by name (`Lane::validate_for`) rather than
     /// ignoring it, and a prediction nobody checks is worse than none.
     ///
     /// What the reservation and the LIFO rollback below were always also for
@@ -1221,8 +1326,11 @@ impl TicketReservation {
     /// before any of them settles — and that is runtime bookkeeping,
     /// unchanged.
     fn apply_to(&self, request: &mut crate::engine::FireRequest) {
-        let mut adopted = !self.cells.is_empty();
-        request.tickets = self
+        if self.cells.is_empty() {
+            return;
+        }
+        let mut adopted = true;
+        let tickets: Vec<engine_api::Ticket> = self
             .cells
             .iter()
             .zip(&self.heads)
@@ -1232,14 +1340,18 @@ impl TicketReservation {
                 adopted &= cell
                     .endpoint()
                     .is_some_and(|endpoint| endpoint.registered().adopted());
-                crate::engine::ChannelTicket {
+                engine_api::Ticket {
                     channel: cell.global_id,
-                    head,
-                    tail,
+                    expected_head: head,
+                    expected_tail: tail,
                 }
             })
             .collect();
-        request.device_channel_tickets = adopted;
+        if let Some(lane) = request.lanes.first_mut()
+            && adopted
+        {
+            lane.channels = tickets;
+        }
     }
 
     fn commit(mut self) {
@@ -1368,7 +1480,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             attn_mask,
             accesses,
             decode_envelope,
-            dense_mask,
         ) = {
             let p = ctx.resources().get_mut(&fwd)?;
             if let Some(e) = &p.failed {
@@ -1452,7 +1563,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 attn_mask,
                 accesses,
                 p.decode_envelope.clone(),
-                p.dense_mask,
             )
         };
         let mut req = crate::engine::FireRequest::default();
@@ -1468,29 +1578,16 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // lowering under test) leave the flag false and submit exactly the
         // fire they always did.
         req.boundary_program = true;
-        req.device_resolved_geometry = decode_envelope.is_some();
-        // The same fact as the line above, said as a CLASS rather than a bool,
-        // because there are three ways to read a fire's geometry and a bool
-        // holds two. This path serves the two the bool could carry; the third
-        // is stamped in `fire_device_geometry`, which a device-geometry pass
-        // takes instead of this one.
-        //
-        // The bool is deliberately left alone. Every existing consumer
-        // (`worker::has_device_geometry`, `wire.rs`'s `deferred_geometry`, the
-        // co-batching rules) keeps the behaviour it was measured with.
+        // A CLASS AND NOT A BOOL, and the bool beside it is gone (alto E).
+        // `device_resolved_geometry` said the same fact with two values where
+        // there are three ways to read a fire's geometry; its only readers
+        // were the deleted co-batching rules, and `fire_device_geometry`
+        // stamps the third class this path cannot reach.
         req.geometry = if decode_envelope.is_some() {
             GeometryClass::DecodeEnvelope
         } else {
             GeometryClass::Host
         };
-        // Carried to the batcher, which keeps such a fire out of shared
-        // waves — see `scheduler::worker::has_dense_device_mask`. The
-        // stamp is the program's binding, but it is NOT final: a fire
-        // whose mask lowers host-side to wire BRLE rows clears it in
-        // `FireAttnMask::Host::apply_to` (the batcher's wire-mask rules
-        // co-batch those), so only genuinely device-resident masks keep
-        // the dense-device solo.
-        req.dense_device_mask = dense_mask;
         req.single_token_mode = req.lanes.iter().all(|lane| lane.tokens.len() == 1);
         // tart (0.3 re-port step 2): the pass's layer truncation rides
         // every fire; the scheduler's region table carries it to the
@@ -1564,11 +1661,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 "pipeline: KV read page {page} escapes the readable declaration"
             )));
         }
-        let page_size = u64::from(ws.page_size);
-        req.kv_write_bounds = Some((
-            writable_pages.start * page_size,
-            writable_pages.end * page_size,
-        ));
         let model = ws.model;
         let engine = ws.engine;
         let pid = ctx.process_id();
@@ -1684,21 +1776,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
         };
         crate::probe_fire_record!(submit_probe.kv_prepare_us, kv_clock.elapsed());
+        // THE PAGE IDS BECOME THE ENGINE'S HERE, and this is the earliest
+        // instant they can: the mapping is only complete once this fire's own
+        // write targets are reserved (`map_lane_pages` argues it).
+        if let Err(refusal) = map_lane_pages(&mut req, &stores, ws.id) {
+            return Ok(Err(refusal));
+        }
         rs_prepared.apply_to(&mut req);
         let (rs_copy_src, rs_copy_dst) = rs_prepared.copies.clone();
         let rstxns = RsTxnsGuard::new(model, engine, rs_prepared.txn);
-        let translation_clock = crate::scheduler::probe::ProbeClock::start();
-        let (translation_version, translation) = match ws.translation() {
-            Ok(translation) => translation,
-            Err(error) => {
-                let reason = format!("pipeline: KV translation: {error}");
-                record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
-                return Ok(Err(reason));
-            }
-        };
-        req.kv_translation_version = translation_version;
-        req.kv_translation = translation.as_ref().to_vec();
-        crate::probe_fire_record!(submit_probe.translation_us, translation_clock.elapsed());
         let completion = ctx
             .resources()
             .get_mut(&fwd)?
@@ -1713,7 +1799,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let (hook_program, lora_program) = {
             let p = ctx.resources().get(&fwd)?;
             let container = &p.instance.program.bound.container;
-            req.hook_page_mask = container_writes_page_mask(container);
             (
                 container_has_attention_stages(container),
                 container_has_lora_sink(container),
@@ -1898,19 +1983,89 @@ pub fn park_frame<C: FireContext>(ctx: &mut C, this: Resource<Pipeline>) -> Anyh
     Ok(())
 }
 
-/// Section 5 structural frame validation (k > 1 only): fusability is a
-/// deterministic program property — decided from program structure and
-/// staged occupancy at submit, never timing.
+/// **STATIC ADMISSION FOR A FRAME** (alto design §1 article 4; survey §7 I8).
+///
+/// Walks the frame's steps in slot order and proves, against the channels'
+/// DECLARED capacities, that no step of this frame can meet a gate the device
+/// would refuse. Three classes, three proofs:
+///
+/// ```text
+/// device-only ring   occupancy in SLOT ORDER: reserved backlog plus this
+///                    frame's in-order net growth fits the capacity
+/// host-writer        every cell a consuming step drains is already staged
+///                    (frames execute uninterrupted; no mid-frame put lands)
+/// reader ring        worst-case pressure — reserved by accepted unsettled
+///                    fires, minus host-consumed, plus this frame's writes —
+///                    fits the capacity
+/// ```
+///
+/// **THIS IS WHAT MAKES RETRY DELETABLE.** Article 4: everything a device
+/// gate could refuse is proved impossible here, so a surviving refusal past
+/// this door is a contract violation and not a replay. The engine lane no
+/// longer sleeps on `Exhausted`, and a readiness miss at an attached pass is
+/// a loud fault naming the instance and the channel
+/// (`engine_cuda::serve::committed_or`).
+///
+/// # What stood here and is gone (wave E)
+///
+/// A fourth rule refused a frame whose slot *j* consumed a channel an earlier
+/// slot published, whenever slot *j* "resolved its descriptors on the HOST".
+/// Its entire justification was a C++ engine: `FramePrepare` ran every step's
+/// host work at frame entry, and a step whose descriptor ports were
+/// device-carried escaped that only if `try_device_composed_template` in
+/// `crates/engine-cuda/csrc/src/pipeline/dispatch.cu` accepted it — so the
+/// rule enumerated the two RS shapes and the one geometry shape that template
+/// refused, and reached into the recurrent store to ask whether a row was
+/// buffered. Neither the file nor the template nor the frame-entry host pass
+/// exists in this tree: `Cuda::submit` drives `prepare`/`enqueue`/`settle` per
+/// step, and a step's descriptor ports are read in ITS prepare, off the
+/// committed front of the rings the step before it advanced. The
+/// `EngineSpec::resolves_geometry_per_step` capability that let a backend opt
+/// out of the rule is deleted with it — no shell in the workspace answered
+/// anything but `false`, and the rule the `false` selected is gone.
 fn validate_frame<C: FireContext>(
     ctx: &mut C,
     k: usize,
     fired: &[(u32, u32)],
 ) -> Anyhow<Result<(), String>> {
+    // The walk is separated from the resource lookup so it can be tested
+    // against channels rather than against a wasm store: `prove_frame_admissible`
+    // is the proof and this is the gather. One `Arc` clone per channel per
+    // slot, at k <= 4 and a handful of channels — the same clone the use map
+    // made anyway.
+    let mut slots: Vec<SlotAccess> = Vec::with_capacity(fired.len());
+    for &(_, rep) in fired {
+        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
+        let pass = ctx.resources().get(&fwd)?;
+        let bound = match pass.bound() {
+            Ok(bound) => bound,
+            Err(error) => return Ok(Err(format!("pipeline: {error}"))),
+        };
+        slots.push(SlotAccess {
+            cells: bound.cells.clone(),
+            accesses: bound.instance.program.channel_accesses.clone(),
+        });
+    }
+    Ok(prove_frame_admissible(k, &slots))
+}
+
+/// One frame slot's channels and what its pass does to each: `(consume, publish)`.
+struct SlotAccess {
+    cells: BoundCells,
+    accesses: Vec<(bool, bool)>,
+}
+
+/// The proof [`validate_frame`] gathers for — see its doc for the three
+/// classes and why each one is what makes retry deletable.
+fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> {
+    /// One channel's part in this frame: how many steps take from it and how
+    /// many put into it.
     struct ChannelUse {
         cell: Arc<Mutex<crate::pipeline::channel::ChannelCell>>,
         consumes: usize,
         publishes: usize,
     }
+    /// A device-only ring's running occupancy as the walk crosses the frame.
     struct DeviceRingUse {
         global_id: u64,
         capacity: u64,
@@ -1919,172 +2074,9 @@ fn validate_frame<C: FireContext>(
     let mut uses: std::collections::HashMap<usize, ChannelUse> = std::collections::HashMap::new();
     let mut device_rings: std::collections::HashMap<usize, DeviceRingUse> =
         std::collections::HashMap::new();
-    // A pass that binds recurrent state needs NO frame restriction. RS
-    // mappings publish at prepare, in slot order, under the store lock — so
-    // slot i+1 classifies against slot i's decision without waiting for it to
-    // settle, and the advanced state's contents are ordered by the stream
-    // like any intra-frame dependency. The former rule (an RS pass had to own
-    // its frame) existed only because `fire` serialized such a pass behind
-    // every predecessor's settlement, which a frame can never reach: the
-    // frame seals one fire short forever. Both halves are gone.
-    // Slot index of the first fire that binds recurrent state, and the set of
-    // channels each slot publishes, so the RS chaining rule below can name the
-    // exact slot pair that is unsupported.
-    let mut first_rs_slot: Option<usize> = None;
-    let mut published_before: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    // Per slot: does this fire bind recurrent state the engine must resolve on
-    // the HOST? Only those slots are subject to the chaining rule below. See
-    // the comment there for why the answer is not simply "it binds RS".
-    let mut rs_host_resolved: Vec<bool> = Vec::with_capacity(fired.len());
-    for &(_, rep) in fired.iter() {
-        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        let (rs_reps, fold_len_is_device) = {
-            let pass = ctx.resources().get(&fwd)?;
-            let bound = match pass.bound() {
-                Ok(bound) => bound,
-                Err(error) => return Ok(Err(format!("pipeline: {error}"))),
-            };
-            (bound.rs_ws.clone(), bound.rs_fold_len.is_none())
-        };
-        if rs_reps.is_empty() {
-            rs_host_resolved.push(false);
-            continue;
-        }
-        if fold_len_is_device {
-            rs_host_resolved.push(true);
-            continue;
-        }
-        let mut buffered = false;
-        // One lock for the whole pass: `bound_rs_working_set_ids` has already
-        // refused a pass whose rows disagree on (model, engine), so the first
-        // row names the store all of them live in.
-        let first: Resource<RsWorkingSet> = Resource::new_borrow(rs_reps[0]);
-        let (model, engine) = {
-            let rs = ctx.resources().get(&first)?;
-            (rs.model, rs.engine)
-        };
-        let mut ids = Vec::with_capacity(rs_reps.len());
-        for &rs_rep in &rs_reps {
-            let resource: Resource<RsWorkingSet> = Resource::new_borrow(rs_rep);
-            ids.push(ctx.resources().get(&resource)?.id);
-        }
-        {
-            let stores = crate::store::registry::get(model, engine);
-            let store = stores.rs.lock().unwrap();
-            for id in ids {
-                // A bound, not the exact count: an indeterminate occupancy
-                // must read as "may be buffered", and `bound()` never refuses.
-                //
-                // An id the store does not know reads as buffered too. This is
-                // a safety guard, so the unknown case fails CLOSED — the worst
-                // it costs is a refusal the guest can retry in a later frame,
-                // where failing open costs a device cascade.
-                if store.buffer_tokens_bound(id).unwrap_or(u32::MAX) > 0 {
-                    buffered = true;
-                    break;
-                }
-            }
-        }
-        rs_host_resolved.push(buffered);
-    }
-    // A pooled device-geometry pass is the OTHER shape the device-composed
-    // template refuses, and it lands in exactly the same place: its
-    // descriptors — including the dense `AttnMask` cell — are read back on the
-    // HOST at frame entry, so a slot chained behind an earlier slot of the
-    // same frame asks for a value no one has produced yet. The rule below was
-    // written for the RS shapes and describes this one word for word; it just
-    // never looked at it.
-    let mut host_resolved: Vec<bool> = Vec::with_capacity(fired.len());
-    for (index, &(_, rep)) in fired.iter().enumerate() {
-        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        let pass = ctx.resources().get(&fwd)?;
-        // ... unless the engine resolves a step's ports when the step RUNS.
-        // The paragraph above describes `FramePrepare`, which is one engine's
-        // shape and not the contract: `engine-vulkan`'s `launch` converts one
-        // step, fires it, lets its program run, and only then converts the
-        // next -- so a chained slot's cell is filled by the time it is read,
-        // and refusing the frame refuses work that backend performs. The
-        // capability is asked rather than assumed, so an engine that does the
-        // frame-entry thing keeps the refusal.
-        let per_step = pass
-            .bound()
-            .ok()
-            .and_then(|bound| crate::engine::get_spec(bound.bound_instance.engine_id).ok())
-            .is_some_and(|spec| spec.resolves_geometry_per_step);
-        let devgeo = pass.devgeo.is_some() && !per_step;
-        host_resolved.push(devgeo || rs_host_resolved[index]);
-    }
-    for (slot, &(_, rep)) in fired.iter().enumerate() {
-        let fwd: Resource<ForwardPass> = Resource::new_borrow(rep);
-        let pass = ctx.resources().get(&fwd)?;
-        let bound = match pass.bound() {
-            Ok(bound) => bound,
-            Err(error) => return Ok(Err(format!("pipeline: {error}"))),
-        };
-        let accesses = &bound.instance.program.channel_accesses;
 
-        // ── The frame shapes the CUDA engine cannot execute.
-        //
-        // FramePrepare runs EVERY step's host work at frame entry, before any
-        // of the frame reaches the stream. A step whose descriptor ports are
-        // device-carried normally escapes that by taking the device-composed
-        // template, which resolves ports at kernel time. So a fire that the
-        // template REFUSES falls back to the host readback path and demands,
-        // at frame entry, a cell that an EARLIER SLOT of the same frame has
-        // not produced yet.
-        //
-        // This rule once covered any fire carrying RS rows, because the
-        // template refused all of them. It no longer does: `299b76320` let an
-        // unbuffered fold-all recurrent decode take the template, which is the
-        // ordinary hybrid decode shape. `try_device_composed_template` in
-        // `crates/engine-cuda/csrc/src/pipeline/dispatch.cu` now refuses exactly two RS
-        // shapes, and `rs_host_resolved` above mirrors them:
-        //
-        //   * buffered rows — ragged and sized to the real request count, so a
-        //     padded template lane indexes past the end;
-        //   * a device-resident fold length — substituted during descriptor
-        //     resolution against a host bound, and the template resolves
-        //     nothing.
-        //
-        // Left unchecked this surfaced as a cascade — `descriptor channel 0
-        // not ready` from the engine, then a poisoned channel in the guest —
-        // that named neither the slot nor the cause. Refuse it here, where
-        // both are known. See `live_slots()` in the SDK, which keeps a linear
-        // lane from building this frame in the first place.
-        if host_resolved[slot] && first_rs_slot.is_none() {
-            first_rs_slot = Some(slot);
-        }
-        if let Some(blame) = first_rs_slot {
-            for (channel, &(consume, _)) in accesses.iter().enumerate() {
-                if !consume {
-                    continue;
-                }
-                let key = Arc::as_ptr(&bound.cells[channel]) as usize;
-                if published_before.contains(&key) {
-                    return Ok(Err(format!(
-                        "pipeline: frame slot {slot} consumes channel {channel}, which an \
-earlier slot of the same frame publishes, and slot {} resolves its descriptors \
-on the HOST ({}) — those are resolved at frame entry, before any slot has run, \
-so they cannot see that value. Submit the chained fire in a LATER frame (a \
-linear lane should size its run-ahead with `live_slots()`).",
-                        blame,
-                        if rs_host_resolved[blame] {
-                            "recurrent state: a buffered row, or a device-resident fold length"
-                        } else {
-                            "a pooled device-geometry pass: every descriptor port, and any \
-dense AttnMask cell, is read back per fire"
-                        }
-                    )));
-                }
-            }
-        }
-        for (channel, &(_, publish)) in accesses.iter().enumerate() {
-            if publish {
-                published_before.insert(Arc::as_ptr(&bound.cells[channel]) as usize);
-            }
-        }
-
-        for (cell, &(consume, publish)) in bound.cells.iter().zip(accesses) {
+    for (slot, step) in slots.iter().enumerate() {
+        for (cell, &(consume, publish)) in step.cells.iter().zip(&step.accesses) {
             let key = Arc::as_ptr(cell) as usize;
             let entry = uses.entry(key).or_insert_with(|| ChannelUse {
                 cell: cell.clone(),
@@ -2094,16 +2086,23 @@ dense AttnMask cell, is read back per fire"
             entry.consumes += usize::from(consume);
             entry.publishes += usize::from(publish);
 
-            // *device-only ring* occupancy, walked in slot order: the device
-            // publish gate admits a publish only while occupancy stays below
-            // capacity (+1 when the same fire also consumes) — an accepted
-            // frame that structurally exceeds it would jam into the makeup
-            // path until retry-budget exhaustion. Enforce the static mirror
-            // at submit: reserved backlog plus this frame's in-order net
-            // growth must fit the declared capacity. Consumes not yet
-            // reserved by any accepted fire grant no relief. Seeded
-            // descriptor channels are exempt (their occupancy is the seed
-            // protocol's, not the reserved-ticket ledger's).
+            // ── DEVICE-ONLY RING OCCUPANCY, WALKED IN SLOT ORDER. The
+            //    device publish gate admits a publish only while occupancy
+            //    stays below capacity (+1 when the same fire also consumes,
+            //    which is the same-fire-consume credit the counter form of
+            //    the ring-full test gives). An accepted frame that
+            //    structurally exceeds it would jam on the device with no
+            //    retry left to absorb it. Consumes not yet reserved by any
+            //    accepted fire grant no relief — this is a worst case, not a
+            //    schedule. Seeded descriptor channels are exempt: their
+            //    occupancy belongs to the seed protocol, not to the
+            //    reserved-ticket ledger.
+            //
+            //    The capacity is the CHANNEL's own declared capacity
+            //    (`ChannelCell::capacity`, set from the program's channel
+            //    registration at bind), and the starting pressure is
+            //    `device_ring_backlog()` — the reservations accepted fires
+            //    hold and have not settled.
             if consume || publish {
                 let guard = cell.lock().unwrap();
                 if guard.role == Some(HostRole::None) && !guard.seeded {
@@ -2113,13 +2112,13 @@ dense AttnMask cell, is read back per fire"
                         pressure: guard.device_ring_backlog(),
                     });
                     if publish && ring.pressure >= ring.capacity + u64::from(consume) {
-                        return Ok(Err(format!(
-                            "pipeline: channel {}: frame would raise device-ring \
-                             occupancy past capacity {} (reserved backlog plus \
-                             in-frame publishes) — size device-only rings so every \
-                             frame's publish backlog fits",
+                        return Err(format!(
+                            "pipeline: channel {}: frame slot {slot} would raise \
+                             device-ring occupancy past capacity {} (reserved backlog \
+                             plus in-frame publishes) — size device-only rings so \
+                             every frame's publish backlog fits",
                             ring.global_id, ring.capacity,
-                        )));
+                        ));
                     }
                     ring.pressure += u64::from(publish);
                     ring.pressure = ring.pressure.saturating_sub(u64::from(consume));
@@ -2127,66 +2126,73 @@ dense AttnMask cell, is read back per fire"
             }
         }
     }
+
     for entry in uses.values() {
         let cell = entry.cell.lock().unwrap();
         match cell.role {
             Some(HostRole::Writer) => {
                 if entry.publishes == 0 && entry.consumes > 0 {
-                    // *staged* class: each consuming fire drains one host
-                    // cell; every one must exist at submit (frames execute
-                    // uninterrupted — no mid-frame host put can arrive).
+                    // ── HOST-WRITER, *staged* class: each consuming fire
+                    //    drains one host cell, and every one of them must
+                    //    already exist. A frame executes uninterrupted, so no
+                    //    mid-frame host `put` can arrive to make up a
+                    //    shortfall. The capacity here is not a ring size but
+                    //    an inventory: `writer_available_cells()` is what the
+                    //    guest has staged and not yet had taken.
                     let available = cell.writer_available_cells();
                     if available < entry.consumes as u64 {
-                        return Ok(Err(format!(
+                        return Err(format!(
                             "pipeline: channel {}: frame consumes {} host-writer \
                              cell(s) but only {available} are staged — stage every \
                              per-fire input before submitting the frame",
                             cell.global_id, entry.consumes
-                        )));
+                        ));
                     }
                 } else if entry.publishes == 0 && entry.consumes == 0 {
-                    // *latest-value* class: a control word the program only
-                    // reads. One committed cell suffices; host `set` may
-                    // replace it at any time.
+                    // ── HOST-WRITER, *latest-value* class: a control word the
+                    //    program only reads. One committed cell suffices; the
+                    //    host's `set` may replace it at any time.
                     if !cell.has_committed_front() {
-                        return Ok(Err(format!(
+                        return Err(format!(
                             "pipeline: channel {}: latest-value control word has \
                              no committed cell at frame submit",
                             cell.global_id
-                        )));
+                        ));
                     }
                 }
                 // publishes > 0: *device-advanced* — the program carries an
-                // advance rule for it.
+                // advance rule for it, so the host stages nothing.
             }
             Some(HostRole::Reader) if entry.publishes > 0 => {
-                // Overflow is prevented statically at submit, never by
-                // back-pressure: worst-case ring occupancy (reserved by
-                // accepted unsettled fires, minus host-consumed, plus
-                // this frame's writes) must fit the capacity.
+                // ── READER RING, WORST CASE. Overflow is prevented here and
+                //    never by back-pressure: the cells reserved by accepted
+                //    unsettled fires, minus what the host has consumed, plus
+                //    everything this frame writes, must fit the channel's
+                //    declared capacity. `reader_ring_pressure()` is the first
+                //    two numbers; `entry.publishes` is the third.
                 let (reserved_tail, consumed) = cell.reader_ring_pressure();
                 let needed = reserved_tail
                     .saturating_sub(consumed)
                     .saturating_add(entry.publishes as u64);
                 if needed > u64::from(cell.capacity) {
-                    return Ok(Err(format!(
+                    return Err(format!(
                         "pipeline: channel {}: frame would need {needed} reader \
                              cell(s) (capacity {}) — size take-side channels to at \
                              least 2k-1 = {} for frame-size k = {k}",
                         cell.global_id,
                         cell.capacity,
                         2 * k - 1,
-                    )));
+                    ));
                 }
             }
             _ => {
-                // Device-only rings are checked in the slot-order occupancy
+                // Device-only rings are proved in the slot-order occupancy
                 // walk above; seeded descriptor channels are governed by the
                 // seed protocol (`SeedAlreadyStaged` guards mutation).
             }
         }
     }
-    Ok(Ok(()))
+    Ok(())
 }
 
 /// Compaction (Design-B lazy KV GC): move `n` token KV cells within `ws`,
@@ -2717,7 +2723,6 @@ async fn fire_device_geometry<C: FireContext>(
     };
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
-    let page_size = ws.page_size;
     let stores = crate::store::registry::get(ws.model, ws.engine);
     let pid = ctx.process_id();
     let quorum_pipeline_id = pipeline_scope.scheduler_id();
@@ -2841,7 +2846,7 @@ async fn fire_device_geometry<C: FireContext>(
     // token lands in, so the host's `kv_last_page_lens` for it was a guess
     // dressed as a fact (`if pages.is_empty() { 0 } else { page_size }`).
     // `KvDelta` has no seat for a guess.
-    let (ws_guard, _pages, (copy_src, copy_dst), kv_translation, kvtxn, rs_prepared) = loop {
+    let (ws_guard, _pages, (copy_src, copy_dst), kvtxn, rs_prepared) = loop {
         let kv_demand =
             match crate::store::registry::with_kv_lock(&stores.kv, "host-other", |store| {
                 kv::prepare_explicit_demand(store, ws.id, &write_indexes)
@@ -2900,7 +2905,7 @@ async fn fire_device_geometry<C: FireContext>(
                 return Ok(Err(format!("pipeline: KV working set: {error}")));
             }
         };
-        let (pages, copies, kv_translation, kvtxn) =
+        let (pages, copies, _kv_translation, kvtxn) =
             match prepare_explicit_kv_reserved(&stores, &ws, &write_indexes, &mut grant) {
                 Ok(prepared) => prepared,
                 Err(ReservedError::Stale) if attempts < STALE_DEMAND_ATTEMPTS => {
@@ -2928,7 +2933,7 @@ async fn fire_device_geometry<C: FireContext>(
             &rs_plan,
             &mut grant,
         ) {
-            Ok(Ok(prepared)) => break (ws_guard, pages, copies, kv_translation, kvtxn, prepared),
+            Ok(Ok(prepared)) => break (ws_guard, pages, copies, kvtxn, prepared),
             Ok(Err(ReservedError::Stale)) if attempts < STALE_DEMAND_ATTEMPTS => {
                 attempts += 1;
                 // kvtxn's guard aborts the prepared KV write on drop.
@@ -2958,11 +2963,9 @@ async fn fire_device_geometry<C: FireContext>(
     // Deliver the fresh grant to the program as a direct put on its `fresh`
     // channel — a shared-ring write the engine pulls before the pass (plan
     // §4.2/§4.3). The grants are WorkingSet-RELATIVE indexes — the
-    // program's in-graph geometry stays logical end-to-end and the engine
-    // translates its resolved `Pages`/`WSlot` values through
-    // `kv_translation` (which the prepared write above backs physically).
-    // This also matches the bind-time seed (`reserve(b)`), which was
-    // already logical.
+    // program's in-graph geometry stays logical end-to-end and the prepared
+    // write above backs the physical pages behind it. This also matches the
+    // bind-time seed (`reserve(b)`), which was already logical.
     let (completion, instance_id, scheduler, cells, fwd_rep, accesses) = {
         let p = ctx.resources().get_mut(&fwd)?;
         let bytes: Vec<u8> = grant_slots.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -2994,9 +2997,10 @@ async fn fire_device_geometry<C: FireContext>(
             accesses,
         )
     };
-    let kv_translation_version = kvtxn
-        .mapping_version()
-        .expect("device-geometry fire always holds a KV transaction");
+    debug_assert!(
+        kvtxn.mapping_version().is_some(),
+        "device-geometry fire always holds a KV transaction"
+    );
 
     // Device geometry and mask provenance are NOT independent, which is what
     // the previous version of this comment had wrong. For a device-geometry
@@ -3061,21 +3065,8 @@ async fn fire_device_geometry<C: FireContext>(
                 ..crate::engine::Lane::default()
             })
             .collect(),
-        kv_translation,
-        kv_translation_version,
         ..crate::engine::FireRequest::default()
     };
-    // The declared writable span is this pass's containment promise, and the
-    // host has to state it even though the device picks the exact cells: the
-    // engine's device-composed template — the ONLY resolver that can read a
-    // value the producing fire has not committed yet — refuses a batch whose
-    // bounds are absent, and falls back to a host readback that cannot see a
-    // loop-carried descriptor at all. Omitting them here is what made every
-    // device-carried decode fail with `descriptor channel N not ready`.
-    if let Some(span) = &writable_span {
-        let page_size = u64::from(page_size);
-        req.kv_write_bounds = Some((span.start * page_size, span.end * page_size));
-    }
     rs_prepared.apply_to(&mut req);
     let fire_wide_mask = matches!(attn_mask, geometry::FireAttnMask::Device);
     if let Err(error) = attn_mask.apply_to(&mut req) {
@@ -3096,13 +3087,16 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
     }
-    // Same carry as the wire path: the AttnMask channel binding is the
-    // program's, so a device-geometry fire of a mask-binding pass must be
-    // scheduled SOLO too. Omitting it here is what let the run-ahead
-    // carrier batch 8 concurrent pipelines into one step, which the engine
-    // rejects (`dense device mask in a multi-program batch`) — the failing
-    // prepare then poisoned descriptor channel 0 and lost every stream.
-    req.dense_device_mask = ctx.resources().get(&fwd)?.dense_mask;
+    // AND THE TABLE THE ENGINE RESOLVES THIS PASS'S PAGE REFERENCES THROUGH.
+    // The host path's `map_lane_pages` has no work here — a device-geometry
+    // lane's `KvDelta::pages` is empty, because its pages are in a channel —
+    // so this is where the same translation crosses instead. See
+    // `stamp_lane_translation`.
+    if let Err(refusal) = stamp_lane_translation(&mut req, &stores, ws.id) {
+        reclaim_pending_device_grant(ctx, &fwd);
+        record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
+        return Ok(Err(refusal));
+    }
     // The CLASS this fire is, said on the wire.
     //
     // A POOLED device-geometry fire states its pages in a channel and picks a
@@ -3136,7 +3130,6 @@ async fn fire_device_geometry<C: FireContext>(
     let (hook_program, lora_program) = {
         let p = ctx.resources().get(&fwd)?;
         let container = &p.instance.program.bound.container;
-        req.hook_page_mask = container_writes_page_mask(container);
         (
             container_has_attention_stages(container),
             container_has_lora_sink(container),
@@ -3418,5 +3411,210 @@ mod lifecycle_tests {
         pipeline_drop(&mut context, pipeline).await?;
         assert!(context.resources.get(&borrowed).is_err());
         Ok(())
+    }
+}
+
+/// **STATIC ADMISSION, PROVED AGAINST CHANNELS** (alto E; design §1 article 4,
+/// survey §7 I8).
+///
+/// These drive [`prove_frame_admissible`] — the half of `validate_frame` that
+/// is the proof rather than the resource lookup — because what article 4 asks
+/// is a statement about rings and capacities, not about a wasm store. Each
+/// test builds the channels a frame would touch, states what each slot does to
+/// them, and asserts the frame is admitted or refused BY NAME.
+///
+/// The rule these replaced is in `validate_frame`'s own doc: a chained-slot
+/// refusal justified by a `try_device_composed_template` in a `csrc/` this
+/// tree does not contain.
+#[cfg(test)]
+mod static_admission_tests {
+    use super::*;
+    use crate::pipeline::channel::ChannelCell;
+    use tensor_ir::container::ChannelDecl;
+    use tensor_ir::types::{DType, Shape};
+
+    /// One bound channel: a cell with a role, a capacity and a seeded flag.
+    fn channel(role: HostRole, capacity: u32, seeded: bool) -> Arc<Mutex<ChannelCell>> {
+        let mut cell = ChannelCell::new(vec![1], DType::U32, capacity);
+        cell.bind(&ChannelDecl {
+            shape: Shape::new(&[1]).expect("a one-element cell"),
+            dtype: tensor_ir::container::ChanDType::Concrete(DType::U32),
+            capacity,
+            host_role: role,
+            seeded,
+        });
+        Arc::new(Mutex::new(cell))
+    }
+
+    /// A slot that does `accesses[i]` to `cells[i]`.
+    fn slot(cells: &[Arc<Mutex<ChannelCell>>], accesses: &[(bool, bool)]) -> SlotAccess {
+        SlotAccess {
+            cells: cells.to_vec(),
+            accesses: accesses.to_vec(),
+        }
+    }
+
+    /// Reserve `n` publish tickets on a channel — what an accepted, unsettled
+    /// fire leaves behind. This is the state the walk starts from.
+    fn reserve_publishes(cell: &Arc<Mutex<ChannelCell>>, n: usize) {
+        for _ in 0..n {
+            cell.lock().unwrap().reserve_device_ticket(false, true);
+        }
+    }
+
+    /// **A DEVICE-ONLY RING IS WALKED IN SLOT ORDER**, and a frame whose net
+    /// growth fits its declared capacity is admitted.
+    ///
+    /// Two slots, each publishing one cell and consuming the one before it:
+    /// occupancy goes 0 → 1 → 1, which a capacity of 2 holds with room. The
+    /// walk has to be ordered for this to be provable at all — the same two
+    /// accesses counted as a set say "two publishes, two consumes" and cannot
+    /// tell this frame from one that publishes both before consuming either.
+    #[test]
+    fn a_device_ring_frame_that_fits_in_slot_order_is_admitted() {
+        let ring = channel(HostRole::None, 2, false);
+        let slots = [
+            slot(std::slice::from_ref(&ring), &[(false, true)]),
+            slot(std::slice::from_ref(&ring), &[(true, true)]),
+        ];
+        assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
+    }
+
+    /// The same shape past the capacity is refused, and the refusal names the
+    /// channel, the slot and the capacity.
+    ///
+    /// This is the whole of why retry is deletable: a frame that structurally
+    /// overfills a device-only ring would jam on the device with nothing left
+    /// to absorb it, so it must not be admitted rather than admitted and
+    /// re-offered.
+    #[test]
+    fn a_device_ring_frame_that_overflows_is_refused_by_name() {
+        let ring = channel(HostRole::None, 1, false);
+        let slots = [
+            slot(std::slice::from_ref(&ring), &[(false, true)]),
+            slot(std::slice::from_ref(&ring), &[(false, true)]),
+        ];
+        let refusal = prove_frame_admissible(2, &slots).expect_err("two publishes, capacity one");
+        assert!(refusal.contains("device-ring occupancy past capacity 1"), "{refusal}");
+        assert!(refusal.contains("frame slot 1"), "{refusal}");
+    }
+
+    /// **THE BACKLOG OF ACCEPTED FIRES IS WHERE THE WALK STARTS.** A ring with
+    /// room for two that already owes one publish to an unsettled fire has
+    /// room for one more, not two.
+    #[test]
+    fn a_reserved_backlog_counts_against_the_frame() {
+        let ring = channel(HostRole::None, 2, false);
+        reserve_publishes(&ring, 1);
+        let one = [slot(std::slice::from_ref(&ring), &[(false, true)])];
+        assert_eq!(prove_frame_admissible(2, &one), Ok(()));
+
+        let two = [
+            slot(std::slice::from_ref(&ring), &[(false, true)]),
+            slot(std::slice::from_ref(&ring), &[(false, true)]),
+        ];
+        let refusal = prove_frame_admissible(2, &two).expect_err("backlog + 2 > capacity 2");
+        assert!(refusal.contains("device-ring occupancy past capacity 2"), "{refusal}");
+    }
+
+    /// A seeded descriptor channel is exempt: its occupancy belongs to the
+    /// seed protocol, not to the reserved-ticket ledger.
+    #[test]
+    fn a_seeded_descriptor_ring_is_not_walked() {
+        let seeded = channel(HostRole::None, 1, true);
+        let slots = [
+            slot(std::slice::from_ref(&seeded), &[(false, true)]),
+            slot(std::slice::from_ref(&seeded), &[(false, true)]),
+        ];
+        assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
+    }
+
+    /// **EVERY HOST-WRITER CELL A FRAME DRAINS MUST ALREADY BE STAGED.**
+    ///
+    /// A frame executes uninterrupted, so a `put` arriving mid-frame is not a
+    /// thing that can happen: two consuming slots against one staged cell is
+    /// a frame that would run dry, and it is refused at submit with the two
+    /// numbers in the message.
+    #[test]
+    fn a_frame_that_drains_more_writer_cells_than_are_staged_is_refused() {
+        let writer = channel(HostRole::Writer, 4, false);
+        writer
+            .lock()
+            .unwrap()
+            .put(vec![0u8; 4])
+            .expect("one staged cell");
+        let one = [slot(std::slice::from_ref(&writer), &[(true, false)])];
+        assert_eq!(prove_frame_admissible(2, &one), Ok(()));
+
+        let two = [
+            slot(std::slice::from_ref(&writer), &[(true, false)]),
+            slot(std::slice::from_ref(&writer), &[(true, false)]),
+        ];
+        let refusal = prove_frame_admissible(2, &two).expect_err("two consumes, one staged");
+        assert!(refusal.contains("consumes 2 host-writer cell(s)"), "{refusal}");
+        assert!(refusal.contains("only 1 are staged"), "{refusal}");
+    }
+
+    /// A latest-value control word — a Writer nobody consumes and nobody
+    /// publishes to — needs one committed cell, and says so when it has none.
+    #[test]
+    fn a_latest_value_word_with_no_committed_cell_is_refused() {
+        let word = channel(HostRole::Writer, 1, false);
+        let slots = [
+            slot(std::slice::from_ref(&word), &[(false, false)]),
+            slot(std::slice::from_ref(&word), &[(false, false)]),
+        ];
+        let refusal = prove_frame_admissible(2, &slots).expect_err("never set");
+        assert!(refusal.contains("latest-value control word"), "{refusal}");
+
+        word.lock()
+            .unwrap()
+            .put(vec![0u8; 4])
+            .expect("the host writes the word");
+        assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
+    }
+
+    /// **THE READER RING IS SIZED FOR THE WORST CASE**, which is the guest
+    /// draining nothing before the frame executes.
+    ///
+    /// Capacity `2k - 1` is the message's own advice at k = 2: a frame of two
+    /// publishing slots needs two cells, and a ring of one is refused with the
+    /// number it would have needed.
+    #[test]
+    fn a_reader_ring_too_small_for_the_frames_writes_is_refused() {
+        let reader = channel(HostRole::Reader, 1, false);
+        let slots = [
+            slot(std::slice::from_ref(&reader), &[(false, true)]),
+            slot(std::slice::from_ref(&reader), &[(false, true)]),
+        ];
+        let refusal = prove_frame_admissible(2, &slots).expect_err("two writes, capacity one");
+        assert!(refusal.contains("frame would need 2 reader cell(s)"), "{refusal}");
+        assert!(refusal.contains("2k-1 = 3"), "{refusal}");
+
+        let roomy = channel(HostRole::Reader, 3, false);
+        let ok = [
+            slot(std::slice::from_ref(&roomy), &[(false, true)]),
+            slot(std::slice::from_ref(&roomy), &[(false, true)]),
+        ];
+        assert_eq!(prove_frame_admissible(2, &ok), Ok(()));
+    }
+
+    /// **A CHAINED SLOT IS ADMITTED**, which is the rule wave E deleted.
+    ///
+    /// Slot 0 publishes a device-only descriptor ring and slot 1 consumes it —
+    /// the shape `validate_frame` used to refuse whenever slot 1's descriptors
+    /// "resolved on the HOST", on behalf of a `FramePrepare` that ran every
+    /// step's host work at frame entry. `Cuda::submit` prepares each step in
+    /// turn, off the committed front the step before it advanced, so the
+    /// frame is ordinary and the only question left is whether the ring holds
+    /// it.
+    #[test]
+    fn a_slot_that_consumes_what_an_earlier_slot_published_is_admitted() {
+        let chained = channel(HostRole::None, 2, false);
+        let slots = [
+            slot(std::slice::from_ref(&chained), &[(false, true)]),
+            slot(std::slice::from_ref(&chained), &[(true, false)]),
+        ];
+        assert_eq!(prove_frame_admissible(2, &slots), Ok(()));
     }
 }

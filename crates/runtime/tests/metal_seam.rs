@@ -43,14 +43,6 @@ fn the_metal_seam_opens_and_refuses_every_verb_by_name() {
             .copy_kv(&Default::default())
             .expect_err("there is no pool to copy within"),
         backend
-            .resize_pool(&engine_api::PoolResize {
-                pool: engine_api::Pool::Kv,
-                target_pages: 0,
-                map_ranges: Vec::new(),
-                unmap_ranges: Vec::new(),
-            })
-            .expect_err("there is no pool to resize"),
-        backend
             .encode(&mut Default::default())
             .expect_err("there is no encoder"),
     ] {

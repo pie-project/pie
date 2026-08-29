@@ -31,7 +31,7 @@
 //! ([`common::SERVING_GREEDY_16`]) in every mode. That is the runtime-level
 //! "folded serving says what eager serving says", single-lane, and it is
 //! the identity the shell's own gates pin. And the fold's MOTION: the
-//! measured mixed window folds its fires; the `PIE_CUDA_PIPELINE=off` arm
+//! measured mixed window folds its fires; the `PIE_FOLD_E2E_PIPELINE=off` arm
 //! pays critical-path rebinds (or the workload is not alternating and the
 //! gate measures nothing); the pipelined arm turns the pair instead.
 //!
@@ -47,11 +47,12 @@
 //!
 //! # Running the A/B
 //!
-//! One boot per process, and `PIE_CUDA_PIPELINE` is read once at load — so
-//! the arms are two invocations, the repo's standing manual-A/B shape:
+//! One boot per process, and the knobs are read once at load off the boot
+//! document this test writes — so the arms are two invocations, the repo's
+//! standing manual-A/B shape:
 //!
 //! ```text
-//! PIE_CUDA_PIPELINE=off cargo test -p pie-gpu-tests \
+//! PIE_FOLD_E2E_PIPELINE=off cargo test -p pie-gpu-tests \
 //!   --features engine-cuda-13,runtime/profile-fire --release \
 //!   --test cuda_fold_hint_e2e -- --ignored --nocapture   # step-4 fold
 //! cargo test -p pie-gpu-tests \
@@ -138,28 +139,13 @@ async fn the_engines_own_hint_reaches_the_fold_without_a_test_side_expect() -> R
         Some("keyed") => Mode::Keyed,
         _ => Mode::Folded,
     };
-    // The fold and the recorder are load-time opt-ins (`PIE_CUDA_FOLD`
-    // defaults off; the serving boot's `[engine] graphs` defaults to eager),
-    // and this gate is ABOUT them. Set before the boot, on the test's main
-    // thread, before any thread the boot spawns can read the environment.
-    //
-    // SAFETY: nothing else runs yet — the boot below is this process's
-    // first, and `Shell::load` reads the variables once.
-    unsafe {
-        match mode {
-            Mode::Folded => {
-                std::env::set_var("PIE_CUDA_GRAPHS", "on");
-                std::env::set_var("PIE_CUDA_FOLD", "on");
-            }
-            Mode::Keyed => {
-                std::env::set_var("PIE_CUDA_GRAPHS", "on");
-                std::env::set_var("PIE_CUDA_FOLD", "off");
-            }
-            Mode::Eager => std::env::set_var("PIE_CUDA_GRAPHS", "off"),
-        }
-    }
+    // The pipeline arm is still an environment word, and it is the TEST's:
+    // one boot per process, so an A/B is two invocations, and what the word
+    // selects is which boot document this test writes. The shell reads none of
+    // it (alto article 9) — every knob below lands in `[engine]` and reaches
+    // the shell typed on its `Boot`.
     let pipeline = !matches!(
-        std::env::var("PIE_CUDA_PIPELINE").ok().as_deref(),
+        std::env::var("PIE_FOLD_E2E_PIPELINE").ok().as_deref(),
         Some("off" | "0" | "false")
     );
     let arm = match (mode, pipeline) {
@@ -171,6 +157,20 @@ async fn the_engines_own_hint_reaches_the_fold_without_a_test_side_expect() -> R
 
     let checkpoint = common::resolve_qwen35_snapshot()?;
     let mut toml = common::serving_standalone_toml(&checkpoint);
+    // **THE ARM, IN THE BOOT DOCUMENT** (alto wave P). The fold and the
+    // recorder are load-time opt-ins — the fold defaults off, `[engine] graphs`
+    // defaults to eager — and this gate is ABOUT them. They were three
+    // `PIE_CUDA_*` variables set on the test's main thread before the boot;
+    // they are `[engine]` keys now, which is also the only form in which an
+    // operator could have reproduced this run.
+    toml.push_str(match mode {
+        Mode::Folded => "graphs = \"on\"\nfold = true\n",
+        Mode::Keyed => "graphs = \"on\"\nfold = false\n",
+        Mode::Eager => "graphs = \"off\"\n",
+    });
+    if !pipeline {
+        toml.push_str("pipeline = false\n");
+    }
     let depth: u32 = std::env::var("PIE_FOLD_E2E_DEPTH")
         .ok()
         .and_then(|s| s.parse().ok())

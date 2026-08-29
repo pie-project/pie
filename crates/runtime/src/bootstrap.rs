@@ -45,14 +45,10 @@ impl Drop for ActiveRuntimeGuard {
 struct RuntimeShutdown {
     scheduler: crate::scheduler::SchedulerShutdownHandle,
     engine_ids: Vec<usize>,
-    elastic_trim_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RuntimeShutdown {
     async fn shutdown(self) -> Result<()> {
-        if let Some(task) = self.elastic_trim_task {
-            task.abort();
-        }
         let scheduler_result = self.scheduler.shutdown().await;
         for engine_id in self.engine_ids {
             let _ = engine::backend::unregister_engine(engine_id);
@@ -177,8 +173,13 @@ pub struct EngineConfig {
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
-    pub elastic_page_bytes: u64,
-    pub elastic_budget_pages: u64,
+    // `elastic_page_bytes` and `elastic_budget_pages` stood here and were
+    // WRITE-ONLY: `translate.rs` copied them off `PoolFacts` and nothing in
+    // this crate ever read either one. Wave C gave the elastic supply its own
+    // reader — `Supply::trim` asks the engine, and `PoolFacts` is where a gate
+    // reads the numbers back — so a second copy in the scheduler's config was
+    // a field that could only go stale. Deleted rather than wired: the facts
+    // are one call away from every caller that wants them (alto wave P).
     pub has_mtp_logits: bool,
     pub has_mtp_drafts: bool,
     pub has_value_head: bool,
@@ -189,8 +190,6 @@ pub struct EngineConfig {
     /// Which descriptor ports it resolves on the device, in the port
     /// registry's own numbering (decision 19).
     pub device_geometry_port_mask: tensor_ir::registry::PortMask,
-    /// See [`crate::engine::EngineSpec::resolves_geometry_per_step`].
-    pub resolves_geometry_per_step: bool,
     pub limits: crate::engine::SchedulerLimits,
     pub engine_backend: crate::engine::EngineBox,
 }
@@ -208,9 +207,6 @@ pub struct SchedulerConfig {
     pub silence_timeout_secs: u64,
     /// Waves per frame (k). See `crate::scheduler::configured_frame_size`.
     pub frame_size: u32,
-    /// Frames a guest keeps submitted into the runtime. See
-    /// `crate::scheduler::configured_submit_depth`.
-    pub frame_submit_depth: u32,
     /// Frames the runtime keeps posted to the engine. See
     /// `crate::scheduler::frame::configured_dispatch_depth`.
     pub frame_dispatch_depth: u32,
@@ -418,18 +414,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
-    let elastic_page_bytes: Vec<u64> = engine_configs
-        .iter()
-        .map(|d| d.elastic_page_bytes)
-        .collect();
-    let rs_slot_bytes: Vec<u64> = engine_configs
-        .iter()
-        .map(|d| d.rs_cache_slot_bytes)
-        .collect();
-    let elastic_trim_enabled: Vec<bool> = engine_configs
-        .iter()
-        .map(|d| d.elastic_page_bytes != 0 && d.elastic_budget_pages != 0)
-        .collect();
     // Whether engine 0 (the contention-managed pool; working sets are
     // hardwired to (0, 0) until the per-engine core lands) can physically
     // move KV bytes to/from host swap — arms the suspend rung.
@@ -448,7 +432,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
-                    resolves_geometry_per_step: d.resolves_geometry_per_step,
                 },
                 d.engine_backend,
             )
@@ -582,7 +565,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // `model.frame-size()` / `model.channel-capacity()`, so they must be
     // installed before anything touches the scheduler.
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
-    crate::scheduler::set_submit_depth(scheduler.frame_submit_depth as usize);
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let scheduler_shutdown = crate::scheduler::spawn(
         &engines,
@@ -590,116 +572,16 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         scheduler.request_timeout_secs,
     )
     .await?;
-    let elastic_trim_task = elastic_trim_enabled
-        .iter()
-        .any(|enabled| *enabled)
-        .then(|| {
-            let engine_ids = engines.clone();
-            let enabled_engines = elastic_trim_enabled.clone();
-            let capacities = arena_kv_pages.clone();
-            let elastic_page_bytes = elastic_page_bytes.clone();
-            let rs_slot_bytes = rs_slot_bytes.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-                interval.tick().await;
-                // Last target actually APPLIED per engine, as (kv, state,
-                // workspace). A resize is not a cheap message: the CUDA engine
-                // refuses one unless the compute and swap streams are already
-                // drained (`context.cpp` resize_pool, "the quiescence gate
-                // above IS the horizon-empty condition"), and the scheduler
-                // manufactures that drain by holding every launch until the
-                // op settles. So each resize costs a full device idle window
-                // -- measured at 51-75 ms apiece, three per tick.
-                //
-                // The trim targets the committed HIGH WATER, which is
-                // monotonic non-decreasing. Once a server reaches its working
-                // size every later tick therefore asks for the same target it
-                // already applied, and pays three drains to change nothing.
-                // Repeating a target is the steady state, not the exception.
-                let mut applied: Vec<[Option<u64>; 3]> = vec![[None; 3]; engine_ids.len()];
-                loop {
-                    interval.tick().await;
-                    for (ordinal, engine_id) in engine_ids.iter().copied().enumerate() {
-                        if !enabled_engines.get(ordinal).copied().unwrap_or(false) {
-                            continue;
-                        }
-                        let Some(stores) =
-                            crate::store::registry::try_get(arena_model_idx, ordinal)
-                        else {
-                            continue;
-                        };
-                        let target = crate::store::registry::with_kv_lock(
-                            &stores.kv,
-                            "elastic_trim_high_water",
-                            |kv| kv.committed_high_water_pages().max(1),
-                        );
-                        let capacity = capacities[ordinal] as u32;
-                        let unmap_ranges = vec![::engine_api::PageRange {
-                            page_index: u64::from(target),
-                            page_count: u64::from(capacity - target),
-                        }];
-                        if applied[ordinal][0] == Some(u64::from(target)) {
-                            // Same target as last time: the pages above it are
-                            // already unmapped. Skipping costs nothing and
-                            // saves the drain.
-                            continue;
-                        }
-                        if let Ok(completion) = crate::scheduler::resize_pool(
-                            engine_id,
-                            ::engine_api::Pool::Kv,
-                            u64::from(target),
-                            Vec::new(),
-                            unmap_ranges,
-                        )
-                        .await
-                            && completion.await.is_ok()
-                        {
-                            applied[ordinal][0] = Some(u64::from(target));
-                            let rs_high_water =
-                                stores.rs.lock().unwrap().committed_high_water_slots();
-                            let page_bytes = elastic_page_bytes.get(ordinal).copied().unwrap_or(0);
-                            let slot_bytes = rs_slot_bytes.get(ordinal).copied().unwrap_or(0);
-                            if page_bytes != 0 && slot_bytes != 0 {
-                                let state_bytes =
-                                    u64::from(rs_high_water).saturating_mul(slot_bytes);
-                                let state_pages =
-                                    state_bytes.saturating_add(page_bytes - 1) / page_bytes;
-                                if applied[ordinal][1] != Some(state_pages)
-                                    && let Ok(state) = crate::scheduler::resize_pool(
-                                        engine_id,
-                                        ::engine_api::Pool::State,
-                                        state_pages,
-                                        Vec::new(),
-                                        Vec::new(),
-                                    )
-                                    .await
-                                    && state.await.is_ok()
-                                {
-                                    applied[ordinal][1] = Some(state_pages);
-                                }
-                            }
-                            // The workspace target is the constant 0, so
-                            // after the first successful trim this one is a
-                            // no-op every single tick.
-                            if applied[ordinal][2] != Some(0)
-                                && let Ok(workspace) = crate::scheduler::resize_pool(
-                                    engine_id,
-                                    ::engine_api::Pool::Workspace,
-                                    0,
-                                    Vec::new(),
-                                    Vec::new(),
-                                )
-                                .await
-                                && workspace.await.is_ok()
-                            {
-                                applied[ordinal][2] = Some(0);
-                            }
-                        }
-                    }
-                }
-            })
-        });
-
+    // **THE 10-SECOND ELASTIC-TRIM POLL IS GONE** (alto design §8, wave C;
+    // survey §2 debt 9). It woke every ten seconds, scanned this runtime's
+    // own page free list for a high water, and sent the engine three
+    // `resize_pool` messages — each of which cost a full device drain,
+    // measured at 51-75 ms. Elasticity is a side effect of admission now: a
+    // frame's union demand is committed atomically by the engine before any
+    // of it runs, so the pools hold what has been asked for rather than what
+    // somebody polled for. The high water it computed was a supply question
+    // asked of a policy structure; the engine owns that number and reports it
+    // (`LoadFacts::pool_high_water_bytes`).
     // (The old reclaim-ladder leave/kill/probe hook seams are gone: the
     // planner lives ABOVE both `store` and `scheduler` and calls
     // `scheduler::worker::notify_pipeline_leave_owned` and the residency
@@ -711,7 +593,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         shutdown: Some(RuntimeShutdown {
             scheduler: scheduler_shutdown,
             engine_ids: engines,
-            elastic_trim_task,
         }),
     })
 }

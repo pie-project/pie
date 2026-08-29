@@ -50,7 +50,7 @@ use engine_api::error::{Error, Result};
 use engine_api::fire::{FrameSubmission, FrameTicket, MediaEncode, Step};
 use engine_api::load::{LoadRequest, Loaded};
 use engine_api::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine_api::transfer::{KvCopy, PoolResize, StateCopy};
+use engine_api::transfer::{KvCopy, StateCopy};
 use engine_api::{ChannelId, Engine};
 
 use crate::engine::CompletionBroker;
@@ -241,11 +241,6 @@ impl Engine for RemoteEngine {
     fn copy_state(&mut self, copy: &StateCopy) -> Result<()> {
         let _ = copy;
         Err(self.refuse("copy_state"))
-    }
-
-    fn resize_pool(&mut self, resize: &PoolResize) -> Result<()> {
-        let _ = resize;
-        Err(self.refuse("resize_pool"))
     }
 
     fn encode(&mut self, plan: &mut MediaEncode) -> Result<()> {

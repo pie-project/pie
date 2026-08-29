@@ -151,8 +151,6 @@ fn build_model(
                 rs_cache_required: g.caps.pools.state_slots != 0,
                 rs_cache_slots: g.caps.pools.state_slots as usize,
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
-                elastic_page_bytes: g.caps.pools.elastic_page_bytes,
-                elastic_budget_pages: g.caps.pools.elastic_budget_pages,
                 has_mtp_logits: g.caps.profile.has_mtp_logits,
                 has_mtp_drafts: g.caps.profile.has_mtp_drafts,
                 has_value_head: g.caps.profile.has_value_head,
@@ -164,13 +162,6 @@ fn build_model(
                 has_attn_score: g.caps.profile.has_attn_score,
                 has_lora: g.caps.profile.has_lora,
                 device_geometry_port_mask: g.caps.ports,
-                // palo B-pipelined-geometry: this said whether an engine
-                // resolves a STEP's descriptor ports when the step runs
-                // rather than for the whole frame. The contract has no field
-                // for it, and no shell in this workspace interleaves the two
-                // halves — the CUDA shell stages every geometry vector from
-                // the host before the walk. False is what both of those say.
-                resolves_geometry_per_step: false,
                 limits: ::runtime::engine::SchedulerLimits {
                     max_forward_requests: g.caps.limits.max_lanes as usize,
                     max_forward_tokens: g.caps.limits.max_tokens as usize,
@@ -204,7 +195,6 @@ fn build_model(
             submit_deadline_us: runtime.submit_deadline.as_micros(),
             silence_timeout_secs: runtime.silence_timeout.as_secs(),
             frame_size: runtime.frame_size,
-            frame_submit_depth: runtime.frame_submit_depth,
             frame_dispatch_depth: runtime.frame_dispatch_depth,
         },
     })

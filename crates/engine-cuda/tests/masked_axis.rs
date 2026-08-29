@@ -26,7 +26,7 @@
 //! cargo test -p engine-cuda --features cuda-13 --test masked_axis -- --nocapture
 //! ```
 
-use engine::engine_api::fire::Mask;
+use engine::engine_api::fire::{Mask, Masking};
 use engine_cuda::{Fault, LaneMask, Seated};
 use model_compiler::{Budget, DeviceProfile, compile};
 use model_dsl::Platform;
@@ -254,7 +254,7 @@ fn gemma_states_a_sliding_window_on_most_of_its_masked_arms() {
 fn the_staged_bits_read_back_the_way_the_device_text_addresses_them() {
     // Lane 0: unmasked, 3 held, 2 new. Lane 1: masked, 5 held, 3 new, with
     // positions 0 and 6 dropped. Lane 2: unmasked decode.
-    let mask = Mask::new(vec![1, 5, 1, 1], 8);
+    let mask = Masking::Extent(Mask::new(vec![1, 5, 1, 1], 8));
     let staged = engine_cuda::mask::stage(&[
         LaneMask {
             mask: None,
@@ -322,7 +322,7 @@ fn a_mask_against_a_maskless_artifact_is_refused_by_name() {
     };
     shell.open(0).expect("slot 0 opens");
     let tokens = [9707u32, 11, 1879];
-    let mask = Mask::new(vec![0, 3], 3);
+    let mask = Masking::Extent(Mask::new(vec![0, 3], 3));
     let refused = shell.fire_seated(&[engine_cuda::Seated::masked(
         engine_cuda::Lane {
             slot: 0,
@@ -380,7 +380,7 @@ fn a_mixed_fire_of_all_three_classes_says_what_each_lane_says_alone() {
     // has to reproduce the causal answer exactly — the same claim
     // `the_masked_arm_says_what_the_causal_arm_says` makes at length, made
     // here inside a mixed fire.
-    let keep = Mask::new(vec![0, masked.len() as u32], masked.len() as u64);
+    let keep = Masking::Extent(Mask::new(vec![0, masked.len() as u32], masked.len() as u64));
 
     // Solo: each lane on its own slot, alone in its fire.
     let solo_carried = gemma::solo(&mut shell, 0, &carried, None, STEPS);
@@ -511,7 +511,7 @@ fn the_masked_arm_says_what_the_causal_arm_says() {
          one is {} tokens",
         long.len()
     );
-    let keep = Mask::new(vec![0, long.len() as u32], long.len() as u64);
+    let keep = Masking::Extent(Mask::new(vec![0, long.len() as u32], long.len() as u64));
 
     let causal = gemma::solo(&mut shell, 0, &long, None, 4);
     let masked = gemma::solo(&mut shell, 1, &long, Some(&keep), 4);
@@ -539,7 +539,8 @@ fn the_masked_arm_says_what_the_causal_arm_says() {
     // no key at all under the 512-wide window, which is a different question
     // (an empty softmax) than the one this file asks. Every query row keeps
     // key 0 by the causal bound, so every row still attends exactly one key.
-    let only_first = Mask::new(vec![0, 1, long.len() as u32 - 1], long.len() as u64);
+    let only_first =
+        Masking::Extent(Mask::new(vec![0, 1, long.len() as u32 - 1], long.len() as u64));
     let cut = gemma::solo(&mut shell, 2, &long, Some(&only_first), 1);
     eprintln!("only-first-key {:?}", tok.decode(&cut, false));
     assert_ne!(
@@ -567,7 +568,7 @@ fn a_masked_composition_captures_once_and_replays_identically() {
     const STEPS: usize = 6;
 
     let masked = tok.encode(&gemma::turn("Name a colour. One word."));
-    let keep = Mask::new(vec![0, masked.len() as u32], masked.len() as u64);
+    let keep = Masking::Extent(Mask::new(vec![0, masked.len() as u32], masked.len() as u64));
 
     let mut run = |mode: engine_cuda::Graphs| {
         shell.set_mode(mode);
@@ -632,7 +633,7 @@ fn two_sequences_through_one_boot_say_the_same_thing() {
         return;
     };
     let prompt = tok.encode(&gemma::turn("What is the capital of France? Answer in one word."));
-    let keep = Mask::new(vec![0, prompt.len() as u32], prompt.len() as u64);
+    let keep = Masking::Extent(Mask::new(vec![0, prompt.len() as u32], prompt.len() as u64));
 
     // A masked sequence between the two, on the same slot, so the second
     // launch follows a DIFFERENT class as well as a different sequence.
@@ -650,6 +651,134 @@ fn two_sequences_through_one_boot_say_the_same_thing() {
         "the second sequence through one boot said {:?} where the first said {:?}",
         tok.decode(&second, false),
         tok.decode(&first, false),
+    );
+}
+
+/// **THE WINDOWED PREFILL, ON THE DEVICE: EVERY ROW UNDER ITS OWN MASK.**
+///
+/// The shape `Masking::Rows` exists for, asked of the kernel rather than of
+/// the expansion. A sliding-window prefill gives row `i` the keys `[i - w, i]`
+/// and row `i + 1` the keys `[i + 1 - w, i + 1]` — two restrictions that are
+/// not nested, so no `Masking::Extent` is either of them, and the lowering
+/// that had only that form refused the fire by name (`palo B-mask`) after an
+/// older one had silently used row ZERO's mask on every row.
+///
+/// **THE CONTROL IS THE SAME LAST ROW REACHED BY THE PROVEN PATH.** Only the
+/// LAST row of this fire is windowed; every earlier row keeps everything,
+/// which under the causal bound is the plain causal prefix. So the same last
+/// row can be built a second way out of parts this file already trusts: fire
+/// the first `n - 1` tokens as an ordinary causal prefill (no mask at all),
+/// then feed the last token as a ONE-ROW lane carrying that row's window as a
+/// `Masking::Extent` — the decode-shaped custom mask, the one form this shell
+/// served before per-row masks existed and the one
+/// `the_masked_arm_says_what_the_causal_arm_says` pins. Both readings see the
+/// identical KV, built identically, and the identical key set on the row that
+/// is read back. They must agree.
+///
+/// **AND THE WINDOW MUST BITE**, or the agreement above is two ways of
+/// spelling the unmasked answer: the same prompt through the plain causal arm
+/// must say something ELSE. Between them the two claims are decisive about
+/// the thing that actually changed — a row's mask is that row's. Under the
+/// row-zero substitution the per-row fire would keep everything on every row
+/// (row 0's mask is the all-keeping one here) and land on the CAUSAL answer,
+/// which is exactly what the second assertion refuses.
+#[test]
+fn a_windowed_prefill_masks_each_row_with_its_own_window() {
+    let _serial = gemma::serialized();
+    let Some((mut shell, tok)) = gemma::ready("the per-row window") else {
+        return;
+    };
+
+    let prompt = tok.encode(&gemma::turn("What is the capital of France? Answer in one word."));
+    let n = u32::try_from(prompt.len()).expect("a prompt of sane length");
+    assert!(n > 4, "the window has to have something to cut: {n} tokens");
+    // ONE KEY BACK. The last row keeps `[n - 2, n - 1]` and nothing else —
+    // narrow on purpose, because the second assertion needs the window to
+    // change the answer and a wide one over a short prompt might not.
+    let front = n - 2;
+    let window = Mask::new(vec![front, n - front], u64::from(n));
+    let keep_all = Mask::new(vec![0, n], u64::from(n));
+
+    // Rows 0..n-2 keep everything (causality does the rest); row n-1 is the
+    // one that differs, which is what makes this mask two-dimensional.
+    let mut rows = vec![keep_all; prompt.len()];
+    rows[prompt.len() - 1] = window.clone();
+    let per_row = Masking::Rows(rows);
+    let extent = Masking::Extent(window);
+
+    // Each reading is fired TWICE and the second kept — the dense autotuner
+    // tunes a GEMM shape on its second sighting, so a cold fire and a warm
+    // one are two tactic ladders (`gemma::solo` argues it at length).
+    let mut windowed = 0u32;
+    for _ in 0..2 {
+        shell.open(0).expect("slot 0 opens");
+        let said = shell
+            .fire_seated(&[Seated::masked(
+                engine_cuda::Lane {
+                    slot: 0,
+                    word: gemma::word(n, true),
+                    tokens: &prompt,
+                },
+                &per_row,
+            )])
+            .expect("a per-row mask is ACCEPTED — the first half of the claim");
+        windowed = gemma::argmax(&said[0]);
+    }
+
+    let mut control = 0u32;
+    for _ in 0..2 {
+        shell.open(1).expect("slot 1 opens");
+        shell
+            .fire_seated(&[Seated::of(engine_cuda::Lane {
+                slot: 1,
+                word: gemma::word(n - 1, false),
+                tokens: &prompt[..prompt.len() - 1],
+            })])
+            .expect("the causal prefix fires");
+        let said = shell
+            .fire_seated(&[Seated::masked(
+                engine_cuda::Lane {
+                    slot: 1,
+                    word: gemma::word(1, true),
+                    tokens: &prompt[prompt.len() - 1..],
+                },
+                &extent,
+            )])
+            .expect("the one-row control fires");
+        control = gemma::argmax(&said[0]);
+    }
+
+    let mut causal = 0u32;
+    for _ in 0..2 {
+        shell.open(2).expect("slot 2 opens");
+        let said = shell
+            .fire_seated(&[Seated::of(engine_cuda::Lane {
+                slot: 2,
+                word: gemma::word(n, false),
+                tokens: &prompt,
+            })])
+            .expect("the unmasked prefill fires");
+        causal = gemma::argmax(&said[0]);
+    }
+
+    eprintln!(
+        "{n} rows: per-row {:?} / one-row control {:?} / causal {:?}",
+        tok.decode(&[windowed], false),
+        tok.decode(&[control], false),
+        tok.decode(&[causal], false),
+    );
+    assert_eq!(
+        windowed, control,
+        "the per-row mask's last row said {:?} where the same row over the same \
+         KV under the same key set through the one-row extent path said {:?}",
+        tok.decode(&[windowed], false),
+        tok.decode(&[control], false),
+    );
+    assert_ne!(
+        windowed, causal,
+        "a two-key window over a {n}-token prompt changed nothing, so either the \
+         last row's own mask never reached the kernel or row zero's was used \
+         for every row — which is the substitution `Masking::Rows` exists to end"
     );
 }
 
@@ -712,6 +841,9 @@ mod common {
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
             trace,
             contract: &contract,
             checkpoint: &checkpoint,
@@ -722,13 +854,452 @@ mod common {
             slots: 4,
             ordinal: 0,
             graphs: engine_cuda::Graphs::Off,
+            knobs: engine_cuda::Knobs::default(),
+            program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
             // claims. `Runahead::of` is the door a deployment comes through.
             runahead: engine::runahead::Runahead::F1,
+            // The warm-boot weight artifact cache is off for a gate: a test
+            // that shared one would be asserting about the last run.
+            weight_cache_dir: None,
         })
         .expect("the shell loads");
         Some((shell, tokenizer))
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE DEVICE-GEOMETRY CLASS, AGAINST THE HOST-GEOMETRY FIRE IT MUST EQUAL
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **THE WHOLE FIRE GEOMETRY OFF THE RINGS, AND THE SAME LOGITS.**
+///
+/// `GeometryClass::DeviceGeometry` is the claim that a fire's ids, its
+/// positions, its readable extent, its page table, its write descriptor and
+/// its attention mask can all come out of an attached instance's channel cells
+/// instead of out of the submission. There is exactly one way to make that
+/// claim decisive: fire the SAME two lanes twice — once with every one of
+/// those values in the submission where the shell has always read them, once
+/// with every one of them in a channel and nothing in the submission at all —
+/// and require the two rectangles of logits to agree BIT FOR BIT.
+///
+/// Bit for bit and not nearly, because the two fires run the same kernels over
+/// the same bytes: any disagreement is a number this shell resolved
+/// differently, and there is no rounding to hide behind. A page CSR off by a
+/// page, a `last_page_len` off by a token, a write descriptor pointing one
+/// cell early, a mask packed MSB-first, the token ids read from `tail` instead
+/// of `head` — each of them moves a logit.
+///
+/// **GEMMA BECAUSE THE MASK NEEDS AN ARM.** The device-resolved mask is half
+/// the class (a beam search's ancestry is `gather(mask, parent)` and lives
+/// nowhere but the device), and `attention.masked` is gemma's alone — see
+/// `gemma_is_the_only_family_that_declares_the_masked_axis` at the top of this
+/// file.
+#[test]
+fn a_device_geometry_fire_is_the_host_geometry_fire_it_describes() {
+    let _one = gemma::serialized();
+    let Some((mut shell, tokenizer)) = gemma::ready("the device-geometry gate") else {
+        return;
+    };
+    let prompt = tokenizer.encode(&gemma::turn("Name one colour."));
+    let held = prompt.len() as u32;
+
+    // The two lanes' tokens, and the ancestry each attends. The mask DROPS
+    // something (key 3 of every row) so that the fire it describes is not the
+    // fire an all-keeping mask would describe: a gate whose mask kept
+    // everything would pass with the bits never read.
+    let feed: [u32; devgeo::LANES] = [prompt[prompt.len() - 1], prompt[0]];
+    let extent = held + 1;
+    let dense = devgeo::dense_mask(extent);
+
+    // ── The control: everything in the submission, where it has always been.
+    //    Fired TWICE and the second kept — the dense autotuner tunes a GEMM
+    //    shape on its second sighting, so a cold fire and a warm one are two
+    //    tactic ladders (see `gemma::solo`'s note). The device fire below is
+    //    the same shape, so warming here warms it too.
+    let control_mask = devgeo::control_masking(extent);
+    let mut control = Vec::new();
+    for _ in 0..2 {
+        devgeo::prime(&mut shell, &prompt);
+        control = devgeo::fire_host(&mut shell, &feed, held, &control_mask);
+    }
+
+    // ── The subject: the same two lanes, with nothing in the submission.
+    devgeo::prime(&mut shell, &prompt);
+    let (instance, table) = devgeo::bind_geometry_instance(&mut shell, &feed, held, &dense);
+    let subject = devgeo::fire_device(&mut shell, instance, &table);
+
+    assert_eq!(
+        subject.len(),
+        control.len(),
+        "both fires read out {} lane(s)",
+        devgeo::LANES
+    );
+    for (lane, (device, host)) in subject.iter().zip(&control).enumerate() {
+        assert_eq!(
+            device.len(),
+            host.len(),
+            "lane {lane}'s two readings are the same width"
+        );
+        let differing = device
+            .iter()
+            .zip(host.iter())
+            .enumerate()
+            .find(|(_, (d, h))| d.to_bits() != h.to_bits());
+        assert!(
+            differing.is_none(),
+            "lane {lane}: the device-resolved geometry and the submitted one \
+             disagree at {differing:?} — the ports resolved a different fire"
+        );
+    }
+}
+
+/// **AND THE WRITE DESCRIPTOR IS LOAD-BEARING.**
+///
+/// The equality above would still hold if `w_slot`/`w_off` were read and
+/// thrown away, because it states exactly the descriptor
+/// `store::kv::geometry_with` derives. This states a DIFFERENT one — the same
+/// page, one cell earlier, over the token the prompt already wrote — and
+/// requires the logits to move. That cell is inside the lane's own readable
+/// extent and the mask keeps it, so a fire that honoured the descriptor
+/// attends a rewritten key and a fire that ignored it does not.
+///
+/// It is the second half of what "the device resolves the geometry" means: a
+/// beam search's whole fork mechanism is `B` lanes appending into cells the
+/// seat's `have + row` arithmetic cannot name, and a shell that read the
+/// descriptor without using it would serve every beam the first beam's cell.
+#[test]
+fn an_explicit_write_descriptor_lands_somewhere_the_seat_would_not_have() {
+    let _one = gemma::serialized();
+    let Some((mut shell, tokenizer)) = gemma::ready("the write-descriptor gate") else {
+        return;
+    };
+    let prompt = tokenizer.encode(&gemma::turn("Name one colour."));
+    let held = prompt.len() as u32;
+    let feed: [u32; devgeo::LANES] = [prompt[prompt.len() - 1], prompt[0]];
+    let extent = held + 1;
+    let dense = devgeo::dense_mask(extent);
+
+    devgeo::prime(&mut shell, &prompt);
+    let (derived, table) = devgeo::bind_geometry_instance(&mut shell, &feed, held, &dense);
+    let at_the_tail = devgeo::fire_device(&mut shell, derived, &table);
+
+    devgeo::prime(&mut shell, &prompt);
+    let (moved, table) = devgeo::bind_geometry_instance_at(&mut shell, &feed, held, &dense, held - 1);
+    let one_cell_early = devgeo::fire_device(&mut shell, moved, &table);
+
+    let same = at_the_tail
+        .iter()
+        .zip(&one_cell_early)
+        .all(|(tail, early)| {
+            tail.iter()
+                .zip(early.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        });
+    assert!(
+        !same,
+        "moving `w_off` back one cell changed nothing, so the write descriptor \
+         the ports resolved is not the one the append used"
+    );
+}
+
+/// The device-geometry gate's fixture: one guest program that is nothing but
+/// descriptor ports, and the two fires it is compared through.
+///
+/// **THE PROGRAM HAS NO BODY ON PURPOSE.** What is under test is the
+/// descriptor-port plane — `program::ports` reading committed cells and
+/// `serve::prepare` using them — and a stage that computed anything would put
+/// its own arithmetic between the seeds this module writes and the geometry
+/// the fire resolves. The channels are seeded and the epilogue does nothing,
+/// so the cell the port reads is the cell this file wrote, and a wrong logit
+/// is the shell's reading of it.
+mod devgeo {
+    use crate::gemma;
+    use engine::engine_api::fire::{Mask, Masking};
+    use engine::engine_api::program::ProgramRegistration;
+    use engine::tensor_ir::registry::GeometryClass;
+    use engine_cuda::{Lane, Seated, Shell};
+    use tensor_ir::container::{
+        ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
+    };
+    use tensor_ir::registry::{ModelProfile, Port, Stage};
+    use tensor_ir::types::{DType, Shape};
+
+    /// Two lanes: the smallest fire in which "which lane does this value
+    /// belong to" is a question at all.
+    pub const LANES: usize = 2;
+    /// The key width the mask rectangle is built at — the POOL's width and not
+    /// the extent's, which is the ordinary shape (see `engine_cuda::mask`'s "a
+    /// mask may be LONGER") and the one a beam search always has.
+    pub const POOL: usize = 64;
+    /// `gemma::ready`'s boot: 1024 tokens of context at 16 tokens a page.
+    const PAGES_PER_SLOT: u32 = 64;
+    const PAGE_SIZE: u32 = 16;
+
+    /// Which pool slot lane `l` sits in, and the pages that slot owns.
+    fn slot(lane: usize) -> u32 {
+        lane as u32
+    }
+
+    fn pages_of(lane: usize, extent: u32) -> Vec<u32> {
+        let base = slot(lane) * PAGES_PER_SLOT;
+        (0..extent.div_ceil(PAGE_SIZE).max(1))
+            .map(|page| base + page)
+            .collect()
+    }
+
+    /// Both lanes back to "the prompt and nothing else", so the two fires
+    /// under comparison start from one KV state.
+    pub fn prime(shell: &mut Shell, prompt: &[u32]) {
+        for lane in 0..LANES {
+            let slot = slot(lane);
+            shell.open(slot).expect("the slot opens");
+            shell
+                .fire(&[Lane {
+                    slot,
+                    word: gemma::word(prompt.len() as u32, false),
+                    tokens: prompt,
+                }])
+                .expect("the prompt prefills");
+        }
+    }
+
+    /// The ancestry every lane attends: everything the extent holds except key
+    /// 3, over a rectangle `POOL` wide.
+    pub fn dense_mask(extent: u32) -> Vec<bool> {
+        (0..LANES)
+            .flat_map(|_| (0..POOL).map(|key| key != 3 && (key as u32) < extent))
+            .collect()
+    }
+
+    /// The same restriction, written independently as run lengths over the
+    /// same `POOL`-wide axis — masked-out first. Independent on purpose: it is
+    /// what makes the equality a claim about `mask::from_dense` and not a
+    /// tautology.
+    pub fn control_masking(extent: u32) -> Masking {
+        let kept = extent.min(POOL as u32);
+        Masking::Extent(Mask::new(
+            vec![0, 3, 1, kept - 4, POOL as u32 - kept],
+            POOL as u64,
+        ))
+    }
+
+    /// The control: every value in the submission.
+    pub fn fire_host(
+        shell: &mut Shell,
+        feed: &[u32; LANES],
+        held: u32,
+        mask: &Masking,
+    ) -> Vec<Vec<f32>> {
+        let tables: Vec<Vec<u32>> = (0..LANES).map(|l| pages_of(l, held + 1)).collect();
+        let tokens: Vec<[u32; 1]> = feed.iter().map(|&token| [token]).collect();
+        let seated: Vec<Seated<'_>> = (0..LANES)
+            .map(|lane| Seated {
+                pages: &tables[lane],
+                held: Some(held),
+                ..Seated::masked(
+                    Lane {
+                        slot: slot(lane),
+                        word: gemma::word(1, true),
+                        tokens: &tokens[lane],
+                    },
+                    mask,
+                )
+            })
+            .collect();
+        shell
+            .fire_seated(&seated)
+            .expect("the host-geometry fire runs")
+    }
+
+    /// The subject: two lanes carrying a slot, a word and the working set's
+    /// flat table — which is everything a device-geometry lane carries, and
+    /// the table is not geometry: it is the map the geometry is resolved
+    /// THROUGH (`Seated::translation`).
+    pub fn fire_device(shell: &mut Shell, instance: u64, table: &[u32]) -> Vec<Vec<f32>> {
+        let seated: Vec<Seated<'_>> = (0..LANES)
+            .map(|lane| {
+                // NO ROWS AND NO IDS: a device-geometry submission states its
+                // row split nowhere, exactly as the runtime ships it.
+                Seated {
+                    translation: table,
+                    ..Seated::of(Lane {
+                        slot: slot(lane),
+                        word: gemma::word(1, true),
+                        tokens: &[],
+                    })
+                }
+            })
+            .collect();
+        shell
+            .fire_attached(
+                &seated,
+                &[engine_cuda::serve::Attached {
+                    lane: 0,
+                    instance,
+                    at: engine::engine_api::fire::Boundary::Epilogue,
+                }],
+            )
+            .expect("the device-geometry fire runs")
+    }
+
+    /// Bind an instance whose seeds ARE this fire's geometry, with the write
+    /// descriptor the seat would have derived.
+    pub fn bind_geometry_instance(
+        shell: &mut Shell,
+        feed: &[u32; LANES],
+        held: u32,
+        dense: &[bool],
+    ) -> (u64, Vec<u32>) {
+        bind_geometry_instance_at(shell, feed, held, dense, held)
+    }
+
+    /// As [`bind_geometry_instance`], landing every lane's row at flat
+    /// position `at` of its own page run instead of at its tail.
+    pub fn bind_geometry_instance_at(
+        shell: &mut Shell,
+        feed: &[u32; LANES],
+        held: u32,
+        dense: &[bool],
+        at: u32,
+    ) -> (u64, Vec<u32>) {
+        let extent = held + 1;
+        let per_lane = extent.div_ceil(PAGE_SIZE).max(1) as usize;
+        // **THE GUEST STATES RELATIVE INDEXES AND THE TABLE IS NOT THE
+        // IDENTITY.** `ws.reserve` hands a guest `0 .. n` and nothing else
+        // (`kv-working-set`: "never a physical page id"), so the seeds below
+        // are `0, 1, 2, 3` — and lane 1's two of them map to pool pages 64 and
+        // 65, which is a slot away from where an untranslated read would land.
+        // A shell that pushed the seed straight into the page CSR would attend
+        // pool pages 2 and 3, and the logits would not be the control's.
+        let table: Vec<u32> = (0..LANES).flat_map(|lane| pages_of(lane, extent)).collect();
+        let pages: Vec<u32> = (0..table.len() as u32).collect();
+        let page_indptr: Vec<u32> = (0..=LANES as u32).map(|lane| lane * per_lane as u32).collect();
+        let w_slot: Vec<u32> = (0..LANES)
+            .map(|lane| (lane * per_lane) as u32 + at / PAGE_SIZE)
+            .collect();
+        let w_off: Vec<u32> = (0..LANES).map(|_| at % PAGE_SIZE).collect();
+
+        let seeds: Vec<Seed> = vec![
+            Seed::i32(Port::EmbedTokens, Shape::vector(LANES as u32), feed.iter().map(|&t| t as i32).collect()),
+            Seed::u32(Port::EmbedIndptr, Shape::vector(LANES as u32 + 1), (0..=LANES as u32).collect()),
+            Seed::u32(Port::Positions, Shape::vector(LANES as u32), vec![held; LANES]),
+            // IN WIRE-TAG ORDER, which is what `tensor_ir::validate` requires
+            // of a container's port table (`PortsUnsorted`): pages (3) and its
+            // CSR (4) stand before the extent (5).
+            Seed::u32(Port::Pages, Shape::vector(pages.len() as u32), pages),
+            Seed::u32(Port::PageIndptr, Shape::vector(page_indptr.len() as u32), page_indptr),
+            Seed::u32(Port::KvLen, Shape::vector(LANES as u32), vec![extent; LANES]),
+            Seed::u32(Port::WSlot, Shape::vector(LANES as u32), w_slot),
+            Seed::u32(Port::WOff, Shape::vector(LANES as u32), w_off),
+            Seed::bools(Port::AttnMask, Shape::matrix(LANES as u32, POOL as u32), dense.to_vec()),
+        ];
+        let registration = registration(&seeds);
+        let program = shell
+            .register_program(&registration)
+            .expect("a port-only program registers");
+        let wire: Vec<(u32, Vec<u8>)> = seeds
+            .iter()
+            .enumerate()
+            .map(|(index, seed)| (index as u32, seed.wire()))
+            .collect();
+        let ids: Vec<u64> = (0..seeds.len() as u64).collect();
+        let instance = shell
+            .bind_program(
+                program,
+                &wire,
+                engine::Extents::default(),
+                GeometryClass::DeviceGeometry,
+                &[],
+                &ids,
+            )
+            .expect("the instance binds in the device-geometry class");
+        (instance, table)
+    }
+
+    /// One channel, its port and its seed.
+    pub struct Seed {
+        port: Port,
+        shape: Shape,
+        dtype: DType,
+        value: engine::Value,
+    }
+
+    impl Seed {
+        fn i32(port: Port, shape: Shape, lanes: Vec<i32>) -> Seed {
+            Seed { port, shape, dtype: DType::I32, value: engine::Value::I32(lanes) }
+        }
+        fn u32(port: Port, shape: Shape, lanes: Vec<u32>) -> Seed {
+            Seed { port, shape, dtype: DType::U32, value: engine::Value::U32(lanes) }
+        }
+        fn bools(port: Port, shape: Shape, lanes: Vec<bool>) -> Seed {
+            Seed {
+                port,
+                shape,
+                dtype: DType::Bool,
+                value: engine::Value::Bool(lanes.into_iter().map(u8::from).collect()),
+            }
+        }
+        /// The seed as the wire cell `bind_program` takes.
+        fn wire(&self) -> Vec<u8> {
+            let lanes = self.shape.numel() as usize;
+            let mut bytes = vec![0u8; engine::wire_cell_bytes(self.dtype, lanes)];
+            engine::encode_wire(&self.value, &mut bytes);
+            bytes
+        }
+    }
+
+    /// The port-only program, all the way to what `register_program` takes.
+    fn registration(seeds: &[Seed]) -> ProgramRegistration {
+        let mut container = TraceContainer {
+            names: Vec::new(),
+            externs: Vec::new(),
+            channels: Vec::new(),
+            ports: Vec::new(),
+            stages: vec![StageProgram {
+                stage: Stage::Epilogue,
+                ops: Vec::new(),
+            }],
+        };
+        for (index, seed) in seeds.iter().enumerate() {
+            container.channels.push(ChannelDecl {
+                shape: seed.shape,
+                dtype: ChanDType::Concrete(seed.dtype),
+                capacity: 1,
+                host_role: HostRole::None,
+                seeded: true,
+            });
+            container.ports.push(PortBinding {
+                port: seed.port,
+                source: PortSource::Channel(index as u32),
+            });
+        }
+        let bound = tensor_ir::validate::bind(container, ModelProfile::dummy())
+            .expect("a port-only container binds");
+        let stages = tensor_compiler::plan::compile_bound(&bound);
+        let launch = tensor_compiler::codegen::launch::build(&bound, &stages);
+        let backend = tensor_compiler::codegen::program::Backend::Cuda;
+        let emitted = tensor_compiler::codegen::program::emit_program(backend, &stages, &bound);
+        ProgramRegistration {
+            program_hash: bound.hash,
+            emitted_kernels: emitted
+                .into_iter()
+                .map(|kernel| engine::engine_api::program::EmittedKernel {
+                    kind: kernel.kind,
+                    stage_index: kernel.stage_index,
+                    region_index: kernel.region_index,
+                    entry_name: kernel.entry_name,
+                    source: kernel.source,
+                    error: kernel.error,
+                })
+                .collect(),
+            emitter_version: backend.emitter_version(),
+            region_analysis: Vec::new(),
+            launch,
+            reference_ptir: Vec::new(),
+        }
     }
 }
 
@@ -737,7 +1308,7 @@ mod gemma {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
-    use engine::engine_api::fire::Mask;
+    use engine::engine_api::fire::Masking;
     use engine_cuda::{Boot, Lane, Seated, Shell};
     use model_compiler::Budget;
     use model_dsl::{Classify, Platform, Request};
@@ -807,7 +1378,7 @@ mod gemma {
         shell: &mut Shell,
         slot: u32,
         prompt: &[u32],
-        mask: Option<&Mask>,
+        mask: Option<&Masking>,
         steps: usize,
     ) -> Vec<u32> {
         warm(shell, slot, prompt, mask);
@@ -838,7 +1409,7 @@ mod gemma {
     }
 
     /// One throwaway fire at this prompt's shape, so the tuner has seen it.
-    fn warm(shell: &mut Shell, slot: u32, prompt: &[u32], mask: Option<&Mask>) {
+    fn warm(shell: &mut Shell, slot: u32, prompt: &[u32], mask: Option<&Masking>) {
         shell.open(slot).expect("the slot opens");
         let lane = Lane {
             slot,
@@ -915,6 +1486,9 @@ mod gemma {
 
         let booted = std::time::Instant::now();
         let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
             trace,
             contract: &contract,
             checkpoint: &checkpoint,
@@ -925,10 +1499,15 @@ mod gemma {
             slots: 4,
             ordinal: 0,
             graphs: engine_cuda::Graphs::Off,
+            knobs: engine_cuda::Knobs::default(),
+            program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
             // claims. `Runahead::of` is the door a deployment comes through.
             runahead: engine::runahead::Runahead::F1,
+            // The warm-boot weight artifact cache is off for a gate: a test
+            // that shared one would be asserting about the last run.
+            weight_cache_dir: None,
         })
         .expect("the shell loads");
         let (weights, arena, pools, inputs) = shell.footprint();

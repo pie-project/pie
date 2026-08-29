@@ -19,6 +19,13 @@
 //! three owners; this module is where the one number lives so that every pool
 //! can DERIVE rather than re-declare.
 //!
+//! **Wave E untied it.** `frame_submit_depth` is gone as a configured knob:
+//! [`Runahead::submit_depth`] is `frames_in_flight + 1` and
+//! [`Runahead::channel_capacity`] is that times `k`, plus the visibility
+//! margin — which is what a guest reads as `model.channel-capacity()`. Two
+//! numbers are left, `frame_size` and `frame_dispatch_depth`, and only the
+//! first is in the guest ABI (wave P retires it).
+//!
 //! # F1 stated the number; F2b spends it
 //!
 //! [`Runahead::frames_in_flight`] was **1** in F1 and that was not a
@@ -132,6 +139,54 @@ impl Runahead {
     pub const fn frames(&self) -> usize {
         self.frames_in_flight as usize
     }
+
+    /// **How many frames a lane keeps outstanding** — and it is not a third
+    /// number (debt 8, closed).
+    ///
+    /// ```text
+    /// submit_depth = frames_in_flight + 1
+    /// ```
+    ///
+    /// One frame per in-flight slot is on the device or posted to it; the
+    /// `+ 1` is the frame the GUEST is building while those run, which is
+    /// exactly the host round trip run-ahead exists to hide. A window sized
+    /// to `frames_in_flight` alone collapses to lockstep — submit, wait,
+    /// submit, wait — because the guest has nothing in hand when the oldest
+    /// frame retires.
+    ///
+    /// `[runtime] frame_submit_depth` was this number, configured separately:
+    /// three by default, beside a `frame_dispatch_depth` of two, with a
+    /// paragraph in each doc explaining that they were not independent. They
+    /// are one number and this is the arithmetic; the default answers 3, as
+    /// it always did.
+    #[must_use]
+    pub const fn submit_depth(&self) -> usize {
+        self.frames_in_flight as usize + 1
+    }
+
+    /// **The host-reader ring a guest needs**, in cells, at frame size `k`.
+    ///
+    /// ```text
+    /// capacity = submit_depth × k + 1
+    /// ```
+    ///
+    /// `submit_depth × k` is the peak occupancy — every outstanding frame's
+    /// every wave publishing one cell before the guest takes any of them. The
+    /// trailing `+ 1` is structural, not empirical: a ring sized to exactly
+    /// the peak needs the consumer's take to be visible to the producer at
+    /// the instant it publishes, and that visibility delay IS the host round
+    /// trip. Zero margin re-imports it into the critical path — a `3k - 1`
+    /// ring measured 28.0k against 34.3k tok/s on the same guest at `3k`
+    /// (text-completion-bench).
+    ///
+    /// This is what a guest reads as `model.channel-capacity()`. Sized for a
+    /// fully live frame (`r = k`); a lane the runtime forces to one live slot
+    /// per frame — a recurrent-state model — needs strictly less, so it is a
+    /// safe bound for every guest.
+    #[must_use]
+    pub const fn channel_capacity(&self, frame_size: usize) -> usize {
+        self.submit_depth() * frame_size + 1
+    }
 }
 
 impl Default for Runahead {
@@ -151,6 +206,22 @@ mod tests {
     #[test]
     fn the_ghost_thirteen_is_this_formula_at_three_frames() {
         assert_eq!(Runahead::of(3).staging_depth(), 13);
+    }
+
+    /// **THE THIRD DEPTH IS THIS ONE PLUS ONE**, and the numbers a
+    /// deployment ran on before it was derived come back unchanged: the
+    /// defaults were `frame_dispatch_depth = 2` and `frame_submit_depth = 3`,
+    /// and `model.channel-capacity()` at k = 2 was 7.
+    #[test]
+    fn the_submit_window_and_the_ring_are_the_dispatch_depths_arithmetic() {
+        let default = Runahead::default();
+        assert_eq!(default.frames_in_flight, 2);
+        assert_eq!(default.submit_depth(), 3);
+        assert_eq!(default.channel_capacity(2), 7);
+        // And k = 1, where an undersized window is what collapsed throughput.
+        assert_eq!(default.channel_capacity(1), 4);
+        // One frame in flight still leaves the guest one to build.
+        assert_eq!(Runahead::F1.submit_depth(), 2);
     }
 
     /// F1's own depth, kept as the byte-identity arm's name.

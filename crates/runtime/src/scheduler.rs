@@ -63,15 +63,14 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
-// `copy_d2h`/`copy_h2d`/`copy_h2h`/`copy_rs_d2d`/`resize_pool` round out the
-// engine ABI verb surface (see `dispatch`'s module doc for which are wired
-// into the current mock-engine fire path vs. reserved/unit-test-only).
+// `copy_d2h`/`copy_h2d`/`copy_h2h`/`copy_rs_d2d` round out the engine ABI
+// verb surface (see `dispatch`'s module doc for which are wired into the
+// current mock-engine fire path vs. reserved/unit-test-only).
 #[allow(unused_imports)]
 pub(crate) use dispatch::{
     bind_instance, bind_instance_classified, close_channels, close_instance, copy_d2d, copy_d2h,
     copy_d2h_tracked, copy_h2d, copy_h2d_tracked, copy_h2h, copy_kv_cells, copy_rs_d2d,
     register_channel, register_channels, register_channels_bind_classified, register_program,
-    resize_pool,
 };
 pub use stats::{AggregateStats, HostSubmitStats};
 pub use worker::BatchScheduler;
@@ -282,32 +281,27 @@ static FRAME_SIZE: AtomicUsize = AtomicUsize::new(0);
 // Guest run-ahead sizing
 // =============================================================================
 
-/// Frames a lane keeps outstanding: one running, plus the rest queued behind
-/// it so the device always has work while the guest is back on the host
-/// deciding what to submit next. Too few and the pipeline collapses to
-/// lockstep — submit, wait, submit, wait — because the host round trip lands
-/// squarely in the critical path.
+/// **Frames a lane keeps outstanding, DERIVED** (alto E; design §1 article 8).
 ///
-/// The default is 3, sized for the default k = 2, where it covers the round
-/// trip with one frame to spare. It is stated as a flat frame count rather
-/// than derived, so this and [`configured_frame_size`] are NOT independent: a
-/// frame is k waves of device time, so the same three frames cover
-/// proportionally less real time as k shrinks, and a deployment that moves k
-/// must re-measure this. Undersizing this window is what collapsed k = 1
-/// throughput (CONTENTION_FOLLOWUP §20.11).
+/// One running per frame the runtime keeps posted to the engine, plus one the
+/// guest is building while they run — `engine::runahead::Runahead::
+/// submit_depth`, which is [`configured_dispatch_depth`] `+ 1`. The formula
+/// lives in the one module that owns every run-ahead depth, and this reads it
+/// rather than restating it.
 ///
-/// Guests never read this directly — they get `model.channel-capacity()`, so
-/// it can move without touching the guest contract.
+/// It used to be `[runtime] frame_submit_depth`, a third independently
+/// configured number whose own documentation had to explain that it was not
+/// independent of the other two ("a frame is k waves of device time, so a
+/// deployment that moves k must re-measure this"). Three numbers with three
+/// owners, two of them guest-visible, checked jointly in a third crate: survey
+/// debt 8. The knob is gone; the default answer is unchanged, because the
+/// defaults were `frame_dispatch_depth = 2` and `frame_submit_depth = 3`.
+///
+/// Guests never read this. They get `model.channel-capacity()`, which is
+/// [`channel_capacity`].
 pub fn configured_submit_depth() -> usize {
-    match SUBMIT_DEPTH.load(Ordering::Relaxed) {
-        0 => DEFAULT_SUBMIT_DEPTH,
-        frames => frames,
-    }
-}
-
-/// Install the configured window at bootstrap.
-pub fn set_submit_depth(frames: usize) {
-    SUBMIT_DEPTH.store(frames, Ordering::Relaxed);
+    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
+        .submit_depth()
 }
 
 /// Install the configured dispatch depth at bootstrap.
@@ -322,10 +316,6 @@ pub fn set_dispatch_depth(depth: usize) {
 pub fn configured_dispatch_depth() -> usize {
     frame::configured_dispatch_depth()
 }
-
-const DEFAULT_SUBMIT_DEPTH: usize = 3;
-/// `0` = never installed; see [`reconfigure`].
-static SUBMIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
 /// Why a [`reconfigure`] was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +340,13 @@ impl std::error::Error for ReconfigureRefused {}
 
 /// Change the batching knobs on a running runtime, between rounds of a
 /// measurement sweep.
+///
+/// **TWO KNOBS, NOT THREE** (alto E; survey debt 8). `frame_submit_depth` was
+/// the third parameter and it was never independent: the guest's window is
+/// `frame_dispatch_depth + 1` (`engine::runahead::Runahead::submit_depth`),
+/// so a sweep that moved the two separately measured shapes the runtime can
+/// no longer be asked for. `channel_capacity` — the one of these numbers a
+/// guest actually reads — moves with the dispatch depth now.
 ///
 /// **This is a quiesce gate, not a drain barrier, and the difference is the
 /// point.** A drain barrier would let in-flight frames retire and then swap.
@@ -378,40 +375,36 @@ impl std::error::Error for ReconfigureRefused {}
 /// engine CARVES its staging ring from these two numbers now — alto F2b — so
 /// there is no fixed pool for a product to overflow and the bound is per
 /// factor.)
-pub fn reconfigure(
-    frame_size: usize,
-    submit_depth: usize,
-    dispatch_depth: usize,
-) -> Result<(), ReconfigureRefused> {
+pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), ReconfigureRefused> {
     let live = crate::inferlet::process::live_count();
     if live > 0 {
         return Err(ReconfigureRefused::Busy(live));
     }
     set_frame_size(frame_size);
-    set_submit_depth(submit_depth);
     set_dispatch_depth(dispatch_depth);
     Ok(())
 }
 
-/// Host-reader channel capacity, in cells, that lets a lane sustain
-/// [`configured_submit_depth`] without the ring becoming the bottleneck.
+/// **Host-reader channel capacity, in cells** — what a guest reads as
+/// `model.channel-capacity()`.
 ///
-/// The trailing `+ 1` is structural, not empirical. A ring sized to exactly the
-/// peak occupancy requires the consumer's take to be visible to the producer at
-/// the moment it publishes — and that visibility delay IS the host round trip
-/// run-ahead exists to hide. Zero margin therefore re-imports the round trip
-/// into the critical path: a 3k-1 ring measured 28.0k vs 34.3k tok/s against
-/// the same guest at 3k (text-completion-bench).
+/// `engine::runahead::Runahead::channel_capacity` is the formula and this is
+/// the runtime's two live numbers put into it: the dispatch depth the
+/// deployment configured and the frame size it configured. Both the peak
+/// occupancy (`submit_depth × k`) and the visibility margin (`+ 1`) are
+/// argued there — a ring sized to exactly the peak re-imports the host round
+/// trip into the critical path, measured at 28.0k against 34.3k tok/s on the
+/// same guest (text-completion-bench).
 ///
 /// At k = 1 an undersized ring is silent: `fire::submit_pass_stamped`
-/// short-circuits before `validate_frame`, so every capacity check is k >= 2
-/// only and a k = 1 guest serialises with no diagnostic at all.
-///
-/// Sized for a fully live frame (r = k). A lane the runtime forces to one live
-/// slot per frame — a recurrent-state model — needs strictly less, so this is
-/// a safe bound for every guest.
+/// short-circuits before `validate_frame`, so the static-admission capacity
+/// proof is k >= 2 only. A k = 1 guest that undersizes its rings serialises
+/// with no diagnostic — and since alto E deleted the sleep-retry loop, one
+/// that OVERFILLS a device ring gets the engine's loud non-commit fault
+/// instead of back-pressure. Sizing to this number is the contract.
 pub fn channel_capacity() -> usize {
-    configured_submit_depth() * configured_frame_size() + 1
+    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
+        .channel_capacity(configured_frame_size())
 }
 
 // =============================================================================

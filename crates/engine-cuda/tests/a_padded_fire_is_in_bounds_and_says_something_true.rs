@@ -1,7 +1,7 @@
 //! **D4's gate: the tail a padded gemm writes belongs to nobody**
 //! (`.wiki/palo/cuda-abi.md` §3, refined form; kill factors 1 and 2).
 //!
-//! `PIE_CUDA_PAD` rounds an Always launch's `M` up to the fire's lattice point
+//! `Knobs::pad` rounds an Always launch's `M` up to the fire's lattice point
 //! before handing it to cuBLASLt, so the library's unpublished shape→kernel
 //! table stops being a function of the batch. The rows `[rows, bucket)` that
 //! buys are read and written garbage. Two claims stand between that and a
@@ -24,7 +24,7 @@
 //! # What this file deliberately does NOT assert, and the measurement that
 //! # says why
 //!
-//! Kill factor 1 asks for **byte-identical tokens across the `PIE_CUDA_PAD`
+//! Kill factor 1 asks for **byte-identical tokens across the `Knobs::pad`
 //! A/B**, and that claim is FALSE — not because the tail leaks, but because
 //! the feature works. Padding's whole purpose is to move which kernel
 //! cuBLASLt picks; a different kernel is a different reduction order; a
@@ -120,11 +120,15 @@ fn finite(logits: &[f32], what: &str) {
     );
 }
 
-/// **THE ARM, AND IT IS SET BEFORE THE LOAD BECAUSE THAT IS WHERE IT IS
-/// READ.** `PIE_CUDA_PAD` and `PIE_CUDA_BUCKETS` are load-time words on this
-/// plane — a `getenv` between two launches is a syscall on the fire path — so
-/// an A/B is two `Shell::load`s and not two settings on one shell.
-fn load(pad: bool, lattice: Option<&str>) -> Option<(Shell, tokenizer::Tokenizer)> {
+/// **THE ARM, AND IT IS STATED ON THE `Boot` BECAUSE THAT IS WHERE IT IS
+/// READ.** The pad and the lattice are load-time words on this plane — the
+/// lattice is BAKED, and the pad is armed before each walk from a word read
+/// once — so an A/B is two `Shell::load`s and not two settings on one shell.
+///
+/// They were `PIE_CUDA_PAD` and `PIE_CUDA_BUCKETS` and are `Knobs::pad` and
+/// `Budget::buckets` now (alto wave P, article 9): the arm is a value the test
+/// hands over, not a variable it sets in its own process.
+fn load(pad: bool, lattice: Option<&[u32]>) -> Option<(Shell, tokenizer::Tokenizer)> {
     if !engine_cuda::device::present() {
         eprintln!("skipping: no CUDA device on this machine");
         return None;
@@ -134,16 +138,6 @@ fn load(pad: bool, lattice: Option<&str>) -> Option<(Shell, tokenizer::Tokenizer
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    // SAFETY: every test in this file holds `serialized()`, and nothing else
-    // in this process reads the environment while one runs.
-    unsafe {
-        std::env::set_var("PIE_CUDA_PAD", if pad { "on" } else { "off" });
-        match lattice {
-            Some(points) => std::env::set_var("PIE_CUDA_BUCKETS", points),
-            None => std::env::remove_var("PIE_CUDA_BUCKETS"),
-        }
-    }
-
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
     let trace = trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
@@ -152,20 +146,40 @@ fn load(pad: bool, lattice: Option<&str>) -> Option<(Shell, tokenizer::Tokenizer
     drop(source);
 
     let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budget: Budget::new(4, 256),
+        // A stated lattice is kept and an unstated one is filled with the
+        // shell's own default (`engine_cuda::api::lattice`), which is what
+        // `None` here asks for.
+        budget: {
+            let mut budget = Budget::new(4, 256);
+            if let Some(points) = lattice {
+                budget.buckets = points.to_vec();
+            }
+            budget
+        },
         profile: None,
         page_size: 16,
         context: 512,
         slots: 4,
         ordinal: 0,
         graphs: engine_cuda::Graphs::Off,
+        knobs: engine_cuda::Knobs {
+            pad,
+            ..engine_cuda::Knobs::default()
+        },
+        program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
         runahead: engine::runahead::Runahead::F1,
+        // The warm-boot weight artifact cache is off for a gate: a test
+        // that shared one would be asserting about the last run.
+        weight_cache_dir: None,
     })
     .expect("the shell loads");
     Some((shell, tokenizer))
@@ -232,7 +246,7 @@ fn warm(millis: &[f64]) -> f64 {
 
 /// **KILL FACTOR 1, AS MUCH OF IT AS IS TRUE.** A padded fire is finite, in
 /// bounds, and still the model: sixteen greedy steps off a real checkpoint,
-/// with `PIE_CUDA_PAD` on and the shell's own lattice under it, land the
+/// with `Knobs::pad` on and the shell's own lattice under it, land the
 /// continuation this tree pinned before D4 existed.
 ///
 /// A padded gemm that walked off its column would take the arena's next value
@@ -320,7 +334,7 @@ fn a_solo_lane_and_a_batched_one_agree_inside_one_bucket() {
     let _serial = serialized();
     // Sixteen holds every fire below — a 5-token prompt on three lanes is 15
     // rows, and every decode after it is 3 — so the whole run is one bucket.
-    let Some((mut shell, tokenizer)) = load(true, Some("16,256")) else {
+    let Some((mut shell, tokenizer)) = load(true, Some(&[16, 256])) else {
         return;
     };
     let prompt = tokenizer.encode(PROMPT);

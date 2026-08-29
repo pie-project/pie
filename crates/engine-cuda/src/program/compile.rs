@@ -519,13 +519,23 @@ pub struct Disk {
 }
 
 impl Disk {
-    /// Resolve the cache directory: `$PIE_HOME/cache/ptir-cuda`, else
-    /// `$XDG_CACHE_HOME/pie/ptir-cuda`, else `$HOME/.cache/pie/ptir-cuda`,
-    /// else nowhere. `PIE_HOME` wins because a deployment sets it on purpose.
+    /// The cache a deployment's stated directory roots, or nowhere when it
+    /// stated none.
+    ///
+    /// **`Disk::from_env` STOOD HERE** and resolved `$PIE_HOME/cache/ptir-cuda`,
+    /// else `$XDG_CACHE_HOME/pie/ptir-cuda`, else `$HOME/.cache/pie/ptir-cuda`.
+    /// Article 9 (alto design §1) says a shell reads no environment, and this
+    /// was the last read in the crate: the directory is a DEPLOYMENT fact, so
+    /// it arrives typed on `Boot::program_cache_dir` — off the boot document's
+    /// `[cache] dir`, which the worker has written all along — exactly as the
+    /// warm-boot weight artifacts' directory does.
+    ///
+    /// `None` is [`Disk::disabled`], and that costs nothing but NVRTC time:
+    /// every failure of this cache is a miss and never an error.
     #[must_use]
-    pub fn from_env() -> Disk {
+    pub fn rooted(directory: Option<impl Into<PathBuf>>) -> Disk {
         Disk {
-            directory: default_directory(),
+            directory: directory.map(Into::into),
         }
     }
 
@@ -684,22 +694,6 @@ fn parse(bytes: &[u8], key: &str, region_index: u32, entry: &str) -> Option<Vec<
     Some(bytes[cubin_at..].to_vec())
 }
 
-/// `$PIE_HOME/cache/ptir-cuda`, else the XDG cache, else `~/.cache`.
-fn default_directory() -> Option<PathBuf> {
-    let non_empty = |name: &str| {
-        std::env::var_os(name)
-            .map(PathBuf::from)
-            .filter(|value| !value.as_os_str().is_empty())
-    };
-    if let Some(home) = non_empty("PIE_HOME") {
-        return Some(home.join("cache").join("ptir-cuda"));
-    }
-    if let Some(cache) = non_empty("XDG_CACHE_HOME") {
-        return Some(cache.join("pie").join("ptir-cuda"));
-    }
-    non_empty("HOME").map(|home| home.join(".cache").join("pie").join("ptir-cuda"))
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // The compiled program
 // ─────────────────────────────────────────────────────────────────────────────
@@ -773,8 +767,11 @@ pub struct Cache {
 }
 
 impl Default for Cache {
+    /// A cache that stores nothing. The directory is the deployment's and
+    /// arrives on the `Boot` (article 9); a `Default` that went looking for
+    /// one would be the environment read this crate no longer makes.
     fn default() -> Cache {
-        Cache::new(Disk::from_env())
+        Cache::new(Disk::disabled())
     }
 }
 

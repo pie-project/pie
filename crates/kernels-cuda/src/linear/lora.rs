@@ -182,7 +182,19 @@ pub fn correct(
     // wherever the id is negative. That zero is what an adapterless row inside
     // an adapter window computes, and the combine below returns on it before
     // it reads the bank at all.
-    super::moe::select_gemv(ctx, OP, x, bank_a, routes, &mut projected)?;
+    // **AN ADAPTER BANK IS RESIDENT BY CONSTRUCTION** (design §8): its slots
+    // are written by `register_adapter` between fires, at addresses reserved
+    // at load, and nothing about it streams. So the D2 seats are the
+    // degenerate pair and this call is byte-for-byte the launch it was.
+    super::moe::select_gemv(
+        ctx,
+        OP,
+        x,
+        bank_a,
+        routes,
+        &mut projected,
+        super::moe::ExpertTable::RESIDENT,
+    )?;
 
     // ── half two: the accumulate ───────────────────────────────────────
     let rank_i = stated(OP, rank)?;

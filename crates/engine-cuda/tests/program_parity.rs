@@ -47,7 +47,7 @@ use engine::tensor_ir::container::HostRole;
 use tensor_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
 use tensor_ir::op::Op;
 use tensor_ir::registry::Stage;
-use tensor_ir::types::Shape;
+use tensor_ir::types::{Literal, Shape};
 use engine::tensor_ir::DType;
 use engine::tensor_ir::op::IntrinsicId;
 use engine::{
@@ -160,13 +160,19 @@ const SUBJECTS: &[Subject] = &[
     // offset, publishes a different token vector rather than a nearby number,
     // and the two halves diff it byte for byte.
     //
-    // **NOT `mtp_verify_tail`, AND THE REASON IS THE EMITTER.** The corpus
-    // does hold a two-column program — the full match-verify DAG — but its
-    // accept-prefix logic is a `cumprod`, and this backend declines a
-    // generated region containing a scan boundary
-    // (`region contains a non-generated boundary (scan)`). That is a standing
-    // codegen gap and not this axis's, so the subject is built here from the
-    // two ops the gate is actually about.
+    // **NOT `mtp_verify_tail`, AND THE REASON WAS THE EMITTER — IT NO LONGER
+    // IS.** The corpus does hold a two-column program, the full match-verify
+    // DAG, and its accept-prefix logic is a `cumprod`. This backend used to
+    // decline any region carrying a scan boundary (`region contains a
+    // non-generated boundary (scan)`), which is why the subject was built here
+    // from the two ops the gate is actually about. That gap is closed —
+    // `tensor_compiler::codegen::cuda::scan` emits the region, and the
+    // `scan_prefix` subject below is what proves the fold — so adopting the
+    // corpus program is now a choice about this axis rather than a codegen
+    // blocker. It stays synthetic because the argument for it never was the
+    // gap: this is the SMALLEST program that can tell the two columns apart,
+    // and the match-verify DAG around it would only add ops five other
+    // subjects already cover.
     //
     // **THIS IS AS FAR AS AN L40S CAN TAKE THE MTP AXIS.** The one shipping
     // SKU whose checkpoint publishes a draft head is `qwen36-27b`, whose bf16
@@ -181,10 +187,107 @@ const SUBJECTS: &[Subject] = &[
         draft_rows: 3,
         why: "two intrinsic columns in one epilogue, argmaxed apart",
     },
+    // **THE `Order` LIBRARY REGIONS** — `top_k` and `sort_desc`, neither a
+    // fused body nor a second-party name but a generated kernel of their own
+    // (`tensor_compiler::codegen::cuda::order`, one emitter for both because
+    // `sort_desc` IS `top_k` at `k = n`). Eight of them in one stage over two
+    // rows of a thousand, so what is compared is the ORDER: descending by
+    // value, ties to the lower index, values and indices agreeing element for
+    // element with `engine::program`'s own `sort_desc_order`.
+    //
+    // The two rows are chosen to fail differently. The taken channel holds
+    // sixteen distinct eighths over a thousand lanes — sixty-odd ties per
+    // value, so every pick of every `k` is a tie broken, and a sort that is not
+    // STABLE lands on the wrong index while landing on the right value. The
+    // derived row, `taken - iota`, is mostly distinct and mostly NEGATIVE, so
+    // it is the ordering itself under test: a descending key that mishandles
+    // the sign bit sorts it exactly backwards.
+    //
+    // The `sort_desc` pair is what pins the FULL order, thousand entries deep,
+    // where the `top_k`s pin only their first `k` — and it is the one shape
+    // that reaches the emitter's runtime-width path, because a sorted row's
+    // width can be symbolic in the plan where a `k` never is.
+    Subject {
+        name: ORDER_SUBJECT,
+        rows: 0,
+        draft_rows: 0,
+        why: "top_k at k in {1,3,8} and sort_desc, over ties and negatives",
+    },
+    // **THE SCAN LIBRARY REGION** — `cumsum`/`cumprod`
+    // (`tensor_compiler::codegen::cuda::scan`), and the one whose kernel is
+    // deliberately NOT parallel within a row. The reference is a left-to-right
+    // f32 fold and this suite compares bytes, so any reassociation is a
+    // failure; what the kernel parallelises is rows, and the subject carries
+    // both shapes to prove it: a single thousand-long row (one thread, the
+    // dependent-FADD chain that a left-to-right fold IS) and a `[8, 125]`
+    // reshape of the same data (eight threads, eight independent folds).
+    //
+    // THE ROW IS DIVIDED BY THREE FIRST, and that is the whole point. `cell`
+    // hands out multiples of an eighth; a thousand of those sum to well under
+    // 2^24, so every partial sum is EXACT and the accumulation order is
+    // unobservable — a chunked scan would pass. One IEEE division
+    // (`--prec-div=true` on the device, correctly rounded on both sides) makes
+    // the mantissas full and the rounding order-dependent, which is what turns
+    // this subject into a test of the fold and not just of the arithmetic.
+    Subject {
+        name: SCAN_SUBJECT,
+        rows: 0,
+        draft_rows: 0,
+        why: "cumsum and cumprod, one long row and eight short ones",
+    },
 ];
 
 /// The one subject built here rather than read from the corpus.
 const MTP_SUBJECT: &str = "mtp_two_columns";
+
+/// The other two.
+const ORDER_SUBJECT: &str = "order_ranks";
+const SCAN_SUBJECT: &str = "scan_prefix";
+
+/// How wide the row the two hand-built subjects rank and scan is.
+///
+/// A thousand, not a vocabulary, and the reason is the OTHER half: the host
+/// interpreter sorts and folds this row once per region per fire, so a
+/// 151,936-wide row costs the reference far more than it costs either kernel.
+/// Neither branches on the width — the order kernel loops to
+/// `input_desc.last`, the scan kernel to the same — so what a wider row adds
+/// is runtime, not coverage.
+///
+/// It has been run at 151,936 BY HAND, both subjects at once and both
+/// agreeing: a full vocabulary-deep `sort_desc` order, `top_k` at each `k`,
+/// a 151,936-long single-row `cumsum` (one thread, that many dependent adds)
+/// and an `8 x 18,992` `cumsum`/`cumprod` pair, over seven fires, in 3.8s of
+/// a release build. That is the evidence for the scan kernel's cost argument
+/// as much as for its correctness, and the width was then put back.
+const ORDER_ROW: u32 = 1000;
+
+/// The `k`s that subject asks for, each on both rows.
+///
+/// Small on purpose, because the whole-row case is covered by the `sort_desc`
+/// pair beside them rather than by a `k = n` here: both go through the same
+/// kernel, and the sorted form is the one that also exercises the runtime
+/// width. What these three pin is the truncation — that the kernel writes `k`
+/// entries of an order it computed in full, and the right `k`.
+const ORDER_KS: [u32; 3] = [1, 3, 8];
+
+/// How the scan subject reshapes its thousand-long row: `ROWS x COLUMNS`.
+///
+/// Eight rows and not one, because the kernel's only parallelism is across
+/// rows — one thread per row — and a subject with a single row would never run
+/// two folds at once, which is where a shared accumulator or a row-stride
+/// error lives.
+const SCAN_ROWS: u32 = 8;
+const SCAN_COLUMNS: u32 = ORDER_ROW / SCAN_ROWS;
+
+/// What the scan subject divides by to make its row non-dyadic, and what it
+/// then adds to keep a `cumprod` of a hundred-odd terms inside f32's range.
+///
+/// Three is not special; being a non-power-of-two is. `0.7` puts the
+/// multiplicands either side of one, so the running product wanders instead of
+/// collapsing to zero or running off to infinity within the first few terms —
+/// which would make every later element agree trivially.
+const SCAN_DIVISOR: f32 = 3.0;
+const SCAN_OFFSET: f32 = 0.7;
 
 /// `mtp_two_columns`, whole: one epilogue, two intrinsic columns, two argmaxes,
 /// two publishes.
@@ -228,6 +331,162 @@ fn mtp_two_columns() -> TraceContainer {
                 Op::ChanPut { chan: 0, value: 2 },
                 Op::ChanPut { chan: 1, value: 3 },
             ],
+        }],
+        externs: Vec::new(),
+    }
+}
+
+/// A reader channel of `shape`, at capacity one so an undrained round fills it.
+fn reader(shape: Shape, dtype: DType) -> ChannelDecl {
+    ChannelDecl {
+        shape,
+        dtype: ChanDType::Concrete(dtype),
+        capacity: 1,
+        host_role: HostRole::Reader,
+        seeded: false,
+    }
+}
+
+/// The thousand-long f32 row both hand-built ranking subjects take, refilled
+/// every round by the harness.
+fn taken_row() -> ChannelDecl {
+    ChannelDecl {
+        shape: Shape::vector(ORDER_ROW),
+        dtype: ChanDType::Concrete(DType::F32),
+        capacity: 1,
+        host_role: HostRole::Writer,
+        seeded: true,
+    }
+}
+
+/// `order_ranks`, whole: one taken row, one derived from it, a `top_k` of each
+/// `k` in [`ORDER_KS`] over both, and a `sort_desc` of each.
+///
+/// Every op here is exact on both halves. `cast` of an `iota` is an integer
+/// under 2^24 in an f32, and the `sub` that follows is a subtraction of two
+/// exactly-representable dyadic values — so the comparison downstream is byte
+/// for byte, as it is for every other subject, and a disagreement is a wrong
+/// answer rather than a rounding argument.
+fn order_ranks() -> TraceContainer {
+    let mut channels = vec![taken_row()];
+    for k in ORDER_KS {
+        for _ in 0..2 {
+            channels.push(reader(Shape::vector(k), DType::F32));
+            channels.push(reader(Shape::vector(k), DType::U32));
+        }
+    }
+    // The `sort_desc` pair, one per row: the whole order, full width.
+    for _ in 0..2 {
+        channels.push(reader(Shape::vector(ORDER_ROW), DType::F32));
+        channels.push(reader(Shape::vector(ORDER_ROW), DType::U32));
+    }
+
+    // 0: the taken row. 1..3: `iota` cast to f32 and subtracted from it.
+    let mut ops = vec![
+        Op::ChanTake(0),
+        Op::Iota { len: ORDER_ROW },
+        Op::Cast {
+            value: 1,
+            dtype: DType::F32,
+        },
+        Op::Sub(0, 2),
+    ];
+    // Each `Order` op defines two values, so the pair for the `i`th one starts
+    // at `4 + 2 * i` — the same arithmetic `result_bases` does, written out
+    // here because a trace names values, not ops.
+    let mut chan = 1u32;
+    let mut value = 4u32;
+    let publish = |ops: &mut Vec<Op>, chan: &mut u32, value: &mut u32| {
+        ops.push(Op::ChanPut {
+            chan: *chan,
+            value: *value,
+        });
+        ops.push(Op::ChanPut {
+            chan: *chan + 1,
+            value: *value + 1,
+        });
+        *chan += 2;
+        *value += 2;
+    };
+    for k in ORDER_KS {
+        for row in [0u32, 3u32] {
+            ops.push(Op::TopK { input: row, k });
+            publish(&mut ops, &mut chan, &mut value);
+        }
+    }
+    for row in [0u32, 3u32] {
+        ops.push(Op::SortDesc(row));
+        publish(&mut ops, &mut chan, &mut value);
+    }
+
+    TraceContainer {
+        names: vec![],
+        channels,
+        ports: vec![],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
+        }],
+        externs: Vec::new(),
+    }
+}
+
+/// `scan_prefix`, whole: one taken row made non-dyadic, then an inclusive
+/// prefix of it at both shapes and both folds.
+///
+/// The three published values are the three things a scan kernel can get
+/// wrong: the long single-row `cumsum` (the fold's ORDER, on one thread), the
+/// reshaped `cumsum` (the row STRIDE, on eight), and the reshaped `cumprod`
+/// (the IDENTITY — one, not zero — and the other combiner).
+fn scan_prefix() -> TraceContainer {
+    let matrix = || Shape::matrix(SCAN_ROWS, SCAN_COLUMNS);
+    let channels = vec![
+        taken_row(),
+        reader(Shape::vector(ORDER_ROW), DType::F32),
+        reader(matrix(), DType::F32),
+        reader(matrix(), DType::F32),
+    ];
+    let ops = vec![
+        // 0: the taken row, multiples of an eighth.
+        Op::ChanTake(0),
+        // 1..3: divided by a non-power-of-two, so the partial sums round.
+        Op::Const(Literal::F32(SCAN_DIVISOR)),
+        Op::Broadcast {
+            value: 1,
+            shape: Shape::vector(ORDER_ROW),
+        },
+        Op::Div(0, 2),
+        // 4: the long single-row inclusive sum — one thread, `ORDER_ROW`
+        // dependent adds.
+        Op::CumSum(3),
+        // 5: the same data as eight rows — eight threads, eight folds.
+        Op::Reshape {
+            value: 3,
+            shape: Shape::matrix(SCAN_ROWS, SCAN_COLUMNS),
+        },
+        // 6: the inclusive sum of those.
+        Op::CumSum(5),
+        // 7..9: shifted either side of one so the running product wanders.
+        Op::Const(Literal::F32(SCAN_OFFSET)),
+        Op::Broadcast {
+            value: 7,
+            shape: Shape::matrix(SCAN_ROWS, SCAN_COLUMNS),
+        },
+        Op::Add(5, 8),
+        // 10: the inclusive product.
+        Op::CumProd(9),
+        Op::ChanPut { chan: 1, value: 4 },
+        Op::ChanPut { chan: 2, value: 6 },
+        Op::ChanPut { chan: 3, value: 10 },
+    ];
+
+    TraceContainer {
+        names: vec![],
+        channels,
+        ports: vec![],
+        stages: vec![StageProgram {
+            stage: Stage::Epilogue,
+            ops,
         }],
         externs: Vec::new(),
     }
@@ -295,6 +554,12 @@ fn golden_profile(name: &str) -> ModelProfile {
 fn container_of(name: &str) -> TraceContainer {
     if name == MTP_SUBJECT {
         return mtp_two_columns();
+    }
+    if name == ORDER_SUBJECT {
+        return order_ranks();
+    }
+    if name == SCAN_SUBJECT {
+        return scan_prefix();
     }
     let path = golden_dir().join(format!("{name}.txt"));
     let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{path:?} is missing"));

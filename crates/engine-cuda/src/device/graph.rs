@@ -593,6 +593,52 @@ impl Event {
         }
     }
 
+    /// **Has everything this event was recorded behind completed?** — asked,
+    /// never waited on.
+    ///
+    /// `cudaEventQuery`, which is the one device call that answers a question
+    /// about progress without blocking on it. The routed-expert tier (alto
+    /// design §7) asks it before it reuses the pinned staging words a previous
+    /// promotion's copies may still be reading: a `false` skips that gap's
+    /// promotion, which is the honest answer for a mechanism whose whole
+    /// doctrine is that residency is a promotion and never a wait.
+    ///
+    /// An event that was never recorded answers `true` — there is nothing
+    /// outstanding behind it — which is what makes the first round free.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Runtimeless`], or [`Fault::Device`] for a status that is
+    /// neither "done" nor "not yet".
+    pub fn done(&self) -> Result<bool> {
+        #[cfg(feature = "_cuda")]
+        {
+            use cudarc::runtime::sys as rt;
+            // SAFETY: the handle is live and this crate created it.
+            let status = unsafe { rt::cudaEventQuery(self.raw.cast()) };
+            match status {
+                rt::cudaError::cudaSuccess => Ok(true),
+                rt::cudaError::cudaErrorNotReady => {
+                    // The status is consumed here rather than left to be
+                    // re-reported by the next unrelated call.
+                    #[allow(unused_must_use)]
+                    unsafe {
+                        rt::cudaGetLastError();
+                    }
+                    Ok(false)
+                }
+                code => Err(Fault::Device {
+                    call: "cudaEventQuery",
+                    code: code as i32,
+                }),
+            }
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            Err(Fault::Runtimeless)
+        }
+    }
+
     /// **Milliseconds of device time from `self` to `end`**, for two events
     /// created by [`Event::timing`] and both already completed.
     ///

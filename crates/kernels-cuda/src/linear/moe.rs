@@ -274,14 +274,54 @@ fn selected(
 
 /// Grouped matmul over a dense bank: each routed row multiplies the expert
 /// its route selects — the decode GEMV, one warp-column per output tile.
+/// **WHERE A ROUTED BANK'S EXPERTS ARE** (alto design §7, wave D2).
+///
+/// The two device addresses a streamed bank hands the select, and the two
+/// zeros a fully-resident one hands it:
+///
+/// * `table` — the bank's device-resident indirection table, `expert_id ->
+///   base address`, one fixed-address entry per expert. An entry points into
+///   the device slab when the expert is resident and at its PINNED HOST bytes
+///   over UVA when it is not, so a miss costs PCIe bandwidth and never a sync
+///   (article 2). Entries are DATA (article 5), which is what lets a captured
+///   graph survive a promotion.
+/// * `hits` — the bank's per-expert usage counters, one `u32` per expert. The
+///   select does one `atomicAdd` per routed expert per fire; the host reads
+///   the buffer between fires and promotes (article 3, applied to weights).
+///
+/// [`ExpertTable::RESIDENT`] is both zeros, and it is the DEGENERATE case
+/// rather than an off switch: with no table the kernel computes the same
+/// `bank_base + expert * stride` it always did, and with no counters it
+/// counts nothing. A load whose device budget covers the whole table passes
+/// it and pays for D2 exactly nothing (dev's `place_all()`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExpertTable {
+    /// Device address of the `expert_id -> base address` table, or 0.
+    pub table: u64,
+    /// Device address of the per-expert usage counters, or 0.
+    pub hits: u64,
+}
+
+impl ExpertTable {
+    /// The whole bank is on the device: no table to read, nothing to count.
+    pub const RESIDENT: ExpertTable = ExpertTable { table: 0, hits: 0 };
+
+    /// Does this bank stream?
+    #[must_use]
+    pub const fn streams(&self) -> bool {
+        self.table != 0
+    }
+}
+
 pub fn matmul_select(
     ctx: &Ctx,
     x: Tensor,
     bank: Tensor,
     routes: Tensor,
     y: &mut Tensor,
+    experts: ExpertTable,
 ) -> Result<(), KernelError> {
-    select_gemv(ctx, "linear.moe_matmul_select", x, bank, routes, y)
+    select_gemv(ctx, "linear.moe_matmul_select", x, bank, routes, y, experts)
 }
 
 /// The routed dense GEMV itself, under the caller's own op name.
@@ -300,6 +340,7 @@ pub(crate) fn select_gemv(
     bank: Tensor,
     routes: Tensor,
     y: &mut Tensor,
+    experts: ExpertTable,
 ) -> Result<(), KernelError> {
     /// K in whole float4 loads.
     const VEC_WIDTH: u32 = 8;
@@ -350,6 +391,11 @@ pub(crate) fn select_gemv(
             k.arg(),
             n.arg(),
             (i64::from(n) * i64::from(k)).arg(), // the bank's expert stride
+            // THE TWO D2 SEATS, both `ABSENT` for a resident bank — see
+            // [`ExpertTable`]. `ABSENT` is a null pointer and the kernel's
+            // arm on it is the arithmetic it did before the seats existed.
+            ArgValue::Ptr(experts.table),
+            ArgValue::Ptr(experts.hits),
         ],
     )
 }

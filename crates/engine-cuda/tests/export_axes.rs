@@ -1062,6 +1062,9 @@ mod gemma {
         drop(source);
 
         let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
             trace,
             contract: &contract,
             checkpoint: &checkpoint,
@@ -1072,10 +1075,15 @@ mod gemma {
             slots: 4,
             ordinal: 0,
             graphs: engine_cuda::Graphs::Off,
+            knobs: engine_cuda::Knobs::default(),
+            program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
             // claims. `Runahead::of` is the door a deployment comes through.
             runahead: engine::runahead::Runahead::F1,
+            // The warm-boot weight artifact cache is off for a gate: a test
+            // that shared one would be asserting about the last run.
+            weight_cache_dir: None,
         })
         .expect("the shell loads");
         eprintln!("gemma4-e4b loaded — capture layers {:?}", shell.score_layers());
@@ -1137,6 +1145,9 @@ fn the_drafting_sku_does_not_fit_this_device() {
     drop(source);
 
     let refused = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
@@ -1147,10 +1158,15 @@ fn the_drafting_sku_does_not_fit_this_device() {
         slots: 4,
         ordinal: 0,
         graphs: Graphs::Off,
+        knobs: engine_cuda::Knobs::default(),
+        program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
         runahead: engine::runahead::Runahead::F1,
+        // The warm-boot weight artifact cache is off for a gate: a test
+        // that shared one would be asserting about the last run.
+        weight_cache_dir: None,
     });
     let said = match refused {
         Ok(shell) => {
@@ -1287,6 +1303,9 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     drop(source);
 
     let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
@@ -1297,10 +1316,15 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         slots: 4,
         ordinal: 0,
         graphs: Graphs::Off,
+        knobs: engine_cuda::Knobs::default(),
+        program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
         runahead: engine::runahead::Runahead::F1,
+        // The warm-boot weight artifact cache is off for a gate: a test
+        // that shared one would be asserting about the last run.
+        weight_cache_dir: None,
     })
     .expect("the shell loads");
     let (weights, arena, pools, inputs) = shell.footprint();

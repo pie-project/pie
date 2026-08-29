@@ -59,18 +59,27 @@
 //! sync, the commit readback, and the host cursor advance — so the sync is
 //! now a lifetime fence and not a control-flow one.
 //!
-//! # The Article 4 bridge, named
+//! # The Article 4 bridge, crossed (wave E)
 //!
-//! [`Session::blocked_channel`] is still asked before a fire, and a fire that
-//! fails it answers [`Fired::Blocked`] without launching. **That is an
-//! ADMISSION check, not a fire-path branch** (article 4: everything a device
-//! gate could refuse is proved impossible at submit, so a surviving refusal
-//! is a contract violation and not a retry). It is an approximation of the
-//! static ring validation wave E ports — it asks this instance's own
-//! declared per-channel requirement rather than the whole frame's union — and
-//! it is here rather than on the fire path because an epilogue that
-//! discovered its rings were not ready AFTER the forward would leave the
-//! lane's tokens in the cache with the guest's pass unrun.
+//! F2a named this the bridge: [`Session::blocked_channel`] asked, before a
+//! fire, whether this instance's own declared per-channel requirement was met,
+//! and the shell's `prepare` asked it again over every attached instance so a
+//! blocked one could cross the contract as `Error::Exhausted` and be
+//! re-offered. It was an approximation of static admission — one instance's
+//! requirement rather than the whole frame's union — and wave E landed the
+//! real thing: `runtime::pipeline::fire::validate_frame` walks a frame's steps
+//! in slot order and proves device-only ring occupancy, host-writer staged
+//! cells and reader-ring worst-case pressure against the channels' declared
+//! capacities, before the frame is admitted.
+//!
+//! So the shell's gate is gone and this one is no longer an admission
+//! decision. What is left of it is the STANDALONE fire's semantics: a program
+//! fired on its own through `Shell::fire_program` answers [`Fired::Blocked`]
+//! for the same channel [`engine::step`] blocks on, which is what the parity
+//! test compares. At a model fire's BOUNDARY a block is not an answer at all —
+//! an epilogue runs after the forward has written the lane's KV, so there is
+//! nothing to replay — and `serve::committed_or` turns it into a [`Fault`]
+//! naming the instance and the channel.
 //!
 //! Past that door the device decides, and a device refusal that is a
 //! READINESS MISS is a loud [`Fault`] rather than a silent retry: the host
@@ -87,6 +96,7 @@
 
 use std::sync::Arc;
 
+use engine::tensor_ir::registry::GeometryClass;
 use engine::tensor_ir::container::HostRole;
 use engine::tensor_ir::validate::Direction;
 use engine::{ExecPlan, Extents};
@@ -370,6 +380,13 @@ impl Session {
     /// Shifts the engine-owned prediction of `channel` by `head` and `tail`.
     /// The guest's own counter is not touched: it is the pinned word, and the
     /// disagreement being tested is exactly the one between the two.
+    ///
+    /// **COMPILED ONLY WHERE A GATE CAN SEE IT** (alto wave P): behind
+    /// `feature = "probe"`, which this crate defaults on and a serving binary
+    /// drops with `default-features = false`. "Named so a serving path could
+    /// not reach for it by accident" is a comment; this is the compiler
+    /// saying it.
+    #[cfg(any(test, feature = "probe"))]
     pub fn skew_prediction(&mut self, channel: u32, head: i64, tail: i64) {
         let shift = |counter: &mut u64, by: i64| {
             *counter = counter.saturating_add_signed(by);
@@ -378,6 +395,22 @@ impl Session {
             shift(&mut cursor.head, head);
             shift(&mut cursor.tail, tail);
         }
+    }
+
+    /// **The device address of this instance's pass commit word.**
+    ///
+    /// The word `channel::pull_validate` seeds and every stage's kernel reads
+    /// first — one per instance, living in the pinned commit pair, and the one
+    /// place "did this pass commit?" is written down. Published because the
+    /// recurrent fold is predicated on the same word: `channel::mask_from_commit`
+    /// takes an array of these addresses and scatters each into the fold
+    /// predicate its lane's scans read (alto design §6's change (a)).
+    ///
+    /// Read-only, and a POINTER rather than a value on purpose — the host
+    /// reading it would be the round trip article 3 forbids.
+    #[must_use]
+    pub fn commit_word(&self) -> u64 {
+        self.commit.device()
     }
 
     /// How many fires have committed on this instance.
@@ -502,8 +535,8 @@ impl Session {
     ///
     /// [`Fault::Program`] for a port naming a channel this instance does not
     /// carry or holding a non-integer cell, and whatever the copy said.
-    pub fn envelope(&self, plan: &ExecPlan) -> Result<Envelope> {
-        ports::resolve(plan, &self.rings, &self.cursors_now(), &self.shapes)
+    pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
+        ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
     }
 
     /// Point one intrinsic at a device buffer, for every stage of this
@@ -605,13 +638,19 @@ impl Session {
             ));
         }
 
-        // ── ADMISSION, AND IT IS NOT A FIRE-PATH BRANCH (article 4, and
-        //    the module header's "Article 4 bridge"). The program's declared
-        //    per-channel requirement, in channel order, answering with the
-        //    FIRST channel that fails — because `engine::step` does exactly
-        //    that and a caller retries on the name. Nothing has been minted
-        //    and nothing has launched, so a refusal here has zero side
-        //    effects, which is what article 4 asks of one.
+        // ── THE STANDALONE FIRE'S OWN VERB (the module header's "Article 4
+        //    bridge, crossed"). The program's declared per-channel
+        //    requirement, in channel order, answering with the FIRST channel
+        //    that fails — because `engine::step` does exactly that and the
+        //    parity test compares the two answers channel for channel.
+        //
+        //    **IT IS NOT AN ADMISSION CHECK ANY MORE.** Static admission is
+        //    the runtime's `validate_frame`, over the whole frame's union of
+        //    rings, before a frame is admitted; the shell's own copy of this
+        //    question — asked in `serve`'s prepare over every attachment, and
+        //    crossing the contract as `Error::Exhausted` — is deleted with the
+        //    sleep-retry loop that consumed it. At a boundary a block reaches
+        //    `serve::committed_or` and is a fault, not a scheduling answer.
         //
         //    Past this door the host makes no more decisions about this fire.
         if let Some(blocked) = self.blocked_channel(plan) {
@@ -939,14 +978,17 @@ impl Session {
     /// The first channel whose declared requirement a fire right now would
     /// not meet, or `None` when this instance is ready to fire.
     ///
-    /// **THE GATE, ASKED WITHOUT FIRING.** [`Session::fire`] opens it for
-    /// itself, and that is enough for a program fired on its own. It is not
-    /// enough at a model fire's boundary: an epilogue is fired AFTER the
-    /// forward has run and written the lane's KV, so discovering there that
-    /// its rings are not ready would leave a fire the caller cannot retry —
-    /// the tokens are in the cache and the guest's pass never happened. So
-    /// the attachment path asks first, over every attached instance, and
-    /// refuses the whole fire before anything launches.
+    /// **THE QUESTION, ASKED WITHOUT FIRING.** [`Session::fire`] asks it for
+    /// itself, and that is the whole of it for a program fired on its own.
+    ///
+    /// It used to be an admission gate as well: the attachment path asked it
+    /// over every attached instance and refused the whole fire before anything
+    /// launched, because an epilogue that discovered its rings were not ready
+    /// AFTER the forward would leave a fire the caller cannot retry. Wave E
+    /// moved that proof to where it can be made over the whole frame at once
+    /// — `runtime::pipeline::fire::validate_frame` — and past it a block at a
+    /// boundary is a contract violation `serve::committed_or` names, not a
+    /// refusal to be re-offered.
     ///
     /// Same arithmetic, one implementation: [`Session::fire`] calls this.
     #[must_use]

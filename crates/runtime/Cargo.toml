@@ -16,13 +16,29 @@ path = "src/lib.rs"
 # tart: the declared-forward toolchain, and OPTIONAL now.
 #
 engine-api = { path = "../engine-api" }
+# THE NEUTRAL SUBSTRATE, and the runtime reads exactly one module of it in the
+# library: `engine::runahead`, which design §1 article 8 names as the
+# enforcement of *one number, one owner*. The runtime owns the run-ahead
+# policy and the guest-visible ring size, so it has to DERIVE them from the
+# formula rather than transcribe it — a second spelling of `frames_in_flight
+# + 1` in this crate is the three-depth knot growing back.
+#
+# It is also the host half of the guest-program plane: `engine::program` is a
+# complete interpreter of the same launch package the CUDA shell executes —
+# same ops, same channel semantics, same pass-atomic commit — and
+# `tests/cuda_program_epilogue.rs` diffs the two over a real model fire's
+# logits. That was a dev-dependency until wave E promoted the edge.
+engine = { path = "../engine" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }
 # THE CUTOVER, DONE. This was `engine-cuda-new` beside a C++ `engine-cuda`
 # that supplied the same thirteen `pie_cuda_*` symbols, so which archive
 # the seam linked was the whole switch and `backend/cuda.rs` was unchanged
 # either way. There is one now, and it has the name.
-engine-cuda = { path = "../engine-cuda", optional = true }
+# `default-features = false` drops the shell's `probe` feature — the gate-only
+# hooks (`Session::skew_prediction`) that exist to make the engine disagree
+# with itself on purpose. A serving binary has no business compiling one.
+engine-cuda = { path = "../engine-cuda", optional = true, default-features = false }
 # BACK AT P5, and only this one of the three. R3 cut the edge rather than
 # gating it, on the reading that "an optional path dependency is enough to drag
 # one back in: cargo adopts a path dep inside the workspace directory as a
@@ -242,13 +258,6 @@ tempfile = "3"
 # parser has no business in a shipped binary. Dev-dependencies are not built
 # for `cargo build`, which is exactly the line we want here.
 wasmtime = { version = "47", default-features = false, features = ["wat"] }
-# THE HOST HALF OF THE GUEST-PROGRAM PLANE, for the `palo B2` gate and for
-# nothing else. `engine::program` is a complete interpreter of the same launch
-# package the CUDA shell executes — same ops, same channel semantics, same
-# pass-atomic commit — and `tests/cuda_program_epilogue.rs` diffs the two over
-# a real model fire's logits. It is the golden, so it has to be the SHARED
-# crate's interpreter and not a second one written beside the test.
-engine = { path = "../engine" }
 # `model-dsl` STOOD HERE, for the boot smoke and for nothing else: `Lane::word`
 # is the one genuinely new submission field, the catalog shipped
 # `(sku, tp, TraceFn)` and no `ClassifyFn`, and the only way to state a word

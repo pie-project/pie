@@ -53,16 +53,6 @@ impl ChannelState {
         }
     }
 
-    #[must_use]
-    pub fn mirror_base(&self) -> u64 {
-        self.cells.lock().expect(POISONED).as_ptr() as u64
-    }
-
-    #[must_use]
-    pub fn word_base(&self) -> u64 {
-        self.words.as_ptr() as u64
-    }
-
     fn load_word(&self, index: usize) -> u64 {
         self.words[index].load(Ordering::Acquire)
     }

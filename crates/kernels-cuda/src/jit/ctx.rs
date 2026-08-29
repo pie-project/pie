@@ -293,17 +293,25 @@ impl Ctx {
     /// slabs and the compiler no longer has to order them apart. `jit::device`
     /// carries the measurements both halves come from.
     ///
-    /// **The contract, both ways.** Growth is `cudaFree` + `cudaMalloc`,
-    /// which would poison a capture in progress. The engine's side: warm
-    /// every scratch-consuming entry with an eager fire at full fire shape
-    /// before capturing, so a captured fire only ever re-reads a slab that
-    /// is already big enough — and the warm pass may fire on ONE stream,
-    /// because growth is broadcast across every stream the arena has been
-    /// told about. This plane's side: the cheap runtime guard in
+    /// **The contract, both ways.** Growth allocates a fresh block, which
+    /// would split a capture in progress across two addresses. The engine's
+    /// side: warm every scratch-consuming entry with an eager fire at full
+    /// fire shape before capturing, so a captured fire only ever re-reads a
+    /// slab that is already big enough — and the warm pass may fire on ONE
+    /// stream, because growth is broadcast across every stream the arena has
+    /// been told about. This plane's side: the cheap runtime guard in
     /// `device::take` — if this context's stream is mid-capture
     /// (`cudaStreamIsCapturing`) and the slab would have to grow, the fire
     /// comes back as a [`KernelError::Backend`] refusal naming the
     /// un-warmed slab instead of corrupting the capture.
+    ///
+    /// **AND WHAT NEITHER SIDE CAN PROMISE**: that no LATER fire grows a name
+    /// a graph already baked. The shapes a serving load brings are not
+    /// bounded by the ones it has brought, so growth after a capture is
+    /// ordinary, and `jit::device` answers it by RETIRING the superseded
+    /// block rather than freeing it — the address a recorded graph holds
+    /// stays its own for the life of the arena. The module comment there
+    /// carries the measurement.
     pub fn scratch(
         &self,
         op: &'static str,

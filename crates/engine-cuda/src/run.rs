@@ -21,6 +21,7 @@ use kernels_cuda::attn::plan::{
     DecodePlan, Device, MlaPlan, PrefillPlan, PrefillPlanSm90, Shape, Toggles, Workspace,
 };
 use kernels_cuda::linear::lora::Segments;
+use kernels_cuda::linear::moe::ExpertTable;
 use kernels_cuda::{Ctx, KvPool, Pad, RaggedTensor, RecurrentPool, Tensor};
 use model_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
@@ -38,6 +39,27 @@ pub enum WeightRow {
     /// A split-plane quantized bank — e2m1 `codes` beside e8m0 `scales` —
     /// resolved by [`Run::planes`], never as one tensor.
     Planes { codes: Tensor, scales: Tensor },
+
+    /// **A STREAMED ROUTED-EXPERT BANK** (alto design §7, wave D2): a device
+    /// slab of fewer slots than the bank has experts, plus the two device
+    /// addresses the select kernel needs to read it — the indirection table
+    /// (`expert_id -> base address`, entries pointing into the slab or at
+    /// pinned host bytes over UVA) and the per-expert usage counters the fire
+    /// path `atomicAdd`s into.
+    ///
+    /// It is a dense row with two numbers on it rather than a second kind of
+    /// weight, and that is deliberate: [`Run::tensor`] resolves it to `slab`
+    /// like any other handle, so every op that reads a bank as a plain
+    /// rectangle keeps working, and only [`Run::expert_bank`] — the MoE
+    /// select's own resolution — asks about the two addresses.
+    Streamed {
+        /// The device slab: `resident` slots at the store's own address.
+        slab: Tensor,
+        /// Device address of this bank's indirection table.
+        table: u64,
+        /// Device address of this bank's usage counters.
+        counts: u64,
+    },
 }
 
 /// Loader-resolved weights, one row per `Trace::params` entry —
@@ -264,6 +286,155 @@ pub struct FireTables {
     pub pool_state: Option<PoolSlabs>,
 }
 
+/// **What one lane's recurrent state does with the buffer this fire**
+/// (`engine_api::RsVerb`, resolved to addressing).
+///
+/// The verb minus everything the shell already decided. `Fold` is the absence
+/// of a move — the plain path, and the only shape that graph-replays — so it
+/// is not a variant a copy has to test for at every layer.
+///
+/// **THE RUN IS A LIST AND NOT A RANGE** (wave F3-tail). It was
+/// `(first_page, pages)` and the page a buffer token lived in was
+/// `first_page + token / page_tokens`, which is an arithmetic the runtime
+/// cannot honour: its recurrent store materializes a buffer page when the
+/// first write reaches it and copies it on write after a fork, so a lane's
+/// run is contiguous only by luck. `RsVerb::Buffer::pages` is the physical
+/// slot ids in buffer order, and the addressing is one indexing —
+/// `pages[token / page_tokens]` — with the same capacity check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsMove<'a> {
+    /// Fold in the forward: nothing is copied.
+    None,
+    /// **Scatter this lane's rows into its buffer** (`RsVerb::Buffer`): row
+    /// `t` of the lane lands at buffer token `at + t`.
+    Scatter {
+        /// The lane's buffer run: physical page slot ids in buffer order.
+        pages: &'a [u32],
+        /// Which buffer token this fire's first row lands at.
+        at: u32,
+        /// **How many of this fire's rows this lane also FOLDS** (alto design
+        /// §6's fused collapse, wave F3b).
+        ///
+        /// `0` is the pure scatter — the draft whose rejection is host
+        /// bookkeeping, and the only value F3 served. Anything else is the
+        /// MIXED ROW: the fire writes every row into the buffer AND lands the
+        /// durable state on row `fold`, so the next window's speculation
+        /// starts from the accepted boundary without a second fire.
+        ///
+        /// `fold == rows` degenerates to the single-call folding path and
+        /// `fold == 0` to the single-call scatter; only a boundary STRICTLY
+        /// inside the row takes the two-launch split.
+        fold: u32,
+    },
+    /// **Gather this lane's buffer over its rows** (`RsVerb::FoldBuffered`):
+    /// buffer token `t` becomes row `t`, for as many rows as the lane has.
+    ///
+    /// The lane's row count IS the host's `bound`; `commit_len` truncates the
+    /// scan at the accepted length inside it, which is the whole of why the
+    /// gather does not need to know that length.
+    Gather {
+        /// The lane's buffer run, addressed exactly as `Scatter` wrote it.
+        pages: &'a [u32],
+        /// **Which buffer token the replay starts at** — the buffer's head
+        /// (wave F3b).
+        ///
+        /// The gap F3 documented and did not close: a fold absorbs tokens off
+        /// the FRONT of the buffer but can only release whole covered pages,
+        /// so a mid-page fold leaves the survivors physically offset and a
+        /// replay from buffer token zero would re-fold what the last fold
+        /// already took. `Scatter`'s `at` is the same number from the same
+        /// origin, which is what lets one page list serve both.
+        at: u32,
+    },
+}
+
+/// **The buffered-activation plane, seated for one fire.**
+#[derive(Debug, Clone, Copy)]
+pub struct RsSeat<'a> {
+    /// The pool and the plan's reading of it.
+    pub buffers: &'a crate::store::rs::Buffers,
+    /// One verb per lane, in FIRE (seriated) order.
+    pub lanes: &'a [RsMove<'a>],
+}
+
+impl RsSeat<'_> {
+    /// Move one plane's rows for every lane of one window.
+    ///
+    /// `bounds` is the window-rebased row CSR (`[lanes + 1]`), `rows` the
+    /// plane's rectangle as this window sees it, and `lane_offset` what turns
+    /// a window request number into a fire lane.
+    fn run(
+        &self,
+        stream: *mut core::ffi::c_void,
+        plane: crate::store::rs::Plane,
+        lane_offset: u32,
+        bounds: &[i32],
+        rows: Tensor,
+    ) -> crate::error::Result<()> {
+        let page_tokens = self.buffers.page_tokens();
+        let elem = model_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
+            .expect("the buffered planes are bf16, which has an element size");
+        if u64::from(rows.width) != plane.width {
+            return Err(crate::error::Fault::Unbound {
+                what: format!(
+                    "a buffered plane reserved at {} elements a token is bound {} wide this \
+                     fire",
+                    plane.width, rows.width
+                ),
+            });
+        }
+        for (at, pair) in bounds.windows(2).enumerate() {
+            let Some(&verb) = self.lanes.get(lane_offset as usize + at) else {
+                continue;
+            };
+            let (pages, from, count) = match verb {
+                RsMove::None => continue,
+                RsMove::Scatter { pages, at, .. } => (pages, at, (pair[1] - pair[0]) as u32),
+                RsMove::Gather { pages, at } => (pages, at, (pair[1] - pair[0]) as u32),
+            };
+            if count == 0 {
+                continue;
+            }
+            let capacity = pages.len() as u64 * u64::from(page_tokens);
+            if u64::from(from) + u64::from(count) > capacity {
+                return Err(crate::error::Fault::Ceiling {
+                    what: "rs buffer tokens",
+                    need: u64::from(from) + u64::from(count),
+                    have: capacity,
+                });
+            }
+            // One contiguous run per (page, plane): the page-major layout is
+            // chosen so that this loop is memcpys and not a strided kernel.
+            let mut done = 0u32;
+            while done < count {
+                let token = from + done;
+                let page = token / page_tokens;
+                let in_page = token % page_tokens;
+                let take = (page_tokens - in_page).min(count - done);
+                // THE ONE LINE THE LIST CHANGES: the run's page `page` is
+                // whatever slot the list names, not `first_page + page`.
+                let page_slot = *pages.get(page as usize).ok_or(crate::error::Fault::Ceiling {
+                    what: "rs buffer pages",
+                    need: u64::from(page) + 1,
+                    have: pages.len() as u64,
+                })?;
+                let slab = self.buffers.row(plane, page_slot, in_page)?;
+                let rows_at = rows.ptr
+                    + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
+                let bytes = usize::try_from(u64::from(take) * plane.width * elem)
+                    .unwrap_or(usize::MAX);
+                let (dst, src) = match verb {
+                    RsMove::Scatter { .. } => (slab, rows_at),
+                    _ => (rows_at, slab),
+                };
+                crate::device::copy_d2d(stream, dst, src, bytes)?;
+                done += take;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// What the engine binds each fire, owned by the [`Run`] for its lifetime.
 ///
 /// `tokens`, `positions`, and `geometry` are the op-visible inputs —
@@ -436,6 +607,10 @@ pub struct Run<'c> {
     /// This fire's bindings.
     fire: FireBindings,
 
+    /// **The buffered-activation plane**, for a fire that carries one — a
+    /// per-lane RS verb and the pool it addresses ([`Run::buffered`]).
+    rs: Option<RsSeat<'c>>,
+
     /// Every region's window, resolved once per fire from the composition's
     /// class table.
     windows: &'c Windows,
@@ -515,6 +690,7 @@ impl<'c> Run<'c> {
             structs: vec![None; values.len() * windows.max_runs() as usize],
             values_wide: values.len(),
             fire,
+            rs: None,
             windows,
             place,
             side: &[],
@@ -536,6 +712,59 @@ impl<'c> Run<'c> {
     pub fn quantized(mut self, pad: Pad) -> Self {
         self.pad = pad;
         self
+    }
+
+    /// **The buffered-activation plane, for a fire that carries one** (alto
+    /// design §6, wave F3).
+    ///
+    /// A builder rather than a [`FireBindings`] field because it is the one
+    /// piece of a fire that is not bound per VALUE: it is a per-LANE verb plus
+    /// a pool, read by exactly the two dispatch arms that touch an
+    /// in-projection plane, and a fire whose every lane folds carries none of
+    /// it at all.
+    pub fn buffered(mut self, rs: RsSeat<'c>) -> Self {
+        self.rs = Some(rs);
+        self
+    }
+
+    /// **Scatter or gather this operand's rows, if it is a buffered plane.**
+    ///
+    /// Called by the dispatch arms of the two ops that READ an in-projection
+    /// plane, immediately before they read it. A value no plan buffers, or a
+    /// fire with no buffered lane, is one `Option` test and nothing else.
+    ///
+    /// The window arithmetic is the same one the launch does: this window's
+    /// request `r` is fire lane `lane_offset + r`, and its rows begin at the
+    /// window-rebased `qo_indptr_host()[r]`.
+    ///
+    /// # Errors
+    ///
+    /// The shell's fault for a page slot past the pool, a buffer run too
+    /// short for the tokens the verb named, or the copy.
+    pub(crate) fn rs_move(
+        &self,
+        op: &'static str,
+        id: ValueId,
+        rows: Tensor,
+    ) -> Result<(), kernels::KernelError> {
+        let Some(seat) = self.rs.as_ref() else {
+            return Ok(());
+        };
+        let Some(plane) = seat.buffers.planes().of(id) else {
+            return Ok(());
+        };
+        let span = self.window().span;
+        let bounds = self.qo_indptr_host();
+        // The shell's fault becomes the dispatch plane's, because that is the
+        // channel this arm answers on: the walk turns a `KernelError` back
+        // into a `Fault` one frame up (`Fault::from`), so nothing is lost but
+        // the variant, and the sentence — which is what a caller reads — is
+        // carried whole.
+        seat.run(self.ctx.stream(), plane, span.lane_offset, bounds, rows)
+            .map_err(|fault| kernels::KernelError::Backend {
+                op,
+                detail: fault.to_string(),
+            })
     }
 
     /// `Trace::values`, for the copy plan's own shape reading.
@@ -949,7 +1178,9 @@ impl<'c> Run<'c> {
             Def::Weight(w) => {
                 let row = *w as usize;
                 match self.weights.0.get(row).copied().flatten() {
-                    Some(WeightRow::Dense(handle)) => handle,
+                    Some(WeightRow::Dense(handle) | WeightRow::Streamed { slab: handle, .. }) => {
+                        handle
+                    }
                     Some(WeightRow::Planes { .. }) => panic!(
                         "value {at} is weight {row}, a split-plane bank; it resolves \
                          through `Run::planes`, never as one dense handle"
@@ -998,9 +1229,40 @@ impl<'c> Run<'c> {
         let row = *w as usize;
         match self.weights.0.get(row).copied().flatten() {
             Some(WeightRow::Planes { codes, scales }) => (codes, scales),
-            Some(WeightRow::Dense(_)) => panic!(
+            Some(WeightRow::Dense(_) | WeightRow::Streamed { .. }) => panic!(
                 "value {at} is weight {row}, bound as one dense handle, and this op reads \
                  a split-plane bank"
+            ),
+            None => panic!("value {at} is weight {row}, which the shell has not bound"),
+        }
+    }
+
+    /// **A ROUTED EXPERT BANK, AND WHERE ITS EXPERTS ARE** (alto design §7,
+    /// wave D2) — the resolution `linear.moe_matmul_select` uses in place of
+    /// [`Run::tensor`].
+    ///
+    /// The handle is the same rectangle `tensor` would answer with. What comes
+    /// beside it is the pair of device addresses the select kernel resolves
+    /// each expert's weights through: for a fully-resident load they are
+    /// [`ExpertTable::RESIDENT`] — two nulls — and the kernel does the
+    /// `bank_base + expert * stride` arithmetic it always did, which is why a
+    /// load that streams nothing pays nothing for this door existing.
+    pub(crate) fn expert_bank(&self, id: ValueId) -> (Tensor, ExpertTable) {
+        let at = id.0 as usize;
+        let Def::Weight(w) = &self.values[at].def else {
+            panic!("value {at} is not a weight, and a routed bank is a weight row");
+        };
+        let row = *w as usize;
+        match self.weights.0.get(row).copied().flatten() {
+            Some(WeightRow::Dense(handle)) => (self.cut(id, handle), ExpertTable::RESIDENT),
+            Some(WeightRow::Streamed {
+                slab,
+                table,
+                counts,
+            }) => (self.cut(id, slab), ExpertTable { table, hits: counts }),
+            Some(WeightRow::Planes { .. }) => panic!(
+                "value {at} is weight {row}, a split-plane bank; a dense routed select \
+                 does not read one"
             ),
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
         }
@@ -1065,11 +1327,69 @@ impl<'c> Run<'c> {
     /// windowed scan gets the window's lanes and nothing else; the slabs
     /// themselves are the model's state, whole.
     pub(crate) fn recurrent(&self, id: ValueId) -> RecurrentPool {
+        // **THE HEAD SEGMENT**, which for every fire but a splitting one is
+        // the whole row: the origin seat is cleared here and bound only by
+        // [`Run::recurrent_tail`], so no launch ever carries both ends of one
+        // boundary and the plain path hands the null pointer it always did.
+        RecurrentPool {
+            begin_at: Tensor::ABSENT,
+            ..self.recurrent_cut(id)
+        }
+    }
+
+    /// **The tail segment of a row whose fold boundary is interior**, or
+    /// `None` for every fire that does not split one (alto design §6's 2R
+    /// split, wave F3b).
+    ///
+    /// A row that folds a prefix of the tokens it is writing cannot be one
+    /// launch: `commit_len` TRUNCATES, so the tokens past the boundary would
+    /// get no outputs at all. So the arm fires twice on the one stream — the
+    /// head `[0, n)` with the length seat and the fold, whose end-of-sequence
+    /// writeback lands ON the boundary, then this tail `[n, rows)` reading
+    /// the state the head just wrote, producing the rest of the outputs and
+    /// moving nothing.
+    ///
+    /// **THE SEAT'S PRESENCE IS THE STATEMENT.** The shell binds the origin
+    /// only for a fire some row splits, so an absent one here is exactly "one
+    /// launch, as before" and there is no second flag to fall out of step
+    /// with it. Every lane of a splitting fire gets a boundary: a lane that
+    /// folds everything begins its tail past its own last row and returns,
+    /// and one that folds nothing begins at zero and runs whole.
+    pub(crate) fn recurrent_tail(&self, id: ValueId) -> Option<RecurrentPool> {
+        let cut = self.recurrent_cut(id);
+        if cut.begin_at.is_absent() {
+            return None;
+        }
+        Some(RecurrentPool {
+            // The tail moves no state: the boundary is where the head left
+            // it, and a second writeback would carry it to the row's end.
+            write_state: false,
+            commit_len: Tensor::ABSENT,
+            ..cut
+        })
+    }
+
+    /// The pool with every per-request seat cut to the asking node's window,
+    /// before either segment claims its end of the boundary.
+    fn recurrent_cut(&self, id: ValueId) -> RecurrentPool {
         match self.cache(id) {
             CachePool::Recurrent(pool) => {
                 let window = self.window().span;
                 RecurrentPool {
                     slot_ids: skip(pool.slot_ids, window.lane_offset, window.lanes),
+                    // **THE RS SEATS RIDE WITH `slot_ids`** and are cut
+                    // by the same window, because `attn/ssm.cuh` indexes all
+                    // of them by the SAME `r`: the request number inside the
+                    // launch, which is a position in this window and not in
+                    // the fire. An absent seat stays absent — `skip` of a
+                    // null handle is a null handle.
+                    write_state_mask: skip(
+                        pool.write_state_mask,
+                        window.lane_offset,
+                        window.lanes,
+                    ),
+                    commit_len: skip(pool.commit_len, window.lane_offset, window.lanes),
+                    begin_at: skip(pool.begin_at, window.lane_offset, window.lanes),
                     ..*pool
                 }
             }

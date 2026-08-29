@@ -147,7 +147,16 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
     // waited for — by name. One frame in flight because that is what this
     // gate does; a deeper ring would carve slots nothing ever claims.
     let request =
-        runtime::engine::load::request(&checkpoint, Platform::Cuda, budgets.clone(), 0, 1)
+        runtime::engine::load::request(
+            &checkpoint,
+            Platform::Cuda,
+            budgets.clone(),
+            // Uncapped: every load in this workspace is fully resident
+            // (alto design §7 — the tiers are D2's).
+            engine_api::Residency::uncapped(),
+            0,
+            1,
+        )
             .expect("the checkpoint identifies and its SKU traces");
     assert_eq!(
         request.trace.name, SKU,
@@ -185,7 +194,22 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
     assert!(caps.admits(tensor_ir::registry::GeometryClass::Host));
     assert!(caps.admits(tensor_ir::registry::GeometryClass::DecodeEnvelope));
     assert!(!caps.admits(tensor_ir::registry::GeometryClass::DeviceGeometry));
-    // And the four verbs it genuinely lacks refuse rather than pretend.
+    // **AND WHAT IT SERVES AND WHAT IT DOES NOT ARE BOTH STATED.** `copy_kv`
+    // moves cells between pages of THIS load's own pools — a fork, a graft, a
+    // prefix-cache hit — and `Capabilities::kv_copy` says so ahead of any
+    // plan. The other three directions name a pinned swap pool this shell
+    // does not reserve or a peer mapping it has not opened, and each refuses
+    // BY NAME rather than pretending: `KvCopy::default()` is host-pinned on
+    // both ends, which is the caller's own memmove.
+    //
+    // `tests/gpu/tests/cuda_kv_page_graft.rs` is where the served direction is
+    // gated on real bytes; this line is only about the negotiation.
+    assert!(caps.kv_copy.device_to_device);
+    assert!(
+        !caps.kv_copy.device_to_host
+            && !caps.kv_copy.host_to_device
+            && !caps.kv_copy.host_to_host
+    );
     assert!(matches!(
         engine.copy_kv(&Default::default()),
         Err(engine_api::Error::Unsupported { engine: "cuda", .. })
@@ -206,6 +230,7 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
             drafts: false,
             captures_scores: false,
             rs: engine_api::RsVerb::Fold,
+            rs_reset: engine_api::RsReset::Inferred,
             channels: Vec::new(),
             readout: Readout::Last,
         }],

@@ -80,22 +80,22 @@ const REPEATS: usize = 3;
 /// The candidates this test drives. Deliberately few and deliberately spread:
 /// the point is that the knobs MOVE and keep working, not that the space is
 /// covered. `k=1` and `k=4` are the extremes of the guest contract, and the
-/// staging bound (`k * dispatch < 13`) admits both here.
+/// staging bound (`k * dispatch < 13`) admits both here. The guest's own
+/// window is no longer a candidate axis — it is `dispatch_depth + 1`
+/// (`engine::runahead::Runahead::submit_depth`), so moving `dispatch_depth`
+/// moves it (alto E).
 fn probe_candidates() -> Vec<Knobs> {
     vec![
         Knobs {
             frame_size: 2,
-            submit_depth: 3,
             dispatch_depth: 2,
         },
         Knobs {
             frame_size: 1,
-            submit_depth: 3,
             dispatch_depth: 2,
         },
         Knobs {
             frame_size: 4,
-            submit_depth: 5,
             dispatch_depth: 3,
         },
         // Back to the first one, last. This is the drift check: the same knobs
@@ -103,7 +103,6 @@ fn probe_candidates() -> Vec<Knobs> {
         // every ranking the sweep produces is confounded by round order.
         Knobs {
             frame_size: 2,
-            submit_depth: 3,
             dispatch_depth: 2,
         },
     ]

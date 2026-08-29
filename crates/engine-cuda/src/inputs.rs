@@ -956,6 +956,17 @@ impl Inputs {
                 })
                 .collect(),
             slot_ids: handles.slot_ids,
+            // **THE PLAIN FOLD IS THE DEFAULT, AND IT IS A DEFAULT AND NOT A
+            // FIELD.** The RS seats are not staged inputs: the fold
+            // predicate is written on the DEVICE by
+            // `channel::mask_from_commit`, and the commit lengths and the
+            // buffered-scatter decision are the fire's RS plan. They are
+            // seated by `Seats::rs`, which is what a fire that carries a
+            // recurrent verb calls and what every other fire does not.
+            write_state: true,
+            write_state_mask: Tensor::ABSENT,
+            commit_len: Tensor::ABSENT,
+            begin_at: Tensor::ABSENT,
         }
     }
 }

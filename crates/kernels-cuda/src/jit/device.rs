@@ -4,6 +4,31 @@
 //! grow under a capturing stream is refused, not grown — the contract lives
 //! on [`Ctx::scratch`](crate::jit::Ctx::scratch).
 //!
+//! # A GROWN SLAB RETIRES ITS PREDECESSOR; IT DOES NOT FREE IT
+//!
+//! **ADDRESSES ARE BAKE-TIME** (alto article 7), and a scratch address is
+//! baked exactly like a pool address: a `cudaGraphExec_t` recorded at fire N
+//! holds the staging pointer the entry took THEN, and a folded bucket replays
+//! that exec for the rest of the load. Growth used to be `cudaFree` +
+//! `cudaMalloc`, which made every graph recorded before the growth hold a
+//! freed block — a `cudaErrorIllegalAddress` on the first replay after a fire
+//! brought one more row than any fire before it. (Measured: the fold-hint gate
+//! died in `ssm_gdn_prep_v_gates` writing `g_log_out` into
+//! `attn.ssm_gdn_chunk_gates` at the address a five-row fire grew and a
+//! six-row fire freed.)
+//!
+//! `Ctx::scratch`'s "warm at full fire shape before capturing" is what keeps a
+//! capture IN PROGRESS from growing, and it is all it can keep: the shapes a
+//! serving load brings are not bounded by the ones it has already brought, so
+//! a later, larger fire will grow a name whatever the warm pass did. So the
+//! superseded block is RETIRED — kept alive, unreferenced by this map, freed
+//! with the arena — and a graph recorded against it keeps reading and writing
+//! a block that is still its own and still big enough for the shape it was
+//! recorded at. Growth is geometric (a slab at least doubles), so a name
+//! grows a bounded number of times and everything retired for it sums to less
+//! than what it currently holds: the ceiling is twice the live scratch, once,
+//! rather than an unbounded ladder.
+//!
 //! # A slab is per `(arena, name, stream)`, and each of the three is a bug
 //! that was measured
 //!
@@ -67,6 +92,11 @@ struct Arena {
     /// first fire, which is what makes the broadcast above complete.
     streams: Vec<usize>,
     slabs: HashMap<(&'static str, usize), Slab>,
+    /// **Superseded allocations, still live.** A slab that grew handed its
+    /// old block here instead of to `cudaFree`, because a graph recorded
+    /// before the growth still launches against that address (the module
+    /// comment argues it). Freed with the arena, and with nothing else.
+    retired: Vec<*mut c_void>,
 }
 
 // SAFETY: the only pointers here are device allocations this map owns
@@ -119,6 +149,16 @@ pub(crate) fn release(arena: u32) {
             // SAFETY: an address this map allocated with `cudaMalloc` and
             // handed to nobody who outlives the arena.
             let _ = unsafe { rt::cudaFree(slab.ptr) };
+        }
+    }
+    // The blocks that growth superseded. The same argument frees them: the
+    // only thing that ever read one is a launch on a stream this arena's
+    // owner has synchronized and is dropping.
+    for ptr in held.retired {
+        if !ptr.is_null() {
+            // SAFETY: as above — an address this map allocated and never
+            // handed to anything that outlives the arena.
+            let _ = unsafe { rt::cudaFree(ptr) };
         }
     }
 }
@@ -178,36 +218,50 @@ pub(crate) fn take(
     Ok(held.slabs[&(name, here)].ptr)
 }
 
-/// Size one `(name, stream)` slab to at least `bytes`, reallocating when it
-/// is short. Never called under capture — [`take`] refuses there first.
+/// Size one `(name, stream)` slab to at least `bytes`, allocating a fresh
+/// block and RETIRING the old one when it is short. Never called under
+/// capture — [`take`] refuses there first.
+///
+/// Three properties this shape has and the `cudaFree`-then-`cudaMalloc` one
+/// did not:
+///
+/// * **The old address stays valid** for the graphs that baked it (the module
+///   comment).
+/// * **Growth is geometric**, so a name is reallocated a bounded number of
+///   times and what it retires sums to less than what it holds.
+/// * **A failed `cudaMalloc` leaves the slab it had.** The old order freed
+///   first, so an out-of-memory growth left a null slab behind a `Fault` the
+///   caller could survive.
 fn grow(arena: &mut Arena, name: &'static str, stream: usize, bytes: usize) -> Result<(), Fault> {
-    let slab = arena.slabs.entry((name, stream)).or_insert(Slab {
-        ptr: core::ptr::null_mut(),
-        bytes: 0,
-    });
-    if slab.bytes >= bytes {
+    let (old_ptr, old_bytes) = arena
+        .slabs
+        .get(&(name, stream))
+        .map_or((core::ptr::null_mut(), 0), |slab| (slab.ptr, slab.bytes));
+    if old_bytes >= bytes {
         return Ok(());
     }
-    if !slab.ptr.is_null() {
-        // SAFETY: an address this map allocated and no captured graph holds,
-        // by the warm-before-capture contract on `Ctx::scratch`.
-        let _ = unsafe { rt::cudaFree(slab.ptr) };
-        slab.ptr = core::ptr::null_mut();
-        slab.bytes = 0;
-    }
+    let want = bytes.max(old_bytes.saturating_mul(2));
     let mut fresh: *mut c_void = core::ptr::null_mut();
 
     // SAFETY: a live local out-parameter and a byte count this caller checked
     // is non-zero.
-    let code = unsafe { rt::cudaMalloc(&raw mut fresh, bytes) };
+    let code = unsafe { rt::cudaMalloc(&raw mut fresh, want) };
     if code != rt::cudaError::cudaSuccess || fresh.is_null() {
         return Err(Fault::Device {
             call: "cudaMalloc",
             code: code as i32,
         });
     }
-    slab.ptr = fresh;
-    slab.bytes = bytes;
+    if !old_ptr.is_null() {
+        arena.retired.push(old_ptr);
+    }
+    arena.slabs.insert(
+        (name, stream),
+        Slab {
+            ptr: fresh,
+            bytes: want,
+        },
+    );
     Ok(())
 }
 

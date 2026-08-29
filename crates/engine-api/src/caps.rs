@@ -111,8 +111,8 @@ pub struct PoolFacts {
     /// Adapter banks the pool seats (design §8 — a budget, not an admission
     /// cap).
     pub adapter_banks: u32,
-    /// Bytes one elastic page occupies, when the pools are virtual and
-    /// `resize_pool` is served. Zero means they are not.
+    /// Bytes one elastic page occupies, when the pools are virtual. Zero
+    /// means they are not — a load whose pools are one fixed reservation.
     pub elastic_page_bytes: u64,
     /// The most elastic pages this load may ever map.
     pub elastic_budget_pages: u64,
@@ -173,6 +173,31 @@ pub struct Capabilities {
     /// ring, and cells cross at the fire's boundary through the two verbs.
     #[serde(default)]
     pub device_channel_commit: bool,
+
+    /// **Does this engine serve the recurrent verbs beyond the plain fold?**
+    /// (alto design §6, wave F3.)
+    ///
+    /// An engine that answers `true` states that
+    /// [`RsVerb::Buffer`](crate::RsVerb::Buffer) scatters the recurrent ops'
+    /// in-projection inputs into a buffered-activation pool it allocated at
+    /// load and leaves the folded state untouched, and that
+    /// [`RsVerb::FoldBuffered`](crate::RsVerb::FoldBuffered) replays that pool
+    /// through conv+recurrence truncated at a device-resolved accepted length,
+    /// from the buffer head the last fold left behind.
+    ///
+    /// It states the MIXED ROW too (wave F3b): a `Buffer` whose fold is
+    /// non-zero lands the durable state on a row of the window it is writing,
+    /// cutting the row at an interior boundary into the segment that folds and
+    /// the segment that continues from it.
+    ///
+    /// `false` is the shape every engine had before F3, and the shape Metal
+    /// still has: only [`RsVerb::Fold`](crate::RsVerb::Fold) is served, and a
+    /// lane that asks for either other verb is refused by name
+    /// ([`Lane::validate_for`](crate::Lane::validate_for)) rather than
+    /// silently folded — a speculative draft handed a destructive fold would
+    /// corrupt the state it was speculating over.
+    #[serde(default)]
+    pub rs_verbs: bool,
 }
 
 impl Capabilities {

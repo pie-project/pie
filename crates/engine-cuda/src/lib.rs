@@ -104,6 +104,14 @@ pub mod arena;
 pub mod device;
 mod dispatch;
 mod error;
+/// The export seam and the op-vocabulary scans beside it — pure IR analysis,
+/// lifted out of `serve.rs` (alto article 9's "shells are call order").
+/// **The routed-expert tier** (alto design §7, wave D2): the residency plan a
+/// budget decides, the pinned host copy of every expert, the device slab of a
+/// few of them, and the indirection table that lets a captured graph read
+/// either without knowing which.
+pub mod experts;
+pub mod exports;
 pub mod inputs;
 pub mod mask;
 pub mod program;
@@ -113,6 +121,7 @@ pub mod serve;
 /// Who is airborne, and where the settlement callbacks ride (survey §7, I7).
 pub mod settle;
 pub mod store;
+pub mod weight_cache;
 pub mod weights;
 pub mod window;
 
@@ -178,7 +187,7 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use api::{ContractFor, Cuda, DeviceBoot};
-pub use serve::{Boot, FireCost, Graphs, Lane, Seated, Shell};
+pub use serve::{Boot, FireCost, Graphs, Knobs, Lane, Seated, Shell};
 
 /// What a capturing lane's fire hands back, one entry per exported attention
 /// layer — the contract's own type, re-exported so a caller of

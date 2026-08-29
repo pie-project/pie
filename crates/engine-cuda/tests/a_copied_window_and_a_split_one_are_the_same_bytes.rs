@@ -764,12 +764,13 @@ fn load(what: &str, budget: Budget, slots: u32) -> Option<(Shell, tokenizer::Tok
     // nothing left for a copy to gather. Emptying the list puts the score
     // window back on the losing side, which is the artifact this file prices.
     //
-    // SAFETY: the caller holds the same one-at-a-time guard the grouped
-    // file's loader does; `Shell::load` reads the variable once and returns.
-    unsafe {
-        std::env::set_var("PIE_CUDA_GROUPED", "off");
-    }
+    // Stated on the `Boot` rather than set in the environment (alto wave P,
+    // article 9): the word is a `Knobs` field now, so no `unsafe` block and no
+    // argument about which thread is loading a shell.
     let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
@@ -780,10 +781,18 @@ fn load(what: &str, budget: Budget, slots: u32) -> Option<(Shell, tokenizer::Tok
         slots,
         ordinal: 0,
         graphs: Graphs::Off,
+        knobs: engine_cuda::Knobs {
+            grouped: false,
+            ..engine_cuda::Knobs::default()
+        },
+        program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
         runahead: engine::runahead::Runahead::F1,
+        // The warm-boot weight artifact cache is off for a gate: a test
+        // that shared one would be asserting about the last run.
+        weight_cache_dir: None,
     })
     .expect("the shell loads");
     Some((shell, tokenizer))

@@ -4,7 +4,7 @@
 //! Four nouns and three verbs' arguments. The nouns describe **where the bytes
 //! are** — [`KvHandle`] is what an engine exports so a peer can write into its
 //! pool without going through it — and the verbs
-//! ([`KvCopy`], [`StateCopy`], [`PoolResize`]) describe a
+//! ([`KvCopy`], [`StateCopy`]) describe a
 //! rearrangement inside one.
 //!
 //! # What changed here, and why
@@ -329,44 +329,20 @@ pub struct StateCopy {
     pub moves: Vec<StateMove>,
 }
 
-/// Which elastic pool a resize is about.
-///
-/// This was `pool_id: u64` carrying one of `PIE_ELASTIC_POOL_KV`,
-/// `_STATE`, `_WORKSPACE` — three values out of 2^64, chosen by a caller that
-/// could pass any of the others.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Pool {
-    /// The KV page pool.
-    Kv,
-    /// The recurrent-state slot pool.
-    State,
-    /// The scratch/workspace pool.
-    Workspace,
-}
-
-/// A run of pages in a pool's virtual address space.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PageRange {
-    /// First page.
-    pub page_index: u64,
-    /// How many.
-    pub page_count: u64,
-}
-
-/// The `resize_pool` verb's argument.
-///
-/// Explicit map/unmap lists rather than a target alone, because a virtual
-/// pool's growth is a mapping decision the caller already made: it knows which
-/// physical pages it is willing to give back and which it wants committed, and
-/// an engine that re-derived them from `target_pages` would be guessing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PoolResize {
-    /// Which pool.
-    pub pool: Pool,
-    /// The page count the pool should hold afterwards.
-    pub target_pages: u64,
-    /// Ranges to commit.
-    pub map_ranges: Vec<PageRange>,
-    /// Ranges to release.
-    pub unmap_ranges: Vec<PageRange>,
-}
+// **`Pool`, `PageRange` AND `PoolResize` ARE GONE** (alto design §8, wave C).
+//
+// They were the argument of `resize_pool`, whose only caller was the
+// runtime's 10-second elastic-trim poll — and that poll died with this wave.
+// Both halves of the verb had lost their reason:
+//
+// * its GROWTH half (`map_ranges`, a target above what is mapped) is
+//   admission's job now. A frame's union demand is committed atomically by
+//   the engine before any of it runs, and a second, non-atomic path to the
+//   same commit is exactly the double allocator article 8 forbids.
+// * its SHRINK half needs a residency truth — which pages still hold a
+//   cached prefix — and the scan that produced it went with the poll.
+//
+// `engine::frame::Supply::trim` is the successor and it lives inside the
+// engine, where supply lives. What has not been designed yet is the seam a
+// residency hint would cross on; when it is, it will be a hint and not a
+// mapping plan, so nothing here is worth keeping warm.

@@ -81,10 +81,18 @@ use crate::store::kv::{self, Paging, Seat};
 use crate::weights::Weights;
 use crate::window::{At, Cursor, Windows};
 
-use engine::engine_api::fire::Mask;
+use engine::engine_api::fire::Masking;
 
 /// The seam name the trunk's logits arrive under.
-const OUT_SEAM: &str = "out";
+///
+/// **READ FROM THE COMPILER, NOT SPELLED AGAIN** (alto wave P — two shells,
+/// one source of truth). This was the literal `"out"`, beside the CUDA
+/// shell's own copy of the same string; `model_compiler::arena` is what gives
+/// the exported values their delivery tail, so it is the honest place for the
+/// name to live: a shell reading a name the carve does not pin would be
+/// reading bytes the carve was free to give away. `engine-cuda` has read it
+/// from here since palo C3b.
+const OUT_SEAM: &str = model_compiler::EXPORT_SEAMS[0];
 
 /// Everything a load states.
 pub struct Boot<'a> {
@@ -160,7 +168,16 @@ pub struct Seated<'a> {
     /// unwritten. A lane that carries one is refused by name
     /// ([`Fault::Maskless`]) rather than served the unmasked continuation,
     /// which is the answer that would look right.
-    pub mask: Option<&'a Mask>,
+    ///
+    /// **A [`Masking`], NOT A [`Mask`](engine::engine_api::fire::Mask), AND
+    /// THE SECOND SHAPE IS REFUSED TWICE OVER.** `Masking::Extent` is one
+    /// restriction of the lane's
+    /// extent; `Masking::Rows` is one per query row, the windowed prefill the
+    /// CUDA shell expands and this plane does not. It reaches
+    /// [`Fault::Maskless`] here like every other mask, and
+    /// [`crate::mask::stage`] names the FORM ([`Fault::MaskRows`]) for the
+    /// day the first refusal lifts.
+    pub mask: Option<&'a Masking>,
 }
 
 impl<'a> Seated<'a> {

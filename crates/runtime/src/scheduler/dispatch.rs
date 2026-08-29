@@ -11,16 +11,17 @@
 //! correct owner and L0 stays free of any upward import.
 //!
 //! `copy_d2h`/`copy_h2d`/`copy_h2h` (the host-pinned <-> device KV copy
-//! directions) and `resize_pool` are part of the complete engine ABI verb
-//! set but aren't yet issued by the single-GPU mock-engine fire path
-//! (`copy_d2d`/`copy_kv_cells` are, plus `copy_rs_d2d` and `resize_pool` are
-//! exercised directly by `scheduler::worker`'s unit tests) — hence
-//! `#![allow(dead_code)]` rather than deleting a documented ABI verb.
+//! directions) are part of the complete engine ABI verb set but aren't yet
+//! issued by the single-GPU mock-engine fire path (`copy_d2d`/`copy_kv_cells`
+//! are, plus `copy_rs_d2d`) — hence `#![allow(dead_code)]` rather than
+//! deleting a documented ABI verb. `resize_pool` was in this list and is
+//! gone: elasticity is a side effect of frame admission now (alto design §8,
+//! wave C).
 #![allow(dead_code)]
 
 use std::sync::Arc;
 
-use ::engine_api::transfer::{KvMove, MemoryDomain, PageRange, Pool, StateMove};
+use ::engine_api::transfer::{KvMove, MemoryDomain, StateMove};
 use anyhow::Result;
 use tensor_ir::registry::GeometryClass;
 
@@ -28,7 +29,7 @@ use ::engine_api::program::BindExtents;
 
 use crate::engine::{
     BoundInstance, ChannelEndpoint, ChannelRegistration, ChannelValue, EngineId, InstanceBindingPlan,
-    InstanceId, KvCopy, PoolResize, ProgramId, ProgramRegistration, StateCopy, SubmissionCompletion,
+    InstanceId, KvCopy, ProgramId, ProgramRegistration, StateCopy, SubmissionCompletion,
 };
 
 use super::{ProcessId, scheduler_handle};
@@ -429,19 +430,3 @@ pub(crate) async fn copy_rs_d2d(
         .await
 }
 
-pub(crate) async fn resize_pool(
-    engine_idx: EngineId,
-    pool: Pool,
-    target_pages: u64,
-    map_ranges: Vec<PageRange>,
-    unmap_ranges: Vec<PageRange>,
-) -> Result<SubmissionCompletion> {
-    scheduler_handle(engine_idx)?
-        .resize_pool(PoolResize {
-            pool,
-            target_pages,
-            map_ranges,
-            unmap_ranges,
-        })
-        .await
-}

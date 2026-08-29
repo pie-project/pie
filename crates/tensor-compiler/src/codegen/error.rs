@@ -58,6 +58,10 @@ pub enum EmitterKind {
     CudaSingleton,
     /// CUDA, a whole generated region per kernel.
     CudaFused,
+    /// CUDA, the generated `Order` library regions — `top_k` and `sort_desc`.
+    CudaOrder,
+    /// CUDA, the generated scan library region — `cumsum` and `cumprod`.
+    CudaScan,
     /// Metal M1 readiness — the pre-launch channel check.
     MetalReadiness,
     /// Metal M1 commit — the post-launch ring advance.
@@ -72,6 +76,8 @@ impl EmitterKind {
         match self {
             EmitterKind::CudaSingleton => "CUDA singleton",
             EmitterKind::CudaFused => "CUDA fused",
+            EmitterKind::CudaOrder => "CUDA order",
+            EmitterKind::CudaScan => "CUDA scan",
             EmitterKind::MetalReadiness => "readiness kernel",
             EmitterKind::MetalCommit => "commit kernel",
             EmitterKind::MetalFused => "fused region",
@@ -188,6 +194,12 @@ pub enum RegionForm {
     GroupedNucleus,
     /// An M3 grouped TopK library region.
     GroupedTopK,
+    /// The CUDA `Order` library regions — `top_k` and `sort_desc` — emitted
+    /// into the fused slot.
+    CudaOrder,
+    /// The CUDA scan library region — `cumsum` and `cumprod` — emitted into
+    /// the fused slot.
+    CudaScan,
     /// A region the validator inspects without naming its form.
     Unnamed,
 }
@@ -238,6 +250,8 @@ impl fmt::Display for EmitError {
                 RegionForm::Fused => f.write_str("fused region node out of range"),
                 RegionForm::GroupedFused => f.write_str("grouped fused region node out of range"),
                 RegionForm::GroupedTopK => f.write_str("TopK library node is out of range"),
+                RegionForm::CudaOrder => f.write_str("CUDA order library node is out of range"),
+                RegionForm::CudaScan => f.write_str("CUDA scan library node is out of range"),
                 RegionForm::GroupedNucleus | RegionForm::Unnamed => {
                     f.write_str("region node out of range")
                 }
@@ -248,6 +262,8 @@ impl fmt::Display for EmitError {
                     f.write_str("grouped fused region nodes are not strictly ordered")
                 }
                 RegionForm::GroupedTopK => f.write_str("TopK library node is invalid"),
+                RegionForm::CudaOrder => f.write_str("CUDA order library node is invalid"),
+                RegionForm::CudaScan => f.write_str("CUDA scan library node is invalid"),
                 RegionForm::GroupedNucleus | RegionForm::Unnamed => {
                     f.write_str("region node indices are not strictly ordered")
                 }
@@ -259,6 +275,8 @@ impl fmt::Display for EmitError {
                 RegionForm::GroupedFused => f.write_str("grouped library region ABI is invalid"),
                 RegionForm::GroupedNucleus => f.write_str("invalid grouped nucleus library region"),
                 RegionForm::GroupedTopK => f.write_str("invalid grouped TopK library region"),
+                RegionForm::CudaOrder => f.write_str("invalid CUDA order library region"),
+                RegionForm::CudaScan => f.write_str("invalid CUDA scan library region"),
                 RegionForm::Fused | RegionForm::Unnamed => {
                     f.write_str("library region ABI is invalid")
                 }
@@ -331,6 +349,14 @@ mod tests {
                 "CUDA fused entry name is not a C identifier",
             ),
             (
+                EmitError::EntryNameNotCIdentifier(EmitterKind::CudaOrder),
+                "CUDA order entry name is not a C identifier",
+            ),
+            (
+                EmitError::EntryNameNotCIdentifier(EmitterKind::CudaScan),
+                "CUDA scan entry name is not a C identifier",
+            ),
+            (
                 EmitError::UnsupportedSingletonOpcode { tag: 0xB3 },
                 "unsupported CUDA singleton opcode tag 179",
             ),
@@ -394,6 +420,14 @@ mod tests {
                 "TopK library node is out of range",
             ),
             (
+                EmitError::RegionNodeOutOfRange(RegionForm::CudaOrder),
+                "CUDA order library node is out of range",
+            ),
+            (
+                EmitError::RegionNodeOutOfRange(RegionForm::CudaScan),
+                "CUDA scan library node is out of range",
+            ),
+            (
                 EmitError::RegionNodeOutOfRange(RegionForm::Unnamed),
                 "region node out of range",
             ),
@@ -404,6 +438,14 @@ mod tests {
             (
                 EmitError::RegionNodesUnordered(RegionForm::GroupedTopK),
                 "TopK library node is invalid",
+            ),
+            (
+                EmitError::RegionNodesUnordered(RegionForm::CudaOrder),
+                "CUDA order library node is invalid",
+            ),
+            (
+                EmitError::RegionNodesUnordered(RegionForm::CudaScan),
+                "CUDA scan library node is invalid",
             ),
             (
                 EmitError::RegionNodesUnordered(RegionForm::Unnamed),
@@ -433,6 +475,14 @@ mod tests {
             (
                 EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedTopK),
                 "invalid grouped TopK library region",
+            ),
+            (
+                EmitError::LibraryRegionAbiInvalid(RegionForm::CudaOrder),
+                "invalid CUDA order library region",
+            ),
+            (
+                EmitError::LibraryRegionAbiInvalid(RegionForm::CudaScan),
+                "invalid CUDA scan library region",
             ),
             (
                 EmitError::ChannelRootBindingOutOfRange,

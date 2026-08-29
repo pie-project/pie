@@ -1165,10 +1165,6 @@ impl RsStore {
         self.pool.release_reserved(slots);
     }
 
-    pub fn committed_high_water_slots(&self) -> u32 {
-        self.pool.highest_in_use_exclusive()
-    }
-
     // ------------------------------------------------------------------
     // Internals
     // ------------------------------------------------------------------

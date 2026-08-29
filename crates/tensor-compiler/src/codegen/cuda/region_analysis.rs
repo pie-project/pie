@@ -44,6 +44,13 @@ pub const REGION_SECOND_PARTY_SUPPORTED: u32 = 1 << 0;
 /// The region is a well-formed generated region, so the fused emitter accepts
 /// it. Mutually exclusive with the flag above in practice, but derived
 /// independently, so recorded independently.
+///
+/// NOT the same question as "can this backend run the region". A `top_k`,
+/// `sort_desc` or scan library region answers `false` here — none is a
+/// generated region and the fused emitter does not accept any — and each is
+/// still emitted, by [`super::order`] or [`super::scan`]. What reaches the
+/// engine is the kernel table; [`super::emit_region`] is the function that
+/// decides it.
 pub const REGION_GENERATED_VALID: u32 = 1 << 1;
 
 /// One `argmax` that reads a logits intrinsic's buffer directly.

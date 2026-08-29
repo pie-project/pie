@@ -102,16 +102,28 @@ crate::declare_tagged_enum! {
         /// Each token's position in its sequence, driving both RoPE and the
         /// causal masks. Taken.
         Positions = 2, "positions";
-        /// The KV pages each request may address. Read.
+        /// The KV pages each request may address, as WORKING-SET-RELATIVE
+        /// indexes — the space `kv-working-set` hands a guest and the only
+        /// space a guest ever holds, because a relative index survives the
+        /// copy-on-write that moves the physical page under it. Whoever
+        /// resolves this port translates it through the working set's flat
+        /// table before it becomes an address: the runtime for a host-folded
+        /// value, the engine for one it reads off a channel. Read.
         Pages = 3, "pages";
         /// Row offsets splitting `pages` per request. Read.
         PageIndptr = 4, "page_indptr";
         /// Per-request readable KV extent after this pass's writes land.
         /// Read.
         KvLen = 5, "kv_len";
-        /// Which adapter slot each token routes to. Taken.
+        /// **The explicit KV write descriptor's page half**: which page each
+        /// token row is appended into, in [`Port::Pages`]'s space and
+        /// translated with it. It is stated rather than derived because a
+        /// derivation cannot spell a write that is not the page run's tail —
+        /// several lanes appending into one shared pool each need their own
+        /// cell, and `have + row` names one cell for all of them. Taken.
         WSlot = 6, "w_slot";
-        /// Each token's offset within its adapter slot. Taken.
+        /// That row's offset inside the page [`Port::WSlot`] names. An offset
+        /// is in no page space and is never translated. Taken.
         WOff = 7, "w_off";
         /// Which token rows the epilogue reads out; absent means the last
         /// row of each request. Read.

@@ -172,6 +172,9 @@ fn ready(what: &str, runahead: Runahead) -> Option<(Shell, tokenizer::Tokenizer)
     drop(source);
 
     let shell = Shell::load(Boot {
+        // Full residency: the whole weight table on the device, which is what
+        // an uncapped `Residency` plans (alto design §7).
+        residency: engine_cuda::experts::Plan::default(),
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
@@ -184,7 +187,12 @@ fn ready(what: &str, runahead: Runahead) -> Option<(Shell, tokenizer::Tokenizer)
         // The golden path: every claim here is about the STREAM, and a graph
         // replay would be measuring the recorder rather than the run-ahead.
         graphs: engine_cuda::Graphs::Off,
+        knobs: engine_cuda::Knobs::default(),
+        program_cache_dir: None,
         runahead,
+        // The warm-boot weight artifact cache is off for a gate: a test
+        // that shared one would be asserting about the last run.
+        weight_cache_dir: None,
     })
     .expect("the shell loads");
     Some((shell, tokenizer))

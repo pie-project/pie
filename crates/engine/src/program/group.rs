@@ -1,7 +1,6 @@
 use engine_api::program::LaunchOp;
 
 use super::extent::Extents;
-use super::readiness::Effect;
 
 pub const MAX_CHANNELS: usize = 29;
 
@@ -61,31 +60,9 @@ pub fn used_channel_slots(ops: &[LaunchOp]) -> Result<usize, TooManyChannels> {
     Ok(needed)
 }
 
-pub const CHANNEL_VALID: u32 = 1 << 0;
-
-pub const CHANNEL_NEEDS_FULL: u32 = 1 << 1;
-
-pub const CHANNEL_NEEDS_EMPTY: u32 = 1 << 2;
-
-pub const CHANNEL_TAKE: u32 = 1 << 3;
-
-pub const CHANNEL_PUT: u32 = 1 << 4;
-
-pub const CHANNEL_RETRY_INELIGIBLE: u32 = 1 << 5;
-
-#[must_use]
-pub fn channel_flags(effect: &Effect, retry_ineligible: bool) -> u32 {
-    let mut flags = CHANNEL_VALID;
-    for (set, bit) in [
-        (effect.requires_full, CHANNEL_NEEDS_FULL),
-        (effect.requires_empty, CHANNEL_NEEDS_EMPTY),
-        (effect.take, CHANNEL_TAKE),
-        (effect.put, CHANNEL_PUT),
-        (retry_ineligible, CHANNEL_RETRY_INELIGIBLE),
-    ] {
-        if set {
-            flags |= bit;
-        }
-    }
-    flags
-}
+// SIX `CHANNEL_*` FLAG BITS AND THE `channel_flags` THAT PACKED THEM stood
+// here: the per-channel word a device lane table used to carry so a kernel
+// could read a program's declared requirement out of the table. Nothing in
+// either shell packs one — readiness is `Readiness`/`Effect` on the host and
+// the ticket words on the device — and the re-exports were the only thing
+// keeping them compiled (alto E).

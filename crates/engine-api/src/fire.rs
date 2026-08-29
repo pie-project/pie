@@ -41,7 +41,6 @@ use serde::{Deserialize, Serialize};
 use crate::channel::Ticket;
 use crate::error::{Error, Result};
 use crate::program::InstanceId;
-use crate::transfer::PageRange;
 
 /// A fire's id, minted by the engine, unique for the life of a load.
 pub type FireId = u64;
@@ -63,6 +62,24 @@ pub type FrameId = u64;
 /// fact) and the run form is genuinely how a mask arrives — a prefix drop, a
 /// sliding window, a set of retained blocks are all a handful of runs over
 /// thousands of positions.
+///
+/// # `total` MAY EXCEED the lane's readable extent, and may not fall short
+///
+/// A caller states its mask over the width it KNOWS, and for a guest that is
+/// the pool it reserved — 48 key positions for a three-page pool of sixteen,
+/// while the lane holds 23 tokens — because the reservation's width does not
+/// move as the sequence grows a token per fire. An engine expands the runs
+/// into a `rows x extent` rectangle and CLIPS the surplus: a position past
+/// `KvDelta::held + tokens.len()` is one this fire has not written, so the
+/// causal bound drops it for every query row whatever its bit says, and
+/// dropping it is therefore not a choice between readings.
+///
+/// The other direction is not symmetric and is not accepted. A mask whose
+/// `total` is SHORT of the extent expands with its tail bits zero, and zero
+/// is MASKED-OUT — an attention silently truncated to the stated prefix. That
+/// is what `total` being stated at all is for: a truncated run list is a
+/// detectable submission, and the engines refuse it by name
+/// (`engine_cuda::Fault::Mask`) rather than pad it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Mask {
     /// Alternating run lengths, masked-out first.
@@ -122,6 +139,86 @@ impl Mask {
     }
 }
 
+/// **How a lane's attention is restricted: over its EXTENT, or per ROW.**
+///
+/// [`Mask`] is one run-length restriction of a lane's readable extent, and
+/// for most masks that is the whole truth: a prefix drop, a retained-block
+/// set, an attention sink are each one set of keys that every query row of
+/// the lane reads under, with the causal bound doing the rest. That mask is
+/// [`Masking::Extent`], it is what every caller before this type wrote, and
+/// an engine re-applies the causal bound to it per row.
+///
+/// **WHAT THAT SHAPE CANNOT SAY IS A WINDOW.** A sliding-window prefill asks
+/// row `i` to keep `[i - w, i]` and row `i + 1` to keep `[i + 1 - w, i + 1]`:
+/// two restrictions that are not nested, so no single mask under the causal
+/// bound is either of them. The lowering that had only [`Masking::Extent`]
+/// to write into refused such a fire by name rather than pick one row — the
+/// old one silently picked row ZERO, which is every later row truncated to
+/// the first one's causal bound — and [`Masking::Rows`] is the form that
+/// refusal was waiting for.
+///
+/// **`Rows` IS PARALLEL TO THE LANE'S QUERY ROWS**, one [`Mask`] per entry of
+/// [`Lane::tokens`], each over that row's own readable extent — which is the
+/// lane's post-append extent for every row, the same number
+/// [`Masking::Extent`]'s single mask covers, because the causal bound and not
+/// the mask is what keeps row `i` off the keys row `i + 1` writes. A count
+/// that is not the lane's row count is refused by [`Lane::validate`]: it is
+/// the one thing about a per-row mask a lane can check about itself.
+///
+/// **AN ENGINE MAY NOT WIDEN CAUSALITY WITH EITHER FORM.** Both are
+/// intersected with `k <= held + row` on expansion. A mask states which of
+/// the readable positions a row may reach, never that a row may reach a
+/// position the fire has not written yet.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Masking {
+    /// ONE restriction over the lane's readable extent, re-applied to every
+    /// query row under the causal bound. Every mask written before per-row
+    /// masks existed is this one.
+    Extent(Mask),
+    /// ONE restriction PER QUERY ROW, parallel to [`Lane::tokens`]: entry `i`
+    /// is row `i`'s mask, over the lane's readable extent.
+    Rows(Vec<Mask>),
+}
+
+impl Masking {
+    /// The masks this states, in row order — one for [`Masking::Extent`].
+    ///
+    /// The one-element slice is not a convenience: it is what lets a shell's
+    /// extent check ("does every stated mask cover this lane's extent?") be
+    /// one loop over both forms rather than two spellings of one rule.
+    #[must_use]
+    pub fn masks(&self) -> &[Mask] {
+        match self {
+            Masking::Extent(mask) => std::slice::from_ref(mask),
+            Masking::Rows(rows) => rows,
+        }
+    }
+
+    /// The mask query row `row` reads under, or `None` for a row this
+    /// masking does not describe.
+    ///
+    /// [`Masking::Extent`] describes EVERY row — that is what "over the
+    /// extent" means — so it answers for any index; [`Masking::Rows`]
+    /// answers for the rows it carries and for no others.
+    #[must_use]
+    pub fn of_row(&self, row: usize) -> Option<&Mask> {
+        match self {
+            Masking::Extent(mask) => Some(mask),
+            Masking::Rows(rows) => rows.get(row),
+        }
+    }
+
+    /// How many query rows this masking states one each for, or `None` for
+    /// [`Masking::Extent`], which states one for all of them.
+    #[must_use]
+    pub fn stated_rows(&self) -> Option<usize> {
+        match self {
+            Masking::Extent(_) => None,
+            Masking::Rows(rows) => Some(rows.len()),
+        }
+    }
+}
+
 /// What this fire does to a lane's KV.
 ///
 /// `held` is the state the shell already has and `pages` is the addressing it
@@ -140,9 +237,57 @@ pub struct KvDelta {
     /// runtime keeping the page table, which is what a load with an exported
     /// [`KvHandle`](crate::transfer::KvHandle) and a remote peer writing into
     /// it needs.
+    ///
+    /// **THESE ARE POOL PAGE IDS AND NOTHING ELSE.** An engine pushes each
+    /// entry straight into its page CSR, so the space is the POOL's — the ids
+    /// its own allocator minted. A guest states its pages in a different space
+    /// (see [`KvDelta::translation`]) and the runtime translates before it
+    /// submits.
     pub pages: Vec<u32>,
-    /// Rewritten page ids, one per entry of `pages`, when a fork moved this
-    /// lane's pages since the last fire. Empty when nothing moved.
+    /// **THE WORKING SET'S FLAT TABLE: entry `i` is the pool page backing that
+    /// working set's relative index `i`.** Empty for every lane whose page
+    /// references the runtime has already resolved, which is every lane of
+    /// every class but one.
+    ///
+    /// # Two spaces, and which side crosses between them
+    ///
+    /// A guest never holds a pool page id. `kv-working-set`'s whole surface is
+    /// WORKING-SET-RELATIVE indexes — `reserve` hands back `0 .. n`, a fork is
+    /// O(1) precisely because a relative index survives the copy-on-write that
+    /// moves the physical page under it — and the runtime translates through
+    /// this table at the point where a page reference stops being the guest's
+    /// and becomes an address.
+    ///
+    /// For every host-resolved geometry that point is inside the runtime:
+    /// `pipeline::fire::map_lane_pages` rewrites the folded `Pages` port into
+    /// [`KvDelta::pages`] and an engine sees only pool ids.
+    ///
+    /// [`GeometryClass::DeviceGeometry`](tensor_ir::registry::GeometryClass)
+    /// is the one class where that point cannot be inside the runtime: the
+    /// lane's page ids and its write descriptor are computed by the guest's
+    /// own epilogue and live in a channel cell the host never reads. So the
+    /// runtime ships the TABLE instead of the result, and the engine applies
+    /// it to the `pages`, `page_indptr` and `w_slot` values it resolves off
+    /// those cells.
+    ///
+    /// **THE MAPPING STILL HAS ONE OWNER** (article 8). The KV store mints it
+    /// and nothing else may compute one; this field is that table quoted, and
+    /// an engine may only index it. An index the table does not cover is a
+    /// refusal by name — the alternative is addressing a pool page belonging
+    /// to somebody else, which is exactly what the two-spaces confusion costs.
+    ///
+    /// Empty beside device-resolved page references is therefore a refusal and
+    /// not a default: "translate by identity" is the bug, spelled.
+    ///
+    /// This arm existed once and was deleted in alto E, on the ground that its
+    /// only implementation was a refusal — it then meant "rewritten page ids
+    /// for a fork that moved this lane's pages", which needed a page mover
+    /// neither shell had. It comes back with the meaning
+    /// `pipeline::fire::kv`'s `build_translation` was already written for and
+    /// documented for ("ships with the launch so the engine can map
+    /// channel-resolved `Pages`/`WSlot` references"), against a consumer that
+    /// exists.
+    #[serde(default)]
     pub translation: Vec<u32>,
 }
 
@@ -186,7 +331,14 @@ pub struct Lane {
     pub kv: KvDelta,
     /// An explicit attention mask, replacing the derived causal one. `Some`
     /// is what makes the lane's `masked` fact true.
-    pub mask: Option<Mask>,
+    ///
+    /// **THE PAYLOAD IS A [`Masking`], NOT A [`Mask`], AND THAT IS THE
+    /// SLIDING WINDOW BEING EXPRESSIBLE.** A restriction of the lane's whole
+    /// readable extent is [`Masking::Extent`] and is what this field carried
+    /// when it was a bare `Mask`; a mask whose ROWS differ — the windowed
+    /// prefill, where row `i` keeps `[i - w, i]` — is [`Masking::Rows`], one
+    /// mask per entry of [`Lane::tokens`]. `Masking` argues both.
+    pub mask: Option<Masking>,
     /// Which adapter bank this lane routes to (design §8). `None` is the base
     /// model.
     pub adapter: Option<u32>,
@@ -235,12 +387,30 @@ pub struct Lane {
     /// so speculation over a Mamba family was unexpressible rather than
     /// refused. [`RsVerb`] is that vocabulary.
     ///
-    /// **ONLY [`RsVerb::Fold`] IS SERVED IN THIS TREE**, and the other two are
-    /// refused by name at [`Lane::validate`] rather than quietly folded — a
-    /// lane that asked for a buffered scatter and got a destructive fold would
-    /// have its speculation corrupt the state it was speculating over.
+    /// **AN ENGINE THAT SERVES THE OTHER TWO SAYS SO** ([`Serves::rs_verbs`],
+    /// from [`Capabilities::rs_verbs`](crate::Capabilities::rs_verbs)); every
+    /// other refuses them by name at [`Lane::validate`] rather than quietly
+    /// folding — a lane that asked for a buffered scatter and got a
+    /// destructive fold would have its speculation corrupt the state it was
+    /// speculating over.
     #[serde(default)]
     pub rs: RsVerb,
+    /// **Whether this lane's recurrent slot arrives fresh** (alto survey §9's
+    /// gap list, wave F3).
+    ///
+    /// The fact belongs to the RS store and to nothing else. Until F3 the
+    /// shells derived it from the KV side — a lane stating `kv.held == 0` was
+    /// taken to be a sequence beginning, so its recurrent bank was zeroed —
+    /// which is a coincidence and not an identity: a runtime that forks a
+    /// sequence, restores a prefix or reuses a seat can hand a slot that must
+    /// be zeroed while its KV count is non-zero, and can hand one whose KV was
+    /// trimmed to nothing while its recurrence must continue.
+    ///
+    /// [`RsReset::Inferred`] is the default and IS the old rule, restated
+    /// where it can be seen: a caller that says nothing gets exactly the
+    /// behaviour it had.
+    #[serde(default)]
+    pub rs_reset: RsReset,
     /// **What this lane predicts its channels' cursors will be** (alto design
     /// §1 article 3). Empty is "the host makes no prediction", which is every
     /// lane in this tree today.
@@ -285,7 +455,7 @@ impl Lane {
     /// [`Error::Invalid`] when the positions do not match the tokens, or
     /// a readout names a row the lane does not have.
     pub fn validate(&self) -> Result<()> {
-        self.validate_for(false)
+        self.validate_for(Serves::NONE)
     }
 
     /// As [`Lane::validate`], for an engine that states whether it validates
@@ -303,7 +473,7 @@ impl Lane {
     ///
     /// As [`Lane::validate`], plus [`Error::Unsupported`] for a stated ticket
     /// against an engine with no device half to check it.
-    pub fn validate_for(&self, device_channel_commit: bool) -> Result<()> {
+    pub fn validate_for(&self, serves: Serves) -> Result<()> {
         if !self.positions.is_empty() && self.positions.len() != self.tokens.len() {
             return Err(Error::Invalid(format!(
                 "lane in slot {} has {} positions for {} tokens",
@@ -321,12 +491,23 @@ impl Lane {
                 self.rows()
             )));
         }
-        if !self.kv.translation.is_empty() && self.kv.translation.len() != self.kv.pages.len() {
+        // A PER-ROW MASK IS PARALLEL TO THE ROWS OR IT IS NOT A PER-ROW MASK.
+        // `Masking::Rows` states one restriction per query row, so a count
+        // that is not the lane's row count leaves some row either undescribed
+        // (an engine would have to invent one, and inventing it is exactly
+        // the silent row-zero substitution this form exists to end) or
+        // describes a row the lane does not carry. It is the one thing about
+        // a masking a LANE can check about itself: the extent each row covers
+        // is `held + rows` and the shell owns that arithmetic, but the count
+        // is right here.
+        if let Some(masking) = &self.mask
+            && let Some(stated) = masking.stated_rows()
+            && stated != self.tokens.len()
+        {
             return Err(Error::Invalid(format!(
-                "lane in slot {} translates {} of its {} pages",
+                "lane in slot {} states {stated} per-row masks for the {} rows it                  carries",
                 self.slot,
-                self.kv.translation.len(),
-                self.kv.pages.len()
+                self.rows()
             )));
         }
         // ── THE TWO F1 SHAPES WITH NO F1 MECHANISM, REFUSED BY NAME.
@@ -335,11 +516,30 @@ impl Lane {
         //    an accepted-then-ignored field is the one failure mode a typed
         //    contract exists to prevent (design §1 article 3's own argument
         //    about predictions, and §6's about the fold).
-        if !self.channels.is_empty() && !device_channel_commit {
+        if !self.channels.is_empty() && !serves.device_channel_commit {
             return Err(Error::unsupported("engine-api", F3_CHANNEL_TICKETS));
         }
-        if !matches!(self.rs, RsVerb::Fold) {
+        if !matches!(self.rs, RsVerb::Fold) && !serves.rs_verbs {
             return Err(Error::unsupported("engine-api", F3_RS_VERBS));
+        }
+        // **THE MIXED ROW IS SERVED NOW** (design §6's "fused collapse",
+        // survey §9's last bullet; wave F3b built the 2R-segment split). What
+        // is left is the one thing about it a lane CAN check about itself:
+        // a boundary is a position among this fire's own rows, so a host
+        // stated one past them names a token this fire does not carry. A
+        // device-stated one is clamped by the shell at compose and cannot be
+        // checked here at all — which is `FoldLen`'s own rule.
+        if let RsVerb::Buffer {
+            fold: FoldLen::Host(fold),
+            ..
+        } = &self.rs
+            && *fold > self.rows()
+        {
+            return Err(Error::Invalid(format!(
+                "lane in slot {} folds {fold} of the {} rows it carries",
+                self.slot,
+                self.rows()
+            )));
         }
         Ok(())
     }
@@ -349,8 +549,61 @@ impl Lane {
 const F3_CHANNEL_TICKETS: &str =
     "Lane::channels against an engine without the pull-validate and commit-bump kernels";
 
-/// The verb spelling for the recurrent verbs with no device half yet.
+/// The verb spelling for the recurrent verbs an engine has no device half for.
 const F3_RS_VERBS: &str = "Lane::rs beyond RsVerb::Fold (wave F3: the RS device half)";
+
+/// **What an engine states it will actually honour**, carried into
+/// [`Lane::validate_for`].
+///
+/// **A STATED-AND-IGNORED FIELD IS THE ONE FAILURE A TYPED CONTRACT EXISTS TO
+/// PREVENT** (design §1 article 3). Two fields of [`Lane`] are predictions an
+/// engine either checks or cannot: the channel tickets and the recurrent verb.
+/// Neither is a fact about the lane, so neither can be checked by the lane
+/// alone — the engine answers, and a lane that asked for something this engine
+/// would drop is refused BY NAME instead of quietly served as something else.
+///
+/// It is a struct rather than two positional `bool`s because it grew from one
+/// to two in a single wave and would have grown a third silently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Serves {
+    /// This engine advances its channel rings on the device
+    /// ([`Capabilities::device_channel_commit`](crate::Capabilities::device_channel_commit)).
+    pub device_channel_commit: bool,
+    /// This engine serves [`RsVerb::Buffer`] and [`RsVerb::FoldBuffered`]
+    /// ([`Capabilities::rs_verbs`](crate::Capabilities::rs_verbs)).
+    pub rs_verbs: bool,
+}
+
+impl Serves {
+    /// The shape every engine had before F2a: neither prediction honoured.
+    pub const NONE: Serves = Serves {
+        device_channel_commit: false,
+        rs_verbs: false,
+    };
+}
+
+/// **Whether a lane's recurrent slot begins here** (alto survey §9).
+///
+/// A recurrent slot IS its history: opening a sequence in a slot another
+/// sequence used means zeroing what that one left, because the scan reads the
+/// whole bank on its first step. Who KNOWS a slot is fresh is the question
+/// this type answers, and until F3 the answer was the wrong store's — the
+/// shells keyed the zeroing on `KvDelta::held == 0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RsReset {
+    /// **The caller states nothing, so the engine keeps its old rule**: a lane
+    /// arriving with `kv.held == 0` is a sequence beginning. Exactly the
+    /// behaviour every caller had before this field existed, which is why it
+    /// is the default.
+    #[default]
+    Inferred,
+    /// The RS store classified this slot as FRESH: zero its banks before the
+    /// fire reads them, whatever the KV side says.
+    Fresh,
+    /// The RS store classified this slot as CONTINUING: leave its banks
+    /// alone, whatever the KV side says.
+    Held,
+}
 
 /// **What this lane's pass does to its recurrent state** (alto design §6).
 ///
@@ -359,7 +612,7 @@ const F3_RS_VERBS: &str = "Lane::rs beyond RsVerb::Fold (wave F3: the RS device 
 /// speculation vocabulary the Mamba families need, named here so that the
 /// exception register has something to point at and so that asking for one is
 /// a refusal rather than a silent fold.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RsVerb {
     /// Fold each token into the recurrent state inside the forward. The
     /// default, and a predicated commit like every other durable advance
@@ -369,14 +622,64 @@ pub enum RsVerb {
     /// Scatter the in-projection activations into `pages` and leave the folded
     /// state untouched: a draft whose rejection is pure host bookkeeping.
     Buffer {
-        /// Where the scattered activations land.
-        pages: PageRange,
-        /// How much of the buffer the fold will eventually accept.
+        /// **The lane's whole buffer run**, as a LIST of physical buffer-page
+        /// slot ids in buffer order: entry `j` holds buffer tokens
+        /// `[j * page_tokens, (j + 1) * page_tokens)`, where `page_tokens` is
+        /// the engine's kv page size ([`PoolFacts`](crate::caps::PoolFacts)).
+        ///
+        /// The whole run and not this fire's share of it, because
+        /// [`RsVerb::FoldBuffered`] addresses the same run from the same
+        /// origin and the two spellings must agree without a second field.
+        ///
+        /// **A LIST AND NOT A RANGE** (wave F3-tail), which is
+        /// [`KvDelta::pages`]'s shape for [`KvDelta::pages`]'s reason: the
+        /// runtime's recurrent store allocates buffer pages one at a time and
+        /// copies them on write after a fork, so a lane's run is contiguous
+        /// only by luck. A range forced the runtime to state a first page and
+        /// a count it could not honour, and the list IS the translation the
+        /// runtime used to carry beside it — `pages[j]` is the physical slot
+        /// logical buffer page `j` currently lives in.
+        pages: Vec<u32>,
+        /// **Which buffer token this fire's first row lands at.** A pure
+        /// append states its current occupancy; a re-drafted window states the
+        /// accepted boundary it is re-filling from.
+        at: u32,
+        /// **How many of this fire's rows this lane also FOLDS** (design
+        /// §6's fused collapse).
+        ///
+        /// **`FoldLen::Host(0)` IS THE PURE SCATTER** — the draft whose
+        /// rejection is host bookkeeping, with the folded state untouched.
+        /// Anything else is the MIXED ROW: one fire that writes every row
+        /// into the buffer AND lands the durable state on row `fold`, so the
+        /// next window's speculation begins at the accepted boundary without
+        /// a second fire.
+        ///
+        /// Counted in THIS FIRE'S ROWS and bounded by them: `fold == rows`
+        /// is the fire that buffers a window and folds all of it, and a
+        /// boundary strictly inside the row is what takes the engine's
+        /// 2R-segment split (wave F3b).
         fold: FoldLen,
     },
     /// Replay the buffer through conv+recurrence, truncated at the accepted
     /// boundary — the batch fold, skipping the in-projection GEMM.
     FoldBuffered {
+        /// The lane's buffer run, addressed exactly as [`RsVerb::Buffer`]
+        /// wrote it: the same list of physical page slot ids, page-major from
+        /// buffer token zero.
+        pages: Vec<u32>,
+        /// **Which buffer token the replay starts at** — [`RsVerb::Buffer`]'s
+        /// `at`, from the same origin (wave F3b).
+        ///
+        /// **THE GAP F3 DOCUMENTED AND DID NOT CLOSE.** A fold absorbs tokens
+        /// off the FRONT of a lane's buffer but can only release whole
+        /// covered pages, so a fold that lands mid-page leaves the survivors
+        /// physically offset inside their first page — and a replay that
+        /// started at buffer token zero would fold the absorbed tokens a
+        /// second time before it reached the live ones. The runtime knew the
+        /// number (`buffer_heads[r]`) and had nowhere to state it, so every
+        /// fold this tree served had to take the buffer whole or land on a
+        /// page boundary. It states it here.
+        at: u32,
         /// The host's upper bound on the accepted length, which is what sizes
         /// the launch. The device clamps to it.
         bound: u32,
@@ -468,7 +771,7 @@ impl Step {
     ///
     /// [`Error::Invalid`] with the first thing that is wrong.
     pub fn validate(&self) -> Result<()> {
-        self.validate_for(false)
+        self.validate_for(Serves::NONE)
     }
 
     /// As [`Step::validate`], carrying each engine's own answer about
@@ -477,12 +780,12 @@ impl Step {
     /// # Errors
     ///
     /// As [`Step::validate`].
-    pub fn validate_for(&self, device_channel_commit: bool) -> Result<()> {
+    pub fn validate_for(&self, serves: Serves) -> Result<()> {
         if self.lanes.is_empty() {
             return Err(Error::Invalid("a fire carries no lanes".into()));
         }
         for (index, lane) in self.lanes.iter().enumerate() {
-            lane.validate_for(device_channel_commit)?;
+            lane.validate_for(serves)?;
             if self.lanes[..index].iter().any(|l| l.slot == lane.slot) {
                 return Err(Error::Invalid(format!(
                     "slot {} appears twice in one fire, at lane {index}",
@@ -569,7 +872,7 @@ impl FrameSubmission {
     /// [`Error::Unsupported`] for a step naming a shape this tree does not
     /// serve yet.
     pub fn validate(&self) -> Result<()> {
-        self.validate_for(false)
+        self.validate_for(Serves::NONE)
     }
 
     /// As [`FrameSubmission::validate`], carrying the admitting engine's own
@@ -583,12 +886,12 @@ impl FrameSubmission {
     /// # Errors
     ///
     /// As [`FrameSubmission::validate`].
-    pub fn validate_for(&self, device_channel_commit: bool) -> Result<()> {
+    pub fn validate_for(&self, serves: Serves) -> Result<()> {
         if self.steps.is_empty() {
             return Err(Error::Invalid("a frame carries no steps".into()));
         }
         for step in &self.steps {
-            step.validate_for(device_channel_commit)?;
+            step.validate_for(serves)?;
         }
         Ok(())
     }

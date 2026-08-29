@@ -22,8 +22,15 @@ doctest = false
 # is no fallback: the dummy engine these no-GPU diagnostics used to run
 # against is deleted, so a build with neither feature reaches no device.
 default = []
-engine-cuda-12 = ["pie/engine-cuda-12"]
-engine-cuda-13 = ["pie/engine-cuda-13"]
+engine-cuda-12 = ["_engine-cuda", "pie/engine-cuda-12", "runtime/engine-cuda-12"]
+engine-cuda-13 = ["_engine-cuda", "pie/engine-cuda-13", "runtime/engine-cuda-13"]
+# The private "the CUDA shell is linked" gate, the same shape and the same
+# underscore as `runtime`'s own. Two gates here drive the `Engine` CONTRACT
+# directly rather than the client edge -- `copy_kv` and `Readout::Rows` are
+# engine verbs with no guest spelling -- so they name `engine_api` and
+# `engine_cuda` types, and a build with neither ABI selected must not compile
+# them.
+_engine-cuda = ["pie/_engine-cuda", "runtime/_engine-cuda"]
 
 [dev-dependencies]
 # The composition root. These tests boot the same `run_standalone` a `pie
@@ -35,6 +42,29 @@ client = { path = "../../crates/client" }
 # The runtime lib — read `inference::get_stats()` in-process to observe the
 # scheduler's fire probes (the thrust-2 bubble/quorum gate) after a decode.
 runtime = { path = "../../crates/runtime" }
+# **THE CONTRACT, FOR THE TWO GATES THAT DRIVE IT DIRECTLY.** `copy_kv` and
+# `Readout::Rows` are `Engine` verbs a guest has no way to spell, so
+# `cuda_kv_page_graft` and `cuda_row_selected_readout` open an engine through
+# `runtime::engine::backend::open` and submit their own frames -- the shape
+# `crates/runtime/tests/cuda_boot_smoke.rs` established one layer down. Every
+# other gate here goes over the websocket, which is still the point of them.
+engine-api = { path = "../../crates/engine-api" }
+# For `engine_cuda::device::present()`: those two gates skip at RUN time on a
+# machine with no card, rather than being `#[ignore]`d on a build flag.
+engine-cuda = { path = "../../crates/engine-cuda" }
+# The catalog's classifier input (`model::Request`), which is what states a
+# lane's fact word. A gate that spelled a word by hand would be pinning a
+# different model than the one it fires.
+model = { path = "../../crates/model" }
+# The guest-program half of `cuda_row_selected_readout`: it authors a PTIR
+# epilogue at the LOAD's own vocabulary (a corpus golden is authored at the
+# dummy profile's and cannot bind here), plans it and emits CUDA for it —
+# which is the splice the scheduler lane makes and a gate holding the engine
+# directly has to make for itself.
+tensor-compiler = { path = "../../crates/tensor-compiler" }
+# The checkpoint's own vocabulary: a tokenizer from another snapshot decodes
+# the right ids into the wrong words.
+tokenizer = { path = "../../crates/tokenizer" }
 
 anyhow = "1.0"
 tokio = { version = "1.53", features = ["full"] }

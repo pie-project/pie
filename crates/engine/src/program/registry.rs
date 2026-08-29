@@ -132,11 +132,15 @@ pub struct Endpoint {
     pub mirror_bytes: usize,
 
     pub word_bytes: usize,
-
-    pub mirror_base: u64,
-
-    pub word_base: u64,
 }
+
+// `mirror_base` and `word_base` — the host ring's cell allocation and word
+// array as raw addresses — stood beside them. They were the neutral half of
+// the address-publishing contract `engine_api::channel`'s header describes and
+// F2a replaced: an engine adopts a host ring by taking the pinned half over,
+// not by being handed a `u64` to dereference. Nothing has read either since,
+// and the two `ChannelState` accessors that produced them are gone with the
+// fields (alto E).
 
 #[derive(Debug)]
 pub struct Instance {
@@ -253,8 +257,6 @@ impl Registry {
             capacity,
             mirror_bytes: state.cells_len(),
             word_bytes: state.words_len(),
-            mirror_base: state.mirror_base(),
-            word_base: state.word_base(),
         };
         self.channels.insert(
             id,

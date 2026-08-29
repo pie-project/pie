@@ -219,12 +219,15 @@ impl Demand {
 /// atomic across arenas, `Exhausted` with **zero side effects**, and past it
 /// the stream work is success-only.
 ///
-/// **F1 IS THE RESERVATION MODEL, HONESTLY NAMED.** The shells here carve
-/// fixed pools at load and grow nothing, so `commit` is the ceiling check that
-/// already existed and `trim` does nothing. Wave C makes it dev's elastic
-/// shape — budgeted physical pool, VMM arenas under fixed virtual ranges — and
-/// the 10-second resize poll dies, because elasticity becomes a side effect of
-/// admission rather than a thing somebody polls for.
+/// **WAVE C MADE THIS REAL ON THE CUDA PLANE.** `commit` is dev's elastic
+/// shape — a budgeted physical pool under VMM arenas whose virtual ranges are
+/// reserved at the load's ceiling and whose physical backing grows to demand
+/// — and the 10-second resize poll that used to stand in for it is gone,
+/// because elasticity is a side effect of admission rather than a thing
+/// somebody polls for. A shell that has not been converted still carves fixed
+/// pools at load, and for it `commit` is the ceiling check it already had and
+/// `trim` has nothing to give back; both readings satisfy this contract, and
+/// the difference is visible as `PoolFacts::elastic_page_bytes`.
 pub trait Supply {
     /// What a refusal is spelled as. The shells speak their own fault type and
     /// the contract layer above them turns it into `Exhausted`/`Impossible`;
@@ -242,8 +245,16 @@ pub trait Supply {
     /// promise, and it is why the caller may retry the identical frame.
     fn commit(&mut self, demand: Demand) -> std::result::Result<(), Self::Error>;
 
-    /// Give back what a frame no longer needs. Background, best-effort, and
+    /// Give back what the load no longer needs. Background, best-effort, and
     /// never on the fire path's critical section.
+    ///
+    /// **THE HINT IS A RESIDENCY STATEMENT, NOT A FRAME'S DEMAND.** A kv page
+    /// holds bytes for as long as somebody's prefix is cached in it, and
+    /// which pages those are is POLICY — the trie, the CoW, the eviction
+    /// choice, all of them the runtime's (article 8). An engine knows only
+    /// what the last frame addressed, which is a smaller set, so it must not
+    /// invent a watermark of its own: a shell unmaps exactly what it is told
+    /// to, above the committed line and only while it is idle.
     fn trim(&mut self, hint: Demand) {
         let _ = hint;
     }

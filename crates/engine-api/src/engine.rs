@@ -43,7 +43,7 @@ use crate::error::{Error, Result};
 use crate::fire::{FrameId, FrameSubmission, FrameTicket, MediaEncode, Step};
 use crate::load::{LoadRequest, Loaded};
 use crate::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use crate::transfer::{KvCopy, KvHandle, PoolResize, StateCopy};
+use crate::transfer::{KvCopy, KvHandle, StateCopy};
 
 /// **Which step of which frame a completion is about.**
 ///
@@ -471,16 +471,13 @@ pub trait Engine: Send + Sync {
         Err(self.unsupported("copy_state"))
     }
 
-    /// Grow or shrink an elastic pool.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Unsupported`] from an engine whose pools are not virtual,
-    /// [`Error::Exhausted`] when the budget will not cover the target.
-    fn resize_pool(&mut self, resize: &PoolResize) -> Result<()> {
-        let _ = resize;
-        Err(self.unsupported("resize_pool"))
-    }
+    // **THERE IS NO `resize_pool`** (alto design §8, wave C). An elastic
+    // pool grows as a side effect of frame admission — the union demand,
+    // committed atomically before any of the frame runs — and shrinks through
+    // the engine's own `Supply::trim`. A verb that let a caller state a
+    // mapping plan would be a second path to the same commit, which is the
+    // double allocator article 8 exists to forbid. See `transfer.rs` for what
+    // went with it.
 
     /// Encode non-text modalities into embedding rows.
     ///

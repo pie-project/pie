@@ -5,49 +5,12 @@ pub use tensor_compiler::plan::lane_table::{
     LaneTableHeader as Header,
 };
 
-pub const FLAG_RAGGED: u32 = 1;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct ChannelMeta {
-    pub words: u64,
-
-    pub capacity: u32,
-
-    pub flags: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct GroupLayout {
-    pub lane_count: u32,
-
-    pub value_count: u32,
-
-    pub scratch_stride: u32,
-
-    pub temporary_offset: u32,
-
-    pub vocab: u32,
-
-    pub binding_stride: u32,
-
-    pub rows_per_lane: u32,
-
-    pub op_stride: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(C)]
-pub struct RowMeta {
-    pub offset: u32,
-
-    pub count: u32,
-
-    pub mtp_offset: u32,
-
-    pub reserved: u32,
-}
+// `FLAG_RAGGED`, `ChannelMeta`, `GroupLayout` and `RowMeta` stood here: four
+// `#[repr(C)]` mirrors of a device lane table's side structures. Nothing
+// constructs or reads one — `tensor_compiler::plan::lane_table` owns the ABI
+// the shells actually bind, and these were a second spelling of part of it
+// (alto E). The three `*_BYTES` constants below are the live half: they size
+// the types re-exported above, which are that crate's.
 
 pub const HEADER_BYTES: u64 = size_of::<Header>() as u64;
 

@@ -316,8 +316,8 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
 /// correction takes a segment list, and the artifact goes from twelve rows
 /// that cost launches to twenty-four that cost none. That is the composition
 /// the two features were built for, and it is why
-/// `engine_cuda::serve`'s `PIE_CUDA_GROUPED` is opt-in — it is an improvement,
-/// but it is a DIFFERENT artifact from the one that ships by default.
+/// `engine_cuda::Knobs::grouped` has an off arm — it is an improvement, but
+/// it is a DIFFERENT artifact from the one the off arm bakes.
 #[test]
 fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
     let (_, _, trace, _) = model::catalog()

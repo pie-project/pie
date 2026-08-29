@@ -274,8 +274,6 @@ pub struct HostSubmitProbes {
     /// KV declaration resolve, demand, grant acquire and reserved prepare —
     /// everything that takes the store lock or awaits the planner.
     pub kv_prepare_us: AtomicU64,
-    /// The working set's page translation, copied into the request.
-    pub translation_us: AtomicU64,
     /// The handoff to the scheduler thread.
     pub scheduler_submit_us: AtomicU64,
     /// `HostShadow::advance` — the fold that moves the shadow one fire on.

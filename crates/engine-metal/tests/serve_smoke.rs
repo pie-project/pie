@@ -420,10 +420,10 @@ fn a_mask_this_plane_does_not_stage_is_refused_by_name() {
     };
     let prompt = tokenizer.encode(PROMPT);
     shell.open(0).expect("slot 0 opens");
-    let mask = engine::engine_api::fire::Mask {
+    let mask = engine::engine_api::fire::Masking::Extent(engine::engine_api::fire::Mask {
         runs: vec![0, prompt.len() as u32],
         total: prompt.len() as u64,
-    };
+    });
     let fault = shell
         .fire_seated(&[Seated {
             lane: Lane {

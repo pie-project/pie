@@ -271,16 +271,18 @@ pub struct TuneReport {
 #[derive(serde::Serialize, Clone, Copy, PartialEq)]
 struct KnobSet {
     frame_size: usize,
-    submit_depth: usize,
     dispatch_depth: usize,
+    /// Derived from `dispatch_depth`, reported because it is what a guest
+    /// feels — see `engine::runahead::Runahead::submit_depth`.
+    submit_depth: usize,
 }
 
 impl From<Knobs> for KnobSet {
     fn from(k: Knobs) -> Self {
         Self {
             frame_size: k.frame_size,
-            submit_depth: k.submit_depth,
             dispatch_depth: k.dispatch_depth,
+            submit_depth: k.submit_depth(),
         }
     }
 }
@@ -383,8 +385,8 @@ impl crate::ui::Report for TuneReport {
                 },
                 [
                     format!("k={}", candidate.knobs.frame_size),
-                    format!("submit={}", candidate.knobs.submit_depth),
                     format!("dispatch={}", candidate.knobs.dispatch_depth),
+                    format!("submit={}", candidate.knobs.submit_depth),
                     ranked,
                     format!("+/-{:.1}%", candidate.rel_sigma * 100.0),
                     if candidate.current {
@@ -417,8 +419,9 @@ impl crate::ui::Report for TuneReport {
                     _ => String::new(),
                 };
                 println!(
-                    "  k={} submit={} dispatch={} beats the current config by {gain:.1}% on {}{change}.",
-                    winner.frame_size, winner.submit_depth, winner.dispatch_depth, self.ranked_by
+                    "  k={} dispatch={} (submit={}) beats the current config by \
+                     {gain:.1}% on {}{change}.",
+                    winner.frame_size, winner.dispatch_depth, winner.submit_depth, self.ranked_by
                 );
                 if self.wrote {
                     println!("  Written to the config.");
@@ -481,7 +484,6 @@ pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
     let mut content = content.to_string();
     for (key, value) in [
         ("runtime.frame_size", knobs.frame_size),
-        ("runtime.frame_submit_depth", knobs.submit_depth),
         ("runtime.frame_dispatch_depth", knobs.dispatch_depth),
     ] {
         let (updated, _) = typed_by_schema(&content, key, &value.to_string())
@@ -635,7 +637,6 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
     let (controller, gateway, worker) = crate::derive::derive_standalone(&content)?;
     let baseline = Knobs {
         frame_size: worker.runtime.frame_size as usize,
-        submit_depth: worker.runtime.frame_submit_depth as usize,
         dispatch_depth: worker.runtime.frame_dispatch_depth as usize,
     };
     let (plan, skipped) = plan(baseline, args.budget);
@@ -762,7 +763,6 @@ mod tests {
 
     const BASE: Knobs = Knobs {
         frame_size: 2,
-        submit_depth: 3,
         dispatch_depth: 2,
     };
 
@@ -888,7 +888,6 @@ calibrate_planner = true
             &content,
             Knobs {
                 frame_size: 3,
-                submit_depth: 4,
                 dispatch_depth: 2,
             },
         )
@@ -896,8 +895,11 @@ calibrate_planner = true
         let parsed: toml::Value = toml::from_str(&updated).unwrap();
         let runtime = parsed.get("runtime").and_then(|r| r.as_table()).unwrap();
         assert_eq!(runtime["frame_size"].as_integer(), Some(3));
-        assert_eq!(runtime["frame_submit_depth"].as_integer(), Some(4));
         assert_eq!(runtime["frame_dispatch_depth"].as_integer(), Some(2));
+        // AND NOT A THIRD KEY. `runtime.frame_submit_depth` was written here
+        // too; it is derived from the dispatch depth now (alto E), so writing
+        // it would be writing a knob `RuntimeConfig` no longer has.
+        assert!(runtime.get("frame_submit_depth").is_none());
         // Typed, not stringified: `pie config set` had this exact bug.
         assert!(!updated.contains("frame_size = \"3\""));
     }
@@ -913,7 +915,6 @@ calibrate_planner = true
             &content,
             Knobs {
                 frame_size: 5,
-                submit_depth: 3,
                 dispatch_depth: 4,
             },
         )

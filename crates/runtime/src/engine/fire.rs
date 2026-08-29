@@ -38,137 +38,45 @@ use tensor_ir::registry::GeometryClass;
 
 use crate::engine::completion::TerminalCell;
 
-/// The recurrent-state half of a request.
-///
-/// **`palo B-rs`: NOTHING CARRIES THIS ACROSS THE BOUNDARY YET.** The old
-/// `LaunchPlan` had eight parallel arms for it (`rs_slot_ids`,
-/// `rs_slot_flags`, `rs_fold_lens`, `rs_buffer_*`, `rs_translation*`) and the
-/// new contract has none: a recurrent slot is a `CacheRow::State` seat in the
-/// plan, the shell owns the pool, and [`Lane::slot`] is the sequence's seat in
-/// BOTH pools. What has no seat yet is the per-fire verb — reset this slot,
-/// fold this many positions, read this buffer — which the design puts on a
-/// model-declared axis rather than on the submission (§8). The runtime still
-/// computes it, because its own recurrent store is built on it and
-/// `copy_state` moves what it names; it stops at the boundary.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RsPlan {
-    /// The state slot each lane writes.
-    pub slot_ids: Vec<u32>,
-    /// Per slot: reset / fold / buffer-write / device-fold-length.
-    pub slot_flags: Vec<u8>,
-    /// Per slot: how many positions the fold covers.
-    pub fold_lens: Vec<u32>,
-    /// The buffer slots each lane writes.
-    pub buffer_slot_ids: Vec<u32>,
-    /// `[lanes + 1]`: each lane's span of [`RsPlan::buffer_slot_ids`].
-    pub buffer_slot_indptr: Vec<u32>,
-    /// The buffer slots each lane reads.
-    pub buffer_read_slot_ids: Vec<u32>,
-    /// `[lanes + 1]`: each lane's span of [`RsPlan::buffer_read_slot_ids`].
-    pub buffer_read_indptr: Vec<u32>,
-    /// How much of each read buffer is live.
-    pub buffer_read_lens: Vec<u32>,
-    /// Each read buffer's ring head.
-    pub buffer_heads: Vec<u32>,
-    /// Slot ids rewritten since the last fire.
-    pub translation: Vec<u32>,
-    /// `[lanes + 1]`: each lane's span of [`RsPlan::translation`].
-    pub translation_indptr: Vec<u32>,
-}
+// **`palo B-rs` CLOSED, AND THE VERB CROSSES NOW** (alto wave F3-tail). An
+// `RsPlan` struct stood here: eleven parallel `Vec<u32>` arms — `slot_ids`,
+// `slot_flags`, `fold_lens`, `buffer_slot_ids` + its CSR, `buffer_read_*`,
+// `buffer_heads`, `translation` + its CSR — the last survivors of
+// `LaunchPlan`'s recurrent half, carried on `FireRequest::rs` because the
+// contract had no recurrent field at all and the runtime's own store was
+// built on them. Nothing across the boundary could read one, so a lane that
+// meant to scatter a speculative window into a buffer was submitted as an
+// ordinary fold and the device folded it.
+//
+// `engine_api::RsVerb` and `engine_api::RsReset` are that vocabulary, and
+// they are fields of the LANE — so the arms have nowhere left to be:
+// `pipeline::fire::rs::PreparedRs::apply_to` stamps one verb and one reset
+// fact onto the lane that carries each row, `RsVerb::Buffer::pages` IS the
+// translation the ninth and tenth arms carried, and everything else was
+// either the runtime store's own bookkeeping (which never left
+// `PreparedRs`) or a second spelling of a number the verb states once
+// (article 8).
 
-impl RsPlan {
-    /// True when this request touches no recurrent state at all — which is
-    /// every request of a plain KV model.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.slot_ids.is_empty()
-            && self.buffer_slot_ids.is_empty()
-            && self.buffer_read_slot_ids.is_empty()
-            && self.translation.is_empty()
-    }
-}
-
-/// The non-text half of a request: images, audio, precomputed embedding rows.
-///
-/// **`palo B-media`: THE ENCODE VERB TAKES THESE, THE FIRE DOES NOT.** The old
-/// `LaunchPlan` carried twenty fields of pixel bytes, patch grids, mRoPE
-/// positions and anchor rows *inside the fire*, so every decode step shipped a
-/// dozen empty vectors. The contract splits it:
-/// [`MediaEncode`](engine_api::MediaEncode) is the `encode` verb's argument
-/// and answers embedding rows, and what a fire needs afterwards is rows in the
-/// arena — which is a seam the shell resolves, not a payload the submission
-/// carries. So the runtime keeps the payload here, hands it to `encode`, and
-/// the rows-into-a-fire half is unwired.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Media {
-    /// Per image: `(temporal, height, width)` patch counts.
-    pub image_grids: Vec<u32>,
-    /// Where each image's embeddings anchor, as a token position.
-    pub image_anchor_positions: Vec<u32>,
-    /// Where each image's embeddings anchor, as a row of this request.
-    pub image_anchor_rows: Vec<u32>,
-    /// Pixel bytes for every image.
-    pub image_pixels: Vec<u8>,
-    /// Byte offsets splitting [`Media::image_pixels`] per image.
-    pub image_pixel_indptr: Vec<u32>,
-    /// Per-image mRoPE positions.
-    pub image_mrope_positions: Vec<u32>,
-    /// Byte offsets splitting [`Media::image_mrope_positions`] per image.
-    pub image_mrope_indptr: Vec<u32>,
-    /// Per patch: its `(y, x)` position.
-    pub image_patch_positions: Vec<u32>,
-    /// Feature bytes for every audio clip.
-    pub audio_features: Vec<u8>,
-    /// Byte offsets splitting [`Media::audio_features`] per clip.
-    pub audio_feature_indptr: Vec<u32>,
-    /// Where each clip's embeddings anchor, as a row of this request.
-    pub audio_anchor_rows: Vec<u32>,
-    /// Precomputed embedding rows, `bf16`.
-    pub embed_rows: Vec<u8>,
-    /// Byte offsets splitting [`Media::embed_rows`] per block.
-    pub embed_indptr: Vec<u32>,
-    /// Each block's `(rows, width)`.
-    pub embed_shapes: Vec<u32>,
-    /// Where each block anchors, as a row of this request.
-    pub embed_anchor_rows: Vec<u32>,
-}
-
-impl Media {
-    /// True when the request is text only.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.image_anchor_rows.is_empty()
-            && self.audio_anchor_rows.is_empty()
-            && self.embed_anchor_rows.is_empty()
-    }
-}
-
-/// A channel's expected ring cursors at this fire.
-///
-/// **THE ASSERTION MOVED TO THE PARTY THAT OWNS THE RINGS.** These were
-/// `channel_expected_head`/`channel_expected_tail` on the plan and
-/// `channel_ticket_indptr` on the step — a per-fire claim, shipped across the
-/// boundary, about where a guest program's rings stand. The engine answers
-/// that question for itself now: it gates every attached instance's readiness
-/// against its OWN cursors before it launches anything
-/// (`engine_cuda::program::Plane::ready`), and a ring that is not where the
-/// caller thought is `Exhausted` rather than a mismatch nobody checked. So
-/// nothing carries these across; they stay as the runtime's own run-ahead
-/// reservation, which is the half [`crate::pipeline::fire`]'s
-/// `TicketReservation` was always about — frame validation at k > 1 reads
-/// `device_ring_backlog` and `writer_available_cells`, and both are counted
-/// from the reservations rather than from this vector.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ChannelTicket {
-    /// Which channel this predicts about, by its GLOBAL id — the only
-    /// spelling an engine and the runtime share, since an instance numbers
-    /// its channels densely and the runtime numbers them by registration.
-    pub channel: u64,
-    /// The head the reader expects.
-    pub head: u64,
-    /// The tail the writer expects.
-    pub tail: u64,
-}
+// **`palo B-media` CLOSED THE OTHER WAY** (alto E). A `Media` struct stood
+// here — twenty fields of pixel bytes, patch grids, mRoPE positions, audio
+// features and precomputed embedding rows, kept so the runtime would have
+// somewhere to hold an encode's payload. Nothing ever wrote one. Every
+// `FireRequest` built in this tree left it `Default`, so
+// `offload::try_encode`'s `media.is_empty()` gate was true on every fire and
+// the encode seam was dead in front of a payload that did not exist. The
+// payload comes back with the verb that produces it
+// (`engine_api::MediaEncode` is `encode`'s argument, and what a fire needs
+// afterwards is rows in the arena — a seam the shell resolves).
+//
+// A `ChannelTicket` struct stood here too: a channel's expected ring cursors,
+// stated on the REQUEST as `FireRequest::tickets` beside a
+// `device_channel_tickets` flag that said whether the engine had a device
+// half to check them, which `scheduler::batch` then transcribed onto the
+// attached lane. Both are gone. The reservation is stamped straight onto the
+// lane that carries the pass (`engine_api::Lane::channels`) by
+// `pipeline::fire`'s `TicketReservation::apply_to` — the party that mints it
+// and the party that knows whether the instance's channels were adopted. Two
+// spellings of one number is what article 8 forbids.
 
 /// One request, as the runtime holds it between submit and fire.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -182,48 +90,12 @@ pub struct FireRequest {
     /// ([`InstanceBinding::geometry`](engine_api::InstanceBinding)); carried
     /// here because the scheduler groups by it.
     pub geometry: GeometryClass,
-    /// The engine reads this request's geometry from a channel the device
-    /// wrote, so the host's copy of it is advisory.
-    pub device_resolved_geometry: bool,
-    /// This request's attention mask lives in a device cell, which is what
-    /// makes it un-batchable with another program's.
-    pub dense_device_mask: bool,
-    /// The bound program writes `attn_page_mask`.
-    pub hook_page_mask: bool,
-    /// The highest page id this request's geometry reaches, plus one.
-    pub required_kv_pages: u32,
-    /// Page ids rewritten since this request's last fire, parallel to the
-    /// lane's own page list.
-    pub kv_translation: Vec<u32>,
-    /// Which mapping version [`FireRequest::kv_translation`] is from.
-    pub kv_translation_version: u64,
-    /// The byte span this request promises to write inside, when it resolves
-    /// its own write targets on the device.
-    pub kv_write_bounds: Option<(u64, u64)>,
     /// How many layers to run, for a partial-depth fire.
     pub max_layers: Option<u32>,
     /// Every lane carries exactly one token.
     pub single_token_mode: bool,
     /// The mask came from the guest rather than from the causal derivation.
     pub has_user_mask: bool,
-    /// The recurrent-state half. See [`RsPlan`].
-    pub rs: RsPlan,
-    /// The non-text half. See [`Media`].
-    pub media: Media,
-    /// The guest program's expected ring cursors. See [`ChannelTicket`].
-    pub tickets: Vec<ChannelTicket>,
-    /// **Does the engine this request is bound for validate predictions on
-    /// the device?** (alto design §1 article 3, wave F2a.)
-    ///
-    /// True exactly when every one of this instance's channels was ADOPTED —
-    /// the engine published the pinned host half and its control kernels read
-    /// it — which is the same fact
-    /// [`Capabilities::device_channel_commit`](engine_api::Capabilities::device_channel_commit)
-    /// states, asked per channel where the runtime already knows it. Only
-    /// then do the reservations above cross as
-    /// [`Lane::channels`](engine_api::Lane): an engine with no device half to
-    /// check them refuses a stated prediction by name rather than ignoring it.
-    pub device_channel_tickets: bool,
     /// **Does this request's bound instance run a pass at the fire's
     /// boundary?** (`palo B2`, design §9.)
     ///
@@ -370,11 +242,11 @@ pub struct StepFire {
 /// `FrameSubmission`'s four frame-level fields are gone with the wire form.
 /// `instance_ids` was the roster the step tables indexed;
 /// `kv_translation`/`kv_translation_indptr` were a per-roster-lane page
-/// rewrite, which is [`KvDelta::translation`](engine_api::KvDelta) on the
-/// lane that owns it; `required_kv_pages` was a frame-union high-water the
-/// engine used to size an admission check it makes for itself now
-/// ([`Error::Exhausted`](engine_api::Error::Exhausted) carries
-/// the numbers).
+/// rewrite for a fork mover no shell in this tree has — both spellings are
+/// deleted rather than carried (alto E); `required_kv_pages` was a
+/// frame-union high-water the engine used to size an admission check it
+/// makes for itself now ([`Error::Exhausted`](engine_api::Error::Exhausted)
+/// carries the numbers).
 #[derive(Default)]
 pub struct FrameFire {
     /// The steps, in the order the lane fires them.
@@ -405,6 +277,16 @@ pub struct MaskWords {
 }
 
 /// Expand every lane's mask into bitmap words.
+///
+/// **`request_indptr` CUTS `word_indptr` PER LANE BECAUSE A LANE CAN CARRY
+/// MORE THAN ONE MASK**, and since `Masking::Rows` it actually does: a
+/// windowed prefill states one restriction per query row, and each of them
+/// expands into its own bitmap. The two-level CSR was already this shape when
+/// every lane put exactly one mask in it — `LaunchPlan::bitmask_words` came
+/// off a wire form that cut a flat mask vector per request — so a per-row
+/// lane fills it rather than changing it. The causal bound is NOT folded in
+/// here: this is the run encoding expanded, and every consumer that reads the
+/// bits intersects them with the row's own bound (`engine_cuda::mask`).
 #[must_use]
 pub fn bitmask_words(lanes: &[Lane]) -> MaskWords {
     let mut request_indptr = Vec::with_capacity(lanes.len() + 1);
@@ -412,7 +294,7 @@ pub fn bitmask_words(lanes: &[Lane]) -> MaskWords {
     let mut words: Vec<u32> = Vec::new();
     request_indptr.push(0);
     for lane in lanes {
-        if let Some(mask) = &lane.mask {
+        for mask in lane.mask.iter().flat_map(|masking| masking.masks()) {
             let start = words.len();
             words.resize(start + mask.words(), 0);
             mask.expand_into(&mut words[start..]);
@@ -436,6 +318,9 @@ pub fn lane_of(slot: u32, tokens: Vec<u32>, held: u32, pages: Vec<u32>) -> Lane 
         kv: KvDelta {
             held,
             pages,
+            // Stamped only where a page reference is the guest's to resolve
+            // (`pipeline::fire::stamp_lane_translation`); every other lane's
+            // pages are pool ids by the time they reach here.
             translation: Vec::new(),
         },
         ..Lane::default()

@@ -626,6 +626,14 @@ impl ReqGeometry {
                     // reason every other axis here is: the day a caller has a
                     // ticket to mint, this is the line it mints it at.
                     rs: crate::engine::RsVerb::Fold,
+                    // **AND THE RESET FACT IS `Inferred` ON PURPOSE** (alto
+                    // survey §9's gap list, wave F3). The engine's old rule
+                    // — `kv.held == 0` is a sequence beginning — is what
+                    // `Inferred` names, and it is what this lowering meant
+                    // while the KV side was the only store that spoke. The
+                    // RS store's own classification is what replaces it, and
+                    // this is the line it lands on.
+                    rs_reset: crate::engine::RsReset::Inferred,
                     channels: Vec::new(),
                     readout: match readout.as_slice() {
                         [] => crate::engine::Readout::None,
@@ -665,17 +673,25 @@ pub(crate) enum FireAttnMask {
 impl FireAttnMask {
     /// Cut this fire's mask onto its lanes.
     ///
-    /// # Errors
+    /// **THE MASK CSR IS ONE ROW PER QUERY, AND BOTH SHAPES OF IT NOW LAND.**
+    /// A lane whose CSR span is one row is a restriction of that lane's whole
+    /// readable extent and lowers to `Masking::Extent`, exactly as it always
+    /// did — the engine re-applies the causal bound per row from it
+    /// ([`engine_cuda::mask`]'s expansion), so that mask round-trips
+    /// unchanged. A lane whose span is SEVERAL rows is a genuinely
+    /// two-dimensional mask whose rows need not be nested — the windowed
+    /// prefill, where row `i` keeps `[i - w, i]` — and it lowers to
+    /// `Masking::Rows`, the CSR's own rows carried through in order.
     ///
-    /// A lane whose mask CSR spans more than one query row. `Lane::mask` is
-    /// ONE mask over the lane's readable extent and the engine re-applies the
-    /// causal bound per row from it ([`engine_cuda::mask`]'s expansion), so a
-    /// mask of the ordinary shape — a restriction of the extent, intersected
-    /// with causality — round-trips exactly. What does not is a genuinely
-    /// two-dimensional mask whose rows are not nested: no per-lane mask can
-    /// carry it, and the row this used to pick silently was row ZERO, which
-    /// is every later row truncated to the first one's causal bound. Refused
-    /// by name instead (`palo B-mask`: the shape, not the axis).
+    /// **WHAT STOOD HERE WAS A REFUSAL AND WHY IT IS GONE** (`palo B-mask`).
+    /// `Lane::mask` was a bare `Mask` — one restriction, no row axis — so a
+    /// multi-row CSR had nowhere to go and this refused it by name rather
+    /// than pick a row, because the lowering before it picked row ZERO
+    /// silently, which is every later row truncated to the FIRST row's causal
+    /// bound. The refusal was about the SHAPE the contract could carry, not
+    /// about the axis, and the contract carries the shape now: nothing here
+    /// decides anything it did not decide before, it just writes the row list
+    /// into the field that can hold one.
     pub(crate) fn apply_to(
         self,
         request: &mut crate::engine::FireRequest,
@@ -683,7 +699,7 @@ impl FireAttnMask {
         match self {
             FireAttnMask::Omitted => {}
             FireAttnMask::Host { masks, mask_indptr } => {
-                // ONE MASK PER LANE, ON THE LANE. The wire form carried a
+                // ONE MASKING PER LANE, ON THE LANE. The wire form carried a
                 // flat `masks` vector and a `mask_indptr` cutting it per lane,
                 // and an engine's first act was to cut it back. A lane holds
                 // its own (`Lane::mask`), so a mask row that belongs to no
@@ -694,28 +710,33 @@ impl FireAttnMask {
                     else {
                         continue;
                     };
-                    if end > start + 1 {
+                    let Some(rows) = masks.get(start as usize..end as usize) else {
                         return Err(format!(
-                            "lane {lane}'s attention mask spans {} query rows and a \
-                             lane carries one mask over its readable extent; a \
-                             multi-query mask whose rows are not one restriction \
-                             under the causal bound has no per-lane form",
-                            end - start
+                            "lane {lane}'s attention mask CSR names rows {start}..{end} \
+                             of the {} the fire carries",
+                            masks.len()
                         ));
-                    }
-                    request_lane.mask = masks.get(start as usize).cloned().filter(|_| end > start);
+                    };
+                    request_lane.mask = match rows {
+                        // No row at all: this lane is unmasked, and an
+                        // unmasked lane carries no masking rather than a
+                        // synthesized all-keeping one.
+                        [] => None,
+                        // ONE row, and it is the lane's whole extent. Kept
+                        // distinct from a one-element `Rows` on purpose: this
+                        // is the shape a decode-shaped mask, a prefix drop and
+                        // an attention sink all have, and it is the shape both
+                        // shells expand in one walk over the runs.
+                        [only] => Some(crate::engine::Masking::Extent(only.clone())),
+                        // Several, parallel to the lane's query rows in the
+                        // CSR's own order.
+                        rows => Some(crate::engine::Masking::Rows(rows.to_vec())),
+                    };
                 }
                 request.has_user_mask = true;
                 // A decode-shaped custom mask still needs the mask-aware
                 // prefill attention path.
                 request.single_token_mode = false;
-                // The pass-level `dense_device_mask` stamp records the
-                // PROGRAM's channel binding; this FIRE's mask resolved on
-                // the host into wire BRLE rows, which the batcher's
-                // wire-mask rules co-batch (one mask row per request,
-                // synthesized causal for unmasked peers). Only a mask that
-                // stays device-resident needs the dense-device solo.
-                request.dense_device_mask = false;
             }
             FireAttnMask::Device => {
                 request.has_user_mask = true;
@@ -1666,12 +1687,71 @@ mod tests {
         };
         lowered.apply_to(&mut plan).expect("a one-row-per-lane mask lowers");
         assert!(plan.has_user_mask);
-        assert_eq!(plan.lanes[0].mask.as_ref(), Some(&masks[0]));
-        assert_eq!(plan.lanes[1].mask.as_ref(), Some(&masks[1]));
+        assert_eq!(
+            plan.lanes[0].mask,
+            Some(crate::engine::Masking::Extent(masks[0].clone()))
+        );
+        assert_eq!(
+            plan.lanes[1].mask,
+            Some(crate::engine::Masking::Extent(masks[1].clone()))
+        );
         assert!(
             !plan.single_token_mode,
             "decode-shaped custom masks require the prefill fallback"
         );
+    }
+
+    /// **A WINDOWED PREFILL LOWERS TO ONE MASK PER ROW, IN ORDER.**
+    ///
+    /// The shape `palo B-mask` refused: three query rows in ONE lane whose
+    /// masks are not nested — row `i` keeps `[i - 1, i]` — so no single
+    /// restriction of the lane's extent is any of them. What made the
+    /// refusal necessary was `Lane::mask` being a bare `Mask`; what makes it
+    /// unnecessary is `Masking::Rows`. The assertion that matters is the
+    /// ORDER: row 2's mask must be row 2's, because the lowering this
+    /// replaced silently used row ZERO for every row.
+    #[test]
+    fn a_windowed_prefill_lowers_to_one_mask_per_query_row() {
+        // Three rows over four key positions, row `i` keeping `[i - 1, i]`.
+        let dense = vec![
+            true, false, false, false, // row 0: key 0
+            true, true, false, false, // row 1: keys 0..1
+            false, true, true, false, // row 2: keys 1..2
+        ];
+        let evaluated = vec![(
+            Port::AttnMask,
+            Ok(tensor_compiler::eval::interp::Value::Bool(dense.clone())),
+        )];
+        let lowered = lower_attn_mask_evaluated(&mask_container(), &[0, 3], &evaluated).unwrap();
+        let FireAttnMask::Host { masks, .. } = lowered.clone() else {
+            panic!("host-known mask must use wire lowering");
+        };
+
+        let mut plan = crate::engine::FireRequest {
+            lanes: vec![crate::engine::Lane {
+                tokens: vec![1, 2, 3],
+                ..Default::default()
+            }],
+            single_token_mode: true,
+            ..Default::default()
+        };
+        lowered
+            .apply_to(&mut plan)
+            .expect("a multi-row mask lowers rather than refusing");
+        assert_eq!(
+            plan.lanes[0].mask,
+            Some(crate::engine::Masking::Rows(masks.clone())),
+            "the lane carries all three rows, in the CSR's order"
+        );
+        for row in 0..3 {
+            assert_eq!(
+                expand_mask(&masks[row]),
+                dense[row * 4..(row + 1) * 4],
+                "row {row}'s mask is row {row}'s"
+            );
+        }
+        // And the lane can check the one thing about it a lane can check.
+        plan.lanes[0].validate().expect("three masks for three rows");
     }
 
     #[test]

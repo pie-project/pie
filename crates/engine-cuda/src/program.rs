@@ -101,9 +101,13 @@ pub struct Plane {
 }
 
 impl Default for Plane {
-    /// A plane whose cubins are cached wherever [`Disk::from_env`] points.
+    /// A plane that caches no cubin. Where they are kept is the DEPLOYMENT's
+    /// answer, arriving on `Boot::program_cache_dir` (article 9: shells read
+    /// no environment) — so a plane made without one stores nothing rather
+    /// than going looking, and pays NVRTC instead. Every failure of that cache
+    /// is a miss and never an error.
     fn default() -> Plane {
-        Plane::new(Disk::from_env())
+        Plane::new(Disk::disabled())
     }
 }
 
@@ -252,7 +256,10 @@ impl Plane {
                 ),
             )
         })?;
-        bound.session.envelope(&program.plan).map(Some)
+        bound
+            .session
+            .envelope(&program.plan, bound.geometry)
+            .map(Some)
     }
 
     /// The class instance `id` was bound in.

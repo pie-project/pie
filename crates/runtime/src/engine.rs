@@ -53,7 +53,7 @@ pub use instance::{BoundInstance, BoundWaitSlots, InstanceBindingPlan, InstanceI
 // parallel CSR arms are gone; what a request IS lives in `fire`, and what
 // crosses the boundary is the contract's own `Lane`.
 pub use fire::{
-    ChannelTicket, FireRequest, FrameFire, MaskWords, Media, RsPlan, StepFire, bitmask_words,
+    FireRequest, FrameFire, MaskWords, StepFire, bitmask_words,
 };
 
 // The contract, re-exported at the path the runtime already reads it from.
@@ -63,19 +63,20 @@ pub use ::engine_api::channel::ChannelRegistration;
 pub use ::engine_api::error::{Error, Result as EngineResult};
 pub use ::engine_api::fire::{
     Attachment, Boundary, FireTicket, FrameSubmission, FrameTicket, KvDelta, Lane, LaneReadout,
-    Mask, MediaEncode, Readout, RsVerb, Step,
+    Mask, Masking, MediaEncode, Readout, RsReset, RsVerb, Step,
 };
 pub use ::engine_api::load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 pub use ::engine_api::program::ProgramRegistration;
-pub use ::engine_api::transfer::{KvCopy, KvMove, MemoryDomain, Pool, PoolResize, StateCopy, StateMove};
+pub use ::engine_api::transfer::{KvCopy, KvMove, MemoryDomain, StateCopy, StateMove};
 pub use ::engine_api::Engine;
 
 /// The four recurrent-state verbs, as a slot's flag byte spells them.
 ///
-/// **`palo B-rs`**: these were `engine_api::plan::RS_FLAG_*` and the contract
-/// has no recurrent-state field left (see [`fire::RsPlan`]). The runtime still
-/// computes them for its own store, so the numbering lives here — one place,
-/// and the byte no longer travels.
+/// **`palo B-rs`**: these were `engine_api::plan::RS_FLAG_*`. The byte no
+/// longer travels — `engine_api::RsVerb` and `engine_api::RsReset` are what
+/// crosses the boundary since wave F3-tail, and `PreparedRs::apply_to` reads
+/// `RESET` here to state which of the two a lane's slot is. The numbering
+/// stays because the runtime's own recurrent store is built on it.
 pub mod rs_flag {
     /// Clear the slot before the fire writes it.
     pub const RESET: u8 = 1 << 0;
@@ -158,7 +159,7 @@ pub mod verbs {
     /// A control verb's answer, as the run-ahead broker wants it.
     ///
     /// **THE SHELLS ARE SYNCHRONOUS AND THE CONTRACT SAYS SO.** `copy_kv`,
-    /// `copy_state`, `resize_pool` and `encode` used to answer a
+    /// `copy_state` and `encode` used to answer a
     /// `SubmissionCompletion` the engine would settle later; they answer
     /// `Result<()>` now, and the work is done when they return. So the
     /// completion the runtime hands its waiters is one that is already

@@ -1166,21 +1166,20 @@ impl<W: PassWit> Pass<W> {
     /// in hand and its own doc says it is not the place for per-pass
     /// restrictions.
     ///
-    /// The runtime classifies such a pass as pool-owned device geometry
-    /// (`lease::detect_pooled_device_geometry`), and every descriptor port of
-    /// one -- the mask included -- is read back at FRAME ENTRY, before any
-    /// slot of the frame has run. So slot 1 of a frame cannot see a token
-    /// slot 0 publishes, which is exactly what a run-ahead lane chains.
-    /// `validate_frame` refuses that frame by name and says a linear lane
-    /// should size its run-ahead to avoid building it.
+    /// The runtime classified such a pass as pool-owned device geometry
+    /// (`lease::detect_pooled_device_geometry`) and REFUSED a frame whose
+    /// slot 1 chained off slot 0, because a C++ engine's `FramePrepare` read
+    /// every step's descriptor ports at FRAME ENTRY, before any slot had run.
+    /// That engine is gone and so is the refusal (alto E): the palo shell
+    /// prepares each step in turn, off the committed front the step before it
+    /// advanced, and `validate_frame` proves ring capacity instead.
     ///
-    /// Every entry of `ports` binds a channel, so the port's presence IS the
-    /// channel binding the runtime tests for. This is a safe
-    /// over-approximation of the runtime's rule -- which also requires the
-    /// channel to be republished by a traced stage, something no builder can
-    /// see -- and it over-approximates in the direction that costs a masked
-    /// lane some run-ahead width rather than the direction that submits a
-    /// frame the runtime refuses.
+    /// **THIS STAYS AS CONSERVATISM, NOT AS OBEDIENCE.** Narrowing a masked
+    /// lane to one live slot per frame costs run-ahead width and nothing
+    /// else, and widening it is a scheduling change to be measured as one
+    /// rather than inherited from a deleted refusal. Every entry of `ports`
+    /// binds a channel, so the port's presence IS the binding this asks
+    /// about.
     pub fn binds_device_mask(&self) -> bool {
         self.inner
             .borrow()
@@ -1612,20 +1611,21 @@ pub fn channel_capacity() -> usize {
 /// Kept as its own query rather than folded into [`frame_size`]: it answers
 /// "how much can this lane submit per frame", which is a model property that
 /// has diverged from k before and may again. It is NOT the place to encode
-/// per-PASS restrictions — a fire that buffers or commits is submitted solo by
-/// the runtime because its `fold-len` picks the RS execution mode for the whole
-/// composed batch, and that is a property of the fire, not of the model.
+/// per-PASS restrictions — those belong to the fire, not to the model. (The
+/// standing example, a buffering or committing fire the runtime submitted
+/// SOLO because its `fold-len` picked the RS execution mode for a whole
+/// composed batch, is gone: no engine in this tree sees `RsPlan` at all, and
+/// alto E deleted the co-batching rule that spoke for one that did.)
 pub fn live_slots() -> usize {
     // k for a dense model, 1 for a recurrent (linear/hybrid) one.
     //
-    // The reason this was ever 1 is GONE. A run-ahead lane chains slot i+1's
-    // token off slot i; an RS fire used to resolve its descriptor ports on the
-    // HOST at frame entry, before any slot had run, because the device-composed
-    // template refused every fire carrying RS rows. `299b76320` lifted that:
-    // an unbuffered fold-all recurrent decode — the ordinary shape — takes the
-    // template and resolves at KERNEL time, so the chained value is there. The
-    // runtime's refusal was narrowed to match (`validate_frame` in
-    // `crates/runtime/src/pipeline/fire.rs`), and `cuda_rs_buffer_bench`'s
+    // The reason this was ever 1 is GONE, twice over. A run-ahead lane chains
+    // slot i+1's token off slot i; an RS fire used to resolve its descriptor
+    // ports on the HOST at frame entry, before any slot had run, because a
+    // device-composed template refused every fire carrying RS rows.
+    // `299b76320` narrowed that to two shapes, and alto E deleted the rule
+    // outright with the engine it spoke for — `validate_frame` proves ring
+    // capacity now and says nothing about chaining. `cuda_rs_buffer_bench`'s
     // `coframe` arm proves the shape runs on device with an identical
     // trajectory — and 31.7% faster than the 1-wide arm.
     //
@@ -1785,11 +1785,10 @@ pub async fn run_ahead<W: PassWit>(
     if budget == 0 {
         return Ok(0);
     }
-    // A pass that binds a dense device mask takes ONE slot per frame: the
-    // runtime resolves its descriptors at frame entry, so a second slot
-    // chained off the first would read a value that does not exist yet, and
-    // `validate_frame` refuses the frame rather than run it. See
-    // `Pass::binds_device_mask`.
+    // A pass that binds a dense device mask takes ONE slot per frame. It was
+    // a refusal the runtime made and is conservatism now — see
+    // `Pass::binds_device_mask` for what changed and why widening it is a
+    // measurement rather than a doc edit.
     let r = if pass.binds_device_mask() {
         1
     } else {

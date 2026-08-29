@@ -3,9 +3,9 @@
 //! ```text
 //! engine.rs    trait Engine — load, register_program, register_channel,
 //!              bind_instance, close_*, submit, copy_kv, copy_state,
-//!              resize_pool, encode
+//!              encode
 //! error.rs     Error                       ← the PIE_STATUS_* graveyard
-//! load.rs      LoadRequest { plan, checkpoint, budgets } -> Loaded { facts, caps }
+//! load.rs      LoadRequest { plan, checkpoint, budgets, residency } -> Loaded { facts, caps }
 //! fire.rs      FrameSubmission { steps: Vec<Step { lanes, attachments }> }
 //!              -> FrameTicket                    ← the execution plane's unit
 //! program.rs   the LaunchPackage lineage, purified
@@ -106,9 +106,10 @@ pub use engine::{CompletionSink, Engine, StepDone, StepOutcome};
 pub use error::{Error, Result};
 pub use fire::{
     Attachment, Boundary, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket,
-    KvDelta, Lane, LaneReadout, LayerScores, Mask, MediaEncode, Readout, RsVerb, Step,
+    KvDelta, Lane, LaneReadout, LayerScores, Mask, Masking, MediaEncode, Readout, RsReset, RsVerb,
+    Serves, Step,
 };
-pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
+pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
 pub use program::{
     Axis, BindExtents, BoundInstance, DirectArgmax, EmittedKernel, ExtentRole, InstanceBinding,
     InstanceId,
@@ -117,6 +118,6 @@ pub use program::{
     ProgramId, ProgramRegistration, RegionAnalysis, RegionKind, StageNeeds, ValueSource,
 };
 pub use transfer::{
-    KvCopy, KvExport, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, PageRange,
-    Pool, PoolResize, StateCopy, StateMove,
+    KvCopy, KvExport, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy,
+    StateMove,
 };

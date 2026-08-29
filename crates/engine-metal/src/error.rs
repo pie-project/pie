@@ -109,7 +109,12 @@ pub enum Fault {
         consumed: String,
     },
 
-    /// A lane's stated mask does not cover the extent it will read.
+    /// A lane's stated mask does not REACH the extent it will read.
+    ///
+    /// Short only. A mask longer than the extent is the page-padded shape
+    /// every masked guest states — the pool's width, not the sequence's — and
+    /// is clipped, because a position past the extent is one the causal bound
+    /// drops for every query row anyway. [`crate::mask`] argues it.
     Mask {
         /// The lane, in submission order.
         lane: u32,
@@ -121,6 +126,26 @@ pub enum Fault {
 
     /// A lane carries a mask and this artifact bakes no masked class.
     Maskless {
+        /// The lane, in submission order.
+        lane: u32,
+    },
+
+    /// A lane states a PER-ROW mask (`Masking::Rows`) and this plane serves
+    /// only `Masking::Extent`.
+    ///
+    /// **REFUSED BY NAME, AND THE NAME IS THE FORM.** A windowed prefill
+    /// states one restriction per query row — row `i` keeps `[i - w, i]` —
+    /// which no single restriction of the lane's extent is. The CUDA shell
+    /// expands the form (`engine_cuda::mask`, one walk per row under that
+    /// row's causal bound); this one does not, and metal parity for it was
+    /// deliberately left out of the wave that landed the form. Serving it as
+    /// the extent form — that is, as row zero's mask on every row — is the
+    /// silent substitution the whole form exists to end, so the shape is
+    /// named here instead. This sits BESIDE [`Fault::Maskless`] rather than
+    /// inside it because they are different sentences: `Maskless` is "this
+    /// plane stages no mask bits at all yet", and this one survives the day
+    /// that stops being true.
+    MaskRows {
         /// The lane, in submission order.
         lane: u32,
     },
@@ -284,11 +309,19 @@ impl fmt::Display for Fault {
                 extent,
             } => write!(
                 f,
-                "lane {lane} states a mask over {stated} keys and will read {extent}"
+                "lane {lane} states a mask over {stated} keys and will read {extent}; a \
+                 mask must REACH the extent (a longer one is fine and is clipped)"
             ),
             Self::Maskless { lane } => write!(
                 f,
                 "lane {lane} carries a mask and this artifact bakes no masked class"
+            ),
+            Self::MaskRows { lane } => write!(
+                f,
+                "lane {lane} states a per-row attention mask (`Masking::Rows`) and this \
+                 plane serves only `Masking::Extent`: a windowed prefill's rows are one \
+                 restriction each, and serving them as row zero's is the substitution \
+                 the form exists to end"
             ),
             Self::MaskWord {
                 lane,

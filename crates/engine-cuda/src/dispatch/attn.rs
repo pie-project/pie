@@ -556,32 +556,74 @@ impl DispatchAttention for Run<'_> {
                 *conv_width,
                 &mut self.tensor(*y),
             ),
+            // **WHERE THE BUFFER TOUCHES THE FORWARD, HALF OF TWO** (alto
+            // design §6, wave F3). `x` is the conv's in-projection rows —
+            // dev's `mixed_qkv` — so a `RsVerb::Buffer` lane scatters them
+            // into its slab here and a `RsVerb::FoldBuffered` lane gathers
+            // them back over the GEMM output that just landed. The gather is
+            // what "skipping the in-projection GEMM" means for a shell whose
+            // graph is immutable: the projection still runs and is
+            // overwritten, on the same stream, in front of the conv that
+            // reads it.
+            //
+            // A fire with no buffered lane tests one `Option` and returns.
+            //
+            // **AND THE 2R SPLIT IS HERE, AS TWO LAUNCHES ON ONE STREAM**
+            // (design §6's interior boundary, wave F3b). A row that folds a
+            // prefix of the tokens it is writing cannot be one call —
+            // `commit_len` truncates, so the tokens past the boundary would
+            // get no outputs. So the head runs `[0, n)` and folds, and the
+            // tail runs `[n, rows)` from the rolling state the head just
+            // wrote and folds nothing. Both write their own share of `y`, so
+            // the pair leaves exactly the rectangle one call would have. A
+            // fire no row splits gets `None` and the single launch it always
+            // made.
             Attention::SsmCausalConv1dChunked {
                 x,
                 weight,
                 state,
                 conv_width,
                 y,
-            } => attn::ssm::causal_conv1d_chunked(
-                self.ctx(),
-                self.ragged(*x),
-                self.tensor(*weight),
-                &self.recurrent(*state),
-                *conv_width,
-                &mut self.tensor(*y),
-            ),
+            } => {
+                self.rs_move("attention.ssm_causal_conv1d_chunked", *x, self.tensor(*x))?;
+                let tail = self.recurrent_tail(*state);
+                attn::ssm::causal_conv1d_chunked(
+                    self.ctx(),
+                    self.ragged(*x),
+                    self.tensor(*weight),
+                    &self.recurrent(*state),
+                    *conv_width,
+                    &mut self.tensor(*y),
+                )?;
+                let Some(tail) = tail else { return Ok(()) };
+                attn::ssm::causal_conv1d_chunked(
+                    self.ctx(),
+                    self.ragged(*x),
+                    self.tensor(*weight),
+                    &tail,
+                    *conv_width,
+                    &mut self.tensor(*y),
+                )
+            }
+            // The other half: `ba` is the `[b | a]` projection — dev's `a`
+            // and `b` planes — and the prep is its only reader, so the move
+            // stands immediately in front of it for the same reason the
+            // conv's does.
             Attention::SsmGdnPrep {
                 ba,
                 dt_bias,
                 a_log,
                 gates,
-            } => attn::ssm::gdn_prep(
-                self.ctx(),
-                self.tensor(*ba),
-                self.tensor(*dt_bias),
-                self.tensor(*a_log),
-                &mut self.tensor(*gates),
-            ),
+            } => {
+                self.rs_move("attention.ssm_gdn_prep", *ba, self.tensor(*ba))?;
+                attn::ssm::gdn_prep(
+                    self.ctx(),
+                    self.tensor(*ba),
+                    self.tensor(*dt_bias),
+                    self.tensor(*a_log),
+                    &mut self.tensor(*gates),
+                )
+            }
             Attention::SsmGatedDelta {
                 qkv,
                 z,
@@ -604,6 +646,10 @@ impl DispatchAttention for Run<'_> {
                 *v_dim,
                 &mut self.tensor(*y),
             ),
+            // The scan's half of the 2R split, and the same two launches for
+            // the same reason (see the chunked conv above): the head folds
+            // the boundary into the bank, the tail loads what the head wrote
+            // and carries the rest of the row's outputs from it.
             Attention::SsmGatedDeltaChunked {
                 qkv,
                 z,
@@ -614,18 +660,34 @@ impl DispatchAttention for Run<'_> {
                 k_dim,
                 v_dim,
                 y,
-            } => attn::ssm::gated_delta_chunked(
-                self.ctx(),
-                self.ragged(*qkv),
-                self.tensor(*z),
-                self.tensor(*gates),
-                &self.recurrent(*state),
-                *k_heads,
-                *v_heads,
-                *k_dim,
-                *v_dim,
-                &mut self.tensor(*y),
-            ),
+            } => {
+                let tail = self.recurrent_tail(*state);
+                attn::ssm::gated_delta_chunked(
+                    self.ctx(),
+                    self.ragged(*qkv),
+                    self.tensor(*z),
+                    self.tensor(*gates),
+                    &self.recurrent(*state),
+                    *k_heads,
+                    *v_heads,
+                    *k_dim,
+                    *v_dim,
+                    &mut self.tensor(*y),
+                )?;
+                let Some(tail) = tail else { return Ok(()) };
+                attn::ssm::gated_delta_chunked(
+                    self.ctx(),
+                    self.ragged(*qkv),
+                    self.tensor(*z),
+                    self.tensor(*gates),
+                    &tail,
+                    *k_heads,
+                    *v_heads,
+                    *k_dim,
+                    *v_dim,
+                    &mut self.tensor(*y),
+                )
+            }
             Attention::SsmKdaStep {
                 mixed,
                 f,

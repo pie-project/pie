@@ -146,7 +146,13 @@ async def test_cacheback_speculative_decoding(client, args):
         ("repetitive", "Repeat exactly: red green blue, red green blue, red green"),
         ("prose", "Explain in detail why the sky appears blue during the day."),
     ):
-        base = {"prompt": prompt, "max_tokens": 24, "max_ngram": 4}
+        # 48, not 24: the current default SKU (qwen35-d0.8b) spends its first
+        # ~20 tokens on a `<think>` preamble where prompt-lookup drafting can
+        # never hit, so a 24-token window proves the identity but starves the
+        # acceptance/rejection assertions below. At 48 the run reaches
+        # repeatable text on both prompts (measured: accepted=14 repetitive,
+        # rejected=43) while both arms still terminate well under the timeout.
+        base = {"prompt": prompt, "max_tokens": 48, "max_ngram": 4}
         sequential = await _report(
             client, args, "cacheback-speculative-decoding", {**base, "draft_length": 0}
         )

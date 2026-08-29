@@ -26,7 +26,7 @@
 mod msl_corpus;
 
 use msl_corpus::{corpus_stages, extended_stages};
-use tensor_compiler::codegen::cuda::{emit_fused_region, validate_generated_region};
+use tensor_compiler::codegen::cuda::{emit_region, is_order_region, is_scan_region};
 use tensor_compiler::plan::{LibraryOp, Region, RegionKind};
 
 /// Regions this backend is allowed not to emit, and why that is not a hole.
@@ -36,13 +36,26 @@ use tensor_compiler::plan::{LibraryOp, Region, RegionKind};
 /// invalidate any. Each entry is a claim that no plan a deployment builds can
 /// route work through such a region.
 const REFUSED: &[(&str, &str)] = &[(
-    "single-op library lift",
-    "a `RegionKind::Library` wrapping one op whose own tag IS the library op \
-         — `top_k`, `sort_desc`, `cumsum`/`cumprod`, `matmul`, a second-party \
-         call. The generic emitter would fall back to `ptir_m1_execute`, whose \
-         single-threaded forms are O(len^2) or worse and do not return at a \
-         real vocabulary, so refusing is the honest answer and the engine now \
-         reports it at load rather than skipping it.",
+    "single-op library lift with no CUDA kernel",
+    "a `RegionKind::Library` wrapping one op whose own tag IS the library op, \
+         and for which this backend has written no kernel. That is now \
+         `matmul` and a second-party call, and nothing else. A second-party \
+         call is a NAME the shell launches itself rather than a body an \
+         emitter could write, and `build_stage` skips it before it reads the \
+         slot; `matmul` has no generated kernel and no curated guest reaches \
+         one through a library region. \
+         \
+         `top_k`, `sort_desc` AND `cumsum`/`cumprod` USED TO BE ON THIS LIST. \
+         `codegen::cuda::order` and `codegen::cuda::scan` emit generated \
+         kernels for them, which is what the two claim tests below assert. \
+         They came off because the excuse was false: four curated inferlets \
+         route work through exactly such a region — `beam-search` (`top_k`), \
+         `locally-typical-sampling` and `tail-free-sampling` (`top_k` then \
+         `cumsum`), and `mtp-speculative-decoding` (`cumprod`) — so `no plan a \
+         deployment builds can route work through such a region` was a claim \
+         about the plans nobody had checked. Each failed to register with \
+         `stage 0 region N was declined by the emitter`, and the reason names \
+         which boundary op it was.",
 )];
 
 /// One region's identity for the purposes of [`REFUSED`].
@@ -59,9 +72,14 @@ fn excuse(region: &Region) -> Option<&'static str> {
     let RegionKind::Library(claimed) = region.kind else {
         return None;
     };
-    // The one multi-op lift emits; every other library op is a single node
-    // carrying the boundary tag itself.
-    if claimed == LibraryOp::NucleusSample {
+    // The four that emit: `NucleusSample` is the one multi-op lift, and
+    // `TopK` / `Sort` / `Scan` are the single-op lifts with kernels of their
+    // own. What is left is a single node carrying a boundary tag with nothing
+    // to run it with.
+    if matches!(
+        claimed,
+        LibraryOp::NucleusSample | LibraryOp::TopK | LibraryOp::Sort | LibraryOp::Scan
+    ) {
         return None;
     }
     (region.nodes.len() == 1).then_some(REFUSED[0].0)
@@ -73,14 +91,15 @@ fn survey() -> Vec<(String, usize, bool, Option<&'static str>, String)> {
     for stage in corpus_stages().into_iter().chain(extended_stages()) {
         let plan = stage.plan;
         for (region_index, region) in plan.fused.regions.iter().enumerate() {
-            let validated = validate_generated_region(&plan, region);
-            let emitted = emit_fused_region("probe", &plan, region);
-            let ok = validated.is_ok() && emitted.is_ok();
-            let why = validated
-                .err()
-                .map(|e| e.to_string())
-                .or_else(|| emitted.err().map(|e| e.to_string()))
-                .unwrap_or_default();
+            // `emit_region` and not `emit_fused_region`: the question is what
+            // reaches the engine's `KernelKind::Fused` slot, and choosing the
+            // emitter that fills it is that function's job. Asking the fused
+            // one directly would report a hole for every region served by a
+            // library kernel — which is the answer this file wants for the ops
+            // that have none and the wrong answer for `top_k`, which has one.
+            let emitted = emit_region("probe", &plan, region);
+            let ok = emitted.is_ok();
+            let why = emitted.err().map(|e| e.to_string()).unwrap_or_default();
             rows.push((
                 format!("{}#{}", stage.golden, stage.stage_index),
                 region_index,
@@ -127,9 +146,9 @@ fn the_nucleus_sampler_emits_a_kernel() {
                 continue;
             }
             found += 1;
-            let emitted = emit_fused_region("probe", &plan, region);
+            let emitted = emit_region("probe", &plan, region);
             assert!(
-                validate_generated_region(&plan, region).is_ok() && emitted.is_ok(),
+                emitted.is_ok(),
                 "{}#{} holds a nucleus region the CUDA emitter will not emit, so \
                  top-p sampling does not run on this backend: {:?}",
                 stage.golden,
@@ -143,6 +162,98 @@ fn the_nucleus_sampler_emits_a_kernel() {
         "no corpus stage plans a nucleus region, so this file proves nothing \
          about the sampler. `nucleus_sample` is in `GOLDEN_NAMES`; if it stopped \
          producing a library region, that is the finding."
+    );
+}
+
+/// The `top_k` ranking in particular, named for the same reason the sampler is.
+///
+/// It is the second region a curated inferlet actually routes work through and
+/// the second that used to be skipped: `beam-search` cuts its candidates with
+/// it every token, and `locally-typical-sampling` and `tail-free-sampling`
+/// both materialise their candidate order with it. All three failed to
+/// register on this backend with `stage 0 region 1 was declined by the emitter
+/// (generated region contains a non-generated boundary (top_k))` until
+/// `codegen::cuda::topk` existed.
+#[test]
+fn the_top_k_ranking_emits_a_kernel() {
+    let mut found = 0;
+    for stage in corpus_stages().into_iter().chain(extended_stages()) {
+        let plan = stage.plan;
+        for region in plan.fused.regions.iter() {
+            if region.kind != RegionKind::Library(LibraryOp::TopK) {
+                continue;
+            }
+            found += 1;
+            assert!(
+                is_order_region(&plan, region),
+                "{}#{} claims `Library(TopK)` around something that is not a \
+                 `top_k`, so the emitter would rank the wrong operand",
+                stage.golden,
+                stage.stage_index,
+            );
+            let emitted = emit_region("probe", &plan, region);
+            assert!(
+                emitted.is_ok(),
+                "{}#{} holds a top_k region the CUDA emitter will not emit, so \
+                 every ranking guest silently reads zeros or fails to register: \
+                 {:?}",
+                stage.golden,
+                stage.stage_index,
+                emitted.err(),
+            );
+        }
+    }
+    assert!(
+        found > 0,
+        "no corpus stage plans a `top_k` region, so this file proves nothing \
+         about ranking. `beam_epilogue` and `pentathlon_iter` both hold one; if \
+         they stopped producing a library region, that is the finding."
+    );
+}
+
+/// The scan prefix, named for the same reason the sampler and the ranking are.
+///
+/// It is the boundary that outlived `top_k`: with the ranking emitting,
+/// `locally-typical-sampling` and `tail-free-sampling` got one region further
+/// and failed on `generated region contains a non-generated boundary (scan)`,
+/// because both cut their candidate set with `cumsum(p) - p`.
+/// `mtp-speculative-decoding` builds its accept prefix with `cumprod` and
+/// failed the same way.
+#[test]
+fn the_scan_prefix_emits_a_kernel() {
+    let mut found = 0;
+    for stage in corpus_stages().into_iter().chain(extended_stages()) {
+        let plan = stage.plan;
+        for region in plan.fused.regions.iter() {
+            if region.kind != RegionKind::Library(LibraryOp::Scan) {
+                continue;
+            }
+            found += 1;
+            assert!(
+                is_scan_region(&plan, region),
+                "{}#{} claims `Library(Scan)` around something that is not a \
+                 `cumsum` or `cumprod`, so the emitter would prefix the wrong \
+                 operand",
+                stage.golden,
+                stage.stage_index,
+            );
+            let emitted = emit_region("probe", &plan, region);
+            assert!(
+                emitted.is_ok(),
+                "{}#{} holds a scan region the CUDA emitter will not emit, so \
+                 every prefix-cutting guest silently reads zeros or fails to \
+                 register: {:?}",
+                stage.golden,
+                stage.stage_index,
+                emitted.err(),
+            );
+        }
+    }
+    assert!(
+        found > 0,
+        "no corpus stage plans a scan region, so this file proves nothing about \
+         prefixes. `mtp_verify_tail` and `pentathlon_iter` both hold one; if \
+         they stopped producing a library region, that is the finding."
     );
 }
 

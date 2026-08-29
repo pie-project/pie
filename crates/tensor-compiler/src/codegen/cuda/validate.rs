@@ -100,13 +100,23 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
 /// the plan RECOGNIZED a dataflow a backend may have a kernel for, not that
 /// every backend has it: Metal's `grouped_library` returns `None` for the ones
 /// it has not written and falls through to its generated emitter, and this
-/// backend has written none at all. Refusing them here emitted nothing for the
-/// region, the engine read `Slot::Refused` as "the host declined on purpose"
-/// and skipped it, and the sampler's whole chain silently never ran — every
-/// nonzero temperature published token 0. What actually decides emittability is
-/// the per-node check below, which is unchanged: a multi-op lift like
-/// `NucleusSample` wraps ordinary ops and emits, while a single-op lift wraps
-/// the library op itself and still does not. `.wiki/migration.md` §11.21.
+/// backend has written three, [`super::order`]'s two and [`super::scan`]'s.
+/// Refusing them here emitted
+/// nothing for the region, the engine read `Slot::Refused` as "the host
+/// declined on purpose" and skipped it, and the sampler's whole chain silently
+/// never ran — every nonzero temperature published token 0. What actually
+/// decides emittability is the per-node check below, which is unchanged: a
+/// multi-op lift like `NucleusSample` wraps ordinary ops and emits, while a
+/// single-op lift wraps the library op itself and still does not.
+/// `.wiki/migration.md` §11.21.
+///
+/// SO THIS IS NO LONGER THE LAST WORD, and the direction matters. A `top_k`,
+/// `sort_desc` or `cumsum`/`cumprod` region is still refused here — none is a
+/// generated region and this emitter has no arm for its node — but
+/// [`super::emit_region`] routes each to its own kernel before it ever reaches
+/// the fused emitter, so they emit anyway. The invariant that has to hold is
+/// the other one: everything the FUSED emitter refuses is still refused here,
+/// so a region that passes this gate and then fails emission cannot exist.
 pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Result<(), EmitError> {
     if region.nodes.is_empty() {
         return Err(EmitError::FusedRequiresGeneratedRegion);

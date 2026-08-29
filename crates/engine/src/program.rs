@@ -19,7 +19,6 @@ pub(crate) mod params;
 pub(crate) mod plan;
 pub(crate) mod readiness;
 pub(crate) mod registry;
-pub(crate) mod resolve;
 pub(crate) mod scratch;
 pub(crate) mod stage_cache;
 pub(crate) mod status;

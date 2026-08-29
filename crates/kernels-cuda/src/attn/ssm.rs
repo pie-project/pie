@@ -37,9 +37,20 @@ const fn kda_shmem(d: u32) -> u32 {
     3u32.saturating_mul(d).saturating_mul(FLOAT)
 }
 
-/// The request count a ragged fire spans: the indptr is `[lanes + 1]`.
+/// The request count a ragged fire spans: the indptr is `[lanes + 1]`. The
+/// boundary vector is driver-assembled, not an operand the validator sees,
+/// so a wrong dtype is refused, not asserted (the boundary rule at
+/// [`refuse`]).
 fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, KernelError> {
-    debug_assert_eq!(x.indptr.dtype, Dtype::I32, "`{op}` walks an i32 query CSR");
+    if x.indptr.dtype != Dtype::I32 {
+        return Err(refuse(
+            op,
+            format!(
+                "the query CSR's boundaries are {:?}, and this scan walks an i32 indptr",
+                x.indptr.dtype
+            ),
+        ));
+    }
     match x.indptr.rows.checked_sub(1) {
         Some(lanes) if lanes > 0 => Ok(lanes),
         _ => Err(refuse(op, "the query CSR this fire names spans no request")),
@@ -57,6 +68,65 @@ fn plane(ctx: &Ctx, op: &'static str, name: &'static str, elems: u64) -> Result<
     let bytes = usize::try_from(bytes)
         .map_err(|_| refuse(op, format!("{bytes} staging bytes do not fit this host")))?;
     Ok(ctx.scratch(op, name, bytes)? as u64)
+}
+
+/// **The RS seats, checked against the arm that is about to run** (alto
+/// design §6).
+///
+/// `attn/ssm.cuh` does not carry the fold predicate, the commit length and
+/// the segment origin on every instantiation: the CHUNKED conv takes all
+/// three, the chunked delta scan takes all three on its fla arm and the
+/// predicate alone on the warp-tiled one, and the DECODE (per-step) kernels
+/// take none — a step kernel updates the
+/// bank in place, interleaved with the output it is computing, so predicating
+/// it would need the shadow slot design §6 rejects.
+///
+/// So a pool that CARRIES a seat this arm has no parameter for is refused by
+/// name. The alternative is the one failure a typed seat exists to prevent:
+/// a speculative fire whose refused pass silently folds anyway, or a replay
+/// that folds the whole buffered window instead of the accepted prefix of it.
+fn seated(
+    op: &'static str,
+    state: &RecurrentPool,
+    arm: &'static str,
+    mask: bool,
+    commit: bool,
+    begin: bool,
+) -> Result<(), KernelError> {
+    if !mask && !state.write_state_mask.is_absent() {
+        return Err(refuse(
+            op,
+            format!(
+                "this fire carries a per-request fold predicate and `{arm}` has no seat for \
+                 one, so a refused pass would fold anyway (wave F3b owns the predicated \
+                 step kernels)"
+            ),
+        ));
+    }
+    if !commit && !state.commit_len.is_absent() {
+        return Err(refuse(
+            op,
+            format!(
+                "this fire carries a commit length and `{arm}` has no seat for one, so the \
+                 replay would fold the whole buffered window instead of its accepted prefix"
+            ),
+        ));
+    }
+    if !begin && !state.begin_at.is_absent() {
+        return Err(refuse(
+            op,
+            format!(
+                "this fire cuts a row at an interior fold boundary and `{arm}` has no seat                  for the segment's origin, so the tail would replay the head's tokens from                  the state the head just folded"
+            ),
+        ));
+    }
+    if !state.write_state && !mask {
+        return Err(refuse(
+            op,
+            format!("`{arm}` folds its boundary unconditionally and this fire asked it not to"),
+        ));
+    }
+    Ok(())
 }
 
 /// The conv's stated extents, shared by both forms.
@@ -93,6 +163,14 @@ pub fn causal_conv1d(
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let (channels, c, k) = conv_extents(OP, x, y, conv_width)?;
     let rows = nonzero(OP, "rows", x.rows)?;
+    seated(
+        OP,
+        state,
+        "ssm_causal_conv1d_update_batched",
+        false,
+        false,
+        false,
+    )?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::ssm_causal_conv1d_update_batched<::pie::bf16>")
@@ -134,6 +212,7 @@ pub fn causal_conv1d_chunked(
     dtype_dispatch!(OP, x.data.dtype, { Bf16 => () });
     let (channels, c, k) = conv_extents(OP, x.data, y, conv_width)?;
     let lanes = requests(OP, x)?;
+    seated(OP, state, "ssm_causal_conv1d_chunked_batched", true, true, true)?;
     let (entrypoint, launch) = if lanes >= CHANNEL_TILE_FROM {
         (
             "::pie::attn::ssm_causal_conv1d_chunked_batched_channel_tile<::pie::bf16>",
@@ -162,9 +241,19 @@ pub fn causal_conv1d_chunked(
             state.conv_stride.arg(),
             c.arg(),
             k.arg(),
-            true.arg(),       // write_state: the fire commits its boundary
-            ArgValue::ABSENT, // the speculative write-mask seat
-            ArgValue::ABSENT, // the commit-length seat
+            // **THE THREE RS SEATS, FILLED.** `write_state` false is the
+            // buffered scatter (the conv computes its rows and leaves the
+            // rolling state alone), the mask is the per-request fold
+            // predicate, and the commit length truncates a replay at the
+            // accepted boundary. All three come off the pool because that is
+            // where the shell resolved them per window.
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            state.commit_len.arg(),
+            // **AND THE FOURTH, WHICH IS THE OTHER END OF THE THIRD** (wave
+            // F3b): the segment's origin, bound only on the tail launch of a
+            // row whose fold boundary falls inside its own tokens.
+            state.begin_at.arg(),
         ],
     )
 }
@@ -378,6 +467,7 @@ pub fn gated_delta(
     debug_assert_eq!(gates.dtype, Dtype::F32, "`{OP}` reads an f32 decay row");
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
+    seated(OP, state, "ssm_gated_delta_step_batched_gqa", false, false, false)?;
     let staged = shape.stage(ctx, OP, qkv, gates)?;
 
     let (entrypoint, launch) = if v_dim == SMEM_ARM_WIDTH && k_dim == SMEM_ARM_WIDTH {
@@ -452,9 +542,9 @@ pub fn gated_delta_chunked(
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
     let staged = shape.stage(ctx, OP, qkv.data, gates)?;
-    let write_state = true;
 
     if k_dim <= BK_MAX_FLA && v_dim % BV_FLA == 0 {
+        seated(OP, state, "ssm_gated_delta_chunked_batched_fla", true, true, true)?;
         return ctx.fire(
             OP,
             Fire::at(
@@ -480,14 +570,30 @@ pub fn gated_delta_chunked(
                 stated(OP, v_heads)?.arg(),
                 stated(OP, k_dim)?.arg(),
                 stated(OP, v_dim)?.arg(),
-                write_state.arg(),
-                ArgValue::ABSENT, // the commit-length seat
-                ArgValue::ABSENT, // the speculative write-mask seat
+                // The one chunked arm that carries all three: the fold
+                // predicate AND the accepted length, which is why a buffered
+                // replay is dispatchable at all (`ssm.cuh:1614-1616`).
+                state.write_state.arg(),
+                state.commit_len.arg(),
+                state.write_state_mask.arg(),
+                // The segment's origin (the 2R split's tail) and the decay's
+                // rounding policy, which used to ride `commit_len`'s null
+                // test and is now said out loud (wave F3b).
+                state.begin_at.arg(),
+                state.fused_decay.arg(),
             ],
         );
     }
 
     if k_dim <= WARP_TILED_K_MAX {
+        seated(
+            OP,
+            state,
+            "ssm_gated_delta_chunked_batched_warp_tiled_gqa",
+            true,
+            false,
+            false,
+        )?;
         return ctx.fire(
             OP,
             Fire::at(
@@ -513,12 +619,13 @@ pub fn gated_delta_chunked(
                 stated(OP, v_heads)?.arg(),
                 stated(OP, k_dim)?.arg(),
                 stated(OP, v_dim)?.arg(),
-                write_state.arg(),
-                ArgValue::ABSENT, // the speculative write-mask seat
+                state.write_state.arg(),
+                state.write_state_mask.arg(),
             ],
         );
     }
 
+    seated(OP, state, "ssm_gated_delta_chunked_batched", false, false, false)?;
     // The plain scan reads one key plane per value head; a GQA fan repeats
     // the staged planes across it first.
     let (q_norm, k_norm) = if v_heads == k_heads {
@@ -721,6 +828,7 @@ pub fn kda_step(
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Kda::of(OP, mixed, f, b, y, heads, head_dim)?;
+    seated(OP, state, "ssm_kda_step_batched", false, false, false)?;
     let staged = shape.stage(ctx, OP, mixed, f, b, dt_bias, a_log, norm_eps)?;
     ctx.fire(
         OP,
@@ -770,6 +878,7 @@ pub fn kda_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Kda::of(OP, mixed.data, f, b, y, heads, head_dim)?;
     let lanes = requests(OP, mixed)?;
+    seated(OP, state, "ssm_kda_chunked_batched", false, false, false)?;
     let staged = shape.stage(ctx, OP, mixed.data, f, b, dt_bias, a_log, norm_eps)?;
     ctx.fire(
         OP,

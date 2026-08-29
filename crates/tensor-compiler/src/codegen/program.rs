@@ -166,12 +166,17 @@ fn signature(stage: &CompiledStage) -> String {
 
 fn emit_cuda_stage(stage: &CompiledStage, stage_index: usize, out: &mut Vec<EmittedKernel>) {
     let signature = signature(stage);
-    // The CUDA engine compiles one fused kernel per generated region and falls
-    // back to the prebuilt tier-0 kernels elsewhere, so singleton regions need
-    // no emission — `module_cache.hpp` only ever calls `emit_fused_region_cuda`.
+    // The CUDA engine compiles one kernel per generated region and falls back
+    // to the prebuilt tier-0 kernels elsewhere, so singleton regions need no
+    // emission — the shell only ever reads the `KernelKind::Fused` slot.
+    //
+    // WHICH emitter fills that slot is `cuda::emit_region`'s to say, not this
+    // walk's: the fused emitter is the usual answer and `top_k` has a library
+    // kernel of its own. Metal's arms are below because Metal emits three
+    // kernel families per region and the choice is per family.
     for (region_index, region) in stage.fused.regions.iter().enumerate() {
         let entry = format!("ptir_fused_{signature}_r{region_index}");
-        let emitted = crate::codegen::cuda::emit_fused_region(&entry, stage, region);
+        let emitted = crate::codegen::cuda::emit_region(&entry, stage, region);
         out.push(EmittedKernel::new(
             KernelKind::Fused,
             stage_index,

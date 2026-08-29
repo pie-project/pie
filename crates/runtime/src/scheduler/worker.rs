@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::{
     BoundInstance, ChannelJoin, ChannelRegistration, EngineBox, EngineId,
-    InstanceBindingPlan, PoolResize, ProgramRegistration, RegisteredChannel, SchedulerLimits,
+    InstanceBindingPlan, ProgramRegistration, RegisteredChannel, SchedulerLimits,
     StateCopy, SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
 };
 use crate::scheduler::ProcessId;
@@ -261,7 +261,6 @@ pub(crate) struct PendingRequest {
     /// for an untracked/prebuilt fire. This is the wait-set key: the frame
     /// lane (and at k = 1 the synthesized single-slot stamp's lane).
     pub(crate) pipeline_id: Option<ProcessId>,
-    pub(crate) prebuilt: bool,
     pub(crate) prelaunch_copy: Option<crate::engine::KvCopy>,
     pub(crate) prelaunch_state_copy: Option<StateCopy>,
     /// Vesuvius frame identity: which lane/frame/slot this fire belongs to.
@@ -293,7 +292,6 @@ impl PendingRequest {
         completion: WorkItemCompletion,
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
-        prebuilt: bool,
         prelaunch_copy: Option<crate::engine::KvCopy>,
         prelaunch_state_copy: Option<StateCopy>,
         frame: Option<FrameStamp>,
@@ -308,7 +306,6 @@ impl PendingRequest {
             completion,
             process_id,
             pipeline_id,
-            prebuilt,
             prelaunch_copy,
             prelaunch_state_copy,
             frame,
@@ -320,123 +317,6 @@ impl PendingRequest {
     pub(crate) fn wire_row_count(&self) -> usize {
         self.request.lanes.len()
     }
-
-    fn requires_solo_submission(&self) -> bool {
-        (self.prebuilt && self.pipeline_id.is_none())
-            || (self.preserves_inner_rows() && self.request.tokens() == 0)
-            || self.rs_batch_kind() == RsBatchKind::Solo
-    }
-
-    /// How this fire's recurrent-state rows constrain the wave it joins.
-    ///
-    /// The engine's RS execution mode is read off `rs_slot_flags` and the
-    /// buffered CSR for the WHOLE composed batch, so a fire that touches the
-    /// RS buffer used to go out alone unconditionally. It no longer has to:
-    /// a row that appends to its buffer and a row that folds in-forward run
-    /// the identical dispatch and differ only in whether the recurrence
-    /// persists, which the engine now expresses per row. What still cannot
-    /// share a batch is a pure COMMIT — it gathers its activations out of the
-    /// slabs instead of computing them, a wholly different dispatch — and an
-    /// RS row cannot share with a row that has no RS binding at all, because
-    /// the RS arrays are one-per-request and a partial batch does not resolve.
-    fn rs_batch_kind(&self) -> RsBatchKind {
-        if self.request.rs.slot_ids.is_empty() {
-            return RsBatchKind::None;
-        }
-        let indptr = &self.request.rs.buffer_slot_indptr;
-        let replays = self
-            .request
-            .rs
-            .slot_flags
-            .iter()
-            .enumerate()
-            .any(|(row, flags)| {
-                let span = indptr
-                    .get(row + 1)
-                    .zip(indptr.get(row))
-                    .is_some_and(|(end, begin)| end > begin);
-                span && flags & crate::engine::RS_FLAG_FOLD != 0
-                    && flags & crate::engine::RS_FLAG_BUFFER_WRITE == 0
-            });
-        if replays {
-            RsBatchKind::Solo
-        } else {
-            RsBatchKind::Composable
-        }
-    }
-
-    pub(crate) fn preserves_inner_rows(&self) -> bool {
-        self.wire_row_count() > 1
-    }
-}
-
-/// See [`PendingRequest::rs_batch_kind`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum RsBatchKind {
-    /// No recurrent-state rows.
-    None,
-    /// Recurrent rows that compute their own tokens: a plain in-forward fold,
-    /// a buffered append, or a write-and-fold. These compose with each other.
-    Composable,
-    /// A pure commit, which replays buffered activations instead of computing
-    /// them. Goes out alone.
-    Solo,
-}
-
-#[derive(Default)]
-pub(crate) struct LaunchGrouping {
-    instances: HashSet<u64>,
-    /// Tracked pipelines already contributing to this wave. ONE wave-member
-    /// per pipeline per wave: fires of one pipeline are ORDERED (B3), and
-    /// the engine's compose-time geometry/containment validation reads the
-    /// device state as of wave entry — a decode fire composed into the same
-    /// wave as the prefill it depends on (R4-4 device-carried handoff
-    /// submits it run-ahead) validates against KV the prefill has not
-    /// committed yet and FAIL-STOPs the lane. Same-instance dedup already
-    /// enforced this within an instance; the single-pipeline stream makes
-    /// the cross-instance case reachable. Also aligns the composer with the
-    /// one-frame-per-lane-per-boundary seal rule.
-    pipelines: HashSet<ProcessId>,
-    count: usize,
-    forward_tokens: usize,
-    page_refs: usize,
-    has_solo_submission: bool,
-    has_rs_rows: bool,
-    has_user_mask: bool,
-    has_device_geometry: bool,
-    has_hook_program: bool,
-    has_multi_token: bool,
-    /// The DISTINCT finite truncations (`set-max-layers`) seen in the
-    /// group — the engine's banded walk serves at most three, so three
-    /// slots suffice; `finite_k_overflow` records a fourth. Consulted when
-    /// a hook member is (or would be) present: under the Act-2 order a
-    /// FULL-DEPTH hook member lives in the banded walk's permanent live
-    /// prefix and bands serve any mix the band cap admits, but a TRUNCATED
-    /// hook member (tier 2, unimplemented) still pins the group to its own
-    /// k, and with banding disarmed the one-boundary dsplit union is the
-    /// only server — those groups stay depth-homogeneous.
-    finite_ks: [Option<u32>; 3],
-    finite_k_overflow: bool,
-    /// A hook member's own FINITE truncation, if any hook member has one.
-    hook_finite_k: Option<u32>,
-    /// A hook member writes the `attn_page_mask` sink — its substitution
-    /// needs the full-R paged decode path, so the group cannot band and
-    /// stays depth-homogeneous (the dsplit union's [k | full] only).
-    has_page_mask_hook: bool,
-    /// A WIRE-class member with a finite truncation. The submission order
-    /// is [wire block | devgeo block] (the envelope-compose suffix is a
-    /// hard engine contract), so global fulls-first/descending-k — the
-    /// banded walk's invariant — holds exactly when every truncated
-    /// member sits in the devgeo tail block, or the group is wire-only.
-    /// A wire truncation in a mixed-class group breaks it.
-    has_wire_trunc: bool,
-}
-
-/// One token per row — the paged-decode-path shape, independent of
-/// `single_token_mode` (which a masked row clears to pick the mask-aware
-/// attention variant while still carrying exactly one token).
-fn one_token_rows(request: &crate::engine::FireRequest) -> bool {
-    request.lanes.iter().all(|lane| lane.tokens.len() == 1)
 }
 
 /// `PIE_WAVE_TRACE` — wave/enqueue observability, resolved once (this sits
@@ -446,219 +326,12 @@ pub(crate) fn wave_trace() -> bool {
     *ON.get_or_init(|| std::env::var_os("PIE_WAVE_TRACE").is_some())
 }
 
-/// A fire the engine will resolve a DENSE per-cell attention mask for out of
-/// a descriptor channel. Such a fire composes only SOLO: the engine's
-/// multi-program batch has no way to merge one program's dense mask with
-/// another's geometry (v1 scope), and it throws
-/// `RetryableLaunchError("dense device mask in a multi-program batch")`
-/// rather than execute a wrong one.
-///
-/// `dense_device_mask` is the program's own binding — an `AttnMask` port
-/// sourced from a channel — and is the SAME predicate the engine resolves
-/// on. The second clause is the older inference (a user mask with no wire
-/// BRLE rows must be device-carried); it is kept because it covers fires
-/// whose mask is device-carried without the port binding being visible here.
-///
-/// The inference alone was not enough. `cuda_runahead_concurrent` runs 8
-/// pipelines of a sink/sliding-window decode program: every fire carried
-/// BOTH wire BRLE rows (`masks` non-empty, so the second clause is false)
-/// AND a channel-bound `AttnMask`, so the batcher merged them and the first
-/// concurrent step failed the engine's contract, poisoned descriptor
-/// channel 0, and lost all 8 streams. (Since the FireAttnMask::Host
-/// narrowing, a host-lowered wire-mask fire clears `dense_device_mask`;
-/// device-geometry wire-mask fires stay out of shared waves via the
-/// `wire_mask_on_device_geometry` clause in `accepts`, which is what
-/// keeps that test green.)
-fn has_dense_device_mask(request: &crate::engine::FireRequest) -> bool {
-    request.dense_device_mask || (request.has_user_mask && !has_wire_masks(request))
-}
-
 /// Whether this request lowered its mask to rows the host can see.
 ///
 /// Was `!request.masks.is_empty()` on a flat mask vector; a mask lives on its
 /// LANE now (`Lane::mask`), so the question is whether any lane carries one.
 fn has_wire_masks(request: &crate::engine::FireRequest) -> bool {
     request.lanes.iter().any(|lane| lane.mask.is_some())
-}
-
-impl LaunchGrouping {
-    pub(crate) fn accepts(
-        &self,
-        request: &PendingRequest,
-        limits: SchedulerLimits,
-        page_size: u32,
-    ) -> bool {
-        if self.instances.contains(&request.instance_id) {
-            return false;
-        }
-        // Wire-geometry (chunk) and device-resolved (chained decode) fires
-        // CO-BATCH as ordered sub-batches of one step (true sub-batches,
-        // Venus second landing): `build_frame_submission` orders the group
-        // wire-first and the engine composes the envelope suffix on device
-        // via the offset fixed-decode compose. The mask/solo exclusions
-        // below still keep dense-masked and wire-masked device-geometry
-        // fires out of shared batches.
-        if request
-            .pipeline_id
-            .is_some_and(|pid| self.pipelines.contains(&pid))
-        {
-            return false;
-        }
-        if self.count != 0 && (request.requires_solo_submission() || self.has_solo_submission) {
-            return false;
-        }
-        // RS rows are one per request across the whole composed batch, so a
-        // fire that binds recurrent state and one that does not cannot share
-        // a wave: the engine would see fewer slot ids than requests.
-        if self.count != 0 && (request.rs_batch_kind() == RsBatchKind::None) != !self.has_rs_rows {
-            return false;
-        }
-        // Custom wire masks co-batch freely with other wire-geometry fires —
-        // the wire layer emits a mask row per request (synthesized causal for
-        // the unmasked ones) and the engine predicates per row. They cannot
-        // ride a composed device-geometry batch: wire masks index the wire
-        // request layout, which composition replaces (engine fails loud).
-        // A DENSE-masked device-resolved fire is stricter still: unlike a
-        // host-derived channel mask, it has no wire BRLE rows and the composed
-        // path cannot merge it with another program.
-        let masked_device_geometry = has_dense_device_mask(&request.request);
-        let wire_mask_on_device_geometry = request.request.has_user_mask
-            && has_wire_masks(&request.request)
-            && request.request.device_resolved_geometry;
-        if self.count != 0
-            && (masked_device_geometry
-                || wire_mask_on_device_geometry
-                || (self.has_user_mask && self.has_device_geometry)
-                || (request.request.has_user_mask && self.has_device_geometry)
-                || (request.request.device_resolved_geometry && self.has_user_mask))
-        {
-            return false;
-        }
-        // Hook-program fires: the engine executes ONE hook program per
-        // launch (the sideband arena is singular), and a page-list
-        // substitution written from a hook needs the PAGED DECODE path —
-        // which a batch loses the moment it carries a MULTI-TOKEN row
-        // (engine fail: "attn_page_mask was written but this layer does
-        // not take the paged decode path"). So a hook fire joins only
-        // one-token-per-row groups with no other hook member, and a
-        // multi-token fire never joins past a hook member. The test is
-        // the qo windows, NOT `single_token_mode`: a masked decode row
-        // clears that flag to pick the mask-aware attention path, but it
-        // is still one token per row and the planned mask split gives its
-        // region its own attention launch.
-        if self.count != 0
-            && ((request.hook_program && (self.has_hook_program || self.has_multi_token))
-                || (!one_token_rows(&request.request) && self.has_hook_program))
-        {
-            return false;
-        }
-        // Hook x depth (Act 2 step (i) admission): a FULL-DEPTH hook
-        // member rides the banded walk's permanent live prefix (the Act-2
-        // order puts every full-depth row before every truncated one), so
-        // its group may hold as many distinct finite truncations as the
-        // engine's band cap (three). A TRUNCATED hook member (tier 2,
-        // unimplemented) pins the group to its own k, and with banding
-        // disarmed the only multi-depth server is the one-boundary dsplit
-        // union — those groups stay depth-homogeneous. Refused lanes form
-        // their own groups and run exact.
-        if self.count != 0 && (self.has_hook_program || request.hook_program) {
-            static BANDS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let bands_on = *BANDS_ON.get_or_init(|| {
-                std::env::var("PIE_DEPTH_BANDS")
-                    .map(|v| !v.starts_with('0'))
-                    .unwrap_or(true)
-            });
-            let joining_hook_k = if request.hook_program {
-                request.request.max_layers
-            } else {
-                None
-            };
-            let distinct_after = {
-                let k = request.request.max_layers;
-                let known = k.is_none() || self.finite_ks.contains(&k);
-                self.finite_ks.iter().filter(|slot| slot.is_some()).count() + usize::from(!known)
-            };
-            let page_mask_hook =
-                self.has_page_mask_hook || (request.hook_program && request.request.hook_page_mask);
-            let hook_k = self.hook_finite_k.or(joining_hook_k);
-            let wire_trunc_after = self.has_wire_trunc
-                || (request.request.max_layers.is_some()
-                    && !request.request.device_resolved_geometry);
-            let devgeo_after = self.has_device_geometry || request.request.device_resolved_geometry;
-            let band_order_holds = !(wire_trunc_after && devgeo_after);
-            let clashes = if page_mask_hook {
-                // Track-B hooks keep the pre-band servers: at most one
-                // distinct finite truncation beside them.
-                self.finite_k_overflow || distinct_after > 1
-            } else if bands_on && band_order_holds {
-                // Tier 2: observation hooks — truncated or full — band
-                // with up to the engine's band cap; a truncated hook's
-                // rows freeze past its k and the body gates its
-                // invocations there (hook_rows_k).
-                self.finite_k_overflow || distinct_after > 3
-            } else if let Some(hk) = hook_k {
-                // Banding disarmed: a truncated hook member pins the
-                // group to its own k (the dsplit union's one boundary).
-                self.finite_k_overflow
-                    || request.request.max_layers.is_some_and(|k| k != hk)
-                    || self.finite_ks.iter().flatten().any(|&k| k != hk)
-            } else {
-                self.finite_k_overflow || distinct_after > 1
-            };
-            if clashes {
-                return false;
-            }
-        }
-        if self.count == 0 {
-            return true;
-        }
-        let usage = batch::request_capacity_usage(request, page_size);
-        self.count.saturating_add(usage.forward_requests) <= limits.max_forward_requests
-            && self.forward_tokens.saturating_add(usage.forward_tokens) <= limits.max_forward_tokens
-            && self.page_refs.saturating_add(usage.page_refs) <= limits.max_page_refs
-    }
-
-    pub(crate) fn push(
-        &mut self,
-        request: &PendingRequest,
-        limits: SchedulerLimits,
-        page_size: u32,
-    ) -> bool {
-        let usage = batch::request_capacity_usage(request, page_size);
-        self.instances.insert(request.instance_id);
-        if let Some(pid) = request.pipeline_id {
-            self.pipelines.insert(pid);
-        }
-        self.count = self.count.saturating_add(usage.forward_requests);
-        self.forward_tokens = self.forward_tokens.saturating_add(usage.forward_tokens);
-        self.page_refs = self.page_refs.saturating_add(usage.page_refs);
-        self.has_solo_submission |= request.requires_solo_submission();
-        self.has_rs_rows |= request.rs_batch_kind() != RsBatchKind::None;
-        self.has_user_mask |= request.request.has_user_mask;
-        self.has_device_geometry |= request.request.device_resolved_geometry;
-        self.has_hook_program |= request.hook_program;
-        self.has_multi_token |= !one_token_rows(&request.request);
-        if let Some(k) = request.request.max_layers
-            && !self.finite_ks.contains(&Some(k))
-        {
-            if let Some(slot) = self.finite_ks.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(k);
-            } else {
-                self.finite_k_overflow = true;
-            }
-        }
-        if request.hook_program {
-            self.hook_finite_k = self.hook_finite_k.or(request.request.max_layers);
-            self.has_page_mask_hook |= request.request.hook_page_mask;
-        }
-        self.has_wire_trunc |=
-            request.request.max_layers.is_some() && !request.request.device_resolved_geometry;
-        request.requires_solo_submission()
-            || has_dense_device_mask(&request.request)
-            || self.count >= limits.max_forward_requests
-            || self.forward_tokens >= limits.max_forward_tokens
-            || self.page_refs >= limits.max_page_refs
-    }
 }
 
 #[allow(
@@ -717,18 +390,13 @@ enum SchedulerItem {
         plan: crate::engine::KvCopy,
         completion: ControlCompletion,
     },
-    // Only reached via `SchedulerHandle::copy_state`/`resize_pool`, which
-    // the mock-engine fire path doesn't call yet (`scheduler::resize_pool`
-    // is exercised by this module's unit tests) — see `scheduler::dispatch`'s
-    // module doc for the full engine-ABI-completeness rationale.
+    // Only reached via `SchedulerHandle::copy_state`, which the mock-engine
+    // fire path doesn't call yet — see `scheduler::dispatch`'s module doc for
+    // the full engine-ABI-completeness rationale. `ResizePool` stood beside
+    // it and is gone with the verb (alto design §8, wave C).
     #[allow(dead_code)]
     CopyState {
         plan: StateCopy,
-        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
-    },
-    #[allow(dead_code)]
-    ResizePool {
-        plan: PoolResize,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
@@ -1105,11 +773,6 @@ impl EngineLoop {
         // failure means the lane thread panicked, which the join reports.
         let _ = match &request {
             LaneRequest::Launch { .. } => self.launch_tx.send(request),
-            LaneRequest::Control { item, .. }
-                if matches!(item.as_ref(), QueuedItem::ResizePool { .. }) =>
-            {
-                self.launch_tx.send(request)
-            }
             LaneRequest::Control { .. } | LaneRequest::Shutdown { .. } => {
                 self.control_tx.send(request)
             }
@@ -1304,29 +967,17 @@ impl EngineLoop {
                             // the per-lane instances — and nothing copies a
                             // token vector to cross the boundary.
                             let LaneLaunch(mut frame) = submission;
-                            // Folded admission: EXHAUSTED retries in place —
-                            // the lane is FIFO, so retrying here preserves global
-                            // frame order (later frames must not overtake), and the
-                            // physical pool frees resolve on the engine's own
-                            // completion threads, never on this lane. Bounded so a
-                            // wedged pool converges to a loud failure.
-                            //
-                            // WHAT CHANGED: the two outcomes are ERROR VARIANTS
-                            // now, not `Ok` shapes. `FrameLaunchOutcome::{Exhausted,
-                            // Impossible}` are `Error::{Exhausted, Impossible}`
-                            // and `Error::is_scheduling` is the one predicate
-                            // that tells them from a fault — which is exactly how
-                            // the contract's own header says to read them. Keeping
-                            // them as errors rather than a third `Ok` shape is what
-                            // makes a caller that ignores the distinction fail
-                            // loudly instead of silently dropping a submission.
-                            //
-                            // A FRAME IS ITS STEPS, FIRED IN ORDER. `Engine::fire`
-                            // takes one `Step`; a frame's k steps were
-                            // always sequential on one device, and the loop is what
-                            // the engine's own `launch` did with `frame.steps`.
-                            const EXHAUSTED_RETRY_SLEEP: Duration = Duration::from_micros(200);
-                            const EXHAUSTED_RETRY_MAX: u32 = 25_000; // ~5 s
+                            // Folded admission, and it does not retry (alto
+                            // E, article 4). Both refusals are ERROR VARIANTS
+                            // — `Error::{Exhausted, Impossible}` — and both
+                            // are terminal for this frame: everything a
+                            // device gate could refuse was proved impossible
+                            // at `submit_frame`, so a refusal here is a
+                            // contract violation rather than back-pressure.
+                            // Keeping them as errors rather than a third `Ok`
+                            // shape is what makes a caller that ignores the
+                            // distinction fail loudly instead of silently
+                            // dropping a submission.
                             let result = match engine.as_mut() {
                                 Some(engine) => {
                                     crate::probe_fire!(stats.fire.execute.engine_fire_us, {
@@ -1334,8 +985,6 @@ impl EngineLoop {
                                             engine,
                                             &channels,
                                             &mut frame,
-                                            EXHAUSTED_RETRY_SLEEP,
-                                            EXHAUSTED_RETRY_MAX,
                                             &launch_rx,
                                             &mut stash,
                                             &broker,
@@ -1484,14 +1133,21 @@ impl EngineLoop {
     /// already keeps, now measuring something real — rather than the length of
     /// a device wait.
     ///
-    /// **`LaunchGrouping` and `validate_frame` still stand.** They are wave
-    /// E's and F3's to delete.
+    /// **AND IT DOES NOT RETRY** (alto E, design §1 article 4). A bounded
+    /// sleep-and-resubmit loop stood around `submit`, answering
+    /// `Error::Exhausted` by parking the lane for 200 us and offering the
+    /// identical frame again, up to ~5 s. Article 4 has no such outcome:
+    /// everything a device gate could refuse is proved impossible at submit —
+    /// `pipeline::fire::validate_frame` walks the frame's steps in slot order
+    /// and proves device-only ring occupancy, host-writer staging and reader
+    /// pressure against the channels' declared capacities — so a refusal that
+    /// reaches this line is a contract violation and is reported as one. The
+    /// lane fails the frame, settles its cells FAILED, and moves on; nothing
+    /// sleeps, and no later frame is held behind a frame that will never fit.
     fn fire_frame(
         engine: &mut EngineBox,
         channels: &ChannelJoin,
         frame: &mut crate::engine::FrameFire,
-        retry_sleep: Duration,
-        retry_max: u32,
         launch_rx: &crossbeam::channel::Receiver<LaneRequest>,
         stash: &mut Option<LaneRequest>,
         broker: &crate::engine::CompletionBroker,
@@ -1546,68 +1202,57 @@ impl EngineLoop {
                 .collect(),
         };
 
-        let mut attempts = 0u32;
-        let ticket = loop {
-            // ── THE CHANNEL JOIN, IN (`palo B2`). Every cell the guest has
-            //    put into a host ring since the last fire crosses into the
-            //    device ring the attached instance's pass reads. It runs
-            //    INSIDE the retry loop and not before it because a frame that
-            //    answered `Exhausted` did not consume anything (article 4's
-            //    zero side effects), and the guest may have published more in
-            //    the meantime — which is, for a blocked guest program,
-            //    exactly what unblocks the retry.
-            //
-            //    **IT NOW SITS AROUND THE FRAME WHERE IT SAT AROUND THE
-            //    FIRE, AND PASS-ATOMICITY IS UNCHANGED.** The guarantee the
-            //    pump makes is that a guest's `take` sees the cells of a pass
-            //    that FINISHED and never of one that did not; a frame is
-            //    admitted whole or not at all, and every attached pass in it
-            //    committed before `submit` answered `Ok`. What did change for
-            //    a multi-step frame is the interleaving: all the steps' cells
-            //    go in before the frame does, and all come out after it —
-            //    which is the ordering article 2 requires anyway, since a
-            //    host pump between two steps IS a host touch between two
-            //    waves.
-            //    **AND FOR A DEVICE-COMMIT ENGINE IT IS ALREADY ALMOST
-            //    NOTHING** (alto F2a). Every channel whose host ring the
-            //    engine published is ADOPTED: the guest wrote its cell into
-            //    the very bytes `channel::pull_validate` reads, so `pump_in`
-            //    moves nothing and only wakes. **Wave E: this call site and
-            //    its partner below are what settlement-through-the-broker
-            //    retires** — the wake is the last thing either does on the
-            //    CUDA path, and a broker that woke the waiter on the
-            //    completion callback would leave nothing here at all.
-            for step in &submitted.steps {
-                for attachment in &step.attachments {
-                    if let Err(error) = channels.pump_in(engine.as_mut(), attachment.instance) {
-                        return Err(format!("channel publish: {error}"));
-                    }
+        // ── THE CHANNEL JOIN, IN (`palo B2`). Every cell the guest has put
+        //    into a host ring since the last fire crosses into the device
+        //    ring the attached instance's pass reads.
+        //
+        //    **IT SITS AROUND THE FRAME WHERE IT SAT AROUND THE FIRE, AND
+        //    PASS-ATOMICITY IS UNCHANGED.** The guarantee the pump makes is
+        //    that a guest's `take` sees the cells of a pass that FINISHED and
+        //    never of one that did not; a frame is admitted whole or not at
+        //    all, and every attached pass in it committed before `submit`
+        //    answered `Ok`. What changed for a multi-step frame is the
+        //    interleaving: all the steps' cells go in before the frame does
+        //    and all come out after it — which is the ordering article 2
+        //    requires anyway, since a host pump between two steps IS a host
+        //    touch between two waves.
+        //
+        //    **AND FOR A DEVICE-COMMIT ENGINE IT IS ALREADY ALMOST NOTHING**
+        //    (alto F2a). Every channel whose host ring the engine published
+        //    is ADOPTED: the guest wrote its cell into the very bytes
+        //    `channel::pull_validate` reads, so `pump_in` moves nothing and
+        //    only wakes. **Wave E: this call site and its partner below are
+        //    what settlement-through-the-broker retires** — the wake is the
+        //    last thing either does on the CUDA path, and a broker that woke
+        //    the waiter on the completion callback would leave nothing here
+        //    at all.
+        //
+        //    It runs ONCE. It used to sit inside the retry loop, because a
+        //    frame that answered `Exhausted` consumed nothing and the guest
+        //    might publish what would unblock the next attempt. There is no
+        //    next attempt (article 4), so there is no second pump.
+        for step in &submitted.steps {
+            for attachment in &step.attachments {
+                if let Err(error) = channels.pump_in(engine.as_mut(), attachment.instance) {
+                    return Err(format!("channel publish: {error}"));
                 }
             }
-            match engine.submit(&submitted) {
-                Ok(ticket) => break ticket,
-                // `Exhausted` retries in place — the lane is FIFO, so
-                // retrying here preserves global frame order (later frames
-                // must not overtake), and the physical pool frees resolve on
-                // the engine's own completion threads, never on this lane.
-                // Bounded so a wedged pool converges to a loud failure.
-                Err(error) if error.is_retryable() => {
-                    attempts += 1;
-                    if attempts == 1 || attempts.is_multiple_of(1000) {
-                        tracing::warn!(attempts, %error, "frame admission exhausted; lane retrying");
-                    }
-                    if attempts > retry_max {
-                        return Err(format!(
-                            "frame admission exhausted beyond deadline: {error}"
-                        ));
-                    }
-                    std::thread::sleep(retry_sleep);
-                }
-                // `Impossible` does not retry, and the difference is a
-                // ceiling the load was baked against against a pool that is
-                // full right now.
-                Err(error) => return Err(format!("{error}")),
+        }
+        // ── ADMISSION IS THE RUNTIME'S, AND IT ALREADY HAPPENED. `submit`
+        //    admits the frame or refuses it with zero side effects, and both
+        //    refusals are terminal here: `Exhausted` means a resource the
+        //    static admission at `submit_frame` was supposed to have proved
+        //    available is not (a contract violation, named), and `Impossible`
+        //    is a ceiling this deployment was baked against.
+        let ticket = match engine.submit(&submitted) {
+            Ok(ticket) => ticket,
+            Err(error) if error.is_retryable() => {
+                return Err(format!(
+                    "frame admission answered a retryable refusal past static \
+                     admission, which article 4 forbids: {error}"
+                ));
             }
+            Err(error) => return Err(format!("{error}")),
         };
 
         // ── AND OUT. `Engine::submit` answered `Ok`, so every attached pass
@@ -2082,29 +1727,6 @@ impl EngineLoop {
                     }
                 }
             },
-            QueuedItem::ResizePool { plan, response } => match engine.as_mut() {
-                Some(engine) => match crate::engine::verbs::settled(engine.resize_pool(&plan)) {
-                    Ok(completion) => {
-                        let _ = response.send(Ok(completion.clone()));
-                        LaneCommit::AsyncControl {
-                            result: Ok(completion),
-                        }
-                    }
-                    Err(err) => {
-                        let message = format!("{err:#}");
-                        let _ = response.send(Err(err));
-                        LaneCommit::AsyncControl {
-                            result: Err(message),
-                        }
-                    }
-                },
-                None => {
-                    let _ = response.send(Err(anyhow!("engine has no backend installed")));
-                    LaneCommit::AsyncControl {
-                        result: Err("engine has no backend installed".to_string()),
-                    }
-                }
-            },
             QueuedItem::CloseInstance { id, .. } => match engine.as_mut() {
                 // The worker already gated existence/pacing/quiescence before
                 // posting; the map removal happens at commit.
@@ -2323,10 +1945,6 @@ enum QueuedItem {
     },
     CopyState {
         plan: StateCopy,
-        response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
-    },
-    ResizePool {
-        plan: PoolResize,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CloseInstance {
@@ -2807,7 +2425,6 @@ impl SchedulerHandle {
                 completion,
                 pipeline_id,
                 pipeline_id,
-                false,
                 prelaunch_copy,
                 prelaunch_state_copy,
                 None,
@@ -2832,7 +2449,6 @@ impl SchedulerHandle {
                 completion,
                 None,
                 None,
-                true,
                 prelaunch_copy,
                 prelaunch_state_copy,
                 None,
@@ -2863,7 +2479,6 @@ impl SchedulerHandle {
                 completion,
                 Some(process_id),
                 Some(pipeline_id),
-                true,
                 prelaunch_copy,
                 prelaunch_state_copy,
                 frame,
@@ -3026,18 +2641,11 @@ impl SchedulerHandle {
         .map_err(|_| anyhow!("scheduler did not answer the debug dump"))?
     }
 
-    // Only called from `scheduler::dispatch::copy_rs_d2d`/`resize_pool`
-    // (not yet issued by the mock-engine fire path) and this module's own
-    // unit tests — see `scheduler::dispatch`'s module doc.
+    // Only called from `scheduler::dispatch::copy_rs_d2d` (not yet issued by
+    // the mock-engine fire path) — see `scheduler::dispatch`'s module doc.
     #[allow(dead_code)]
     pub async fn copy_state(&self, plan: StateCopy) -> Result<SubmissionCompletion> {
         self.request(|response| SchedulerItem::CopyState { plan, response })
-            .await?
-    }
-
-    #[allow(dead_code)]
-    pub async fn resize_pool(&self, plan: PoolResize) -> Result<SubmissionCompletion> {
-        self.request(|response| SchedulerItem::ResizePool { plan, response })
             .await?
     }
 
@@ -3529,7 +3137,6 @@ impl BatchScheduler {
                 QueuedItem::CopyKv { .. } => "CopyKv".to_string(),
                 QueuedItem::CopyKvTracked { .. } => "CopyKvTracked".to_string(),
                 QueuedItem::CopyState { .. } => "CopyState".to_string(),
-                QueuedItem::ResizePool { .. } => "ResizePool".to_string(),
                 QueuedItem::CloseInstance { id, .. } => format!("CloseInstance {id}"),
                 QueuedItem::CloseChannels { ids } => format!("CloseChannels x{}", ids.len()),
             };
@@ -3833,9 +3440,6 @@ impl BatchScheduler {
             }
             SchedulerItem::CopyState { plan, response } => {
                 pending.push_back(QueuedItem::CopyState { plan, response });
-            }
-            SchedulerItem::ResizePool { plan, response } => {
-                pending.push_back(QueuedItem::ResizePool { plan, response });
             }
             SchedulerItem::CloseInstance { id, pacing_wait_id } => {
                 pending.push_back(QueuedItem::CloseInstance { id, pacing_wait_id });
@@ -4458,17 +4062,6 @@ impl BatchScheduler {
                     holds_launches,
                 });
             }
-            QueuedItem::ResizePool { .. } => {
-                in_flight_control.push(PendingControl {
-                    state: ControlSlotState::Posted { token },
-                    logical_completion: None,
-                    process_id: None,
-                    pipeline_id: None,
-                    tracked_completion: None,
-                    operation: "pool resize",
-                    holds_launches,
-                });
-            }
             _ => {}
         }
         *lane_inflight += 1;
@@ -4488,21 +4081,13 @@ impl BatchScheduler {
     /// fences and quiesces a victim's working sets before its D2H, and a
     /// restored process is only readmitted after its H2D copy retired —
     /// `planner::exec` awaits the tracked completion before the commit).
-    /// Resizes were exempted here first, on the same pinning argument (~45x on
-    /// gen-boundary teardown); the copy barrier that remained composed with
-    /// frame atomicity and the resize rotation refusal into a three-party
-    /// queue-order deadlock under contention — a sealed frame straddling a
-    /// {resize, copy} pair never posted (CONTENTION_FOLLOWUP.md §12).
-    ///
-    /// That exemption is about this SCAN — which lanes a frame post must hold
-    /// for — and does not extend to the in-flight rule: a posted resize DOES
-    /// hold launches (`holds_launches = !standalone_copy`), and must, because
-    /// the CUDA engine refuses a resize outright unless the compute and swap
-    /// streams are already drained (`context.cpp` `resize_pool`: "the
-    /// quiescence gate above IS the horizon-empty condition"). The hold is
-    /// what manufactures that drain. This doc used to claim resizes "never
-    /// barrier fires" full stop, which read as a licence to drop the hold;
-    /// dropping it would only get the resize refused and retried.
+    /// Pool resizes were the other exemption here (~45x on gen-boundary
+    /// teardown, and a three-party queue-order deadlock when the copy barrier
+    /// composed with frame atomicity and the resize rotation refusal —
+    /// CONTENTION_FOLLOWUP.md §12). The verb is gone: an elastic pool grows
+    /// as a side effect of frame admission and shrinks through the engine's
+    /// own trim, so there is no queued item to exempt and no drain to
+    /// manufacture (alto design §8, wave C).
     fn scan_queue<'a>(
         cache: &'a mut ScanCache,
         pending: &PendingQueue,
@@ -5377,6 +4962,111 @@ mod tests {
         assert!(channels.is_empty());
     }
 
+    /// An engine that answers every `submit` with `Error::Exhausted`, and
+    /// counts how many times it was asked.
+    struct ExhaustedEngine {
+        submits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl engine_api::Engine for ExhaustedEngine {
+        fn kind(&self) -> &'static str {
+            "exhausted"
+        }
+
+        fn load(
+            &mut self,
+            _request: engine_api::LoadRequest,
+        ) -> engine_api::Result<engine_api::Loaded> {
+            Err(engine_api::Error::Load("no model".into()))
+        }
+
+        fn submit(
+            &mut self,
+            _frame: &engine_api::FrameSubmission,
+        ) -> engine_api::Result<engine_api::FrameTicket> {
+            self.submits.fetch_add(1, Ordering::Relaxed);
+            Err(engine_api::Error::Exhausted {
+                resource: "guest channel cells",
+                wanted: 2,
+                available: 1,
+            })
+        }
+    }
+
+    /// **RETRY FAILS LOUDLY** (alto E; design §1 article 4, and the gate dev
+    /// carried at `worker.rs:5371`).
+    ///
+    /// A retryable refusal past static admission is a CONTRACT VIOLATION, not
+    /// back-pressure. `pipeline::fire::validate_frame` walks the frame's steps
+    /// in slot order and proves device-only ring occupancy, host-writer
+    /// staging and reader pressure against the channels' declared capacities
+    /// before the frame is admitted; everything a device gate could refuse is
+    /// therefore impossible by the time the lane submits.
+    ///
+    /// What stood here was a bounded sleep-and-resubmit loop — 200 us a turn,
+    /// up to ~5 s — that offered the identical frame again and again. Two
+    /// things were wrong with it. It made an unmeetable frame cost five
+    /// seconds of a FIFO lane, holding every later frame behind one that
+    /// could never fit; and it turned the one signal that static admission had
+    /// a hole in it into a latency blip nobody would ever read.
+    ///
+    /// So: exactly one submit, an error naming what happened, and the launch
+    /// answered rather than left in flight.
+    #[test]
+    fn a_retryable_refusal_past_admission_fails_by_name_instead_of_replaying() {
+        let submits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (reply_tx, reply_rx) = crossbeam::channel::unbounded();
+        let mut lane = EngineLoop::spawn(
+            0,
+            Some(Box::new(ExhaustedEngine {
+                submits: Arc::clone(&submits),
+            })),
+            reply_tx,
+            Arc::new(SchedulerStats::default()),
+        );
+
+        lane.post(LaneRequest::Launch {
+            token: 42,
+            submission: LaneLaunch(crate::engine::FrameFire {
+                steps: vec![crate::engine::StepFire {
+                    submission: crate::engine::Step {
+                        lanes: vec![crate::engine::Lane::decode(0, 0, 1, 0)],
+                        attachments: Vec::new(),
+                    },
+                    terminal_cells: Vec::new(),
+                    instances: vec![0],
+                    logical_fire_ids: vec![42],
+                }],
+            }),
+            prefill: false,
+        });
+
+        let reply = reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the launch must be answered, not slept on");
+        let SchedulerItem::Lane(LaneReply::LaunchDone { token, result }) = reply else {
+            panic!("a launch must be answered with a launch reply");
+        };
+        assert_eq!(token, 42);
+        let Err(error) = result else {
+            panic!("an engine that refuses everything cannot have admitted a frame");
+        };
+        assert!(
+            error.contains("article 4"),
+            "the failure must say which promise was broken, so the fix is to \
+             static admission rather than to the retry budget: {error}"
+        );
+        assert!(error.contains("guest channel cells"), "{error}");
+        assert_eq!(
+            submits.load(Ordering::Relaxed),
+            1,
+            "the frame is offered ONCE; a second offer is the sleep-retry loop \
+             growing back"
+        );
+
+        let (_engine, _channels) = lane.shutdown();
+    }
+
     /// An engine that records, in order, every composition it is TOLD ABOUT
     /// (`expect_fire`) and every one it RUNS (`fire`), each identified by
     /// its first lane's `word` — the field a hint is actually about.
@@ -5419,7 +5109,20 @@ mod tests {
             // in which order the engine heard about compositions, and a frame
             // is its steps. What changed is that it hears about all of them in
             // one call, which is the property the lookahead test is about.
-            for step in &frame.steps {
+            //
+            // **AND THE INTRA-FRAME HINT IS STATED HERE, because after F2b
+            // that is where a real engine states it** (`engine_cuda::Cuda::
+            // submit`: `if let Some(next) = frame.steps.get(index + 1) {
+            // self.expect_fire(next) }`). A frame crosses whole, so its own
+            // successors are the engine's to see; only the launch queued
+            // BEHIND this frame is the runtime lane's, and that half is the
+            // `expect_fire` call in `fire_frame`. A recorder that stated
+            // neither would be modelling an engine this workspace does not
+            // contain.
+            for (index, step) in frame.steps.iter().enumerate() {
+                if let Some(next) = frame.steps.get(index + 1) {
+                    self.hear("expect", next);
+                }
                 self.hear("fire", step);
                 std::thread::sleep(Duration::from_millis(20));
             }

@@ -41,14 +41,22 @@
 //!
 //! # What this engine does not serve, and says so
 //!
-//! `copy_kv`, `copy_state`, `resize_pool` and `encode` take the trait's
-//! default bodies, which answer [`Error::Unsupported`]. That is the
-//! honest report of what the v1 shell has: its pools are not virtual, it has
-//! no peer-copy path, no recurrent-state mover and no multimodal encoder.
-//! Stubbing any of them to `Ok(())` would make a prefix-cache hit, a swap or
-//! an image prompt *appear* to work and silently read the wrong bytes, which
-//! is the failure mode the contract's "refusal is a value" section exists to
-//! prevent.
+//! `encode` takes the trait's default body, which answers
+//! [`Error::Unsupported`]: this shell carries no multimodal encoder. Stubbing
+//! it to `Ok(())` would make an image prompt *appear* to work and silently
+//! read the wrong bytes, which is the failure mode the contract's "refusal is
+//! a value" section exists to prevent.
+//!
+//! `copy_kv` and `copy_state` stood beside it and no longer do — the shell has
+//! a page mover ([`Pools::copy_kv`](crate::store::Pools::copy_kv)) and a slot
+//! mover ([`Pools::copy_slot`](crate::store::Pools::copy_slot)) now. `copy_kv`
+//! serves DEVICE-TO-DEVICE inside this load's own pools and refuses every
+//! other direction BY NAME: a host-pinned end is a swap pool this shell does
+//! not reserve, and a second device's is a peer mapping it has not opened.
+//! [`Capabilities::kv_copy`](engine::engine_api::caps::Capabilities) is where
+//! that is stated rather than discovered. `resize_pool` is not on the trait at
+//! all any more (design §8, wave C: an elastic pool grows as a side effect of
+//! frame admission).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -67,17 +75,17 @@ use engine::engine_api::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, Lo
 use engine::engine_api::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::engine_api::transfer::MemoryDomain;
+use engine::engine_api::transfer::{KvCopy, MemoryDomain, StateCopy};
 use engine::engine_api::Engine;
 use model_compiler::{Budget, DeviceProfile};
 use model_ir::Trace;
 use model_loader::contract::ModelContract;
-use engine::engine_api::tensor_ir::registry::{GeometryClass, ModelProfile, PortMask};
+use engine::engine_api::tensor_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use engine::engine_api::tensor_ir::types::DType;
 
 use crate::error::Fault;
 use crate::program::Session as ProgramSession;
-use crate::serve::{Attached, Boot, Graphs, Lane, Seated, Shell};
+use crate::serve::{Attached, Boot, Graphs, Knobs, Lane, Seated, Shell};
 
 /// How a caller answers "what does this checkpoint's bytes mean for this
 /// plan".
@@ -97,8 +105,42 @@ pub type ContractFor =
 pub struct DeviceBoot {
     /// Which device to bind.
     pub ordinal: i32,
-    /// How much of a fire to record. Overridden by `PIE_CUDA_GRAPHS`.
+    /// How much of a fire to record, from `[engine] graphs`. Nothing
+    /// overrides it any more (article 9: shells read no environment).
     pub graphs: Graphs,
+    /// **THE SHELL'S OWN WORDS**, from the boot document's `[engine]` table —
+    /// what nine `PIE_CUDA_*` environment reads were before article 9.
+    ///
+    /// A deployment fact like the ordinal beside it: the knobs describe how
+    /// this machine's shell fires, not what one model asks for, so they are
+    /// stated once when the engine is opened and carried onto every
+    /// [`Boot`] it makes. [`Knobs::default`] is what an
+    /// absent variable meant, byte for byte.
+    pub knobs: Knobs,
+    /// **Where this deployment keeps its warm-boot weight artifacts** (alto
+    /// design §7's T2 tier), from `[model] weight_cache_dir`.
+    ///
+    /// A deployment fact, which is why it sits here beside the ordinal rather
+    /// than on the load: the directory belongs to the machine and the
+    /// operator, and every model this engine ever loads writes into the same
+    /// one under its own key.
+    ///
+    /// **TYPED, NOT `getenv`** (article 9). The worker has been writing this
+    /// key into every CUDA boot document since the palo rewrite and nothing
+    /// read it; this is the field it arrives at. `None` is the honest answer
+    /// for a deployment that named no directory — the feature is off, no
+    /// artifact is read and none is written.
+    pub weight_cache_dir: Option<std::path::PathBuf>,
+    /// **Where this deployment keeps the guest-program plane's compiled
+    /// cubins**, from the boot document's `[cache] dir`.
+    ///
+    /// A deployment fact beside [`DeviceBoot::weight_cache_dir`], and typed
+    /// for its reason: `program::compile::Disk` used to resolve
+    /// `$PIE_HOME/cache/ptir-cuda` itself, which was the last environment read
+    /// in the shell (article 9). `None` is the feature off — every program
+    /// compiles through NVRTC and nothing is stored, which costs time and
+    /// never an answer.
+    pub program_cache_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for DeviceBoot {
@@ -106,6 +148,9 @@ impl Default for DeviceBoot {
         DeviceBoot {
             ordinal: 0,
             graphs: Graphs::default(),
+            knobs: Knobs::default(),
+            weight_cache_dir: None,
+            program_cache_dir: None,
         }
     }
 }
@@ -114,9 +159,17 @@ impl Default for DeviceBoot {
 /// One submitted step, held for a caller that comes back for numbers.
 ///
 /// The readback plan the shell computed at `settle`, plus the per-lane
-/// `Readout` policy the SUBMISSION stated — which the shell never sees,
-/// because which rows a caller wants back is a contract question and not a
-/// device one.
+/// `Readout` policy the SUBMISSION stated.
+///
+/// **THE POLICY IS CARRIED HERE AND HANDED DOWN AT THE NUMBERS DOOR**
+/// (`palo B-readout`, closed). It used to be a list the shell never saw, on
+/// the argument that which rows a caller wants back is a contract question
+/// and not a device one — true of `Last` versus `None`, which are two ways of
+/// spending the same one row the shell read anyway, and false the moment
+/// `Rows` names three: the shell is the only party that knows where a lane's
+/// row run sits in the arena rectangle, so the list has to reach the loop that
+/// indexes it. `settle_frame` passes it into `Shell::read_out_rows`; nothing
+/// on the FIRE path reads it, which is the part that was load-bearing.
 struct PendingStep {
     readout: Vec<Readout>,
     settled: crate::serve::Settled,
@@ -273,6 +326,11 @@ fn fault(fault: Fault) -> Error {
             wanted: need,
             available: have,
         },
+        // **THE RESIDENCY REFUSAL IS `Impossible` AND SAYS SO IN ONE PLACE**
+        // (alto design §7). A budget the tiers cannot meet is not a pool the
+        // deployment can free its way out of; the sentence already carries
+        // both numbers and what would have to change.
+        Fault::Residency(_) => Error::Impossible(fault.to_string()),
         Fault::Ceiling { what, need, have } => Error::Impossible(format!(
             "this fire wants {need} {what} and the load reserved {have}"
         )),
@@ -285,9 +343,10 @@ fn fault(fault: Fault) -> Error {
         // no masked arm, is the SUBMISSION's — the caller stated it and the
         // caller can state it differently. `Invalid`, not `Impossible`: a
         // retry with a mask of the lane's own extent is a real answer.
-        Fault::Mask { .. } | Fault::Maskless { .. } | Fault::MaskWord { .. } => {
-            Error::Invalid(fault.to_string())
-        }
+        Fault::Mask { .. }
+        | Fault::MaskRows { .. }
+        | Fault::Maskless { .. }
+        | Fault::MaskWord { .. } => Error::Invalid(fault.to_string()),
         // The adapter axis's three, sorted the same way. A lane routed
         // against an artifact with no correction, or against a word that puts
         // it outside the correction's window, is the SUBMISSION's — a retry
@@ -310,21 +369,14 @@ fn fault(fault: Fault) -> Error {
         | Fault::Scoreless { .. }
         | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
-        // **THE ONE REFUSAL THAT CROSSES AS A SCHEDULING ANSWER**, and the
-        // reason it is a variant rather than a sentence. `Fault::Blocked` is
-        // the readiness gate in `serve`'s prepare phase saying an attached
-        // guest's ring has no room *right now*; the host drains it and the
-        // identical frame is admitted. The numbers are the CHANNEL's: a
-        // blocked instance wants one more cell than the ring can give it,
-        // which is either an input that has not arrived or an output the host
-        // has not taken, and naming the channel is what tells a log those two
-        // apart. This is exactly what `Cuda::fire` used to compute by asking
-        // `program_ready` a second time before the shell asked it at all.
-        Fault::Blocked { channel, .. } => Error::Exhausted {
-            resource: "guest channel cells",
-            wanted: u64::from(channel) + 1,
-            available: u64::from(channel),
-        },
+        // A `Fault::Blocked` arm stood here and crossed as `Error::Exhausted`
+        // — an attached guest's ring with no room right now, which the host
+        // was to drain before re-submitting the identical frame. Article 4
+        // has no such outcome: `validate_frame` proves ring occupancy,
+        // host-writer staging and reader pressure statically at submit, so a
+        // readiness miss past admission is a contract violation and
+        // `serve::committed_or` names it. `Fault::OutOfMemory` above is the
+        // only exhaustion this shell reports, and it is about device bytes.
         Fault::Compile(_) | Fault::Program { .. } => Error::Program(fault.to_string()),
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
     }
@@ -345,6 +397,95 @@ fn extents(stated: &BindExtents) -> engine::Extents {
         sampled_rows: stated.sampled_rows,
         query_len: stated.query_len,
         key_len: stated.key_len,
+    }
+}
+
+/// **THE LATTICE A DEPLOYMENT GETS WHEN IT STATES NONE**: the powers of two
+/// from [`LATTICE_FLOOR`] up to and including `max_tokens`.
+///
+/// `Budget::buckets` is a deployment's dial and `Budget::new` leaves it
+/// empty, which `compose::bucket_of` reads — correctly — as "one graph per
+/// exact size, and the honest bucket for a fire of `rows` rows is `rows`".
+/// That answer makes every consumer of the lattice a no-op: P4's fallback menu
+/// collapses to one bucket at position 0, and D4's padding rounds a fire up to
+/// itself. A shell whose whole business is firing on a real device should not
+/// ship that as its default, because a dial nobody set is not a measurement of
+/// the dial's zero.
+///
+/// **POWERS OF TWO, BECAUSE GEOMETRIC IS WHAT BOUNDS THE TAIL.** Above the
+/// floor a fire never computes more than twice its own rows, which is D4's
+/// whole cost argument stated as a ratio rather than as a hope. It is also the
+/// spacing of the fourteen-point lattice `crate::window`'s header prices the
+/// copy/split crossover on and `every_sku_walks_its_classes` walks, so the two
+/// consumers of `Budget::buckets` are looking at the same kind of object.
+///
+/// The ceiling is included even when it is not a power of two, because a fire
+/// AT `max_tokens` must have a bucket and `Fault::NoBucket` is the refusal for
+/// a fire above the lattice, not for the largest one the budget admits.
+#[must_use]
+pub(crate) fn default_lattice(max_tokens: u32) -> Vec<u32> {
+    let mut lattice: Vec<u32> =
+        core::iter::successors(Some(LATTICE_FLOOR), |point| point.checked_mul(2))
+            .take_while(|point| *point < max_tokens)
+            .collect();
+    lattice.push(max_tokens);
+    lattice
+}
+
+/// **WHERE THE DEFAULT LATTICE STARTS, AND WHY IT IS NOT 1.**
+///
+/// A lattice is free to name every small size, and the fourteen-point one this
+/// tree quotes does. D4 asks for the opposite at the bottom, for two reasons
+/// the census measured:
+///
+/// * **The arm flip at one row is the whole point.** `.wiki/palo/cuda-abi.md`
+///   §1: a one-lane decode takes the gemv arm and a two-lane one does not —
+///   127 launches change kernel across that boundary, and the 423-node
+///   topology it produces is a shape of its own. §3's promise is that "the
+///   gemv↔gemm arm flip at ×1 dies (M ≥ 2 always)", and a lattice naming 1
+///   keeps it alive. §3's own worked example — "decode 3 lanes padded to 8" —
+///   is a lattice whose first point is this one.
+/// * **A boundary is where two fires stop agreeing.** Padding does not remove
+///   the arithmetic drift between two compositions; it QUANTIZES it (two fires
+///   compute the same numbers iff they share a bucket — see
+///   `a_padded_fire_is_in_bounds_and_says_something_true`). Every extra point
+///   at the bottom is one more place where a lane fired alone and the same
+///   lane fired beside two others land on different sides, and at decode
+///   scale that is the commonest pair a deployment has.
+///
+/// What it costs is the tail on the smallest fires, where the cost argument is
+/// strongest rather than weakest: a decode fire's linear layers are
+/// weight-bound — 1.40 GiB of weight reads against eight rows of activation —
+/// so the rows below the floor ride reads that were happening anyway.
+/// `the_tail_a_padded_decode_computes_rides_the_weight_reads` is that claim
+/// with a number on it, and a deployment that measures otherwise on its own
+/// hardware states its own `Budget::buckets`.
+pub(crate) const LATTICE_FLOOR: u32 = 8;
+
+
+/// **THE SHAPE LATTICE POLICY, AT THE DOOR** (alto wave P, article 9).
+///
+/// It was `lattice_from_env` in `serve.rs` — `PIE_CUDA_BUCKETS` read at load,
+/// under a header claiming the file had no logic. Two things were wrong with
+/// that and only one was the environment: which buckets exist is a COMPILER
+/// input, so the policy belongs beside [`bake_budgets`], where this crate
+/// turns a load request's ceilings into the `Budget` the bake is handed.
+///
+/// A caller that stated a lattice keeps it, exactly. One that stated none —
+/// which is every `Budget::new` caller, and so every gate and the worker's own
+/// embedded engine — gets [`default_lattice`], because the empty lattice makes
+/// P4's bucket ranges collapse to one position and D4's padding round every
+/// fire up to itself, and a dial nobody set is not a measurement of the dial's
+/// zero.
+///
+/// Idempotent by construction: a filled lattice is stated, and a stated
+/// lattice is kept.
+#[must_use]
+pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32) -> Vec<u32> {
+    if stated.is_empty() {
+        default_lattice(max_tokens)
+    } else {
+        stated
     }
 }
 
@@ -460,6 +601,7 @@ impl Engine for Cuda {
             trace,
             checkpoint,
             budgets,
+            residency,
             ordinal,
             frames_in_flight,
         } = request;
@@ -478,6 +620,33 @@ impl Engine for Cuda {
         };
         let path = PathBuf::from(path);
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
+
+        // ── RESIDENCY, BEFORE A BYTE IS ALLOCATED (alto design §7).
+        //    This shell has TWO tiers now, and which of them a plane can live
+        //    in is a property of the plane rather than a setting:
+        //
+        //      routed expert banks   a device slab of `n < experts` slots over
+        //                            a pinned host copy of all of them, behind
+        //                            a device-resident indirection table
+        //      everything else       resident, whole, as it always was
+        //
+        //    `Plan::of` reads the budget against the trace ALONE — no device
+        //    is bound and no byte is allocated — and answers the residency
+        //    this load will actually have: the empty plan for an uncapped
+        //    budget or one that covers the whole table (dev's `place_all`),
+        //    a per-bank slot count for one that does not, and
+        //    `Fault::Residency` -> `Error::Impossible` for a budget under the
+        //    dense planes, which do not stream in this wave.
+        //
+        //    `Residency::admit` is then asked with what the PLAN demands
+        //    rather than with what the checkpoint holds — the device demand
+        //    it fits by construction, and the host demand is the real
+        //    question, because the pinned tier holds every expert of every
+        //    streamed bank and a `host_weight_budget` under it is a load this
+        //    machine cannot hold either.
+        let plan =
+            crate::experts::Plan::of(&trace, residency.device_weight_budget).map_err(fault)?;
+        residency.admit(plan.device_demand(), plan.host_demand())?;
 
         let shell = Shell::load(Boot {
             trace,
@@ -498,16 +667,40 @@ impl Engine for Cuda {
             // that also named one is the deployment's default.
             ordinal: if ordinal >= 0 { ordinal } else { self.boot.ordinal },
             graphs: self.boot.graphs,
+            // The deployment's words, unchanged per load — the `[engine]`
+            // table is a fact about this machine's shell, not about one model.
+            knobs: self.boot.knobs,
+            // The deployment's directory, unchanged per load: every model
+            // this engine loads keys its own artifact inside it.
+            weight_cache_dir: self.boot.weight_cache_dir.as_deref(),
+            // The deployment's cubin cache, unchanged per load — every program
+            // this engine ever compiles keys its own file inside it.
+            program_cache_dir: self.boot.program_cache_dir.as_deref(),
             // **THE DEPTH CROSSES ONCE AND IS DERIVED FROM HERE ON** (article
             // 8). `Runahead::of` clamps what the free-slot word cannot carry;
             // the deployment's config layer refuses an out-of-range depth by
             // name long before it reaches this line.
             runahead: engine::runahead::Runahead::of(frames_in_flight),
+            // The plan the two budgets decided, carried whole rather than
+            // re-derived: a shell that recomputed it could disagree with the
+            // numbers `admit` was asked about.
+            residency: plan,
         })
         .map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
+        // **WHAT IS RESERVED AND WHAT IS MAPPED ARE TWO NUMBERS** (wave C).
+        // `pool_bytes` above is the ceiling the arenas' address space was
+        // reserved at; these are what admission has actually put physical
+        // pages behind. Read here, at load, they are the floor a fresh load
+        // starts from — the interesting reading is later, and it comes out of
+        // the same accessor.
+        let (pool_committed_bytes, pool_high_water_bytes, elastic_page_bytes, elastic_budget_pages) =
+            shell.elastic();
+        let weights_from_cache = shell.weights_from_cache();
+        // Read beside the other facts, while the shell is still here to ask.
+        let weights_resident = shell.weights_resident();
         let paging = shell.paging();
         let profile = profile(&shell, &budgets)?;
 
@@ -555,10 +748,13 @@ impl Engine for Cuda {
                     .map(|&(_, adapters, _)| adapters)
                     .min()
                     .unwrap_or(0),
-                // The pools are not virtual, so `resize_pool` is not served
-                // and zero is what says so.
-                elastic_page_bytes: 0,
-                elastic_budget_pages: 0,
+                // **THE POOLS ARE VIRTUAL NOW** (wave C), and these two
+                // say so: one logical page of the elastic supply, and the
+                // most of them this load may ever map. Zero was the
+                // reservation model's honest answer and is no longer this
+                // shell's.
+                elastic_page_bytes,
+                elastic_budget_pages,
             },
             limits: FireLimits {
                 max_lanes: budgets.max_lanes,
@@ -571,26 +767,55 @@ impl Engine for Cuda {
                 max_context: paging.context(),
             },
             profile,
-            // THE DECODE ENVELOPE IS SERVED AND NOTHING WIDER IS (`palo
-            // B3`). `crate::program::ports` reads `embed_tokens`, `positions`
-            // and `kv_len` off the attached instance's own device rings at
-            // fire time — the token because the device DECIDED it and no host
-            // can know it, the other two because a port that is read is a
-            // port that is served, and both are checked against the seat the
-            // page arithmetic is carved from.
+            // **THE WHOLE FIRE GEOMETRY IS SERVED, AND THE MASK BESIDE IT.**
+            // `crate::program::ports` reads every port in this set off the
+            // attached instance's own rings at fire time, before anything has
+            // launched, and `serve::prepare` uses each:
             //
-            // The four ports above that — `pages`, `page_indptr`, `w_slot`,
-            // `w_off` — are NOT claimed, and the mask says so. A
-            // decode-envelope lane's page table is this shell's own
-            // (`KvDelta::pages` empty is the submission saying so), and
-            // `store::kv::geometry_with` derives all four from the seat;
-            // claiming them would mean letting a guest's page ids reach the
-            // pool, which is the pooled device-geometry class and a different
-            // piece of work. A `DeviceGeometry` binding is still refused at
-            // bind, by name.
-            ports: PortMask::DECODE_ENVELOPE,
-            geometry: GeometryClass::DecodeEnvelope,
-            kv_copy: KvCopyDomains::default(),
+            // ```text
+            // embed_tokens  the ids                the device DECIDED them
+            // embed_indptr  the member's lane CSR  which lanes, which rows
+            // positions     what reaches RoPE      the guest may renumber
+            // kv_len        the extent AFTER       `have` is derived back
+            //                                     from it; the page count and
+            //                                     the last page's fill follow
+            // pages         the lane's page run    cut out of one flat run by
+            // page_indptr   the run's bounds       the CSR beside it
+            // w_slot        where a row lands      `have + row` cannot spell
+            // w_off         and at what offset     B lanes into one pool
+            // attn_mask     a dense bool rectangle run-length encoded and
+            //                                     expanded by `crate::mask`
+            //                                     into the same slab a
+            //                                     host-stated mask expands to
+            // ```
+            //
+            // The four beyond the decode envelope — the page family and the
+            // write descriptor — were withheld while the page ids were this
+            // shell's alone (`palo B3`). They are claimed now because
+            // `geometry_with` already took a caller-stated table per lane
+            // (`KvDelta::pages` non-empty), and a guest that states its pages
+            // on a CHANNEL is that same caller reaching the pool one phase
+            // later. The mask is claimed with them because a fire whose
+            // ancestry is device data — a beam search's `gather(mask, parent)`
+            // — has nowhere else to state it, and the runtime's bind-time
+            // classifier asks for exactly this union before it will admit one
+            // (`inferlet::host::forward`'s `devgeo_capable`).
+            ports: PortMask::DEVICE_GEOMETRY.with(Port::AttnMask),
+            geometry: GeometryClass::DeviceGeometry,
+            // **THE ONE DIRECTION THIS SHELL HAS BYTES FOR.** `copy_kv`
+            // moves cells between pages of THESE pools, on this stream, as
+            // device-to-device copies (`Pools::copy_kv`). The other three
+            // names a swap pool or a peer mapping: a host-pinned end needs a
+            // pinned page pool this load does not reserve, and a second
+            // device's ordinal needs a peer mapping it has not opened. Each
+            // is refused by name in `Cuda::copy_kv`, and this is where a
+            // caller reads that without having to try one.
+            kv_copy: KvCopyDomains {
+                device_to_device: true,
+                device_to_host: false,
+                host_to_device: false,
+                host_to_host: false,
+            },
             kv_handle: None,
             media_encode: false,
             // **F2a: THE RINGS ADVANCE ON THE DEVICE.** `register_channel`
@@ -600,6 +825,14 @@ impl Engine for Cuda {
             // state. So a caller may predict cursors by counting, and its
             // pump has nothing left to carry.
             device_channel_commit: true,
+            // **THE RS DEVICE HALF, STATED** (alto design §6, waves F3 and
+            // F3b). This shell allocates the buffered-activation pool at
+            // load, seats the `commit_len`, `write_state_mask` and segment
+            // origin the chunked scans honour, and serves `RsVerb::Buffer`
+            // and `RsVerb::FoldBuffered` against them — including the mixed
+            // row, whose interior fold boundary is run as the head that folds
+            // and the tail that continues from it.
+            rs_verbs: true,
         };
 
         self.shell = Some(shell);
@@ -608,9 +841,19 @@ impl Engine for Cuda {
             facts: LoadFacts {
                 trace_name,
                 weight_bytes,
+                // **ANSWERED, NOT ASSUMED** (alto design §7). `false` says
+                // this load opened the routed-expert tier: some bank of it is
+                // a device slab smaller than the bank, over pinned host
+                // bytes, and `weight_bytes` above is then what is RESIDENT
+                // rather than what the checkpoint holds. `true` is the
+                // degenerate case and every load that states no budget.
+                weights_resident,
+                weights_from_cache,
                 arena_bytes,
                 pool_bytes,
                 input_bytes,
+                pool_committed_bytes,
+                pool_high_water_bytes,
             },
             caps,
         })
@@ -646,7 +889,13 @@ impl Engine for Cuda {
         // The engine's own answer about channel tickets rides in: a
         // prediction this shell validates on the device is accepted, and one
         // it could only ignore is refused by name (`Lane::validate_for`).
-        frame.validate_for(self.caps.as_ref().is_some_and(|caps| caps.device_channel_commit))?;
+        frame.validate_for(engine::engine_api::Serves {
+            device_channel_commit: self
+                .caps
+                .as_ref()
+                .is_some_and(|caps| caps.device_channel_commit),
+            rs_verbs: self.caps.as_ref().is_some_and(|caps| caps.rs_verbs),
+        })?;
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);
         // **THE PREVIOUS FRAME'S NUMBERS DIE HERE** and the drop is the whole
@@ -752,7 +1001,13 @@ impl Engine for Cuda {
         let (_, mut settled) = self.pending.take().expect("checked just above");
         let shell = self.loaded_mut()?;
         for step in &mut settled {
-            shell.read_out(&mut step.settled).map_err(fault)?;
+            // The row lists the submission stated, handed down: `Last` for a
+            // lane that wanted its sampler's row, the named rows for a
+            // spec-decode verifier, nothing at all for a lane that ran for
+            // its cache writes.
+            shell
+                .read_out_rows(&mut step.settled, &step.readout)
+                .map_err(fault)?;
         }
         for (receipt, step) in ticket.steps.iter_mut().zip(&settled) {
             receipt.readouts = readouts_of(step);
@@ -978,25 +1233,228 @@ impl Engine for Cuda {
         self.instance(instance)?.take(channel).map_err(fault)
     }
 
-    // `copy_kv`, `copy_state`, `resize_pool` and `encode` take the trait's
-    // default bodies. See the module header: the v1 shell genuinely has
-    // none of the four, and a stub that answered `Ok(())` would make a
-    // prefix-cache hit, a swap or an image prompt appear to work.
+    /// **Move recurrent state between slots** (alto survey §9's gap list,
+    /// wave F3) — the verb an RS fork dispatched into nothing until now.
+    ///
+    /// # The two id spaces, and which one this reads (survey §9, gap 6)
+    ///
+    /// `StateMove` carries `src_slot_id`/`dst_slot_id`, and the runtime's RS
+    /// store has an `RsSlotId` space of its own that covers folded states AND
+    /// buffered pages. **This shell reads them as its own SEAT ids** — the
+    /// same number `Lane::slot` carries and `Pools::clear` indexes — and does
+    /// not translate, because there is nothing here to translate WITH: the
+    /// engine has never been told the runtime's mapping, and a shell that
+    /// invented one would move the wrong bytes silently. The aliasing is
+    /// therefore stated rather than hidden: **a caller's slot id means, to
+    /// this engine, the seat that caller's lanes name.** A runtime whose RS
+    /// store keeps a second space owes the translation on its own side, which
+    /// is where the mapping lives.
+    ///
+    /// # Whole slots only
+    ///
+    /// A recurrent bank is a folded summary of a prefix, not an array of
+    /// per-token entries — "the first `n` tokens of a slot" names nothing that
+    /// exists — so `src_token_offset`, `dst_token_offset` and `token_count`
+    /// have no meaning here and a move that states them is refused rather
+    /// than rounded off. dev's `copy_slot_d2d` is whole-slot for the same
+    /// reason.
+    ///
+    /// **THE BUFFERED ACTIVATIONS ARE NOT COPIED**, which is also dev's
+    /// answer: a fork's buffer is the runtime's to re-derive or to abandon,
+    /// and the folded state is the only thing a fork cannot recompute.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] for a partial move, [`Error::Device`] for a slot
+    /// past the pool or the copy itself.
+    fn copy_state(&mut self, copy: &StateCopy) -> EngineResult<()> {
+        for (at, move_) in copy.moves.iter().enumerate() {
+            if move_.src_token_offset != 0 || move_.dst_token_offset != 0 {
+                return Err(Error::Invalid(format!(
+                    "state move {at} names a token offset, and a recurrent bank is a folded \
+                     summary of a prefix rather than an array of per-token entries — this \
+                     engine moves whole slots"
+                )));
+            }
+        }
+        let shell = self.loaded_mut()?;
+        for move_ in &copy.moves {
+            shell
+                .copy_state(move_.src_slot_id, move_.dst_slot_id)
+                .map_err(fault)?;
+        }
+        Ok(())
+    }
+
+    /// **Move KV pages inside this device's pools** (alto survey §9's gap
+    /// list) — the verb a prefix-tree fork dispatched into nothing until now.
+    ///
+    /// # One direction, and the other three refused by name
+    ///
+    /// Device-to-device WITHIN THIS LOAD'S OWN POOLS, which is what a fork,
+    /// a graft and a prefix-cache hit are. The other three domain pairs are
+    /// refused with the pair spelled out, because each names storage this
+    /// shell does not hold:
+    ///
+    /// ```text
+    /// device -> device (this ordinal)   served: cells move inside the arenas
+    /// device -> host / host -> device   a pinned swap pool this load does
+    ///                                   not reserve (dev's KvSwapPool)
+    /// host   -> host                    two buffers neither end of which is
+    ///                                   ours; the caller owns that memmove
+    /// device -> another ordinal         a peer mapping nothing has opened
+    /// ```
+    ///
+    /// [`Capabilities::kv_copy`] states the same thing ahead of time, so a
+    /// caller that reads capabilities never has to discover this by being
+    /// refused.
+    ///
+    /// # The two spellings are one move
+    ///
+    /// `src_page_ids`/`dst_page_ids` are whole pages and `moves` are single
+    /// token cells; both flatten into [`store::Move`] runs, which is a
+    /// `(page, token, tokens)` pair per side. **Consecutive cell moves are
+    /// COALESCED** — a fork copying a partial page's live tokens states one
+    /// `KvMove` per token, and the run they form is one `cudaMemcpyAsync` per
+    /// plane rather than one per token per plane. The merge is exact
+    /// (identical pages on both sides, both offsets continuing the previous
+    /// run by one) and order-preserving, so a caller whose moves do not form
+    /// runs gets the same bytes at more copies, never different bytes.
+    ///
+    /// # The page ids are the CALLER'S, and this shell does not translate
+    ///
+    /// Article 8: page ids are the runtime's policy and the bytes under them
+    /// are the engine's supply. A page id here indexes the same arenas
+    /// [`KvDelta::pages`](engine::engine_api::fire::KvDelta) indexes, which is
+    /// what makes "copy the pages, then fire against the copies" mean
+    /// anything.
+    ///
+    /// # Ordering
+    ///
+    /// Enqueued on the fire stream and NOT synchronized (article 2). The
+    /// copies queue behind every step still airborne — which may be reading
+    /// the source pages — and in front of every fire submitted after this
+    /// returns. See [`Shell::copy_kv`](crate::serve::Shell::copy_kv).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for a domain pair this shell has no storage
+    /// for, [`Error::Invalid`] for a malformed plan — unequal page lists, or
+    /// a move whose two ends overlap — and [`Error::Impossible`] for a page
+    /// past the pool.
+    ///
+    /// [`Capabilities::kv_copy`]: engine::engine_api::caps::Capabilities
+    /// [`store::Move`]: crate::store::Move
+    fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
+        copy.validate()?;
+        // THE DOMAIN PAIR, BEFORE ANYTHING IS BUILT. `Unsupported` and not
+        // `Invalid`: the plan is a plan this contract describes, and what is
+        // missing is storage on THIS engine — which is exactly the difference
+        // the two variants carry.
+        let ordinal = self
+            .caps
+            .as_ref()
+            .map(|caps| caps.device.domain)
+            .and_then(MemoryDomain::ordinal);
+        let served = matches!(
+            (copy.src, copy.dst),
+            (MemoryDomain::CudaDevice(src), MemoryDomain::CudaDevice(dst))
+                if Some(src) == ordinal && Some(dst) == ordinal
+        );
+        if !served {
+            return Err(Error::Unsupported {
+                verb: kv_copy_direction(copy.src, copy.dst),
+                engine: "cuda",
+            });
+        }
+        let page_size = self.loaded_mut()?.paging().page_size;
+        let mut moves: Vec<crate::store::Move> =
+            Vec::with_capacity(copy.src_page_ids.len() + copy.moves.len());
+        // The whole-page half: every token slot of the page, both sides at
+        // offset zero. A page's LIVE length is the runtime's bookkeeping and
+        // not a number this verb is handed, so the whole page moves — which is
+        // also what dev's `copy_d2d_async` did, page by page.
+        for (src, dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
+            moves.push(crate::store::Move {
+                src_page: *src,
+                src_token: 0,
+                dst_page: *dst,
+                dst_token: 0,
+                tokens: page_size,
+            });
+        }
+        // The token-granular half, coalesced into runs.
+        for (at, cell) in copy.moves.iter().enumerate() {
+            if cell.src_token_offset >= page_size || cell.dst_token_offset >= page_size {
+                return Err(Error::Invalid(format!(
+                    "kv move {at} names token offsets {}/{} in pages of {page_size} tokens",
+                    cell.src_token_offset, cell.dst_token_offset
+                )));
+            }
+            if cell.src_page_id == cell.dst_page_id
+                && cell.src_token_offset == cell.dst_token_offset
+            {
+                continue;
+            }
+            let run = moves.last_mut().filter(|run| {
+                run.src_page == cell.src_page_id
+                    && run.dst_page == cell.dst_page_id
+                    && run.src_token + run.tokens == cell.src_token_offset
+                    && run.dst_token + run.tokens == cell.dst_token_offset
+                    && run.src_token + run.tokens < page_size
+            });
+            match run {
+                Some(run) => run.tokens += 1,
+                None => moves.push(crate::store::Move {
+                    src_page: cell.src_page_id,
+                    src_token: cell.src_token_offset,
+                    dst_page: cell.dst_page_id,
+                    dst_token: cell.dst_token_offset,
+                    tokens: 1,
+                }),
+            }
+        }
+        // **OVERLAPPING ENDS ARE THE CALLER'S ERROR AND ARE NAMED HERE.** Both
+        // ends of a run live in the same arena, so a run that reads and writes
+        // overlapping cells of one page is a device copy with overlapping
+        // ends — undefined, and silently so. A caller that means "shift a
+        // page's tokens" states a staging page and two moves.
+        for run in &moves {
+            if run.src_page != run.dst_page {
+                continue;
+            }
+            let (lo, hi) = (
+                u32::min(run.src_token, run.dst_token),
+                u32::max(run.src_token, run.dst_token),
+            );
+            if hi - lo < run.tokens {
+                return Err(Error::Invalid(format!(
+                    "a kv move of {} tokens reads page {} from token {} and writes the same \
+                     page at token {} — the two ends overlap, and a device copy whose ends \
+                     overlap is undefined rather than a shift",
+                    run.tokens, run.src_page, run.src_token, run.dst_token
+                )));
+            }
+        }
+        self.loaded_mut()?.copy_kv(&moves).map_err(fault)
+    }
+
+    // `encode` takes the trait's default body. See the module header: the
+    // shell genuinely carries no multimodal encoder, and a stub that answered
+    // `Ok(())` would make an image prompt appear to work.
 }
 
 impl Cuda {
     /// One step of an admitted frame, run to completion.
     ///
-    /// **THE DOUBLE DOOR, CLOSED** (alto design §9). What stood here was a
-    /// loop asking `program_ready` over every attachment so that a blocked
-    /// guest could be answered `Error::Exhausted` — and then `serve`'s own
-    /// gate asked the identical question a few microseconds later, because it
-    /// has to: an epilogue that discovers its rings are not ready AFTER the
-    /// forward is a fire nobody can retry. Two doors, one question, and the
-    /// only reason for the first one was that the shell spoke `Fault` and
-    /// `Exhausted` is a contract word. `Fault::Blocked` is that word in the
-    /// shell's language and `fault()` is the translation, so the question is
-    /// asked once now, where the answer is load-bearing.
+    /// **BOTH DOORS, CLOSED** (alto design §9, then §1 article 4). What stood
+    /// here was a loop asking `program_ready` over every attachment so that a
+    /// blocked guest could be answered `Error::Exhausted`; F2a deleted it and
+    /// left `serve`'s own gate asking the identical question. Wave E deletes
+    /// that one too. Readiness is not a fire-path question at all: the
+    /// runtime proves it over the whole frame at `submit`
+    /// (`validate_frame`), and past that door a pass that does not commit is
+    /// a fault naming the instance and the channel — never a replay.
     fn fire_step(
         &mut self,
         submission: &Step,
@@ -1027,19 +1485,6 @@ impl Cuda {
                         engine: "cuda",
                     });
                 }
-                if !lane.kv.translation.is_empty() {
-                    // A fork moved this lane's pages, and the runtime states
-                    // both the old ids and the new. The shell reads the page
-                    // table it is given and never the one before it, so a
-                    // translation is either already applied to `pages` — in
-                    // which case stating it is redundant — or it is not, in
-                    // which case honouring it needs a page mover this shell
-                    // does not have (`copy_kv`, unsupported below).
-                    return Err(Error::Unsupported {
-                        verb: "kv page translation",
-                        engine: "cuda",
-                    });
-                }
                 Ok(Seated {
                     lane: Lane {
                         slot: lane.slot,
@@ -1048,6 +1493,10 @@ impl Cuda {
                     },
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                    // The two spaces, both crossing here: `pages` is already
+                    // pool ids and this is the table the ports resolved off
+                    // the rings still have to go through.
+                    translation: &lane.kv.translation,
                     // `palo B-mask`, closed on this side. The `masked` fact
                     // is a declared axis (design §0/§8) and the mask itself
                     // is a runtime input, so the shell carries the bits and
@@ -1080,6 +1529,31 @@ impl Cuda {
                     // is `Fault::DraftWord` / `Fault::ScoreWord`.
                     drafts: lane.drafts,
                     captures_scores: lane.captures_scores,
+                    // `alto F3`, closed on this side: the verb and the reset
+                    // fact cross unchanged, and the SHELL decides what they
+                    // mean. A verb against a plan with no chunked recurrence
+                    // is `Fault::Unbound` at the fire, named there rather
+                    // than refused for every model here — the mask's rule and
+                    // the adapter's, for the sixth time.
+                    rs: lane.rs.clone(),
+                    rs_reset: lane.rs_reset,
+                    // **THE ROW LIST CROSSES TO THE DEVICE HALF TOO**
+                    // (`palo B-readout`). `settle_frame` hands the same
+                    // `Readout` to `Shell::read_out_rows` for the HOST mirror;
+                    // this hands the row indices to the fire, because the
+                    // other reader of a fire's logits is a guest epilogue
+                    // reading `IntrinsicId::Logits` on the device and the
+                    // shell is the only party that knows where a lane's row
+                    // run sits in the arena rectangle.
+                    //
+                    // `Last` and `None` both cross as `None`, which is the
+                    // lane's last row: that is the row every epilogue was
+                    // given before a list could be stated, and a lane that
+                    // asked for no host mirror may still carry an epilogue.
+                    readout: match &lane.readout {
+                        Readout::Rows(rows) => Some(rows.as_slice()),
+                        Readout::Last | Readout::None => None,
+                    },
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
@@ -1153,19 +1627,18 @@ impl Cuda {
         // readout list"). The numbers, for a caller that wants them, come from
         // `Engine::settle_frame`; the runtime never asks, because a guest
         // reads its logits on the device through the epilogue's intrinsic.
-        for lane in &submission.lanes {
-            if let Readout::Rows(_) = lane.readout {
-                // palo B-readout: reading an interior row means keeping the
-                // whole logits rectangle addressable after the walk, which the
-                // arena does — `slots.0[out]` is the rectangle — but the row
-                // list has to reach the read-back loop, and `Shell::read_out`
-                // answers one row per lane by design.
-                return Err(Error::Unsupported {
-                    verb: "row-selected readout",
-                    engine: "cuda",
-                });
-            }
-        }
+        //
+        //    **AND `Readout::Rows` IS NOT REFUSED HERE ANY MORE** (`palo
+        //    B-readout`, closed). What stood at this line was a loop refusing
+        //    every lane that named interior rows, on the true observation that
+        //    `Shell::read_out` answered one row per lane. The rectangle was
+        //    always addressable after the walk — `slots.0[out]` is it, and the
+        //    capture columns are already read at a lane's own row run — so
+        //    what was missing was the row LIST, which `PendingStep` was
+        //    already carrying to settlement and now hands to
+        //    `Shell::read_out_rows`. A row past the lane's own rows is refused
+        //    by `Lane::validate_for` at submit, and again by name in the
+        //    read-back loop.
         Ok((
             FireTicket {
                 id,
@@ -1176,6 +1649,34 @@ impl Cuda {
                 settled,
             },
         ))
+    }
+}
+
+/// **The verb name a refused `copy_kv` direction is refused under.**
+///
+/// A `&'static str` because [`Error::Unsupported`] carries one, so the pairs
+/// this shell can be asked for are enumerated rather than formatted. That is
+/// not a limitation being worked around: a refusal a caller can MATCH ON is
+/// worth more than one it can only print, and there are seven domains and one
+/// served pair.
+fn kv_copy_direction(src: MemoryDomain, dst: MemoryDomain) -> &'static str {
+    match (src, dst) {
+        (MemoryDomain::HostPinned, MemoryDomain::HostPinned) => {
+            "`copy_kv` host-pinned to host-pinned, which is the caller's own memmove"
+        }
+        (MemoryDomain::HostPinned, _) => {
+            "`copy_kv` out of host-pinned memory, which needs a swap pool this load does not \
+             reserve"
+        }
+        (_, MemoryDomain::HostPinned) => {
+            "`copy_kv` into host-pinned memory, which needs a swap pool this load does not \
+             reserve"
+        }
+        (MemoryDomain::CudaDevice(_), MemoryDomain::CudaDevice(_)) => {
+            "`copy_kv` between two CUDA ordinals, which needs a peer mapping this load has not \
+             opened"
+        }
+        _ => "`copy_kv` between the domains named, neither of which is this load's own device",
     }
 }
 
@@ -1223,25 +1724,41 @@ fn attributed(error: Error, airborne: u64) -> Error {
 /// a different reader, and a lane that asked for its mass and set
 /// `Readout::None` for its logits asked for both of those things and meant
 /// them.
+///
+/// **THE ROW COUNT IS THE SHELL'S ANSWER AND NOT THIS FUNCTION'S GUESS.**
+/// `Shell::read_out_rows` was handed the same `Readout` list and reports what
+/// it actually mirrored in `Settled::rows`; the width is then one division
+/// rather than a second reading of the same policy. That is what keeps a
+/// three-row readout from being described as one row of triple width by a
+/// function that never saw the rectangle.
 fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
     let mut out = Vec::with_capacity(step.readout.len());
     for (lane, want) in step.readout.iter().enumerate() {
         let scores = step.settled.scores.get(lane).cloned().unwrap_or_default();
         let values = step.settled.logits.get(lane).cloned().unwrap_or_default();
+        let rows = step.settled.rows.get(lane).copied().unwrap_or(0);
+        let width = if rows == 0 {
+            0
+        } else {
+            u32::try_from(values.len() / rows as usize).unwrap_or(u32::MAX)
+        };
         out.push(match want {
+            // The shell mirrored nothing for this lane, so `values` is already
+            // empty and `rows` already zero; the arm is written out anyway
+            // because the CAPTURE still crosses and the default is what
+            // carries it.
             Readout::None => LaneReadout {
                 scores,
                 ..LaneReadout::default()
             },
-            Readout::Last => LaneReadout {
-                rows: 1,
-                width: u32::try_from(values.len()).unwrap_or(u32::MAX),
+            // One row under `Last`, `n` rows in the caller's own order under
+            // `Rows(n)`, and the same three fields describe both.
+            Readout::Last | Readout::Rows(_) => LaneReadout {
+                rows,
+                width,
                 values,
                 scores,
             },
-            // Refused at submit; a `Vec` of nothing is the only honest answer
-            // if one ever reached here.
-            Readout::Rows(_) => LaneReadout::default(),
         });
     }
     out
@@ -1255,3 +1772,84 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
 // one thread touches a shell at a time.
 unsafe impl Send for Cuda {}
 unsafe impl Sync for Cuda {}
+
+#[cfg(test)]
+mod tests {
+    use super::{LATTICE_FLOOR, default_lattice, lattice};
+
+    /// The lattice a `Boot` that stated none is served, spelled out: geometric
+    /// above a floor of eight, so that no fire computes more than twice its own
+    /// rows and no decode fire lands on a bucket boundary its solo twin missed.
+    #[test]
+    fn the_default_lattice_is_geometric_above_the_floor() {
+        assert_eq!(
+            default_lattice(8192),
+            vec![8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
+        );
+    }
+
+    /// **THE ARM FLIP AT ONE ROW IS WHAT THE FLOOR EXISTS TO KILL** (the
+    /// cuda-abi census: a one-lane decode takes the gemv arm, a two-lane one
+    /// does not, and 127 launches change kernel across that boundary). A
+    /// lattice naming 1 would leave it exactly where it was.
+    #[test]
+    fn no_default_lattice_names_a_bucket_that_keeps_the_gemv_arm_alive() {
+        for ceiling in [8u32, 16, 64, 256, 8192] {
+            assert!(
+                default_lattice(ceiling).iter().all(|point| *point > 1),
+                "a lattice for {ceiling} rows puts a fire on M=1"
+            );
+        }
+    }
+
+    /// Two properties P0 refuses a lattice for (`model_compiler`'s `accept`):
+    /// it must strictly ascend, and no point may pass the token ceiling. A
+    /// default that could not be baked would turn every unstated lattice into
+    /// `Fault::Bake`.
+    #[test]
+    fn the_default_lattice_ascends_and_stops_at_the_ceiling() {
+        for ceiling in [1u32, 2, 3, 4, 63, 64, 65, 256, 511, 8192] {
+            let lattice = default_lattice(ceiling);
+            assert_eq!(
+                *lattice.last().expect("a lattice is never empty"),
+                ceiling,
+                "a fire AT the ceiling must have a bucket"
+            );
+            assert!(
+                lattice.windows(2).all(|pair| pair[0] < pair[1]),
+                "{lattice:?} does not strictly ascend"
+            );
+            assert!(
+                lattice.iter().all(|point| *point <= ceiling),
+                "{lattice:?} names a bucket past the token ceiling"
+            );
+        }
+    }
+
+    /// The waste D4 pays is bounded by the lattice's ratio, and a geometric
+    /// lattice is what makes that a sentence with a number in it: no fire ever
+    /// computes more than twice the rows it has.
+    #[test]
+    fn no_fire_above_the_floor_is_padded_past_twice_its_own_rows() {
+        let lattice = default_lattice(8192);
+        for rows in LATTICE_FLOOR..=8192 {
+            let bucket = lattice
+                .iter()
+                .copied()
+                .find(|point| *point >= rows)
+                .expect("every row count up to the ceiling has a bucket");
+            assert!(
+                u64::from(bucket) < 2 * u64::from(rows),
+                "a fire of {rows} rows pads to {bucket}"
+            );
+        }
+    }
+
+    /// A stated lattice is kept, and an unstated one is filled — the whole of
+    /// [`lattice`], and the property that made `PIE_CUDA_BUCKETS` unnecessary.
+    #[test]
+    fn a_stated_lattice_is_kept_and_an_unstated_one_is_filled() {
+        assert_eq!(lattice(vec![4, 9, 33], 64), vec![4, 9, 33], "stated wins");
+        assert_eq!(lattice(Vec::new(), 64), default_lattice(64));
+    }
+}

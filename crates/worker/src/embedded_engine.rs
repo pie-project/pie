@@ -461,7 +461,7 @@ pub use engine_api::Capabilities as EngineCapabilities;
 /// each seated sequence one block of `max_context / page_size` pages: how
 /// many sequences fit is that division, not a third knob to keep in step.
 #[cfg(any(feature = "_engine-cuda", test))]
-fn cuda_budgets(opts: &CudaNativeEngineOptions) -> engine_api::Budgets {
+fn cuda_budgets(opts: &CudaNativeEngineOptions, adapter_seats: u32) -> engine_api::Budgets {
     let page_size = opts.kv_page_size.unwrap_or(16).max(1);
     // No CUDA knob states a context ceiling — `max_model_len` is the Metal
     // options' — so this is the contract's own default, stated once here
@@ -474,17 +474,22 @@ fn cuda_budgets(opts: &CudaNativeEngineOptions) -> engine_api::Budgets {
         // v1 pads nothing: a fire's shape IS its graph key (`engine-cuda`'s
         // `record.rs` argues the mechanism, and what padding would take).
         buckets: Vec::new(),
-        // **THE BUDGET IS AN INTENT, AND NO WORKER OPTION NAMES ONE** (palo
-        // C2). Capacity is a SHAPE the model text declares — every bank a
-        // plan carries is reserved at load whatever this number is, and
+        // **THE BUDGET IS AN INTENT, AND NOW AN OPERATOR NAMES IT** (palo C2,
+        // alto D1). Capacity is a SHAPE the model text declares — every bank
+        // a plan carries is reserved at load whatever this number is, and
         // `Engine::register_adapter` is checked against that shape — so what
         // `max_adapters` states is how many the DEPLOYMENT intends to
         // register, and `model_compiler::compile` refuses a load whose intent
-        // is bigger than what the text seats. Zero is the honest answer for a
-        // boot config with no knob for it: this worker registers none. The
-        // knob, and the request-side id that would make it worth having,
-        // arrive with the client-facing half.
-        max_adapters: 0,
+        // is bigger than what the text seats.
+        //
+        // It was hard-coded `0` under a comment saying "the knob, and the
+        // request-side id that would make it worth having, arrive with the
+        // client-facing half". The knob is `[model.adapters]` and it arrives
+        // here as one number (article 8): `AdapterConfig::seats`, which is
+        // what the operator stated or what their roster needs. Zero is still
+        // the answer for a deployment that states nothing, and zero is still
+        // the load where the correction op never launches.
+        max_adapters: adapter_seats,
         page_size,
         max_context,
         slots: opts
@@ -522,9 +527,83 @@ fn land(
     // frame_dispatch_depth` is the deployment's statement of how many frames
     // it will keep posted to the engine; the engine's staging ring and
     // settlement event pool are sized from it and from nothing else.
-    let request =
-        ::runtime::engine::load::request(snapshot_dir, platform, budgets, -1, frames_in_flight)?;
+    let request = ::runtime::engine::load::request(
+        snapshot_dir,
+        platform,
+        budgets,
+        // **UNCAPPED, WHICH IS WHAT THIS DEPLOYMENT HAS ALWAYS ASKED FOR**
+        // (alto design §7). The residency policy is two budgets and `None`
+        // is uncapped; no shell in this workspace streams weights, so the
+        // only budget a worker could state that would change anything is one
+        // that refuses the load. Stated by name rather than left to
+        // `Default` so that the day `[model]` grows a weight budget, this is
+        // the line it arrives at.
+        engine_api::Residency::uncapped(),
+        -1,
+        frames_in_flight,
+    )?;
     backend.load(request).map_err(anyhow::Error::from)
+}
+
+/// **Write the operator's adapters into the banks the load just reserved**
+/// (alto design §8, decision 17; survey §2 debt 6's "doors on both sides with
+/// nothing between").
+///
+/// `runtime::engine::verbs::register_adapter` has existed since the palo
+/// rewrite with no caller anywhere: the bytes had a door, a lane had a field,
+/// and nothing in the tree walked through either. This is the first caller,
+/// and boot is the right instant for it — registration is a control-plane
+/// RESIDENCY verb, once per adapter and never again
+/// (`engine_api::adapter`'s own argument for why it is not a `transfer`), so
+/// it belongs beside the load rather than on any request path.
+///
+/// It runs HERE, between `land` and the engine's handover to the scheduler,
+/// because that is the last instant the worker holds the `EngineBox` itself.
+///
+/// A plane file is one bank's slot, verbatim: the padding is the caller's
+/// (`engine_api::adapter` argues why a shell cannot do it), and a file whose
+/// length is not the slot's is refused by the engine with both numbers in it.
+///
+/// # Errors
+///
+/// A plane file that will not read, or whatever the engine refused — an
+/// unknown bank, an id past the capacity the plan seats, a plane that is not
+/// one slot's bytes, or `Unsupported` from a shell whose loads seat no bank.
+fn register_operator_adapters(
+    backend: &mut ::runtime::engine::EngineBox,
+    adapters: &crate::config::AdapterConfig,
+) -> Result<()> {
+    for adapter in &adapters.registered {
+        let mut planes = Vec::with_capacity(adapter.planes.len());
+        for (bank, path) in &adapter.planes {
+            let bytes = std::fs::read(path).with_context(|| {
+                format!(
+                    "read the plane for bank {bank:?} of adapter {} from {path:?}",
+                    adapter.id
+                )
+            })?;
+            planes.push(::runtime::engine::AdapterPlane {
+                bank: bank.clone(),
+                bytes,
+            });
+        }
+        let registration = ::runtime::engine::AdapterRegistration {
+            id: adapter.id,
+            planes,
+        };
+        ::runtime::engine::verbs::register_adapter(backend, &registration).with_context(|| {
+            format!(
+                "registering adapter {} into this model's banks",
+                adapter.id
+            )
+        })?;
+        tracing::info!(
+            id = adapter.id,
+            planes = adapter.planes.len(),
+            "registered an operator-declared adapter into this model's banks"
+        );
+    }
+    Ok(())
 }
 
 /// Write the cuda engine's bootstrap TOML. Schema mirrors
@@ -633,6 +712,45 @@ pub(crate) fn write_cuda_startup_toml(
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", opts.verbose);
     insert_table(&mut doc, "runtime", runtime);
+
+    // **`[engine]`: THE SHELL'S OWN WORDS** (alto article 9 — shells read no
+    // environment). Nine `PIE_CUDA_*` variables were read inside the shell at
+    // load and are typed `Boot` fields now; this is the table they arrive
+    // through, and `runtime::engine::backend::cuda::knobs` is the one reader.
+    //
+    // EVERY KEY IS OMITTED WHEN THE OPERATOR STATED NOTHING, like the derived
+    // keys above and for the same reason: the shell's own default IS the
+    // answer for an absent key, so writing one would be a second spelling of
+    // absence — and, here, a second place the default is written down.
+    let mut engine = toml::Table::new();
+    if let Some(graphs) = opts.graphs.as_deref() {
+        insert_str(&mut engine, "graphs", graphs);
+    }
+    if let Some(pad) = opts.pad {
+        insert_bool(&mut engine, "pad", pad);
+    }
+    if let Some(fold) = opts.fold {
+        insert_bool(&mut engine, "fold", fold);
+    }
+    if let Some(pipeline) = opts.pipeline {
+        insert_bool(&mut engine, "pipeline", pipeline);
+    }
+    if let Some(policy) = opts.fold_disable.as_deref() {
+        insert_str(&mut engine, "fold_disable", policy);
+    }
+    if let Some(copies) = opts.fallback_copy {
+        insert_bool(&mut engine, "fallback_copy", copies);
+    }
+    if let Some(grouped) = opts.grouped {
+        insert_bool(&mut engine, "grouped", grouped);
+    }
+    if let Some(streams) = opts.side_streams {
+        insert_int(&mut engine, "side_streams", i64::from(streams));
+    }
+    if !engine.is_empty() {
+        insert_table(&mut doc, "engine", engine);
+    }
+
     insert_cache_table(&mut doc);
 
     if let Some(tp) = tp {
@@ -773,6 +891,7 @@ pub(crate) fn create_engine_backend_group(
     tp_launches: &[TpLaunch],
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
+    adapters: &crate::config::AdapterConfig,
 ) -> Result<crate::translate::GroupEngine> {
     validate_snapshot_dir(snapshot_dir)?;
     if rank_options.is_empty() {
@@ -851,11 +970,15 @@ pub(crate) fn create_engine_backend_group(
     let loaded = land(
         &mut backend,
         snapshot_dir,
-        cuda_budgets(opts),
+        cuda_budgets(opts, adapters.seats()),
         engine_api::model_ir::Platform::Cuda,
         component,
         frames_in_flight,
     )?;
+    // THE BANKS ARE RESERVED BY THE LOAD; THIS IS THE WRITE. Between the
+    // load and the handover is the last instant this layer holds the engine.
+    register_operator_adapters(&mut backend, adapters)?;
+
     Ok(crate::translate::GroupEngine {
         caps: loaded.caps,
         facts: loaded.facts,
@@ -882,6 +1005,7 @@ pub(crate) fn create_engine_backend(
     tp: Option<&TpLaunch>,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
+    adapters: &crate::config::AdapterConfig,
 ) -> Result<crate::translate::GroupEngine> {
     // Each is used only inside a `#[cfg(feature = "engine-…")]` arm below.
     let _ = (group_id, tp, config, weight_dtype);
@@ -943,7 +1067,7 @@ pub(crate) fn create_engine_backend(
                 let backend = ::runtime::engine::backend::open::cuda(&boot_doc)?;
                 (
                     backend,
-                    cuda_budgets(opts),
+                    cuda_budgets(opts, adapters.seats()),
                     engine_api::model_ir::Platform::Cuda,
                 )
             }
@@ -976,7 +1100,12 @@ pub(crate) fn create_engine_backend(
                         max_lanes: opts.max_forward_requests.max(1),
                         max_tokens: opts.max_forward_tokens.max(1),
                         buckets: Vec::new(),
-                        max_adapters: 0,
+                        // The same one number the CUDA arm takes. `[model]`
+                        // rather than `[model.engine.options]` is what makes
+                        // it portable: debt 6's complaint was that Metal had
+                        // no configuration at all, and an adapter seat count
+                        // is not a fact about a backend.
+                        max_adapters: adapters.seats(),
                         page_size: opts.kv_page_size.max(1),
                         max_context: opts
                             .max_model_len
@@ -1006,6 +1135,11 @@ pub(crate) fn create_engine_backend(
         frames_in_flight,
     )?;
 
+    // THE BANKS ARE RESERVED BY THE LOAD; THIS IS THE WRITE. See
+    // `register_operator_adapters` — this is `verbs::register_adapter`'s
+    // first caller in the tree.
+    register_operator_adapters(&mut backend, adapters)?;
+
     Ok(crate::translate::GroupEngine {
         caps: loaded.caps,
         facts: loaded.facts,
@@ -1030,7 +1164,7 @@ mod tests {
             max_total_pages: Some(1024),
             ..Default::default()
         };
-        let budgets = cuda_budgets(&opts);
+        let budgets = cuda_budgets(&opts, 0);
         assert_eq!(budgets.page_size, 16);
         // 4096 tokens of context is 256 pages a slot; 1024 pages seats four.
         assert_eq!(budgets.max_context, 4096);
@@ -1039,12 +1173,32 @@ mod tests {
         // No cap stated: the contract's own default seat count, not a
         // division by nothing.
         opts.max_total_pages = None;
-        assert_eq!(cuda_budgets(&opts).slots, 256);
+        assert_eq!(cuda_budgets(&opts, 0).slots, 256);
 
         // A cap smaller than one slot's block still seats one — a pool that
         // seats nothing is a load that cannot fire.
         opts.max_total_pages = Some(1);
-        assert_eq!(cuda_budgets(&opts).slots, 1);
+        assert_eq!(cuda_budgets(&opts, 0).slots, 1);
+    }
+
+    /// **THE OPERATOR'S SEAT COUNT REACHES THE BUDGET**, which is the half of
+    /// design §8 that was a hard-coded zero (survey §2 debt 6: doors on both
+    /// sides with nothing between).
+    ///
+    /// `max_adapters` is an INTENT, not a pool size: the banks are reserved
+    /// at load whatever this says, and `model_compiler::compile` refuses a
+    /// load whose intent is bigger than what the model text seats. So the
+    /// only thing this layer owes is that the number an operator wrote is
+    /// the number that crosses.
+    #[test]
+    fn the_adapter_seat_count_crosses_into_the_budget() {
+        let opts = CudaNativeEngineOptions::default();
+        assert_eq!(
+            cuda_budgets(&opts, 0).max_adapters,
+            0,
+            "a deployment that states no adapters still registers none"
+        );
+        assert_eq!(cuda_budgets(&opts, 8).max_adapters, 8);
     }
 
     /// A stand-in checkpoint config for the tests that are about something
@@ -1156,6 +1310,54 @@ mod tests {
         .unwrap();
         let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(val["cache"]["dir"].as_str().unwrap(), "/pie-home/cache");
+    }
+
+    /// **THE `[engine]` TABLE, WRITTEN** (alto wave P, article 9). The nine
+    /// `PIE_CUDA_*` words the shell used to read are `[engine]` keys now, and a
+    /// key nobody writes is a key nobody can set — the same failure
+    /// `[model] weight_cache_dir` had for a whole rewrite.
+    ///
+    /// A default boot writes NO `[engine]` table at all, because the shell's
+    /// own default is the answer for an absent key and a second spelling of
+    /// absence is a second place the default is written down.
+    #[test]
+    fn the_startup_toml_writes_only_the_engine_knobs_an_operator_stated() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("snapshot");
+
+        let write = |opts: &CudaNativeEngineOptions, name: &str| -> toml::Value {
+            let out = dir.path().join(name);
+            write_cuda_startup_toml(&out, opts, DTYPE, &snap, 0, None, CONFIG).unwrap();
+            toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap()
+        };
+
+        let quiet = write(&CudaNativeEngineOptions::default(), "quiet.toml");
+        assert!(
+            quiet.get("engine").is_none(),
+            "a boot that stated no knob must write no `[engine]` table: {quiet:?}"
+        );
+
+        let stated = write(
+            &CudaNativeEngineOptions {
+                graphs: Some("on".into()),
+                fold: Some(true),
+                pad: Some(false),
+                fold_disable: Some("library".into()),
+                side_streams: Some(0),
+                ..CudaNativeEngineOptions::default()
+            },
+            "stated.toml",
+        );
+        let engine = &stated["engine"];
+        assert_eq!(engine["graphs"].as_str().unwrap(), "on");
+        assert_eq!(engine["fold"].as_bool().unwrap(), true);
+        assert_eq!(engine["pad"].as_bool().unwrap(), false);
+        assert_eq!(engine["fold_disable"].as_str().unwrap(), "library");
+        assert_eq!(engine["side_streams"].as_integer().unwrap(), 0);
+        // And nothing the operator did not state.
+        assert!(engine.get("pipeline").is_none());
+        assert!(engine.get("grouped").is_none());
+        assert!(engine.get("fallback_copy").is_none());
     }
 
     #[test]

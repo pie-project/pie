@@ -148,7 +148,16 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
         max_context: 512,
         slots: 4,
     };
-    let request = runtime::engine::load::request(&checkpoint, Platform::Metal, budgets.clone(), 0, 1)
+    let request = runtime::engine::load::request(
+            &checkpoint,
+            Platform::Metal,
+            budgets.clone(),
+            // Uncapped: every load in this workspace is fully resident
+            // (alto design §7 — the tiers are D2's).
+            engine_api::Residency::uncapped(),
+            0,
+            1,
+        )
         .expect("the checkpoint identifies and its SKU traces");
     assert_eq!(
         request.plan.name, SKU,
@@ -202,6 +211,7 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
             drafts: false,
             captures_scores: false,
             rs: engine_api::RsVerb::Fold,
+            rs_reset: engine_api::RsReset::Inferred,
             channels: Vec::new(),
             readout: Readout::Last,
         }],

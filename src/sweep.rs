@@ -22,13 +22,19 @@ use anyhow::{Context, Result};
 
 /// The batching knobs one round holds fixed.
 ///
-/// Only the three that `scheduler::reconfigure` can move. The memory-lattice
+/// Only the two that `scheduler::reconfigure` can move. The memory-lattice
 /// knobs (`kv_page_size`, `max_forward_tokens`, `max_forward_requests`) are
 /// fixed at boot and belong to the engine's own sweep — see the plan's §6.
+///
+/// **THERE WERE THREE, AND THE THIRD WAS THE SAME NUMBER** (alto E, survey
+/// debt 8). `submit_depth` — frames a guest keeps outstanding — was swept as
+/// its own axis, five values wide, and it is `dispatch_depth + 1`
+/// (`engine::runahead::Runahead::submit_depth`). Sweeping it independently
+/// measured eighty candidates where sixteen exist, and four fifths of them
+/// were configs the runtime can no longer be asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Knobs {
     pub frame_size: usize,
-    pub submit_depth: usize,
     pub dispatch_depth: usize,
 }
 
@@ -56,13 +62,17 @@ impl Knobs {
         worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).staging_depth()
     }
 
+    /// Frames a guest keeps outstanding at this shape — derived, not swept.
+    pub fn submit_depth(&self) -> usize {
+        worker::config::Runahead::of(self.dispatch_depth.min(255) as u8).submit_depth()
+    }
+
     /// Is this a shape `RuntimeConfig::validate` will admit?
     pub fn admissible(&self) -> bool {
         self.frame_size >= 1
             && self.frame_size <= Self::MAX_FRAME_SIZE
             && self.dispatch_depth >= 1
             && self.dispatch_depth <= Self::MAX_DISPATCH_DEPTH
-            && self.submit_depth >= 2
     }
 }
 
@@ -70,8 +80,10 @@ impl std::fmt::Display for Knobs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "k={} submit={} dispatch={}",
-            self.frame_size, self.submit_depth, self.dispatch_depth
+            "k={} dispatch={} (submit={})",
+            self.frame_size,
+            self.dispatch_depth,
+            self.submit_depth()
         )
     }
 }
@@ -327,13 +339,9 @@ pub async fn sweep_all(
 
     for pass in 0..repeats {
         for (index, knobs) in candidates.iter().enumerate() {
-            runtime::scheduler::reconfigure(
-                knobs.frame_size,
-                knobs.submit_depth,
-                knobs.dispatch_depth,
-            )
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("apply {knobs}"))?;
+            runtime::scheduler::reconfigure(knobs.frame_size, knobs.dispatch_depth)
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("apply {knobs}"))?;
             let run = fleet::run(addr, program, inputs).await;
             throughputs[index].push(run.throughput_tok_s());
             p95s[index].push(run.lane_percentile_us(95) as f64);
@@ -375,29 +383,17 @@ pub fn candidates() -> Vec<Knobs> {
     for frame_size in [1usize, 2, 3, 4] {
         let mut group = Vec::new();
         for dispatch_depth in 1usize..=4 {
-            // `submit_depth` does not enter the bound, so any value answers it.
-            let shape = Knobs {
+            // **THE BOUND IS PER FACTOR** (alto F2b): the engine carves its
+            // staging ring from these two numbers rather than owning a fixed
+            // pool a product could overflow, so what a candidate has to clear
+            // is `frame_size <= STEPS_MAX` and `dispatch_depth <= MAX_FRAMES`
+            // — both of which the loops above already stay inside, which is
+            // why nothing is skipped here. The guest's own window rides along
+            // (`Knobs::submit_depth`) rather than being a third loop.
+            group.push(Knobs {
                 frame_size,
-                submit_depth: 2,
                 dispatch_depth,
-            };
-            // **THE BOUND IS PER FACTOR NOW** (alto F2b): the engine carves
-            // its staging ring from these two numbers rather than owning a
-            // fixed pool a product could overflow, so what a candidate has to
-            // clear is `frame_size <= STEPS_MAX` and
-            // `dispatch_depth <= MAX_FRAMES` — both of which the loops above
-            // already stay inside, which is why nothing is skipped here.
-            let _ = &shape;
-            // `frame_submit_depth` must be at least 2 -- one frame runs while
-            // the rest stay queued, and 1 leaves nothing queued. Its own field
-            // doc has the argument, and `RuntimeConfig::validate` enforces it.
-            for submit_depth in 2usize..=6 {
-                group.push(Knobs {
-                    frame_size,
-                    submit_depth,
-                    dispatch_depth,
-                });
-            }
+            });
         }
         groups.push(group);
     }
@@ -436,7 +432,7 @@ mod tests {
         assert!(!candidates.is_empty());
         for knobs in &candidates {
             assert!(knobs.admissible(), "{knobs} is a shape the runtime refuses");
-            assert!(knobs.submit_depth >= 2, "{knobs} leaves nothing queued");
+            assert!(knobs.submit_depth() >= 2, "{knobs} leaves nothing queued");
         }
     }
 
@@ -484,7 +480,6 @@ mod tests {
 
     const BASE: Knobs = Knobs {
         frame_size: 2,
-        submit_depth: 3,
         dispatch_depth: 2,
     };
 
