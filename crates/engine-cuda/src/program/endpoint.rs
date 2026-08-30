@@ -133,6 +133,45 @@ pub struct Endpoint {
     /// How many instances have bound this channel — [`MAX_ATTACHMENTS`] at
     /// most.
     attachments: AtomicU32,
+    /// **THE SHARED RING'S HOST PREDICTION, ON THE RING AND NOT IN A
+    /// SESSION** (alto article 3's exact shape, and the wave that removed the
+    /// boundary's wait).
+    ///
+    /// Two monotone counters, advanced by COUNTING when any attachment mints
+    /// a fire that moves them and rolled back when the device refuses it —
+    /// the same discipline [`Session::cursors`] keeps for a channel with one
+    /// engine-side owner. What makes them the ENDPOINT's is that a
+    /// device-only ring has no single engine-side owner: two attachments put
+    /// and take on one ring, so a prediction kept per session is a prediction
+    /// the other attachment cannot see.
+    ///
+    /// [`Session::cursors`]: super::session::Session#structfield.cursors
+    ///
+    /// **AND IT IS WHAT MAKES A DEFERRED SETTLEMENT SAFE.** The words are
+    /// advanced by `channel::settle` on the DEVICE now, so between a fire's
+    /// mint and the moment that kernel runs they stand one behind what the
+    /// host has minted, and after it they stand level. A host answer computed
+    /// as `words + this session's unsettled count` is therefore right only
+    /// while something forces the two to be read together — which is what the
+    /// boundary's `cudaStreamSynchronize` was doing, and what
+    /// `serve::AirborneFires` no longer takes. Counted here the answer never
+    /// consults a word at all, so no wait can make it more or less true.
+    ///
+    /// **IT DOES NOT DELETE `serve`'s SHARED-RING FLUSH, AND THE REASON IS
+    /// WORTH WRITING DOWN.** That flush looks like it exists for host
+    /// visibility and does not: `channel::pull_validate` runs ONCE at the
+    /// front of a wave, for every lane, before any lane's regions — so a
+    /// taking attachment batched with the putting one is validated against
+    /// words the putter's `channel::settle` has not reached yet, whatever the
+    /// host believes, and `REQUIRE_INPUT`'s `tail > head` is false. Two
+    /// attachments of one ring must be two waves. The prediction being the
+    /// ring's own fixes the ANSWER; only launch order can fix the ADMISSION.
+    ///
+    /// Ordered against the guest's own reads by nothing, because there is no
+    /// guest: `HostRole::None` is the one role with no other end. Atomic
+    /// because the sessions that share the ring share it through an `Arc`.
+    predicted_head: AtomicU64,
+    predicted_tail: AtomicU64,
     /// **Has a bind already planted this ring's seeds?**
     ///
     /// A seed is a cell the ring starts life holding, and a shared ring starts
@@ -205,6 +244,8 @@ impl Endpoint {
             wire_bytes,
             cap1,
             device_cells,
+            predicted_head: AtomicU64::new(0),
+            predicted_tail: AtomicU64::new(0),
             attachments: AtomicU32::new(0),
             seeded: AtomicU32::new(0),
         })
@@ -333,14 +374,24 @@ impl Endpoint {
         self.word(TAIL_WORD)
     }
 
-    /// Advance the head by one.
+    /// **Advance the head by one, word and prediction together.**
+    ///
+    /// The HOST's own advance — a seed planted at bind, or a
+    /// `host_take`/`host_put` between fires — and it is the one place the two
+    /// move as a pair. On the fire path they do not: the prediction advances
+    /// at mint and the word at settle, on the device, and
+    /// `channel::pull_validate` compares them. Here there is no fire between
+    /// the two, so leaving the prediction behind would make the next fire
+    /// predict a cell the host had already consumed.
     pub fn bump_head(&self) {
         self.store(HEAD_WORD, self.word(HEAD_WORD) + 1);
+        self.predict_head();
     }
 
-    /// Advance the tail by one.
+    /// [`Endpoint::bump_head`] for the tail.
     pub fn bump_tail(&self) {
         self.store(TAIL_WORD, self.word(TAIL_WORD) + 1);
+        self.predict_tail();
     }
 
     /// One wire cell of the mirror, at ring position `sequence % cap1`.
@@ -361,6 +412,52 @@ impl Endpoint {
         }
         let at = (sequence % u64::from(self.cap1)) as usize * self.wire_bytes as usize;
         self.mirror.write(at, wire)
+    }
+
+    /// **WHERE THIS SHARED RING STANDS, AS THE HOST HAS COUNTED IT** — the
+    /// prediction, not the words (see
+    /// [`predicted_head`](Endpoint#structfield.predicted_head)).
+    #[must_use]
+    pub fn predicted(&self) -> (u64, u64) {
+        (
+            self.predicted_head.load(Ordering::Acquire),
+            self.predicted_tail.load(Ordering::Acquire),
+        )
+    }
+
+    /// Advance the predicted head by one, at mint.
+    pub fn predict_head(&self) {
+        self.predicted_head.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Advance the predicted tail by one, at mint.
+    pub fn predict_tail(&self) {
+        self.predicted_tail.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// **Take a prediction back**, for a fire the device refused.
+    ///
+    /// The counterpart of [`Endpoint::predict_head`], and the reason a
+    /// refusal is survivable: a prediction that stayed advanced past a fire
+    /// that moved nothing would be compared by `channel::pull_validate`
+    /// against a word one behind it, forever, and every later fire on this
+    /// ring would be refused for the same reason. Saturating, because a
+    /// counter that went below its word would be the same failure mirrored.
+    pub fn unpredict_head(&self, by: u64) {
+        let _ = self
+            .predicted_head
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |at| {
+                Some(at.saturating_sub(by))
+            });
+    }
+
+    /// [`Endpoint::unpredict_head`] for the tail.
+    pub fn unpredict_tail(&self, by: u64) {
+        let _ = self
+            .predicted_tail
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |at| {
+                Some(at.saturating_sub(by))
+            });
     }
 
     /// One word, acquire-loaded: the other end of this counter is a different
@@ -408,6 +505,8 @@ mod tests {
             wire_bytes: 4,
             cap1: 2,
             device_cells: None,
+            predicted_head: AtomicU64::new(0),
+            predicted_tail: AtomicU64::new(0),
             attachments: AtomicU32::new(0),
             seeded: AtomicU32::new(0),
         };
@@ -437,6 +536,8 @@ mod tests {
             wire_bytes: 4,
             cap1: 2,
             device_cells: None,
+            predicted_head: AtomicU64::new(0),
+            predicted_tail: AtomicU64::new(0),
             attachments: AtomicU32::new(0),
             seeded: AtomicU32::new(0),
         };
@@ -466,6 +567,8 @@ mod tests {
             wire_bytes: 4,
             cap1: 2,
             device_cells: None,
+            predicted_head: AtomicU64::new(0),
+            predicted_tail: AtomicU64::new(0),
             attachments: AtomicU32::new(0),
             seeded: AtomicU32::new(0),
         };

@@ -9,7 +9,8 @@
 //! fire
 //! ----
 //! admit       the host pre-check, the Article 4 bridge (see below)   host
-//! mint        predictions -> tickets, cell addresses, slot lists     host
+//! mint        predictions -> tickets, cell addresses, slot lists,    host
+//!             appended as ONE LANE of the boundary's `Wave`
 //! pull        channel::pull_validate: seed the commit word, check    device
 //!             every prediction against the live pinned counters,
 //!             pull what the guest wrote into the device cells
@@ -18,9 +19,22 @@
 //!             ring state, and only if the commit word survived
 //! publish     channel::scatter_publish: the committed cells into     device
 //!             the guest's mapped pinned mirror — not a memcpy
-//! settle      one synchronize, then the verdict off the PINNED       host
-//!             commit word: never a device read
+//! settle      channel::settle: the endpoint's own counters, to the    device
+//!             prediction the fire was admitted on, predicated on the
+//!             same commit word
+//! reap        the verdict off the PINNED commit word, at the NEXT     host
+//!             frame: never a device read, never a wait of this fire's
+//!             own, and — since the row above became a kernel — never
+//!             a stream drain either
 //! ```
+//!
+//! **FOUR OF THOSE ROWS ARE THE WAVE'S AND NOT THIS SESSION'S.** `pull`,
+//! `bump`, `publish` and `settle` all take a LANE COUNT, and a boundary is
+//! sixty-four independent fires that all need them: they launch ONCE for the
+//! whole boundary, with a block per lane, over control structures every
+//! session appended to the same arena. What a session owns of a fire is its
+//! mint, its regions and its verdict. See [`super::wave`] for the arena and
+//! for the profile that moved it up a level.
 //!
 //! # What this replaced, and why the replacement is not optional
 //!
@@ -49,15 +63,33 @@
 //!   wrote it (the pinned mirror, inside `pull_validate`) and a pass's cell is
 //!   WRITTEN where the guest will read it (`scatter_publish`).
 //!
-//! # The end-of-fire synchronize is still the law (F2b is where it goes)
+//! # The end-of-fire synchronize is gone (alto §14 exception #1, closed)
 //!
-//! One `context.synchronize()` remains, at the end of the fire, and the
-//! settlement below reads the pinned commit word after it. That is deliberate
-//! for this wave: making settlement asynchronous needs the staging ring and
-//! more than one frame in flight, and both are the next wave's. What has
-//! already gone is everything the sync was load-bearing FOR — the per-stage
-//! sync, the commit readback, and the host cursor advance — so the sync is
-//! now a lifetime fence and not a control-flow one.
+//! F2b left one `context.synchronize()` at the end of the fire and registered
+//! it as a known exception. A c=64 profile is what came to collect: **16,898
+//! `cudaStreamSynchronize` for 869 ms, 44% of all CUDA API time**, four per
+//! attachment per token-step, and a GPU idle 45% of its own kernel span in
+//! ~56 µs bubbles that matched the fires one for one. Sixty-four independent
+//! passes were running as sixty-four serialized host round trips.
+//!
+//! So the fire is three parts now. [`Session::stage`] mints into the wave,
+//! [`Session::take_lane`] hands the boundary's launch this fire's row, and
+//! [`Session::settle_launched`] reads the verdict; the WAIT between them
+//! belongs to the caller, who takes one for a whole boundary — sixty-four
+//! epilogues enqueued back to back, then one synchronize, then sixty-four
+//! settlements — instead of one apiece. [`Plane::fire`] still composes the
+//! parts with a wait of its own, because a program fired on its own has
+//! nothing to overlap and a caller who asked for an answer.
+//!
+//! [`Plane::fire`]: super::Plane::fire
+//!
+//! What the wait still buys, and therefore what has to stand before any
+//! settlement, is unchanged: the commit word is the device's and reading it
+//! early answers about the previous fire. What it no longer buys is
+//! SEQUENCING between two attachments — with one exception the batching
+//! respects by name, a device-only ring two of them share, whose pinned
+//! counters advance at settle and are read by the next mint
+//! ([`Session::shared_rings`], and `serve`'s flush).
 //!
 //! # The Article 4 bridge, crossed (wave E)
 //!
@@ -100,17 +132,15 @@ use engine::tensor_ir::registry::GeometryClass;
 use engine::tensor_ir::container::HostRole;
 use engine::tensor_ir::validate::Direction;
 use engine::{ExecPlan, Extents};
-use kernels_cuda::channel::{self, BumpLane, PublishLane, PullLane, Ticket};
+use kernels_cuda::channel::{self, PublishLane, PullLane, SettleLane, Ticket};
 
-use crate::device::{Buffer, Context, Pinned};
+use crate::device::Pinned;
 use crate::error::{Fault, Result};
 
 use super::compile::Compiled;
 use super::endpoint::Endpoint;
-use super::launch::{
-    ChannelShape, Cursor, Prepared, Rings, native_to_wire, record_bytes, slice_bytes,
-    wire_to_native,
-};
+use super::launch::{ChannelShape, Cursor, Prepared, Rings, native_to_wire, wire_to_native};
+use super::wave::Wave;
 use super::ports::{self, Envelope};
 
 /// What one fire produced.
@@ -135,6 +165,38 @@ pub enum Fired {
     Faulted(String),
 }
 
+/// **What the STAGING half of a fire answers** — [`Session::stage`].
+///
+/// Deliberately not a `Fired`: the two outcomes a launch can reach are "this
+/// is on the stream and owes a settlement" and "this never launched and its
+/// verdict is already final", and collapsing them would let a caller settle
+/// something that was never airborne — or, worse, skip settling something
+/// that is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Launched {
+    /// The fire is on the stream. [`Session::settle_launched`] owes it a
+    /// verdict, after a synchronize the caller takes when it suits the caller.
+    Airborne,
+    /// Nothing launched and nothing is owed: a blocked channel, a poisoned
+    /// instance, or a mint that could not be made.
+    Refused(Fired),
+}
+
+/// **ONE INTRINSIC, POINTED AT A BUFFER AND WAITING FOR A LANE.**
+///
+/// The five numbers [`Prepared::bind_intrinsic`] writes, plus the id that says
+/// which row of the side tables they go in. Held per session because the ROW
+/// is per lane and the lane is not known until the boundary flies.
+#[derive(Clone, Copy, Debug)]
+struct Intrinsic {
+    id: engine::tensor_ir::op::IntrinsicId,
+    base: u64,
+    storage: u32,
+    width: u32,
+    row_stride: u32,
+    row_offset: u32,
+}
+
 /// One bound instance's device state.
 ///
 /// The cursors are `u64` sequence numbers that never wrap, exactly as the host
@@ -152,24 +214,32 @@ pub struct Session {
     /// the guest's own counter is its pinned word, and
     /// [`Session::cursors_now`] is where the two are read as one.
     cursors: Vec<Cursor>,
-    /// **What THIS session has minted and not yet settled**, per channel, for
-    /// the SHARED rings alone (design §5).
+    /// **WHAT THIS INSTANCE'S VALUE SHAPES RESOLVE AGAINST**, stated at bind
+    /// and never again.
     ///
-    /// A device-only ring's counters live in its endpoint and are advanced at
-    /// settle by whichever attachment committed; between a fire's mint and its
-    /// settle the ring stands one further on than its words say, for the
-    /// channels that fire moves. [`Session::merge`] adds this back so the
-    /// answer is the ring's, not a stale read of it.
+    /// Half of the key its [`Prepared`] batch is cut against — the program is
+    /// the other half — because [`engine::layout`]'s `offsets` are shared by
+    /// every lane of a launch and `describe` resolves a value's size against
+    /// these. Two attachments of one program that agree here ride one launch;
+    /// two that disagree are two launches, which is one more kernel and no
+    /// arithmetic anybody has to trust.
+    extents: Extents,
+    /// **THE INTRINSIC BINDINGS, HELD ON THE HOST UNTIL A LANE IS TAKEN.**
     ///
-    /// Zero for every channel that is not a shared ring, and — while
-    /// [`Session::fire`] synchronizes before it settles — zero everywhere
-    /// outside one `fire` call. Kept as arithmetic rather than as an
-    /// assumption about that synchronize.
-    inflight: Vec<Cursor>,
-    /// One per stage plan, `None` for a stage with nothing to launch — the
-    /// adapter prologue is exactly that, its one region being a sink the model
-    /// fire reads out of the plan rather than a body anyone compiled.
-    prepared: Vec<Option<Prepared>>,
+    /// A binding names a buffer, a storage mode, a width, a stride and a row —
+    /// and the row is the lane's own, which is exactly why it cannot be
+    /// written at the moment the caller states it: which lane of which batch
+    /// this fire will occupy is not decided until the boundary flies. So the
+    /// five numbers wait here and [`Prepared::bind_intrinsic`] writes them
+    /// into the batch's row when the lane is taken.
+    ///
+    /// It also deletes five `cudaMemcpyAsync` calls per attachment per
+    /// boundary — 320 a step at c=64, of four and eight bytes each — for five
+    /// copies of the whole table, once for the wave.
+    ///
+    /// Indexed by `IntrinsicId as usize`; a binding SURVIVES a fire, so this
+    /// is cleared by nothing.
+    intrinsics: Vec<Option<Intrinsic>>,
     /// Which intrinsics have been pointed at a buffer, one bit per
     /// `IntrinsicId`. Tracked because the emitted kernel DEREFERENCES an
     /// unbound intrinsic's base — the side tables start at zero, and zero is
@@ -188,21 +258,16 @@ pub struct Session {
     /// a synchronize — which is exactly the readback F2a exists to delete.
     /// Every writer of it is a kernel.
     commit: Pinned,
-    /// This fire's ticket table, one entry per host-visible channel that
-    /// makes a claim. Carved at bind: the fire path allocates nothing
-    /// (article 7).
-    tickets: Buffer,
-    /// The one [`PullLane`] a fire is, and the one [`BumpLane`] and
-    /// [`PublishLane`] it settles through. One lane because one instance is
-    /// one pass with one commit; the kernels take tables because a grouped
-    /// fire is many.
-    pull_lane: Buffer,
-    bump_lane: Buffer,
-    publish_lane: Buffer,
-    /// The two slot lists `commit_bump` walks: channels whose head advances
-    /// and channels whose tail does.
-    taken: Buffer,
-    put: Buffer,
+    /// **THE ONE FIRE THIS SESSION MAY HAVE AIRBORNE**, from the moment
+    /// [`Session::stage`] returns until [`Session::settle_launched`] reads
+    /// its commit word.
+    ///
+    /// `Some` is the whole of what the removed end-of-fire synchronize used
+    /// to make impossible. One and not a queue: a second mint would predict
+    /// against cursors the first has not reconciled with the pinned words
+    /// `pull_validate` compares against, so the depth is a design bound and
+    /// `launch` refuses past it by name.
+    pending: Option<Minted>,
 }
 
 /// What one fire's mint decided, kept until the settlement reads it.
@@ -218,11 +283,19 @@ struct Minted {
     /// The tickets as they were staged, re-checked against the pinned words
     /// when the fire is refused to tell a readiness MISS (a contract
     /// violation) from a stage that declined.
+    ///
+    /// **AND NOTHING ELSE.** The two slot lists used to be kept here too,
+    /// because the settlement walked them to advance the endpoints' pinned
+    /// counters; `channel::settle` does that on the device now, so the lists
+    /// live only in the wave's arena where `commit_bump` reads them and a
+    /// mint's copy would be a second, staler one.
     tickets: Vec<Ticket>,
-    /// Channels whose head the bump advances.
-    taken: Vec<u32>,
-    /// Channels whose tail the bump advances.
-    put: Vec<u32>,
+    /// The SHARED rings whose predicted head this fire advanced, and whose
+    /// prediction a refusal must take back — the endpoint's counterpart of
+    /// [`Minted::before`], which rolls the session's own cursors back.
+    shared_head: Vec<u32>,
+    /// The same, for the predicted tail.
+    shared_tail: Vec<u32>,
 }
 
 impl Session {
@@ -264,43 +337,23 @@ impl Session {
         let rings = Rings::allocate(&shapes, endpoints)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
-        // ── The fire's control-plane bytes, all of them, now (article 9).
-        //    `commit` is pinned because the settlement reads it; the rest are
-        //    device buffers the mint stages into, sized for the widest table
-        //    this instance could ever hand a kernel — one entry per channel.
-        let slots = shapes.len().max(1);
+        // ── The fire's one pinned word pair, now (article 9). It is pinned
+        //    because the SETTLEMENT reads it on the host; everything else a
+        //    fire stages is the wave's, cut once for a whole boundary rather
+        //    than once per instance.
         let commit = Pinned::mapped(2 * size_of::<u32>())?;
-        let session_commit = commit.device();
-
-        let mut prepared = Vec::with_capacity(compiled.plans.len());
-        for (index, stage_plan) in compiled.plans.iter().enumerate() {
-            let launches = compiled
-                .stages
-                .get(index)
-                .is_some_and(|stage| !stage.regions.is_empty());
-            prepared.push(if launches {
-                Some(Prepared::build(stage_plan, &shapes, extents, session_commit)?)
-            } else {
-                None
-            });
-        }
 
         let mut session = Session {
             rings,
-            inflight: vec![Cursor::default(); shapes.len()],
             shapes,
             cursors,
-            prepared,
+            extents,
+            intrinsics: vec![None; super::launch::INTRINSIC_SLOTS],
             bound: 0,
             poisoned: false,
             fires: 0,
             commit,
-            tickets: Buffer::zeroed(slots * size_of::<Ticket>())?,
-            pull_lane: Buffer::zeroed(size_of::<PullLane>())?,
-            bump_lane: Buffer::zeroed(size_of::<BumpLane>())?,
-            publish_lane: Buffer::zeroed(size_of::<PublishLane>())?,
-            taken: Buffer::zeroed(slots * size_of::<u32>())?,
-            put: Buffer::zeroed(slots * size_of::<u32>())?,
+            pending: None,
         };
         for (channel, wire) in seeds {
             // **A SHARED RING IS SEEDED ONCE, BY WHICHEVER ATTACHMENT BINDS
@@ -391,27 +444,32 @@ impl Session {
             // consulted at all.
             //
             // This is the line the "blocked AFTER the gate admitted it" fault
-            // came from. `blocked_channel` and `Session::fire` both ask
+            // came from. `blocked_channel` and a standalone fire both ask
             // `depth`, which asks here; while this returned a per-session
             // prediction, the taker's gate and the taker's fire agreed
             // perfectly with each other and both disagreed with the ring the
             // putter had actually filled.
             //
-            // **AND THIS SESSION'S OWN IN-FLIGHT FIRE IS ADDED BACK ON.** A
-            // fire advances its prediction at mint and the pinned word only at
-            // settle, so between the two the ring stands one further on than
-            // its words say for the fires THIS session has minted. Today that
-            // window is closed before it can be observed — `Session::fire`
-            // synchronizes before it settles, so a session never has two of
-            // its own fires outstanding — and `inflight` is therefore always
-            // zero here. It is added anyway because the arithmetic, not the
-            // synchronize, is what makes the answer right.
+            // **AND IT IS THE ENDPOINT'S PREDICTION, NOT ITS WORDS** (the
+            // wave that removed the boundary's wait). The words are advanced
+            // by `channel::settle` on the DEVICE, so between a fire's mint and
+            // the moment that kernel runs they stand one behind what the host
+            // has minted — and a host that read them there would predict a
+            // cell it had already spoken for. The prediction is the ring's
+            // own, advanced by whichever attachment mints and rolled back by
+            // whichever is refused, so every attachment reads one number and
+            // none of them has to wait for a fire to land.
+            //
+            // It does NOT delete `serve`'s shared-ring flush, which survives
+            // for a reason that is the device's and not the host's:
+            // `channel::pull_validate` runs once at the front of a wave, so a
+            // taking attachment batched with the putting one is validated
+            // against words the putter's `channel::settle` has not reached,
+            // and `REQUIRE_INPUT` fails. Two attachments of one ring are two
+            // waves. See `Endpoint::predicted_head`.
             Some(endpoint) if endpoint.role() == HostRole::None => {
-                let inflight = self.inflight.get(channel).copied().unwrap_or_default();
-                Cursor {
-                    head: endpoint.head() + inflight.head,
-                    tail: endpoint.tail() + inflight.tail,
-                }
+                let (head, tail) = endpoint.predicted();
+                Cursor { head, tail }
             }
             Some(endpoint) => Cursor {
                 head: if endpoint.engine_owns_head() {
@@ -589,7 +647,7 @@ impl Session {
     ///
     /// **THE COMMITTED FRONT, WHICH IS THE CELL THE GUEST'S OWN PASS TAKES.**
     /// A port's value for THIS fire is the cell at `head` — the same address
-    /// [`Prepared::refresh`] publishes to the emitted kernel as
+    /// [`Prepared::stage_lane`] publishes to the emitted kernel as
     /// `committed_cell` — so the shell's read and the guest's take are one
     /// value. Nothing is consumed: the pass's own commit advances `head` for
     /// every port [`Port::consumes`](engine::tensor_ir::registry::Port::consumes)
@@ -606,27 +664,29 @@ impl Session {
     /// Point one intrinsic at a device buffer, for every stage of this
     /// instance.
     ///
-    /// **EVERY STAGE, BECAUSE A PROGRAM IS ONE FIRE.** The side tables are
-    /// per-stage buffers, but `logits` means the same buffer to a prologue and
-    /// to an epilogue: binding one stage would leave the other reading address
-    /// zero, which the emitted kernel dereferences.
+    /// The binding SURVIVES a fire — nothing clears [`Session::intrinsics`] —
+    /// so a caller that rebinds the same buffer every fire and one that binds
+    /// it once behave the same. `width` is the row width (the vocabulary for
+    /// logits), `row_stride` the ELEMENTS between rows, and `row_offset` which
+    /// row this instance reads.
     ///
-    /// The binding SURVIVES a fire — [`Session::fire`] resets the pending
-    /// flags and the scratch and nothing else (the commit word is the
-    /// device's, seeded by `channel::pull_validate`) — so a caller
-    /// that rebinds the same buffer every fire and one that binds it once
-    /// behave the same. `width` is the row width (the vocabulary for logits),
-    /// `row_stride` the ELEMENTS between rows, and `row_offset` which row this
-    /// instance reads.
+    /// **IT TOUCHES NO STREAM AT ALL NOW**, which is stronger than the
+    /// enqueue-only it replaced. The five numbers name a ROW of the program's
+    /// side tables and the row is this fire's lane, which is not decided until
+    /// the boundary flies — so they wait on the host and
+    /// [`Session::take_lane`] writes them when the lane is taken. What that
+    /// deletes is five `cudaMemcpyAsync` calls per attachment per boundary, of
+    /// four and eight bytes each: 320 a step at c=64, replaced by five copies
+    /// of the whole table once for the wave. (Two `cudaStreamSynchronize`
+    /// stood here through F2b before that, which is a different deletion and
+    /// an older one.)
     ///
     /// # Errors
     ///
-    /// [`Fault::Program`] for an intrinsic past the side tables' pitch, and
-    /// whatever the copies said.
+    /// [`Fault::Program`] for an intrinsic past the side tables' pitch.
     #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
-        context: &Context,
         intrinsic: engine::tensor_ir::op::IntrinsicId,
         base: u64,
         storage: u32,
@@ -634,40 +694,98 @@ impl Session {
         row_stride: u32,
         row_offset: u32,
     ) -> Result<()> {
-        let stream = context.stream();
-        for prepared in self.prepared.iter_mut().flatten() {
-            prepared.bind_intrinsic(
-                intrinsic, base, storage, width, row_stride, row_offset, stream,
-            )?;
-        }
+        let slot = intrinsic as usize;
+        let seat = self.intrinsics.get_mut(slot).ok_or_else(|| {
+            Fault::program(
+                "program::session",
+                format!(
+                    "intrinsic {slot} is past the pitch the side tables are indexed with"
+                ),
+            )
+        })?;
+        *seat = Some(Intrinsic {
+            id: intrinsic,
+            base,
+            storage,
+            width,
+            row_stride,
+            row_offset,
+        });
         self.bound |= 1u64 << (intrinsic as u32);
-        context.synchronize()
+        Ok(())
     }
 
-    /// Run every stage of `compiled` as ONE fire: mint, pull-validate,
-    /// launch, bump, publish, settle. The module header is the map.
+    /// **WHAT THIS INSTANCE'S VALUE SHAPES RESOLVE AGAINST** — half the key
+    /// its lane batch is cut against. See [`Session::extents`].
+    #[must_use]
+    pub const fn extents(&self) -> Extents {
+        self.extents
+    }
+
+    /// **THE ENQUEUE HALF OF A FIRE**: mint, pull-validate, launch, bump,
+    /// publish — and then nothing at all.
     ///
-    /// **A REFUSED FIRE IS NOT AN ERROR AND A BLOCKED ONE NEVER LAUNCHED.**
-    /// A program whose inputs are not there is [`Fired::Blocked`] and is
-    /// refused at the admission door with zero side effects; a program whose
-    /// stages cleared the commit word is [`Fired::Declined`] and ran in full,
-    /// publishing nothing. The one refusal that IS an error is a ticket the
-    /// ring denied after the admission check approved it — see
-    /// [`Session::settle`].
+    /// # Why the synchronize left this function (alto §14 exception #1)
+    ///
+    /// F2b registered the end-of-fire synchronize as a known exception and
+    /// named the wave that would take it. This is that wave, and the number
+    /// that made it urgent is a c=64 profile: **16,898 `cudaStreamSynchronize`
+    /// calls for 869 ms**, 44% of all CUDA API time, four per attachment per
+    /// token-step, with the GPU idle 45% of the kernel span in ~56 µs bubbles
+    /// that matched the fires one for one. The host was firing one lane,
+    /// waiting ~72 µs for a 51 µs epilogue to land, and only then minting the
+    /// next lane's — so a wave of sixty-four independent passes ran as
+    /// sixty-four serialized round trips.
+    ///
+    /// What the synchronize bought is bought elsewhere now:
+    ///
+    /// ```text
+    /// the verdict off the pinned    -> [`Session::settle_launched`], called
+    /// commit word                      after ONE synchronize for the whole
+    ///                                  boundary rather than one per fire
+    /// the cursor/word reconciliation-> the same settlement: still before any
+    /// before the next mint             later fire of this session mints
+    /// the shared ring's ordering    -> unchanged where it matters, and
+    ///                                  `serve`'s flush refuses to batch
+    ///                                  past an endpoint another airborne
+    ///                                  fire in the same boundary holds
+    /// error attribution             -> degraded exactly as the model path's
+    ///                                  was in F2b: a fault raised at the
+    ///                                  boundary's settlement names the
+    ///                                  attachment, and the launch it belongs
+    ///                                  to is one of the boundary's, not
+    ///                                  necessarily the last
+    /// ```
+    ///
+    /// **THE PENDING MINT IS THE WHOLE OF THE STATE THIS LEAVES BEHIND.** One
+    /// `Option<Minted>` per session — a session may have exactly one fire
+    /// airborne, because a second launch would mint against cursors the first
+    /// has not reconciled with the pinned words the device reads. Launching
+    /// twice is therefore a named refusal and not a silent race.
     ///
     /// # Errors
     ///
-    /// [`Fault::Program`] when the compiled stages and their plans are not
-    /// parallel, or when a prediction the gate approved the ring denied; and
-    /// whatever the launches, copies and the synchronize said.
-    pub fn fire(
+    /// As [`super::Plane::fire`], less whatever the launches and the
+    /// synchronize said.
+    pub fn stage(
         &mut self,
-        context: &Context,
         compiled: &Compiled,
         plan: &ExecPlan,
-    ) -> Result<Fired> {
+        wave: &mut Wave,
+    ) -> Result<Launched> {
+        if self.pending.is_some() {
+            return Err(Fault::program(
+                "program::session",
+                "this instance already has a fire airborne: a second mint would predict \
+                 against cursors the first has not yet reconciled with the pinned words \
+                 `pull_validate` reads, and the device would refuse whichever of the two \
+                 it saw second",
+            ));
+        }
         if self.poisoned {
-            return Ok(Fired::Faulted("instance is poisoned".to_string()));
+            return Ok(Launched::Refused(Fired::Faulted(
+                "instance is poisoned".to_string(),
+            )));
         }
         stages_and_plans_agree(compiled)?;
 
@@ -718,69 +836,127 @@ impl Session {
         //
         //    Past this door the host makes no more decisions about this fire.
         if let Some(blocked) = self.blocked_channel(plan) {
-            return Ok(Fired::Blocked(blocked));
+            return Ok(Launched::Refused(Fired::Blocked(blocked)));
         }
-
-        let stream = context.stream();
-        let ctx = context.ctx();
 
         // ── MINT. Predictions to tickets, tickets to cell addresses; the
         //    predictions advance HERE, before anything has run, because that
         //    is what lets fire N+1 be built while fire N is still on the
         //    stream (survey §7 upgrade 1). A device refusal rolls them back
-        //    at settle.
-        let minted = match self.mint(plan) {
+        //    at settle. Nothing here touches a stream: the mint's product is
+        //    a lane of the caller's wave, and the wave carries every lane of
+        //    the boundary across in ONE copy.
+        let minted = match self.mint(plan, wave) {
             Ok(minted) => minted,
             Err(why) => {
                 self.poisoned = true;
-                return Ok(Fired::Faulted(why));
+                return Ok(Launched::Refused(Fired::Faulted(why)));
             }
         };
 
-        // ── PULL-VALIDATE. It seeds the fire's commit word — so a fire with
-        //    no ticket at all still runs this, because the seeding is what
-        //    every stage's early-return reads — then checks each prediction
-        //    against the live pinned counters and pulls what the guest wrote
-        //    into the device cells.
-        channel::pull_validate(ctx, self.tickets.ptr(), self.pull_lane.ptr(), 1)?;
+        // ── AND THAT IS THE WHOLE OF THE STAGING. The three control kernels
+        //    and this fire's own regions are the caller's to enqueue —
+        //    `Wave::fly`, [`Session::launch_regions`], `Wave::land` — because
+        //    a boundary's lanes share all three launches and only the regions
+        //    are per fire.
+        self.pending = Some(minted);
+        Ok(Launched::Airborne)
+    }
 
-        // ── THE STAGES, UNCONDITIONALLY (survey §7 I4). Every stage launches
-        //    whatever the pull decided: the emitted kernel's first three lines
-        //    read the commit word and return when it is clear
-        //    (`fused_block1.cuh`), so a refused fire costs what a running one
-        //    does and writes only into the pending cell nobody can address.
-        //    The kernel sequence is therefore a function of the program and
-        //    not of this fire's ring state, which is article 5.
-        //
-        //    NO SYNCHRONIZE BETWEEN STAGES. One stream is the ordering: a
-        //    stage that reads a cell the previous one wrote is a later launch
-        //    on the same stream, and kernel completion is itself the release.
-        for (index, stage) in compiled.stages.iter().enumerate() {
-            let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
-                // A stage with nothing to launch needs no buffers and no
-                // launch. Not an empty case: the adapter prologue is exactly
-                // this shape.
-                continue;
-            };
-            prepared.refresh(&self.rings, &minted.before, stream)?;
-            for region in stage.regions.iter() {
-                prepared.launch_region(region, stream)?;
+    /// **TAKE THIS FIRE'S LANE OF THE PROGRAM'S BATCH**, in every stage of it.
+    ///
+    /// The one thing a session contributes to a lane-batched launch: its
+    /// channel cell addresses, its commit word, and its intrinsic bindings,
+    /// written into the row the batch hands out. Everything else in a lane
+    /// record — the extents, the slot offset — is the batch's own and was
+    /// written when it was cut.
+    ///
+    /// A session with nothing airborne takes no lane: the mint is what
+    /// resolves a region's cell addresses and there is none to resolve
+    /// against.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] when a stage-local slot names a channel this
+    /// instance does not carry, or when the batch has no lane left.
+    pub fn take_lane(&mut self, stages: &mut [Option<Prepared>]) -> Result<()> {
+        let Some(minted) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        let commit = self.commit.device();
+        for prepared in stages.iter_mut().flatten() {
+            let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
+            // **EVERY STAGE, BECAUSE A PROGRAM IS ONE FIRE.** The side tables
+            // are per-stage buffers, but `logits` means the same buffer to a
+            // prologue and to an epilogue: binding one stage would leave the
+            // other reading address zero, which the emitted kernel
+            // dereferences.
+            for intrinsic in self.intrinsics.iter().flatten() {
+                prepared.bind_intrinsic(
+                    lane,
+                    intrinsic.id,
+                    intrinsic.base,
+                    intrinsic.storage,
+                    intrinsic.width,
+                    intrinsic.row_stride,
+                    intrinsic.row_offset,
+                )?;
             }
         }
+        Ok(())
+    }
 
-        // ── THE BUMP, which is the only advance of durable ring state, and
-        //    then the publication, which is the only crossing outward. Both
-        //    read the one commit word; both do nothing when it is clear.
-        //    Enqueued in this order because the launch boundary between the
-        //    cell write and the announcement is what orders payload before
-        //    tail (`channels.cuh`'s ordering note).
-        channel::commit_bump(ctx, self.bump_lane.ptr(), 1)?;
-        channel::scatter_publish(ctx, self.tickets.ptr(), self.publish_lane.ptr(), 1)?;
-
-        // ── THE ONE SYNCHRONIZE, and it is the last host touch in the fire.
-        //    F2b is where it goes; what it no longer does is decide anything.
-        context.synchronize()?;
+    /// **THE VERDICT HALF**: read the pinned commit word this fire's kernels
+    /// wrote and reconcile the predictions with it.
+    ///
+    /// **THE CALLER OWES A PROOF THAT THE KERNELS RAN.** Not because the read
+    /// is unsafe without one — the word is mapped pinned memory and a stale
+    /// read is a torn verdict, not a fault — but because a verdict read before
+    /// the kernels ran is an answer about the PREVIOUS fire. What counts as a
+    /// proof got cheaper when the counters became `channel::settle`'s: the
+    /// serving path parks the boundary and reads the verdicts at the NEXT
+    /// frame, where the settled-step count usually answers it for nothing
+    /// (`serve::reap_guest_fires`), and [`super::Plane::fire`] still takes a
+    /// synchronize of its own because a program fired alone has nothing to
+    /// overlap and a caller waiting for the answer.
+    ///
+    /// Answers [`Fired::Committed`] when there was nothing airborne, because
+    /// a session with no pending mint has nothing outstanding to be wrong
+    /// about.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::settle`].
+    pub fn settle_launched(&mut self) -> Result<Fired> {
+        let Some(minted) = self.pending.take() else {
+            return Ok(Fired::Committed);
+        };
         self.settle(&minted)
+    }
+
+    /// **Is a fire of this session's on the stream, unsettled?**
+    #[must_use]
+    pub const fn airborne(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// **The shared rings this instance is attached to**, as the identity of
+    /// the endpoint itself.
+    ///
+    /// A device-only ring's counters are the ENDPOINT's pinned words, advanced
+    /// by whichever attachment committed, and the arithmetic that reads them
+    /// ([`Session::merge`]) adds back only THIS session's in-flight fire. So
+    /// two attachments of one ring may not be airborne at once, and a caller
+    /// that batches fires has to be able to ask which rings a fire holds.
+    /// `serve`'s boundary loop asks exactly this and flushes when the answer
+    /// collides.
+    pub fn shared_rings(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.shapes.len()).filter_map(|channel| {
+            self.rings
+                .endpoint(channel)
+                .filter(|endpoint| endpoint.role() == HostRole::None)
+                .map(|endpoint| Arc::as_ptr(endpoint) as usize)
+        })
     }
 
     /// **THIS FIRE'S TICKETS, ITS SLOT LISTS AND ITS THREE LANES, STAGED.**
@@ -807,12 +983,22 @@ impl Session {
     ///
     /// A slot joins `taken`/`put` exactly when the prediction moved, so the
     /// device registry and the host's prediction advance in lockstep.
-    fn mint(&mut self, plan: &ExecPlan) -> std::result::Result<Minted, String> {
+    fn mint(
+        &mut self,
+        plan: &ExecPlan,
+        wave: &mut Wave,
+    ) -> std::result::Result<Minted, String> {
         let before = self.cursors_now();
         let mut next = before.clone();
         let mut tickets: Vec<Ticket> = Vec::with_capacity(self.shapes.len());
         let mut taken: Vec<u32> = Vec::new();
         let mut put: Vec<u32> = Vec::new();
+        // The SHARED rings this fire moves, kept apart from the two slot lists
+        // because their prediction is the endpoint's and their rollback is a
+        // different call. `commit_bump` never sees them (`mint`'s note below
+        // says why) and neither does the registry.
+        let mut shared_head: Vec<u32> = Vec::new();
+        let mut shared_tail: Vec<u32> = Vec::new();
 
         for (channel, cursor) in before.iter().enumerate() {
             let slot = channel as u32;
@@ -849,11 +1035,19 @@ impl Session {
                 .is_some_and(|endpoint| endpoint.role() == HostRole::None);
 
             let mut used = cursor.tail - cursor.head;
+            // **WHETHER THE PREDICTION MOVED**, which is a different question
+            // from whether the fire addresses the cell — and the one
+            // `channel::settle` is predicated on. A `read` peeks at the head
+            // without taking it and a take whose ring was empty takes nothing,
+            // and neither advances a counter; both still carry a ticket.
+            let mut moved_head = false;
+            let mut moved_tail = false;
             if takes && used != 0 {
                 next[channel].head = cursor.head + 1;
                 used -= 1;
+                moved_head = true;
                 if shared {
-                    self.inflight[channel].head += 1;
+                    shared_head.push(slot);
                 } else {
                     taken.push(slot);
                 }
@@ -866,8 +1060,9 @@ impl Session {
                     ));
                 }
                 next[channel].tail = cursor.tail + 1;
+                moved_tail = true;
                 if shared {
-                    self.inflight[channel].tail += 1;
+                    shared_tail.push(slot);
                 } else {
                     put.push(slot);
                 }
@@ -888,7 +1083,29 @@ impl Session {
             }
             if puts {
                 flags |= Ticket::PUBLISH;
-                if endpoint.role() == HostRole::Reader {
+                // **A DEVICE-ONLY RING GETS THE PUBLISH TOO, AND ITS MIRROR IS
+                //    THE ENGINE'S** (the D2H this wave came for).
+                //
+                //    A shared ring's cells are the ring itself, so nothing
+                //    CROSSES here — no guest end exists to cross to, and the
+                //    endpoint publishes no `HostMirror`. What the mirror
+                //    becomes is a pinned SHADOW of the committed cell, written
+                //    by `scatter_publish` at the same instant it writes a
+                //    guest's, and the reason it is worth writing is
+                //    `program::ports`: a descriptor port resolved off a
+                //    device-only ring was `read_cell` → `copy_d2h`, a blocking
+                //    four-byte `cudaMemcpy` per port per fire. A c=64 profile
+                //    counted **49,149 of them for 503 ms**, on the host, in
+                //    `prepare`, the phase whose whole definition is that it
+                //    does not touch a stream. Read off the mirror the same
+                //    port costs a load out of mapped memory.
+                //
+                //    `wire_bytes` and `native_bytes` are EQUAL for such a ring
+                //    — `Cuda::register_channel` opens its endpoint at the
+                //    native width precisely because its cells are the slab's —
+                //    so the copy is byte-for-byte and no packing applies,
+                //    which is why the bool flag below is not set for it.
+                if matches!(endpoint.role(), HostRole::Reader | HostRole::None) {
                     flags |= Ticket::HOST_READER;
                 }
             }
@@ -898,7 +1115,33 @@ impl Session {
             if plan.requires_channel_input(slot) {
                 flags |= Ticket::REQUIRE_INPUT;
             }
-            if shape.dtype == engine::tensor_ir::DType::Bool {
+            // **WHAT THE SETTLEMENT MAY ADVANCE, DECIDED HERE AND NOWHERE
+            //    ELSE** (the wave this restores). These two flags are the
+            //    whole of what `channel::settle` does, and they are the exact
+            //    arithmetic `Session::settle` used to do on the host after a
+            //    `cudaStreamSynchronize`: bump the engine-owned counter of
+            //    every slot whose prediction moved, iff the fire committed.
+            //
+            //    TWO CONDITIONS, AND BOTH MATTER. `moved_*` is why the flag is
+            //    not `CONSUME`/`PUBLISH` — a peek addresses the head without
+            //    moving it. `engine_owns_*` is the SPSC discipline the whole
+            //    plane rests on: on a channel the host writes, the tail is the
+            //    guest's word and a kernel storing it would be two writers on
+            //    one counter. A device-only ring owns both, which is what
+            //    makes its settlement the device's too.
+            if moved_head && endpoint.engine_owns_head() {
+                flags |= Ticket::ADVANCE_HEAD;
+            }
+            if moved_tail && endpoint.engine_owns_tail() {
+                flags |= Ticket::ADVANCE_TAIL;
+            }
+            // **A SHARED RING HAS NO WIRE FORM TO PACK INTO.** Its endpoint
+            // was opened at the NATIVE width and its mirror is a shadow of the
+            // slab, so packing one bit per lane on the way out would write a
+            // cell an eighth the width the readers expect.
+            if shape.dtype == engine::tensor_ir::DType::Bool
+                && endpoint.role() != HostRole::None
+            {
                 flags |= Ticket::PACKED_BOOL;
             }
             let cells = self
@@ -923,57 +1166,85 @@ impl Session {
             });
         }
 
-        let count = u32::try_from(tickets.len()).unwrap_or(u32::MAX);
         let rings = self.rings.device();
         let commit = self.commit.device();
-        let stage = |buffer: &mut Buffer, bytes: &[u8]| -> std::result::Result<(), String> {
-            if bytes.is_empty() {
-                return Ok(());
-            }
-            buffer.write(0, bytes).map_err(|why| format!("{why}"))
-        };
-        stage(&mut self.tickets, &slice_bytes(&tickets))?;
-        stage(&mut self.taken, &slice_bytes(&taken))?;
-        stage(&mut self.put, &slice_bytes(&put))?;
-        stage(
-            &mut self.pull_lane,
-            &record_bytes(&PullLane {
+
+        // **ONE COPY FOR A BOUNDARY, NOT ONE PER FIRE** (alto article 2, and
+        // the number this wave came for).
+        //
+        // A fire stages six control structures — the ticket table, the two
+        // slot lists, and the pull, bump and publish lanes. They were six
+        // `cudaMemcpy` calls, then six `cudaMemcpyAsync` calls, then ONE
+        // async copy of a per-session image (wave 6). That last collapse was
+        // right and it stopped one level too low: a per-session buffer is a
+        // per-session ARRAY, so the three control kernels could only ever be
+        // launched with `lane_count = 1`, sixty-four times a boundary, one
+        // block apiece. `channel::pull_validate` alone was 362 ms at c=64,
+        // 11% of all GPU time, almost all of it PCIe latency on pinned
+        // endpoint words read one ticket at a time.
+        //
+        // So the six are the WAVE's now: every lane of a boundary appends to
+        // the same six lists, the whole arena crosses in one copy, and each
+        // control kernel launches once with a block per lane. What a mint
+        // owes the wave is its own row, and what the wave owes the mint is
+        // where the row landed — which is the `ticket_offset` field these
+        // records have carried since they were written and nobody had a
+        // second lane to set.
+        //
+        // `ticket_offset`/`ticket_count` and the bump lane's two list
+        // pointers are the wave's to fill: at this instant neither the
+        // window nor the arena's base exists yet.
+        // The lane index the wave answers with is the row this fire took; the
+        // session keeps none of it, because every address into the arena is
+        // the wave's own arithmetic and nothing here ever names one.
+        let _lane = wave.stage(
+            &tickets,
+            &taken,
+            &put,
+            PullLane {
                 full: rings.full,
                 pass_commit: commit,
                 ticket_offset: 0,
-                ticket_count: count,
+                ticket_count: 0,
                 // The fire arrives with no reason of its own to refuse: the
                 // admission check passed and no stage has run. Every later
                 // clearing of this word is a device decision.
                 initial_commit: 1,
                 diagnose: 0,
-            }),
-        )?;
-        stage(
-            &mut self.bump_lane,
-            &record_bytes(&rings.bump_lane(
-                self.taken.ptr(),
-                u32::try_from(taken.len()).unwrap_or(u32::MAX),
-                self.put.ptr(),
-                u32::try_from(put.len()).unwrap_or(u32::MAX),
-                commit,
-            )),
-        )?;
-        stage(
-            &mut self.publish_lane,
-            &record_bytes(&PublishLane {
+            },
+            rings.bump_lane(0, 0, 0, 0, commit),
+            PublishLane {
                 commit,
                 ticket_offset: 0,
-                ticket_count: count,
-            }),
-        )?;
+                ticket_count: 0,
+            },
+            SettleLane {
+                commit,
+                ticket_offset: 0,
+                ticket_count: 0,
+            },
+        );
 
         self.cursors = next;
+        // **THE SHARED RINGS' PREDICTIONS ADVANCE HERE**, on the endpoint, at
+        // the same instant this session's own cursors do — and for the same
+        // reason: what the next fire predicts must count what this one minted,
+        // whether the next fire is this session's or the other attachment's.
+        for slot in &shared_head {
+            if let Some(endpoint) = self.rings.endpoint(*slot as usize) {
+                endpoint.predict_head();
+            }
+        }
+        for slot in &shared_tail {
+            if let Some(endpoint) = self.rings.endpoint(*slot as usize) {
+                endpoint.predict_tail();
+            }
+        }
         Ok(Minted {
             before,
             tickets,
-            taken,
-            put,
+            shared_head,
+            shared_tail,
         })
     }
 
@@ -983,11 +1254,22 @@ impl Session {
     /// its own, no device read, no four-byte D2H. What it decides:
     ///
     /// ```text
-    /// committed   advance the engine's PINNED counters, one per slot the
-    ///             bump moved, so the next fire's prediction and the guest's
-    ///             live words still agree
+    /// committed   count the fire and nothing else: the endpoint words the
+    ///             next mint predicts off were advanced ON THE DEVICE by
+    ///             `channel::settle`
     /// refused     roll the predictions back, then say which kind of refusal
     /// ```
+    ///
+    /// **THE COUNTER ADVANCE LEFT THIS FUNCTION AND BECAME A KERNEL.** What
+    /// stood here was a `bump_head`/`bump_tail` per moved slot — the engine's
+    /// half of every host-visible endpoint, written by a host thread. The next
+    /// fire's mint predicts off exactly those words, so a boundary could not
+    /// enqueue its fires and walk away: it had to take a
+    /// `cudaStreamSynchronize`, read the commit word, and write the counters
+    /// before anything could be minted again. ~826 waits a c64 run were that
+    /// and nothing else. `channel::settle` does it on the device, in stream
+    /// order, predicated on the same commit word, off the same arithmetic —
+    /// the ticket's `ADVANCE_HEAD`/`ADVANCE_TAIL` flags are this loop, minted.
     ///
     /// And the two kinds of refusal are not the same sentence. A stage
     /// clearing the word is [`Fired::Declined`] — the program refused itself,
@@ -1005,52 +1287,34 @@ impl Session {
     fn settle(&mut self, minted: &Minted) -> Result<Fired> {
         let word = self.commit.read(0, size_of::<u32>());
         let committed = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) != 0;
-        // **THE SHARED RINGS ADVANCE HERE AND ONLY HERE** (design §5). Their
-        // slots are not in `minted.taken`/`minted.put` — `mint` says why — so
-        // they are walked off this session's own in-flight count instead, and
-        // the pinned words the OTHER attachments read move exactly when this
-        // fire committed.
-        //
-        // **AND THE PIPELINE FIFO IS WHAT ORDERS THEM.** Two attachments of
-        // one ring are two passes of one guest pipeline, submitted in order
-        // and fired in order; each pass's `Session::fire` synchronizes before
-        // it reaches this line, so the putter's word has moved before the
-        // taker is minted at all. The ordering is not an assumption about
-        // kernel completion — it is the same host-side happens-before every
-        // other counter on this plane rests on.
-        for (channel, flight) in self.inflight.iter_mut().enumerate() {
-            let (head, tail) = (flight.head, flight.tail);
-            *flight = Cursor::default();
-            let Some(endpoint) = self.rings.endpoint(channel) else {
-                continue;
-            };
-            if !committed {
-                continue;
-            }
-            for _ in 0..head {
-                endpoint.bump_head();
-            }
-            for _ in 0..tail {
-                endpoint.bump_tail();
-            }
-        }
+        // **NOTHING IS ADVANCED HERE, BY EITHER OUTCOME.** Every counter this
+        // used to move — the engine's half of each host-visible endpoint, and
+        // both halves of every shared ring — is written by `channel::settle`
+        // on the device, predicated on the same word this line reads. What is
+        // left is arithmetic on the host's own belief: a commit confirms it, a
+        // refusal takes it back.
         if committed {
-            for slot in &minted.taken {
-                if let Some(endpoint) = self.rings.endpoint(*slot as usize)
-                    && endpoint.engine_owns_head()
-                {
-                    endpoint.bump_head();
-                }
-            }
-            for slot in &minted.put {
-                if let Some(endpoint) = self.rings.endpoint(*slot as usize)
-                    && endpoint.engine_owns_tail()
-                {
-                    endpoint.bump_tail();
-                }
-            }
             self.fires += 1;
             return Ok(Fired::Committed);
+        }
+        // **A REFUSED FIRE TAKES ITS SHARED PREDICTIONS BACK.** The session's
+        // own cursors are restored below by assignment; a shared ring's are
+        // the endpoint's and are decremented, because another attachment may
+        // have minted against them since. A prediction left standing past a
+        // fire that moved nothing would be compared by `channel::pull_validate`
+        // against a word one behind it, and every later fire on that ring
+        // would be refused for the same reason — the failure dev's
+        // `rollback_device_ticket` exists to prevent, spelled where the
+        // counter lives.
+        for slot in &minted.shared_head {
+            if let Some(endpoint) = self.rings.endpoint(*slot as usize) {
+                endpoint.unpredict_head(1);
+            }
+        }
+        for slot in &minted.shared_tail {
+            if let Some(endpoint) = self.rings.endpoint(*slot as usize) {
+                endpoint.unpredict_tail(1);
+            }
         }
 
         self.cursors = minted.before.clone();
@@ -1098,7 +1362,7 @@ impl Session {
     /// The first channel whose declared requirement a fire right now would
     /// not meet, or `None` when this instance is ready to fire.
     ///
-    /// **THE QUESTION, ASKED WITHOUT FIRING.** [`Session::fire`] asks it for
+    /// **THE QUESTION, ASKED WITHOUT FIRING.** [`Session::stage`] asks it for
     /// itself, and that is the whole of it for a program fired on its own.
     ///
     /// It used to be an admission gate as well: the attachment path asked it
@@ -1110,7 +1374,7 @@ impl Session {
     /// boundary is a contract violation `serve::committed_or` names, not a
     /// refusal to be re-offered.
     ///
-    /// Same arithmetic, one implementation: [`Session::fire`] calls this.
+    /// Same arithmetic, one implementation: [`Session::stage`] calls this.
     #[must_use]
     pub fn blocked_channel(&self, plan: &ExecPlan) -> Option<u32> {
         for channel in 0..self.shapes.len() {

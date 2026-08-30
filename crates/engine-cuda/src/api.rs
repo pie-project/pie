@@ -273,6 +273,7 @@ impl Cuda {
     fn instance(&mut self, id: InstanceId) -> EngineResult<&mut ProgramSession> {
         self.loaded_mut()?
             .program_instance(id)
+            .map_err(fault)?
             .ok_or(Error::Closed {
                 what: "instance",
                 id,
@@ -605,6 +606,21 @@ impl Engine for Cuda {
             ordinal,
             frames_in_flight,
         } = request;
+
+        // Serving eagerly is a choice a deployment may make — for a bisect,
+        // for a golden diff — but never one it should make silently: an
+        // uncaptured decode pays hundreds of kernel launches per token-step
+        // of pure CPU time (~25% of single-stream latency measured on
+        // qwen35-d0.8b, 2026-08-29). `Graphs::On` is the default; this warn
+        // is the receipt for overriding it.
+        if !self.boot.graphs.records() {
+            eprintln!(
+                "engine-cuda: serving without CUDA graph capture ([engine] graphs = \
+{:?}, not \"on\"): every fire launches eagerly, which costs per-step host time; \
+intended for diagnostics, not serving",
+                self.boot.graphs
+            );
+        }
 
         // `Checkpoint::None` — bind and bake, land nothing — is a shape the
         // contract states and this shell has no path for: `Weights::resident`
@@ -1097,9 +1113,17 @@ impl Engine for Cuda {
         //
         // What a `None` channel still has no part of is the CROSSING. It
         // publishes no `HostMirror`, because there is no guest end to point at
-        // it, and `mint` sets neither `HOST_WRITER` nor `HOST_READER` on its
-        // tickets — so the pull and the publish kernels skip it and its cells
-        // never leave the device, which is exactly what its role says.
+        // it, and `mint` never sets `HOST_WRITER` on its tickets — nothing on
+        // the host writes into it, so there is nothing to pull.
+        //
+        // It DOES set `HOST_READER`, and the mirror it opens below is not
+        // dead. Nothing crosses to a guest through it: it is a pinned SHADOW
+        // of the committed cell, written by `channel::scatter_publish` at the
+        // same instant it writes a real guest's, so that a descriptor port
+        // resolved off a device-only ring is a load out of mapped memory
+        // rather than a blocking four-byte `cudaMemcpy` inside `prepare`
+        // (`Session::mint`, and `Rings::read_cell`). Its width is the SLAB's,
+        // which is why `cell_bytes` below is the native one.
         let numel = registration
             .shape
             .iter()

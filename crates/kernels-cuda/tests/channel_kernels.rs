@@ -1,4 +1,4 @@
-//! **THE THREE CONTROL KERNELS, ON A REAL DEVICE.**
+//! **THE FIVE CONTROL KERNELS, ON A REAL DEVICE.**
 //!
 //! ```text
 //! cargo test -p kernels-cuda --features cuda-13 --test channel_kernels -- --nocapture
@@ -6,7 +6,8 @@
 //!
 //! # What this is for
 //!
-//! `channel::pull_validate` / `commit_bump` / `scatter_publish` / `mask_from_commit` are the device
+//! `channel::pull_validate` / `commit_bump` / `scatter_publish` / `settle` /
+//! `mask_from_commit` are the device
 //! half of a fire's admission decision (alto design §5): the host predicts
 //! where a channel's ring stands, the device checks the prediction against the
 //! live words, and one predicated bump either publishes the whole pass or
@@ -15,7 +16,7 @@
 //! it is asserted here. A wrong ring index does not crash; it serves the wrong
 //! token.
 //!
-//! The eight gates, each a way the protocol can be silently wrong:
+//! The nine gates, each a way the protocol can be silently wrong:
 //!
 //! ```text
 //! (a) a correct prediction passes, and the bump advances head, tail and the
@@ -36,6 +37,9 @@
 //!     in which case the take's credit admits it
 //! (h) a committed fire's cell reaches the guest's mapped pinned mirror —
 //!     packed, for a bool channel — and a refused fire's does not
+//! (i) a committed fire's SETTLEMENT advances the guest endpoint's own
+//!     counters to the prediction plus one — and only the counters a ticket
+//!     names, and only for a lane that committed
 //! ```
 //!
 //! # How it is set up
@@ -950,5 +954,136 @@ fn a_committed_fires_cell_reaches_the_pinned_mirror_and_a_refused_fires_does_not
         mirror(refused_host, 4 * 8),
         vec![POISON; 32],
         "a refused lane publishes nothing, so a dummy run's bytes never reach a guest",
+    );
+}
+
+// ───────────────────────────────── (i) ───────────────────────────────────
+
+/// **THE SETTLEMENT ADVANCES THE GUEST'S OWN COUNTERS, AND ONLY THE ONES A
+/// TICKET NAMES.**
+///
+/// The kernel that replaced a `cudaStreamSynchronize` per frame boundary. Its
+/// whole job is four words wide, and every way it can be wrong is silent: a
+/// counter left where it was makes the next fire's prediction stale and
+/// `pull_validate` refuses forever; a counter advanced on a lane that did not
+/// commit hands the guest a cell nothing published; a counter advanced for a
+/// ticket that only PEEKED skips a cell nobody read.
+///
+/// Four endpoints, one launch:
+///
+/// ```text
+/// slot 0  ADVANCE_HEAD | ADVANCE_TAIL   both counters move, committed lane
+/// slot 1  CONSUME, no ADVANCE_HEAD      a peek: nothing moves, and this is
+///                                       the flag divergence from dev, where
+///                                       kTicketConsume alone would advance
+/// slot 2  ADVANCE_TAIL only             the head is the GUEST's counter on a
+///                                       channel the host reads, so a store
+///                                       here would be two writers on one word
+/// slot 3  ADVANCE_HEAD | ADVANCE_TAIL   on the REFUSED lane: nothing moves
+/// ```
+#[test]
+fn a_committed_fires_settlement_advances_exactly_the_counters_its_tickets_name() {
+    let mut gpu = Gpu::open();
+
+    // One endpoint's `[head, tail, poison, closed]` in mapped pinned memory,
+    // with the host pointer kept so the words can be read back.
+    let endpoint = |gpu: &mut Gpu, head: u64, tail: u64| {
+        let (host, device) = gpu.mapped(4 * core::mem::size_of::<u64>());
+        // SAFETY: `mapped` allocated four u64s at `host` and nothing else
+        // holds it; the allocation is 8-aligned (`cudaHostAlloc` is page
+        // aligned).
+        unsafe {
+            let words = host.cast::<u64>();
+            words.write(head);
+            words.add(1).write(tail);
+            // Non-zero sentinels: the settlement writes neither, and dev's
+            // `words+2 = 0` is deliberately NOT ported (nothing in this engine
+            // owns the poison word yet, and a kernel storing it would race the
+            // host callback that will).
+            words.add(2).write(0xAA);
+            words.add(3).write(0xBB);
+        }
+        (host.cast::<u64>(), device)
+    };
+
+    let (both_host, both_words) = endpoint(&mut gpu, 41, 43);
+    let (peek_host, peek_words) = endpoint(&mut gpu, 7, 9);
+    let (tail_host, tail_words) = endpoint(&mut gpu, 100, 200);
+    let (refused_host, refused_words) = endpoint(&mut gpu, 3, 4);
+
+    let mut both = ticket(
+        0,
+        Ticket::CONSUME | Ticket::PUBLISH | Ticket::ADVANCE_HEAD | Ticket::ADVANCE_TAIL,
+        4,
+        both_words,
+    );
+    both.expected_head = 41;
+    both.expected_tail = 43;
+
+    // CONSUME without ADVANCE_HEAD: a `read` that addresses the committed cell
+    // without taking it.
+    let mut peek = ticket(1, Ticket::CONSUME, 4, peek_words);
+    peek.expected_head = 7;
+
+    let mut tail_only = ticket(2, Ticket::PUBLISH | Ticket::ADVANCE_TAIL, 4, tail_words);
+    tail_only.expected_head = 100;
+    tail_only.expected_tail = 200;
+
+    let mut refused = ticket(
+        3,
+        Ticket::CONSUME | Ticket::PUBLISH | Ticket::ADVANCE_HEAD | Ticket::ADVANCE_TAIL,
+        4,
+        refused_words,
+    );
+    refused.expected_head = 3;
+    refused.expected_tail = 4;
+
+    let tickets = gpu.up(&[both, peek, tail_only, refused]);
+    let committed = gpu.up(&[1u32, 0]);
+    let declined = gpu.up(&[0u32, 0]);
+    let lanes = gpu.up(&[
+        channel::SettleLane {
+            commit: committed,
+            ticket_offset: 0,
+            ticket_count: 3,
+        },
+        channel::SettleLane {
+            commit: declined,
+            ticket_offset: 3,
+            ticket_count: 1,
+        },
+    ]);
+
+    let ctx = gpu.ctx();
+    channel::settle(&ctx, tickets, lanes, 2).expect("enqueues");
+    gpu.sync();
+
+    // SAFETY: every endpoint is alive until `gpu` drops, and the launch that
+    // wrote them has been synchronized.
+    let read = |host: *mut u64| unsafe { core::slice::from_raw_parts(host.cast_const(), 4).to_vec() };
+
+    assert_eq!(
+        read(both_host),
+        vec![42, 44, 0xAA, 0xBB],
+        "a committed fire leaves each named counter at the PREDICTION plus one, \
+         and the poison and closed words alone",
+    );
+    assert_eq!(
+        read(peek_host),
+        vec![7, 9, 0xAA, 0xBB],
+        "a ticket that addresses the head without taking it moves nothing: \
+         CONSUME is not ADVANCE_HEAD",
+    );
+    assert_eq!(
+        read(tail_host),
+        vec![100, 201, 0xAA, 0xBB],
+        "the head of a channel the host reads is the GUEST's counter and no \
+         kernel may store it",
+    );
+    assert_eq!(
+        read(refused_host),
+        vec![3, 4, 0xAA, 0xBB],
+        "a refused lane settles nothing, so the guest's endpoint stands exactly \
+         where it stood and the next fire predicts the same numbers",
     );
 }

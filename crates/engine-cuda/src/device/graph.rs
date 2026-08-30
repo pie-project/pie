@@ -639,6 +639,45 @@ impl Event {
         }
     }
 
+    /// **Block this thread until everything recorded before this event has
+    /// happened** — `cudaEventSynchronize`, and the narrow form of a wait.
+    ///
+    /// **NOT `cudaStreamSynchronize`.** A stream synchronize drains the WHOLE
+    /// stream, including work enqueued after the point of interest, so a
+    /// caller that only needs one boundary's kernels to have landed pays for
+    /// every launch behind them and leaves the device with nothing queued.
+    /// This waits for exactly the recorded point, so the work enqueued after
+    /// it keeps running while the host blocks — which is the difference
+    /// between a host that waits and a GPU that idles.
+    ///
+    /// An event that was never recorded returns at once, for the same reason
+    /// [`Event::done`] answers `true` for one.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Runtimeless`], or [`Fault::Device`] for whatever the recorded
+    /// work said — this is a blocking call, so an asynchronous fault from any
+    /// launch before the record surfaces here.
+    pub fn settle(&self) -> Result<()> {
+        #[cfg(feature = "_cuda")]
+        {
+            use cudarc::runtime::sys as rt;
+            // SAFETY: the handle is live and this crate created it.
+            let status = unsafe { rt::cudaEventSynchronize(self.raw.cast()) };
+            if status != rt::cudaError::cudaSuccess {
+                return Err(Fault::Device {
+                    call: "cudaEventSynchronize",
+                    code: status as i32,
+                });
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            Err(Fault::Runtimeless)
+        }
+    }
+
     /// **Milliseconds of device time from `self` to `end`**, for two events
     /// created by [`Event::timing`] and both already completed.
     ///

@@ -51,6 +51,7 @@ pub mod endpoint;
 pub mod launch;
 pub mod ports;
 pub mod session;
+pub mod wave;
 
 use std::collections::BTreeMap;
 
@@ -65,7 +66,8 @@ pub use compile::{Cache, Compiled, Disk, Module, Region, Stage, Target};
 pub use endpoint::Endpoint;
 pub use launch::{ChannelShape, Cursor, Prepared, Rings};
 pub use ports::Envelope;
-pub use session::{Fired, Session, seeds_of};
+pub use session::{Fired, Launched, Session, seeds_of};
+pub use wave::Wave;
 
 /// One registered program: what the host planned, and what compiled from it.
 #[derive(Debug)]
@@ -80,6 +82,73 @@ pub struct Program {
     pub plan: ExecPlan,
     /// The compiled regions, one table per stage.
     pub compiled: Compiled,
+    /// **THE LANE BATCHES**, one per [`Extents`] any instance of this program
+    /// has bound at.
+    ///
+    /// The fire-path buffers used to be a session's, which is what made a
+    /// boundary's sixty-four epilogues sixty-four one-block launches
+    /// ([`Prepared`]'s own note, and the 25% of GPU time it names). They are
+    /// the PROGRAM's now, so attachments that share a program and its extents
+    /// share a launch with a block apiece.
+    ///
+    /// A `Vec` rather than a map because it holds one entry in every shape
+    /// this workspace serves — an epilogue binds at `sampled_rows` and every
+    /// other role at one — and two or three in the ones it does not.
+    batches: Vec<Batch>,
+}
+
+/// **ONE PROGRAM'S FIRE-PATH BUFFERS FOR ONE SET OF EXTENTS**, one entry per
+/// stage.
+///
+/// `None` for a stage with nothing to launch — the adapter prologue is
+/// exactly that, its one region being a sink the model fire reads out of the
+/// plan rather than a body anyone compiled.
+#[derive(Debug)]
+struct Batch {
+    extents: Extents,
+    stages: Vec<Option<Prepared>>,
+}
+
+impl Program {
+    /// The batch cut for `extents`, cutting it if this program has never seen
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] when a value's shape does not resolve against
+    /// `extents` or the scratch does not fit, and whatever the allocations
+    /// said.
+    fn batch(&mut self, extents: Extents, lanes: u32) -> Result<&mut Batch> {
+        if let Some(at) = self
+            .batches
+            .iter()
+            .position(|batch| batch.extents == extents)
+        {
+            return Ok(&mut self.batches[at]);
+        }
+        let shapes: Vec<ChannelShape> = self
+            .plan
+            .package
+            .channels
+            .iter()
+            .map(ChannelShape::of)
+            .collect();
+        let mut stages = Vec::with_capacity(self.compiled.plans.len());
+        for (index, stage_plan) in self.compiled.plans.iter().enumerate() {
+            let launches = self
+                .compiled
+                .stages
+                .get(index)
+                .is_some_and(|stage| !stage.regions.is_empty());
+            stages.push(if launches {
+                Some(Prepared::build(stage_plan, &shapes, extents, lanes)?)
+            } else {
+                None
+            });
+        }
+        self.batches.push(Batch { extents, stages });
+        Ok(self.batches.last_mut().expect("just pushed"))
+    }
 }
 
 /// The shell's guest-program plane: the compile cache, the registered
@@ -98,6 +167,20 @@ pub struct Plane {
     instances: BTreeMap<u64, Bound>,
     next_program: u64,
     next_instance: u64,
+    /// **THIS BOUNDARY'S STAGED FIRES**, `(program, extents, instance)` in
+    /// staging order.
+    ///
+    /// The grouping key and the group, in one list: [`Plane::fly`] walks it
+    /// once to decide which attachments ride which launch. Emptied at
+    /// [`Plane::land`].
+    staged: Vec<(u64, Extents, u64)>,
+    /// **ONE BOUNDARY'S CONTROL PLANE, SHARED BY EVERY FIRE IN IT.**
+    ///
+    /// The plane's and not a session's, because the whole point of it is that
+    /// the lanes of a boundary are CONTIGUOUS — see [`wave`]. Long-lived so
+    /// that its device arena is allocated at a high-water mark rather than
+    /// per boundary; empty between batches.
+    wave: Wave,
 }
 
 impl Default for Plane {
@@ -122,6 +205,8 @@ impl Plane {
             instances: BTreeMap::new(),
             next_program: 1,
             next_instance: 1,
+            staged: Vec::new(),
+            wave: Wave::default(),
         }
     }
 
@@ -174,6 +259,7 @@ impl Plane {
                 hash: registration.program_hash,
                 plan,
                 compiled,
+                batches: Vec::new(),
             },
         );
         self.by_hash.insert(registration.program_hash, id);
@@ -205,8 +291,15 @@ impl Plane {
     ) -> Result<u64> {
         let program = self
             .programs
-            .get(&program_id)
+            .get_mut(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
+        // **THE FIRE-PATH BUFFERS ARE CUT HERE, AT BIND** (Build log 15), and
+        // the extents are what they are cut against: a guess zero-fills
+        // silently, so a batch that does not resolve is a refusal at the door
+        // rather than three rows of zeroes at the first fire. One lane is
+        // enough for the validation; a boundary grows it to what it brings.
+        program.batch(extents, 1)?;
+        let program = &*program;
         let endpoints = endpoints_for(&program.plan, adopted)?;
         let held = endpoints.clone();
         let session = match Session::bind(
@@ -308,7 +401,6 @@ impl Plane {
     #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
-        context: &Context,
         id: u64,
         intrinsic: engine::tensor_ir::op::IntrinsicId,
         base: u64,
@@ -321,9 +413,7 @@ impl Plane {
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_intrinsic(
-                context, intrinsic, base, storage, width, row_stride, row_offset,
-            )
+            .bind_intrinsic(intrinsic, base, storage, width, row_stride, row_offset)
     }
 
     /// The first channel of instance `id` whose declared requirement a fire
@@ -408,32 +498,278 @@ impl Plane {
     /// Fire instance `id` once: readiness, then every stage's regions, then
     /// one commit.
     ///
+    /// **A BOUNDARY OF EXACTLY ONE LANE.** The three control kernels launch
+    /// with `lane_count = 1` and the program's batch with `grid = 1`: a
+    /// standalone fire is not a different protocol, only a smaller wave.
+    ///
     /// # Errors
     ///
     /// [`Fault::Program`] for an unknown instance, and whatever the launches
     /// said. A program that blocks or refuses is a [`Fired`], not an error.
     pub fn fire(&mut self, context: &Context, id: u64) -> Result<Fired> {
-        // The program is looked up THROUGH the instance's own record rather
-        // than taken as an argument, so a caller cannot fire one program's
-        // stages against another's rings — which would index scratch,
-        // descriptors and a channel table sized for someone else, and would
-        // not fault.
+        match self.stage(id)? {
+            Launched::Airborne => {
+                self.fly(context)?;
+                self.land(context)?;
+                context.synchronize()?;
+                self.settle_launched(id)
+            }
+            // A refusal never reached the mint, so it staged no lane and
+            // there is nothing to take back.
+            Launched::Refused(fired) => Ok(fired),
+        }
+    }
+
+    /// **THE STAGING HALF OF A FIRE**: mint instance `id`'s tickets, slot
+    /// lists and three lane records into the plane's [`Wave`], and enqueue
+    /// nothing at all.
+    ///
+    /// The program is looked up THROUGH the instance's own record rather than
+    /// taken as an argument, so a caller cannot fire one program's stages
+    /// against another's rings — which would index scratch, descriptors and a
+    /// channel table sized for someone else, and would not fault.
+    ///
+    /// A [`Launched::Airborne`] has taken a lane of the wave and owes, in
+    /// order: [`Plane::fly`], [`Plane::land`], a wait, and
+    /// [`Plane::settle_launched`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Plane::fire`].
+    pub fn stage(&mut self, id: u64) -> Result<Launched> {
+        let Plane {
+            programs,
+            instances,
+            wave,
+            staged,
+            ..
+        } = self;
+        let bound = instances
+            .get_mut(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program_id = bound.program_id;
+        let program = programs.get(&program_id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!("instance {id} names program {program_id}, which is gone"),
+            )
+        })?;
+        let launched = bound
+            .session
+            .stage(&program.compiled, &program.plan, wave)?;
+        if matches!(launched, Launched::Airborne) {
+            staged.push((program_id, bound.session.extents(), id));
+        }
+        Ok(launched)
+    }
+
+    /// **THE BOUNDARY, ON THE STREAM**: the wave's copy and its
+    /// `pull_validate`, then every staged fire's regions, then the wave's
+    /// `commit_bump` and `scatter_publish`.
+    ///
+    /// # The one thing this does that a per-fire launch could not
+    ///
+    /// The staged fires are grouped by `(program, extents)` — which is the
+    /// key a [`Prepared`] batch is cut against — and each group's regions
+    /// launch ONCE with a block per lane. Sixty-four decode samplers were
+    /// sixty-four `cuLaunchKernel`s of one block each, 42.5 µs apiece and
+    /// 25% of all GPU time in an nsys capture, every one of them reading half
+    /// a megabyte of logits at one SM's share of the bandwidth while the
+    /// other 141 idled. They are one launch of sixty-four blocks now.
+    ///
+    /// Order is preserved where it means something and nowhere else: within a
+    /// group, a stage that reads what the previous one wrote is still a later
+    /// launch on the same stream; between groups there is nothing to order,
+    /// because two lanes of a boundary share no ring (a shared ring flushes
+    /// the batch before it can be staged).
+    ///
+    /// Idempotent in the sense that matters: a boundary with nothing staged
+    /// launches nothing.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the allocations, the copies and the launches said.
+    pub fn fly(&mut self, context: &Context) -> Result<()> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+        self.wave.fly(context)?;
+        let stream = context.stream();
+        let Plane {
+            programs,
+            instances,
+            staged,
+            ..
+        } = self;
+
+        // Grouped in FIRST-SEEN order, so a boundary's launches come out in
+        // the order its attachments were staged — which is what an error
+        // message and a profile both read as "the order the shell asked for".
+        let mut groups: Vec<(u64, Extents, Vec<u64>)> = Vec::new();
+        for (program_id, extents, instance) in staged.iter() {
+            match groups
+                .iter_mut()
+                .find(|(pid, ext, _)| pid == program_id && ext == extents)
+            {
+                Some((_, _, members)) => members.push(*instance),
+                None => groups.push((*program_id, *extents, vec![*instance])),
+            }
+        }
+
+        for (program_id, extents, members) in groups {
+            let program = programs.get_mut(&program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("a staged fire names program {program_id}, which is gone"),
+                )
+            })?;
+            // **A GROUP THAT DOES NOT FIT IS SPLIT, NOT REFUSED.** The
+            // scratch ceiling is a wave's — 512 MiB over `lanes * stride` —
+            // so a program whose stride is generous runs out of room before
+            // the boundary does. Narrowing the launch costs one more kernel
+            // and loses nothing; refusing would kill a boundary that has
+            // already minted.
+            let ceiling = program
+                .batch(extents, 1)?
+                .stages
+                .iter()
+                .flatten()
+                .map(Prepared::lane_ceiling)
+                .min()
+                .unwrap_or(u32::MAX)
+                .max(1) as usize;
+            for chunk in members.chunks(ceiling) {
+                Plane::fly_one(programs, instances, program_id, extents, chunk, stream)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One launch's worth of a group: take every member's lane, stage the
+    /// batch's tables, and launch each region once with a block per lane.
+    fn fly_one(
+        programs: &mut BTreeMap<u64, Program>,
+        instances: &mut BTreeMap<u64, Bound>,
+        program_id: u64,
+        extents: Extents,
+        members: &[u64],
+        stream: *mut core::ffi::c_void,
+    ) -> Result<()> {
+        {
+            let program = programs.get_mut(&program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("a staged fire names program {program_id}, which is gone"),
+                )
+            })?;
+            let lanes = u32::try_from(members.len()).unwrap_or(u32::MAX);
+            let batch = program.batch(extents, lanes)?;
+            for prepared in batch.stages.iter_mut().flatten() {
+                prepared.begin(extents, lanes)?;
+            }
+            for instance in members {
+                let bound = instances.get_mut(instance).ok_or_else(|| {
+                    Fault::program(
+                        "program::plane",
+                        format!("a staged fire names instance {instance}, which is gone"),
+                    )
+                })?;
+                bound.session.take_lane(&mut batch.stages)?;
+            }
+            for prepared in batch.stages.iter_mut().flatten() {
+                prepared.commit_lanes(stream)?;
+            }
+        }
+        {
+            let program = programs.get(&program_id).ok_or_else(|| {
+                Fault::program(
+                    "program::plane",
+                    format!("a staged fire names program {program_id}, which is gone"),
+                )
+            })?;
+            // **THE STAGES LAUNCH UNCONDITIONALLY** (survey §7 I4). Every
+            // stage launches whatever the pull decided: the emitted kernel's
+            // first three lines read its lane's commit word and return when
+            // it is clear (`fused_block1.cuh`), so a refused lane costs what a
+            // running one does and writes only into the pending cell nobody
+            // can address — and its neighbours in the same launch are
+            // untouched, because the word is per lane.
+            //
+            // NO SYNCHRONIZE BETWEEN STAGES. One stream is the ordering.
+            for (index, stage) in program.compiled.stages.iter().enumerate() {
+                let Some(prepared) = program
+                    .batches
+                    .iter()
+                    .find(|batch| batch.extents == extents)
+                    .and_then(|batch| batch.stages.get(index))
+                    .and_then(Option::as_ref)
+                else {
+                    // A stage with nothing to launch needs no buffers and no
+                    // launch. Not an empty case: the adapter prologue is
+                    // exactly this shape.
+                    continue;
+                };
+                for region in stage.regions.iter() {
+                    prepared.launch_region(region, stream)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// **THE WAVE'S BUMP AND ITS PUBLICATION**, once for the whole batch —
+    /// see [`wave::Wave::land`]. Clears the wave for the next boundary.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the launches said.
+    pub fn land(&mut self, context: &Context) -> Result<()> {
+        self.staged.clear();
+        self.wave.land(context)
+    }
+
+    /// **How many lanes are staged and not yet flown.**
+    #[must_use]
+    pub fn staged(&self) -> usize {
+        self.staged.len().max(self.wave.staged())
+    }
+
+    /// **THROW AWAY A BATCH THAT WILL NEVER FLY.**
+    ///
+    /// The host half only, and there is no device half to throw: a staged
+    /// lane has touched no stream. What this exists for is the one way lanes
+    /// can be left in the wave — a fault raised BETWEEN a boundary's first
+    /// stage and its landing, which unwinds past both — after which the
+    /// sessions that staged them are wedged on their own pending mints
+    /// anyway. Clearing keeps the next boundary from launching a control
+    /// kernel over rows belonging to fires nobody will settle.
+    pub fn abandon_wave(&mut self) {
+        self.staged.clear();
+        self.wave.clear();
+    }
+
+
+    /// **The verdict half** — see [`Session::settle_launched`].
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an unknown instance, or for a prediction the
+    /// gate approved and the ring denied.
+    pub fn settle_launched(&mut self, id: u64) -> Result<Fired> {
         let bound = self
             .instances
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
-        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!(
-                    "instance {id} names program {}, which is gone",
-                    bound.program_id
-                ),
-            )
-        })?;
-        bound
-            .session
-            .fire(context, &program.compiled, &program.plan)
+        bound.session.settle_launched()
+    }
+
+    /// **Which shared rings instance `id` holds** — see
+    /// [`Session::shared_rings`]. An unknown instance holds none.
+    pub fn shared_rings(&self, id: u64) -> Vec<usize> {
+        self.instances
+            .get(&id)
+            .map(|bound| bound.session.shared_rings().collect())
+            .unwrap_or_default()
     }
 
     /// Drop instance `id`, freeing its rings and its stage buffers.

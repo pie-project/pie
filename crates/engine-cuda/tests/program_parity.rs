@@ -800,7 +800,6 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
             .unwrap_or_else(|error| panic!("{name}: staging the readout: {error}"));
         plane
             .bind_intrinsic(
-                context,
                 instance,
                 IntrinsicId::Logits,
                 buffer.ptr(),
@@ -829,7 +828,6 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
             .unwrap_or_else(|error| panic!("{name}: staging the draft column: {error}"));
         plane
             .bind_intrinsic(
-                context,
                 instance,
                 IntrinsicId::MtpLogits,
                 buffer.ptr(),

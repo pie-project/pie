@@ -471,8 +471,13 @@ fn cuda_budgets(opts: &CudaNativeEngineOptions, adapter_seats: u32) -> engine_ap
     engine_api::Budgets {
         max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
         max_tokens: opts.max_forward_tokens.unwrap_or(8192).max(1),
-        // v1 pads nothing: a fire's shape IS its graph key (`engine-cuda`'s
-        // `record.rs` argues the mechanism, and what padding would take).
+        // Empty is a DEFERRAL, not "no buckets": `engine_cuda::api::lattice`
+        // fills a stated-nothing budget with `default_lattice` (8, 16, …,
+        // max_tokens), and under `[engine] graphs = "on"` — the default —
+        // fires pad to those rungs and replay one captured exec per bucket.
+        // This line's old claim ("v1 pads nothing: a fire's shape IS its
+        // graph key") described `Graphs::Off`, which is a diagnostic mode
+        // now, not the served one.
         buckets: Vec::new(),
         // **THE BUDGET IS AN INTENT, AND NOW AN OPERATOR NAMES IT** (palo C2,
         // alto D1). Capacity is a SHAPE the model text declares — every bank

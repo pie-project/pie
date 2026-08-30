@@ -1,6 +1,6 @@
-//! **THE DEVICE HALF OF THE TICKET/COMMIT MACHINERY** — the four control
-//! kernels a fire's admission decision and its publication are made of (alto
-//! design §5), and the `#[repr(C)]` layouts they read.
+//! **THE DEVICE HALF OF THE TICKET/COMMIT MACHINERY** — the five control
+//! kernels a fire's admission decision, its publication and its settlement are
+//! made of (alto design §5), and the `#[repr(C)]` layouts they read.
 //!
 //! The mechanism in one sentence: **the host owns a prediction and the device
 //! owns the truth, and the two are reconciled by a kernel rather than by a
@@ -11,8 +11,18 @@
 //! is stale; [`commit_bump`] — the only writer of durable ring state — then
 //! publishes and consumes, or does nothing whatsoever; [`scatter_publish`]
 //! carries the cells a committed fire put out into the guest's mapped pinned
-//! mirror, so the crossing is a kernel and not a `cudaMemcpy`. Nothing in the
-//! sequence reads a device word on the host, and nothing waits.
+//! mirror, so the crossing is a kernel and not a `cudaMemcpy`; and [`settle`]
+//! advances the guest endpoint's own counters to the prediction the fire was
+//! admitted on. Nothing in the sequence reads a device word on the host, and
+//! nothing waits.
+//!
+//! **THE SETTLEMENT IS THE ONE THAT CAME BACK LAST**, and it is why the
+//! boundary used to wait. Those endpoint counters are what the NEXT fire's
+//! mint predicts off; while a host thread was the only thing that could
+//! advance them, every frame boundary took a `cudaStreamSynchronize` to give
+//! that thread a turn. On the device they are advanced in stream order, so the
+//! kernel that reads them next runs after the kernel that wrote them and no
+//! host thread is between the two.
 //!
 //! A refused fire is a DUMMY RUN, not an error: it computed, it wrote its
 //! output into the pending (tail) cell, and because the bump never moved the
@@ -100,6 +110,11 @@ const BUMP_BLOCK: u32 = 1;
 /// strides its own span.
 const MASK_BLOCK: u32 = 256;
 
+/// The settlement's block: dev launches 128 threads per lane
+/// (`channels.hpp:544`), which strides a lane's ticket window. A fire carries
+/// a handful of tickets, so this is a ceiling and not a shape.
+const SETTLE_BLOCK: u32 = 128;
+
 /// **ONE HOST-VISIBLE CHANNEL ENDPOINT, AS THIS FIRE PREDICTED IT** —
 /// `#[repr(C)]` against dev `channels.hpp:216-227`
 /// (`DeviceHostChannelTicket`).
@@ -181,6 +196,27 @@ impl Ticket {
     /// together with [`Ticket::PUBLISH`], because what is scattered is the
     /// cell this fire just wrote.
     pub const HOST_READER: u32 = 1 << 5;
+
+    /// **A COMMITTED FIRE MOVES THIS ENDPOINT'S HEAD TO
+    /// `expected_head + 1`** — [`settle`]'s predicate, and NOT
+    /// [`Ticket::CONSUME`].
+    ///
+    /// dev predicates its settlement on `kTicketConsume` directly
+    /// (`channels.hpp:437`) because there a consuming ticket always consumed.
+    /// Here [`Ticket::CONSUME`] means *this fire addresses the committed
+    /// cell*, which a `read` that peeks without taking also sets, and which a
+    /// take whose ring was empty at mint sets too — neither of those moves the
+    /// counter. It also carries an ownership decision the device cannot see:
+    /// on a channel the host READS, the head is the GUEST's counter and the
+    /// engine may never store it. So the mint states the advance separately,
+    /// off the same arithmetic `Session::settle` used to do on the host.
+    pub const ADVANCE_HEAD: u32 = 1 << 6;
+
+    /// **A COMMITTED FIRE MOVES THIS ENDPOINT'S TAIL TO
+    /// `expected_tail + 1`** — the mirror of [`Ticket::ADVANCE_HEAD`], set
+    /// where the fire puts and the ENGINE owns the tail (a channel the host
+    /// reads, or a device-only ring).
+    pub const ADVANCE_TAIL: u32 = 1 << 7;
 }
 
 const _: () = assert!(
@@ -278,6 +314,47 @@ pub struct PublishLane {
 const _: () = assert!(
     core::mem::size_of::<PublishLane>() == 16,
     "channel::PublishLane: sizeof disagrees with `channel/channels.cuh`'s PublishLane",
+);
+
+/// **ONE FIRE'S SETTLEMENT WINDOW OVER THE SAME TICKET TABLE** —
+/// `#[repr(C)]` against `channel/channels.cuh`'s `SettleLane`, dev
+/// `channels.hpp:380-388` (`HostChannelSettlementLane`) less the fields this
+/// port does not need.
+///
+/// Three values identical to [`PublishLane`]'s, and a distinct type on
+/// purpose: two kernels reading one array would make a field added to either
+/// a silent corruption of the other.
+///
+/// # What dev carries here and this does not
+///
+/// * **`host_commit`** — dev's mapped mirror of the commit pair, written so
+///   the completion callback can classify a lane without a D2H. Here the
+///   commit pair IS mapped pinned memory (`Session`'s own), so the host reads
+///   the word the kernels wrote where they wrote it and there is nothing to
+///   mirror.
+/// * **`full`/`head`/`cap1`/`consume`** — dev's settlement also clears the
+///   consumed cell's full byte and advances the registry head for its
+///   conditional-consume slots. That is [`commit_bump`]'s `taken` loop here,
+///   verbatim and predicated on the same word, so doing it again would
+///   advance every consumed ring TWICE. **The registry is the bump's; the
+///   endpoint words are the settlement's** — which is why this lane carries
+///   no registry pointer at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct SettleLane {
+    /// Word `[0]` of the fire's commit pair — the same word [`pull_validate`]
+    /// seeded and every other kernel here read. **Zero and this lane advances
+    /// nothing**, which is what leaves a refused fire's guest endpoint
+    /// exactly where it stood.
+    pub commit: DevicePtr,
+    /// Where this lane's tickets start in the table handed to [`settle`].
+    pub ticket_offset: u32,
+    pub ticket_count: u32,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<SettleLane>() == 16,
+    "channel::SettleLane: sizeof disagrees with `channel/channels.cuh`'s SettleLane",
 );
 
 /// **THE RING REGISTRY**: the four device arrays every slot's bookkeeping
@@ -468,6 +545,57 @@ pub fn scatter_publish(
         OP,
         Fire::at(FILE, "::pie::channel::scatter_publish")
             .apply(Launch::grid([lane_count, 1, 1], [PULL_BLOCK, 1, 1])),
+        &[
+            ArgValue::Ptr(tickets),
+            ArgValue::Ptr(lanes),
+            ArgValue::U32(lane_count),
+        ],
+    )
+}
+
+/// **THE ENDPOINT'S COUNTERS, ADVANCED BY THE DEVICE** — dev
+/// `k_settle_host_channels_batch` (`channels.hpp:411-455`), and the kernel
+/// whose absence made every frame boundary take a `cudaStreamSynchronize`.
+///
+/// These four words are the guest's view of the ring, and until this kernel
+/// existed the HOST advanced them: synchronize, read the pinned commit word,
+/// then bump each slot's counter. The next fire's mint predicts off exactly
+/// those counters, so the wait was never there to make the answer correct —
+/// it was there because the answer did not exist until a host thread wrote
+/// it. Written by the device, in stream order, it exists when the next kernel
+/// that reads it runs and no host thread stands between the two.
+///
+/// Per lane, iff its commit word survived: for every ticket flagged
+/// [`ADVANCE_HEAD`](Ticket::ADVANCE_HEAD) store `expected_head + 1` into
+/// `words[0]`, and for every [`ADVANCE_TAIL`](Ticket::ADVANCE_TAIL) store
+/// `expected_tail + 1` into `words[1]`. **The prediction plus one, never a
+/// read-modify-write** — the prediction is what [`pull_validate`] already
+/// proved the word equals, and an increment would race the guest's own
+/// counter at the other end of the ring.
+///
+/// **Enqueue this AFTER [`scatter_publish`]** on the same stream. That launch
+/// boundary is the entire payload-before-tail argument: the cells the scatter
+/// wrote into the guest's mirror are visible system-wide at its completion,
+/// which strictly precedes the first store this kernel makes, so a tail can
+/// never reach the guest ahead of the cell it announces. Every store here is
+/// relaxed at system scope and there is no fence — see the module header.
+pub fn settle(
+    ctx: &Ctx,
+    tickets: DevicePtr,
+    lanes: DevicePtr,
+    lane_count: u32,
+) -> Result<(), KernelError> {
+    const OP: &str = "channel.settle";
+    // A wave with no host-visible endpoint has no counter to advance, and
+    // that is not a refusal — the same reading every other kernel here gives
+    // an empty wave.
+    if lane_count == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::channel::settle")
+            .apply(Launch::grid([lane_count, 1, 1], [SETTLE_BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(tickets),
             ArgValue::Ptr(lanes),

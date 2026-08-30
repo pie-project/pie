@@ -1173,6 +1173,28 @@ impl engine::frame::Supply for Pools {
     /// hands it a frame's demand instead of a residency watermark will lose
     /// cached bytes, and that is the caller's error rather than a safety
     /// margin this method is entitled to add.
+    ///
+    /// # And a third condition: the drop has to be worth the unmap
+    ///
+    /// `cuMemUnmap` is not free and it is not asynchronous. A c=64 profile
+    /// counted **186 of them mid-serving at 545 µs each** — a tenth of a
+    /// second of host wall time, spent because a residency watermark that
+    /// breathes by a page either side of its mean crosses the "below what is
+    /// mapped" line on most frames, and every crossing pays a full unmap and
+    /// then a `cuMemMap` on the frame after it.
+    ///
+    /// So the trim is HYSTERETIC: a drop smaller than
+    /// [`TRIM_HYSTERESIS_SHIFT`] of what is mapped is not acted on, and the
+    /// watermark stays where it is until the hint has genuinely moved away
+    /// from it. Nothing is lost that the design cared about — the pages stay
+    /// mapped, which is what they were a moment ago, and the next frame that
+    /// wants them finds them.
+    ///
+    /// **THE BAND IS LIFTED UNDER PRESSURE**, because the whole reason to
+    /// give a page back is that somebody else needs it: once the physical
+    /// pool is within [`TRIM_HYSTERESIS_SHIFT`] of its budget, every byte the
+    /// hint releases is released exactly as asked. A trim that had to happen
+    /// still happens; only the ones nobody was waiting for are deferred.
     fn trim(&mut self, hint: engine::frame::Demand) {
         let idle = self.airborne.as_ref().is_none_or(|counts| counts.count() == 0);
         if !idle {
@@ -1183,9 +1205,41 @@ impl engine::frame::Supply for Pools {
         {
             return;
         }
+        if !self.trim_is_worth_the_unmap(hint) {
+            return;
+        }
         self.release_to(
             hint.kv_pages.min(self.committed_kv_pages),
             hint.state_slots.min(self.committed_state_slots),
         );
+    }
+}
+
+/// **How far below the watermark a hint must fall before an unmap is paid
+/// for**, as a right shift: `1 << 3` is an eighth.
+///
+/// Doubles as the pressure line — a pool within an eighth of its budget trims
+/// on any hint at all, because then the pages are wanted.
+const TRIM_HYSTERESIS_SHIFT: u32 = 3;
+
+impl Pools {
+    /// Is this drop large enough — or the pool tight enough — to be worth a
+    /// `cuMemUnmap`? See [`Supply::trim`](engine::frame::Supply::trim)'s note
+    /// on the band.
+    fn trim_is_worth_the_unmap(&self, hint: engine::frame::Demand) -> bool {
+        let budget = self.pool.budget_pages();
+        let free = budget.saturating_sub(self.pool.committed_pages());
+        if free <= budget >> TRIM_HYSTERESIS_SHIFT {
+            // Under pressure: the band is off and the hint is obeyed.
+            return true;
+        }
+        let kv_drop = u64::from(self.committed_kv_pages)
+            .saturating_sub(u64::from(hint.kv_pages.min(self.committed_kv_pages)));
+        let state_drop = u64::from(
+            self.committed_state_slots
+                .saturating_sub(hint.state_slots.min(self.committed_state_slots)),
+        );
+        kv_drop > u64::from(self.committed_kv_pages) >> TRIM_HYSTERESIS_SHIFT
+            || state_drop > u64::from(self.committed_state_slots) >> TRIM_HYSTERESIS_SHIFT
     }
 }

@@ -28,10 +28,11 @@
 //! [`ChannelState`]: engine::ChannelState
 
 use engine::engine_api::program::LaunchStagePlan;
+use engine::tensor_ir::container::HostRole;
 use engine::tensor_ir::DType;
 use engine::tensor_ir::op::{IntrinsicId, tags};
 use engine::{
-    Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LANE_SLOT_BYTES, LaneChannelSlot, LaneHeader,
+    Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader,
     LaneRecord, LaneShape, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN, ValueDesc, describe,
     layout,
 };
@@ -601,7 +602,25 @@ impl Rings {
         //    ring read the device cells directly, so the seed has to BE one.
         if let Some(base) = self.shared_slab(channel) {
             let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
-            return crate::device::write_raw(base + at, native);
+            crate::device::write_raw(base + at, native)?;
+            // **AND INTO THE PINNED SHADOW, because a seed is a committed
+            // cell.** `read_cell` reads the shadow now, and a ring seeded
+            // only into the slab would answer its first reader with zeros
+            // until some fire published over that ring position.
+            if let Some(endpoint) = self.endpoint(channel)
+                && !endpoint.write_cell(sequence, native)
+            {
+                return Err(Fault::program(
+                    "program::launch",
+                    format!(
+                        "channel {channel}'s shared shadow cell is {} bytes and {} were \
+                         offered",
+                        endpoint.wire_bytes(),
+                        native.len()
+                    ),
+                ));
+            }
+            return Ok(());
         }
         if let Some(endpoint) = self.endpoint(channel) {
             let wire = native_to_wire(shape.dtype, shape.numel, native)?;
@@ -639,11 +658,27 @@ impl Rings {
         //    port wants is the device one, which is where both attachments
         //    write it — the same read the per-session branch below took while
         //    the ring was per session.
-        if let Some(base) = self.shared_slab(channel) {
-            let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
-            let mut out = vec![0u8; shape.cell_bytes()];
-            crate::device::copy_d2h(base + at, &mut out)?;
-            return Ok(out);
+        // ── **AND ITS COMMITTED CELL IS READ OUT OF THE PINNED SHADOW**,
+        //    which `channel::scatter_publish` wrote at the same instant it
+        //    wrote the slab's — see `Session::mint`'s note on the shared
+        //    ring's `HOST_READER`. What stood here was `copy_d2h`: a blocking
+        //    four-byte `cudaMemcpy` per descriptor port per fire, 49,149 of
+        //    them for 503 ms in a c=64 profile, taken inside `prepare` — the
+        //    phase whose definition is that it reaches no stream.
+        //
+        //    The shadow is NATIVE bytes, not wire: the endpoint of a
+        //    device-only channel is opened at the slab's own width
+        //    (`Cuda::register_channel`), so there is no conversion here and
+        //    none below.
+        //
+        //    It holds only cells a fire COMMITTED, which is the difference
+        //    from the slab and it is the right difference: a refused fire's
+        //    bytes sit in the pending cell addressable by nobody, and the
+        //    slab handed them out to any reader that asked for that sequence.
+        if let Some(endpoint) = self.endpoint(channel)
+            && endpoint.role() == HostRole::None
+        {
+            return Ok(endpoint.read_cell(sequence));
         }
         if let Some(endpoint) = self.endpoint(channel) {
             return wire_to_native(shape.dtype, shape.numel, &endpoint.read_cell(sequence));
@@ -680,23 +715,81 @@ pub struct Cursor {
     /// The sequence a producer writes.
     pub tail: u64,
 }
-
-/// One stage's device state, allocated once and refreshed per fire.
+/// **ONE STAGE'S DEVICE STATE, CUT FOR MANY LANES.**
 ///
 /// **NOTHING ALLOCATES ON THE FIRE PATH** (design §0). A stage's value types
 /// size its scratch, its bindings index its lane table and its op count
 /// strides its params — all three are properties of the PLAN, not of the fire
-/// — so every buffer below is carved at bind and only the four things a fire
-/// actually changes are written again: the cell addresses in the lane table,
-/// the pending flags, the scratch, and the commit slot.
+/// — so every buffer below is carved once and only the few things a boundary
+/// actually changes are written again: each lane's record and channel slots,
+/// each lane's intrinsic row, the pending flags and the scratch.
+///
+/// # Why this is not per session any more (the 21% this wave came for)
+///
+/// It was, and the consequence was one `cuLaunchKernel` with `grid = 1` per
+/// attachment: an nsys capture at c=64 put the emitted sampler region at
+/// **16,383 launches × 42.5 µs = 697 ms, 25% of all GPU time**, every one of
+/// them a single block reading half a megabyte of logits at one SM's share of
+/// the bandwidth while 141 other SMs idled. The kernels were never the
+/// problem — `fused_block2.cuh` has read `all_descriptors + dispatch_lane *
+/// value_count` and `all_scratch + dispatch_lane * scratch_stride` since it
+/// was written, and `codegen/cuda/fused.rs` indexes the intrinsic side tables
+/// at `dispatch_lane * PTIR_INTRINSIC_SLOTS + intr` — what was missing was a
+/// caller with more than one lane to hand them.
+///
+/// So this belongs to the PROGRAM, keyed by the extents it was carved
+/// against, and a boundary's attachments that share both ride one launch with
+/// a block apiece.
+///
+/// # What is strided and what is shared, and the emitter says which
+///
+/// ```text
+/// lanes[dispatch_lane]                        strided   the lane records
+/// channels[lane.channel_slot_offset + n]      strided   the cell addresses
+/// pending_flags[lane.channel_slot_offset + n] strided   (the SAME index)
+/// all_descriptors + lane * value_count        strided
+/// all_scratch + lane * scratch_stride         strided
+/// intrinsic_*[lane * INTRINSIC_SLOTS + intr]  strided
+/// offsets                                     SHARED    where values sit
+/// params                                      SHARED    what each op does
+/// ```
+///
+/// **THE TWO SHARED ONES ARE WHY EXTENTS ARE PART OF THE KEY.** `offsets` is
+/// [`engine::layout`]'s answer for one descriptor set and the kernel does not
+/// stride it, so two lanes whose values are different sizes cannot share this
+/// structure — and `describe` resolves a value's size against the extents.
+/// Rather than pad every lane to an envelope, a batch is cut per `Extents`
+/// and lanes that disagree are simply different batches, which is one more
+/// launch and no arithmetic anybody has to trust. In the shape that motivated
+/// the wave they never disagree: an epilogue binds at `sampled_rows` and
+/// every other role at one (`BindExtents`'s own doc), so sixty-four decode
+/// samplers are one batch of sixty-four.
+///
+/// Because the extents are the key, **every lane's descriptor row is the same
+/// row** — `describe` reads the value type and the extents and nothing else —
+/// so the descriptors are written once per GROW and never again. What a
+/// boundary writes per lane is its record, its channel slots and its
+/// intrinsic row: a few dozen bytes.
 #[derive(Debug)]
 pub struct Prepared {
+    /// **THE BUFFERS A GROW REPLACED, KEPT ALIVE.**
+    ///
+    /// A batch grows at a high-water lane count, and `cudaFree` is not
+    /// enqueued — it takes effect when the host calls it. The epilogue
+    /// boundary is enqueue-only (`serve::AirborneFires::defer`), so a
+    /// previous boundary's regions may still be reading the table, the
+    /// scratch or a side table this grow is replacing; the only safe thing to
+    /// do with one is nothing. A grow happens on the first few boundaries of
+    /// a run and never again, so this holds a handful of allocations for the
+    /// life of the batch and never grows on the fire path.
+    retired: Vec<Buffer>,
     table: Buffer,
-    /// The host mirror of the table. Kept so a fire patches the sixteen bytes
-    /// of each channel slot rather than rebuilding a header and a record it
-    /// already wrote.
+    /// The host mirror of the table. Kept so a boundary patches each lane's
+    /// record and slots rather than rebuilding a header it already wrote.
     table_host: Vec<u8>,
     descriptors: Buffer,
+    /// One lane's descriptor row, kept so a grow can repeat it.
+    descriptor_row: Vec<u8>,
     params: Buffer,
     offsets: Buffer,
     scratch: Buffer,
@@ -706,35 +799,35 @@ pub struct Prepared {
     intrinsic_widths: Buffer,
     intrinsic_strides: Buffer,
     intrinsic_offsets: Buffer,
-    /// Where the kernel writes its verdict — **the fire's commit word, not
-    /// this stage's**, and it is not allocated here.
-    ///
-    /// `channel::pull_validate` SEEDS this word (to one, or to zero when a
-    /// ticket's prediction was stale), every stage's kernel reads it first and
-    /// early-returns when it is clear, `channel::commit_bump` moves durable
-    /// ring state only if it survived, and `channel::scatter_publish`
-    /// publishes only then. One word, four readers, one meaning — which is
-    /// what makes a refused fire a DUMMY RUN rather than a fire that did not
-    /// happen (survey §7 I4). It lives in the session's pinned commit pair, so
-    /// the host reads the verdict at settle without a device read (I3).
-    commit: u64,
+    /// The host mirrors of the five side tables, `lanes * INTRINSIC_SLOTS`
+    /// each. Mirrored because a binding SURVIVES a fire: a caller that binds
+    /// `logits` once and fires a hundred times must find it still bound, and
+    /// the tables are restaged whole once per boundary.
+    intrinsic_bases_host: Vec<u64>,
+    intrinsic_modes_host: Vec<u32>,
+    intrinsic_widths_host: Vec<u32>,
+    intrinsic_strides_host: Vec<u32>,
+    intrinsic_offsets_host: Vec<u32>,
     channel_count: u32,
     value_count: u32,
     scratch_stride: u32,
     temporary_offset: u32,
+    /// How many lanes every buffer above is cut for. A high-water mark: it
+    /// grows when a boundary brings more attachments than it has seen and
+    /// never shrinks, because the grow is a reallocation and the only safe
+    /// moment for one is a boundary that has not staged anything yet.
+    lanes: u32,
+    /// How many lanes THIS boundary has taken. The launch's grid, and the
+    /// table header's `lane_count` — which is also the emitted kernel's own
+    /// bound (`fused_block1.cuh`'s second line), so a stale one past `filled`
+    /// returns rather than reading a lane nobody wrote.
+    filled: u32,
     /// This stage's local channel slot → the instance's dense channel index.
     bindings: Vec<u32>,
 }
 
 impl Prepared {
-    /// Carve every buffer one stage needs, for a single-lane fire.
-    ///
-    /// **ONE LANE.** The lane table's shape already admits many — that is what
-    /// [`LaneShape`] is — and the emitted kernel reads `blockIdx.x` as its
-    /// lane. What a grouped fire additionally needs is one ring registry
-    /// shared across instances, which is a decision about the runtime's
-    /// batching and not about this plane; step 7 binds one instance per
-    /// session and the shape is left reachable.
+    /// Carve every buffer one stage needs, for `lanes` lanes.
     ///
     /// # Errors
     ///
@@ -745,7 +838,7 @@ impl Prepared {
         plan: &LaunchStagePlan,
         shapes: &[ChannelShape],
         extents: Extents,
-        commit: u64,
+        lanes: u32,
     ) -> Result<Prepared> {
         let channel_count = u32::try_from(plan.channel_bindings.len())
             .map_err(|_| Fault::program("program::launch", "more channels than a u32 can count"))?;
@@ -775,44 +868,6 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "a scratch stride past a u32"))?;
         let temporary_offset = u32::try_from(scratch_layout.temporary)
             .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
-
-        // ── The lane table: header, one record, its channel slots. ──
-        let shape = LaneShape::of(1, channel_count);
-        let table_bytes = shape
-            .bytes()
-            .and_then(|bytes| usize::try_from(bytes).ok())
-            .ok_or_else(|| Fault::program("program::launch", "a lane table past what fits"))?;
-        let mut table_host = vec![0u8; table_bytes];
-        write_record(
-            &mut table_host,
-            0,
-            &LaneHeader {
-                abi_version: engine::LANE_ABI_VERSION,
-                lane_count: 1,
-                channel_slots_per_lane: channel_count,
-                flags: 0,
-            },
-        );
-        write_record(
-            &mut table_host,
-            LANE_HEADER_BYTES as usize,
-            &LaneRecord {
-                kv_len: extents.kv_len,
-                page_count: extents.page_count,
-                row_count: extents.row_count,
-                token_count: extents.token_count,
-                sampled_rows: extents.sampled_rows,
-                query_len: extents.query_len,
-                key_len: extents.key_len,
-                // The lane's row in the flat slot array. Lane zero starts at
-                // zero; the kernel indexes `channels[offset + n]`.
-                channel_slot_offset: 0,
-                commit_slot: commit,
-                ..LaneRecord::default()
-            },
-        );
-        let mut table = Buffer::zeroed(table_bytes)?;
-        table.write(0, &table_host)?;
 
         // ── Op params, widened to CUDA's 88-byte record. ──
         let mut records = Vec::with_capacity(plan.ops.len());
@@ -860,10 +915,6 @@ impl Prepared {
         )?;
         params.write(0, &records_bytes(&records))?;
 
-        let descriptor_bytes: Vec<u8> = descriptors.iter().flat_map(record_bytes).collect();
-        let mut descriptor_buffer = Buffer::zeroed(descriptor_bytes.len().max(1))?;
-        descriptor_buffer.write(0, &descriptor_bytes)?;
-
         let offset_bytes: Vec<u8> = scratch_layout
             .values
             .iter()
@@ -873,55 +924,229 @@ impl Prepared {
         let mut offsets = Buffer::zeroed(offset_bytes.len().max(size_of::<u32>()))?;
         offsets.write(0, &offset_bytes)?;
 
-        let scratch_bytes =
-            (scratch_stride as usize).max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256));
-        let scratch = Buffer::zeroed(scratch_bytes)?;
-        // One byte per channel: zero means a take reads the committed cell,
-        // and the kernel sets it as puts land within the fire.
-        let pending = Buffer::zeroed((channel_count as usize).max(1))?;
-
-        let words = INTRINSIC_SLOTS;
-        Ok(Prepared {
-            table,
-            table_host,
-            descriptors: descriptor_buffer,
+        let mut prepared = Prepared {
+            retired: Vec::new(),
+            table: Buffer::zeroed(0)?,
+            table_host: Vec::new(),
+            descriptors: Buffer::zeroed(0)?,
+            descriptor_row: descriptors.iter().flat_map(record_bytes).collect(),
             params,
             offsets,
-            scratch,
-            pending,
-            intrinsic_bases: Buffer::zeroed(words * size_of::<u64>())?,
-            intrinsic_modes: Buffer::zeroed(words * size_of::<u32>())?,
-            intrinsic_widths: Buffer::zeroed(words * size_of::<u32>())?,
-            intrinsic_strides: Buffer::zeroed(words * size_of::<u32>())?,
-            intrinsic_offsets: Buffer::zeroed(words * size_of::<u32>())?,
-            commit,
+            scratch: Buffer::zeroed(0)?,
+            pending: Buffer::zeroed(0)?,
+            intrinsic_bases: Buffer::zeroed(0)?,
+            intrinsic_modes: Buffer::zeroed(0)?,
+            intrinsic_widths: Buffer::zeroed(0)?,
+            intrinsic_strides: Buffer::zeroed(0)?,
+            intrinsic_offsets: Buffer::zeroed(0)?,
+            intrinsic_bases_host: Vec::new(),
+            intrinsic_modes_host: Vec::new(),
+            intrinsic_widths_host: Vec::new(),
+            intrinsic_strides_host: Vec::new(),
+            intrinsic_offsets_host: Vec::new(),
             channel_count,
             value_count,
             scratch_stride,
             temporary_offset,
+            lanes: 0,
+            filled: 0,
             bindings: plan.channel_bindings.clone(),
-        })
+        };
+        prepared.grow(extents, lanes.max(1))?;
+        Ok(prepared)
     }
 
-    /// Point this stage's lane table at the cells `cursors` name, and reset
-    /// everything a fire starts from: pending flags clear, scratch zeroed,
-    /// commit slot set.
+    /// **CUT THE PER-LANE BUFFERS FOR `lanes` LANES**, keeping every intrinsic
+    /// binding the smaller table held.
     ///
-    /// The commit word is NOT reset here: `channel::pull_validate` seeds it
-    /// on the stream, ahead of this stage's launches, from this fire's
-    /// tickets.
+    /// A HIGH-WATER MARK AND NOT A FIT: every allocation here replaces one a
+    /// launch may still be reading, so the only sound moment to call it is a
+    /// boundary that has staged nothing — which is where [`Prepared::begin`]
+    /// puts it.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] when the lane table or the scratch outgrows what
+    /// [`engine::layout`] permits, and whatever the allocations said.
+    fn grow(&mut self, extents: Extents, lanes: u32) -> Result<()> {
+        if lanes <= self.lanes {
+            return Ok(());
+        }
+        // **THE SCRATCH CEILING IS A WAVE'S, NOT A LANE'S** (`engine::scratch`
+        // MAX_BYTES). A stride that fits on its own can still refuse at
+        // sixty-four, and the answer is a smaller batch rather than a dead
+        // shell — so this is a named refusal the caller halves and retries.
+        let total = u64::from(self.scratch_stride) * u64::from(lanes);
+        if total > engine::SCRATCH_MAX_BYTES {
+            return Err(Fault::Ceiling {
+                what: "a wave's fused-region scratch",
+                need: total,
+                have: engine::SCRATCH_MAX_BYTES,
+            });
+        }
+        let shape = LaneShape::of(lanes, self.channel_count);
+        let table_bytes = shape
+            .bytes()
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| Fault::program("program::launch", "a lane table past what fits"))?;
+        let mut table_host = vec![0u8; table_bytes];
+        write_record(
+            &mut table_host,
+            0,
+            &LaneHeader {
+                abi_version: engine::LANE_ABI_VERSION,
+                // Seeded at the ceiling and rewritten at every commit with
+                // what the boundary actually staged; the kernel reads it as
+                // its own bound.
+                lane_count: lanes,
+                channel_slots_per_lane: self.channel_count,
+                flags: 0,
+            },
+        );
+        // Every lane's record carries the SAME extents — they are the key this
+        // batch is cut against — and differs only in where its channel slots
+        // start and which commit word it votes on. The second is a session's
+        // and arrives at `stage_lane`.
+        for lane in 0..lanes {
+            let at = shape
+                .record_offset(lane)
+                .and_then(|at| usize::try_from(at).ok())
+                .ok_or_else(|| Fault::program("program::launch", "a lane record past the table"))?;
+            write_record(
+                &mut table_host,
+                at,
+                &LaneRecord {
+                    kv_len: extents.kv_len,
+                    page_count: extents.page_count,
+                    row_count: extents.row_count,
+                    token_count: extents.token_count,
+                    sampled_rows: extents.sampled_rows,
+                    query_len: extents.query_len,
+                    key_len: extents.key_len,
+                    // The lane's row in the flat slot array. The kernel
+                    // indexes `channels[offset + n]` AND
+                    // `pending_flags[offset + n]` with it, which is why the
+                    // pending buffer is cut to the same shape.
+                    channel_slot_offset: shape.slot_index(lane).ok_or_else(|| {
+                        Fault::program("program::launch", "a lane's slot row past the table")
+                    })?,
+                    ..LaneRecord::default()
+                },
+            );
+        }
+        // Anything the smaller table held for lanes it still has is carried
+        // over: the header and the records above are freshly written, and the
+        // channel slots are rewritten by every `stage_lane`.
+        let mut table = Buffer::zeroed(table_bytes)?;
+        table.write(0, &table_host)?;
+        self.retired.push(std::mem::replace(&mut self.table, table));
+        self.table_host = table_host;
+
+        // Every lane's descriptor row is the same row, so this is the one
+        // write it ever needs.
+        let row = self.descriptor_row.len().max(1);
+        let mut descriptors = Buffer::zeroed(row * lanes as usize)?;
+        if !self.descriptor_row.is_empty() {
+            let repeated: Vec<u8> = self
+                .descriptor_row
+                .iter()
+                .copied()
+                .cycle()
+                .take(self.descriptor_row.len() * lanes as usize)
+                .collect();
+            descriptors.write(0, &repeated)?;
+        }
+        self.retired
+            .push(std::mem::replace(&mut self.descriptors, descriptors));
+
+        let scratch_bytes = (self.scratch_stride as usize * lanes as usize)
+            .max(usize::try_from(SCRATCH_ALIGN).unwrap_or(256));
+        self.retired.push(std::mem::replace(
+            &mut self.scratch,
+            Buffer::zeroed(scratch_bytes)?,
+        ));
+        // One byte per channel per lane, indexed exactly as the channel slots
+        // are: zero means a take reads the committed cell, and the kernel sets
+        // it as puts land within the fire.
+        self.retired.push(std::mem::replace(
+            &mut self.pending,
+            Buffer::zeroed((self.channel_count as usize * lanes as usize).max(1))?,
+        ));
+
+        let words = INTRINSIC_SLOTS * lanes as usize;
+        self.intrinsic_bases_host.resize(words, 0u64);
+        self.intrinsic_modes_host.resize(words, 0u32);
+        self.intrinsic_widths_host.resize(words, 0u32);
+        self.intrinsic_strides_host.resize(words, 0u32);
+        self.intrinsic_offsets_host.resize(words, 0u32);
+        for (slot, bytes) in [
+            (&mut self.intrinsic_bases, words * size_of::<u64>()),
+            (&mut self.intrinsic_modes, words * size_of::<u32>()),
+            (&mut self.intrinsic_widths, words * size_of::<u32>()),
+            (&mut self.intrinsic_strides, words * size_of::<u32>()),
+            (&mut self.intrinsic_offsets, words * size_of::<u32>()),
+        ] {
+            self.retired
+                .push(std::mem::replace(slot, Buffer::zeroed(bytes)?));
+        }
+        self.lanes = lanes;
+        Ok(())
+    }
+
+    /// **OPEN A BOUNDARY**, growing to `lanes` if this batch has never carried
+    /// that many.
+    ///
+    /// Nothing of this batch is staged here, so nothing of THIS boundary is
+    /// reading the buffers a grow replaces. A PREVIOUS boundary's may be —
+    /// the epilogue is enqueue-only and its kernels outlive the call that
+    /// launched them — which is why [`Prepared::grow`] retires what it
+    /// replaces instead of dropping it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Prepared::grow`].
+    pub fn begin(&mut self, extents: Extents, lanes: u32) -> Result<()> {
+        self.filled = 0;
+        self.grow(extents, lanes)
+    }
+
+    /// **TAKE THE NEXT LANE OF THIS BOUNDARY**, pointing its channel slots at
+    /// the cells `cursors` name and its record at `commit`.
+    ///
+    /// Answers the lane index, which is the row a caller's later
+    /// [`Prepared::bind_intrinsic`] names.
     ///
     /// # Errors
     ///
     /// [`Fault::Program`] when a stage-local slot names a channel this
-    /// instance does not carry, and whatever the copies said.
-    pub fn refresh(
-        &mut self,
-        rings: &Rings,
-        cursors: &[Cursor],
-        stream: *mut core::ffi::c_void,
-    ) -> Result<()> {
-        let slots_at = LANE_HEADER_BYTES as usize + LANE_RECORD_BYTES as usize;
+    /// instance does not carry, or when the batch has no lane left — which
+    /// [`Prepared::begin`] is what prevents.
+    pub fn stage_lane(&mut self, rings: &Rings, cursors: &[Cursor], commit: u64) -> Result<u32> {
+        let lane = self.filled;
+        if lane >= self.lanes {
+            return Err(Fault::program(
+                "program::launch",
+                format!(
+                    "a boundary staged lane {lane} of a batch cut for {}: `begin` is what \
+                     sizes it and it was told a smaller number",
+                    self.lanes
+                ),
+            ));
+        }
+        let shape = LaneShape::of(self.lanes, self.channel_count);
+        // **THE COMMIT WORD IS THE ONLY PART OF A RECORD THAT IS A SESSION'S.**
+        // The extents are the batch's key and the slot offset is the lane's
+        // arithmetic, both written at `grow`; this is the one field that
+        // arrives per fire, and it is what makes a refused lane early-return
+        // while its neighbours in the same launch run.
+        let record_at = shape
+            .record_offset(lane)
+            .and_then(|at| usize::try_from(at).ok())
+            .ok_or_else(|| Fault::program("program::launch", "a lane record past the table"))?;
+        let commit_at = record_at + std::mem::offset_of!(LaneRecord, commit_slot);
+        self.table_host[commit_at..commit_at + size_of::<u64>()]
+            .copy_from_slice(&commit.to_le_bytes());
+
         for (local, &dense) in self.bindings.iter().enumerate() {
             let channel = dense as usize;
             let cursor = cursors.get(channel).copied().ok_or_else(|| {
@@ -933,9 +1158,15 @@ impl Prepared {
                     ),
                 )
             })?;
+            let slot_at = shape
+                .slot_offset(lane, u32::try_from(local).unwrap_or(u32::MAX))
+                .and_then(|at| usize::try_from(at).ok())
+                .ok_or_else(|| {
+                    Fault::program("program::launch", "a channel slot past the table")
+                })?;
             write_record(
                 &mut self.table_host,
-                slots_at + local * LANE_SLOT_BYTES as usize,
+                slot_at,
                 &LaneChannelSlot {
                     committed_cell: rings.cell_address(channel, cursor.head)?,
                     pending_cell: rings.cell_address(channel, cursor.tail)?,
@@ -947,48 +1178,105 @@ impl Prepared {
                 },
             );
         }
+        // **AN UNTAKEN BINDING IS ADDRESS ZERO, AND A LANE IS REUSED.** The
+        // batch outlives the boundary and lane `l` belongs to a different
+        // session every time; leaving the previous occupant's row would hand
+        // this one a buffer it never asked for under a name it never bound.
+        // The doc that says "an unbound intrinsic reads address zero" is only
+        // true if this line is here.
+        let row = lane as usize * INTRINSIC_SLOTS;
+        self.intrinsic_bases_host[row..row + INTRINSIC_SLOTS].fill(0);
+        self.intrinsic_modes_host[row..row + INTRINSIC_SLOTS].fill(0);
+        self.intrinsic_widths_host[row..row + INTRINSIC_SLOTS].fill(0);
+        self.intrinsic_strides_host[row..row + INTRINSIC_SLOTS].fill(0);
+        self.intrinsic_offsets_host[row..row + INTRINSIC_SLOTS].fill(0);
+        self.filled += 1;
+        Ok(lane)
+    }
+
+    /// **THE BOUNDARY'S TABLES, ON THE STREAM**, and the state every fire
+    /// starts from reset: pending flags clear, scratch zeroed.
+    ///
+    /// The commit word is NOT reset here: `channel::pull_validate` seeds it on
+    /// the stream, ahead of this stage's launches, from each fire's tickets. A
+    /// host store of one here would overwrite the device's verdict with the
+    /// host's opinion.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the copies said.
+    pub fn commit_lanes(&mut self, stream: *mut core::ffi::c_void) -> Result<()> {
+        if self.filled == 0 {
+            return Ok(());
+        }
+        // **THE HEADER IS THE KERNEL'S OWN BOUND.** `fused_block1.cuh` returns
+        // for `dispatch_lane >= header->lane_count`, so a boundary that
+        // staged fewer lanes than the batch is cut for says so here rather
+        // than leaving stale rows addressable.
+        write_record(
+            &mut self.table_host,
+            0,
+            &LaneHeader {
+                abi_version: engine::LANE_ABI_VERSION,
+                lane_count: self.filled,
+                channel_slots_per_lane: self.channel_count,
+                flags: 0,
+            },
+        );
         self.table.stage(stream, 0, &self.table_host)?;
-        self.pending.clear(stream)?;
+        self.intrinsic_bases
+            .stage(stream, 0, &slice_bytes(&self.intrinsic_bases_host))?;
+        self.intrinsic_modes
+            .stage(stream, 0, &slice_bytes(&self.intrinsic_modes_host))?;
+        self.intrinsic_widths
+            .stage(stream, 0, &slice_bytes(&self.intrinsic_widths_host))?;
+        self.intrinsic_strides
+            .stage(stream, 0, &slice_bytes(&self.intrinsic_strides_host))?;
+        self.intrinsic_offsets
+            .stage(stream, 0, &slice_bytes(&self.intrinsic_offsets_host))?;
+        // **ONLY WHAT THIS BOUNDARY USES.** The batch is cut at a high-water
+        // mark and a quiet boundary may bring two lanes to a table sized for
+        // sixty-four; zeroing the whole allocation would put the busiest
+        // boundary's memset on the quietest one's bill.
+        let lanes = self.filled as usize;
+        self.pending
+            .zero_span_on(stream, 0, lanes * self.channel_count as usize)?;
         // Zeroed every fire, not once: a value slot no op writes reads back as
         // whatever the LAST fire left there, and zeros are the state the
         // emitted kernels — and the host interpreter they are diffed against —
         // both assume.
-        self.scratch.clear(stream)?;
-        // THE COMMIT WORD IS NOT SEEDED HERE ANY MORE, and that is the whole
-        // of F2a in one deletion: `channel::pull_validate` seeds it on the
-        // stream, in front of these launches, after checking this fire's
-        // tickets against the live pinned counters. A host store of one here
-        // would overwrite the device's verdict with the host's opinion.
+        self.scratch
+            .zero_span_on(stream, 0, lanes * self.scratch_stride as usize)?;
         Ok(())
     }
 
-    /// Point one intrinsic at the buffer a model fire produced.
+    /// Point one lane's intrinsic at the buffer a model fire produced.
     ///
     /// The side tables are zeroed at bind, so an unbound intrinsic reads
     /// address zero. `modes` is a STORAGE mode, not a `DType` wire code: they
     /// collide only at `DType::F32 as u8 == 0 == INTRINSIC_STORAGE_F32`, so
     /// passing a dtype for a bf16 buffer misreads every logit, silently.
     ///
-    /// **THE SEAM, NOT THE ATTACHMENT.** What is missing is not this call —
-    /// [`Session::bind_intrinsic`](super::session::Session::bind_intrinsic)
-    /// reaches it and the parity test drives it — but the shell deciding WHEN
-    /// to make it: pointing this at the buffer `Shell::fire` produced, in the
-    /// order a prologue and an epilogue run around a model fire, is the
-    /// runtime's step.
+    /// **HOST-SIDE, AND STAGED WITH THE REST AT [`Prepared::commit_lanes`].**
+    /// It used to be five `cudaMemcpyAsync` calls of four and eight bytes,
+    /// per attachment, per boundary — 320 of them a step at c=64 for numbers
+    /// nobody asked to observe. They are five copies of the whole table now,
+    /// once for the wave.
     ///
     /// # Errors
     ///
-    /// [`Fault::Program`] for an intrinsic past the table's pitch.
+    /// [`Fault::Program`] for an intrinsic past the table's pitch or a lane
+    /// past the batch.
     #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
+        lane: u32,
         intrinsic: IntrinsicId,
         base: u64,
         storage: u32,
         width: u32,
         row_stride: u32,
         row_offset: u32,
-        stream: *mut core::ffi::c_void,
     ) -> Result<()> {
         let slot = intrinsic as usize;
         if slot >= INTRINSIC_SLOTS {
@@ -1000,36 +1288,38 @@ impl Prepared {
                 ),
             ));
         }
-        self.intrinsic_bases.stage(
-            stream,
-            (slot * size_of::<u64>()) as u64,
-            &base.to_le_bytes(),
-        )?;
-        let word = |buffer: &mut Buffer, value: u32| -> Result<()> {
-            buffer.stage(
-                stream,
-                (slot * size_of::<u32>()) as u64,
-                &value.to_le_bytes(),
-            )
-        };
-        word(&mut self.intrinsic_modes, storage)?;
-        word(&mut self.intrinsic_widths, width)?;
-        word(&mut self.intrinsic_strides, row_stride)?;
-        word(&mut self.intrinsic_offsets, row_offset)?;
+        if lane >= self.lanes {
+            return Err(Fault::program(
+                "program::launch",
+                format!("lane {lane} is past a batch cut for {}", self.lanes),
+            ));
+        }
+        let at = lane as usize * INTRINSIC_SLOTS + slot;
+        self.intrinsic_bases_host[at] = base;
+        self.intrinsic_modes_host[at] = storage;
+        self.intrinsic_widths_host[at] = width;
+        self.intrinsic_strides_host[at] = row_stride;
+        self.intrinsic_offsets_host[at] = row_offset;
         Ok(())
     }
 
-    /// Launch one generated region over this fire's single lane.
+    /// Launch one generated region over every lane this boundary staged.
     ///
-    /// One CTA per lane at the compiled function's own block width — the
+    /// **ONE CTA PER LANE** at the compiled function's own block width — the
     /// kernel's contract, not a tuning choice: it reads `blockIdx.x` as its
-    /// lane and reduces with a halving tree over `blockDim.x`.
+    /// lane and reduces with a halving tree over `blockDim.x`. What changed in
+    /// this wave is only the grid: sixty-four blocks that used to be
+    /// sixty-four launches now overlap each other's memory latency across
+    /// sixty-four SMs.
     ///
     /// # Errors
     ///
     /// [`Fault::Device`] when the driver refuses the launch. A fault INSIDE
     /// the kernel is asynchronous and surfaces at the next synchronize.
     pub fn launch_region(&self, region: &Region, stream: *mut core::ffi::c_void) -> Result<()> {
+        if self.filled == 0 {
+            return Ok(());
+        }
         let mut args = Args::new();
         args.ptr(self.table.ptr())
             .ptr(self.lane_records_ptr())
@@ -1049,7 +1339,7 @@ impl Prepared {
             .ptr(self.intrinsic_offsets.ptr());
         launch(
             &region.module,
-            1,
+            self.filled,
             region.module.block_threads(),
             &mut args,
             FUSED_ARITY,
@@ -1057,13 +1347,39 @@ impl Prepared {
         )
     }
 
-    /// The fire's commit word, as this stage's lane record points at it.
+    /// **HOW MANY LANES THIS STAGE CAN CARRY IN ONE LAUNCH.**
+    ///
+    /// The scratch ceiling ([`engine::SCRATCH_MAX_BYTES`], 512 MiB) is a
+    /// WAVE's and not a lane's: a stride that fits on its own can refuse at
+    /// sixty-four. Answering the number rather than faulting is what lets a
+    /// caller split a group into launches that fit — which is one more kernel
+    /// and no lost work, where a refusal would be a dead boundary.
+    ///
+    /// At least one, always: a single lane that does not fit was refused at
+    /// bind by [`engine::layout`] itself.
     #[must_use]
-    pub const fn commit(&self) -> u64 {
-        self.commit
+    pub fn lane_ceiling(&self) -> u32 {
+        if self.scratch_stride == 0 {
+            return u32::MAX;
+        }
+        u32::try_from(engine::SCRATCH_MAX_BYTES / u64::from(self.scratch_stride))
+            .unwrap_or(u32::MAX)
+            .max(1)
     }
 
-    /// How many channel slots this stage's table carries.
+    /// How many lanes this boundary staged.
+    #[must_use]
+    pub const fn filled(&self) -> u32 {
+        self.filled
+    }
+
+    /// How many lanes the buffers are cut for.
+    #[must_use]
+    pub const fn lanes(&self) -> u32 {
+        self.lanes
+    }
+
+    /// How many channel slots one lane of this stage's table carries.
     #[must_use]
     pub const fn channel_count(&self) -> u32 {
         self.channel_count
@@ -1074,9 +1390,15 @@ impl Prepared {
         self.table.ptr() + LANE_HEADER_BYTES
     }
 
-    /// The flat channel-slot array, which begins after every lane record.
+    /// The flat channel-slot array, which begins after EVERY lane record.
+    ///
+    /// It was `+ LANE_HEADER_BYTES + LANE_RECORD_BYTES` while a batch was one
+    /// lane, and `program/launch.rs` said in as many words that this was a
+    /// latent single-lane assumption. It is the shape's arithmetic now.
     fn channel_slots_ptr(&self) -> u64 {
-        self.table.ptr() + LANE_HEADER_BYTES + LANE_RECORD_BYTES
+        self.table.ptr()
+            + LANE_HEADER_BYTES
+            + u64::from(self.lanes) * LANE_RECORD_BYTES
     }
 }
 
@@ -1250,6 +1572,7 @@ pub fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine::LANE_SLOT_BYTES;
 
     /// One wrong record size has every lane after the first read the last
     /// one's tail, and a single-lane fire never shows it.
@@ -1262,8 +1585,14 @@ mod tests {
         assert_eq!(LANE_SLOT_BYTES, 32, "four u64");
     }
 
-    /// The slot array begins past every lane record; the arithmetic
-    /// `Prepared` uses for a single lane must agree with `LaneShape`'s.
+    /// The slot array begins past EVERY lane record, and the arithmetic
+    /// `Prepared::channel_slots_ptr` uses must agree with `LaneShape`'s.
+    ///
+    /// **THIS IS THE ASSERTION THE SINGLE-LANE ASSUMPTION HID.** While a
+    /// batch was one lane, `+ LANE_HEADER_BYTES + LANE_RECORD_BYTES` and
+    /// `+ LANE_HEADER_BYTES + lanes * LANE_RECORD_BYTES` were the same
+    /// number, and every lane of a wider table but the first would have read
+    /// its neighbour's slots as its own.
     #[test]
     fn the_slot_array_begins_past_every_lane_record() {
         let one = LaneShape::of(1, 2).bytes().expect("fits");
@@ -1272,6 +1601,25 @@ mod tests {
             LaneShape::of(1, 2).slots_offset().expect("fits"),
             LANE_HEADER_BYTES + LANE_RECORD_BYTES
         );
+        for lanes in [1u32, 2, 64] {
+            assert_eq!(
+                LaneShape::of(lanes, 3).slots_offset().expect("fits"),
+                LANE_HEADER_BYTES + u64::from(lanes) * LANE_RECORD_BYTES,
+                "the slot array of a {lanes}-lane table"
+            );
+        }
+    }
+
+    /// A lane's channel slots and its PENDING FLAGS are indexed by the same
+    /// number — `lane.channel_slot_offset + n`, in `codegen/cuda/fused.rs` —
+    /// so the pending buffer is cut to the lane table's slot shape and not to
+    /// one lane's.
+    #[test]
+    fn a_lane_s_slot_row_is_where_its_pending_flags_are() {
+        let shape = LaneShape::of(4, 3);
+        for lane in 0..4u32 {
+            assert_eq!(shape.slot_index(lane).expect("fits"), lane * 3);
+        }
     }
 
     /// A kernel handed fifteen of sixteen arguments reads the last past the

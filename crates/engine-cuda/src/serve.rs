@@ -189,12 +189,17 @@ use crate::exports::{Exports, MTP_SEAM, SCORES_SEAM, corrected_classes, masked_c
 /// finish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Graphs {
-    /// Eager, with schedules carved to fit each fire. The golden.
-    #[default]
+    /// Eager, with schedules carved to fit each fire. The golden — a
+    /// DIAGNOSTIC mode now, not a serving one: every recorded fire is diffed
+    /// against it (decision #11), and `Shell::load` warns when a deployment
+    /// serves eagerly, because an uncaptured decode pays ~470 kernel
+    /// launches per token-step of pure CPU time (In Gim, 2026-08-29: "graph는
+    /// 당연히 on이고 off일시 warning을 내도록").
     Off,
     /// Eager, with graph-shaped (padded) schedules.
     Shaped,
-    /// Captured once per shape key, replayed after.
+    /// Captured once per shape key, replayed after. The serving default.
+    #[default]
     On,
 }
 
@@ -857,6 +862,44 @@ pub struct Shell {
     /// counters. Shared with the callbacks (which bump the settled side) and
     /// read by `record::Graphs` before it overwrites or destroys an exec.
     airborne: crate::settle::Airborne,
+    /// **THE EPILOGUE BOUNDARY'S FIRES, ENQUEUED AND UNSETTLED PAST THE CALL
+    /// THAT ENQUEUED THEM** — the field the boundary's wait turned into.
+    ///
+    /// A boundary used to end in `cudaStreamSynchronize`, because the verdict
+    /// is a pinned word a kernel writes and the counters the NEXT fire
+    /// predicts off were advanced by a host thread reading it. The counters
+    /// are `channel::settle`'s now, so the only thing left on the far side of
+    /// the wait is the VERDICT — and a verdict is only ever an error path.
+    /// So the fires are left airborne and reaped at the last possible moment:
+    /// the next frame, in front of the stage that needs the lane free.
+    ///
+    /// At most one, because [`reap_guest_fires`] runs in front of every path
+    /// that could add a second.
+    owed: Option<GuestBatch>,
+    /// **The point on the compute stream [`Shell::owed`]'s verdicts become
+    /// readable**, recorded once per deferred boundary and waited on with
+    /// `cudaEventSynchronize` rather than a stream drain — see
+    /// [`Event::settle`](crate::device::graph::Event::settle).
+    guest_landed: crate::device::graph::Event,
+}
+
+/// **ONE BOUNDARY'S GUEST FIRES, LEFT ON THE STREAM.**
+///
+/// What a deferred settlement has to carry is small, and deliberately so:
+/// which instances owe a verdict, and two ways of asking whether the verdict
+/// is readable yet.
+#[derive(Debug)]
+struct GuestBatch {
+    /// `(lane, instance)` for every launch owing a settlement, in launch
+    /// order. The lane is carried only to name the fault; by the time this is
+    /// read the `Prepared` that described the frame is gone, which is why the
+    /// instance id travels rather than a borrow of its `Attached`.
+    launched: Vec<(usize, u64)>,
+    /// **The step whose settlement callback proves this batch landed.** Read
+    /// FIRST, because it costs nothing: `Airborne` is two atomics on the host
+    /// and a `true` here means the reap takes no CUDA call at all. The event
+    /// is the fallback for the frame that has not called back yet.
+    seq: u64,
 }
 
 impl Shell {
@@ -1075,6 +1118,11 @@ impl Shell {
             // and its callback.
             settlement: crate::settle::Settlement::open(boot.runahead.staging_depth())?,
             airborne,
+            owed: None,
+            // One event, because one boundary is deferred at a time — the
+            // reap in front of every stage is what makes that true. Created
+            // at load: the fire path allocates nothing (article 9).
+            guest_landed: crate::device::graph::Event::new()?,
         })
     }
 
@@ -1320,17 +1368,50 @@ impl Shell {
         self.programs.ready(instance_id)
     }
 
+    /// **COLLECT THE DEFERRED EPILOGUE BATCH** — [`reap_guest_fires`] with
+    /// this shell's own four pieces, for every caller outside `enqueue_on`
+    /// (which has them destructured).
+    ///
+    /// # Errors
+    ///
+    /// As [`reap_guest_fires`].
+    pub fn reap_guests(&mut self) -> Result<()> {
+        reap_guest_fires(
+            &mut self.programs,
+            &mut self.owed,
+            &self.airborne,
+            &self.guest_landed,
+        )
+    }
+
     /// One bound instance, for publishing into and taking out of its channels.
-    pub fn program_instance(&mut self, instance_id: u64) -> Option<&mut ProgramSession> {
-        self.programs.instance_mut(instance_id)
+    ///
+    /// **THE REAP IS THE PRICE OF THE HANDLE**, because what a caller does
+    /// with it is read and write ring cells: a session with an airborne
+    /// epilogue has cells `channel::scatter_publish` has not written yet and a
+    /// prediction one fire ahead of its words. Control plane, so the wait
+    /// costs nothing anybody measures.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::reap_guests`].
+    pub fn program_instance(&mut self, instance_id: u64) -> Result<Option<&mut ProgramSession>> {
+        self.reap_guests()?;
+        Ok(self.programs.instance_mut(instance_id))
     }
 
     /// Tear down one bound instance and free its rings.
     ///
+    /// **NOTHING OF ITS MAY BE ON THE STREAM**: the rings a closing session
+    /// frees are read by a `commit_bump` and a `scatter_publish` that may
+    /// still be running, so the deferred batch is collected first.
+    ///
     /// # Errors
     ///
-    /// [`Fault::Program`] for an instance that is already gone.
+    /// [`Fault::Program`] for an instance that is already gone, and whatever
+    /// the reap said.
     pub fn close_program_instance(&mut self, instance_id: u64) -> Result<()> {
+        self.reap_guests()?;
         self.programs.close_instance(instance_id)
     }
 
@@ -1342,6 +1423,10 @@ impl Shell {
     /// [`Fault::Program`] for an unknown instance, and whatever the launches
     /// said.
     pub fn fire_program(&mut self, instance_id: u64) -> Result<Fired> {
+        // A standalone fire mints, so the deferred epilogue batch has to be
+        // collected first: a session may hold one airborne fire, and staging
+        // a second is a named refusal rather than a race.
+        self.reap_guests()?;
         self.programs.fire(&self.device, instance_id)
     }
 
@@ -2108,6 +2193,24 @@ impl FrameShell for Shell {
         //    and the instance's own `embed_indptr` port is what says how many
         //    and where each one's rows lie. So the map below is per lane and
         //    carries the lane's INDEX WITHIN ITS MEMBER beside the envelope.
+        //    **AND A PORT READ IS THE ONE HOST READ OF A GUEST CELL LEFT ON
+        //    THIS PATH**, which is why the deferred epilogue batch is
+        //    collected in front of it. `read_cell` reads the committed front
+        //    of a ring, and on a device-carried instance that cell is written
+        //    by the previous fire's `channel::scatter_publish` — a kernel
+        //    which, since the boundary stopped waiting, may still be on the
+        //    stream. Paid only where a port exists: a `GeometryClass::Host`
+        //    instance resolves `None` without touching a ring, and the c64
+        //    decode path is entirely Host.
+        if self.owed.is_some()
+            && attachments.iter().any(|attached| {
+                self.programs
+                    .geometry_of(attached.instance)
+                    .is_some_and(|class| class != engine::tensor_ir::registry::GeometryClass::Host)
+            })
+        {
+            self.reap_guests()?;
+        }
         let mut resolved: Vec<crate::program::Envelope> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         for attached in attachments {
@@ -3123,6 +3226,12 @@ impl Shell {
             // binding, below — and by one writer.
             readout_rows,
             budget,
+            // NAMED FOR THE FOURTH TIME AND FOR THE SAME REASON: the deferred
+            // epilogue batch is parked at ONE instant and collected at two,
+            // all three of them in this function.
+            owed,
+            guest_landed,
+            airborne,
             ..
         } = self;
         let graphs = *graphs;
@@ -3145,13 +3254,33 @@ impl Shell {
         //    (`committed_or`), so today the two agree twice over; the order
         //    below is what keeps the fold's predicate true on its own terms
         //    the day the policy softens, which is what article 3 asks of it.
+        //    **AND THE BOUNDARY TAKES ONE WAIT, NOT ONE PER ATTACHMENT**
+        //    (alto §14 exception #1, closed). Every prologue is ENQUEUED
+        //    here; the verdicts are read below, after one synchronize for the
+        //    whole boundary. See [`Boundary`]'s own note and
+        //    [`Session::launch`](crate::program::Session::launch).
         let mut verdicts: Vec<(usize, Fired)> = Vec::new();
+        let mut prologues = AirborneFires::default();
+        // The same obligation the epilogue loop below has, and paid only when
+        // there is a prologue to stage: a decode guest attaches its sampler at
+        // the epilogue and nothing here, so the common frame does not reach
+        // this at all.
+        if p.attachments.iter().any(|a| a.at == Boundary::Prologue) {
+            reap_guest_fires(programs, owed, airborne, guest_landed)?;
+        }
         for (at, attached) in p.attachments.iter().enumerate() {
             if attached.at != Boundary::Prologue {
                 continue;
             }
-            verdicts.push((at, programs.fire(device, attached.instance)?));
+            if let Some(fired) = prologues.stage(device, programs, at, attached.instance)? {
+                verdicts.push((at, fired));
+            }
         }
+        // **THE PROLOGUE'S FIRES LEAVE THE GROUND HERE**, before the fold
+        // predicate is written, because the predicate is each lane's own
+        // commit word and `channel::pull_validate` is what seeds it. Staging
+        // decided nothing; this is the launch.
+        prologues.fly(device, programs)?;
 
         // ── The fold predicate, as device data (design §6, §12 finding 4).
         //
@@ -3192,8 +3321,19 @@ impl Shell {
             }
         }
 
+        // ── THE PROLOGUE BOUNDARY'S ONE WAIT, and then every verdict.
+        //
+        //    It stands HERE, before the forward, because that is what it
+        //    always meant: a prologue that did not commit is a fire nobody can
+        //    replay, and `committed_or` refuses to build a forward on top of
+        //    one. What changed is the count — one synchronize for the whole
+        //    boundary rather than one per attachment — and a boundary with
+        //    nothing enqueued takes none at all, which is the common shape:
+        //    a decode guest attaches a sampler at the epilogue and nothing
+        //    here.
+        prologues.settle_into(device, programs, &mut verdicts)?;
         for (at, fired) in verdicts {
-            committed_or(fired, &p.attachments[at], "prologue")?;
+            committed_or(fired, p.attachments[at].instance, "prologue")?;
         }
 
         // ── The fresh slots' recurrent banks, zeroed. `prepare` decided
@@ -3639,6 +3779,15 @@ impl Shell {
                 }
                 None => None,
             };
+            // **THE PREVIOUS FRAME'S EPILOGUES, COLLECTED HERE AND NOWHERE
+            //    EARLIER.** A session may hold one airborne fire, so its lane
+            //    has to be free before this loop stages the next — and this is
+            //    the LATEST point that is true, which is the whole of why the
+            //    wait is free: the forward of THIS frame is already on the
+            //    stream above, so the device runs on across whatever the host
+            //    blocks for.
+            reap_guest_fires(programs, owed, airborne, guest_landed)?;
+            let mut epilogues = AirborneFires::default();
             for attached in p
                 .attachments
                 .iter()
@@ -3701,7 +3850,6 @@ impl Shell {
                     .all(|pair| pair[1] == pair[0].wrapping_add(1));
                 if consecutive {
                     programs.bind_intrinsic(
-                        device,
                         attached.instance,
                         engine::tensor_ir::op::IntrinsicId::Logits,
                         logits.ptr,
@@ -3727,7 +3875,6 @@ impl Shell {
                         .saturating_mul(lane as u64);
                     readout_rows.stage(device.stream(), at, &table)?;
                     programs.bind_intrinsic(
-                        device,
                         attached.instance,
                         engine::tensor_ir::op::IntrinsicId::Logits,
                         readout_rows.ptr() + at,
@@ -3739,7 +3886,6 @@ impl Shell {
                 }
                 if let Some(column) = draft {
                     programs.bind_intrinsic(
-                        device,
                         attached.instance,
                         engine::tensor_ir::op::IntrinsicId::MtpLogits,
                         column.ptr,
@@ -3749,8 +3895,51 @@ impl Shell {
                         first_row[attached.lane as usize],
                     )?;
                 }
-                let fired = programs.fire(device, attached.instance)?;
-                committed_or(fired, attached, "epilogue")?;
+                if let Some(fired) =
+                    epilogues.stage(device, programs, attached.lane as usize, attached.instance)?
+                {
+                    committed_or(fired, attached.instance, "epilogue")?;
+                }
+            }
+
+            // ── **THE EPILOGUE BOUNDARY'S WAIT, GONE** — the line this wave
+            //    is about, and the last one in the fire path.
+            //
+            //    Sixty-four samplers are enqueued back to back above. What
+            //    stood here read their verdicts, which meant a
+            //    `cudaStreamSynchronize` for the whole frame: the device had
+            //    nothing left when it returned and stayed idle for as long as
+            //    the host took to build the next one. ~826 of them a c64 run,
+            //    26% of the GPU's own span.
+            //
+            //    Three things made it removable and none of them is here.
+            //    `channel::settle` advances the endpoint counters the next
+            //    mint predicts off, on the device, in stream order.
+            //    `Endpoint::predicted` answers where a shared ring stands
+            //    without consulting a word at all. And a verdict is only ever
+            //    an error path — nothing downstream reads one. So the fires
+            //    are parked and `reap_guest_fires` collects them at the next
+            //    frame, in front of the stage that needs the lane free, by
+            //    which time the device has passed them and the reap costs two
+            //    atomic loads.
+            //
+            //    A mid-batch flush's verdicts are the exception and are read
+            //    here: a shared ring already forced that wait, so they are
+            //    final now and naming them late would be worse.
+            let mut settled: Vec<(usize, Fired)> = Vec::new();
+            *owed = epilogues.defer(device, programs, guest_landed, seq, &mut settled)?;
+            for (lane, fired) in settled {
+                let attached = p
+                    .attachments
+                    .iter()
+                    .find(|a| a.at == Boundary::Epilogue && a.lane as usize == lane)
+                    .ok_or_else(|| {
+                        Fault::program(
+                            "serve::enqueue",
+                            format!("lane {lane} settled an epilogue nothing attached"),
+                        )
+                    })?;
+                committed_or(fired, attached.instance, "epilogue")?;
             }
 
             // The fire is enqueued, so the sequences are longer. Only the
@@ -4256,9 +4445,315 @@ fn resolve_fold_len(
     Ok(folded)
 }
 
+/// **THE FIRES OF ONE BOUNDARY, ENQUEUED AND UNSETTLED** (alto §14 exception
+/// #1, closed).
+///
+/// A boundary is a run of independent guest passes — sixty-four samplers at
+/// c=64, one per lane — and until this wave the shell fired them one at a
+/// time, each ending in `Session::fire`'s own `cudaStreamSynchronize`. A
+/// profile put the bill at 16,898 synchronize calls for 869 ms, 44% of all
+/// CUDA API time, with the GPU idle 45% of its kernel span in ~56 µs bubbles
+/// that matched the fires one for one: the host was waiting ~72 µs for a
+/// 51 µs epilogue before it would mint the next lane's.
+///
+/// So the boundary enqueues everything and waits once. This holds what is
+/// airborne between the two.
+///
+/// # And then the epilogue stopped waiting at all
+///
+/// One wait a boundary is still one wait a frame, and it drained the stream:
+/// the device had nothing left when it returned and stayed idle for as long as
+/// the host took to build the next frame. [`AirborneFires::defer`] is what
+/// replaced it — the fires are parked as a [`GuestBatch`] and
+/// [`reap_guest_fires`] collects them at the next frame — and it became
+/// possible when `channel::settle` moved the endpoint counters onto the device
+/// and `Endpoint::predicted` moved the shared rings' host answer off the
+/// words. The PROLOGUE still waits, because its verdicts gate the forward
+/// launched a few lines after them.
+///
+/// # The one ordering the batch may not flatten
+///
+/// A DEVICE-ONLY RING SHARED BY TWO ATTACHMENTS (design §5's draft→verify
+/// chaining) is a putting pass and a taking pass, and the taker's admission
+/// depends on the putter's settlement having happened. **That is a launch
+/// order, not a host visibility problem, and it survived the move of the
+/// prediction onto `Endpoint`**: `channel::pull_validate` runs ONCE at the
+/// front of a wave, for every lane, before any lane's regions — so a taker
+/// batched with its putter is validated against words the putter's
+/// `channel::settle` has not reached yet, `REQUIRE_INPUT`'s `tail > head` is
+/// false, and the fire is refused. Whatever the host believes, and however
+/// the host came to believe it.
+///
+/// So two attachments of one ring must be two waves, and this reinstates that:
+/// an attachment whose shared rings collide with one already airborne FLUSHES
+/// the batch first — one synchronize, every verdict, a clean slate — and only
+/// then launches. Nothing is lost but the batching, and only for the passes
+/// that genuinely chain.
+#[derive(Default)]
+struct AirborneFires {
+    /// `(tag, instance)` for every launch owing a settlement, in launch order.
+    /// `tag` is whatever the caller wants back beside the verdict — an
+    /// attachment index at the prologue, a lane at the epilogue.
+    launched: Vec<(usize, u64)>,
+    /// The identities of the shared rings the airborne fires hold, as
+    /// `Session::shared_rings` answers them.
+    rings: Vec<usize>,
+    /// Settled verdicts a flush produced, kept until `settle_into` hands the
+    /// whole boundary's back in one list.
+    settled: Vec<(usize, Fired)>,
+    /// **HAS THIS BATCH LEFT THE GROUND?** `stage` only mints; `fly` is what
+    /// puts the pull, the regions and the tail on the stream, and it is
+    /// idempotent because two callers reach for it — the prologue, which
+    /// needs the fires enqueued before it writes the fold predicate, and the
+    /// flush, which needs them enqueued before it waits.
+    flown: bool,
+}
+
+impl AirborneFires {
+    /// Stage instance `instance` into the plane's wave, flushing first if it
+    /// chains onto a shared ring already airborne.
+    ///
+    /// Answers `Some(fired)` for a fire that never launched — a blocked
+    /// channel or a poisoned instance, whose verdict is final without a wait
+    /// — and `None` for one now holding a lane of the wave.
+    ///
+    /// **NOTHING IS ON THE STREAM WHEN THIS RETURNS.** The whole point of the
+    /// wave is that a boundary's lanes are staged before any of them flies,
+    /// so the three control kernels can launch once with a block per lane
+    /// rather than once per attachment with one block. A caller that binds
+    /// intrinsics or writes side tables between two `stage` calls is still
+    /// ordered correctly: every one of those copies is enqueued before `fly`
+    /// puts the first region on the stream.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the mint, the flush's synchronize or a settlement said.
+    fn stage(
+        &mut self,
+        device: &Context,
+        programs: &mut ProgramPlane,
+        tag: usize,
+        instance: u64,
+    ) -> Result<Option<Fired>> {
+        // **DEBRIS FROM A FAULTED BOUNDARY IS NOT THIS BATCH'S TO FLY.** The
+        // wave is the plane's and lives across boundaries; a fault raised
+        // between some earlier boundary's first stage and its landing unwinds
+        // past the landing that would have cleared it. This batch's first
+        // lane is the one moment nothing of ours is in there, so anything
+        // that is belongs to fires nobody will settle.
+        if self.launched.is_empty() && !self.flown && programs.staged() != 0 {
+            programs.abandon_wave();
+        }
+        let rings = programs.shared_rings(instance);
+        if rings.iter().any(|ring| self.rings.contains(ring)) {
+            self.flush(device, programs)?;
+        }
+        match programs.stage(instance)? {
+            crate::program::Launched::Airborne => {
+                self.rings.extend(rings);
+                self.launched.push((tag, instance));
+                Ok(None)
+            }
+            crate::program::Launched::Refused(fired) => Ok(Some(fired)),
+        }
+    }
+
+    /// **THE BATCH, ON THE STREAM**: one `pull_validate` over every staged
+    /// lane, then each fire's regions in staging order, then one
+    /// `commit_bump` and one `scatter_publish` over the same lanes.
+    ///
+    /// The order within a fire is what it always was — pull, regions, bump,
+    /// publish — and the order BETWEEN fires is nothing, which is what makes
+    /// the interleave sound: two lanes of one wave share no ring (a shared
+    /// ring flushes at `stage`) and the stream orders each lane's own three
+    /// phases around its own regions.
+    ///
+    /// Idempotent: a batch already flown is left alone.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the copy and the launches said.
+    fn fly(&mut self, device: &Context, programs: &mut ProgramPlane) -> Result<()> {
+        if self.flown || self.launched.is_empty() {
+            return Ok(());
+        }
+        programs.fly(device)?;
+        programs.land(device)?;
+        self.flown = true;
+        Ok(())
+    }
+
+    /// Everything enqueued, one wait, then every airborne fire's verdict.
+    fn flush(&mut self, device: &Context, programs: &mut ProgramPlane) -> Result<()> {
+        if self.launched.is_empty() {
+            self.rings.clear();
+            return Ok(());
+        }
+        self.fly(device, programs)?;
+        device.synchronize()?;
+        for (tag, instance) in self.launched.drain(..) {
+            let fired = programs.settle_launched(instance)?;
+            self.settled.push((tag, fired));
+        }
+        self.rings.clear();
+        self.flown = false;
+        Ok(())
+    }
+
+    /// [`AirborneFires::flush`], appending every verdict this batch produced
+    /// — including any a mid-batch flush already read — onto `into`.
+    ///
+    /// # Errors
+    ///
+    /// As [`AirborneFires::flush`].
+    fn settle_into(
+        &mut self,
+        device: &Context,
+        programs: &mut ProgramPlane,
+        into: &mut Vec<(usize, Fired)>,
+    ) -> Result<()> {
+        self.flush(device, programs)?;
+        into.append(&mut self.settled);
+        Ok(())
+    }
+
+    /// **EVERYTHING ENQUEUED AND NOTHING WAITED FOR** — the line this wave is
+    /// about, and [`AirborneFires::settle_into`]'s replacement wherever a
+    /// verdict can be read one frame late.
+    ///
+    /// Puts the batch on the stream, records `landed` behind it, and hands
+    /// the airborne fires back as a [`GuestBatch`] for the caller to park.
+    /// Any verdict a MID-BATCH flush already read is appended to `into` —
+    /// those cost their wait when a shared ring forced one and are final now.
+    ///
+    /// `seq` is the step whose settlement callback will prove this batch
+    /// landed; the reap reads it before it touches the event.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the launches and the event record said.
+    fn defer(
+        &mut self,
+        device: &Context,
+        programs: &mut ProgramPlane,
+        landed: &crate::device::graph::Event,
+        seq: u64,
+        into: &mut Vec<(usize, Fired)>,
+    ) -> Result<Option<GuestBatch>> {
+        self.fly(device, programs)?;
+        into.append(&mut self.settled);
+        if self.launched.is_empty() {
+            self.rings.clear();
+            return Ok(None);
+        }
+        // **RECORDED ON THE COMPUTE STREAM, BEHIND THIS BATCH AND NOTHING
+        //    MORE.** A stream synchronize would drain every launch enqueued
+        //    after it too, which at the epilogue is the whole of the next
+        //    frame; waiting on a point instead lets the device run past it
+        //    while the host is still behind.
+        landed.record(device.stream())?;
+        let batch = GuestBatch {
+            launched: core::mem::take(&mut self.launched),
+            seq,
+        };
+        self.rings.clear();
+        self.flown = false;
+        Ok(Some(batch))
+    }
+}
+
+/// **READ A DEFERRED BOUNDARY'S VERDICTS, WAITING ONLY IF THE DEVICE HAS NOT
+/// PASSED THEM.**
+///
+/// The far half of [`AirborneFires::defer`], and the reason the boundary's
+/// `cudaStreamSynchronize` could go at all. Three things had to become true
+/// first, and each is somewhere else:
+///
+/// ```text
+/// the endpoint counters the next mint predicts off  channel::settle, on the
+///                                                   device, in stream order
+/// where a SHARED ring stands, for either attachment Endpoint::predicted
+/// the verdict itself                                only ever an error path
+/// ```
+///
+/// So this is what is left of the wait: a check of two host atomics, and —
+/// only when the frame that carried the batch has not called back yet — a
+/// `cudaEventSynchronize` on the point the batch landed at. **The device is
+/// not idle across it.** By the time anything reaps, the next frame's forward
+/// is already enqueued behind the batch, so the host blocks and the GPU runs
+/// on; that is the whole difference from the drain this replaced, where the
+/// stream was empty on the far side of the wait and stayed empty for as long
+/// as the host took to build the next frame.
+///
+/// **WHERE IT MUST BE CALLED, AND WHY EACH ONE.** In front of every path that
+/// reads a guest ring on the host or stages a second fire into a session that
+/// already has one:
+///
+/// ```text
+/// serve::enqueue, before either boundary's stage loop   a session may hold
+///                                                       ONE airborne fire
+/// serve::prepare, before the descriptor-port read       the port is a cell
+///                                                       `scatter_publish`
+///                                                       writes
+/// api's publish/take channel doors                      the same cells, from
+///                                                       the runtime's side
+/// close_instance                                        a session whose
+///                                                       kernels are running
+///                                                       may not be dropped
+/// ```
+///
+/// # Errors
+///
+/// Whatever the wait said, and the first non-committing verdict — deferred by
+/// one frame from where it used to be raised, which is the one semantic this
+/// wave changes and is stated at [`committed_or`].
+fn reap_guest_fires(
+    programs: &mut ProgramPlane,
+    owed: &mut Option<GuestBatch>,
+    airborne: &crate::settle::Airborne,
+    landed: &crate::device::graph::Event,
+) -> Result<()> {
+    let Some(batch) = owed.take() else {
+        return Ok(());
+    };
+    // The free question first. A batch whose frame has already settled is
+    // reaped with no CUDA call at all, which is the steady state whenever the
+    // host is not running ahead of the device.
+    if !airborne.settled_past(batch.seq) {
+        landed.settle()?;
+    }
+    let mut first: Option<crate::error::Fault> = None;
+    for (lane, instance) in batch.launched {
+        // **EVERY LANE IS SETTLED, EVEN AFTER ONE HAS FAULTED.** A session
+        // that keeps its `pending` mint can never fire again, so an early
+        // return here would turn one bad epilogue into a permanently stuck
+        // instance for every lane behind it in the batch.
+        let outcome = programs
+            .settle_launched(instance)
+            .and_then(|fired| committed_or(fired, instance, "epilogue"));
+        if let Err(fault) = outcome {
+            let _ = lane;
+            first.get_or_insert(fault);
+        }
+    }
+    match first {
+        Some(fault) => Err(fault),
+        None => Ok(()),
+    }
+}
+
 /// A guest pass that ran, or the sentence for the one that did not.
 ///
 /// **THREE VERDICTS ARE FAILURES HERE AND ONE IS NOT ELSEWHERE.** Fired on
+/// **AND AN EPILOGUE'S VERDICT NOW ARRIVES ONE FRAME LATE.** The epilogue
+/// boundary is enqueue-only ([`AirborneFires::defer`]), so its fires are
+/// settled by [`reap_guest_fires`] at the next frame and a fault raised here
+/// fails THAT frame rather than the one that produced it. Nothing downstream
+/// reads a verdict for anything but this: a guest's cells reach it through
+/// device-written pinned words, and the fold predicate is the commit word
+/// itself, on the device. The prologue boundary is unchanged and still waits,
+/// because its verdicts gate the forward that follows them in the same call.
+///
 /// its own, a [`Fired::Blocked`] program is a normal answer a caller retries
 /// on. Attached to a model fire it is not: the gate already asked, before
 /// anything launched, so a block at this point means the pass's own cursors
@@ -4266,28 +4761,26 @@ fn resolve_fold_len(
 /// that forbids. [`Fired::Declined`] is a stage clearing its commit slot and
 /// [`Fired::Faulted`] is an instance that is unusable from now on; both leave
 /// the guest's channels where they were, and both are the caller's to poison.
-fn committed_or(fired: Fired, attached: &Attached, at: &str) -> Result<()> {
+fn committed_or(fired: Fired, instance: u64, at: &str) -> Result<()> {
     match fired {
         Fired::Committed => Ok(()),
         Fired::Blocked(channel) => Err(Fault::program(
             "serve::fire",
             format!(
-                "instance {}'s {at} blocked on channel {channel} AFTER the gate \
-                 admitted it, so something advanced its cursors between the two",
-                attached.instance
+                "instance {instance}'s {at} blocked on channel {channel} AFTER the gate \
+                 admitted it, so something advanced its cursors between the two"
             ),
         )),
         Fired::Declined => Err(Fault::program(
             "serve::fire",
             format!(
-                "instance {}'s {at} declined: a stage cleared its commit slot, so \
-                 nothing the guest computed this fire is visible",
-                attached.instance
+                "instance {instance}'s {at} declined: a stage cleared its commit slot, so \
+                 nothing the guest computed this fire is visible"
             ),
         )),
         Fired::Faulted(why) => Err(Fault::program(
             "serve::fire",
-            format!("instance {}'s {at} faulted and stays faulted: {why}", attached.instance),
+            format!("instance {instance}'s {at} faulted and stays faulted: {why}"),
         )),
     }
 }
@@ -4405,7 +4898,7 @@ mod tests {
             instance: 77,
             at: Boundary::Epilogue,
         };
-        committed_or(Fired::Committed, &attached, "epilogue")
+        committed_or(Fired::Committed, attached.instance, "epilogue")
             .expect("a committed pass is the ordinary answer");
 
         for (fired, expected) in [
@@ -4413,7 +4906,7 @@ mod tests {
             (Fired::Declined, "declined"),
             (Fired::Faulted("bad table".into()), "faulted"),
         ] {
-            let fault = committed_or(fired, &attached, "epilogue")
+            let fault = committed_or(fired, attached.instance, "epilogue")
                 .expect_err("a pass that did not commit is not an outcome to retry");
             let said = fault.to_string();
             assert!(said.contains("77"), "the instance must be named: {said}");

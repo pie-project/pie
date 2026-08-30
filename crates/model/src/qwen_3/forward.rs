@@ -7,6 +7,7 @@ pub struct Facts {
     pub has_adapter: bool,
     pub drafts: bool,
     pub captures_scores: bool,
+    pub masked: bool,
 }
 
 impl Facts {
@@ -71,9 +72,10 @@ impl Facts {
     /// is exactly what it is here: a third arm of the attention merge, beside
     /// decode and prefill, chosen by this bit.
     ///
-    /// **IT IS FIRST IN THE THREE-WAY SPLIT, AND THAT ORDER IS THE
-    /// SEMANTICS.** `[captures_scores, qo_one, rest]` means a capturing lane
-    /// takes the capture arm WHATEVER its row count — one row or a thousand.
+    /// **IT PRECEDES `qo_one` IN THE SPLIT, AND THAT ORDER IS THE
+    /// SEMANTICS.** `[.., captures_scores, qo_one, rest]` means a capturing
+    /// lane takes the capture arm WHATEVER its row count — one row or a
+    /// thousand. (Only the masked window outranks it; see `masked`.)
     /// The alternative, ordering `qo_one` first, would leave a capturing
     /// decode lane on the plain decode kernel with no scores to show for it:
     /// a lane that asked for an observation and silently did not get one.
@@ -84,6 +86,26 @@ impl Facts {
     pub fn captures_scores() -> Predicate {
         Predicate::fact(3)
     }
+
+    /// **THE MASKED WINDOW** (gemma's `attention.masked` arm, seated here).
+    ///
+    /// A lane that brought its own attention mask instead of the causal one.
+    /// The bit routes it to the masked arm of the attention merge, where
+    /// `ops::attn::masked` reads the fire's packed mask bits beside the
+    /// query; a fire with no masked lane has zero rows in this class and the
+    /// arm costs it nothing (`engine::fire::walk`'s rule 1).
+    ///
+    /// **THE MASK APPLIES AT THE ATTENTION LAYERS AND ONLY THERE.** This
+    /// family's other mixer is a gated-delta recurrence: a GDN layer walks
+    /// its rows in order and carries state — there is no per-key score for a
+    /// mask bit to veto — so a masked lane's GDN layers read it as the plain
+    /// prefill/decode they always were. That is the honest reading of a
+    /// custom mask on a hybrid text: it constrains every place the model
+    /// attends, and no place the model recurs.
+    #[must_use]
+    pub fn masked() -> Predicate {
+        Predicate::fact(4)
+    }
 }
 
 impl Classify for Facts {
@@ -93,6 +115,7 @@ impl Classify for Facts {
             has_adapter: r.has_adapter(),
             drafts: r.drafts(),
             captures_scores: r.captures_scores(),
+            masked: r.has_custom_mask(),
         }
     }
 
@@ -101,6 +124,7 @@ impl Classify for Facts {
             | (u64::from(self.has_adapter) << 1)
             | (u64::from(self.drafts) << 2)
             | (u64::from(self.captures_scores) << 3)
+            | (u64::from(self.masked) << 4)
     }
 }
 
@@ -148,7 +172,7 @@ impl ForwardHybrid for Model {
         let m = self;
 
         // ONE SCHEDULE PER CLASS, AND EACH SAYS WHAT IT IS CARVED FOR (build
-        // log 21, blocker 2). The three classes are cut off `inputs` FIRST,
+        // log 21, blocker 2). The four classes are cut off `inputs` FIRST,
         // and each schedule is then built off the one arm that reads it — so a
         // plan node's guard is the class it was carved for because the text
         // says so, not because a later pass inferred it from who read it. The
@@ -164,11 +188,27 @@ impl ForwardHybrid for Model {
         // items do — `model_compiler::Error::Straddled` at the load. Reading `plan_p` from
         // the capture arm is now refused by `Recorder::push` at the line that
         // mixed the two arms.
-        let classes = [Facts::captures_scores(), Facts::qo_one(), Predicate::rest()];
-        let [input_s, input_d, input_p] = inputs.split(classes);
+        //
+        // The masked window is FIRST, ahead of the capture window, and that
+        // priority is a correctness ruling: a lane that brought its own mask
+        // must have it applied whatever else it asked for, because the mask
+        // changes WHICH keys the output attends where the capture only adds
+        // an observation. (gemma orders its split the same way.) A lane that
+        // asked for both takes the masked arm and keeps no scores — the arm
+        // that could honor both does not exist in the vocabulary
+        // (`Attention::Masked` exports no lse).
+        let classes = [
+            Facts::masked(),
+            Facts::captures_scores(),
+            Facts::qo_one(),
+            Predicate::rest(),
+        ];
+        let [input_m, input_s, input_d, input_p] = inputs.split(classes);
+        let plan_m = ops::attn::plan_prefill(&input_m, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_d = ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_p = ops::attn::plan_prefill(&input_p, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_s = ops::attn::plan_prefill(&input_s, m.q_heads, m.kv_heads, m.head_dim, None);
+        let mask = inputs.mask();
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
 
@@ -176,7 +216,9 @@ impl ForwardHybrid for Model {
         for (_, w) in inputs.walk_layers(&m.layers) {
             let x = ops::elemwise::rmsnorm_plus_one(&y, &w.mixer_norm, w.mixer_norm_eps);
             let o = match &w.mixer {
-                Mixer::Attn(a) => attn_mixer(&x, &inputs, m, &plan_d, &plan_p, &plan_s, a),
+                Mixer::Attn(a) => {
+                    attn_mixer(&x, &inputs, m, &plan_m, &plan_d, &plan_p, &plan_s, &mask, a)
+                }
                 Mixer::Gdn(g) => gdn_mixer(&x, &inputs, g),
             };
             let o = if m.tp > 1 {
@@ -406,9 +448,11 @@ fn attn_mixer(
     x: &Value,
     inputs: &Input<Facts>,
     m: &Model,
+    plan_m: &Value,
     plan_d: &Value,
     plan_p: &Value,
     plan_s: &Value,
+    mask: &Value,
     a: &Attn,
 ) -> Value {
     let pages = inputs.kv(&a.kv);
@@ -426,7 +470,7 @@ fn attn_mixer(
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, &[&q]);
 
-    // **THREE ARMS OF ONE MERGE, AND THE THIRD IS THE OBSERVATION** (palo C4,
+    // **FOUR ARMS OF ONE MERGE: MASKED, THEN THE OBSERVATION** (palo C4,
     // design §8's score-capture row, §9's archetype). `merge!` lowers to arms
     // writing disjoint row ranges of one buffer, so the capture arm costs a
     // fire nobody captured exactly nothing: zero rows, no launch.
@@ -441,17 +485,23 @@ fn attn_mixer(
     // — `engine_cuda::dispatch::attn` calls `attn::prefill_lse` with both
     // outputs bound — so this axis adds NO op and NO kernel.
     //
-    // The three classes are written out again here rather than handed down,
+    // The four classes are written out again here rather than handed down,
     // because this is a different function and `q` is a different carrier —
     // but it is the SAME carve: the same three predicates in the same priority
     // order `forward` cut the inputs by, so each arm of `q` carries a cond
     // structurally equal to that of the input arm its schedule was built off.
     // `Recorder::push` is what holds the two equal, and it refuses `sq` against
     // a schedule carved for any other class at the line that mixed them.
-    let [sq, dq, p] = q.split([Facts::captures_scores(), Facts::qo_one(), Predicate::rest()]);
+    let [mq, sq, dq, p] = q.split([
+        Facts::masked(),
+        Facts::captures_scores(),
+        Facts::qo_one(),
+        Predicate::rest(),
+    ]);
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
     let o = Value::merge(vec![
+        ops::attn::masked(&mq, plan_m, mask, pages, None, d, a.sm_scale),
         so,
         ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
         ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),

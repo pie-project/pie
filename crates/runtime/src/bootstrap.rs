@@ -341,12 +341,18 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     // extra steps.
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
     let seat_cost = crate::scheduler::configured_dispatch_depth().max(1);
-    let rs_seat_cap = engine_configs
+    // The binding engine's seat pool, kept WITH its page pool: the warning
+    // below is the only notice an operator gets that their concurrency was
+    // overruled, and "seated=32" alone does not say by what. The seat count is
+    // not a knob — `Budgets::slots` is the page pool divided by one
+    // FULL-CONTEXT block per seat (`Paging::pages_per_slot`) — so the two
+    // numbers that produced it are the two an operator can act on.
+    let rs_pool = engine_configs
         .iter()
-        .map(|d| d.rs_cache_slots)
-        .filter(|&slots| slots > 0)
-        .min()
-        .map(|slots| (slots / seat_cost).max(1));
+        .filter(|d| d.rs_cache_slots > 0)
+        .min_by_key(|d| d.rs_cache_slots)
+        .map(|d| (d.rs_cache_slots, d.total_pages));
+    let rs_seat_cap = rs_pool.map(|(slots, _)| (slots / seat_cost).max(1));
     let admission_cap = config
         .max_concurrent_processes
         .or_else(|| {
@@ -358,12 +364,22 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         })
         .map(|cap| match rs_seat_cap {
             Some(seats) if cap > seats => {
+                let (slots, pages) = rs_pool.unwrap_or((0, 0));
                 tracing::warn!(
                     requested = cap,
                     seated = seats,
                     seat_cost,
-                    "admission: more lanes than the recurrent-state pool can seat; \
-                     capping, because each lane holds one slot per posted frame"
+                    pool_seats = slots,
+                    pool_pages = pages,
+                    pages_per_seat = pages.checked_div(slots).unwrap_or(0),
+                    "admission: more lanes than the pools can seat; capping, because each \
+                     lane holds one seat per posted frame. THE SEAT COUNT IS THE PAGE POOL \
+                     DIVIDED BY ONE FULL-CONTEXT BLOCK PER SEAT, so it falls when the KV \
+                     page pool is capped: to seat `requested * seat_cost` sequences, raise \
+                     the pool (`[model.engine.options] max_total_pages`, or leave it unset \
+                     to derive it from gpu_mem_utilization) or lower the context ceiling. \
+                     Every batch this deployment fires is bounded by `seated`, not by the \
+                     engine's max_lanes"
                 );
                 seats
             }

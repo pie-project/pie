@@ -268,9 +268,29 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
 /// `n/4` apart. Complements are one axis, not two: `qo_one` and `¬qo_one` are
 /// the same cut and a linear order that seats one seats the other.
 ///
-/// So a text with `k` mutually crossing axes must withdraw `k - 2` of them,
-/// and no more: `qwen35` states three (`qo_one`, `has_adapter`,
-/// `captures_scores`) and pays one, `qwen36-27b` states four and pays two.
+/// So a text with `k` mutually crossing axes must withdraw `k - 2` of them —
+/// `qwen36-27b` pays for `drafts` — and no more, UNLESS the text also states
+/// the masked window, which this arithmetic cannot see and which costs
+/// exactly two on top:
+///
+/// **THE MASKED TAX.** `masked` is FIRST in the qwen priority split (a lane
+/// that brought its own mask must have it applied whatever else it asked
+/// for), so the attention merge partitions the classes into four blocks —
+/// masked | capture | decode-rest | prefill-rest — and each block is owed an
+/// interval of its own. That does two things to the count above. First,
+/// `captures_scores` leaves it: its window is now `¬masked ∧ captures`,
+/// which is a third of the classes and not a half, so the halves filter no
+/// longer sees it (qwen35 reads "2 crossing axes" where it used to read 3).
+/// Second, the partition constrains HARDER than the axis it hid: seating the
+/// four blocks plus one surviving half-axis pins the other half-axis apart
+/// (its members land in three non-adjacent blocks) and pins one merge
+/// complement — the GDN mixer's `¬qo_one` arm — into two runs. Checked by
+/// hand at twelve classes: the order [m¬qo | m qo | capt-rest qo | capt |
+/// prefill-rest] seats the blocks, `qo_one`, and the capture window, and
+/// nothing seats those AND `has_adapter` AND `¬qo_one` — so the optimum
+/// withdraws exactly two more than the crossing-halves bound, which is what
+/// P4 finds on every masked qwen pair, all four platforms.
+///
 /// A withdrawal count above the bound is a search that gave up early; below
 /// it is arithmetic that stopped being true.
 #[test]
@@ -322,7 +342,16 @@ fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
                         .is_some_and(|tree| !PqTree::is_interval(tree.frontier(), mask))
                 })
                 .count();
-            let bound = axes.saturating_sub(2);
+            // The masked tax (see above): a text whose attention merge has a
+            // masked arm partitioned its classes around that window, and the
+            // partition costs two seats the halves arithmetic cannot count.
+            let masked = trace.nodes.iter().any(|node| {
+                matches!(
+                    node.op,
+                    model_ir::Operation::Attention(model_ir::Attention::Masked { .. })
+                )
+            });
+            let bound = axes.saturating_sub(2) + if masked { 2 } else { 0 };
             if withdrawn != bound {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: {classes} classes, {axes} crossing axes, so the \

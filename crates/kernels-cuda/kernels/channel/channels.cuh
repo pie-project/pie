@@ -1,7 +1,8 @@
 #pragma once
 
-// The four control kernels of the ticket/commit machinery: the device half
-// of a fire's admission decision (alto design §5). Reference implementations
+// The five control kernels of the ticket/commit machinery: the device half
+// of a fire's admission decision, its publication and its settlement (alto
+// design §5). Reference implementations
 // live in dev `driver/cuda/src/pipeline/channels.hpp`, and every claim below
 // cites it by line.
 //
@@ -88,6 +89,23 @@ constexpr u32 TICKET_REQUIRE_INPUT = 1u << 4;
 // mapped pinned mirror. The mirror side of TICKET_HOST_WRITER, and the reason
 // a full guest round trip makes no `cudaMemcpy` in either direction.
 constexpr u32 TICKET_HOST_READER = 1u << 5;
+// **THE TWO FLAGS THE SETTLE KERNEL READS, AND THE REASON THEY ARE NOT
+// CONSUME/PUBLISH.** dev's settlement predicates its word stores on
+// kTicketConsume/kTicketPublish directly (channels.hpp:432-444) because there
+// a consuming ticket always consumed. Here CONSUME means "this fire ADDRESSES
+// the committed cell" — a `read` that peeks without taking sets it, and so
+// does a take whose ring was empty at mint — while what the settlement must
+// advance is the endpoint counter the ENGINE owns, and only where the host's
+// prediction actually moved. So the mint states the advance separately from
+// the address, and the two are set together only in the common case.
+//
+// They also carry the ownership decision the device cannot see: on a channel
+// the host WRITES the guest owns the tail, on one it READS the guest owns the
+// head, and the settlement may never store the guest's own counter. The mint
+// sets these flags off `Endpoint::engine_owns_head`/`engine_owns_tail`, so a
+// word the guest owns simply has no flag naming it.
+constexpr u32 TICKET_ADVANCE_HEAD = 1u << 6;
+constexpr u32 TICKET_ADVANCE_TAIL = 1u << 7;
 
 // One host-visible channel endpoint as this fire predicted it
 // (channels.hpp:216-227 `DeviceHostChannelTicket`).
@@ -169,6 +187,39 @@ struct PublishLane {
 
 static_assert(sizeof(PublishLane) == 16, "PublishLane: the Rust `channel::PublishLane` mirrors this layout");
 
+// One fire's SETTLEMENT window over the same ticket table — dev
+// `HostChannelSettlementLane` (channels.hpp:380-388), less the three fields
+// this port does not need. Same three values as `PublishLane` and a distinct
+// type on purpose: two kernels reading one array would make a field added to
+// either a silent corruption of the other.
+//
+// WHAT DEV CARRIES HERE AND THIS DOES NOT, and why leaving it out is not a
+// gap:
+//
+//   * `host_commit` — dev's mapped mirror of the commit pair, written so the
+//     completion callback can classify a lane without a D2H. Here the commit
+//     pair IS mapped pinned memory (`Session::commit`), so the host reads the
+//     word the kernels wrote where they wrote it and there is nothing to
+//     mirror.
+//   * `full`/`head`/`cap1`/`consume` — dev's settlement also clears the
+//     consumed cell's full byte and advances the registry head for its
+//     "conditional consume" slots. That is `commit_bump`'s `taken` loop here,
+//     verbatim and already predicated on the same word, so doing it again
+//     would advance every consumed ring TWICE. **The registry is the bump's;
+//     the endpoint words are this kernel's.** That line is the whole ownership
+//     split and it is why this lane carries no registry pointer at all.
+struct SettleLane {
+    // Word [0] of the fire's commit pair — the SAME word `pull_validate`
+    // seeded, `commit_bump` read and `scatter_publish` read. Zero and this
+    // lane advances nothing, which is what makes a refused fire leave the
+    // guest's endpoint exactly where it found it.
+    const u32* commit;
+    u32 ticket_offset;
+    u32 ticket_count;
+};
+
+static_assert(sizeof(SettleLane) == 16, "SettleLane: the Rust `channel::SettleLane` mirrors this layout");
+
 extern "C" __device__ int printf(const char*, ...);
 
 // A ring word as the guest endpoint has it RIGHT NOW.
@@ -187,6 +238,26 @@ __device__ __forceinline__ u64 load_system_acquire(const u64* word) {
     asm volatile("ld.acquire.sys.b64 %0, [%1];" : "=l"(value) : "l"(word) : "memory");
 #endif
     return value;
+}
+
+// A ring word as this fire leaves it, stored where the guest will read it.
+//
+// RELAXED, AND THAT IS THE MEASURED DECISION, NOT AN OVERSIGHT
+// (channels.hpp:249-262). System-scope RELEASE compiles to a system release
+// fence per store, which on a discrete GPU serialises the write against the
+// host interconnect instead of letting the stores pipeline: dev measured 159
+// us against 12 us at one ticket and 792 us against 19 us at eight, growing
+// linearly in the word count, plus ~37 us for a single explicit
+// `__threadfence_system()` at this launch shape. Relaxed keeps the ATOMICITY
+// — no torn 64-bit word ever reaches the host — and gives up only an ordering
+// between these stores that no reader is positioned to observe, because every
+// reader of them is on the far side of this kernel's completion boundary.
+__device__ __forceinline__ void store_system_relaxed(u64* word, u64 value) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    asm volatile("st.volatile.b64 [%0], %1;" :: "l"(word), "l"(value) : "memory");
+#else
+    asm volatile("st.relaxed.sys.b64 [%0], %1;" :: "l"(word), "l"(value) : "memory");
+#endif
 }
 
 // ─────────────────────────── the three kernels ───────────────────────────
@@ -385,6 +456,62 @@ __global__ void scatter_publish(
             }
         }
         __syncthreads();
+    }
+}
+
+// **THE ENDPOINT'S COUNTERS, ADVANCED BY THE DEVICE** — dev
+// `k_settle_host_channels_batch` (channels.hpp:411-455), and the kernel whose
+// absence made every frame boundary take a `cudaStreamSynchronize`.
+//
+// WHAT THE WAIT WAS FOR. These four words are the guest's view of the ring,
+// and until this kernel existed the HOST advanced them: synchronize, read the
+// pinned commit word, then `bump_head`/`bump_tail` per slot. The next fire's
+// mint predicts off exactly those counters, so the wait was not there to make
+// the answer correct — it was there because the answer did not exist until a
+// host thread wrote it. Written by the device, in stream order, it exists
+// when the next kernel that reads it runs, and no host thread is between the
+// two. ~826 waits a c64 run, all of them this.
+//
+// WHAT IT ADVANCES, AND WHAT IT MUST NOT. Exactly the two words a ticket
+// names with TICKET_ADVANCE_HEAD / TICKET_ADVANCE_TAIL, to `expected_head + 1`
+// / `expected_tail + 1` — the PREDICTION plus one, never a read-modify-write,
+// because the prediction is what `pull_validate` already proved the word
+// equals and an increment would race the guest's own counter on the other
+// end. The registry (`full`, `head`, `tail`) belongs to `commit_bump` and is
+// not touched here; the guest's own counter has no flag naming it and is not
+// touched here either. See `SettleLane` for the full ownership split.
+//
+// ORDERING. Enqueued AFTER `scatter_publish` on the same stream, and that
+// launch boundary is the ENTIRE payload-before-tail argument: the cells
+// `scatter_publish` wrote into the guest's mirror are visible system-wide at
+// its completion, which strictly precedes the first store this kernel makes.
+// So the tail that announces a cell can never reach the guest ahead of the
+// cell. Every store below is therefore relaxed and there is no fence — see
+// `store_system_relaxed` for the 13.8x this buys, and the header's ordering
+// note for why relaxed gives up nothing any reader can observe.
+__global__ void settle(
+    const Ticket* __restrict__ tickets,
+    const SettleLane* __restrict__ lanes,
+    u32 lane_count)
+{
+    const u32 lane_index = blockIdx.x;
+    if (lane_index >= lane_count) return;
+    const SettleLane lane = lanes[lane_index];
+    // **THE ONE PREDICATE, AS EVERYWHERE ELSE.** A refused fire settles
+    // nothing: the guest's endpoint stands exactly where it stood, the bytes
+    // the pass wrote are in a cell no counter addresses, and the next fire
+    // predicts the same numbers and is admitted.
+    if (lane.commit == nullptr || *lane.commit == 0u) return;
+
+    for (u32 index = threadIdx.x; index < lane.ticket_count; index += blockDim.x) {
+        const Ticket ticket = tickets[lane.ticket_offset + index];
+        if (ticket.words == nullptr) continue;
+        if ((ticket.flags & TICKET_ADVANCE_HEAD) != 0) {
+            store_system_relaxed(ticket.words + 0, ticket.expected_head + 1);
+        }
+        if ((ticket.flags & TICKET_ADVANCE_TAIL) != 0) {
+            store_system_relaxed(ticket.words + 1, ticket.expected_tail + 1);
+        }
     }
 }
 

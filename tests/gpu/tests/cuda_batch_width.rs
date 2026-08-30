@@ -27,20 +27,40 @@
 //!      [`MIN_MEAN_WIDTH_FRACTION`] of the fleet, so a single wide fire
 //!      surrounded by narrow ones cannot satisfy (2) alone.
 //!
+//! A NOTE ON THE UNIT. `total_requests_processed / total_batches` counts lanes
+//! per SEALED FRAME, and a frame is `model.frame-size()` waves deep (k = 2 by
+//! default), so a fleet-wide frame reads as up to k x FLEET here while each
+//! forward carries FLEET. The fractions below are therefore deliberately
+//! stated against FLEET rather than against k x FLEET: the gate's business is
+//! that width tracks the fleet, and it should not go red the day k changes.
+//!
+//! AND A SECOND CEILING, WHICH IS NOT A BUG AND IS WHY THIS GATE PINS ITS
+//! FLEET. Batch width is bounded by process ADMISSION, admission by the pools'
+//! seat count, and `Budgets::slots` is the KV page pool divided by one
+//! FULL-CONTEXT block per seat. Capping the pool therefore caps every batch:
+//! measured at 256 concurrent inferlets, `--total-pages 16384` seats 64,
+//! admits 32 and fires 32-lane forwards; 65536 seats 256, admits 128, fires
+//! 128; 131072 seats 512, admits 256, and every steady-state forward carries
+//! the whole 256-way fleet. Nothing in the scheduler is involved. `bootstrap`
+//! says so at boot now — the warning names the pool and the per-seat block —
+//! but a gate whose FLEET outran the seat count would still fail for that
+//! reason while reading as a scheduler regression.
+//!
 //! Neither fraction is a tuned number, because the two regimes are not close.
 //! The same A/B on THIS test, the only difference being
 //! `LaneTurn::LAUNCH_RUN_BEFORE_CONTROL` set to `u32::MAX` (which restores the
 //! unbounded launch-first preference and nothing else):
 //!
 //! ```text
-//! starved   fleet=16  348 tok/s  batches=1543  mean_width=1.33  peak=2   hist=[1038,505,0,...]
-//! served    fleet=16 1502 tok/s  batches= 262  mean_width=7.82  peak=14  hist=[5,1,4,252,0,...]
+//! starved  fleet=64   120 tok/s  batches=7940  mean_width= 1.03  peak= 2  hist=[7688,252,0,...]
+//! served   fleet=64  3076 tok/s  batches= 265  mean_width=30.91  peak=43  hist=[7,0,0,2,131,125,0,0]
 //! ```
 //!
-//! The thresholds sit in the empty middle: 0.5x FLEET peak is 4x what the
-//! collapse reached and 0.57x what a healthy run reaches; 0.25x FLEET mean is
-//! 3x the collapsed mean and 0.51x the healthy one. Ramp-in and drain are
-//! inside the mean, which is why it is a fraction and not a floor at FLEET.
+//! The thresholds sit in the empty middle of a thirty-fold gap: the peak floor
+//! (0.5x FLEET = 32) is 16x what the collapse reached and 0.74x what a healthy
+//! run reaches; the mean floor (0.25x FLEET = 16) is 15x the collapsed mean and
+//! 0.52x the healthy one. Ramp-in and drain are inside the mean, which is why
+//! it is a fraction and not a floor at FLEET.
 //!
 //! `#[ignore]` (needs a CUDA device and the Qwen3.5-0.8B snapshot). Run:
 //!   PIE_COMPILER_LAUNCHER=env \
@@ -61,10 +81,18 @@ use pie::sweep::{self, fleet};
 /// here reads its answer beyond "it produced one".
 const GENERATE: &str = "text-completion@0.1.0";
 
-/// Live lanes. Large enough that a collapsed scheduler is unmistakable (the
-/// regression fired 2-3 wide regardless of fleet size, so the gap grows with
-/// this number) and small enough that the round is seconds.
-const FLEET: usize = 16;
+/// Live lanes. Large enough that a collapsed scheduler is unmistakable (both
+/// regressions fired at a fixed small width regardless of fleet size, so the
+/// gap grows with this number) and small enough that the round is seconds.
+///
+/// Bounded above by what the boot can SEAT, which is not the same as what the
+/// engine can fire: `boot_cuda` leaves `max_total_pages` unset, so the pools
+/// come out at the contract's default 256 seats, and a recurrent model spends
+/// `frame_dispatch_depth` seats per admitted lane — 128 lanes here. Sixty-four
+/// sits clear of that. A gate that asked for more would measure the seat pool
+/// rather than the scheduler, which is the trap this file's second note is
+/// about.
+const FLEET: usize = 64;
 
 /// Tokens per lane. A lane has to outlive the fleet's own bring-up or it
 /// contributes only to the ramp, which is the part of the run this gate is
@@ -73,12 +101,12 @@ const MAX_TOKENS: usize = 128;
 
 /// Widest fire in the window, as a fraction of `FLEET`. Not 1.0: lanes join
 /// and drain at slightly different instants and the gate has no reason to
-/// demand that all sixteen were ever ready in the same microsecond. Measured
-/// 14/16 healthy against 2/16 collapsed.
+/// demand that all sixty-four were ever ready in the same microsecond.
+/// Measured 43/64 healthy against 2/64 collapsed.
 const MIN_PEAK_WIDTH_FRACTION: f64 = 0.5;
 
-/// Mean lanes per fire, as a fraction of `FLEET`. Measured 7.82/16 healthy
-/// against 1.33/16 collapsed.
+/// Mean lanes per fire, as a fraction of `FLEET`. Measured 30.91/64 healthy
+/// against 1.03/64 collapsed.
 const MIN_MEAN_WIDTH_FRACTION: f64 = 0.25;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
