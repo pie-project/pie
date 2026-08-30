@@ -15,6 +15,6 @@
   },
   "dependencies": {
     "@noble/hashes": "^2.2.0",
-    "msgpack-lite": "^0.1.26"
+    "msgpack-lite": "^0.2.1"
   }
 }
