@@ -45,6 +45,24 @@ interface forward {
     use channel.{channel};
     use working-set.{kv-working-set, page-span};
     use pipeline.{pipeline};
+    use media.{image, audio};
+
+    /// One attached media span, by the resource the guest is holding.
+    ///
+    /// **A VARIANT FROM DAY ONE** (media-door.md §2). Audio input's tower is
+    /// its own wave and its front-end is not written yet, but the shape it
+    /// will arrive in is decided here: a second modality joins by taking a
+    /// case, not by growing a second verb beside `media`. The host reads both
+    /// cases into the same span record — the two differ in how they were
+    /// computed and in nothing the sequence can see.
+    ///
+    /// Borrowed, not owned: the pass reads the payload out and the guest keeps
+    /// its handle, which is what lets one decoded image be submitted to two
+    /// passes without decoding twice.
+    variant media-span {
+        image(borrow<image>),
+        audio(borrow<audio>),
+    }
 
     /// Attention geometry. Every input is an individual channel; the record
     /// exists so the whole group can be handled as a unit (and, in
@@ -92,6 +110,31 @@ interface forward {
         /// rejected. Unset = the full model. Mixed-depth co-fires run as
         /// banded depth when the deployment supports it.
         set-max-layers: func(max-layers: u32) -> result<_, error>;
+
+        /// **THE PAYLOAD BESIDE THE LEDGER** (media-door.md §0/§3): the spans
+        /// this pass's tokens carry, in the order their placeholder runs
+        /// appear.
+        ///
+        /// **THE TOKENS ARE THE LEDGER AND THIS IS NOT A SECOND ONE.** A span
+        /// entered the sequence through `embed`, as the run `image.tokens()`
+        /// answered and as nothing else; there is no anchor here, no offset,
+        /// no length. This call carries only what a token id cannot: the
+        /// preprocessed patches the tower consumes. The correspondence between
+        /// the two is not asserted by the guest — it is SCANNED by the host,
+        /// which finds the model's reserved placeholder runs in the submitted
+        /// tokens (a tokenizer never emits that id from text) and matches them
+        /// to these spans in order.
+        ///
+        /// **EVERY DISAGREEMENT IS REFUSED BY NAME, BEFORE ANYTHING LAUNCHES.**
+        /// More runs than spans or more spans than runs; a run whose length is
+        /// not that span's `token-count` (which is what catches a guest that
+        /// sliced a run in half, or spliced two spans' runs together); media
+        /// attached to a model with no tower. None of these can reach the
+        /// device, and none of them are diagnosed by a wrong answer.
+        ///
+        /// Ordered with `embed`, not against it: call either first. The scan
+        /// runs at `submit`, when both the tokens and the spans are final.
+        media: func(spans: list<media-span>) -> result<_, error>;
 
         /// Attach canonical ETA bytes and channel handles in dense declaration
         /// order. Validation uses the engine-owned ModelProfile, and now also

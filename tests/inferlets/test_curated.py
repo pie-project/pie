@@ -836,6 +836,132 @@ async def test_lora_probe(client, args):
     )
 
 
+# ── THE MEDIA DOOR (`.wiki/alto/media-door.md`, M-1(b) / M-1(c)) ────────────
+#
+# **THESE TWO WANT A LOAD WITH A TOWER, AND THEY SAY SO RATHER THAN FAILING.**
+# A vision checkpoint fits its family's text row AND its own, and the load
+# identifies the text row first -- deliberately, because a two-unit load stands
+# the fold down. So a census run that did not name a sku serves a trunk with no
+# patch axis, and a fire carrying spans is refused there by name
+# (`Fault::Towerless`, "this artifact declares no patch axis"). That is the
+# CORRECT answer for that load, not a failure of this gate, so it is reported
+# as a skip -- and the run that means to exercise the door names the row:
+#
+#     tests/inferlets/test_curated.py --model Qwen/Qwen3.5-0.8B \
+#         --sku qwen35-d0.8b-vision-bf16-kv-bf16
+TOWERLESS = ("no patch axis", "Towerless", "NoVisionFrontEnd")
+
+
+async def _caption(client, args, color: str, **extra) -> dict:
+    """One caption run, or a skip when this load has no vision tower."""
+    try:
+        return await _report(
+            client, args, "image-captioning", {"color": color, **extra}
+        )
+    except RuntimeError as error:
+        if any(mark in str(error) for mark in TOWERLESS):
+            # conftest reports FileNotFoundError as SKIPPED.
+            raise FileNotFoundError(
+                f"the loaded model has no vision tower, so the media door has "
+                f"nothing to open onto: {error}"
+            ) from error
+        raise
+
+
+async def test_image_captioning(client, args):
+    """M-1(b): a deterministic, sensible caption on a real image, e2e.
+
+    Three assertions, and they are three different strengths of claim.
+
+    1. **SENSIBLE** -- the caption names the colour. This is the weakest of the
+       three and the one that is about the MODEL: a 0.8-billion-parameter
+       trunk describing a flat colour field is not a hard vision task, but it
+       is still a model's taste, and a checkpoint that answered "a solid block
+       of colour" would fail this while being perfectly correct. That is the
+       honest limit of "sensible" here, and it is why the image is a solid
+       square rather than a photograph: it is the one picture whose content is
+       a sentence this file can state.
+
+    2. **DETERMINISTIC** -- greedy decoding, so the same image and the same
+       prompt answer the same tokens twice. This is about the ENGINE: a patch
+       payload staged into a slot the previous fire left dirty, or a route
+       computed off a stale offset, shows up here as a caption that moves.
+
+    3. **THE TOWER CONDITIONED THE TRUNK** -- a red square and a blue square
+       answer DIFFERENTLY. This is the claim that holds whatever the model's
+       taste is, and it is the one that catches the failure the whole door
+       exists to prevent: a pass that scattered nothing, or scattered into the
+       wrong rows, answers fluently about an image it never saw -- and answers
+       the same fluent thing for every image.
+    """
+    red = await _caption(client, args, "red")
+    assert red["soft_tokens"] > 0, "the span occupied no token rows"
+    assert red["prompt_tokens"] > red["soft_tokens"], (
+        "the prefill carried the span and no text around it"
+    )
+    lowered = red["text"].lower()
+    assert "red" in lowered, (
+        "the caption of a solid red square does not mention red: "
+        f"{red['text']!r}"
+    )
+
+    again = await _caption(client, args, "red")
+    assert again["text"] == red["text"], (
+        "greedy captioning of one image answered differently twice\n"
+        f"  first  = {red['text']!r}\n  second = {again['text']!r}"
+    )
+    assert again["digest"] == red["digest"], (
+        "one image preprocessed to two different spans"
+    )
+
+    blue = await _caption(client, args, "blue")
+    assert blue["digest"] != red["digest"], (
+        "two different images share a span digest -- media-door §5's statute "
+        "rests on exactly this not happening"
+    )
+    assert blue["text"] != red["text"], (
+        "a red square and a blue square got the same caption, so the patch "
+        "rows did not reach the trunk\n"
+        f"  red  = {red['text']!r}\n  blue = {blue['text']!r}"
+    )
+
+
+async def test_image_captioning_beside_text_lanes(client, args):
+    """M-1(c): a caption lane co-batched with text lanes, guest level.
+
+    The door is open per submission; this asks whether it is open per LANE.
+    A caption running alone and a caption running beside three text programs
+    must answer the same tokens -- the media rows are keyed by lane and the
+    batcher rebases them onto the step it co-batches into, so a rebase off by
+    one lane would scatter this lane's patches into a neighbour's rows.
+
+    The text neighbours are checked too, in the other direction: a text lane
+    beside a media lane must still attend its own prompt, which is what fails
+    if the seriated fire put the second row axis somewhere the text lanes'
+    rectangle overlapped.
+    """
+    solo = await _caption(client, args, "green")
+
+    ask = {"prompt": ATTENDS_PROMPT, "max_tokens": 12, "temperature": 0.0}
+    results = await asyncio.gather(
+        _caption(client, args, "green"),
+        run_inferlet(client, "chat-completion", ask, timeout=args.timeout),
+        run_inferlet(client, "chat-completion", ask, timeout=args.timeout),
+        run_inferlet(client, "chat-completion", ask, timeout=args.timeout),
+    )
+    mixed, *texts = results
+    assert mixed["text"] == solo["text"], (
+        "a caption lane answered differently beside text lanes than alone\n"
+        f"  alone = {solo['text']!r}\n  mixed = {mixed['text']!r}"
+    )
+    for i, text in enumerate(texts):
+        lowered = text.lower()
+        assert "france" in lowered or "paris" in lowered, (
+            f"text lane {i} beside a media lane did not attend its prompt: "
+            f"{text[:200]!r}"
+        )
+
+
 async def test_chat_completion_attends_prompt(client, args):
     await _attends_prompt(client, args, "chat-completion", {"max_tokens": 14, "temperature": 0.0})
 
@@ -927,6 +1053,8 @@ def tests():
         test_tova_attention,
         test_h2o_attention,
         test_snapkv_attention,
+        test_image_captioning,
+        test_image_captioning_beside_text_lanes,
     ]
 
 

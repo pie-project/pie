@@ -27,6 +27,13 @@ use super::worker::PendingRequest;
 pub(crate) struct StepBuild {
     /// The lanes, in member order.
     pub(crate) lanes: Vec<crate::engine::Lane>,
+    /// **THE MEDIA ROWS, REBASED ONTO THE STEP'S LANE NUMBERING**
+    /// (media-door §6). A member states a lane index into its OWN lanes,
+    /// because a submission cannot know which step it co-batches into; the
+    /// concatenation is where that index becomes the step's, and it is the
+    /// same rebase an [`Attachment`](engine::fire::Attachment)'s lane takes
+    /// four lines below.
+    pub(crate) media: Vec<engine::fire::StepMedia>,
     /// Which bound instance each MEMBER belongs to.
     pub(crate) instance_ids: Vec<u64>,
     /// Whether each MEMBER's instance runs a pass at the fire's boundary —
@@ -251,16 +258,29 @@ pub(crate) fn build_batch_request(
         let mut logical_fire_ids = Vec::with_capacity(requests.len());
         let mut member_lane_indptr = Vec::with_capacity(requests.len() + 1);
         member_lane_indptr.push(0);
+        let mut media: Vec<engine::fire::StepMedia> = Vec::new();
         for req in requests {
             boundary_programs.push(req.request.boundary_program);
             instance_ids.push(req.instance_id);
             terminal_cells.push(req.completion.terminal_cell_ptr());
             logical_fire_ids.push(req.logical_fire_id);
+            // The member's first lane IS its rebase, and it has to be read
+            // BEFORE its lanes are appended.
+            let base = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
             lanes.extend(req.request.lanes.iter().cloned());
             member_lane_indptr.push(u32::try_from(lanes.len()).unwrap_or(u32::MAX));
+            // **A TEXT-ONLY MEMBER CONTRIBUTES NOTHING AND PAYS NOTHING**: the
+            // vector above is not allocated until some member carries a span,
+            // which is what keeps a step of ordinary lanes byte-identical to
+            // the step it always was.
+            media.extend(req.request.media.iter().cloned().map(|mut row| {
+                row.lane = row.lane.saturating_add(base);
+                row
+            }));
         }
         StepBuild {
             lanes,
+            media,
             instance_ids,
             boundary_programs,
             member_lane_indptr,
@@ -424,6 +444,7 @@ pub(crate) fn build_frame_submission(
             submission: crate::engine::Step {
                 lanes,
                 attachments,
+                media: build.media,
             },
             terminal_cells: build.terminal_cells,
             instances,

@@ -666,6 +666,25 @@ pub struct ModelConfig {
     /// What to serve: a store name (`Qwen--Qwen3-0.6B`, as `pie model list`
     /// prints it) or a path to a `.zt` artifact. See `weights::resolve`.
     pub model: String,
+    /// **WHICH SKU OF THAT CHECKPOINT TO SERVE**, or omit to let the load
+    /// identify one.
+    ///
+    /// Identification asks every import in the catalog and takes the FIRST
+    /// whose contract builds and whose plan fits the checkpoint's shapes. That
+    /// is the right answer whenever exactly one row fits — and there is one
+    /// family where several do. A vision checkpoint holds a text trunk AND a
+    /// tower, so it fits the text-only row and the vision row both, and the
+    /// text row is deliberately first: a two-unit load stands the fold down
+    /// and cost 14.9% of throughput when it was tried the other way round
+    /// (`model::qwen_3`'s own measurement). So the default is the cheap row
+    /// and an operator who wants the tower NAMES it.
+    ///
+    /// It is a `[model]` key rather than an engine option because it is a fact
+    /// about the load, and it is a SKU string rather than a boolean because
+    /// the id space is the catalog's own — `pie model list` prints it and
+    /// `model::catalog()` is the only table that defines it.
+    #[serde(default)]
+    pub sku: Option<String>,
     /// Which backend runs the model, on what devices.
     pub engine: EngineConfig,
     /// Where this model's materialized-weight artifacts are kept between runs.
@@ -1408,6 +1427,16 @@ pub struct CudaNativeEngineOptions {
     ///
     /// What is left after the weights becomes the KV pool, so this is the
     /// knob that sizes it -- `max_total_pages` only caps the result.
+    ///
+    /// **AND IT REACHES AN ENGINE NOW** (alto streaming §3 item 5,
+    /// `next.md` B1). This key was written into the boot document's
+    /// `[batching]` table, which the C++ engine read and the Rust shell never
+    /// did, so for four waves it was declared, defaulted, validated and
+    /// schema'd here and read by nothing: the elastic pool took ~100% of
+    /// whatever the card had free. It is an `[engine]` key on the wire now and
+    /// `engine_cuda::device::elastic::budget_bytes` is the one arithmetic that
+    /// reads it -- `total x utilization - (total - free) - floor`, which at
+    /// `1.0` is byte for byte the pool this deployment had before.
     pub gpu_mem_utilization: f64,
     /// Which serving shape the memory planner optimizes its layout for:
     /// `auto` to infer it, `latency` for few concurrent requests, or
@@ -2504,6 +2533,61 @@ mtp_num_drafts = 6
         // Absent = derive: the planner scores candidates unless pinned.
         assert_eq!(opts.kv_page_size, None);
         assert_eq!(opts.kv_cache_dtype, "auto"); // default
+    }
+
+    #[test]
+    fn an_out_of_range_gpu_mem_utilization_refuses_by_the_keys_name() {
+        // **THE KEY THAT REACHED NO SHELL NOW SIZES THE ELASTIC POOL** (alto
+        // streaming §3 item 5, `next.md` B1), so its range is load-bearing
+        // rather than decorative: `0.0` is a deployment with no pool at all
+        // and anything over `1.0` is a fraction of a card that does not exist.
+        // Both refuse HERE, by the key's name, and again in
+        // `engine_cuda::boot` for a boot document nobody wrote through this
+        // config.
+        for fraction in ["0.0", "1.5", "-0.5", "nan"] {
+            let bad = format!(
+                r#"
+[model]
+name = "default"
+model = "Qwen/Qwen3-0.6B"
+
+[model.engine]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.engine.options]
+gpu_mem_utilization = {fraction}
+"#
+            );
+            let cfg: Config = toml::from_str(&bad).unwrap();
+            let err = cfg
+                .validate()
+                .expect_err("a fraction outside (0.0, 1.0] is not a deployment")
+                .to_string();
+            assert!(
+                err.contains("engine.gpu_mem_utilization"),
+                "the refusal names the key; got: {err}"
+            );
+        }
+        // And the whole card is a legal statement — it is what the pool took
+        // before the fraction reached a shell, so an operator has to be able
+        // to ask for it back.
+        let whole = r#"
+[model]
+name = "default"
+model = "Qwen/Qwen3-0.6B"
+
+[model.engine]
+type = "cuda_native"
+device = ["cuda:0"]
+
+[model.engine.options]
+gpu_mem_utilization = 1.0
+"#;
+        let cfg: Config = toml::from_str(whole).unwrap();
+        cfg.validate().unwrap();
+        let opts: CudaNativeEngineOptions = cfg.model.engine.options.clone().try_into().unwrap();
+        assert_eq!(opts.gpu_mem_utilization, 1.0);
     }
 
     #[test]

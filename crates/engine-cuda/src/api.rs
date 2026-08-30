@@ -101,7 +101,9 @@ pub type ContractFor =
 /// Everything here is a property of the MACHINE and the deployment, which is
 /// what an engine is opened with; the model's own ceilings arrive later on
 /// [`LoadRequest::budgets`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` left with [`Knobs`]'s: the knobs carry `gpu_mem_utilization`, an `f64`,
+// and a total equality over a float is a claim neither struct should make.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviceBoot {
     /// Which device to bind.
     pub ordinal: i32,
@@ -754,6 +756,11 @@ fn adapter_of(
         return Ok(None);
     };
     let seats = shell.bank_seats();
+    // **WHICH SITE THE GUEST ASKED FOR** (alto next B3), read off the sink's
+    // placement constant once and checked against the banks by `planes_of`:
+    // a text that names its site refuses a mismatch, a text that names none
+    // means what it always meant.
+    let site = sink.site().map_err(fault)?;
     let mut built: Vec<(String, Vec<u8>)> = Vec::new();
     for (role, channel) in &sink.planes {
         // **A CHANNEL THE SINK NAMES AND THE BIND DID NOT SEED IS A REFUSAL**,
@@ -775,7 +782,7 @@ fn adapter_of(
                     role.bank()
                 ))
             })?;
-        built.extend(crate::adapter::planes_of(*role, wire, &seats).map_err(fault)?);
+        built.extend(crate::adapter::planes_of(*role, site, wire, &seats).map_err(fault)?);
     }
     let planes: Vec<crate::AdapterPlane<'_>> = built
         .iter()
@@ -2033,6 +2040,64 @@ impl Cuda {
         //    name. Nothing here can fail a fire — see `Shell::arm_if_due`.
         shell.arm_if_due(&seated);
 
+        // ── **THE MARSHAL** (media-door §6, wave MD-C). The contract's media
+        //    rows in, `serve::Media` borrows out — the same eight fields,
+        //    owned there and borrowed here — plus the ONE conversion MD-A
+        //    deliberately did not guess.
+        //
+        //    **A PAYLOAD IS `f32` UNTIL IT MEETS A PLAN.** A front-end
+        //    computes real numbers; a plan computes in the element its text
+        //    declares, and `RuntimeInput::Patches` is where that is written
+        //    down. No party above the load holds a trace, so no party above
+        //    the load could have converted — a submission stated in bytes
+        //    would have had to guess an element and would have guessed it in
+        //    the runtime, for every engine at once. It is converted here,
+        //    where `Shell::patch_element` is a value this shell reads off its
+        //    own load.
+        //
+        //    **AND A TEXT-ONLY FIRE PAYS NOTHING FOR THIS.** `submission.media`
+        //    is empty for every fire this engine served before the door, so
+        //    the two vectors below are never allocated and the `StepView` is
+        //    handed the same empty slice it always was.
+        let mut staged: Vec<Vec<u8>> = Vec::new();
+        if !submission.media.is_empty() {
+            // A media submission against a load whose plan states no patch row
+            // has no element to convert into, and no tower to convert for. The
+            // shell's own refusal, taken at the first instant it is knowable
+            // rather than after a rectangle has been sized against a zero.
+            let Some(element) = shell.patch_element() else {
+                return Err(fault(crate::error::Fault::from(model_exec::Error::Fire(
+                    model_exec::fire::Fault::Towerless {
+                        lane: submission.media[0].lane,
+                    },
+                ))));
+            };
+            staged.reserve(submission.media.len());
+            for row in &submission.media {
+                staged.push(patch_bytes(&row.patches, element).map_err(|why| {
+                    Error::Unsupported {
+                        verb: why,
+                        engine: "cuda",
+                    }
+                })?);
+            }
+        }
+        let media: Vec<crate::serve::Media<'_>> = submission
+            .media
+            .iter()
+            .zip(&staged)
+            .map(|(row, patches)| crate::serve::Media {
+                lane: row.lane,
+                rows: &row.rows,
+                patches,
+                routes: &row.routes,
+                positions: &row.positions,
+                embed_rows: &row.embed_rows,
+                embed_weights: &row.embed_weights,
+                token_positions: &row.token_positions,
+            })
+            .collect();
+
         let settled = {
             use engine::frame::Shell as FrameShell;
             let prepared = FrameShell::prepare(
@@ -2040,12 +2105,12 @@ impl Cuda {
                 crate::serve::StepView {
                     lanes: &seated,
                     attachments: &attached,
-                    // THE RUNTIME CARRIES NO IMAGE YET (multimodal M3): the
-                    // contract's `Step` has no media rows, so this door
-                    // submits none and every lane through it is text-only.
-                    // The seam it would arrive through is `StepView::media`,
-                    // and the shell path behind it is complete.
-                    media: &[],
+                    // **AND THE IMAGES CROSS** (media-door §6). This line read
+                    // `&[]` under a note saying the contract's `Step` had no
+                    // media rows, so this door submitted none and every lane
+                    // through it was text-only. It has them, and the shell
+                    // path behind this seam was complete before they existed.
+                    media: &media,
                 },
                 None,
             )
@@ -2081,6 +2146,34 @@ impl Cuda {
                 settled,
             },
         ))
+    }
+}
+
+/// **THE ONE ARITHMETIC THE MEDIA DOOR LEFT** (media-door §6): a payload row's
+/// `f32` numbers, in the element the plan computes in, little-endian.
+///
+/// **ROUND TO NEAREST EVEN, AND STATED RATHER THAN TRUNCATED**, for the reason
+/// [`crate::adapter::bf16_bits`] gives where it does the same to an adapter's
+/// planes: a truncating conversion would land a slightly different image than
+/// the one the front-end computed, and every parity claim about the tower
+/// below it would then be about the wrong numbers. It is that same function,
+/// called rather than restated.
+///
+/// # Errors
+///
+/// The `&'static str` an [`Error::Unsupported`] carries, for a plan whose
+/// activation element this marshal cannot write. `Fp8` and the quantized
+/// codes are weight elements and no activation is stated in one, so the arm
+/// that would encode them is a refusal rather than a guess.
+fn patch_bytes(patches: &[f32], element: model_ir::Dtype) -> std::result::Result<Vec<u8>, &'static str> {
+    match element {
+        model_ir::Dtype::Bf16 => Ok(patches
+            .iter()
+            .flat_map(|&v| crate::adapter::bf16_bits(v).to_le_bytes())
+            .collect()),
+        model_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
+        _ => Err("a media submission against a plan whose activation element is neither \
+                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in"),
     }
 }
 

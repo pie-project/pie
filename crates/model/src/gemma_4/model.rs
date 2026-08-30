@@ -19,6 +19,13 @@ pub struct Model {
     /// per-lane axis, not a per-layer one.
     pub adapters: Adapters,
 
+    /// **THE VISION TOWER, WHEN THE CHECKPOINT SHIPS ONE** (multimodal §0,
+    /// §12; campaign M-2). `Option` for the qwen rows' reason: it is a fact
+    /// about the ARTIFACT — E4B publishes a sixteen-block
+    /// `model.vision_tower.*` and B31 publishes none — and it is the whole of
+    /// what makes this plan a TWO-UNIT one.
+    pub tower: Option<Tower>,
+
     pub kv: Dtype,
     pub softcap: Option<f32>,
     pub embed: Weight,
@@ -26,6 +33,60 @@ pub struct Model {
     pub layers: Vec<Layer>,
     pub final_norm: Weight,
     pub final_norm_eps: f32,
+
+    /// **THE AUX DRAFT HEAD, WHEN AN OVERLAY CARRIES ONE** (campaign M-4,
+    /// design §M5).
+    ///
+    /// `None` for every stock gemma4 artifact, and that is not a disabled
+    /// feature: **no gemma checkpoint publishes a draft head** — the cached
+    /// E4B and E2B hold not one tensor matching `mtp`/`nextn`/`draft`/`eagle`,
+    /// which `the_checkpoints_state_what_the_texts_read` asserts as a verdict
+    /// rather than a note. A head reaches this family the way EAGLE heads
+    /// reach any family: separately obtained, and baked in beside the base by
+    /// `pie model import --aux`.
+    ///
+    /// **AND GEMMA IS WHERE THE IDENTITY GATE BELONGS** (multimodal §17). A
+    /// greedy speculative run must answer the greedy sequential run token for
+    /// token, and on qwen35 it cannot: that text is a HYBRID, and its
+    /// gated-delta layers carry a recurrent state that a rejected draft row
+    /// folds into and no mask can cut. Gemma attends and does not recur, so a
+    /// rejected row leaves nothing behind but a kv cell the next fire
+    /// overwrites — which is the whole contract speculation rests on.
+    pub draft: Option<Draft>,
+}
+
+/// One EAGLE-style aux head: the fusion of a hidden state with the next
+/// token's embedding, one decoder block over the fused stream, and a readout
+/// through the base model's own head.
+///
+/// **THE SAME SHAPE `qwen_3::Mtp` DECLARES, MINUS THE TWO PIECES EAGLE HAS
+/// NOT.** No pre-fusion norms — the recipe fuses the raw pair — and no final
+/// norm of its own, because the hidden it was trained against is the one this
+/// trunk's `final_norm` already produced. What is gemma's rather than qwen's
+/// is the BLOCK: four norms around two sublayers, the family's own sentence,
+/// so a head trained for gemma is written the way gemma writes a layer.
+///
+/// **`fc` IS TWO BANKS AND THE OVERLAY SHIPS ONE.** `[a|b]·[Wₑ|W_h]ᵀ =
+/// a·Wₑᵀ + b·W_hᵀ` exactly, and this IR states no concatenation; `import`
+/// slices the stored `[hidden, 2·hidden]` at column `hidden`, embedding half
+/// first, which is the order the fusion concatenates in.
+pub struct Draft {
+    pub fc_embed: Weight,
+    pub fc_hidden: Weight,
+    pub attn_norm: Weight,
+    pub post_attn_norm: Weight,
+    pub pre_ffw_norm: Weight,
+    pub post_ffw_norm: Weight,
+    /// The head's own block reads GLOBALLY — full attention, its own kv row.
+    /// One arm and not two, for `qwen_3::mtp_attn`'s reason: the head is the
+    /// small speculative forward, and a batched-prefill read of a one-row lane
+    /// is the same numbers as a decode read.
+    pub attn: Attn,
+    pub o_proj: Weight,
+    pub gate_up: Weight,
+    pub inter: u32,
+    pub down: Weight,
+    pub norm_eps: f32,
 }
 
 pub struct Ple {
@@ -43,6 +104,95 @@ pub struct PleLayer {
     pub norm: Weight,
     pub norm_eps: f32,
     pub scalar: Weight,
+}
+
+/// **GEMMA'S SECOND ROW AXIS** (multimodal §12, campaign M-2).
+///
+/// The same patch rectangle qwen's tower reads, and a different model on it.
+/// Four sentences are gemma's own, each settled against
+/// `transformers/models/gemma4/modeling_gemma4.py` and the E4B checkpoint
+/// rather than assumed:
+///
+/// **THE BLOCK IS THIS FAMILY'S OWN FOUR-NORM SENTENCE.**
+/// `Gemma4VisionEncoderLayer` norms before AND after each sublayer and adds
+/// the residual last — `input → attn → post_attention → +residual`, then
+/// `pre_ffw → mlp → post_ffw → +residual` — which is exactly what the trunk
+/// above writes. RMSNorm throughout, weight only, so no `layernorm_no_scale`
+/// here: gemma's tower is the one that never needed §6.1.
+///
+/// **AND `sm_scale` IS 1.0, NOT `head_dim^-0.5`.** `Gemma4VisionAttention`
+/// states `self.scaling = 1.0`, the same number the trunk carries, and a
+/// tower that took the usual reciprocal square root would be a plausible
+/// wrong answer. `v_norm` is a norm with NO SCALE (`with_scale=False`), which
+/// is `elemwise.rmsnorm_no_scale` per head — the trunk's `qkv_unfused` writes
+/// that line already.
+///
+/// **THE POSITION TABLE IS TWO SEPARABLE LOOKUPS, NOT AN INTERPOLATION.**
+/// `_position_embeddings` gathers `table[0][x] + table[1][y]` — no bilinear
+/// resample anywhere, which is what qwen's tower needs four taps for. The
+/// stored `[2, positions, hidden]` is TRANSMUTED to `[2 · positions, hidden]`
+/// and read with `layout.embed_weighted` at two taps and weights of one: the
+/// `y` stream indexes the second half, so one node answers the sum and the
+/// weight stream carries ones rather than a hat. Exact, and one gather where
+/// two plus an add would have been.
+///
+/// **AND THE CLIPPED LINEARS FORBID A FUSED MLP** (§12). Every projection
+/// clamps its input and its output to bounds the CHECKPOINT states — 448
+/// scalars over this tower — so `gate_proj` and `up_proj`, which read the same
+/// `x`, clamp it to DIFFERENT bounds and cannot share a packed bank the way
+/// the trunk's `gate_up` does. The MLP is therefore two matmuls and the
+/// two-value `mlp_geglu_tanh`, not the packed one.
+pub struct Tower {
+    pub hidden: u32,
+    pub heads: u32,
+    pub head_dim: u32,
+    /// `pooling_kernel_size`: `layout.pool_rows` folds `pool²` consecutive
+    /// patch rows into one soft token, which is the same merge-block-major
+    /// statute qwen's fold reads at a different `k`.
+    pub pool: u32,
+    /// `C · P²` — no temporal axis, which is the one shape difference from
+    /// qwen's patch row.
+    pub patch_width: u32,
+    /// `2 · position_embedding_size`: the two axis tables, end to end.
+    pub positions: u32,
+    pub theta: f32,
+    pub norm_eps: f32,
+    pub sm_scale: f32,
+    pub patch_embed: Weight,
+    pub pos_embed: Weight,
+    pub blocks: Vec<TowerBlock>,
+    /// `[trunk hidden, hidden]` — `model.embed_vision.embedding_projection`,
+    /// which is what makes the pooled soft token a token row.
+    pub projection: Weight,
+}
+
+/// One clipped linear: the bank, and the four bounds the checkpoint states for
+/// it (§12). `lo`/`hi` are `[1]` weights and not plan constants, because a
+/// trace is built with no checkpoint in the room.
+pub struct Clipped {
+    pub bank: Weight,
+    pub in_lo: Weight,
+    pub in_hi: Weight,
+    pub out_lo: Weight,
+    pub out_hi: Weight,
+}
+
+/// One vision block: four norms, a bidirectional attention over seven clipped
+/// linears' worth of banks, and a gated ungated-by-fusion MLP.
+pub struct TowerBlock {
+    pub attn_norm: Weight,
+    pub post_attn_norm: Weight,
+    pub pre_ffw_norm: Weight,
+    pub post_ffw_norm: Weight,
+    pub q: Clipped,
+    pub k: Clipped,
+    pub v: Clipped,
+    pub o: Clipped,
+    pub q_norm: Weight,
+    pub k_norm: Weight,
+    pub gate: Clipped,
+    pub up: Clipped,
+    pub down: Clipped,
 }
 
 pub use crate::adapter::Adapters;
@@ -170,7 +320,56 @@ pub enum AttnBanks {
     },
 }
 
+/// The tower's own numbers, off `config.json`'s `vision_config`. Nothing here
+/// divides by `tp` — a sixteen-block 768-wide tower is replicated for the
+/// reason qwen's is, and cutting it would put a collective inside the patch
+/// unit.
+#[derive(Clone, Copy)]
+struct TowerDims {
+    depth: u32,
+    hidden: u32,
+    heads: u32,
+    inter: u32,
+    /// `in_channels · patch_size²`; gemma's patch has no temporal extent.
+    patch_width: u32,
+    pool: u32,
+    /// `position_embedding_size`, per AXIS. The declared table is twice it.
+    positions: u32,
+    out_hidden: u32,
+    theta: f32,
+    norm_eps: f32,
+    sm_scale: f32,
+}
+
+impl TowerDims {
+    /// **E4B's TOWER**, every number `vision_config`'s own:
+    /// `num_hidden_layers: 16`, `hidden_size: 768`, `num_attention_heads: 12`
+    /// (so `head_dim: 64`, which the config also states),
+    /// `intermediate_size: 3072`, `patch_size: 16` over three channels,
+    /// `pooling_kernel_size: 3`, `position_embedding_size: 10240`,
+    /// `rope_parameters.rope_theta: 100.0`, `rms_norm_eps: 1e-6`, and
+    /// `Gemma4VisionAttention`'s own `scaling = 1.0`.
+    const fn e4b() -> TowerDims {
+        TowerDims {
+            depth: 16,
+            hidden: 768,
+            heads: 12,
+            inter: 3072,
+            patch_width: 3 * 16 * 16,
+            pool: 3,
+            positions: 10_240,
+            out_hidden: 2560,
+            theta: 100.0,
+            norm_eps: 1e-6,
+            sm_scale: 1.0,
+        }
+    }
+}
+
 struct Dims {
+    tower: Option<TowerDims>,
+    /// Whether this SKU's artifact carries an `aux.*` overlay head.
+    draft: bool,
     hidden: u32,
     layers: u32,
     full_every: u32,
@@ -194,11 +393,13 @@ struct Dims {
 
 impl Model {
     pub fn e4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(
-            w,
-            kv,
-            tp,
-            Dims {
+        Model::new(w, kv, tp, Model::e4b_dims())
+    }
+
+    fn e4b_dims() -> Dims {
+        Dims {
+                tower: None,
+                draft: false,
                 hidden: 2560,
                 layers: 42,
                 full_every: 6,
@@ -218,8 +419,33 @@ impl Model {
                 softcap: Some(30.0),
                 window: 512,
                 norm_eps: 1e-6,
-            },
-        )
+        }
+    }
+
+    /// **THE THIRD SKU** (campaign M-2): the same forty-two layers reading the
+    /// sixteen-block tower E4B's own checkpoint ships.
+    ///
+    /// A second row for `qwen35-d0.8b-vision`'s reason: a tower is what makes
+    /// the plan two capture units, and a row that declared it optionally would
+    /// put a patch axis in every gemma4 artifact.
+    pub fn e4b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::e4b_dims();
+        d.tower = Some(TowerDims::e4b());
+        Model::new(w, kv, tp, d)
+    }
+
+    /// **THE M-4 IDENTITY RIG** (campaign M-4, multimodal §17): the same
+    /// forty-two layers with an EAGLE head overlaid.
+    ///
+    /// A row of its own for `qwen35-d0.8b-eagle`'s reason — whether a head is
+    /// there is a fact about the ARTIFACT, and this artifact is a different
+    /// one — and it exists on GEMMA because gemma attends and does not recur.
+    /// The qwen rig's identity gate cannot close while a rejected draft row
+    /// folds into a gated-delta state; this one has no state to fold into.
+    pub fn e4b_eagle(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::e4b_dims();
+        d.draft = true;
+        Model::new(w, kv, tp, d)
     }
 
     pub fn b31(w: Dtype, kv: Dtype, tp: u32) -> Model {
@@ -228,6 +454,8 @@ impl Model {
             kv,
             tp,
             Dims {
+                tower: None,
+                draft: false,
                 hidden: 5376,
                 layers: 60,
                 full_every: 6,
@@ -368,6 +596,110 @@ impl Model {
             })
             .collect();
 
+        // **THE TOWER, WHEN THE CHECKPOINT PUBLISHES ONE.** Every plane
+        // replicated and every name under `vision.`, which is the
+        // checkpoint's own namespace with `model.vision_tower.` stripped.
+        let tower = d.tower.map(|t| {
+            assert_eq!(
+                t.out_hidden, d.hidden,
+                "a tower's projection lands a TRUNK row; a mismatch would scatter a \
+                 rectangle of the wrong width into the embedding"
+            );
+            let th = t.hidden as u64;
+            let ti = t.inter as u64;
+            let head_dim = t.hidden / t.heads;
+            let n = |s: String| format!("vision.{s}");
+            let bank = |s: String, dims: [u64; 2]| Weight::sym(n(s), dims, w);
+            let vec1 = |s: String, len: u64| Weight::sym(n(s), [len], dense);
+            // One clipped linear: the bank and the four bounds beside it.
+            let clip = |s: &str, dims: [u64; 2]| Clipped {
+                bank: bank(s.to_string(), dims),
+                in_lo: vec1(format!("{s}_in_lo"), 1),
+                in_hi: vec1(format!("{s}_in_hi"), 1),
+                out_lo: vec1(format!("{s}_out_lo"), 1),
+                out_hi: vec1(format!("{s}_out_hi"), 1),
+            };
+            Tower {
+                hidden: t.hidden,
+                heads: t.heads,
+                head_dim,
+                pool: t.pool,
+                patch_width: t.patch_width,
+                positions: 2 * t.positions,
+                theta: t.theta,
+                norm_eps: t.norm_eps,
+                sm_scale: t.sm_scale,
+                patch_embed: bank("patch_embed".into(), [th, u64::from(t.patch_width)]),
+                pos_embed: bank("pos_embed".into(), [2 * u64::from(t.positions), th]),
+                blocks: (0..t.depth)
+                    .map(|l| {
+                        let b = |s: &str| format!("block.{l}.{s}");
+                        TowerBlock {
+                            attn_norm: vec1(b("attn_norm"), th),
+                            post_attn_norm: vec1(b("post_attn_norm"), th),
+                            pre_ffw_norm: vec1(b("pre_ffw_norm"), th),
+                            post_ffw_norm: vec1(b("post_ffw_norm"), th),
+                            q: clip(&b("q"), [th, th]),
+                            k: clip(&b("k"), [th, th]),
+                            v: clip(&b("v"), [th, th]),
+                            o: clip(&b("o"), [th, th]),
+                            q_norm: vec1(b("q_norm"), u64::from(head_dim)),
+                            k_norm: vec1(b("k_norm"), u64::from(head_dim)),
+                            gate: clip(&b("gate"), [ti, th]),
+                            up: clip(&b("up"), [ti, th]),
+                            down: clip(&b("down"), [th, ti]),
+                        }
+                    })
+                    .collect(),
+                projection: bank("projection".into(), [hidden, th]),
+            }
+        });
+
+        // **THE AUX HEAD, WHEN AN OVERLAY CARRIES ONE.** Named under `aux.`,
+        // which is the namespace `pie model import --aux` prefixes a second
+        // checkpoint's tensors with; the block is this family's own, read
+        // GLOBALLY, and its kv row is `kv.mtp` in the trunk's one page-id
+        // space — one page table for one sequence, which is the ruling the
+        // qwen head's row rests on too.
+        let draft = d.draft.then(|| {
+            let hd = global.head_dim as u64;
+            let q_w = q_heads as u64 * hd;
+            let kv_w = global.kv_heads as u64 * hd;
+            let iw = intermediate as u64;
+            let n = |s: &str| format!("aux.{s}");
+            let norm = |s: &str, len: u64| Weight::sym(n(s), [len], dense);
+            Draft {
+                // REPLICATED, both halves: a fusion bank contracts over
+                // `hidden` and produces `hidden`, and both ends are replicated
+                // values — the embedding of a token every rank holds, and the
+                // trunk's residual after its reduce.
+                fc_embed: Weight::sym(n("fc_embed"), [hidden, hidden], w),
+                fc_hidden: Weight::sym(n("fc_hidden"), [hidden, hidden], w),
+                attn_norm: norm("attn_norm", hidden),
+                post_attn_norm: norm("post_attn_norm", hidden),
+                pre_ffw_norm: norm("pre_ffw_norm", hidden),
+                post_ffw_norm: norm("post_ffw_norm", hidden),
+                attn: Attn {
+                    sm_scale: d.sm_scale,
+                    q_norm: norm("q_norm", hd),
+                    q_norm_eps: d.norm_eps,
+                    kv: "kv.mtp".to_string(),
+                    banks: AttnBanks::Owned {
+                        qkv: Weight::sym(n("qkv"), [q_w + 2 * kv_w, hidden], w)
+                            .packed([q_w, kv_w, kv_w]),
+                        k_norm: norm("k_norm", hd),
+                        k_norm_eps: d.norm_eps,
+                    },
+                    reading: Reading::Global,
+                },
+                o_proj: Weight::sym(n("o_proj"), [hidden, q_w], w).rows(),
+                gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
+                inter: intermediate,
+                down: Weight::sym(n("down"), [hidden, iw], w).rows(),
+                norm_eps: d.norm_eps,
+            }
+        });
+
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
@@ -376,6 +708,7 @@ impl Model {
             sliding,
             global,
             adapters: ADAPTERS,
+            tower,
             kv,
             softcap: d.softcap,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
@@ -405,6 +738,7 @@ impl Model {
             layers,
             final_norm: Weight::sym("final_norm", [hidden], dense),
             final_norm_eps: d.norm_eps,
+            draft,
         }
     }
 }
@@ -455,6 +789,50 @@ impl Model {
             claim(&layer.down);
             if let Some(scalar) = &layer.scalar {
                 claim(scalar);
+            }
+        }
+
+        if let Some(t) = &self.tower {
+            claim(&t.patch_embed);
+            claim(&t.pos_embed);
+            claim(&t.projection);
+            for b in &t.blocks {
+                for w in [
+                    &b.attn_norm,
+                    &b.post_attn_norm,
+                    &b.pre_ffw_norm,
+                    &b.post_ffw_norm,
+                    &b.q_norm,
+                    &b.k_norm,
+                ] {
+                    claim(w);
+                }
+                for c in [&b.q, &b.k, &b.v, &b.o, &b.gate, &b.up, &b.down] {
+                    for w in [&c.bank, &c.in_lo, &c.in_hi, &c.out_lo, &c.out_hi] {
+                        claim(w);
+                    }
+                }
+            }
+        }
+
+        if let Some(a) = &self.draft {
+            for w in [
+                &a.fc_embed,
+                &a.fc_hidden,
+                &a.attn_norm,
+                &a.post_attn_norm,
+                &a.pre_ffw_norm,
+                &a.post_ffw_norm,
+                &a.attn.q_norm,
+                &a.o_proj,
+                &a.gate_up,
+                &a.down,
+            ] {
+                claim(w);
+            }
+            if let AttnBanks::Owned { qkv, k_norm, .. } = &a.attn.banks {
+                claim(qkv);
+                claim(k_norm);
             }
         }
 

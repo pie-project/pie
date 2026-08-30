@@ -72,9 +72,82 @@ pub struct Conditional {
     pub handle: u64,
     /// The `CUgraphNode` this placed in the parent graph.
     pub node: *mut c_void,
-    /// The `CUgraph` the driver minted for the body, which
-    /// [`begin_body`] captures into.
-    pub body: *mut c_void,
+    /// **THE DRIVER'S ARRAY OF BODY GRAPHS**, [`arms`](Conditional::arms) long
+    /// — one for an `IF`, one per arm for a `SWITCH`.
+    ///
+    /// Private because it is a raw array and the only legal reading of it is
+    /// [`body`](Conditional::body)'s: in bounds, and as a `CUgraph`. The
+    /// driver owns the storage and keeps it alive for the node's lifetime,
+    /// which is the parent capture's, which is longer than this receipt's.
+    bodies: *mut *mut c_void,
+    /// How many bodies the node has: `1` for an `IF`, the arm count for a
+    /// `SWITCH`.
+    pub arms: u32,
+}
+
+impl Conditional {
+    /// The child graph of one arm, or `None` for an index this node has no
+    /// body for.
+    ///
+    /// An `IF` has exactly one and it is `body(0)`. A `SWITCH` has one per
+    /// arm, in the arm order `Def::Merge` states and `model_exec::fire::walk`
+    /// announces — which is why the recorder can hand `cond_arm`'s own number
+    /// straight to this.
+    #[must_use]
+    pub fn body(&self, arm: u32) -> Option<*mut c_void> {
+        if self.bodies.is_null() || arm >= self.arms {
+            return None;
+        }
+        // SAFETY: `bodies` is the driver's array of `arms` graphs, populated
+        // by `cuGraphAddNode_v2` and valid for the node's lifetime; `arm` was
+        // just bounds-checked against the `size` that call was given.
+        Some(unsafe { *self.bodies.add(arm as usize) })
+    }
+}
+
+/// Which flavour of conditional node to place, and how many bodies it has.
+///
+/// **ONE ENUM RATHER THAN TWO FUNCTIONS**, because the two differ in exactly
+/// two fields of one struct — `type_` and `size` — and everything around them
+/// (the frontier read, the context, the dependency update) is the same
+/// sequence for the same reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `CU_GRAPH_COND_TYPE_IF`: one body, taken when the handle is non-zero.
+    If,
+    /// `CU_GRAPH_COND_TYPE_SWITCH`: `arms` bodies, and the handle holds the
+    /// INDEX of the one that runs. An index at or past `arms` runs none of
+    /// them, which is the driver's own rule and is what makes a group with no
+    /// live arm expressible without a store.
+    Switch { arms: u32 },
+}
+
+impl Kind {
+    /// How many bodies the node is asked for.
+    #[must_use]
+    pub const fn size(self) -> u32 {
+        match self {
+            Kind::If => 1,
+            Kind::Switch { arms } => arms,
+        }
+    }
+
+    /// **THE VALUE THE HANDLE HOLDS WHEN NOTHING STORES INTO IT**, and each
+    /// kind's is the one that runs nothing.
+    ///
+    /// For an `IF` that is `0` — false, and the argument for it is that a
+    /// launch which did not happen is indistinguishable from one that decided
+    /// no, so the two must mean the same thing. For a `SWITCH` it is `arms`,
+    /// which is past the last body: a group whose every arm stood down stores
+    /// nothing at all, and "nothing stored" has to be "nothing runs" or the
+    /// empty fire would silently take arm 0.
+    #[must_use]
+    pub const fn quiescent(self) -> u32 {
+        match self {
+            Kind::If => 0,
+            Kind::Switch { arms } => arms,
+        }
+    }
 }
 
 /// The graph a stream is capturing into, and the frontier the next node would
@@ -148,18 +221,29 @@ fn said(call: &'static str, code: cudarc::driver::sys::CUresult) -> Result<()> {
 
 /// Mint a conditional handle on the graph `stream` is capturing into.
 ///
-/// `default` is the value the handle holds when no kernel sets it. **It is
-/// `false` here and the caller may not ask for anything else**: a default of
-/// `true` is a body that runs when the predicate kernel did not run, which is
-/// a graph whose control flow is decided by whether a launch happened — and a
-/// launch that did not happen is precisely the case a capture cannot
-/// distinguish from one that decided `false`.
+/// **THE DEFAULT LAUNCH VALUE IS THE KIND'S QUIESCENT ONE AND THE CALLER MAY
+/// NOT ASK FOR ANOTHER** — see [`Kind::quiescent`]. The whole argument is that
+/// a predicate kernel which did not run must be indistinguishable from one
+/// that decided to run nothing, because a capture cannot tell those apart: an
+/// `IF` defaults to false and a `SWITCH` to an index past its last body.
+///
+/// **AND `CU_GRAPH_COND_ASSIGN_DEFAULT` IS WHAT MAKES THE DEFAULT MEAN THAT ON
+/// EVERY LAUNCH AND NOT JUST THE FIRST.** Without the flag a handle is written
+/// once at creation and then KEEPS whatever the last store put in it, across
+/// launches of the same exec — which is invisible for a predicate that always
+/// stores (an `IF`'s setter writes 0 or 1 either way) and silently wrong for
+/// one that stores only when it has something to say. `set_switch` is exactly
+/// that: it stores its arm's index only if its arm is live, so a fire where no
+/// arm is live would replay the PREVIOUS fire's arm. Measured, on the gate's
+/// fourth launch, before the flag went on. With it, the driver re-applies the
+/// default at every launch before any node runs, and "nobody stored" is
+/// "nothing runs" every time.
 ///
 /// # Errors
 ///
 /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`] for a
 /// stream that is not capturing or a mint the driver refused.
-pub fn handle(stream: *mut c_void) -> Result<u64> {
+pub fn handle(stream: *mut c_void, kind: Kind) -> Result<u64> {
     #[cfg(feature = "_cuda")]
     {
         use cudarc::driver::sys as dr;
@@ -174,30 +258,38 @@ pub fn handle(stream: *mut c_void) -> Result<u64> {
         // SAFETY: `graph` is the capture's own, `ctx` this thread's current
         // one, and the out-parameter is a live local.
         said("cuGraphConditionalHandleCreate", unsafe {
-            dr::cuGraphConditionalHandleCreate(&raw mut handle, graph, ctx, 0, 0)
+            dr::cuGraphConditionalHandleCreate(
+                &raw mut handle,
+                graph,
+                ctx,
+                kind.quiescent(),
+                dr::CU_GRAPH_COND_ASSIGN_DEFAULT,
+            )
         })?;
         Ok(handle)
     }
     #[cfg(not(feature = "_cuda"))]
     {
-        let _ = stream;
+        let _ = (stream, kind);
         Err(Fault::Runtimeless)
     }
 }
 
-/// Place an `IF` node at the capture's current frontier and hand back its body
-/// graph, leaving the capture depending on the node.
+/// Place a conditional node at the capture's current frontier and hand back
+/// its body graphs, leaving the capture depending on the node.
 ///
-/// **CALLED AFTER THE PREDICATE KERNEL AND NOT BEFORE.** The setter's launch
+/// **CALLED AFTER THE PREDICATE KERNELS AND NOT BEFORE.** Each setter's launch
 /// is a node of the parent graph, and the frontier read here is what makes the
-/// conditional depend on it; read the frontier first and the two are siblings,
-/// which is a graph free to evaluate the handle before it was written.
+/// conditional depend on all of them; read the frontier first and they are
+/// siblings, which is a graph free to evaluate the handle before it was
+/// written. A `SWITCH` launches one setter per arm and the argument is the
+/// same one `arms` times.
 ///
 /// # Errors
 ///
 /// [`Fault::Runtimeless`], or [`Fault::Device`] for a frontier query, a node
 /// the driver refused to add, or a dependency update it refused.
-pub fn open(stream: *mut c_void, handle: u64) -> Result<Conditional> {
+pub fn open(stream: *mut c_void, handle: u64, kind: Kind) -> Result<Conditional> {
     #[cfg(feature = "_cuda")]
     {
         use cudarc::driver::sys as dr;
@@ -211,15 +303,19 @@ pub fn open(stream: *mut c_void, handle: u64) -> Result<Conditional> {
 
         // The driver POPULATES `phGraph_out` — it points into memory the
         // conditional node owns for its own lifetime — so what goes in is a
-        // null the call overwrites, and reading it back is how the body graph
-        // is learned. `size: 1` is the one body an `IF` has; the ELSE half
-        // CUDA 12.8 grew would be `size: 2`, and P3 does not bake one.
+        // null the call overwrites, and reading it back is how the body graphs
+        // are learned. `size` is the body count: `1` for the one body an `IF`
+        // has (the ELSE half CUDA 12.8 grew would be `2`, and P3 does not bake
+        // one), and the arm count for a `SWITCH`.
         let mut params: dr::CUgraphNodeParams = unsafe { core::mem::zeroed() };
         params.type_ = dr::CUgraphNodeType::CU_GRAPH_NODE_TYPE_CONDITIONAL;
         params.__bindgen_anon_1.conditional = dr::CUDA_CONDITIONAL_NODE_PARAMS {
             handle,
-            type_: dr::CUgraphConditionalNodeType::CU_GRAPH_COND_TYPE_IF,
-            size: 1,
+            type_: match kind {
+                Kind::If => dr::CUgraphConditionalNodeType::CU_GRAPH_COND_TYPE_IF,
+                Kind::Switch { .. } => dr::CUgraphConditionalNodeType::CU_GRAPH_COND_TYPE_SWITCH,
+            },
+            size: kind.size(),
             phGraph_out: core::ptr::null_mut(),
             ctx,
         };
@@ -252,8 +348,6 @@ pub fn open(stream: *mut c_void, handle: u64) -> Result<Conditional> {
                 code: 0,
             });
         }
-        // SAFETY: `size` is 1, so element 0 is in bounds.
-        let body = unsafe { *bodies };
 
         // **AND THE CAPTURE NOW HANGS OFF THE NODE.** `SET` and not `ADD`:
         // the launches after the bracket must depend on the conditional and
@@ -276,12 +370,13 @@ pub fn open(stream: *mut c_void, handle: u64) -> Result<Conditional> {
         Ok(Conditional {
             handle,
             node: node.cast(),
-            body: body.cast(),
+            bodies: bodies.cast(),
+            arms: kind.size(),
         })
     }
     #[cfg(not(feature = "_cuda"))]
     {
-        let _ = (stream, handle);
+        let _ = (stream, handle, kind);
         Err(Fault::Runtimeless)
     }
 }

@@ -44,7 +44,7 @@ pub enum Arm {
 }
 
 impl Arm {
-    const fn armed(self) -> i32 {
+    pub(crate) const fn armed(self) -> i32 {
         match self {
             Arm::Warm => 0,
             Arm::Set => 1,
@@ -110,6 +110,50 @@ pub fn set_conditional_byte(
             crate::ArgValue::Ptr(live),
             u32::from(absent).arg(),
             arm.armed().arg(),
+        ],
+    )
+}
+
+/// **SET A SWITCH HANDLE TO THIS ARM'S INDEX, IF THIS ARM HAS ROWS.**
+///
+/// The `SWITCH` twin of [`set_conditional`], and the difference is what a
+/// handle holds: an `IF`'s is a bool and a `SWITCH`'s is an arm index in
+/// `0..arms`, with "at or past `arms`" meaning no body runs at all. So a
+/// group's empty fire needs no store — the handle's DEFAULT is what says
+/// nothing runs, and the recorder mints it out of range on purpose.
+///
+/// **CALLED ONCE PER ARM.** There is no single vector holding every arm's row
+/// count (each arm is its own region with its own window), so each arm gets
+/// its own launch with its own `indptr`, and each stores only if it is live.
+/// P3 proves at most one arm is demanded by any admissible composition, so at
+/// most one of those stores happens and their order cannot matter.
+///
+/// `indptr` at zero stores nothing: this arm stands down. The recorder never
+/// passes one — it refuses a SWITCH whose arm cannot state a row count — so
+/// that spelling belongs to a gate.
+///
+/// # Errors
+///
+/// Whatever the launch refused, tagged with this op's name.
+pub fn set_switch(
+    ctx: &Ctx,
+    handle: u64,
+    arm: u32,
+    indptr: u64,
+    lanes: u32,
+    warm: Arm,
+) -> Result<(), Error> {
+    const OP: &str = "graph.set_switch";
+    let lanes = i32::try_from(lanes).unwrap_or(i32::MAX);
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol("::pie::graph::set_switch")).apply(once()),
+        &[
+            handle.arg(),
+            arm.arg(),
+            crate::ArgValue::Ptr(indptr),
+            lanes.arg(),
+            warm.armed().arg(),
         ],
     )
 }

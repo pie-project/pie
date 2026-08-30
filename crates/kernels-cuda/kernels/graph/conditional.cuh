@@ -88,3 +88,50 @@ __global__ void set_conditional_byte(
 }
 
 }
+
+namespace pie::graph {
+
+/// **THE SWITCH FORM, AND IT STORES AN INDEX RATHER THAN A BOOL.**
+///
+/// An `IF` handle takes 0 or 1 and the node has one body. A `SWITCH` handle
+/// takes an ARM INDEX in `0..arms` and the node has `arms` of them, so the
+/// question the predicate answers stops being "does this region run" and
+/// becomes "which of these regions does". The driver's own rule for an index
+/// at or past `arms` is that NO body runs, which is what makes the whole
+/// group's empty case expressible: nothing has to be stored for nothing to
+/// happen.
+///
+/// **ONE LAUNCH PER ARM, AND THE STORE IS CONDITIONAL ON THE ARM BEING LIVE.**
+/// A group's arms are `arms` separate regions with `arms` separate windows,
+/// and there is no one vector holding all their counts — building one would be
+/// a per-fire device buffer nothing else needs. So the recorder launches this
+/// once per arm, each with that arm's own boundary vector, and each stores
+/// only if its own window has rows. That composes because P3 proves what makes
+/// a SWITCH legal in the first place: **at most one arm is demanded by any
+/// composition the budgets admit** (`switch_groups`, which only ever groups at
+/// `max_lanes == 1`). Under that proof at most one of these launches stores,
+/// so the order they land in cannot matter — and if the proof were ever wrong
+/// the last one would win, which is a wrong answer rather than a corrupt
+/// graph.
+///
+/// A null `indptr` stores nothing: this arm does not claim the group. The
+/// recorder never passes one — it refuses a SWITCH whose arm cannot state a
+/// row count, because "take it anyway" is the safe direction for an `IF` and
+/// there is no such direction here — so the null is the gate's spelling of an
+/// arm that stands down.
+__global__ void set_switch(
+    unsigned long long handle,
+    unsigned int arm,
+    const int* __restrict__ indptr,
+    int lanes,
+    int armed)
+{
+    if (armed == 0) return;
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (indptr == nullptr || lanes < 0) return;
+    if (indptr[lanes] == 0) return;
+
+    cudaGraphSetConditional(handle, arm);
+}
+
+}

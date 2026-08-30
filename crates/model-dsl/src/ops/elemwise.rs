@@ -101,6 +101,33 @@ pub fn layernorm_no_scale(x: &Value, eps: f32) -> Value {
     y
 }
 
+/// **THE WHOLE `nn.LayerNorm`, IN ONE NODE** (multimodal §9.1's owed saving,
+/// next.md B5): centred, scaled by `weight`, biased by `bias`.
+///
+/// `y = (x − mean(x)) · rsqrt(var(x) + eps) · w + b`. What a qwen vision block
+/// writes, and what it wrote before this row existed is three nodes —
+/// `add_bias(b, rmsnorm(layernorm_no_scale(x, eps), w, eps))` — because §9.1
+/// found the import fold half-expressible and the halves non-composing. Three
+/// launches and two extra device rectangles per norm, twenty-five norms per
+/// qwen35 tower fire; this is the one node they collapse to.
+///
+/// [`layernorm_no_scale`] stays for the text whose scale genuinely bakes.
+pub fn layernorm(x: &Value, weight: &Weight, bias: &Weight, eps: f32) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Layernorm {
+            x: x.id(),
+            weight: r.weight(weight),
+            bias: r.weight(bias),
+            eps,
+            y: y.id(),
+        },
+        &[x],
+    );
+    y
+}
+
 /// **THE CLIPPED LINEAR'S CLAMP** (multimodal §6.5): `min(max(x, lo), hi)`,
 /// in place, both bounds trace constants.
 ///

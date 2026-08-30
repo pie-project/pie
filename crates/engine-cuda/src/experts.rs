@@ -102,19 +102,83 @@
 //! the DENSE select kernel dereferences (`moe_matmul_select_gemv_body` loads
 //! `expert_table[expert]`), and there is no such load on the packed path to
 //! point anywhere. So a split-plane bank cannot be seated expert by expert
-//! without a kernel that asks, and kernels are not this wave's.
+//! without a kernel that asks.
 //!
 //! **The unit of residency is therefore the GROUP** — the code plane and
 //! every companion plane the load plan pairs with it — and a group is held
 //! WHOLE on one tier: every plane of it in the device store, or every plane
-//! of it in the pinned tier, addressed by the kernel over UVA. Which is not a
-//! weaker promise than the dense tier's, it is a different one, and it is the
-//! one that makes a torn pair unconstructible: a group never changes tier
-//! after the load, so there is no instant at which the codes have moved and
-//! the exponents have not. Seating the codes alone would be the failure the
-//! metal sibling names in its own header — `scales += e * ...` reading
-//! another expert's factors, a model that computes and is wrong — and this
-//! shell does not have a shape that can express it.
+//! of it in the pinned tier, addressed by the kernel over UVA, or every plane
+//! of it in the mapped artifact. Which is not a weaker promise than the dense
+//! tier's, it is a different one, and it is the one that makes a torn pair
+//! unconstructible. Seating the codes alone would be the failure the metal
+//! sibling names in its own header — `scales += e * ...` reading another
+//! expert's factors, a model that computes and is wrong — and this shell does
+//! not have a shape that can express it.
+//!
+//! # THE LADDER: A GROUP MOVES NOW, AND THE PAIR IS ONE WORD (wave B7)
+//!
+//! W-5 made the torn pair unconstructible the cheap way — *a group never
+//! changes tier after the load* — and paid for it with a residency decided
+//! once, off a plan, before a token was served. What HMM did underneath was
+//! the only promotion on this path, and streaming §3 item 3 said so.
+//!
+//! The kernel change it named is here, and it is one load. The two plane
+//! bases were kernel PARAMETERS, and a captured graph holds its parameters
+//! forever (article 7), so the group's tier was frozen with them. Now the
+//! launch carries a CELL instead — one 16-byte, 16-byte-aligned word of data
+//! at a fixed address, holding `(codes, scales)`, read by
+//! `moe_matmul_select_mxfp4` with a single `ld.global.v2.u64`:
+//!
+//! ```text
+//! before   codes  + e * n * (k / 2)          bases are launch parameters
+//!          scales + e * n * (k / 32)
+//! after    (codes, scales) = *cell           ONE extra load, per GROUP,
+//!          codes  + e * n * (k / 2)          per LAUNCH: one address the
+//!          scales + e * n * (k / 32)         whole grid shares
+//! ```
+//!
+//! **One extra load per group, argued.** It is not per route and not per row:
+//! every thread of the grid loads the same sixteen bytes, so it is one L1
+//! broadcast against a kernel that then reads hundreds of kilobytes of codes
+//! per warp. And a fully-resident load does not pay even that — the cell
+//! pointer is null, the arm is the arithmetic it always did, and that is the
+//! same degeneration [`ExpertTable::RESIDENT`] gives the dense path.
+//!
+//! **THE PAIR IS ONE WORD, WHICH IS WHY THE TORN PAIR IS STILL
+//! UNCONSTRUCTIBLE — now across MOTION rather than by forbidding it.** Both
+//! plane addresses live in the same sixteen bytes, filled together in the
+//! pinned shadow before any copy is issued, so no state of the cell names one
+//! group's codes beside another's exponents. And the move itself lands the
+//! bytes before it flips the pointer:
+//!
+//! ```text
+//! gap n     the berth's occupant's cell -> the artifact   16 bytes
+//!           [the next fire waits HERE]
+//!           the candidate's planes -> the berth           ~265 MiB, unwaited
+//! gap n+k   the candidate's cell -> the berth             16 bytes
+//!           [the next fire waits HERE]
+//! ```
+//!
+//! Between the two gaps the berth is referenced by nobody: the occupant's
+//! cell already names the file and the candidate's does not name the berth
+//! yet. **Nothing a fire waits for is bigger than sixteen bytes** — the copy
+//! that costs something is enqueued on the notify stream AFTER the event the
+//! next fire waits on, and whether it has landed is asked at a later gap
+//! rather than waited for (article 2, the same sentence one tier up). A gap
+//! that would start a second copy is skipped rather than queued behind the
+//! first, because a stream is ordered and a promotion that would have to wait
+//! is not one.
+//!
+//! **And the vote is a strict-improvement rule, which has a consequence worth
+//! writing down.** A swap is taken only when the candidate is strictly hotter
+//! than the occupant it displaces, so `Σ hits × rung` strictly falls and the
+//! sequence terminates. It also means a model whose routed banks are ALL read
+//! every fire — which is every MoE in today's catalog — has a uniform vote
+//! and a steady state at the plan's own assignment. That is the right answer
+//! and not a missing feature: with equal demand any assignment costs the
+//! same. What the ladder is for is the demand the plan cannot see — a bank a
+//! session never routes to, holding a rung a hot mapped bank wants.
+//! [`Tier::decide_group`] carries the argument in full.
 //!
 //! What a capped budget buys on the packed path is therefore per-BANK and not
 //! per-expert: gpt-oss-20b is 48 groups of ~265 MiB, and a budget under its
@@ -143,6 +207,13 @@
 //! The constitutional sentence is the same one the UVA miss already owns:
 //! **slow, not wrong** (article 2). A T2 group's reads are counted
 //! ([`observed`]) and nothing is load-bearing on the count.
+//!
+//! **AND IT IS ALSO THE LADDER'S FLOOR.** The artifact is a snapshot of the
+//! device store, so it carries every plane of every group — including the
+//! ones that have never been off the device — and that is what a demotion
+//! points a cell back at. So the ladder's precondition is exactly streaming
+//! §0's: a load with no artifact has the assignment it booted with, which is
+//! a shorter ladder rather than a wrong one, and nothing refuses.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
@@ -170,6 +241,29 @@ const COUNTER: u64 = 4;
 /// top-k 8 and costs, for the largest bank in the catalog, ~4 MiB of PCIe per
 /// gap.
 const MOVES: usize = 2;
+
+/// **How many packed GROUPS may change tier between two fires** (wave B7).
+///
+/// One, and the arithmetic is why: an expert of a dense bank is ~2 MiB and a
+/// gap may hold two of them; a gpt-oss group is ~265 MiB — the code plane and
+/// its exponents, whole — which is ~10 ms of PCIe. That copy is never waited
+/// for (see [`Tier::promote`]: it is enqueued AFTER the event the next fire
+/// waits on), but it does occupy the notify stream, and a second one queued
+/// behind it would put a fire's own staging behind ~20 ms of it.
+///
+/// So: one group in flight, and a gap that would start a second is SKIPPED —
+/// the same doctrine [`MOVES`] rides, at the size the unit actually is.
+const GROUP_MOVES: usize = 1;
+
+/// One base cell: two device addresses, sixteen bytes, sixteen-byte aligned —
+/// the `(codes, scales)` pair the packed select loads with one
+/// `ld.global.v2.u64`. See `MoeGroupBases` in `linear/quant.cuh`.
+const CELL: u64 = 16;
+
+/// How many planes a cell can name. A split-plane bank is codes AND factors
+/// and nothing else has ever been seated here; a group that declared a third
+/// plane is refused by name rather than seated with one plane unaddressed.
+const CELL_PLANES: usize = 2;
 
 /// **A quantized bank's OTHER device planes**, by `Trace::params` index — the
 /// pairing [`weights::pairings`](crate::weights) reads off the load plan, in
@@ -234,12 +328,33 @@ impl Budgets {
 /// this is a property of the group and never of a plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Held {
+    /// T0: the device store. **Never a [`Plan::groups`] entry** — a group the
+    /// store holds is a group the plan did not have to place — and that is
+    /// what [`Plan::seated`] answers instead. It IS a tier the LADDER can put
+    /// a group back on (wave B7), which is why the word exists here at all.
+    Device,
     /// T1: page-locked host memory the kernel reads over UVA. The tier owns
     /// the bytes and the landing sink writes them.
     Pinned,
     /// T2: the warm artifact, mapped. The tier owns nothing — the bytes were
     /// on disk before this load started and no one copies them.
     Mapped,
+}
+
+impl Held {
+    /// **How far down the ladder this tier is**: 0 device, 1 pinned, 2 mapped.
+    ///
+    /// The ONE ordering the promotion reads, and it is a cost order and not a
+    /// preference: HBM, then PCIe over UVA, then a page fault to NVMe. A move
+    /// is legal only from a higher rung to a lower one.
+    #[must_use]
+    pub const fn rung(self) -> u8 {
+        match self {
+            Held::Device => 0,
+            Held::Pinned => 1,
+            Held::Mapped => 2,
+        }
+    }
 }
 
 // ── the T2 register (design §14: counted, never load-bearing) ───────────────
@@ -357,6 +472,21 @@ pub struct Plan {
     /// each, seated together in the pinned tier and read there over UVA.
     /// Empty for a plan whose packed banks all fit, and for a plan with none.
     groups: Vec<GroupPlan>,
+    /// **The ROUTED packed groups the device store DOES hold** (wave B7).
+    ///
+    /// They are not in `groups` and must not be: `groups` is the list of
+    /// placements the budget was forced to make, and every reader of it —
+    /// `weights::places`, the landing sink, the two standing gates — reads it
+    /// as *"these planes are not in the store"*. A T0 group is in the store
+    /// like any other plane.
+    ///
+    /// It is carried separately because the LADDER needs it. A device seat is
+    /// the fastest rung and a group on it is what a hotter group displaces, so
+    /// the tier has to know which store regions are group-shaped and where
+    /// they are. Dense planes the budget spilled are deliberately absent: they
+    /// are `routed: false`, they are bound as one handle with no cell for a
+    /// promotion to write, and moving them is D2b's pump and not this ladder.
+    seated: Vec<GroupPlan>,
     /// `param index -> how many experts of it live on the device`. The one
     /// map `weights::places` consults to reserve a bank at less than its
     /// declared size.
@@ -616,6 +746,7 @@ impl Plan {
             .sum();
         let mut host_left = budgets.host.map(|host| host.saturating_sub(dense_pin));
         let mut groups: Vec<GroupPlan> = Vec::new();
+        let mut seated_groups: Vec<GroupPlan> = Vec::new();
         let mut pinned_of: BTreeSet<usize> = BTreeSet::new();
         let mut mapped_of: BTreeSet<usize> = BTreeSet::new();
         let mut seated = 0u64;
@@ -630,6 +761,16 @@ impl Plan {
             if group.bytes <= left {
                 left -= group.bytes;
                 seated += group.bytes;
+                // **A ROUTED GROUP THE STORE HOLDS IS STILL A SEAT** (B7).
+                // It is not a placement — nothing below reserves anything for
+                // it, because the store already did — but it is the fastest
+                // rung on the ladder, and the tier cannot displace what it
+                // cannot name. A spilled DENSE plane is not recorded: it has
+                // no cell and no ladder.
+                if group.routed {
+                    group.held = Held::Device;
+                    seated_groups.push(group);
+                }
                 continue;
             }
             let fits_host = host_left.is_none_or(|host| group.bytes <= host);
@@ -722,6 +863,7 @@ impl Plan {
         Ok(Plan {
             banks,
             groups,
+            seated: seated_groups,
             resident_of,
             pinned_of,
             mapped_of,
@@ -748,6 +890,15 @@ impl Plan {
     #[must_use]
     pub fn groups(&self) -> &[GroupPlan] {
         &self.groups
+    }
+
+    /// **The ROUTED packed banks the DEVICE STORE holds**, in param order —
+    /// every one of them [`Held::Device`], and none of them in
+    /// [`Plan::groups`]. See the field's own doc for why the two lists are
+    /// two lists.
+    #[must_use]
+    pub fn seated(&self) -> &[GroupPlan] {
+        &self.seated
     }
 
     /// **Does the PINNED tier hold this param whole?** — what
@@ -1020,6 +1171,132 @@ struct Mapped {
     bytes: u64,
 }
 
+/// **ONE PACKED GROUP, AND WHICH RUNG OF THE LADDER IT IS ON RIGHT NOW**
+/// (alto streaming §3 item 3, wave B7).
+///
+/// [`Whole`] and [`Mapped`] are the LOAD's answer — where the plan put a
+/// group's planes and where the weight table pointed at them. This is the
+/// LIVE answer, and the difference between the two is the whole of what this
+/// wave added: a group's tier used to be fixed at load, because the two plane
+/// bases were kernel parameters and a captured graph holds its parameters
+/// forever (article 7). Now the launch reads a CELL instead, the cell is data,
+/// and this is what the host knows the cell says.
+#[derive(Debug)]
+struct Group {
+    /// Index into `Trace::params` of the CODE plane — the group's own name.
+    param: usize,
+    name: String,
+    experts: u32,
+    /// Every plane, in the plan's order: code plane first, then companions.
+    planes: Vec<GroupPlane>,
+    /// Index of this group's cell, in `cells` — also its counter's index.
+    cell_at: usize,
+    /// Where each plane is RIGHT NOW, in `planes` order. What the cell says.
+    at: Vec<u64>,
+    /// Which tier those addresses are on.
+    held: Held,
+    /// **Where each plane is IN THE ARTIFACT** — the rung a demotion falls
+    /// back to, and the only one that is always there because it is a file.
+    ///
+    /// Empty when this load opened no artifact, or when the artifact does not
+    /// carry every plane of this group. A group with no backing can be
+    /// promoted (its bytes are read, never written) but never DEMOTED, so it
+    /// is never the occupant a swap displaces. That is the honest statement of
+    /// the precondition: **the ladder needs somewhere to put what it moves,
+    /// and streaming §0 already named the file.**
+    backing: Vec<u64>,
+    /// Which berth it occupies, or `None` for a group read where it lies.
+    berth: Option<usize>,
+    /// **When it last changed rung**, on [`Tier::tick`]'s monotone clock; `0`
+    /// for a group still where the plan seated it.
+    ///
+    /// The vote never reads it — a strict-improvement rule needs no tiebreak —
+    /// but [`Tier::promote_now`] does, and for a reason worth stating: the
+    /// door has the vote's clause struck out, so with a uniform demand every
+    /// berth looks equally good and it would displace the group it just
+    /// promoted. Least-recently-settled is the tiebreak that makes a sequence
+    /// of forced rungs walk ACROSS the berths rather than in and out of one.
+    settled: u64,
+}
+
+/// **One physical region a group's planes can be copied INTO** — a device
+/// store region a T0 group was seated in, or a span of the pinned tier a T1
+/// group was seated in.
+///
+/// T2 is deliberately NOT a berth. The mapping is a read-only view of a file:
+/// nothing is copied into it, and a group demoted there simply points back at
+/// its own bytes, which were never anywhere else. So the ladder's two upper
+/// rungs are berths, its bottom rung is the file, and a swap is always
+/// *"the occupant goes back to the file, the candidate comes up"*.
+#[derive(Debug)]
+struct Berth {
+    /// Which rung. [`Held::Device`] or [`Held::Pinned`], never [`Held::Mapped`].
+    tier: Held,
+    /// One address per plane, in plane order.
+    at: Vec<u64>,
+    /// **The reserved bytes of each plane** — the SHAPE a group must match to
+    /// take this berth.
+    ///
+    /// Exactly, plane for plane. A berth is sized for the group the plan put
+    /// in it, and a group with different plane bytes taking it would either
+    /// run off the end or leave a hole the next plane's reader walks into.
+    /// gpt-oss-20b's 48 groups are two shapes — a gate/up bank and a down bank
+    /// — so this partitions the berths into two interchangeable classes and
+    /// refuses everything across them, which is what it should do.
+    shape: Vec<u64>,
+    /// Which group is in it, by index into `Tier::groups`.
+    holds: Option<usize>,
+}
+
+/// **The one swap in flight** — a promotion between its two halves.
+///
+/// A group's bytes are hundreds of megabytes, so the copy that moves them is
+/// the one thing on this path that cannot be finished inside a gap. It is
+/// therefore SPLIT, and the split is what keeps article 2:
+///
+/// ```text
+/// gap n    notify: [wait drained] the occupant's cell -> the file
+///                  [record ready] ─────────── the next fire waits HERE
+///                  the candidate's planes -> the berth   (~265 MiB)
+///                  [record landed]
+/// gap n+k  notify: [wait drained] the candidate's cell -> the berth
+///                  [record ready] ─────────── the next fire waits HERE
+/// ```
+///
+/// The next fire waits on `ready`, which is recorded BEFORE the bulk copy is
+/// enqueued — so what a fire ever waits for is two sixteen-byte writes, and
+/// the copy that actually costs something is behind it on the stream and
+/// gates nothing. Between the two gaps the berth is referenced by NOBODY: the
+/// occupant's cell already names the file, and the candidate's still names
+/// wherever it was.
+#[derive(Debug, Clone, Copy)]
+struct Swap {
+    berth: usize,
+    group: usize,
+}
+
+/// Which half of a [`Swap`] this gap takes.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// The berth's occupant goes back to the file, and the bulk copy follows
+    /// on the notify stream behind the event the next fire waits on.
+    Open(Swap),
+    /// The bytes have landed; the candidate's cell arrives in the berth.
+    Close(Swap),
+}
+
+/// **The two device addresses one packed GROUP hands its select kernel.** The
+/// shell's spelling of `kernels_cuda::linear::moe::GroupSeat`, kept here for
+/// the reason [`Handles`] is: `run.rs` carries a weight row without naming a
+/// kernel type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GroupHandles {
+    /// The group's 16-byte `(codes, scales)` base cell.
+    pub cell: u64,
+    /// The group's `u32` usage counter.
+    pub hits: u64,
+}
+
 /// **The two device addresses one bank hands its select kernel.** The shell's
 /// spelling of `kernels_cuda::linear::moe::ExpertTable`, kept here so that
 /// `run.rs` does not have to name a kernel type to carry a weight row.
@@ -1076,9 +1353,46 @@ pub struct Tier {
     mirror: Pinned,
     seats: Vec<Seat>,
     /// Every plane of every packed group the store does not hold, at its own
-    /// offset inside [`Tier::host`]. Read by the weight table, never by a
-    /// promotion: a group does not move.
+    /// offset inside [`Tier::host`]. Read by the weight table AT LOAD; the
+    /// live answer after that is [`Group::at`], because a group moves now.
     wholes: Vec<Whole>,
+    /// **THE LADDER'S ONLY MUTABLE ADDRESS SURFACE**, and its address never
+    /// moves (article 7): one 16-byte `(codes, scales)` cell per packed group,
+    /// which is what the mxfp4 select loads its two plane bases out of.
+    cells: Buffer,
+    /// A pinned mirror of `cells` and the SOURCE of every cell write, for
+    /// [`Tier::shadow`]'s reason: the bytes an in-flight copy reads belong to
+    /// this tier for the load's life rather than to a temporary. **The pair is
+    /// filled here before the copy is issued, which is what makes a torn pair
+    /// unconstructible** — no cell state names one group's codes beside
+    /// another's exponents, because the sixteen bytes are written as one.
+    cell_shadow: Pinned,
+    /// One `u32` per packed group, `atomicAdd`ed by the select once per routed
+    /// row per fire.
+    group_counts: Buffer,
+    /// A pinned mirror of `group_counts`, filled by the same asynchronous D2H
+    /// [`Tier::mirror`] rides, and read the same way: without a wait, because
+    /// a stale hint is all a promotion ever needed.
+    group_mirror: Pinned,
+    /// Every ROUTED packed group of this load — the ones the store holds and
+    /// the ones it does not — in plan order.
+    groups: Vec<Group>,
+    /// Every region a group can be copied into. See [`Berth`].
+    berths: Vec<Berth>,
+    /// The promotion between its two halves, or `None`. See [`Swap`].
+    swap: Option<Swap>,
+    /// Records on the notify stream when a swap's bulk copy is past. **Nothing
+    /// waits on it on a stream** — the host asks [`Event::done`] at the next
+    /// gap, which is what makes the copy free of the fire path.
+    landed: Event,
+    /// `(groups promoted, groups demoted, gaps a swap in flight held back)`.
+    ladder: (u64, u64, u64),
+    /// **Can anything be displaced at all?** True when at least one group's
+    /// planes were resolved against an artifact. Decided once, at
+    /// [`Tier::open`], because it is a property of the load and not of a gap.
+    ladder_open: bool,
+    /// A monotone clock over rung changes; see [`Group::settled`].
+    tick: u64,
     /// **T2**: the mapped warm artifact, held open for the load's whole life
     /// because the weight rows point into it. `None` for every plan that
     /// spills nothing.
@@ -1245,8 +1559,72 @@ impl Tier {
         if !mapped.is_empty() {
             bump(Stat::Loads);
         }
+        // ── THE LADDER'S ROSTER (wave B7). Every ROUTED packed group of this
+        //    load, whichever rung the plan put it on: the ones the store holds
+        //    (`Plan::seated`) and the ones it does not (`Plan::groups`,
+        //    routed). A spilled DENSE plane is not one of them — it has no
+        //    cell for a promotion to write and no select kernel that would
+        //    read one — and the roster's order is param order, so two boots of
+        //    one deployment number the cells the same.
+        //
+        //    **THE BACKING IS RESOLVED FOR ALL OF THEM, NOT JUST FOR T2.**
+        //    The swap's first half sends the berth's occupant back to the
+        //    file, and the occupant may be a group that has never been off the
+        //    device; so what makes a group displaceable is that the artifact
+        //    carries it, and that is asked here, once, of every group. A group
+        //    the artifact cannot answer for keeps an empty backing and is
+        //    simply never displaced — no refusal, because the LOAD is not
+        //    wrong, only the ladder is shorter.
+        let mut roster: Vec<&GroupPlan> = plan
+            .seated()
+            .iter()
+            .chain(plan.groups().iter().filter(|group| group.routed))
+            .collect();
+        roster.sort_by_key(|group| group.param);
+        let mut groups = Vec::with_capacity(roster.len());
+        for (cell_at, group) in roster.into_iter().enumerate() {
+            if group.planes.len() != CELL_PLANES {
+                return Err(Fault::Residency(format!(
+                    "`{}` is a routed packed bank of {} planes and a base cell names                      {CELL_PLANES}. The cell IS the pair — codes beside factors, one                      sixteen-byte word, written together so that no state of it can                      name one group's codes and another's exponents — and a third                      plane would be an address the select never loads. Refused rather                      than seated with a plane unaddressed.",
+                    group.name,
+                    group.planes.len(),
+                )));
+            }
+            let backing = match source.as_ref() {
+                None => Vec::new(),
+                Some(artifact) => group
+                    .planes
+                    .iter()
+                    .map(|plane| {
+                        let id = u32::try_from(plane.param).unwrap_or(u32::MAX);
+                        artifact
+                            .plane(id, 0)
+                            .filter(|bytes| bytes.len() as u64 == plane.bytes)
+                            .map(|bytes| bytes.as_ptr() as u64)
+                    })
+                    .collect::<Option<Vec<u64>>>()
+                    .unwrap_or_default(),
+            };
+            groups.push(Group {
+                param: group.param,
+                name: group.name.clone(),
+                experts: group.experts,
+                planes: group.planes.clone(),
+                cell_at,
+                // `land` fills both: it is the first moment the store's own
+                // addresses exist, and a cell published before them would name
+                // where the plan MEANT a plane to be.
+                at: Vec::new(),
+                held: group.held,
+                backing,
+                berth: None,
+                settled: 0,
+            });
+        }
         let entries = entry_at as u64 * ENTRY;
         let counters = counter_at as u64 * COUNTER;
+        let cells = groups.len() as u64 * CELL;
+        let group_counters = groups.len() as u64 * COUNTER;
         Ok(Tier {
             plan,
             host: Pinned::mapped(usize::try_from(host_at).unwrap_or(usize::MAX))?,
@@ -1256,6 +1634,17 @@ impl Tier {
             mirror: Pinned::mapped(usize::try_from(counters).unwrap_or(usize::MAX))?,
             seats,
             wholes,
+            cells: Buffer::zeroed(usize::try_from(cells).unwrap_or(usize::MAX))?,
+            cell_shadow: Pinned::mapped(usize::try_from(cells).unwrap_or(usize::MAX))?,
+            group_counts: Buffer::zeroed(usize::try_from(group_counters).unwrap_or(usize::MAX))?,
+            group_mirror: Pinned::mapped(usize::try_from(group_counters).unwrap_or(usize::MAX))?,
+            ladder_open: groups.iter().any(|group| !group.backing.is_empty()),
+            groups,
+            berths: Vec::new(),
+            swap: None,
+            landed: Event::new()?,
+            ladder: (0, 0, 0),
+            tick: 0,
             source,
             mapped,
             drained: Event::new()?,
@@ -1359,12 +1748,24 @@ impl Tier {
     /// fired, so nothing has an opinion about which experts are hot, and the
     /// promotion loop's first few gaps are what turn this into a working set.
     ///
+    /// `store_at` gives the store's own address for every plane the store
+    /// holds, as `(param, address)`. It is what turns a T0 packed group into a
+    /// BERTH — the ladder's fastest rung, and the one the tier cannot displace
+    /// a group out of unless it knows where the region is. The loader is the
+    /// only caller that can answer it, because the offsets are its.
+    ///
     /// # Errors
     ///
     /// [`Fault::Device`] for the copies, [`Fault::Runtimeless`] without a
     /// runtime.
-    pub fn land(&mut self, slab_of: &[u64], stream: *mut c_void) -> Result<()> {
+    pub fn land(
+        &mut self,
+        slab_of: &[u64],
+        store_at: &[(usize, u64)],
+        stream: *mut c_void,
+    ) -> Result<()> {
         debug_assert_eq!(slab_of.len(), self.seats.len());
+        self.seat_groups(store_at)?;
         for (seat, slab) in self.seats.iter_mut().zip(slab_of) {
             seat.slab = *slab;
             seat.in_slot = (0..seat.resident).collect();
@@ -1387,7 +1788,108 @@ impl Tier {
                 )?;
             }
         }
-        self.publish_all(stream)
+        self.publish_all(stream)?;
+        self.publish_cells(stream)
+    }
+
+    /// **Seat every packed group and open its berth** — the first moment the
+    /// store's addresses exist, which is why it is here and not in
+    /// [`Tier::open`].
+    ///
+    /// A group's live addresses are the plan's: the store's for a T0 group,
+    /// the pinned tier's for a T1 one, the mapping's for a T2 one. The first
+    /// two are BERTHS — regions a later, hotter group may be copied into —
+    /// and the third is not, because a read-only mapping of a file is not a
+    /// place anything is copied to.
+    fn seat_groups(&mut self, store_at: &[(usize, u64)]) -> Result<()> {
+        let host = self.host.device();
+        for at in 0..self.groups.len() {
+            let held = self.groups[at].held;
+            let mut where_at = Vec::with_capacity(self.groups[at].planes.len());
+            for plane in &self.groups[at].planes {
+                let found = match held {
+                    Held::Device => store_at
+                        .iter()
+                        .find(|(param, _)| *param == plane.param)
+                        .map(|(_, at)| *at),
+                    Held::Pinned => self
+                        .wholes
+                        .iter()
+                        .find(|whole| whole.param == plane.param)
+                        .map(|whole| host + whole.host_at),
+                    Held::Mapped => self
+                        .mapped
+                        .iter()
+                        .find(|mapped| mapped.param == plane.param)
+                        .map(|mapped| mapped.at),
+                };
+                let Some(found) = found else {
+                    return Err(Fault::Residency(format!(
+                        "`{}` is planned {held:?} and plane {} has no address on that                          tier; the plan and the seating were built from different                          walks",
+                        self.groups[at].name, plane.param,
+                    )));
+                };
+                where_at.push(found);
+            }
+            self.groups[at].at = where_at.clone();
+            if held != Held::Mapped {
+                let berth = self.berths.len();
+                self.berths.push(Berth {
+                    tier: held,
+                    at: where_at,
+                    shape: self.groups[at].planes.iter().map(|plane| plane.reserved).collect(),
+                    holds: Some(at),
+                });
+                self.groups[at].berth = Some(berth);
+            }
+        }
+        Ok(())
+    }
+
+    /// Write every group's cell from its live addresses, and copy the lot
+    /// across. Called once at [`Tier::land`]; after that only ONE cell at a
+    /// time is ever written, by a swap.
+    fn publish_cells(&mut self, stream: *mut c_void) -> Result<()> {
+        if self.cell_shadow.bytes() == 0 {
+            return Ok(());
+        }
+        for at in 0..self.groups.len() {
+            self.write_cell(at);
+        }
+        copy_any(
+            stream,
+            self.cells.ptr(),
+            self.cell_shadow.device(),
+            self.cell_shadow.bytes(),
+        )
+    }
+
+    /// Fill one group's sixteen shadow bytes from its live addresses.
+    ///
+    /// **BOTH PLANES OR NEITHER.** The pair is one word and it is written as
+    /// one, which is the property that makes a torn pair unconstructible on
+    /// this path — there is no shadow state that names one group's codes and
+    /// another group's exponents, so there is no cell state that can either.
+    fn write_cell(&self, at: usize) {
+        let group = &self.groups[at];
+        let mut word = [0u8; CELL as usize];
+        for (plane, address) in group.at.iter().enumerate().take(CELL_PLANES) {
+            let byte = plane * 8;
+            word[byte..byte + 8].copy_from_slice(&address.to_ne_bytes());
+        }
+        self.cell_shadow
+            .write(group.cell_at * CELL as usize, &word);
+    }
+
+    /// Copy one group's cell across, on `stream`.
+    fn copy_cell(&self, at: usize, stream: *mut c_void) -> Result<()> {
+        let cell = self.groups[at].cell_at as u64 * CELL;
+        copy_any(
+            stream,
+            self.cells.ptr() + cell,
+            self.cell_shadow.device() + cell,
+            CELL as usize,
+        )
     }
 
     /// Write every entry of every bank's table, from the seats' current
@@ -1416,6 +1918,24 @@ impl Tier {
         )
     }
 
+    /// **The two device addresses a PACKED group's select kernel reads**, or
+    /// `None` for a param that is not one of this tier's routed packed banks.
+    ///
+    /// The cell is where the group's two plane bases live; the counter is
+    /// where its routing is noted. Both are fixed addresses for the load's
+    /// life — the CONTENTS move, which is the whole of the ladder — so a
+    /// captured graph holds them across every promotion (article 7).
+    #[must_use]
+    pub fn group_handles(&self, param: usize) -> Option<GroupHandles> {
+        self.groups
+            .iter()
+            .find(|group| group.param == param)
+            .map(|group| GroupHandles {
+                cell: self.cells.ptr() + group.cell_at as u64 * CELL,
+                hits: self.group_counts.ptr() + group.cell_at as u64 * COUNTER,
+            })
+    }
+
     /// The two device addresses `param`'s select kernel reads, or `None` for a
     /// param this tier does not hold — which is every param of a plan whose
     /// banks are resident.
@@ -1438,15 +1958,27 @@ impl Tier {
     ///
     /// [`Fault::Device`] for the copy.
     pub fn drain(&self, stream: *mut c_void) -> Result<()> {
-        if self.counts.bytes() == 0 {
-            return Ok(());
+        if self.counts.bytes() > 0 {
+            copy_any(
+                stream,
+                self.mirror.device(),
+                self.counts.ptr(),
+                self.counts.bytes(),
+            )?;
         }
-        copy_any(
-            stream,
-            self.mirror.device(),
-            self.counts.ptr(),
-            self.counts.bytes(),
-        )
+        // The GROUP counters ride the same asynchronous D2H and are read the
+        // same way (wave B7): one `u32` per packed group, `atomicAdd`ed once
+        // per routed row per fire by the block that owns that route's first
+        // row tile. Nothing waits for them either.
+        if self.group_counts.bytes() > 0 {
+            copy_any(
+                stream,
+                self.group_mirror.device(),
+                self.group_counts.ptr(),
+                self.group_counts.bytes(),
+            )?;
+        }
+        Ok(())
     }
 
     /// **The promotion**, between two fires (alto design §7; article 3
@@ -1479,7 +2011,7 @@ impl Tier {
     ///
     /// [`Fault::Device`] for an event or a copy the runtime refused.
     pub fn promote(&mut self, compute: *mut c_void, notify: *mut c_void) -> Result<u32> {
-        if self.seats.is_empty() {
+        if self.seats.is_empty() && self.groups.is_empty() {
             return Ok(0);
         }
         // The shadow is one allocation shared by every entry write, so a round
@@ -1488,9 +2020,23 @@ impl Tier {
             self.skipped += 1;
             return Ok(0);
         }
+        // ── **A GROUP'S BULK COPY HOLDS THE WHOLE ROUND BACK** (wave B7), and
+        //    that is the doctrine and not an oversight. The copy is hundreds
+        //    of megabytes on the notify stream; anything a later round
+        //    enqueued would land BEHIND it, and `ready` — which the next fire
+        //    waits on — would then be recorded behind it too. So the copy that
+        //    was deliberately kept off the fire path would arrive back on it
+        //    by way of the stream order. A round that would have to wait
+        //    simply does not happen.
+        if self.swap.is_some() && !self.landed.done()? {
+            self.ladder.2 += 1;
+            self.skipped += 1;
+            return Ok(0);
+        }
         let hits = self.mirror.read(0, self.mirror.bytes());
         let moves = self.decide(&hits);
-        if moves.is_empty() {
+        let step = self.step();
+        if moves.is_empty() && step.is_none() {
             return Ok(0);
         }
 
@@ -1536,10 +2082,164 @@ impl Tier {
             seat.in_slot[*slot as usize] = *into;
             self.promotions += 1;
         }
+        // ── THE LADDER'S SIXTEEN-BYTE HALF. Either the occupant's cell
+        //    leaving the berth, or the candidate's cell arriving in it — one
+        //    or the other, never both in one gap, because between them stands
+        //    a copy that has to land.
+        let bulk = match step {
+            Some(Step::Open(swap)) => {
+                self.open_berth(swap, notify)?;
+                Some(swap)
+            }
+            Some(Step::Close(swap)) => {
+                self.close_berth(swap, notify)?;
+                None
+            }
+            None => None,
+        };
+        // **EVERYTHING A FIRE EVER WAITS FOR IS ABOVE THIS LINE.** Table
+        // entries, slot bytes and cells: all small, all already enqueued.
         self.ready.record(notify)?;
         self.ready.wait(compute)?;
+        // ── AND THE BULK COPY IS BELOW IT. Enqueued on the notify stream
+        //    after `ready` was recorded, so no fire is ordered against it: it
+        //    runs while the fires run, the berth it writes is referenced by
+        //    nobody (the occupant's cell left it one instruction ago and the
+        //    candidate's does not name it yet), and `landed` is asked at a
+        //    later gap rather than waited on here.
+        if let Some(swap) = bulk {
+            let into = self.berths[swap.berth].at.clone();
+            let group = &self.groups[swap.group];
+            let from: Vec<(u64, u64)> = group
+                .at
+                .iter()
+                .zip(&group.planes)
+                .map(|(at, plane)| (*at, plane.bytes))
+                .collect();
+            for (dst, (src, bytes)) in into.into_iter().zip(from) {
+                copy_any(notify, dst, src, usize::try_from(bytes).unwrap_or(usize::MAX))?;
+            }
+            self.landed.record(notify)?;
+            self.swap = Some(swap);
+        }
         self.moving = true;
         Ok(u32::try_from(moves.len()).unwrap_or(u32::MAX))
+    }
+
+    /// **Half one: the berth's occupant goes back to the file.**
+    ///
+    /// The cell write is what does it, and it is ordered before the bulk copy
+    /// by the stream both ride: from this sixteen bytes on, a kernel that
+    /// reads the group reads the artifact, which is where its bytes have been
+    /// all along (the artifact is a snapshot of the store, so a T0 group's
+    /// bytes are in it too, unchanged — expert weights are read-only, which is
+    /// what makes a demotion free rather than a write-back).
+    ///
+    /// Answers the swap to copy, so the caller can enqueue it after `ready`.
+    fn open_berth(&mut self, swap: Swap, notify: *mut c_void) -> Result<()> {
+        if let Some(out) = self.berths[swap.berth].holds {
+            self.groups[out].at = self.groups[out].backing.clone();
+            self.groups[out].held = Held::Mapped;
+            self.groups[out].berth = None;
+            self.tick += 1;
+            self.groups[out].settled = self.tick;
+            self.write_cell(out);
+            self.copy_cell(out, notify)?;
+            self.ladder.1 += 1;
+        }
+        self.berths[swap.berth].holds = None;
+        Ok(())
+    }
+
+    /// **Half two: the candidate's cell arrives in the berth.**
+    ///
+    /// Only reached once [`Tier::landed`] says the bytes are there, so the
+    /// address this publishes names a copy that is complete. Land the copy,
+    /// THEN flip the pointer — the whole order of the thing, in two gaps.
+    fn close_berth(&mut self, swap: Swap, notify: *mut c_void) -> Result<()> {
+        let berth = &self.berths[swap.berth];
+        let (tier, at) = (berth.tier, berth.at.clone());
+        // The berth the candidate is LEAVING, if it was in one, is now free:
+        // that is how the ladder walks more than one rung, one gap at a time.
+        if let Some(was) = self.groups[swap.group].berth {
+            self.berths[was].holds = None;
+        }
+        self.groups[swap.group].at = at;
+        self.groups[swap.group].held = tier;
+        self.groups[swap.group].berth = Some(swap.berth);
+        self.berths[swap.berth].holds = Some(swap.group);
+        self.tick += 1;
+        self.groups[swap.group].settled = self.tick;
+        self.write_cell(swap.group);
+        self.copy_cell(swap.group, notify)?;
+        self.swap = None;
+        self.ladder.0 += 1;
+        Ok(())
+    }
+
+    /// **What the ladder does this gap** — see [`Swap`] for the two halves.
+    ///
+    /// `Close` first and unconditionally: a swap whose bytes have landed is
+    /// finished before another is started, because the berth's occupant is
+    /// already back on the file and every gap that passes is a gap the
+    /// candidate spends slower than it has to.
+    fn step(&self) -> Option<Step> {
+        if let Some(swap) = self.swap {
+            return Some(Step::Close(swap));
+        }
+        // **A LOAD WITH NO ARTIFACT HAS THE ASSIGNMENT IT BOOTED WITH**, and
+        // this is where that costs nothing rather than costing a vote every
+        // gap: a swap's first half points the displaced group's cell back at
+        // the file, so with no file nothing is displaceable and the question
+        // is not worth asking. One bool, decided once at `open`.
+        if GROUP_MOVES == 0 || self.berths.is_empty() || !self.ladder_open {
+            return None;
+        }
+        let hits = self.group_mirror.read(0, self.group_mirror.bytes());
+        self.decide_group(&hits).map(Step::Open)
+    }
+
+    /// **Which group should change rungs, given the counters** — the vote,
+    /// and the ONE rule it follows.
+    ///
+    /// ```text
+    /// a swap of candidate G into berth B, displacing occupant H, is taken
+    /// iff   rung(B) < rung(G)          B is a faster tier than G is on
+    /// and   shape(B) == shape(G)       the berth was sized for G's planes
+    /// and   hits(G) > hits(H)          and G is strictly the hotter of the two
+    /// ```
+    ///
+    /// **THE THIRD LINE IS A STRICT-IMPROVEMENT RULE AND IT IS WHY NOTHING
+    /// CHURNS.** Read the deployment's cost as `Σ hits(g) × rung(tier(g))`:
+    /// swapping G and H changes it by `(hits(G) − hits(H)) × (rung(G) −
+    /// rung(B))`, both factors positive, so every move this function returns
+    /// strictly lowers a bounded sum and the sequence terminates. It also
+    /// says, exactly, what the ladder does NOT do — and that sentence is worth
+    /// writing down because it is the honest reading of today's catalog:
+    ///
+    /// **A model whose routed banks are all read every fire has a UNIFORM
+    /// vote, and a uniform vote is a steady state at the plan's own
+    /// assignment.** Every one of gpt-oss-20b's 48 groups is read by every
+    /// step, so after the counters warm they are equal, `hits(G) > hits(H)` is
+    /// false everywhere, and the ladder correctly does nothing. That is not a
+    /// missing feature: with equal demand any assignment costs the same, and a
+    /// swap would be ~265 MiB of PCIe bought for zero. What the ladder is for
+    /// is the demand the PLAN cannot see — a bank a session never routes to (a
+    /// tower's, an aux head's, an arm of a conditional), which sits on the
+    /// device holding a rung a hot mapped bank wants. Then the difference is
+    /// large, the rule fires, and it stops as soon as the order is right.
+    ///
+    /// Ties break toward the biggest improvement, then toward the lowest berth
+    /// and the lowest group, so that two boots of one deployment with the same
+    /// counters make the same move.
+    fn decide_group(&self, hits: &[u8]) -> Option<Swap> {
+        let count = |at: usize| -> u32 {
+            let byte = at * COUNTER as usize;
+            hits.get(byte..byte + COUNTER as usize)
+                .and_then(|word| word.try_into().ok())
+                .map_or(0, u32::from_ne_bytes)
+        };
+        vote(&self.berths, &self.groups, count)
     }
 
     /// Which experts should change places, given the counters.
@@ -1600,19 +2300,153 @@ impl Tier {
                 .collect(),
         });
         // **A PACKED GROUP REPORTS ZERO SLOTS, WHICH IS THE TRUTH.** Its
-        // planes are on the pinned tier whole; the device slab seats none of
-        // its experts and counts none of its routing, because no kernel on
-        // this path reads a table or an `atomicAdd`s a counter. A gate that
-        // asks what is resident is told exactly that.
-        let packed = self.plan.groups().iter().map(|group| BankResidency {
-            name: group.name.clone(),
-            experts: group.experts,
-            slots: 0,
-            in_slot: Vec::new(),
-            hits: Vec::new(),
-            held: Some(group.held),
+        // planes are on ONE tier whole; the device slab seats none of its
+        // experts, because no kernel on this path reads a per-expert table. A
+        // gate that asks what is resident is told exactly that.
+        //
+        // **AND `held` IS THE LIVE ANSWER, NOT THE PLAN'S** (wave B7). Since a
+        // group moves, the plan's word for where it is goes stale the first
+        // time the ladder takes a rung, and the accessor a gate reads is the
+        // one place that must not be stale. `hits` is the group's own counter
+        // — one number, because a group is what can move — carried out by the
+        // same asynchronous readback the dense counts ride.
+        let counts = self.group_mirror.read(0, self.group_mirror.bytes());
+        let packed = self.groups.iter().map(|group| {
+            let byte = group.cell_at * COUNTER as usize;
+            BankResidency {
+                name: group.name.clone(),
+                experts: group.experts,
+                slots: 0,
+                in_slot: Vec::new(),
+                hits: vec![
+                    counts
+                        .get(byte..byte + COUNTER as usize)
+                        .and_then(|word| word.try_into().ok())
+                        .map_or(0, u32::from_ne_bytes),
+                ],
+                held: Some(group.held),
+            }
         });
-        dense.chain(packed).collect()
+        // The spilled DENSE planes are groups too and are reported as such,
+        // still off the plan: they have no cell, they never move, and an
+        // operator reading "48 banks mapped" wants to know whether the
+        // embedding was one of them.
+        let planes = self
+            .plan
+            .groups()
+            .iter()
+            .filter(|group| !group.routed)
+            .map(|group| BankResidency {
+                name: group.name.clone(),
+                experts: group.experts,
+                slots: 0,
+                in_slot: Vec::new(),
+                hits: Vec::new(),
+                held: Some(group.held),
+            });
+        dense.chain(packed).chain(planes).collect()
+    }
+
+    /// `(groups promoted, groups demoted, gaps a swap in flight held back)`,
+    /// since load — the ladder's own motion, beside [`Tier::motion`]'s
+    /// per-expert one.
+    ///
+    /// A promotion and a demotion come in pairs while every berth is full,
+    /// which is the ordinary case; a demotion without a promotion behind it is
+    /// a swap whose bytes have not landed yet.
+    #[must_use]
+    pub fn ladder(&self) -> (u64, u64, u64) {
+        self.ladder
+    }
+
+    /// **Take one rung for `name` NOW, whatever the counters say** — the gate's
+    /// door onto the ladder, and nothing in the shell calls it.
+    ///
+    /// [`Tier::decide_group`]'s rule is a strict-improvement rule, and its doc
+    /// proves what follows from that: a deployment whose routed banks are all
+    /// read every fire has a uniform vote and therefore a steady state at the
+    /// plan's own assignment. That is the right behaviour and it is also why a
+    /// GATE cannot observe a rung being taken by waiting for one.
+    ///
+    /// So this asks the same question with the vote's clause struck out, and
+    /// strikes out nothing else: the same berth match, the same two halves in
+    /// the same order, the same cell-written-last discipline. It is
+    /// SYNCHRONOUS — it settles the bulk copy on the host rather than asking
+    /// `landed` at a later gap — which is exactly the property the production
+    /// path does not have, and the reason this is a door and not a policy.
+    ///
+    /// Answers `(from, to)` for the group that moved, or `None` when no berth
+    /// of the right shape stands on a faster rung.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Device`] for an event or a copy the runtime refused.
+    pub fn promote_now(
+        &mut self,
+        name: &str,
+        compute: *mut c_void,
+        notify: *mut c_void,
+    ) -> Result<Option<(Held, Held)>> {
+        let Some(group) = self.groups.iter().position(|group| group.name == name) else {
+            return Ok(None);
+        };
+        let shape: Vec<u64> = self.groups[group]
+            .planes
+            .iter()
+            .map(|plane| plane.reserved)
+            .collect();
+        let was = self.groups[group].held;
+        let hits = self.group_mirror.read(0, self.group_mirror.bytes());
+        let count = |at: usize| -> u32 {
+            let byte = at * COUNTER as usize;
+            hits.get(byte..byte + COUNTER as usize)
+                .and_then(|word| word.try_into().ok())
+                .map_or(0, u32::from_ne_bytes)
+        };
+        // An EMPTY berth first, then the coldest occupant, then the one that
+        // has sat on its rung longest — see [`Group::settled`] for why the
+        // third clause is here and why the vote does not need it.
+        let Some(berth) = self
+            .berths
+            .iter()
+            .enumerate()
+            .filter(|(at, berth)| {
+                berth.tier.rung() < was.rung()
+                    && berth.shape == shape
+                    && self.groups[group].berth != Some(*at)
+                    && berth
+                        .holds
+                        .is_none_or(|out| !self.groups[out].backing.is_empty())
+            })
+            .min_by_key(|(_, berth)| match berth.holds {
+                None => (0u8, 0u32, 0u64),
+                Some(out) => (1, count(self.groups[out].cell_at), self.groups[out].settled),
+            })
+            .map(|(at, _)| at)
+        else {
+            return Ok(None);
+        };
+        let swap = Swap { berth, group };
+        self.drained.record(compute)?;
+        self.drained.wait(notify)?;
+        self.open_berth(swap, notify)?;
+        let into = self.berths[berth].at.clone();
+        let from: Vec<(u64, u64)> = self.groups[group]
+            .at
+            .iter()
+            .zip(&self.groups[group].planes)
+            .map(|(at, plane)| (*at, plane.bytes))
+            .collect();
+        for (dst, (src, bytes)) in into.into_iter().zip(from) {
+            copy_any(notify, dst, src, usize::try_from(bytes).unwrap_or(usize::MAX))?;
+        }
+        self.landed.record(notify)?;
+        self.landed.settle()?;
+        self.close_berth(swap, notify)?;
+        self.ready.record(notify)?;
+        self.ready.settle()?;
+        self.moving = false;
+        Ok(Some((was, self.groups[group].held)))
     }
 
     /// `(experts promoted, experts demoted, gaps skipped because the previous
@@ -1632,10 +2466,63 @@ impl Tier {
     /// tables and their shadow, the counters and their mirror.
     #[must_use]
     pub fn bytes(&self) -> (u64, u64) {
-        let device = self.table.bytes() as u64 + self.counts.bytes() as u64;
-        let host = self.host.bytes() as u64 + self.shadow.bytes() as u64 + self.mirror.bytes() as u64;
+        let device = self.table.bytes() as u64
+            + self.counts.bytes() as u64
+            + self.cells.bytes() as u64
+            + self.group_counts.bytes() as u64;
+        let host = self.host.bytes() as u64
+            + self.shadow.bytes() as u64
+            + self.mirror.bytes() as u64
+            + self.cell_shadow.bytes() as u64
+            + self.group_mirror.bytes() as u64;
         (device, host)
     }
+}
+
+/// **The vote, as a pure function of the seating and the counters** — the
+/// body of [`Tier::decide_group`], lifted out so that the rule can be
+/// exercised without a device (the tier itself is four device allocations).
+///
+/// The rule and its termination argument are on [`Tier::decide_group`].
+fn vote(berths: &[Berth], groups: &[Group], count: impl Fn(usize) -> u32) -> Option<Swap> {
+    let mut best: Option<(u32, Swap)> = None;
+    for (at, berth) in berths.iter().enumerate() {
+        // An occupant with no backing cannot be displaced: there would be
+        // nowhere to point its cell at. A load that opened no artifact has no
+        // group with a backing, which is exactly the statement that its
+        // assignment is the one it boots with.
+        let out = match berth.holds {
+            Some(out) if groups[out].backing.is_empty() => continue,
+            held => held,
+        };
+        let floor = out.map_or(0, |out| count(groups[out].cell_at));
+        for (group, candidate) in groups.iter().enumerate() {
+            if candidate.berth == Some(at) || candidate.held.rung() <= berth.tier.rung() {
+                continue;
+            }
+            // Plane for plane, and WITHOUT building a vector to say so: this
+            // runs berths x groups times in every inter-fire gap, and a gap is
+            // the one place in this file that is measured in microseconds.
+            if candidate.planes.len() != berth.shape.len()
+                || candidate
+                    .planes
+                    .iter()
+                    .zip(&berth.shape)
+                    .any(|(plane, want)| plane.reserved != *want)
+            {
+                continue;
+            }
+            let hot = count(candidate.cell_at);
+            if hot <= floor {
+                continue;
+            }
+            let gain = hot - floor;
+            if best.is_none_or(|(had, _)| gain > had) {
+                best = Some((gain, Swap { berth: at, group }));
+            }
+        }
+    }
+    best.map(|(_, swap)| swap)
 }
 
 /// Where expert `expert` of `seat` lives right now.
@@ -1845,6 +2732,10 @@ mod tests {
             match group.held {
                 Held::Pinned => pinned += group.bytes,
                 Held::Mapped => mapped += group.bytes,
+                // `Plan::groups` is the placements a budget was forced to
+                // make; a group the STORE holds is never one of them and is
+                // in `Plan::seated` instead (wave B7).
+                Held::Device => panic!("`{}` is in `groups` and held on the device", group.name),
             }
         }
         assert!(pinned > 0 && mapped > 0, "this budget pair uses both tiers");
@@ -2063,6 +2954,191 @@ mod tests {
             !plan.pinned(first) && !plan.mapped(first),
             "the plane a fire reads first (`{}`) left the device",
             trace.params[first].name
+        );
+    }
+
+    // ── THE LADDER (wave B7) ────────────────────────────────────────────────
+
+    #[test]
+    fn a_capped_packed_plan_names_every_group_exactly_once() {
+        // `Plan::groups` is the placements a budget was FORCED to make and
+        // `Plan::seated` is the routed groups the store kept — two lists,
+        // disjoint, and between them every packed bank of the trace. The
+        // ladder reads both; the standing gates read only the first, which is
+        // why the second is a second list and not a variant in the first.
+        let trace = gpt_oss();
+        let planes = scales_of(&trace);
+        let full = Plan::of(&trace, &planes, Budgets::uncapped())
+            .expect("uncapped plans")
+            .device_demand();
+        let plan = Plan::of(&trace, &planes, Budgets::device(full * 7 / 10))
+            .expect("seven tenths of the table serves");
+
+        assert!(!plan.seated().is_empty(), "seven tenths of it stays");
+        assert!(!plan.groups().is_empty(), "and three tenths does not");
+        for group in plan.seated() {
+            assert_eq!(group.held, Held::Device, "`{}` is in the store", group.name);
+            assert!(group.routed, "a spilled dense plane is never a seat");
+            for plane in &group.planes {
+                assert!(
+                    !plan.streamed_whole(plane.param),
+                    "`{}` is seated in the store and the plan says it is elsewhere",
+                    group.name
+                );
+            }
+        }
+        let mut named: BTreeSet<usize> = BTreeSet::new();
+        for group in plan.seated().iter().chain(plan.groups()) {
+            assert!(named.insert(group.param), "`{}` is in both lists", group.name);
+        }
+        assert_eq!(
+            named.len(),
+            planes.len() + plan.groups().iter().filter(|group| !group.routed).count(),
+            "every packed bank of the trace is named once, and so is every spilled plane"
+        );
+    }
+
+    /// A berth of `shape`, on `tier`, holding `holds`.
+    fn berth(tier: Held, shape: &[u64], holds: Option<usize>) -> Berth {
+        Berth {
+            tier,
+            at: shape.iter().enumerate().map(|(at, _)| 0x1000 + at as u64).collect(),
+            shape: shape.to_vec(),
+            holds,
+        }
+    }
+
+    /// A group of `shape` on `held`, in berth `berth`, with a backing unless
+    /// `backed` says otherwise.
+    fn group(cell_at: usize, held: Held, shape: &[u64], berth: Option<usize>, backed: bool) -> Group {
+        Group {
+            param: cell_at,
+            name: format!("bank.{cell_at}"),
+            experts: 32,
+            planes: shape
+                .iter()
+                .enumerate()
+                .map(|(at, bytes)| GroupPlane {
+                    param: cell_at * 8 + at,
+                    bytes: *bytes,
+                    reserved: *bytes,
+                })
+                .collect(),
+            cell_at,
+            at: vec![0; shape.len()],
+            held,
+            backing: if backed { vec![0xf000; shape.len()] } else { Vec::new() },
+            berth,
+            settled: 0,
+        }
+    }
+
+    #[test]
+    fn a_uniform_vote_is_a_steady_state_and_a_cold_bank_is_displaced() {
+        // **THE ONE RULE, BOTH WAYS ROUND.** Two berths, one on each of the
+        // ladder's two upper rungs, and three same-shaped groups: one in each
+        // berth and one on the file.
+        let shape = [1024u64, 64];
+        let berths = vec![
+            berth(Held::Device, &shape, Some(0)),
+            berth(Held::Pinned, &shape, Some(1)),
+        ];
+        let groups = vec![
+            group(0, Held::Device, &shape, Some(0), true),
+            group(1, Held::Pinned, &shape, Some(1), true),
+            group(2, Held::Mapped, &shape, None, true),
+        ];
+
+        // (a) UNIFORM DEMAND MOVES NOTHING. Every bank read every fire is
+        //     every catalog MoE today, and the right answer is to stay put:
+        //     with equal hits any assignment costs the same and a swap is
+        //     ~265 MiB of PCIe bought for zero.
+        assert!(
+            vote(&berths, &groups, |_| 100).is_none(),
+            "an equal vote moved a group, which is a churn and not a promotion"
+        );
+
+        // (b) A COLD OCCUPANT IS DISPLACED BY A HOT CANDIDATE, and by the
+        //     BIGGEST improvement: the mapped group is hotter than both, and
+        //     the device berth is the rung that buys the most.
+        let hits = |at: usize| [1u32, 50, 900][at];
+        let swap = vote(&berths, &groups, hits).expect("a cold device seat gives way");
+        assert_eq!(swap.group, 2, "the hot mapped bank is what comes up");
+        assert_eq!(swap.berth, 0, "into the fastest rung it can reach");
+
+        // (c) AND IT TERMINATES. Applying the move by hand, the same counters
+        //     answer the next question with the berth the candidate LEFT — not
+        //     with the move undone.
+        let mut moved = groups;
+        moved[0].held = Held::Mapped;
+        moved[0].berth = None;
+        moved[2].held = Held::Device;
+        moved[2].berth = Some(0);
+        let mut berths = berths;
+        berths[0].holds = Some(2);
+        let next = vote(&berths, &moved, hits);
+        assert!(
+            next.is_none_or(|swap| swap.group != 0),
+            "the group just demoted came straight back: {next:?}"
+        );
+    }
+
+    #[test]
+    fn a_berth_takes_only_a_group_it_was_sized_for() {
+        // gpt-oss's 48 groups are two shapes — a gate/up bank and a down bank
+        // — and a berth is sized for the group the plan put in it. A group of
+        // the other shape taking it would run off the end of the region or
+        // leave a hole the next plane's reader walks into, so the shapes are
+        // compared plane for plane and everything across them is declined.
+        let small = [512u64, 32];
+        let large = [1024u64, 64];
+        let berths = vec![berth(Held::Device, &small, Some(0))];
+        let groups = vec![
+            group(0, Held::Device, &small, Some(0), true),
+            group(1, Held::Mapped, &large, None, true),
+        ];
+        assert!(
+            vote(&berths, &groups, |at| [1u32, 900][at]).is_none(),
+            "a bank of another shape took a berth sized for this one"
+        );
+    }
+
+    #[test]
+    fn an_occupant_with_no_backing_is_never_displaced() {
+        // The swap's first half points the occupant's cell back at the file.
+        // A load that opened no artifact has no file to point at — so it has
+        // the assignment it booted with, and that is a shorter ladder rather
+        // than a wrong one.
+        let shape = [1024u64, 64];
+        let berths = vec![berth(Held::Device, &shape, Some(0))];
+        let groups = vec![
+            group(0, Held::Device, &shape, Some(0), false),
+            group(1, Held::Mapped, &shape, None, true),
+        ];
+        assert!(
+            vote(&berths, &groups, |at| [1u32, 900][at]).is_none(),
+            "a group with nowhere to be demoted to was demoted"
+        );
+    }
+
+    #[test]
+    fn an_empty_berth_takes_the_hottest_bank_that_has_fired() {
+        // A berth whose occupant was promoted out of it is empty, and the next
+        // gap fills it — that is how the ladder walks more than one rung. The
+        // floor is zero, so what it declines is a bank that has NEVER fired:
+        // spending PCIe on a group no route has reached is the one promotion
+        // that cannot pay for itself.
+        let shape = [1024u64, 64];
+        let berths = vec![berth(Held::Pinned, &shape, None)];
+        let groups = vec![
+            group(0, Held::Mapped, &shape, None, true),
+            group(1, Held::Mapped, &shape, None, true),
+        ];
+        let swap = vote(&berths, &groups, |at| [7u32, 90][at]).expect("an empty berth fills");
+        assert_eq!(swap.group, 1, "with the hotter of the two");
+        assert!(
+            vote(&berths, &groups, |_| 0).is_none(),
+            "a bank no route has reached was promoted on the strength of nothing"
         );
     }
 }

@@ -251,9 +251,10 @@ fn the_qwen36_import_covers_its_plan_over_the_real_census() {
 /// catches that.
 #[test]
 fn the_vision_imports_cover_their_plans_over_the_real_census() {
-    const ROWS: [(&str, &str); 2] = [
+    const ROWS: [(&str, &str); 3] = [
         ("models--Qwen--Qwen3.5-0.8B", "qwen35-d0.8b-vision-bf16-kv-bf16"),
         ("models--Qwen--Qwen3.6-27B", "qwen36-27b-vision-bf16-kv-bf16"),
+        ("models--google--gemma-4-E4B-it", "gemma4-e4b-vision-bf16-kv-bf16"),
     ];
     let mut faults = Vec::new();
     let mut asked = 0usize;

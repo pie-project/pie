@@ -79,12 +79,18 @@ fn serialized() -> MutexGuard<'static, ()> {
 const QMM_FILE: &str = "linear/quant_qmm_t.metal";
 const QMV_FILE: &str = "linear/quant_qmv.metal";
 
-/// The threadgroups the two families launch. **These are the SHADER's and not
-/// the selection's**: `WM * WN * SIMD_SIZE` for the tile, two simdgroups for
-/// the vector point, both fixed in `quant_qmm_t.metal` and `quant_qmv.metal`
-/// where the accumulators are declared. `quant`'s grid helpers below supply
-/// the lane counts, which are the part that IS a selection.
-const QMM_GROUP: [u32; 3] = [32, 2, 2];
+/// The threadgroup the vector point launches. **This is the SHADER's and not
+/// the selection's**: two simdgroups, fixed in `quant_qmv.metal` where the
+/// accumulators are declared. `quant`'s grid helpers below supply the lane
+/// counts, which are the part that IS a selection.
+///
+/// The TILE's threadgroup is no longer a constant and so is not one here:
+/// `quant::qmm_group` answers 64 lanes at the 8 rung and 128 above it,
+/// because `BlockMMA`'s warp tile is `BM / (8 * WM)` rows and an 8-row block
+/// admits ONE simdgroup down M. Asking that function is half of what these
+/// cases test — a rung fired at the other rung's threadgroup reads half of
+/// every staged tile out of whatever threadgroup memory last held, which is a
+/// wrong answer and one this file is the floor under.
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
 
 /// The format every point here is stamped for. Group 64 at 4 bits is the one
@@ -431,7 +437,13 @@ fn the_vector_point_computes_the_affine_product_the_host_computes() {
 
 /// **THE PLAIN STAMPED TILE, AT EVERY RUNG IT IS STAMPED AT.** `bm` is the
 /// row block and `bn` the column tile; the ladder reaches only the pair a
-/// given prompt and a given tuning table select, so all nine are fired here.
+/// given prompt and a given tuning table select, so all TWELVE are fired
+/// here — four row rungs against three column tiles.
+///
+/// The 8 rung joins them without a line of its own in the source: the stamp
+/// macro is unchanged and `affine_qmm_t_aligned` reads its `WM` from
+/// `qmm_wm<BM>()`, so the same `PIE_STAMP_qmm_t` that mints the 16 mints the
+/// 8 at one simdgroup down M.
 #[test]
 fn the_plain_stamped_tile_computes_it_at_every_row_and_column_rung() {
     let _serial = serialized();
@@ -439,7 +451,7 @@ fn the_plain_stamped_tile_computes_it_at_every_row_and_column_rung() {
         return;
     };
     let (k, n) = (K as i32, N as i32);
-    for bm in [16i32, 32, 64] {
+    for bm in [8i32, 16, 32, 64] {
         for bn in [16i32, 32, 64] {
             let rows = bm.unsigned_abs();
             let point = quant::qmm_point(
@@ -464,7 +476,7 @@ fn the_plain_stamped_tile_computes_it_at_every_row_and_column_rung() {
                     Fire::at(QMM_FILE, point.entry).stamp(point.stamp).apply(
                         Grid::of(
                             quant::qmm_grid("floor.qmm_t", n, bn, rows as i32, bm, 1)?,
-                            QMM_GROUP,
+                            quant::qmm_group(bm),
                         ),
                     ),
                     &[
@@ -496,7 +508,7 @@ fn the_precast_pair_stages_the_activation_and_computes_it_in_half() {
         return;
     };
     let (k, n) = (K as i32, N as i32);
-    for bm in [16i32, 32, 64] {
+    for bm in [8i32, 16, 32, 64] {
         for bn in [16i32, 32, 64] {
             let rows = bm.unsigned_abs();
             let entry = quant::precast_point("floor.precast", "", bm, bn)
@@ -539,7 +551,7 @@ fn the_precast_pair_stages_the_activation_and_computes_it_in_half() {
                 ctx.fire(
                     Fire::at(QMM_FILE, entry).apply(Grid::of(
                         quant::qmm_grid("floor.precast", n, bn, rows as i32, bm, 1)?,
-                        QMM_GROUP,
+                        quant::qmm_group(bm),
                     )),
                     &gemm,
                 )
@@ -566,7 +578,7 @@ fn the_split_pair_partitions_the_contraction_and_folds_it_back() {
     };
     let (k, n) = (K as i32, N as i32);
     let split = SPLIT as i32;
-    for bm in [16i32, 32, 64] {
+    for bm in [8i32, 16, 32, 64] {
         let rows = bm.unsigned_abs();
         let entry = quant::splitk_point(
             "floor.splitk",
@@ -654,60 +666,74 @@ fn a_padded_launch_computes_the_same_rows_over_a_poisoned_tail() {
         return;
     };
     let (k, n) = (K as i32, N as i32);
-    // Twenty rows of meaning at a rung of sixteen, padded to thirty-two —
-    // `mb_rows`' own answer, asked rather than asserted from a table.
-    let meant = 20u32;
-    let bm = quant::bm_rung(meant as i32);
-    let padded = quant::mb_rows(meant as i32, ROWS as i32, 8);
-    assert_eq!(
-        (bm, padded),
-        (16, 32),
-        "the rung and the pad this case is written for"
-    );
-    floor.poison(meant, padded.unsigned_abs());
+    // Two cases, WIDEST FIRST, because the poison stays where it is written:
+    // the narrow case reads rows 0..5, which the wide case's tail does not
+    // reach, and the other order would poison rows the wide case reads.
+    //
+    //   * twenty rows at a rung of sixteen, padded to thirty-two — the case
+    //     that was here before the 8 rung existed;
+    //   * FIVE rows at a rung of EIGHT, padded to eight, which is what the 8
+    //     rung was stamped for. Five rows used to pad to sixteen and so
+    //     needed a slot sixteen rows deep to launch at all; three poisoned
+    //     rows now sit where eleven did.
+    for (meant, min_batch, rung, pad) in [(20u32, 8i32, 16i32, 32i32), (5, 2, 8, 8)] {
+        // `mb_rows`' own answer, asked rather than asserted from a table.
+        let bm = quant::bm_rung(meant as i32);
+        let padded = quant::mb_rows(meant as i32, ROWS as i32, min_batch);
+        assert_eq!(
+            (bm, padded),
+            (rung, pad),
+            "the rung and the pad this case is written for"
+        );
+        floor.poison(meant, padded.unsigned_abs());
 
-    let point = quant::qmm_point(
-        "floor.pad",
-        "",
-        "PIE_STAMP_qmm_t",
-        GROUP as i32,
-        BITS as i32,
-        bm,
-        32,
-    )
-    .expect("an axis point");
-    let (codes, scales, biases, x, out) = (
-        floor.codes,
-        floor.scales,
-        floor.biases,
-        floor.x,
-        floor.out,
-    );
-    let got = floor.fired(padded.unsigned_abs(), |ctx| {
-        ctx.fire(
-            Fire::at(QMM_FILE, point.entry).stamp(point.stamp).apply(Grid::of(
-                quant::qmm_grid("floor.pad", n, 32, padded, bm, 1)?,
-                QMM_GROUP,
-            )),
-            &[
-                codes.arg(),
-                scales.arg(),
-                biases.arg(),
-                x.arg(),
-                out.arg_mut(),
-                k.arg(),
-                n.arg(),
-            ],
+        let point = quant::qmm_point(
+            "floor.pad",
+            "",
+            "PIE_STAMP_qmm_t",
+            GROUP as i32,
+            BITS as i32,
+            bm,
+            32,
         )
-    });
-    let read = (meant * N) as usize;
-    agrees("pad: the rows the fire reads", &got[..read], &reference(meant));
-    // And the pad really launched: a run that quietly covered only the first
-    // twenty rows would satisfy everything above it.
-    assert!(
-        got[read..].iter().any(|v| v.abs() > 100.0),
-        "the rows the pad added hold {:?}, which is not the product of a poisoned row — \
-         this case did not launch the pad it is about",
-        &got[read..read + 8.min(got.len() - read)],
-    );
+        .expect("an axis point");
+        let (codes, scales, biases, x, out) = (
+            floor.codes,
+            floor.scales,
+            floor.biases,
+            floor.x,
+            floor.out,
+        );
+        let got = floor.fired(padded.unsigned_abs(), |ctx| {
+            ctx.fire(
+                Fire::at(QMM_FILE, point.entry).stamp(point.stamp).apply(Grid::of(
+                    quant::qmm_grid("floor.pad", n, 32, padded, bm, 1)?,
+                    quant::qmm_group(bm),
+                )),
+                &[
+                    codes.arg(),
+                    scales.arg(),
+                    biases.arg(),
+                    x.arg(),
+                    out.arg_mut(),
+                    k.arg(),
+                    n.arg(),
+                ],
+            )
+        });
+        let read = (meant * N) as usize;
+        agrees(
+            &format!("pad bm={bm}: the rows the fire reads"),
+            &got[..read],
+            &reference(meant),
+        );
+        // And the pad really launched: a run that quietly covered only the first
+        // twenty rows would satisfy everything above it.
+        assert!(
+            got[read..].iter().any(|v| v.abs() > 100.0),
+            "the rows the pad added hold {:?}, which is not the product of a poisoned row — \
+             this case did not launch the pad it is about",
+            &got[read..read + 8.min(got.len() - read)],
+        );
+    }
 }

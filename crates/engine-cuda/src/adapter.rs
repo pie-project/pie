@@ -43,10 +43,18 @@
 //! * a channel the sink names and the bind seeded nothing into: the weights
 //!   would be a cell of zeros, which is the identity adapter, which is a
 //!   silently wrong answer rather than a loud one.
+//! * **a site the guest asked for and this load's banks do not declare**
+//!   (alto next B3): until a bank name could carry a site, a guest's
+//!   `Site::Q` took whichever site the text corrected and nobody was told.
+//!   Now a text may name it ([`crate::site_of`]) and a mismatch is refused
+//!   with both sites in the message. A load whose banks name NO site is the
+//!   pre-B3 load and keeps its meaning exactly — the widening costs the six
+//!   family texts nothing.
 
 use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
 use eta_ir::op::tags;
 
+use crate::blob::Site;
 use crate::error::{Fault, Result};
 use crate::weights::BankSeat;
 
@@ -92,11 +100,54 @@ pub struct Sink {
     /// order.
     pub planes: Vec<(Role, u32)>,
     /// The trace-known placement constant — the site bits the guest asked
-    /// for. Carried for the report and the refusals; **not** matched against
-    /// the model text, because a bank is named `layer.{l}.lora_a` and carries
-    /// no site of its own. Which site a text corrects is the text's, and
-    /// this shell has no fact to check it against (see the module's report).
+    /// for, [`crate::blob::Site::bit`]'s own numbering.
+    ///
+    /// **AND IT IS MATCHED AGAINST THE MODEL TEXT NOW** (alto next B3). It
+    /// used not to be, and could not be: a bank was named `layer.{l}.lora_a`
+    /// and carried no site of its own, so a guest's `Site::Q` took whichever
+    /// site the text corrected, unchecked. A name may now declare its site
+    /// ([`crate::site_of`]) and [`Sink::site`] reads this constant back into
+    /// one — so a load whose banks name a site refuses a guest that asked for
+    /// a different one, and a load whose banks name none goes on meaning what
+    /// it meant.
     pub sites: u32,
+}
+
+impl Sink {
+    /// **WHICH SITE THIS GUEST ASKED FOR**, or `None` for a sink that named
+    /// no placement at all.
+    ///
+    /// One sink corrects ONE site: `Pass::adapter(site, …)` emits one `lora`
+    /// per site with `Tensor::constant(site.bit())` beside it
+    /// (`crates/inferlet/src/eta.rs`), so exactly one bit is the shape this
+    /// resolver compiled against. `None` — the constant the package did not
+    /// declare — keeps today's meaning and lets an untagged load serve it.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Adapter`] for a placement constant that is not one site of
+    /// the vocabulary: a program built outside the closed surface, refused
+    /// with the bits it carried rather than rounded to the nearest site.
+    pub fn site(&self) -> Result<Option<Site>> {
+        match self.sites {
+            0 => Ok(None),
+            bits => Site::ALL
+                .into_iter()
+                .find(|site| site.bit() == bits)
+                .map(Some)
+                .ok_or_else(|| Fault::Adapter {
+                    bank: LORA.to_string(),
+                    why: format!(
+                        "carries placement constant {bits:#08b} and one sink corrects \
+                         ONE site of {}: the surface emits one `lora` per \
+                         `Pass::adapter` call with that site's single bit beside it, so \
+                         a constant naming none of them — or several — is a program \
+                         this shell did not compile against",
+                        Site::vocabulary()
+                    ),
+                }),
+        }
+    }
 }
 
 /// **DOES THIS PROGRAM CARRY AN ADAPTER, AND WHICH CHANNELS ARE ITS
@@ -231,27 +282,82 @@ pub fn sink_of(package: &LaunchPackage) -> Result<Option<Sink>> {
 /// channel never could — and it is why a channel-seeded adapter pays a
 /// conversion the file path does not.
 ///
+/// **AND THE SITE IS CHECKED HERE** (alto next B3). `site` is what the guest
+/// asked for — [`Sink::site`]'s reading of the placement constant — and the
+/// banks it lands in are the ones that declare THAT site. A load whose banks
+/// declare no site at all is the pre-B3 load and takes today's meaning: the
+/// text's own default site, whatever the guest named, because there is no
+/// fact to check against and inventing one would refuse every program that
+/// works. A load whose banks DO name sites refuses a guest that asked for one
+/// they do not, by name — which is the silent-wrongness A-2 found, closed.
+///
 /// # Errors
 ///
-/// [`Fault::Adapter`] for a role this load declares no bank for, banks of one
-/// role that are not one shape, a cell whose length is not
-/// `layers x rank x hidden` f32 elements, or a rank the bank cannot seat.
-pub fn planes_of(role: Role, wire: &[u8], seats: &[BankSeat]) -> Result<Vec<(String, Vec<u8>)>> {
+/// [`Fault::Adapter`] for a role this load declares no bank for, a site its
+/// banks do not declare, banks of one role that are not one shape, a cell
+/// whose length is not `layers x rank x hidden` f32 elements, or a rank the
+/// bank cannot seat.
+pub fn planes_of(
+    role: Role,
+    site: Option<Site>,
+    wire: &[u8],
+    seats: &[BankSeat],
+) -> Result<Vec<(String, Vec<u8>)>> {
     let refuse = |why: String| Fault::Adapter {
         bank: role.bank().to_string(),
         why,
     };
-    let mut banks: Vec<&BankSeat> = seats
+    let of_role: Vec<&BankSeat> = seats
         .iter()
         .filter(|seat| crate::role_of(&seat.name) == role.bank())
         .collect();
+    // **ABSENT IS A VALUE, NOT A WILDCARD — EXCEPT WHERE IT IS THE ONLY
+    //   VALUE.** A load whose every bank of this role declares no site is a
+    //   text written before the site tag existed; its one correction site is
+    //   the text's own and there is nothing to compare a guest's ask with, so
+    //   the ask is carried unchecked exactly as it was. The moment ONE bank
+    //   names a site, the load has an opinion and the ask has to match it.
+    let sited = of_role.iter().any(|seat| crate::site_of(&seat.name).is_some());
+    let want = match sited {
+        true => site,
+        false => None,
+    };
+    let mut banks: Vec<&BankSeat> = of_role
+        .iter()
+        .copied()
+        .filter(|seat| crate::site_of(&seat.name) == want)
+        .collect();
     banks.sort_by_key(|seat| crate::layer_of(&seat.name));
     let seat = *banks.first().ok_or_else(|| {
-        refuse(format!(
-            "is a plane of the `lora` sink and this load declares no bank by that \
-             role; its banks are {:?}",
-            seats.iter().map(|seat| &seat.name).collect::<Vec<_>>()
-        ))
+        let declared = {
+            let mut seen: Vec<String> = Vec::new();
+            for seat in &of_role {
+                let spelled = match crate::site_of(&seat.name) {
+                    Some(site) => format!("`{}`", site.spelled()),
+                    None => "the text's own unstated one".to_string(),
+                };
+                if !seen.contains(&spelled) {
+                    seen.push(spelled);
+                }
+            }
+            seen.join(", ")
+        };
+        match of_role.is_empty() {
+            true => refuse(format!(
+                "is a plane of the `lora` sink and this load declares no bank by that \
+                 role; its banks are {:?}",
+                seats.iter().map(|seat| &seat.name).collect::<Vec<_>>()
+            )),
+            false => refuse(format!(
+                "is a plane of the `lora` sink asked for {}, and this load's banks of \
+                 that role correct {} — so the correction the guest asked for is not \
+                 one this model text carries. A site nobody declared is refused rather \
+                 than served from whichever site the text does correct, because an \
+                 adapter that answered the wrong projection would answer it silently",
+                Site::stated(want),
+                declared
+            )),
+        }
     })?;
     if let Some(odd) = banks
         .iter()
@@ -396,7 +502,7 @@ mod tests {
     #[test]
     fn a_layered_cell_becomes_one_plane_per_layer_bank() {
         let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
-        let planes = planes_of(Role::A, &cell, &a_seats()).expect("a full-rank A");
+        let planes = planes_of(Role::A, None, &cell, &a_seats()).expect("a full-rank A");
         assert_eq!(planes.len(), 2, "one plane per layer bank");
         assert_eq!(planes[0].0, "layer.0.lora_a");
         assert_eq!(planes[1].0, "layer.1.lora_a");
@@ -413,11 +519,11 @@ mod tests {
     fn a_short_rank_pads_where_its_orientation_says() {
         // Rank 1 into a rank-2 bank: A's second ROW is zero.
         let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let planes = planes_of(Role::A, &cell, &a_seats()).expect("a rank-1 A");
+        let planes = planes_of(Role::A, None, &cell, &a_seats()).expect("a rank-1 A");
         assert_eq!(&planes[0].1[..6], [bf16(1.0), bf16(2.0), bf16(3.0)].concat());
         assert_eq!(&planes[0].1[6..], &[0u8; 6], "the unused rank is a zero row");
         // Rank 1 into a rank-2 B: every ROW's second column is zero.
-        let planes = planes_of(Role::B, &cell, &b_seats()).expect("a rank-1 B");
+        let planes = planes_of(Role::B, None, &cell, &b_seats()).expect("a rank-1 B");
         assert_eq!(&planes[0].1[..2], &bf16(1.0));
         assert_eq!(&planes[0].1[2..4], &[0u8; 2], "the unused rank is a stride");
         assert_eq!(&planes[0].1[4..6], &bf16(2.0));
@@ -429,13 +535,13 @@ mod tests {
     #[test]
     fn a_cell_the_banks_cannot_seat_is_refused_by_name() {
         let cell = wire(&[1.0; 7]);
-        let why = planes_of(Role::A, &cell, &a_seats()).expect_err("7 is not 2 x r x 3");
+        let why = planes_of(Role::A, None, &cell, &a_seats()).expect_err("7 is not 2 x r x 3");
         let said = why.to_string();
         assert!(said.contains("28"), "names the bytes it was handed: {said}");
         assert!(said.contains('3'), "and the rectangle it wanted: {said}");
         // And a rank past the bank's.
         let cell = wire(&[1.0; 18]);
-        let why = planes_of(Role::A, &cell, &a_seats()).expect_err("rank 3 into rank 2");
+        let why = planes_of(Role::A, None, &cell, &a_seats()).expect_err("rank 3 into rank 2");
         assert!(
             why.to_string().contains("seats rank 2"),
             "names both ranks: {why}"
@@ -497,6 +603,76 @@ mod tests {
         assert_eq!(sink.stage, 0);
         assert_eq!(sink.planes, vec![(Role::A, 4), (Role::B, 5)]);
         assert_eq!(sink.sites, 0b1000, "the trace-known placement constant");
+    }
+
+    /// **A GUEST'S SITE, AGAINST A TEXT THAT NAMES ITS OWN** (alto next B3).
+    ///
+    /// This is A-2's silent wrongness, closed: a load whose banks declare
+    /// `o` and a guest that asked for `q` used to be indistinguishable from
+    /// a match, because the bank name could not carry the site to compare
+    /// with. Now it is a refusal, and the refusal says both sites.
+    #[test]
+    fn a_site_the_banks_do_not_declare_is_refused_by_name() {
+        let sited = vec![seat("layer.0.o.lora_a", 2, 3), seat("layer.1.o.lora_a", 2, 3)];
+        let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        // The site the text names lands, into the sited banks by name.
+        let planes = planes_of(Role::A, Some(Site::O), &cell, &sited).expect("the named site");
+        assert_eq!(planes[0].0, "layer.0.o.lora_a");
+        assert_eq!(planes[1].0, "layer.1.o.lora_a");
+        // Another one does not.
+        let why = planes_of(Role::A, Some(Site::Q), &cell, &sited).expect_err("q is not o");
+        let said = why.to_string();
+        assert!(said.contains("`q`"), "names the site asked for: {said}");
+        assert!(said.contains("`o`"), "and the site declared: {said}");
+        // And so does a guest that named none against a load that named one:
+        // the ask is unstated, the text's is not, and unstated is a value.
+        let why = planes_of(Role::A, None, &cell, &sited).expect_err("none is not o");
+        assert!(
+            why.to_string().contains("at no stated site"),
+            "says what was asked: {why}"
+        );
+    }
+
+    /// **AND AN UNTAGGED LOAD MEANS WHAT IT ALWAYS MEANT** — the
+    /// byte-compatible half. Every A-6 family text names `layer.{l}.lora_a`,
+    /// so every guest site it is asked for lands exactly the bytes it landed
+    /// before the widening.
+    #[test]
+    fn an_untagged_load_answers_every_site_the_bytes_it_always_did() {
+        let cell = wire(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let before = planes_of(Role::A, None, &cell, &a_seats()).expect("the pre-B3 call");
+        for site in Site::ALL {
+            let after = planes_of(Role::A, Some(site), &cell, &a_seats())
+                .unwrap_or_else(|why| panic!("an untagged load serves {site:?}: {why}"));
+            assert_eq!(after, before, "{site:?} lands the same bytes in the same banks");
+        }
+    }
+
+    /// **THE PLACEMENT CONSTANT READS BACK AS ONE SITE**, and a constant
+    /// naming none of them is a program outside the closed surface.
+    #[test]
+    fn the_placement_constant_is_one_site_or_a_refusal() {
+        let sink = sink_of(&package_with(vec![0, 1, 2]))
+            .expect("a readable sink")
+            .expect("a package that declares one");
+        assert_eq!(
+            sink.site().expect("0b1000 is a site"),
+            Some(Site::O),
+            "bit 3 is the mixer output, the site every family text corrects"
+        );
+        let none = Sink {
+            stage: 0,
+            planes: vec![],
+            sites: 0,
+        };
+        assert_eq!(none.site().expect("no constant is no ask"), None);
+        let many = Sink {
+            stage: 0,
+            planes: vec![],
+            sites: 0b1001,
+        };
+        let why = many.site().expect_err("two sites is not one sink");
+        assert!(why.to_string().contains("ONE site"), "{why}");
     }
 
     /// A package with no sink is the ordinary answer and costs nothing.

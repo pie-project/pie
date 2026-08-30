@@ -98,8 +98,10 @@ pub const MAX_RING: u32 = 64;
 pub const NO_TICKET: u64 = u64::MAX;
 
 /// The pull-validate block: dev launches 256 threads per lane
-/// (`channels.hpp:587`), which is the block the mirror→cell copy is strided
-/// over.
+/// (`channels.hpp:587`), and this port spends it three ways — one thread per
+/// ticket for the vote, one WARP per host-writer ticket for the cell copy, and
+/// the whole block striding a single wide cell. Eight warps is why eight
+/// endpoints cost about what one does; see [`pull_validate`].
 const PULL_BLOCK: u32 = 256;
 
 /// The bump is one thread per lane (dev `channels.hpp:196`): it walks two
@@ -449,16 +451,52 @@ const _: () = assert!(
 /// WROTE** — dev `k_pull_validate_host_channels_batch`
 /// (`channels.hpp:277-376`).
 ///
-/// One block per lane. Seeds each lane's commit pair, then per ticket compares
-/// the host's prediction against `words[0]`/`words[1]` read straight out of
-/// mapped pinned memory, `atomicAnd`-ing the commit word to zero on any
-/// mismatch. A ticket that passes and is flagged
+/// One block per lane. Seeds each lane's commit pair, then compares every
+/// ticket's prediction against `words[0]`/`words[1]` read straight out of
+/// mapped pinned memory, clearing the commit word if any is wrong. A ticket
+/// that passes and is flagged
 /// [`HOST_WRITER`](Ticket::HOST_WRITER)`|`[`CONSUME`](Ticket::CONSUME) also
 /// copies its mirror cell into the device slab and sets the full byte.
 ///
 /// `tickets` is the whole wave's table; each lane names its own window into it
 /// with `ticket_offset`/`ticket_count`. Enqueue only — an `Ok` means the
 /// launch is on the stream, not that any lane has voted.
+///
+/// # Its cost is the aperture's, and it is paid ONCE
+///
+/// Every predicate here reads the guest's live counters where the guest keeps
+/// them, so each load is a PCIe read and the kernel is latency, not
+/// arithmetic. **The tickets of one fire are independent** — separate rings,
+/// and a vote that is an `and` over the answers — so their loads are issued
+/// together, one thread per ticket, and their cell copies are issued together,
+/// one warp per ticket. A fire waits out one round trip instead of one per
+/// endpoint it addresses.
+///
+/// Measured on an L40S at 64 lanes with 64-byte cells
+/// (`tests/channel_pull_cost.rs`, which stands as the gate):
+///
+/// ```text
+/// tickets/lane      1       2       4       8
+/// serialized     6.55    9.65   16.20   29.41 us
+/// overlapped     6.39    6.40    6.76    7.86 us
+/// ```
+///
+/// — 3.7x at eight endpoints, and the growth in the ticket count falls from
+/// 4.5x to 1.2x. On the bandwidth axis, one ticket a lane, where the copy
+/// widened from a byte a thread to a `uint4`: a 1 KiB cell 10.17 → 8.55 us and
+/// a 16 KiB cell 72.2 → 56.3 us (14.5 → 18.6 GB/s), on an aperture whose
+/// absolute number moves with whatever else is on the link.
+///
+/// A fire that addresses no host-visible endpoint mints no ticket, so
+/// its block seeds a commit pair and exits — the "skip a program with no
+/// channel accesses" case costs nothing and needs nothing.
+///
+/// What is NOT skipped is a re-pull of a cell a previous fire already dragged
+/// across — a `read` peeks the head without moving it, so the same bytes cross
+/// again. The kernel cannot prove it is the same cell (`channels.cuh`'s note on
+/// the pull says where the proof would have to come from), and the case that
+/// made it expensive is closed by a different ruling: an adapter's weights are
+/// seeded at bind and no fire reads the cell (`.wiki/alto/adapter.md` §6.1).
 pub fn pull_validate(
     ctx: &Ctx,
     tickets: DevicePtr,

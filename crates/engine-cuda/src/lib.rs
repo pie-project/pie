@@ -129,6 +129,7 @@ pub mod inputs;
 pub mod mask;
 pub mod program;
 pub mod record;
+pub mod rotate;
 pub mod run;
 pub mod scores;
 pub mod serve;
@@ -207,13 +208,18 @@ pub use run::{
 };
 pub use api::{ContractFor, Cuda, DeviceBoot};
 pub use boot::open;
-pub use serve::{Boot, FireCost, Graphs, Knobs, Lane, Media, Seated, Shell};
+pub use serve::{
+    Boot, DEFAULT_GPU_MEM_UTILIZATION, FireCost, Graphs, Knobs, Lane, Media, Seated, Shell,
+};
 
 /// What a capturing lane's fire hands back, one entry per exported attention
 /// layer — the contract's own type, re-exported so a caller of
 /// [`Shell::fire_captured`] need not reach two crates deep for the noun its
 /// own signature is written in (design §9, palo C4b).
 pub use engine::fire::LayerScores;
-pub use blob::{Adapters, Binding, Source as AdapterSource, layer_of, role_of};
+pub use blob::{
+    Adapters, Binding, Site as AdapterSite, Source as AdapterSource, layer_of, role_of,
+    site_of,
+};
 pub use weights::{AdapterPlane, BankSeat};
 pub use window::{Cursor, Window, Windows};

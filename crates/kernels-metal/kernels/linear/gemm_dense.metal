@@ -89,47 +89,39 @@ template <typename T, int BM, int BK, int BN, int WM = 2, int WN = 2>
   }
 }
 
-#define instantiate_dense_gemm_t(name, itype, bm, bk, bn)                    \
-  template [[host_name("dense_gemm_t_" #name "_bm_" #bm "_bn_" #bn)]]        \
-  [[kernel]] void dense_gemm_t<itype, bm, bk, bn>(                           \
+// ── the two rungs, and why they answer the same numbers ─────────────────────
+//
+// **THE ROW BLOCK IS A PERFORMANCE CHOICE AND NOT A NUMERICAL ONE.** Every
+// output element of this kernel accumulates over k in ONE order — ascending,
+// in `kFragSize`-wide chunks, block after block — and `BM`, `BK`, `WM` and
+// `WN` decide only which thread holds which element and how much of the
+// operand is staged per pass. A K tail is padded with zeros into a whole
+// `BK` and a zero product adds exactly nothing, so a tail does not move the
+// order either. Two instantiations of this template therefore land the SAME
+// BITS for the same row, and that is what lets `act_x_wt` pick between them
+// on the fire's row count without the pick being visible in the answer.
+//
+// It is the property the vector kernel that used to serve the narrow rung
+// could not have. That one split K across a simdgroup's 32 lanes and folded
+// the pieces with `simd_sum` — a different order, therefore different
+// rounding, therefore a lane's logits depended on how many lanes rode with
+// it. See `linear/gemm.rs`.
+
+#define instantiate_dense_gemm_t(name, itype, bm, bk, bn, wm, wn)            \
+  template [[host_name(                                                      \
+      "dense_gemm_t_" #name "_bm_" #bm "_bk_" #bk "_bn_" #bn)]]              \
+  [[kernel]] void dense_gemm_t<itype, bm, bk, bn, wm, wn>(                   \
       const device itype*, const device itype*, device itype*,               \
       const constant int&, const constant int&, const constant int&,         \
       uint3, uint, uint);
 
-instantiate_dense_gemm_t(bfloat16, bfloat, 32, 32, 32)
+// The wide rung: one 32x32 tile of output per threadgroup, four simdgroups.
+instantiate_dense_gemm_t(bfloat16, bfloat, 32, 32, 32, 2, 2)
 
-template <typename T>
-[[kernel]] void dense_gemv_t(
-    const device T* act      [[buffer(0)]],
-    const device T* w        [[buffer(1)]],
-    device T* y              [[buffer(2)]],
-    const constant int& M    [[buffer(3)]],
-    const constant int& N    [[buffer(4)]],
-    const constant int& K    [[buffer(5)]],
-    uint2 gid  [[thread_position_in_grid]],
-    uint lane  [[thread_index_in_simdgroup]]) {
-  const int n = int(gid.x) / SIMD_SIZE;
-  const int m = int(gid.y);
-  if (n >= N || m >= M) {
-    return;
-  }
-  const device T* act_row = act + size_t(m) * size_t(K);
-  const device T* w_row = w + size_t(n) * size_t(K);
-  float acc = 0.0f;
-  for (int k = int(lane); k < K; k += SIMD_SIZE) {
-    acc += float(act_row[k]) * float(w_row[k]);
-  }
-  acc = simd_sum(acc);
-  if (lane == 0) {
-    y[size_t(m) * size_t(N) + size_t(n)] = static_cast<T>(acc);
-  }
-}
-
-#define instantiate_dense_gemv_t(name, itype)                                \
-  template [[host_name("dense_gemv_t_" #name)]]                              \
-  [[kernel]] void dense_gemv_t<itype>(                                       \
-      const device itype*, const device itype*, device itype*,               \
-      const constant int&, const constant int&, const constant int&,         \
-      uint2, uint);
-
-instantiate_dense_gemv_t(bfloat16, bfloat)
+// The narrow rung. `BM = 8` is the floor — an 8x8 fragment is the unit the
+// matrix instruction multiplies — so a one-row decode still pays for eight
+// rows of arithmetic; `WM = 1` gives the eight rows one simdgroup rather than
+// two idle ones, and `BK = 64` halves the staging passes that redundancy is
+// spent under. Measured on an M1 Max over qwen35-d0.8b, one decode fire:
+// 13.4 ms at one lane and 22.2 at eight, against 15.0/23.0 at BK = 32.
+instantiate_dense_gemm_t(bfloat16, bfloat, 8, 64, 32, 1, 2)

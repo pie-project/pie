@@ -103,8 +103,24 @@ fn budget() -> Budget {
     Budget::new(4, 256)
 }
 
+/// **THE ONE-LANE BUDGET, AND IT IS THE ONLY LEVER THAT MAKES A `SWITCH`.**
+///
+/// P3 groups a merge's arms into a SWITCH only when it can prove no admissible
+/// composition demands two of them, and with `max_lanes >= 2` any two classes
+/// can co-fire, so the proof holds exactly when a fire cannot hold two classes
+/// at all. A one-lane deployment is a real deployment — it is what the
+/// activation clause in `switch_groups` is written about — and it is where the
+/// arms of every merge in the catalog become switch groups.
+fn one_lane() -> Budget {
+    Budget::new(1, 256)
+}
+
 /// A shell loaded with a profile of the caller's choosing.
-fn ready(what: &str, profile: Option<DeviceProfile>) -> Option<(Shell, tokenizer::Tokenizer)> {
+fn ready(
+    what: &str,
+    profile: Option<DeviceProfile>,
+    budget: Budget,
+) -> Option<(Shell, tokenizer::Tokenizer)> {
     if !engine_cuda::device::present() {
         eprintln!("skipping {what}: no CUDA device on this machine");
         return None;
@@ -137,7 +153,7 @@ fn ready(what: &str, profile: Option<DeviceProfile>) -> Option<(Shell, tokenizer
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budget: budget(),
+        budget,
         patches: None,
         profile,
         page_size: 16,
@@ -226,7 +242,7 @@ fn the_shells_own_artifact_holds_no_conditional_region() {
 #[test]
 fn an_all_decode_graph_already_holds_no_empty_launch() {
     let _serial = serialized();
-    let Some((mut shell, tokenizer)) = ready("the empty-launch census", None) else {
+    let Some((mut shell, tokenizer)) = ready("the empty-launch census", None, budget()) else {
         return;
     };
     let prompt = tokenizer.encode(PROMPT);
@@ -382,7 +398,7 @@ fn a_conditionalized_artifact_records_its_nodes_and_replays_what_the_eager_walk_
         "this profile conditionalized nothing, so the gate below would pass          over an always-launch artifact and prove nothing",
     );
 
-    let Some((mut shell, tokenizer)) = ready("the conditional capture", Some(forcing)) else {
+    let Some((mut shell, tokenizer)) = ready("the conditional capture", Some(forcing), budget()) else {
         return;
     };
     let prompt = tokenizer.encode(PROMPT);
@@ -457,5 +473,112 @@ fn a_conditionalized_artifact_records_its_nodes_and_replays_what_the_eager_walk_
     assert_eq!(
         eager, recorded,
         "the recorded arm of a conditionalized artifact answered different          tokens from the eager one",
+    );
+}
+
+/// Claim 4 — **THE `SWITCH` GATE** (B6). Every merge arm in the plan behind one
+/// evaluation point, recorded, replaying what the eager walk said.
+///
+/// **A ONE-LANE BAKE IS THE INSTRUMENT AND IT IS NOT A HAND-STAMP.** No SKU
+/// gets a SWITCH at the default budget, and the reason is a proof rather than a
+/// threshold: `switch_groups` will only group arms it can show no admissible
+/// composition demands two of, and with two or more lanes any two classes can
+/// co-fire. At `max_lanes == 1` the proof holds, and this SKU's plan comes back
+/// with two-arm and four-arm groups all through it. So the artifact under test
+/// is P3's own construction over a catalog text — the same pass, the same
+/// gates, a deployment statute moved — and not a lowering written by this file.
+///
+/// The claim is the same one claim 3 makes for `IF`, because it is the same
+/// claim: what a conditional records must be what the walk would have run. What
+/// is new underneath it is that the bracket now spans REGIONS — a group's arms
+/// are consecutive regions under one node — so a `region_begin` happens with a
+/// body capture open, `cond_arm` closes one child graph and opens the next, and
+/// a wrong answer here is the seam.
+#[test]
+fn a_switch_group_records_its_arms_and_replays_what_the_eager_walk_said() {
+    let _serial = serialized();
+    let forcing = DeviceProfile {
+        fat_region_us: 0.0,
+        cond_fixed_us: 0.5,
+        cond_per_arm_us: 0.0,
+        ..DeviceProfile::default()
+    };
+    // What the one-lane bake actually built, asked without a device — a run
+    // that grouped nothing would pass everything below over an `IF`-only
+    // artifact and prove nothing new.
+    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let (groups, arms) = {
+        let trace = trace(Platform::Cuda);
+        let compiled = compile(&trace, &one_lane(), &forcing).expect("the one-lane bake bakes");
+        let mut groups = 0;
+        let mut arms = 0;
+        for region in &compiled.regions {
+            if let Lowering::Switch { arm, .. } = region.lowering {
+                arms += 1;
+                groups += usize::from(arm == 0);
+            }
+        }
+        (groups, arms)
+    };
+    assert!(
+        groups > 0,
+        "the one-lane bake grouped no SWITCH, so this gate would run over an \
+         artifact with nothing new in it",
+    );
+
+    let Some((mut shell, tokenizer)) = ready("the switch capture", Some(forcing), one_lane()) else {
+        return;
+    };
+    let prompt = tokenizer.encode(PROMPT);
+
+    /// Long enough that the capture happens well inside it and every arm of
+    /// every group has been crossed many times.
+    const STEPS: usize = 12;
+
+    let mut arm_of = |shell: &mut Shell| -> Vec<u32> {
+        shell.open(0).expect("slot 0 opens");
+        let seeded = shell
+            .fire(&[Lane {
+                slot: 0,
+                word: word(prompt.len() as u32),
+                tokens: &prompt,
+            }])
+            .expect("the prefill fires");
+        let mut carried = argmax(&seeded[0]);
+        let mut out = vec![carried];
+        for _ in 0..STEPS {
+            let step = shell
+                .fire(&[Lane {
+                    slot: 0,
+                    word: word(1),
+                    tokens: &[carried],
+                }])
+                .expect("a decode fires");
+            carried = argmax(&step[0]);
+            out.push(carried);
+        }
+        out
+    };
+
+    shell.set_mode(Graphs::Off);
+    let eager = arm_of(&mut shell);
+    shell.set_mode(Graphs::On);
+    let recorded = arm_of(&mut shell);
+
+    let stats = shell.graph_stats();
+    eprintln!(
+        "one-lane `{SKU}`: {groups} switch groups over {arms} arms; \
+         {} captures, {} execs, {} nodes\n  \
+         eager    {eager:?}\n  recorded {recorded:?}",
+        stats.captures, stats.execs, stats.nodes,
+    );
+    assert!(
+        stats.captures > 0,
+        "the recorded arm never captured, so no switch node was recorded",
+    );
+    assert_eq!(
+        eager, recorded,
+        "the recorded arm of a switch-grouped artifact answered different tokens \
+         from the eager one",
     );
 }

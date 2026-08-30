@@ -222,15 +222,17 @@ impl Recipe {
 ///
 /// # Four sentences that are not obvious, and what settles each
 ///
-/// **THE NORMS ARE `nn.LayerNorm`, AND THE SCALE IS A SECOND NORM**
-/// (multimodal §6.1, §9.1). The checkpoints publish `norm1.bias` beside
-/// `.weight`, which an RMSNorm has none of. `elemwise.layernorm_no_scale`
-/// answers a row whose rms is 1, so an `elemwise.rmsnorm` on top of it does
-/// not normalize anything — it multiplies by its weight — and
-/// `elemwise.add_bias` is the bias. The fold into the following GEMM that §6.1
-/// proposed is HALF expressible (`Expr::Scale` can scale a bank, `Expr::Bias`
-/// cannot add `b·Mᵀ`) and the two halves do not compose, so the text says the
-/// whole norm in ops and the import contract stays a copy.
+/// **THE NORMS ARE `nn.LayerNorm`, AND THE TEXT SAYS THE WHOLE OF ONE**
+/// (multimodal §6.1, §9.1; next.md B5). The checkpoints publish `norm1.bias`
+/// beside `.weight`, which an RMSNorm has none of. The fold into the
+/// following GEMM that §6.1 proposed is HALF expressible (`Expr::Scale` can
+/// scale a bank, `Expr::Bias` cannot add `b·Mᵀ`) and the two halves do not
+/// compose, so the text says the whole norm in ops and the import contract
+/// stays a copy. `LN` above is `elemwise.layernorm` — one node, centred and
+/// scaled and biased. It was three (`layernorm_no_scale`, then an
+/// `rmsnorm` that normalized nothing and only read the weight, then
+/// `add_bias`) until B5 fused them: 25 norms a tower fire, 75 launches down
+/// to 25.
 ///
 /// **THE MLP IS UNGATED** (§6.2): `linear_fc2(act(linear_fc1(x)))` with
 /// nothing to multiply, which is `linear.mlp_gelu_tanh` and not a geglu.

@@ -14,6 +14,10 @@ would still hold if the decode path were deleted:
      observation window sits and attention is local. A tap that captured the
      wrong rows -- say the first `window` rows, or an unmasked dot product --
      would still produce a plausible-looking distribution, but not this shape;
+  3b. and INSIDE the window the mass tapers toward the end, which is the causal
+     mask being obeyed rather than a property of the prompt. This is a separate
+     case on a separate prompt, and the note above `PROMPT` argues why the two
+     window claims cannot share one;
   4. the resulting keep-set is enforced: a 1-page budget must change the text,
      an all-page budget must reproduce the baseline bit for bit.
 
@@ -30,14 +34,50 @@ os.environ.setdefault("PIE_CUDA_KV_ENVELOPES", "1")
 from conftest import run_inferlet  # noqa: E402
 
 
-# SnapKV selects among PROMPT pages, so the prompt has to span several of them
-# or the policy has nothing to choose between. ~250 tokens is >= 15 pages at the
-# usual page size, and it puts a distinctive, recallable fact at the front so a
-# too-aggressive budget is visibly destructive.
+# SnapKV selects among PROMPT pages, so a prompt has to span several of them or
+# the policy has nothing to choose between. ~280 tokens is >= 15 pages at the
+# usual page size, which both prompts below clear.
+#
+# THERE ARE TWO OF THEM, AND THE SPLIT IS STRUCTURAL RATHER THAN COSMETIC. The
+# window claims in this file pull in opposite directions and one prompt cannot
+# satisfy both:
+#
+#   * `min(win) > max(mid)` -- the window's pages outweigh EVERY ordinary
+#     prefix page -- is a claim about CONTENT. It needs a middle that carries
+#     nothing the window carries, because attention is local: the page
+#     immediately before the window is adjacent to it and will out-mass the
+#     window's own tail page on any prompt whose middle reads like its end.
+#     Measured on the old single-sentence prompt (`_QUEST_PROMPT`'s shape):
+#     window [0.671, 0.433] against a middle whose last page reached 0.512 --
+#     a failure of the PROMPT, not of the capture, and the same reason
+#     `test_curated.py`'s `_EVICT_PROMPT` exists.
+#   * `win[-1] < max(win)` -- the taper inside the window -- is a claim about
+#     the CAUSAL MASK, and it only reads cleanly when the window's own pages
+#     are interchangeable. Put the question on the window's last page and that
+#     page is heaviest for a reason that has nothing to do with masking, so the
+#     mask claim would fail on a model that masks perfectly.
+#
+# So the content claims get a prompt with content to separate, and the mask
+# claim gets one with none.
+
+#: A fact at the HEAD the filler never repeats, asked for at the TAIL. The head
+#: page and the question page are then the only two that carry information, and
+#: that is the shape SnapKV claims to find -- so the window separates, and a
+#: budget too small to hold the question's pages loses the continuation.
+#: (Same construction as `test_curated.py`'s `_EVICT_PROMPT`, and for the
+#: reason argued there.)
 PROMPT = (
-    "The capital of France is Paris. "
-    + "Paris is a large European city with a long history. " * 24
+    "Remember this: the secret code word is banana. "
+    + "The weather in the valley is mild and the roads are clear. " * 20
+    + " What is the secret code word? The secret code word is"
 )
+
+#: ONE SENTENCE, REPEATED, AND NOTHING ELSE -- every page carries the same
+#: information, so nothing but position can shape the profile. That is useless
+#: for the separation claim (it is exactly why the claim used to fail) and it is
+#: precisely what the taper claim wants: inside the window the only thing left
+#: to explain a falling profile is the causal mask.
+FILLER_PROMPT = "Paris is a large European city with a long history. " * 24
 # Near-greedy: see the note above `_COHERENCE_TAU` in test_curated.py. Token
 # equality against the baseline is only a stable invariant when the decision
 # margin is wider than the plan-level float residue.
@@ -181,20 +221,6 @@ async def test_snapkv_window_is_at_the_end_of_the_prompt(client, args):
         print(f"  [note] window spans {win_pages}/{n} pages -- too wide for the "
               "strong separation check; skipped")
 
-    # Within the window the mass must FALL toward the end, and that is not a
-    # quirk -- it is the causal mask being obeyed. Window row `w` sees kv up to
-    # position `first_row + w`, so kv position `first_row + j` is weighted by
-    # only `window - j` of the `window` rows. The last page is structurally
-    # attended by the fewest rows, so a profile that peaked at the very last
-    # page would mean the mask was NOT applied to the captured rows. (With a
-    # single-page window there is no interior to compare against.)
-    if len(win) >= 2:
-        assert win[-1] < max(win), (
-            f"the last page is the heaviest in the window {win}; the captured "
-            "rows are not causally masked -- every row would have to see the "
-            "end of the prompt for that to happen"
-        )
-
     # ... and the attention sink at position 0 must still be visible, which is
     # the other half of the shape SnapKV relies on: it is why an evicting policy
     # must be told to keep page 0.
@@ -206,6 +232,51 @@ async def test_snapkv_window_is_at_the_end_of_the_prompt(client, args):
     print(f"  [ ok ] window page {win_mean:.4f} vs prefix page {mid_mean:.4f} "
           f"({win_mean / mid_mean:.1f}x), sink {sink:.4f} "
           f"({sink / total:.0%} of all mass)")
+
+
+async def test_snapkv_window_mass_tapers_across_the_window(client, args):
+    """(3b) THE CAUSAL MASK, READ OFF THE WINDOW'S OWN PROFILE -- on the
+    filler-only prompt, because this is the claim `PROMPT` cannot carry.
+
+    Within the window the mass must FALL toward the end, and that is not a
+    quirk: window row `w` sees kv up to position `first_row + w`, so kv
+    position `first_row + j` is weighted by only `window - j` of the `window`
+    rows. The last page is structurally attended by the fewest rows, so a
+    profile that PEAKED at the very last page would mean the mask was not
+    applied to the captured rows.
+
+    "Structurally" is the load-bearing word, and it is why this runs on
+    `FILLER_PROMPT`. The argument counts ROWS, not tokens, so it only survives
+    if every position in the window is worth the same to a row that can see
+    it. On `PROMPT` the window's last page holds the question -- which the
+    later rows attend to for its content -- and the taper would break on a
+    model whose mask is perfect. One sentence repeated leaves the mask as the
+    only thing that can shape the profile.
+    """
+    r = await _run(client, args, "trackb-snapkv",
+                   {"prompt": FILLER_PROMPT, "page_budget": 4096})
+    masses = [float(m) for m in r["page_mass"]]
+    window, win_lo = _window_pages(r)
+    win = masses[win_lo:]
+
+    print(f"  pages       = {len(masses)}  page_size = {r['page_size']}  "
+          f"window = {window}")
+    print(f"  window mass = {[f'{m:.5f}' for m in win]}")
+
+    # With a single-page window there is no interior to compare against, so the
+    # claim would be vacuous rather than passing.
+    assert len(win) >= 2, (
+        f"the observation window covers {len(win)} page of {len(masses)} -- "
+        "there is no interior to taper across; widen PIE_ATTN_SCORE_WINDOW or "
+        "shorten the page size"
+    )
+    assert win[-1] < max(win), (
+        f"the last page is the heaviest in the window {win}; the captured "
+        "rows are not causally masked -- every row would have to see the "
+        "end of the prompt for that to happen"
+    )
+    print(f"  [ ok ] the window tapers: last page {win[-1]:.4f} under the "
+          f"window's peak {max(win):.4f}")
 
 
 async def test_snapkv_enforces_its_keep_set(client, args):
@@ -267,6 +338,7 @@ def tests():
     return [
         test_snapkv_observes_the_prompt_window,
         test_snapkv_window_is_at_the_end_of_the_prompt,
+        test_snapkv_window_mass_tapers_across_the_window,
         test_snapkv_enforces_its_keep_set,
         test_snapkv_keeps_what_it_scored,
     ]
@@ -278,5 +350,5 @@ if __name__ == "__main__":
     run_tests(
         tests(),
         "SnapKV prefill-window observation + enforcement",
-        requires=("attn_score", "attn_page_mask"),
+        requires=("attn_score",),
     )

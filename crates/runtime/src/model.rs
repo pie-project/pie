@@ -140,6 +140,18 @@ pub const ROWS: &[Row] = &[
         arch: "gemma4",
     },
     Row {
+        id: "gemma4-e4b-eagle-bf16-kv-bf16",
+        layers: 42,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
+    Row {
+        id: "gemma4-e4b-vision-bf16-kv-bf16",
+        layers: 42,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
+    Row {
         id: "gemma4-31b-bf16-kv-bf16",
         layers: 60,
         vocab: 262_144,
@@ -494,6 +506,47 @@ pub fn model() -> &'static Arc<Model> {
     MODEL.get().expect("model accessed before registration")
 }
 
+/// **THE RESERVED PAD THIS MODEL SPELLS A MEDIA RUN WITH** (media-door §3), or
+/// `None` for a model with no media front-end at all.
+///
+/// One id, cached once: `MODEL` is a `OnceLock` and one process serves one
+/// model, so the tokenizer is asked once and every fire after that reads an
+/// integer. That matters because this is on the SUBMIT PATH of every fire,
+/// media or not — a run with no span attached is one of the door's four
+/// refusals, and finding it means scanning the tokens of passes that carry no
+/// media at all.
+///
+/// It lives here rather than beside the media host because it is a fact about
+/// the bound MODEL, and because `pipeline::fire` may read the model and may
+/// not read the guest boundary.
+pub fn media_pad() -> Option<u32> {
+    static PAD: OnceLock<Option<u32>> = OnceLock::new();
+    *PAD.get_or_init(|| {
+        use crate::inferlet::host::media::{front_end_for, multimodal};
+        let m = model();
+        let arch = m.arch_name();
+        // **THE PAD IS THE FRONT-END'S OWN, AND ONLY ITS OWN** (wave MD-C).
+        // A second table of placeholder strings stood here and it had already
+        // gone stale: it answered gemma's pad as `<image_soft_token>`, which
+        // is gemma-3's spelling, while the front-end that actually spells a
+        // gemma span answers `<|image|>`. Two spellings of one id is what
+        // article 8 forbids, and this is what a disagreement between them
+        // costs — the orphan-run scan looking for a token no span is ever
+        // written with, on the one model where it matters.
+        let spelling = front_end_for(arch)
+            .map(|fe| fe.delimiters().placeholder)
+            .or_else(|| multimodal::audio_arch_supported(arch).then(multimodal::audio_placeholder))?;
+        match m.tokenize(spelling)[..] {
+            [id] => Some(id),
+            // A checkpoint whose tokenizer cannot spell its architecture's pad
+            // has no run for the scan to find, and `from_bytes` refuses such a
+            // span before it can be attached — so there is nothing to look for
+            // and saying so is the right answer, not a panic.
+            _ => None,
+        }
+    })
+}
+
 // =============================================================================
 // Model
 // =============================================================================
@@ -700,8 +753,9 @@ impl Model {
 
     /// The fact word a lane carries: `query_len` rows, whether the lane states
     /// a custom attention mask of its own, whether it routes to an adapter
-    /// bank, whether it wants the model's draft head run over its rows, and
-    /// whether it wants its attention's mass kept.
+    /// bank, whether it wants the model's draft head run over its rows,
+    /// whether it wants its attention's mass kept, and whether its submission
+    /// carried media spans.
     ///
     /// **THIS IS WHAT A FIRE IS COMPOSED FROM** (palo design §0). The engine
     /// turns a lane's word into a class, and the class into the row WINDOW
@@ -712,11 +766,26 @@ impl Model {
     /// `Classify::of(..).word()` through the catalog pointer and never reads a
     /// bit.
     ///
-    /// The runtime states all five because it knows all five: a lane's rows are
+    /// The runtime states all six because it knows all six: a lane's rows are
     /// the tokens it submits, a custom mask is a lane's only once the fire's
-    /// mask has lowered, and the adapter, the draft ask and the capture ask
-    /// are what whoever built the lane put on it
+    /// mask has lowered, the adapter, the draft ask and the capture ask are
+    /// what whoever built the lane put on it, and the media fact is whether
+    /// the submission the lane came from attached spans
     /// (`pipeline::fire::stamp_lane_words`).
+    ///
+    /// **AND THE SIXTH RIDES THE COMMIT THAT MADE IT REACHABLE**
+    /// (`.wiki/alto/multimodal.md` §15's hard constraint; media-door.md §4).
+    /// §15 wrote the field, the builder and the two families' predicates and
+    /// then had to leave the serving path stamping `false`, because no
+    /// submission could carry a span for it to read: "until a media submission
+    /// reaches `Step`, nothing on the serving path can set it, and the honest
+    /// default is `false`". `forward-pass.media` is that submission, and this
+    /// argument lands in the same commit as the verb — because the alternative
+    /// is not a missing feature, it is an image lane silently composing as the
+    /// TEXT-ONLY class: `qwen_3`'s embed merge and `gemma_4`'s both guard on
+    /// `Facts::media`, so a lane whose word says `false` runs a graph with no
+    /// node to land its patch rows in and answers fluently about an image it
+    /// never saw.
     ///
     /// **THE LIST GROWS ONE ARGUMENT PER AXIS, AND SO DOES THE REFUSAL SET**
     /// (palo C3b/C4b). `drafts` and `captures_scores` join on `adapter`'s
@@ -747,12 +816,14 @@ impl Model {
         adapter: bool,
         drafts: bool,
         captures_scores: bool,
+        media: bool,
     ) -> u64 {
         (self.classify)(
             &::model::Request::new(query_len, custom_mask)
                 .adapted(adapter)
                 .drafting(drafts)
-                .capturing_scores(captures_scores),
+                .capturing_scores(captures_scores)
+                .with_media(media),
         )
     }
 
@@ -794,6 +865,59 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), before, "two rows share an id");
+    }
+
+    /// **THE §15 STAMP, AND THE COMMIT IT HAD TO RIDE**
+    /// (`.wiki/alto/multimodal.md` §15; media-door.md §4).
+    ///
+    /// The media fact is a real axis of the word, not an argument that is
+    /// accepted and dropped: a lane whose submission carried spans resolves to
+    /// a DIFFERENT class than the same lane text-only, in both families that
+    /// have a tower. That is what `Facts::media` guards the embed merge with,
+    /// and it is why the argument could not land a commit later than the verb
+    /// that makes it reachable — a `false` here is not a missing feature, it
+    /// is an image lane composing as the text-only class and answering
+    /// fluently about a picture whose patch rows had no node to land in.
+    ///
+    /// Read through the catalog's own `classify` pointer, which is exactly
+    /// what [`Model::word`] calls, so this pins the path and not a copy of it.
+    #[test]
+    fn a_media_submission_resolves_to_a_different_class_than_the_same_text_lane() {
+        let tower_skus: Vec<&'static str> = ROWS
+            .iter()
+            .filter(|r| matches!(r.arch, "qwen3_5" | "gemma4"))
+            .map(|r| r.id)
+            .collect();
+        assert!(!tower_skus.is_empty(), "the catalog has no tower models");
+        for sku in tower_skus {
+            let classify = ::model::classify_of(sku).expect("every row has a classify");
+            let plain = ::model::Request::new(7, false);
+            let text = classify(&plain);
+            let imaged = classify(&plain.clone().with_media(true));
+            assert_ne!(
+                text, imaged,
+                "{sku}: a media lane and a text lane resolve to the same word, \
+                 so the embed merge's guard cannot see the difference"
+            );
+        }
+    }
+
+    /// And the other direction, which is the one a regression would take: a
+    /// text-only lane's word does not move because the argument exists.
+    #[test]
+    fn a_text_only_lane_is_the_word_it_always_was() {
+        for sku in ROWS.iter().map(|r| r.id) {
+            let classify = ::model::classify_of(sku).expect("every row has a classify");
+            let request = ::model::Request::new(3, false)
+                .adapted(false)
+                .drafting(false)
+                .capturing_scores(false);
+            assert_eq!(
+                classify(&request.clone().with_media(false)),
+                classify(&request),
+                "{sku}: stamping `false` is not the same as stamping nothing"
+            );
+        }
     }
 
     /// A typo is answered with the row it is a typo OF — the property the

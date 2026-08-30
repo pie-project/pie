@@ -204,6 +204,7 @@ fn a_grafted_page_run_decodes_exactly_as_the_run_it_was_copied_from() {
     let prefill = FrameSubmission::of(Step {
         lanes: vec![lane(0, &PARENT, 0, tokens.clone(), Readout::Last)],
         attachments: Vec::new(),
+        media: Vec::new(),
     });
     prefill.validate().expect("the parent prefill is well formed");
     let mut ticket = engine.submit(&prefill).expect("the parent prefill fires");
@@ -265,6 +266,7 @@ fn a_grafted_page_run_decodes_exactly_as_the_run_it_was_copied_from() {
             lane(1, &FORK, HELD, vec![next], Readout::Last),
         ],
         attachments: Vec::new(),
+        media: Vec::new(),
     });
     decode.validate().expect("the paired decode is well formed");
     let mut ticket = engine.submit(&decode).expect("the paired decode fires");

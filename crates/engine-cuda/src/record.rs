@@ -1277,6 +1277,16 @@ impl Sink for Tapped<'_, '_> {
 /// refusal at the arm rather than a wrong graph at the replay. The keyed path
 /// serves these artifacts today; teaching the census to descend into a child
 /// graph is what would lift it.
+///
+/// **NOR IS IT GIVEN THE DENSE PUMP, AND FOR A REASON WITH THE SAME SHAPE**
+/// (alto streaming §3 item 4, wave B8). A load whose spilled dense planes
+/// rotate through device slots never reaches this function at all — `serve.rs`
+/// sets `records = false` for it beside the buffered fire — because the ring's
+/// backpressure is a HOST cursor advanced at every `region_begin`, and a
+/// replayed graph has no walk to advance it. Baking the copies as nodes is
+/// possible in principle (the schedule is fire-invariant), but they would be
+/// forked onto a second stream and stand in no position of the parent chain:
+/// the same hole the conditional makes, one mechanism over.
 fn walk_capture_tapped(
     at: &Fire<'_>,
     run: &mut Run<'_>,

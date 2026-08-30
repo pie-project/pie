@@ -52,9 +52,10 @@ const PLATFORMS: [Platform; 4] = [
 /// identical either way — one fact bit, one window, one kv row, one export
 /// seam — and asking BOTH is what says the generalization did not quietly
 /// become two axes with one name.
-const DRAFTING: [&str; 2] = [
+const DRAFTING: [&str; 3] = [
     "qwen36-27b-bf16-kv-bf16",
     "qwen35-d0.8b-eagle-bf16-kv-bf16",
+    "gemma4-e4b-eagle-bf16-kv-bf16",
 ];
 
 /// The workhorse the capture arm is asked about — small, dense, and the SKU

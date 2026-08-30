@@ -190,7 +190,7 @@ impl Run<'_> {
                 routes,
                 y,
             } => {
-                let (codes, scales) = self.planes(*bank);
+                let (codes, scales, seat) = self.planes(*bank);
                 linear::moe::matmul_select_bias(
                     self.ctx(),
                     self.tensor(*x),
@@ -199,13 +199,14 @@ impl Run<'_> {
                     self.tensor(*bias),
                     self.tensor(*routes),
                     &mut self.tensor(*y),
+                    seat,
                 )
             }
             // The same two-plane bank as the biased twin above, with nothing
             // added inside the fold: the down leg's routed bias lands after
             // the reduce, through `MoeBiasSum`.
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
-                let (codes, scales) = self.planes(*bank);
+                let (codes, scales, seat) = self.planes(*bank);
                 linear::moe::matmul_select_quant(
                     self.ctx(),
                     self.tensor(*x),
@@ -213,6 +214,7 @@ impl Run<'_> {
                     scales,
                     self.tensor(*routes),
                     &mut self.tensor(*y),
+                    seat,
                 )
             }
             Linear::MoeWeightedSum { routed, weights, y } => linear::moe::weighted_sum(

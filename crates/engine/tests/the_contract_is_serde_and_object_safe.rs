@@ -134,6 +134,7 @@ fn every_noun_round_trips() {
             Lane::decode(1, 0b0100, 99, 31),
         ],
         attachments: Vec::new(),
+        media: Vec::new(),
     };
     assert_eq!(round_trip(&submission), submission);
     assert_eq!(submission.rows(), 6);
@@ -631,6 +632,7 @@ fn the_unbuilt_v2_shapes_are_refused_by_name() {
         steps: vec![Step::default(), Step {
             lanes: vec![lane],
             attachments: Vec::new(),
+            media: Vec::new(),
         }],
     };
     assert!(frame.validate().is_err());
@@ -683,6 +685,7 @@ fn a_malformed_fire_says_what_is_wrong() {
     let mut fire = Step {
         lanes: vec![Lane::decode(3, 0, 7, 0), Lane::decode(3, 0, 8, 0)],
         attachments: Vec::new(),
+        media: Vec::new(),
     };
     let error = fire.validate().unwrap_err();
     assert!(

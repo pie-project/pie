@@ -99,6 +99,21 @@ impl Shell {
         !self.exports.scores.is_empty()
     }
 
+    /// **THE ELEMENT THIS PLAN'S PATCH ROWS ARE WRITTEN IN**, or `None` for a
+    /// load whose plan states no patch row (media-door §6).
+    ///
+    /// Read off `RuntimeInput::Patches` at load, like the row's width is,
+    /// because `C·T·P²` and the dtype beside it are the model TEXT's numbers.
+    /// The submit path is what needs it: the contract carries a payload in
+    /// `f32` — a front-end's own answer, and a value no party above the load
+    /// could have converted, because none of them holds a trace — and the
+    /// marshal converts it here, where the number is a value this shell can
+    /// simply read.
+    #[must_use]
+    pub fn patch_element(&self) -> Option<model_ir::Dtype> {
+        self.patch_seat.map(|seat| seat.dtype)
+    }
+
     /// Whether this load can serve `IntrinsicId::AttnScore` — the artifact
     /// declares a capture column AND the slab that observes it was carved.
     ///
@@ -177,6 +192,24 @@ impl Shell {
         self.weights.all_resident()
     }
 
+    /// **What the rotating dense pump has done** (alto streaming §3 item 4,
+    /// D2b), or `None` for a load that armed none — which is every load whose
+    /// budget held its dense planes.
+    ///
+    /// A §14 register: nothing branches on it. `late` is the counted exception
+    /// the design names — a region that opened before its plane's copy had
+    /// been issued — and it is a stall, never a wrong answer.
+    #[must_use]
+    pub fn rotation(&self) -> Option<(crate::rotate::Observed, u32, u64, u64)> {
+        let rotor = self.weights.rotor()?;
+        Some((
+            rotor.observed(),
+            rotor.rotation().slots(),
+            rotor.rotation().arena(),
+            rotor.rotation().rotating(),
+        ))
+    }
+
     /// **Which expert is in which slot of each streamed bank, and how often
     /// each has been routed to** — the promotion's only observable (alto
     /// design §7, wave D2).
@@ -200,6 +233,43 @@ impl Shell {
         self.weights
             .experts()
             .map_or((0, 0, 0), crate::experts::Tier::motion)
+    }
+
+    /// `(groups promoted, groups demoted, gaps a swap in flight held back)`
+    /// since load — the PACKED ladder's motion, beside [`Shell::expert_motion`]'s
+    /// per-expert one (alto streaming §3 item 3, wave B7).
+    #[must_use]
+    pub fn group_ladder(&self) -> (u64, u64, u64) {
+        self.weights
+            .experts()
+            .map_or((0, 0, 0), crate::experts::Tier::ladder)
+    }
+
+    /// **Take one rung of the packed ladder for the group `name` NOW** — the
+    /// gate's door, and nothing in the serving path calls it.
+    ///
+    /// [`experts::Tier::promote_now`](crate::experts::Tier::promote_now)
+    /// carries the argument for why a door exists at all: the vote is a
+    /// strict-improvement rule, so a deployment whose routed banks are all
+    /// read every fire reaches its steady state at the plan's own assignment
+    /// and never moves again, and a gate cannot observe a rung by waiting for
+    /// one. Answers `(from, to)`, or `None` when there is no berth of the
+    /// right shape on a faster rung — and `None` for a fully-resident load,
+    /// which has no tier at all.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Device`](crate::error::Fault) for a copy or an event the
+    /// runtime refused.
+    pub fn promote_group(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<(crate::experts::Held, crate::experts::Held)>> {
+        let (compute, notify) = (self.device.stream(), self.device.notify_stream());
+        match self.weights.experts_mut() {
+            None => Ok(None),
+            Some(tier) => tier.promote_now(name, compute, notify),
+        }
     }
 
     /// How many bytes the buffered-activation pool holds, and `0` for a plan
@@ -354,6 +424,21 @@ impl Shell {
             self.pools.bytes(),
             self.inputs.bytes(),
         )
+    }
+
+    /// **The unified accounting sentence this load was admitted under** —
+    /// *weight tiers + elastic pool + safety floor = the card* (alto streaming
+    /// §3 item 5).
+    ///
+    /// The six numbers `Shell::load` refused ahead of every allocation, kept
+    /// so they can be read back: [`Accounting::pool`](crate::store::Accounting)
+    /// is what the elastic supply was PREDICTED to get, and
+    /// [`Shell::elastic`]'s budget pages is what it actually took. A
+    /// deployment stating `[engine] gpu_mem_utilization` can check the
+    /// fraction arrived by comparing the two.
+    #[must_use]
+    pub fn accounting(&self) -> crate::store::Accounting {
+        self.accounting
     }
 
     /// **Every pool arena's base address**, in row-then-plane order.

@@ -128,6 +128,11 @@ class EngineConfig:
 class ModelConfig:
     name: str = "default"
     hf_repo: str = ""
+    # Which SKU of that checkpoint to serve, or None to let the load identify
+    # one. A vision artifact fits its family's text row AND its own, and
+    # identification takes the cheap one first, so the tower is asked for by
+    # name. The id space is `model::catalog()`'s.
+    sku: Optional[str] = None
     # What the CHECKPOINT holds, which is a model fact. `activation_dtype`
     # and `kv_cache_dtype` stay on the engine because they are what the
     # engine computes and stores in.
@@ -164,6 +169,8 @@ class Config:
         # `model`, not `hf_repo`: the field is spelled `model` internally and
         # this emitter feeds the internal deserializer directly.
         _emit_kv(buf, "model", m.hf_repo)
+        if m.sku is not None:
+            _emit_kv(buf, "sku", m.sku)
         if m.weight_dtype is not None:
             _emit_kv(buf, "weight_dtype", m.weight_dtype)
         _emit_table(buf, f"{prefix}model.engine", _engine_block(m.engine),
@@ -235,6 +242,7 @@ class Config:
 
         m = self.model
         model: dict = {"name": m.name, "model": m.hf_repo}
+        put(model, "sku", m.sku)
         put(model, "weight_dtype", m.weight_dtype)
 
         # The section is split by NAME rather than by nesting, so the common

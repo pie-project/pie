@@ -112,6 +112,231 @@ const STATE_DTYPE: Dtype = Dtype::Bf16;
 /// or, worse, accepted at the wrong head count.
 const NHD: i32 = 0;
 
+/// **THE UNIFIED ACCOUNTING SENTENCE** — *weight tiers + elastic pool + safety
+/// floor = the card* (alto streaming §3 item 5, `next.md` B2).
+///
+/// The two accountings this shell keeps have always summed correctly and
+/// have never been WRITTEN DOWN, which is a different thing. The weight store
+/// is a `cudaMalloc` in `Weights::resident`; [`Pools::reserve`] runs after it
+/// and opens a [`PhysicalPool`] against whatever the card then reports. So
+/// they unify BY ORDER — the pool gets what the weights left — and because
+/// nothing states the sum, nothing can refuse AHEAD of it: a deployment whose
+/// weights leave no room for its declared context discovers that as an
+/// unrelated `Exhausted` on some later fire, or as a `cudaMalloc` that fails
+/// inside a load, rather than as a sentence at boot naming the six numbers.
+///
+/// This is that sentence, as arithmetic:
+///
+/// ```text
+/// card         what the device has, total
+/// ceiling      card x utilization        the operator's whole allowance
+/// weights      the T0 weight tier        what `Plan::device_demand` will hold
+/// floor        min(128 MiB, card/10)     the driver's landing room
+/// pool         ceiling - weights - floor what the elastic supply may hold
+/// minimum      one slot at the declared context, every cache row
+/// ```
+///
+/// and the claim is `pool >= minimum`.
+///
+/// # Why the minimum is one slot and not the whole reservation
+///
+/// The elastic pool is deliberately over-RESERVED: address space costs
+/// nothing, every arena reserves at its own ceiling, and how far past each
+/// base is readable is what admission decides per frame (design §8). So "the
+/// pool cannot hold its reservation" is the normal case and refusing on it
+/// would refuse every load. What is NOT normal is a pool that cannot hold ONE
+/// SEQUENCE at the context the deployment declared: under that line
+/// `[model] max_context` is a number no request can reach, every long request
+/// dies `Exhausted`, and the deployment is misconfigured in a way no fire can
+/// fix. That is the floor worth naming, and it is computed from the same
+/// declaration [`Pools::reserve`] sizes the arenas from — `pages_per_slot`
+/// pages of every kv plane at its own width, plus one slot of every recurrent
+/// slab.
+///
+/// # `Impossible`, and why the card's OTHER tenants are not in this sum
+///
+/// Everything above is the CONFIG against the CARD: nothing another
+/// deployment frees changes `card x utilization - weights - floor`, so the
+/// refusal is [`Fault::Residency`] and reaches the contract as
+/// `Error::Impossible`. What another process holds is physics, it is charged
+/// against the pool by [`elastic::budget_bytes`] at open, and it refuses as
+/// `Fault::OutOfMemory` -> `Error::Exhausted` with both numbers. The pair
+/// `admit_tiers` draws — *statute is `Impossible` here, physics is `Exhausted`
+/// there, and no path answers both* — is drawn here the same way and on
+/// purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Accounting {
+    /// What the device has, total.
+    pub card: u64,
+    /// `card x utilization` — the operator's whole allowance for pie.
+    pub ceiling: u64,
+    /// The T0 weight tier's bytes.
+    pub weights: u64,
+    /// `min(128 MiB, card/10)`, held back for the driver.
+    pub floor: u64,
+    /// `ceiling - weights - floor`: what is left for the elastic supply.
+    pub pool: u64,
+    /// One slot at the declared context, across every cache row.
+    pub minimum: u64,
+}
+
+impl Accounting {
+    /// Write the sentence down, from the card and the three demands.
+    ///
+    /// Pure arithmetic on four numbers, so the gate that spells the refusal
+    /// needs no device.
+    #[must_use]
+    pub fn of(card: u64, utilization: f64, weights: u64, minimum: u64) -> Accounting {
+        let fraction = if utilization.is_finite() {
+            utilization.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a byte count of a GPU card is far inside f64's exact integer range, \
+                      and the product is floored back into u64 deliberately"
+        )]
+        let ceiling = (card as f64 * fraction) as u64;
+        let floor = elastic::safety_floor_bytes(card);
+        Accounting {
+            card,
+            ceiling,
+            weights,
+            floor,
+            pool: ceiling.saturating_sub(weights).saturating_sub(floor),
+            minimum,
+        }
+    }
+
+    /// **Does the card hold this deployment?** One refusal, naming every term.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Residency`] — `Error::Impossible` — when the elastic pool's
+    /// share is under one slot at the declared context.
+    pub fn admit(&self) -> Result<()> {
+        if self.pool >= self.minimum {
+            return Ok(());
+        }
+        Err(Fault::Residency(format!(
+            "the card does not hold this deployment: {card} bytes on the device, of which \
+             `[engine] gpu_mem_utilization` allows pie {ceiling}; this load's weight tier \
+             takes {weights} and the driver's safety floor holds back {floor}, leaving the \
+             elastic pool {pool} bytes — and one sequence at the declared context needs \
+             {minimum} across this model's cache rows. weight tier + elastic pool + safety \
+             floor must fit inside the fraction of the card, and here they do not. Lower \
+             `[model] max_context` or `[model] slots`, raise `[engine] \
+             gpu_mem_utilization`, or state a `[model] device_weight_budget` that streams \
+             the weight tier down.",
+            card = self.card,
+            ceiling = self.ceiling,
+            weights = self.weights,
+            floor = self.floor,
+            pool = self.pool,
+            minimum = self.minimum,
+        )))
+    }
+}
+
+/// **The bytes ONE SLOT of every cache row occupies** — the elastic supply's
+/// declared minimum, and [`Accounting`]'s last term.
+///
+/// The same declaration [`Pools::reserve`] sizes the arenas from, read one
+/// slot wide instead of `slots` wide: `pages_per_slot` pages of every kv plane
+/// at that plane's own width, plus one slot of every recurrent slab. A row
+/// whose element has no byte size refuses here exactly as it refuses there.
+///
+/// # Errors
+///
+/// [`Fault::Unbound`] for a cache row whose element has no size.
+pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
+    let mut bytes: u64 = 0;
+    for row in &trace.caches {
+        match row {
+            CacheRow::Kv {
+                name,
+                planes,
+                dtype,
+                ..
+            } => {
+                let element = elem_bytes(name, *dtype)?;
+                let cells = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
+                for width in planes {
+                    bytes = bytes.saturating_add(cells * width * element);
+                }
+            }
+            CacheRow::State { name, slab } => {
+                let stride: u64 = slab.iter().product();
+                bytes = bytes.saturating_add(stride * elem_bytes(name, STATE_DTYPE)?);
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// **Ask the card, then ask the sentence** — the one call `Shell::load` makes
+/// before a byte of this load is allocated.
+///
+/// `weights` is [`Plan::device_demand`](crate::experts::Plan::device_demand),
+/// with one reading applied: `Plan::default()` is FULL residency and stores a
+/// derived zero, so a zero here means the whole table rather than no weights,
+/// and the whole table is what `weights::plane_bytes` says it is.
+///
+/// # Errors
+///
+/// [`Fault::Runtimeless`] with no runtime selected, [`Fault::Device`] for the
+/// memory query, [`Fault::Unbound`] for a cache row whose element has no size,
+/// and [`Fault::Residency`] for the deployment the card does not hold.
+pub fn admit_the_card(
+    utilization: f64,
+    weights: u64,
+    trace: &Trace,
+    paging: Paging,
+) -> Result<Accounting> {
+    let full: u64 = crate::weights::plane_bytes(trace)?
+        .iter()
+        .map(|plane| plane.next_multiple_of(crate::weights::ALIGN))
+        .sum();
+    let weights = match weights {
+        0 => full,
+        stated => stated.min(full),
+    };
+    let accounting = Accounting::of(
+        card_bytes()?,
+        utilization,
+        weights,
+        one_slot_bytes(trace, paging)?,
+    );
+    accounting.admit()?;
+    Ok(accounting)
+}
+
+/// What this device has, total — the one number [`Accounting`] cannot derive.
+///
+/// # Errors
+///
+/// [`Fault::Runtimeless`] with no runtime selected, [`Fault::Device`] for the
+/// query.
+fn card_bytes() -> Result<u64> {
+    #[cfg(feature = "_cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: two live locals; the call only writes them.
+        let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
+        crate::device::ctx::check("cudaMemGetInfo", asked)?;
+        Ok(total as u64)
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        Err(Fault::Runtimeless)
+    }
+}
+
 /// How one cache row is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
@@ -327,12 +552,26 @@ impl Pools {
     /// which page, never how wide the row it addresses is, and gemma's
     /// sliding and global layers share one page-id space at two widths
     /// ([`SpaceFacts`](crate::store::kv::SpaceFacts)).
-    pub fn reserve(device: i32, trace: &Trace, paging: Paging, facts: &Facts) -> Result<Pools> {
-        // The budget is read from the card ONCE, here: what is free at load,
-        // less a safety floor. Every arena below reserves address space at
-        // its own ceiling out of that one supply, and nothing is mapped until
-        // a frame's admission asks for it.
-        let pool = PhysicalPool::open(device)?;
+    pub fn reserve(
+        device: i32,
+        utilization: f64,
+        trace: &Trace,
+        paging: Paging,
+        facts: &Facts,
+    ) -> Result<Pools> {
+        // The budget is read from the card ONCE, here: the operator's fraction
+        // of the whole card, less everything already on it (this load's weight
+        // store first of all) and less a safety floor. Every arena below
+        // reserves address space at its own ceiling out of that one supply, and
+        // nothing is mapped until a frame's admission asks for it.
+        //
+        // **`utilization` IS `[engine] gpu_mem_utilization` AND THIS IS THE
+        // ROUTE IT TAKES** (alto `next.md` B1): the worker's config declares
+        // it, the boot document's `[engine]` table carries it, `crate::boot`
+        // reads it into [`Knobs`](crate::Knobs), `Shell::load` hands it here,
+        // and `PhysicalPool::open` is the one arithmetic that reads it. A
+        // fraction of `1.0` is what this line did before the route existed.
+        let pool = PhysicalPool::open(device, utilization)?;
         let mut rows: Vec<Vec<Arena>> = Vec::with_capacity(trace.caches.len());
         let mut shapes = Vec::with_capacity(trace.caches.len());
 

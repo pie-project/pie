@@ -199,6 +199,14 @@ pub struct ForwardBindings {
     /// tart (0.3 re-port step 2): run layers [0, k) and take the head at
     /// k for this pass's fires. None = full model.
     pub max_layers: Option<u32>,
+    /// **THE PAYLOAD BESIDE THE LEDGER** (media-door §0): the spans this
+    /// pass's tokens carry, in the order `forward-pass.media` attached them.
+    ///
+    /// Empty on every text-only pass, which is every pass in the tree today —
+    /// so a submission that carries no media constructs nothing, scans
+    /// nothing, and is the submission it always was. `Arc` because a decoded
+    /// image submitted to two passes is decoded once and copied never.
+    pub media: Vec<std::sync::Arc<media_frontend::EncodedSpan>>,
 }
 
 /// Where a fire's folded boundary lands — the host mirror of WIT

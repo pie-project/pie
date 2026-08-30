@@ -62,7 +62,7 @@
 //! | `PIE_PROBE_SKUS` | which rows run — `u4`, `gptoss`, `qwen36`, `gemma4`, comma separated |
 //! | `PIE_PROBE_LANES` | the ladder, comma separated |
 //! | `PIE_PROBE_STEPS` | decode fires in one warm window |
-//! | `PIE_PROBE_MOE_MIN` | `moe_batch_min_per_expert`, for A/B-ing a mixture's two arms |
+//! | `PIE_PROBE_TUNING` | `[metal.tuning]` keys, `key=value` comma separated, for A/B-ing a crossover |
 //! | `PIE_U4_SNAPSHOT` etc. | where each row's snapshot lives |
 
 #![cfg(target_vendor = "apple")]
@@ -331,17 +331,21 @@ fn steps() -> usize {
         .unwrap_or(STEPS)
 }
 
-/// **THE MIXTURE'S CROSSOVER, MOVED FOR ONE RUN** — `PIE_PROBE_MOE_MIN`,
-/// which becomes `[metal.tuning] moe_batch_min_per_expert` in a boot document
-/// this process opens before it loads anything.
+/// **A CROSSOVER, MOVED FOR ONE RUN** — `PIE_PROBE_TUNING`, a comma-separated
+/// list of `key = value` pairs that becomes the body of a `[metal.tuning]`
+/// table in a boot document this process opens before it loads anything.
 ///
-/// It is here because the mixture column below reports a STEP, and a column
-/// that reports one without being able to cross it on purpose is a column that
-/// can only ever be read as a coincidence. `should_batch` fires at
-/// `pairs >= experts × min`, so `0` batches at every width, a number past
-/// `lanes × top_k / experts` batches at none, and the M1 Max's own row says
-/// `1` — which for gpt-oss's 32 experts routed four ways puts the crossover
-/// between the four-lane rung and the eight-lane one.
+/// Any key that table names is reachable, because a sweep that could only move
+/// the ONE constant somebody had already suspected is a sweep that can only
+/// confirm. The two this file was written to cross:
+///
+///   * `moe_batch_min_per_expert` — the mixture column below reports a STEP,
+///     and a column that reports one without being able to cross it on
+///     purpose can only ever be read as a coincidence. `should_batch` fires at
+///     `pairs >= experts × min`, so `0` batches at every width and a number
+///     past `lanes × top_k / experts` batches at none.
+///   * `qmm_min_batch` — the dense GEMV/GEMM crossover, which decides whether
+///     a rung of this ladder reads every weight once or once per lane.
 ///
 /// **ONE ANSWER PER PROCESS, WHICH IS WHY THIS IS A RUN AND NOT AN ARM.**
 /// `kernels_metal::tuning` folds the device row and the document at the first
@@ -350,10 +354,54 @@ fn steps() -> usize {
 /// twice, and a run that states this should also name ONE row in
 /// `PIE_PROBE_SKUS` so that the load which freezes the table is the one that
 /// was told.
-fn moe_crossover() -> Option<u32> {
-    std::env::var("PIE_PROBE_MOE_MIN")
-        .ok()
-        .and_then(|stated| stated.trim().parse().ok())
+///
+/// **AND A GEMM ARM READ OFF A NARROW LADDER IS NOT THE GEMM ARM.** This is
+/// the trap `qmm_min_batch = 2` walks into, and it is worth a paragraph
+/// because it costs a whole sweep. [`ready`] sizes the load at the WIDEST
+/// rung this run asks for, and that ceiling reaches
+/// `kernels_metal::linear::quant::mb_rows` as its `capacity` — so a run told
+/// `PIE_PROBE_LANES=2,3,4` loads a shell whose activation slot holds four
+/// rows, `mb_rows` declines to pad a four-row fire up to a row block it
+/// cannot write, and every rung of the "GEMM" column is silently the GEMV.
+/// The column looks plausible and is a copy of the other arm. **Name a rung
+/// at or above the row block under test** — the sweep behind
+/// [`DeviceTuning::qmm_min_batch`] runs `2,3,4,5,6,7,8,16` for exactly this
+/// reason, and the sixteen-lane row it collects is the control besides.
+///
+/// [`DeviceTuning::qmm_min_batch`]: kernels_metal::tuning::DeviceTuning::qmm_min_batch
+///
+/// **A KEY THIS SPELLS WRONG IS DROPPED IN SILENCE**, because
+/// `engine_metal::boot` reads the table advisorily and a shared document is
+/// not entitled to refuse a boot over a knob. That is precisely the failure
+/// `kernels_metal::tuning`'s header records two false conclusions from, so
+/// [`resolved`] prints what the table ACTUALLY says after the fold, and every
+/// number below is to be read against that line rather than against this one.
+fn stated_tuning() -> Option<String> {
+    let stated = std::env::var("PIE_PROBE_TUNING").ok()?;
+    let body: String = stated
+        .split(',')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| format!("{pair}\n"))
+        .collect();
+    (!body.is_empty()).then_some(body)
+}
+
+/// The crossovers this run is ACTUALLY going to fire, read back out of the
+/// frozen table — see [`stated_tuning`] for why a probe that only echoed what
+/// it asked for would be the one mistake this knob exists to avoid.
+fn resolved() -> String {
+    let t = kernels_metal::tuning::current();
+    format!(
+        "qmm_min_batch {} (moe {}, emulated {}), moe_batch_min_per_expert {}, \
+         moe_tile_mid_per {}, sdpa_tile_min_rows_per_request {}",
+        t.qmm_min_batch,
+        t.qmm_min_batch_moe,
+        t.qmm_min_batch_emulated,
+        t.moe_batch_min_per_expert,
+        t.moe_tile_mid_per,
+        t.sdpa_tile_min_rows_per_request,
+    )
 }
 
 /// A contract lookup the boot door never reaches: the document above is opened
@@ -512,10 +560,9 @@ fn ready(row: &Sku, rungs: &[u32]) -> Option<(Shell, Vec<Vec<u32>>)> {
         .unwrap_or_else(|why| panic!("{sku}'s import contract does not fit {snapshot:?}: {why}"));
     drop(source);
 
-    if let Some(min) = moe_crossover() {
-        let doc = format!("[metal.tuning]\nmoe_batch_min_per_expert = {min}\n");
+    if let Some(body) = stated_tuning() {
+        let doc = format!("[metal.tuning]\n{body}");
         engine_metal::open(doc.as_bytes(), no_door).expect("the boot document opens");
-        eprintln!("{sku}: moe_batch_min_per_expert stated as {min} by PIE_PROBE_MOE_MIN");
     }
 
     let booted = Instant::now();
@@ -552,7 +599,7 @@ fn ready(row: &Sku, rungs: &[u32]) -> Option<(Shell, Vec<Vec<u32>>)> {
     let (weights, arena, pools, inputs) = shell.footprint();
     eprintln!(
         "loaded {sku} on {} in {:.1}s — weights {:.2} GiB, arena {:.1} MiB, pools {:.1} MiB, \
-         inputs {:.1} MiB, {} frames in flight",
+         inputs {:.1} MiB, {} frames in flight\n  tuning: {}",
         shell.device_name(),
         booted.elapsed().as_secs_f64(),
         weights as f64 / (1 << 30) as f64,
@@ -560,6 +607,7 @@ fn ready(row: &Sku, rungs: &[u32]) -> Option<(Shell, Vec<Vec<u32>>)> {
         pools as f64 / (1 << 20) as f64,
         inputs as f64 / (1 << 20) as f64,
         shell.frames_in_flight(),
+        resolved(),
     );
     Some((shell, prompts))
 }

@@ -1065,7 +1065,28 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
 /// arm at a slab the fire never staged. The CUDA shell refuses exactly that
 /// pairing by name — `Fault::MaskWord`, asked per lane against the class the
 /// word resolved to — so the narrowing costs a refusal and never an answer.
-fn stamp_lane_words(req: &mut crate::engine::FireRequest, fire_wide_mask: bool) {
+///
+/// **AND THE SIXTH FACT IS THE SUBMISSION'S, NOT THE LANE'S** (multimodal §15,
+/// media-door §4). `media` says the submission this fire came from attached
+/// spans — one reading of one `forward-pass.media` call, stamped on every lane
+/// the submission fires, because the pass is one pass and its images are its
+/// images whichever row groups it splits into. It joins here rather than
+/// earlier for the reason `drafts` and `captures_scores` do: it imposes no
+/// ordering of its own, so it takes the instant that already exists.
+///
+/// §15's constraint is that this argument and the verb that makes it
+/// reachable land TOGETHER. A lane whose word said `false` while its
+/// submission carried images would compose as the text-only class — and both
+/// `qwen_3` and `gemma_4` guard their embed merge on `Facts::media`, so the
+/// patch rows would have no node to land in and the pass would answer
+/// fluently about an image it never saw. That is not a failure any test
+/// downstream of here catches, which is why it is a constraint and not a
+/// follow-up.
+fn stamp_lane_words(
+    req: &mut crate::engine::FireRequest,
+    fire_wide_mask: bool,
+    carries_media: bool,
+) {
     let model = crate::model::model();
     for lane in &mut req.lanes {
         let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
@@ -1092,6 +1113,7 @@ fn stamp_lane_words(req: &mut crate::engine::FireRequest, fire_wide_mask: bool) 
             lane.adapter.is_some(),
             lane.drafts,
             lane.captures_scores,
+            carries_media,
         );
     }
 }
@@ -1619,6 +1641,44 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let p = ctx.resources().get(&fwd)?;
             p.max_layers
         };
+        // **THE RUN SCAN** (`.wiki/alto/media-door.md` §3, wave MD-A).
+        //
+        // THE TOKENS ARE THE LEDGER AND THIS IS THE AUDIT. A span entered the
+        // sequence as the run `image.tokens()` answered; the handle crossed
+        // again beside it through `forward-pass.media` carrying only the
+        // payload; nothing said where the two meet. So the host finds the
+        // model's reserved placeholder runs in the submitted tokens — a
+        // tokenizer never emits that id from text — and matches them to the
+        // attached spans IN ORDER, refusing every disagreement by name.
+        //
+        // It stands HERE, at the first instant both halves are final: the
+        // tokens are the lanes' only once `geometry.apply_to` has split them,
+        // and the spans are the pass's from the moment `media` was called. A
+        // scan any earlier would be a scan of half the fact, and any later
+        // would be after the fire had staged.
+        let media_spans = ctx.resources().get(&fwd)?.bindings.media.clone();
+        let carries_media = !media_spans.is_empty();
+        let matched = {
+            let lane_tokens: Vec<&[u32]> =
+                req.lanes.iter().map(|lane| lane.tokens.as_slice()).collect();
+            let scanned = if carries_media {
+                crate::pipeline::media::scan(&lane_tokens, &media_spans)
+            } else {
+                // THE OTHER DIRECTION, and it costs one pass over the tokens
+                // on a text-only fire: a run with no span behind it would
+                // otherwise embed the pad id as an ordinary token and decode
+                // as nonsense nothing named.
+                crate::pipeline::media::refuse_orphan_runs(
+                    &lane_tokens,
+                    crate::model::media_pad(),
+                )
+                .map(|()| Vec::new())
+            };
+            match scanned {
+                Ok(matched) => matched,
+                Err(refusal) => return Ok(Err(format!("pipeline: {refusal}"))),
+            }
+        };
         // The mask is on the FIRE when it stays device-resident, and there is
         // no `Lane::mask` to read it back off — so the class is read here,
         // before `apply_to` consumes it, and handed to the word stamp.
@@ -1627,8 +1687,29 @@ pub async fn submit_pass_stamped<C: FireContext>(
             return Ok(Err(format!("pipeline: fire attention mask: {error}")));
         }
         // THE LANES ARE FINISHED, so their words can be stated: rows from the
-        // geometry above, mask from the lowering just now (`palo B-word`).
-        stamp_lane_words(&mut req, fire_wide_mask);
+        // geometry above, mask from the lowering just now (`palo B-word`), and
+        // the media fact from the scan above — multimodal §15's constraint,
+        // landing in the same commit as the verb that makes it reachable.
+        stamp_lane_words(&mut req, fire_wide_mask, carries_media);
+        // **AND THE DOOR IS CUT** (media-door §6, wave MD-C). What stood here
+        // was `Refusal::EngineDoor` — a typed stop, refusing rather than
+        // dropping, because the rows the spans land in did not exist. They
+        // exist: `engine::fire::StepMedia` is the contract's parallel slice
+        // keyed by lane, `lane_media` answers it directly, and the request
+        // carries it to `scheduler::batch`, which rebases each row's lane onto
+        // the step it co-batches into.
+        //
+        // Everything above this line is unchanged and is MD-A's: the scan, its
+        // four refusals, and the word stamp. The attachment is the last act
+        // and it is a move, not a computation.
+        if !matched.is_empty() {
+            let lane_rows: Vec<u32> = req
+                .lanes
+                .iter()
+                .map(|lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX))
+                .collect();
+            req.media = crate::pipeline::media::lane_media(&matched, &lane_rows);
+        }
         crate::pipeline::offload::try_encode(&mut req).await;
         // Resource preparation is independent of token position: realize the
         // declaration once, back only its missing frontier, then snapshot the
@@ -2712,6 +2793,22 @@ async fn fire_device_geometry<C: FireContext>(
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
+    // **A DEVICE-RESOLVED GEOMETRY CANNOT CARRY MEDIA, AND SAYS SO FIRST**
+    // (media-door §3). This path's token ids never reach the host — the
+    // engine resolves the embed port in-graph — so there is no submitted
+    // token list to scan for placeholder runs, and the door's whole safety
+    // argument is that the correspondence is CHECKED rather than promised.
+    // Taking the spans anyway would be taking the guest's word for exactly
+    // the thing the scan exists to not take on trust.
+    if !ctx.resources().get(&fwd)?.bindings.media.is_empty() {
+        return Ok(Err(
+            "pipeline: MediaDeviceGeometry: this pass attached media spans \
+             and resolves its token ids on the device, so the host has no \
+             token list to scan for their placeholder runs — media rides a \
+             host-resolved geometry, where the runs can be checked"
+                .to_string(),
+        ));
+    }
     // Contention-probe marker: when the guest's WIT call reached the host
     // (vs when its build reaches `acquire` — the delta is the build
     // preamble, including the settlement drain below).
@@ -3100,7 +3197,15 @@ async fn fire_device_geometry<C: FireContext>(
     }
     // The same stamp as the wire path, for the same reason and at the same
     // point: rows from the lanes above, mask from the lowering just now.
-    stamp_lane_words(&mut req, fire_wide_mask);
+    //
+    // **AND `false` IS THE ONLY WORD THIS PATH CAN STATE** (media-door §3). A
+    // device-geometry fire's token ids are resolved ON THE DEVICE — the lanes
+    // above are built with `vec![0; rows]` — so there is no host-side token
+    // list to scan for placeholder runs, and a media submission here could
+    // only be taken on the guest's word. `fire_device_geometry`'s entry
+    // refuses that combination by name, so by this line the submission
+    // carries no spans and `false` is a fact rather than a default.
+    stamp_lane_words(&mut req, fire_wide_mask, false);
     // And the same seating, from the same owner: this pass's working set.
     // A device-geometry fire resolves its ROW SPLIT on the device and its
     // seats here, because a seat is not geometry — it is which sequence each

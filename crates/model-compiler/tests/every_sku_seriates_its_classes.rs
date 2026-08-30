@@ -118,7 +118,8 @@ fn constraints(regions: &[Region], classes: &ClassTable) -> Vec<Vec<u8>> {
 /// a text owes a fallback exactly when its attention merge has more than two
 /// arms. Prefill and decode nest; an arm past them is what turns a nested
 /// family into a crossing one. That is the same premise
-/// `a_text_withdraws_exactly_two_fewer_than_its_crossing_axes` prices, so the
+/// `a_text_withdraws_one_mask_per_crossing_axis_once_its_merge_grows_a_third_arm`
+/// prices, so the
 /// two files' claims stand or fall together rather than drifting apart.
 #[test]
 #[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
@@ -337,7 +338,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
 /// it is arithmetic that stopped being true.
 #[test]
 #[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
-fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
+fn a_text_withdraws_one_mask_per_crossing_axis_once_its_merge_grows_a_third_arm() {
     let mut wrong: Vec<String> = Vec::new();
     let mut with_axes = 0usize;
 
@@ -376,7 +377,7 @@ fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
 
             // One withdrawn mask per node set the table names, deduplicated:
             // the rows are keyed by node and a mask is stated by many.
-            let withdrawn = masks
+            let withdrawn: Vec<&Vec<u8>> = masks
                 .iter()
                 .filter(|mask| {
                     compiled
@@ -384,26 +385,62 @@ fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
                         .tree()
                         .is_some_and(|tree| !PqTree::is_interval(tree.frontier(), mask))
                 })
-                .count();
-            // THE MERGE TAX, WHICH USED TO BE A MASKED TAX. The `+ 2` here was
-            // read off qwen, whose attention merge has FOUR arms — masked,
-            // the score capture, decode, prefill — and stated as `if masked`,
-            // which made "has a masked arm" the premise when the arm COUNT was
-            // doing the work. Gemma declares a masked arm too and its merge
-            // has three, so it pays one and not two: it withdraws a single
-            // mask where the flag predicted a pair. Widening the premise
-            // rather than patching the number collapses both branches into one
-            // term, and the flag disappears — two arms cost nothing because
-            // prefill and decode are what the halves arithmetic already
-            // counts.
+                .collect();
+            // **THE BOUND, STATED FOR THE THIRD TIME, AND THE FIRST TWO WERE
+            // COINCIDENCES.**
+            //
+            // It began as `axes - 2` plus a flat `+ 2` when the text declared
+            // a masked arm — read off qwen, whose attention merge has FOUR
+            // arms (masked, the score capture, decode, prefill). Gemma's has
+            // three and pays one, so the flag was widened to the arm COUNT:
+            // `axes - 2 + arms - 2`. That was exact at every pair the catalog
+            // then held, and it was exact by accident — `axes` and `arms` had
+            // never varied independently. `gemma4-e4b-eagle` (2617762b8) is
+            // the row that separates them: a three-arm merge with TWO crossing
+            // axes, where the old form predicts one withdrawal and the bake
+            // makes two.
+            //
+            // What fits all of them, including the two that broke the last
+            // form, is simpler than either: **a text whose attention merge has
+            // more than two arms withdraws one mask per crossing axis, and a
+            // text whose merge has two withdraws nothing.** Prefill and decode
+            // nest, so a two-arm family is laminar and seats whole; a third
+            // arm partitions the classes around a window that the axes then
+            // cannot all be intervals of, and each axis costs one.
+            //
+            // That is the SAME premise `a_text_owes_a_fallback_exactly_when_
+            // its_attention_merge_grows_a_third_arm` is written on, which is
+            // the point: owing and withdrawing are one fact asked twice, and
+            // they now stand or fall together rather than drifting.
             let arms = attention_merge_arms(&trace);
-            let bound = axes.saturating_sub(2) + arms.saturating_sub(2);
-            if withdrawn != bound {
+            let bound = if arms > 2 { axes } else { 0 };
+            if withdrawn.len() != bound {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: {classes} classes, {axes} crossing axes and \
                      {arms} attention merge arms, so the bound is {bound} — but \
-                     {withdrawn} masks are not intervals of the order it ships",
+                     {} masks are not intervals of the order it ships",
+                    withdrawn.len(),
                 ));
+            }
+            // **AND THE COUNT IS CHECKED AGAINST WHAT WAS WITHDRAWN.** A bare
+            // total is what let two coincidences pass; this asks the masks
+            // themselves. Every withdrawn mask is either a HALF — one side of
+            // a crossing axis — or a FAMILY window, `classes / (arms - 1)`,
+            // one of the blocks the merge partitions the classes into. A
+            // withdrawal of any other size is a mask this bound's argument
+            // does not describe, whatever the count says.
+            let families = arms.saturating_sub(1);
+            for mask in &withdrawn {
+                let half = mask.len() * 2 == classes;
+                let family = families > 0 && mask.len() * families == classes;
+                if !half && !family {
+                    wrong.push(format!(
+                        "`{sku}` as {platform:?}: withdrew a mask of {} classes out of \
+                         {classes}, which is neither a half nor one of the {families} \
+                         family windows the {arms}-arm merge partitions them into",
+                        mask.len(),
+                    ));
+                }
             }
         }
     }

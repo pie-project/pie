@@ -1311,6 +1311,27 @@ impl Metal {
             })
             .collect();
 
+        // **AND MEDIA IS REFUSED BY NAME, BEFORE A FIRE ID IS SPENT**
+        // (media-door §6). This shell binds no patch seat: nothing in it
+        // reserves `RuntimeInput::Patches`, stages a payload, or carries a
+        // second row axis through `compose`, so a submission carrying spans has
+        // no rectangle to land in here.
+        //
+        // **REFUSED AND NOT DROPPED**, which is the whole discipline the door
+        // is built on: a fire that quietly forgot its images would answer
+        // fluently about none of them, and nothing downstream of this line
+        // would say so. `Unsupported` and not `Invalid` because the submission
+        // is well formed — it is this ENGINE that does not serve it, which is
+        // exactly what the variant means and what makes a runtime able to tell
+        // "wrong submission" from "wrong backend".
+        if !submission.media.is_empty() {
+            return Err(Error::Unsupported {
+                verb: "a fire carrying media spans, which wants a patch seat this shell \
+                       binds none of",
+                engine: "metal",
+            });
+        }
+
         let id = self.next_fire;
         self.next_fire = self.next_fire.wrapping_add(1);
 

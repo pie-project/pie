@@ -98,21 +98,36 @@ use crate::serve::{Graphs, Knobs};
 /// that binds, bakes and lands, and there is nothing to bind before a plan
 /// says what to bake.
 pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Cuda, String> {
+    Ok(Cuda::new(read(config_bytes)?, contract_for))
+}
+
+/// **The boot document, as this shell's own type** — [`open`] without the
+/// device it would be opened as.
+///
+/// The whole of [`open`]'s reading, split out so that WHAT A DOCUMENT SAYS can
+/// be checked without a machine. Every key here has had the same failure at
+/// least once — `[model] weight_cache_dir` was written by the worker and
+/// parsed by nobody for a whole rewrite, and `[engine] gpu_mem_utilization`
+/// for four waves after that — and a key nobody can read back is a key whose
+/// arrival nothing tests.
+///
+/// # Errors
+///
+/// A boot document that is not UTF-8 or not TOML, or one whose keys are out of
+/// the range they declare, as a sentence.
+pub fn read(config_bytes: &[u8]) -> Result<DeviceBoot, String> {
     let doc: toml::Table = std::str::from_utf8(config_bytes)
         .map_err(|error| format!("the cuda boot config is not utf-8: {error}"))?
         .parse()
         .map_err(|error| format!("the cuda boot config is not TOML: {error}"))?;
-    Ok(Cuda::new(
-        DeviceBoot {
-            ordinal: ordinal(&doc),
-            graphs: graphs(&doc),
-            knobs: knobs(&doc),
-            weight_cache_dir: weight_cache_dir(&doc),
-            program_cache_dir: program_cache_dir(&doc),
-            adapter_dir: adapter_dir(&doc),
-        },
-        contract_for,
-    ))
+    Ok(DeviceBoot {
+        ordinal: ordinal(&doc),
+        graphs: graphs(&doc),
+        knobs: knobs(&doc)?,
+        weight_cache_dir: weight_cache_dir(&doc),
+        program_cache_dir: program_cache_dir(&doc),
+        adapter_dir: adapter_dir(&doc),
+    })
 }
 
 /// Which device `[model] device` names.
@@ -160,7 +175,7 @@ fn graphs(doc: &toml::Table) -> Graphs {
 /// a value the reader does not understand is absent too: the arms below
 /// accept exactly the spellings the environment words accepted, and anything
 /// else leaves the default rather than inventing a third answer.
-fn knobs(doc: &toml::Table) -> Knobs {
+fn knobs(doc: &toml::Table) -> Result<Knobs, String> {
     let table = doc.get("engine").and_then(toml::Value::as_table);
     let word = |key: &str| -> Option<&str> {
         table
@@ -183,7 +198,8 @@ fn knobs(doc: &toml::Table) -> Knobs {
         }
     };
     let stock = Knobs::default();
-    Knobs {
+    Ok(Knobs {
+        gpu_mem_utilization: gpu_mem_utilization(table, stock.gpu_mem_utilization)?,
         pad: flag("pad", stock.pad),
         fold: flag("fold", stock.fold),
         pipeline: flag("pipeline", stock.pipeline),
@@ -210,7 +226,57 @@ fn knobs(doc: &toml::Table) -> Knobs {
             },
             _ => stock.side_streams,
         },
+    })
+}
+
+/// **What fraction of the card `[engine] gpu_mem_utilization` lets pie hold**,
+/// weights included (alto streaming §3 item 5, `next.md` B1).
+///
+/// **THE KEY WAS ALREADY BEING WRITTEN AND NOBODY READ IT** — the same
+/// sentence [`weight_cache_dir`] earns, one table over and for four waves
+/// longer. `worker::config` has declared it, defaulted it to `0.90`, validated
+/// it in `(0.0, 1.0]` and put it in the schema since before the palo rewrite,
+/// and `grep` found no reader in any shell: the elastic pool took ~100% of
+/// what the card had free. This is the read.
+///
+/// Absent is `default`, which is [`crate::DEFAULT_GPU_MEM_UTILIZATION`] —
+/// `0.90`, the worker's own default for the key, so a boot document that says
+/// nothing means what the config that says nothing means.
+///
+/// **OUT OF RANGE REFUSES AT BOOT, BY THE KEY'S NAME**, rather than being
+/// clamped into something that runs. It is validated in `worker::config` too
+/// and this is not a duplicate schema: a boot document may be written by hand
+/// or by another launcher, this shell is the party that turns the number into
+/// bytes, and a fraction of `0` or `1.7` is a deployment nobody meant. An
+/// INTEGER is accepted beside a float for the one value that has both
+/// spellings (`gpu_mem_utilization = 1`), because refusing that would be a
+/// schema this document has nowhere to publish — the same ruling `flag` makes
+/// about `pad = "off"`.
+fn gpu_mem_utilization(table: Option<&toml::Table>, default: f64) -> Result<f64, String> {
+    let stated = match table.and_then(|engine| engine.get("gpu_mem_utilization")) {
+        None => return Ok(default),
+        Some(toml::Value::Float(fraction)) => *fraction,
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "the only integers in range are 0 and 1, both exact"
+        )]
+        Some(toml::Value::Integer(fraction)) => *fraction as f64,
+        Some(other) => {
+            return Err(format!(
+                "[engine] gpu_mem_utilization is a fraction of this card in (0.0, 1.0],                  and this document spells it {other}"
+            ));
+        }
+    };
+    if !stated.is_finite() || stated <= 0.0 || stated > 1.0 {
+        return Err(format!(
+            "[engine] gpu_mem_utilization must be finite and in (0.0, 1.0]; this \
+             document says {stated}. It is the fraction of the whole card this \
+             deployment lets pie hold, weights included — 1.0 is the whole card, \
+             which is what the elastic pool took before the key reached a shell \
+             at all."
+        ));
     }
+    Ok(stated)
 }
 
 /// Where `[model] weight_cache_dir` says this deployment keeps its warm-boot
@@ -346,7 +412,9 @@ graphs = "shaped""#), Graphs::Shaped);
     /// anywhere in the path. `pad` and `fold` are the two the gate names.
     #[test]
     fn a_knob_set_in_the_boot_document_reaches_the_shells_toggle() {
-        let read = |text: &str| knobs(&text.parse::<toml::Table>().expect("valid TOML"));
+        let read = |text: &str| {
+            knobs(&text.parse::<toml::Table>().expect("valid TOML")).expect("a legal document")
+        };
         assert_eq!(read("").pad, true, "absent is the shell's own default");
         assert_eq!(read("").fold, false);
         assert_eq!(read("[engine]\npad = false").pad, false);
@@ -356,9 +424,8 @@ graphs = "shaped""#), Graphs::Shaped);
         // Everything a key does not mention keeps the default, so one stated
         // knob never moves another.
         let one = read("[engine]\nfold = true");
-        assert_eq!(
-            Knobs { fold: false, ..one },
-            Knobs::default(),
+        assert!(
+            Knobs { fold: false, ..one } == Knobs::default(),
             "stating `fold` moved something else"
         );
     }
@@ -379,7 +446,9 @@ graphs = "shaped""#), Graphs::Shaped);
     /// The other five keys, and the two that are not booleans.
     #[test]
     fn every_engine_knob_key_is_read_in_the_spellings_the_words_took() {
-        let read = |text: &str| knobs(&text.parse::<toml::Table>().expect("valid TOML"));
+        let read = |text: &str| {
+            knobs(&text.parse::<toml::Table>().expect("valid TOML")).expect("a legal document")
+        };
         assert_eq!(read("[engine]\npipeline = \"off\"").pipeline, false);
         assert_eq!(read("[engine]\nfallback_copy = 0").copies, true, "not a bool: default");
         assert_eq!(read("[engine]\nfallback_copy = \"0\"").copies, false);
@@ -393,5 +462,32 @@ graphs = "shaped""#), Graphs::Shaped);
         assert_eq!(read("[engine]\nside_streams = 4").side_streams, Some(4));
         assert_eq!(read("[engine]\nside_streams = \"off\"").side_streams, Some(0));
         assert_eq!(read("").side_streams, None, "absent leaves the profile's figure");
+    }
+
+    /// **THE TENTH `[engine]` KEY, AND THE ONE THAT WAS NEVER A `PIE_CUDA_*`
+    /// WORD** (alto streaming §3 item 5, `next.md` B1): the fraction of the
+    /// card this deployment lets pie hold. Declared, defaulted, validated and
+    /// schema'd in `worker::config` for four waves and read by no shell —
+    /// which is the failure `[model] weight_cache_dir` had, one table over.
+    #[test]
+    fn the_memory_fraction_is_read_and_an_illegal_one_refuses_by_the_keys_name() {
+        let read = |text: &str| {
+            let doc = text.parse::<toml::Table>().expect("valid TOML");
+            let table = doc.get("engine").and_then(toml::Value::as_table);
+            gpu_mem_utilization(table, crate::DEFAULT_GPU_MEM_UTILIZATION)
+        };
+        assert_eq!(read("").expect("absent is legal"), 0.90, "the config's own default");
+        assert_eq!(read("[engine]\ngraphs = \"on\"").expect("legal"), 0.90);
+        assert_eq!(read("[engine]\ngpu_mem_utilization = 0.5").expect("legal"), 0.5);
+        // The whole card, in both spellings an operator writes it in.
+        assert_eq!(read("[engine]\ngpu_mem_utilization = 1.0").expect("legal"), 1.0);
+        assert_eq!(read("[engine]\ngpu_mem_utilization = 1").expect("legal"), 1.0);
+        // And out of range refuses rather than clamping: a fraction silently
+        // rounded into range is a number the operator cannot see is not theirs.
+        for bad in ["0.0", "-0.5", "1.5", "nan", "\"lots\""] {
+            let refusal = read(&format!("[engine]\ngpu_mem_utilization = {bad}"))
+                .expect_err("outside (0.0, 1.0] is not a deployment");
+            assert!(refusal.contains("gpu_mem_utilization"), "got: {refusal}");
+        }
     }
 }

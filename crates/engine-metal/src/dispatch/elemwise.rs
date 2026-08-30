@@ -75,15 +75,18 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            // **THE CENTRED NORM AND THE CLAMP, REFUSED BY NAME** (multimodal
-            // §6.1, §6.5). This plane's `elemwise::norm` ships no centred
-            // entry and its `elemwise` no free-standing clamp, so the arms
-            // that exist here are the two names — which is the family's rule
+            // **THE CENTRED NORMS AND THE CLAMP, REFUSED BY NAME**
+            // (multimodal §6.1, §6.5, next.md B5). This plane's
+            // `elemwise::norm` ships no centred entry — neither the scale-less
+            // one nor the fused whole-`LayerNorm` beside it — and its
+            // `elemwise` no free-standing clamp, so the arms that exist here
+            // are the names — which is the family's rule
             // the other way round from `attn::dense`'s: a written shader gets
             // a forwarding arm, an unwritten one gets its own refusal rather
             // than a shader that norms the wrong thing. One `kernels-metal`
             // entry each retires these, and nothing else moves.
             Elementwise::LayernormNoScale { .. }
+            | Elementwise::Layernorm { .. }
             | Elementwise::Clamp { .. }
             | Elementwise::ClampLearned { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })

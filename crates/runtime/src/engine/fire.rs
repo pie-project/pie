@@ -114,6 +114,20 @@ pub struct FireRequest {
     /// be the epilogue ([`Attachment`]'s own doc). `batch` stamps
     /// [`Boundary::Epilogue`].
     pub boundary_program: bool,
+    /// **THE MEDIA SPANS THIS REQUEST'S PASS ATTACHED** (media-door §6, wave
+    /// MD-C), keyed by lane and empty for every text-only request — which is
+    /// every request that does not call `forward-pass.media`.
+    ///
+    /// `lane` is an index into THIS REQUEST's [`lanes`](FireRequest::lanes),
+    /// because a submission cannot know which step it co-batches into;
+    /// `scheduler::batch` rebases it by the member's own lane offset when it
+    /// concatenates, exactly as it stamps an [`Attachment`]'s lane.
+    ///
+    /// **IT IS THE CONTRACT'S OWN RECORD AND NOT A RUNTIME COPY OF IT.**
+    /// `pipeline::media::lane_media` derives the rows from the run scan and
+    /// answers `engine::fire::StepMedia` directly, so `batch` moves them into
+    /// the step and nothing between here and the engine re-states a number.
+    pub media: Vec<engine::fire::StepMedia>,
 }
 
 impl FireRequest {

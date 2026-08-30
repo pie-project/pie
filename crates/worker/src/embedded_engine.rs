@@ -529,6 +529,11 @@ fn land(
     platform: model_ir::Platform,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
+    // **`[model] sku`, OR `None` TO IDENTIFY ONE** (media-door §6). A
+    // checkpoint that fits two rows — a vision artifact fits its text trunk's
+    // row and its own — is identified as the first that fits, and the
+    // operator names the other one when they want it.
+    sku: Option<&str>,
 ) -> Result<engine::Loaded> {
     if component != crate::executor::ModelComponent::Full {
         // palo B-component: an encoder is a traced plan like any other, and
@@ -544,7 +549,15 @@ fn land(
     // frame_dispatch_depth` is the deployment's statement of how many frames
     // it will keep posted to the engine; the engine's staging ring and
     // settlement event pool are sized from it and from nothing else.
-    let request = ::runtime::engine::load::request(
+    // **THE OPERATOR'S ROW WINS, AND ONLY WHEN THEY STATED ONE.** `request`
+    // identifies; `request_for` takes a name the caller already knows and
+    // asks the catalog for its trace. A sku that does not fit this checkpoint
+    // is refused where every mismatched load is — `checkpoint::plan::compile`,
+    // inside the weight residency, naming the param and both shapes — which is
+    // the same sentence an operator gets today for a checkpoint that fits no
+    // row at all.
+    let request = ::runtime::engine::load::request_of(
+        sku,
         snapshot_dir,
         platform,
         budgets,
@@ -693,10 +706,6 @@ pub(crate) fn write_cuda_startup_toml(
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
-    batching.insert(
-        "gpu_mem_utilization".into(),
-        toml::Value::Float(opts.gpu_mem_utilization),
-    );
     insert_str(
         &mut batching,
         "memory_profile",
@@ -749,6 +758,24 @@ pub(crate) fn write_cuda_startup_toml(
     // answer for an absent key, so writing one would be a second spelling of
     // absence — and, here, a second place the default is written down.
     let mut engine = toml::Table::new();
+    // **AND THE FRACTION MOVED HERE FROM `[batching]`, BECAUSE HERE IT HAS A
+    // READER** (alto streaming §3 item 5, `next.md` B1). `gpu_mem_utilization`
+    // was written into `[batching]` for the C++ engine that read that table,
+    // and when the shell became Rust nothing read `[batching]` at all: the key
+    // was declared, defaulted, validated and schema'd, and reached no engine.
+    // `engine_cuda::boot` reads the `[engine]` table and only the `[engine]`
+    // table, so this is where the number has to be written for the elastic
+    // pool to see it. Moved rather than duplicated — two spellings of one
+    // operator statement is the drift `backend.rs`' header warns about.
+    //
+    // ALWAYS WRITTEN, unlike the optional keys below it: the field is an `f64`
+    // with a default rather than an `Option`, so what the operator stated and
+    // what the config defaulted to are the same number by the time it reaches
+    // here, and there is no absence left to express.
+    engine.insert(
+        "gpu_mem_utilization".into(),
+        toml::Value::Float(opts.gpu_mem_utilization),
+    );
     if let Some(graphs) = opts.graphs.as_deref() {
         insert_str(&mut engine, "graphs", graphs);
     }
@@ -773,6 +800,11 @@ pub(crate) fn write_cuda_startup_toml(
     if let Some(streams) = opts.side_streams {
         insert_int(&mut engine, "side_streams", i64::from(streams));
     }
+    // The guard predates the fraction, which is always written, so the table is
+    // never empty now. Kept rather than deleted: it is the rule for the keys
+    // BELOW it — every one of them omitted when the operator stated nothing —
+    // and a future where the fraction moves back out should not have to
+    // rediscover it.
     if !engine.is_empty() {
         insert_table(&mut doc, "engine", engine);
     }
@@ -924,6 +956,8 @@ pub(crate) fn create_engine_backend_group(
     // as VALUES beside `residency` for W-3's reason: this layer holds a boot
     // document and an adapter roster, not the worker's `Config`.
     patch_ceilings: (Option<u32>, Option<u32>),
+    // `[model] sku`, or `None` to identify one — see `land`.
+    sku: Option<&str>,
 ) -> Result<crate::translate::GroupEngine> {
     validate_snapshot_dir(snapshot_dir)?;
     if rank_options.is_empty() {
@@ -1007,6 +1041,7 @@ pub(crate) fn create_engine_backend_group(
         model_ir::Platform::Cuda,
         component,
         frames_in_flight,
+        sku,
     )?;
     // THE BANKS ARE RESERVED BY THE LOAD; THIS IS THE WRITE. Between the
     // load and the handover is the last instant this layer holds the engine.
@@ -1045,6 +1080,8 @@ pub(crate) fn create_engine_backend(
     // as VALUES beside `residency` for W-3's reason: this layer holds a boot
     // document and an adapter roster, not the worker's `Config`.
     patch_ceilings: (Option<u32>, Option<u32>),
+    // `[model] sku`, or `None` to identify one — see `land`.
+    sku: Option<&str>,
 ) -> Result<crate::translate::GroupEngine> {
     // Each is used only inside a `#[cfg(feature = "engine-…")]` arm below.
     let _ = (group_id, tp, config, weight_dtype);
@@ -1133,6 +1170,29 @@ pub(crate) fn create_engine_backend(
                     format!("read the engine boot config just written to {toml_path:?}")
                 })?;
                 let backend = ::runtime::engine::backend::open::metal(&boot_doc)?;
+                let page_size = opts.kv_page_size.max(1);
+                let max_context = opts
+                    .max_model_len
+                    .unwrap_or_else(|| engine::Budgets::default().max_context);
+                // **`total_pages` IS A PAGE COUNT AND `slots` IS A SEAT
+                // COUNT**, and the budget below handed the first over as the
+                // second until this line existed. `Paging::of` gives every
+                // seat a block of `max_context / page_size` pages and reserves
+                // the product (`model_exec::store::kv::Paging::pages`), so
+                // 1024 PAGES read as 1024 SEATS reserved 131072 pages — a
+                // hundred and twenty-eight times the pool the operator asked
+                // for. On qwen35-d0.8b that is 8 GiB of KV per attention
+                // layer, and what it buys is a first command buffer that
+                // either fails with `kIOGPUCommandBufferCallbackError
+                // OutOfMemory` or hangs the device outright.
+                //
+                // The division is `cuda_budgets`' own, and that function's
+                // header already says why it is the only honest one: "the
+                // shell's paging hands each seated sequence one block of
+                // `max_context / page_size` pages: how many sequences fit is
+                // that division, not a third knob to keep in step". Both arms
+                // read the operator's page cap as a page cap now.
+                let pages_per_slot = max_context.div_ceil(page_size).max(1);
                 (
                     backend,
                     engine::Budgets {
@@ -1145,11 +1205,9 @@ pub(crate) fn create_engine_backend(
                         // no configuration at all, and an adapter seat count
                         // is not a fact about a backend.
                         max_adapters: adapters.seats(),
-                        page_size: opts.kv_page_size.max(1),
-                        max_context: opts
-                            .max_model_len
-                            .unwrap_or_else(|| engine::Budgets::default().max_context),
-                        slots: opts.total_pages.max(1),
+                        page_size,
+                        max_context,
+                        slots: (opts.total_pages / pages_per_slot).max(1),
                         // The metal mirror binds no patch seat and refuses
                         // every patch-axis input by name, so a ladder here
                         // would be a ceiling on a rectangle this plane cannot
@@ -1179,6 +1237,7 @@ pub(crate) fn create_engine_backend(
         platform,
         component,
         frames_in_flight,
+        sku,
     )?;
 
     // THE BANKS ARE RESERVED BY THE LOAD; THIS IS THE WRITE. See
@@ -1363,9 +1422,13 @@ mod tests {
     /// key nobody writes is a key nobody can set — the same failure
     /// `[model] weight_cache_dir` had for a whole rewrite.
     ///
-    /// A default boot writes NO `[engine]` table at all, because the shell's
+    /// A default boot writes ONLY `gpu_mem_utilization`, because the shell's
     /// own default is the answer for an absent key and a second spelling of
-    /// absence is a second place the default is written down.
+    /// absence is a second place the default is written down — and the
+    /// fraction is the one key with no absence to spell: it is an `f64` with a
+    /// default rather than an `Option`, so by the time it reaches this writer
+    /// the operator's statement and the config's default are one number
+    /// (`next.md` B1).
     #[test]
     fn the_startup_toml_writes_only_the_engine_knobs_an_operator_stated() {
         let dir = tempfile::tempdir().unwrap();
@@ -1378,9 +1441,15 @@ mod tests {
         };
 
         let quiet = write(&CudaNativeEngineOptions::default(), "quiet.toml");
-        assert!(
-            quiet.get("engine").is_none(),
-            "a boot that stated no knob must write no `[engine]` table: {quiet:?}"
+        let quiet_engine = quiet["engine"].as_table().unwrap();
+        assert_eq!(
+            quiet_engine.len(),
+            1,
+            "a boot that stated no knob writes the fraction and nothing else: {quiet:?}"
+        );
+        assert_eq!(
+            quiet_engine["gpu_mem_utilization"].as_float().unwrap(),
+            0.90
         );
 
         let stated = write(
@@ -1400,6 +1469,10 @@ mod tests {
         assert_eq!(engine["pad"].as_bool().unwrap(), false);
         assert_eq!(engine["fold_disable"].as_str().unwrap(), "library");
         assert_eq!(engine["side_streams"].as_integer().unwrap(), 0);
+        // **AND THE FRACTION IS THERE WITHOUT BEING ASKED FOR** — the one key
+        // an operator cannot omit from this table, because the config type has
+        // already turned its absence into `0.90`.
+        assert_eq!(engine["gpu_mem_utilization"].as_float().unwrap(), 0.90);
         // And nothing the operator did not state.
         assert!(engine.get("pipeline").is_none());
         assert!(engine.get("grouped").is_none());
@@ -1516,8 +1589,14 @@ calibrate_planner = true
         // second spelling of an absent key.
         assert!(val["batching"].get("kv_page_size").is_none());
         assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
+        // **THE FRACTION IS AN `[engine]` KEY**, because `[engine]` is the only
+        // table `engine_cuda::boot` reads: it sat in `[batching]` for the C++
+        // engine and reached no Rust shell at all (`next.md` B1). Asserted
+        // ABSENT from `[batching]` as well as present here, so the move cannot
+        // silently become a duplication.
+        assert!(val["batching"].get("gpu_mem_utilization").is_none());
         assert_eq!(
-            val["batching"]["gpu_mem_utilization"].as_float().unwrap(),
+            val["engine"]["gpu_mem_utilization"].as_float().unwrap(),
             0.90
         );
         assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
@@ -1528,7 +1607,8 @@ calibrate_planner = true
         // derived in memory -- see `CudaNativeEngineOptions::calibrate_planner`
         // for why it cannot come from a file.
         assert!(val["batching"].get("calibrate_planner").is_none());
-        assert_eq!(val["batching"].as_table().unwrap().len(), 4);
+        // Three, not four: the fraction is `[engine]`'s now.
+        assert_eq!(val["batching"].as_table().unwrap().len(), 3);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         // Expert streaming is off unless an operator asks for it: for a model
         // that fits it is strictly slower, and it costs graph capture besides.

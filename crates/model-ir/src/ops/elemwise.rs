@@ -67,6 +67,40 @@ pub enum Elementwise {
         eps: f32,
         y: ValueId,
     },
+    /// **THE WHOLE `nn.LayerNorm`, IN ONE ROW** (multimodal §9.1's owed
+    /// saving, next.md B5).
+    ///
+    /// `y = (x − mean(x)) · rsqrt(var(x) + eps) · w + b`, whole rows, the
+    /// scale and the bias read as `[width]` planes.
+    ///
+    /// **WHY THIS EXISTS BESIDE
+    /// [`LayernormNoScale`](Elementwise::LayernormNoScale).** §9.1 found the
+    /// import fold half-expressible — `Expr::Scale` bakes `w` into the GEMM
+    /// behind the norm, `Expr::Bias` adds one compile-time constant where
+    /// `b·Mᵀ` is a matrix-vector product, and the two do not compose — so the
+    /// towers spell the norm at RUNTIME. The spelling that stood until this
+    /// row is three nodes:
+    ///
+    /// ```text
+    /// add_bias(b, rmsnorm(layernorm_no_scale(x, eps), w, eps))
+    /// ```
+    ///
+    /// which is TWO elementwise passes and a third launch for the bias, times
+    /// twenty-five norms per qwen35 tower fire (`norm1`/`norm2` on twelve
+    /// blocks, plus `merger.norm`). This row is those three, and the
+    /// centred row it computes is never rounded to a storage type on the way
+    /// through — which is the one thing the composition cannot claim.
+    ///
+    /// The scale-less variant STAYS: it is what a text writes when the scale
+    /// really does bake, and the two differ in what they read and not in a
+    /// flag.
+    Layernorm {
+        x: ValueId,
+        weight: ValueId,
+        bias: ValueId,
+        eps: f32,
+        y: ValueId,
+    },
     /// **THE CLIPPED LINEAR'S HALF THAT IS NOT A GEMM** (multimodal §6.5).
     ///
     /// `x = min(max(x, lo), hi)`, in place, with both bounds TRACE CONSTANTS.
@@ -343,6 +377,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHeadPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
             Self::RmsnormNoScale { x, .. } => sink.push(*x),
             Self::LayernormNoScale { x, .. } => sink.push(*x),
+            Self::Layernorm { x, weight, bias, .. } => sink.extend([*x, *weight, *bias]),
             Self::Clamp { x, .. } => sink.push(*x),
             Self::ClampLearned { x, lo, hi, .. } => sink.extend([*x, *lo, *hi]),
             Self::RmsnormGated { x, gate, weight, .. } => sink.extend([*x, *gate, *weight]),
@@ -382,6 +417,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHeadPlusOne { y, .. } => sink.push(*y),
             Self::RmsnormNoScale { y, .. } => sink.push(*y),
             Self::LayernormNoScale { y, .. } => sink.push(*y),
+            Self::Layernorm { y, .. } => sink.push(*y),
             Self::Clamp { x_out, .. } => sink.push(*x_out),
             Self::ClampLearned { x_out, .. } => sink.push(*x_out),
             Self::RmsnormGated { y, .. } => sink.push(*y),
@@ -412,6 +448,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHeadPlusOne { .. } => {}
             Self::RmsnormNoScale { .. } => {}
             Self::LayernormNoScale { .. } => {}
+            Self::Layernorm { .. } => {}
             Self::Clamp { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::ClampLearned { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::RmsnormGated { .. } => {}
@@ -446,6 +483,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHeadPlusOne { .. } => "elementwise.rmsnorm_per_head_plus_one",
             Self::RmsnormNoScale { .. } => "elementwise.rmsnorm_no_scale",
             Self::LayernormNoScale { .. } => "elementwise.layernorm_no_scale",
+            Self::Layernorm { .. } => "elementwise.layernorm",
             Self::Clamp { .. } => "elementwise.clamp",
             Self::ClampLearned { .. } => "elementwise.clamp_learned",
             Self::RmsnormGated { .. } => "elementwise.rmsnorm_gated",

@@ -104,6 +104,12 @@ members = [
     "crates/eta-dsl",
     "crates/eta-compiler",
 
+    # -- the media door (.wiki/alto/media-door.md §4) ------------------------
+    # The front-end contract: encoded bytes in, one EncodedSpan out. Per-arch
+    # preprocessing lives behind its traits; the runtime dispatches on
+    # `ROWS.arch` and names no architecture of its own.
+    "crates/media-frontend",
+
     # -- guest-target members (outside default-members, see below) ----------
     # `inferlet` owns the canonical `pie:inferlet` WIT package (`wit/`) AND is
     # the wit-bindgen site over it -- it has to be both, because `generate!`
@@ -178,6 +184,8 @@ default-members = [
     "crates/model",
     "crates/model-ir",
     "crates/model-dsl",
+    # Deviceless, decodeless above the trait — a workspace sweep carries it.
+    "crates/media-frontend",
     # Pure, deviceless and fast to check — a workspace sweep should carry it.
     "crates/model-compiler",
     "crates/checkpoint",

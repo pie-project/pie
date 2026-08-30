@@ -170,6 +170,18 @@ inline bool m1_sort_better(float value, uint index, float best, uint best_index)
   return index < best_index;
 }
 
+// The descending total order of `m1_sort_better`, as a sortable u32 key:
+// smaller key = better. NaN keys sort last so they never displace a real
+// element. Ported from `ptir_m1_runtime_prologue.cuh`'s `m1_desc_key`, whose
+// radix select below reads the same bits in the same order.
+inline uint m1_desc_key(float value) {
+  if (isnan(value)) return 0xFFFFFFFFu;
+  if (value == 0.0f) value = 0.0f;  // -0.0 compares equal to +0.0
+  const uint bits = as_type<uint>(value);
+  const uint ascending = (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+  return ~ascending;
+}
+
 inline uint m1_pick(uint len, uint index) {
   return len == 1 ? 0u : index;
 }
@@ -881,40 +893,88 @@ inline void ptir_m1_execute(
     for (uint row = 0; row < d0.rows; ++row) {
       const uint base = row * d0.last;
       if (p.pred_tag == 0) {
-        int k = m1_load_i(a1, m1_pick(d1.len, row), d1.dtype);
-        k = clamp(k, 0, int(d0.last));
-        for (uint i = 0; i < d0.last; ++i) {
-          const float value = m1_load_f(a0, base + i, d0.dtype);
-          int greater = 0;
-          if (!isnan(value))
+        int signed_k = m1_load_i(a1, m1_pick(d1.len, row), d1.dtype);
+        uint k = signed_k <= 0 ? 0u : uint(signed_k);
+        if (k > d0.last) k = d0.last;
+        if (k == 0u) {
+          for (uint i = 0; i < d0.last; ++i) m1_store_b(o0, base + i, false);
+        } else {
+          // 4-pass 8-bit MSB radix select on `m1_desc_key`, O(5*len). The
+          // form this replaces rescanned the whole row for every element --
+          // O(len^2) on ONE thread, ~1.2e11 visits at a 248320-token
+          // vocabulary, which is a hang rather than a slow answer.
+          //
+          // `greater(i)` is the count of strictly smaller keys and is monotone
+          // in the key, so `greater(i) < k` holds exactly when
+          // `key(i) <= K_k` for `K_k` the k-th smallest key counting
+          // multiplicity: ties all survive or all fall together, which is what
+          // the reference does. Ported from `ptir_m1_runtime_body.cuh`, which
+          // took the same fix for the same reason.
+          uint histogram[256];
+          uint prefix = 0u;
+          uint target = k;
+          for (int pass = 0; pass < 4; ++pass) {
+            const int shift = 24 - 8 * pass;
+            // `pass == 0` is special-cased because shifting a 32-bit value by
+            // 32 is undefined, not zero.
+            const uint high_mask = (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+            for (uint bucket = 0u; bucket < 256u; ++bucket) histogram[bucket] = 0u;
             for (uint j = 0; j < d0.last; ++j) {
-              const float other = m1_load_f(a0, base + j, d0.dtype);
-              if (!isnan(other) && other > value) ++greater;
+              const uint key = m1_desc_key(m1_load_f(a0, base + j, d0.dtype));
+              if ((key & high_mask) == (prefix & high_mask))
+                ++histogram[(key >> shift) & 0xFFu];
             }
-          m1_store_b(o0, base + i, !isnan(value) && greater < k);
+            uint run = 0u;
+            uint chosen = 255u;
+            for (uint bucket = 0u; bucket < 256u; ++bucket) {
+              if (run + histogram[bucket] >= target) { chosen = bucket; break; }
+              run += histogram[bucket];
+            }
+            target -= run;
+            prefix |= chosen << shift;
+          }
+          for (uint i = 0; i < d0.last; ++i) {
+            const float value = m1_load_f(a0, base + i, d0.dtype);
+            m1_store_b(o0, base + i, !isnan(value) && m1_desc_key(value) <= prefix);
+          }
         }
       } else if (p.pred_tag == 1) {
+        // Descending selection with the LAST PICK's total-order key as the
+        // availability threshold (the k_pivot_cummassle technique) instead of
+        // an already-picked rescan: the rescan made this O(len^3) on ONE
+        // thread -- >10^16 steps at a 248320-token vocabulary, which is what
+        // hung every sampling inferlet on this plane. Bit-identical picks and
+        // keep bits: `m1_sort_better` is a strict total order, so "strictly
+        // after the previous pick" visits the same elements in the same
+        // order, and once `exclusive` clears the threshold (or goes NaN) every
+        // later keep is false -- they are pre-stored and the loop stops early.
+        // Ported from `ptir_m1_runtime_body.cuh`, which took the same fix.
         const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
+        for (uint i = 0; i < d0.last; ++i) m1_store_b(o0, base + i, false);
         float exclusive = 0.0f;
-        for (uint position = 0; position < d0.last; ++position) {
+        float prev_value = 0.0f;
+        uint prev_index = 0;
+        bool have_prev = false;
+        for (uint position = 0; position < d0.last && exclusive < threshold; ++position) {
           uint best_index = 0;
-          float best_value = NAN;
+          float best_value = 0.0f;
           bool found = false;
           for (uint candidate = 0; candidate < d0.last; ++candidate) {
-            bool used = false;
-            for (uint prior = 0; prior < position; ++prior)
-              if (reinterpret_cast<device uint*>(temporary)[prior] == candidate) used = true;
-            if (used) continue;
             const float value = m1_load_f(a0, base + candidate, d0.dtype);
+            if (have_prev && !m1_sort_better(prev_value, prev_index, value, candidate))
+              continue;
             if (!found || m1_sort_better(value, candidate, best_value, best_index)) {
               found = true;
               best_value = value;
               best_index = candidate;
             }
           }
-          reinterpret_cast<device uint*>(temporary)[position] = best_index;
+          if (!found) break;
           m1_store_b(o0, base + best_index, exclusive < threshold);
           exclusive += best_value;
+          prev_value = best_value;
+          prev_index = best_index;
+          have_prev = true;
         }
       } else {
         const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);

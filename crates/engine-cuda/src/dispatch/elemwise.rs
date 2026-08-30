@@ -84,6 +84,25 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
+            // **AND THE WHOLE OF IT, IN ONE LAUNCH** (next.md B5). §9.1 read
+            // the fold again and found it half expressible, so the towers say
+            // the norm at runtime; this arm is the three nodes they used to
+            // say it in — `add_bias(b, rmsnorm(layernorm_no_scale(x), w))` —
+            // collapsed to one.
+            Elementwise::Layernorm {
+                x,
+                weight,
+                bias,
+                eps,
+                y,
+            } => elemwise::layernorm::layernorm(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*weight),
+                self.tensor(*bias),
+                *eps,
+                &mut self.tensor(*y),
+            ),
             // **THE CLIPPED LINEAR'S CLAMP** (multimodal §6.5), in place on
             // `x` — the IR aliases `x_out` onto it.
             Elementwise::Clamp { x, lo, hi, x_out: _ } => {

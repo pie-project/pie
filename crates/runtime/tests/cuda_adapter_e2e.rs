@@ -235,6 +235,7 @@ fn run(checkpoint: &Path, prompt: &[u32], graphs: Graphs, routing: Routing) -> V
             readout: Readout::Last,
         }],
         attachments: Vec::new(),
+        media: Vec::new(),
     };
     step.validate().expect("the submission is one the contract describes");
     let frame = engine::FrameSubmission::of(step);

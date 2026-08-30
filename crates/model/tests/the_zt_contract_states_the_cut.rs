@@ -40,6 +40,12 @@ fn skus() -> Vec<Sku> {
         sku("gemma4-e4b-bf16-kv-bf16", |src| {
             model::gemma_4::model::Model::e4b(Dtype::Bf16, Dtype::Bf16, 1).load(src)
         }),
+        sku("gemma4-e4b-eagle-bf16-kv-bf16", |src| {
+            model::gemma_4::model::Model::e4b_eagle(Dtype::Bf16, Dtype::Bf16, 1).load(src)
+        }),
+        sku("gemma4-e4b-vision-bf16-kv-bf16", |src| {
+            model::gemma_4::model::Model::e4b_vision(Dtype::Bf16, Dtype::Bf16, 1).load(src)
+        }),
         sku("gemma4-31b-bf16-kv-bf16", |src| {
             model::gemma_4::model::Model::b31(Dtype::Bf16, Dtype::Bf16, 1).load(src)
         }),

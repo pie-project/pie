@@ -526,14 +526,23 @@ pub enum Fault {
     /// module load whichever frontend emitted the call. The unit compiles
     /// whole-program through the same NVRTC path as every other one.
     ///
+    /// **AND THE `SWITCH` HALF IS RETIRED TOO** (B6). A group's arms are
+    /// consecutive regions under one node minted with `size: arms`, the
+    /// bracket lives across `arms - 1` region boundaries, and `cond_arm` is
+    /// where one child graph is closed and the next begun. The predicate is
+    /// one `kernels_cuda::graph::set_switch` per arm, each storing its own
+    /// index only if its own window has rows — at most one does, which is the
+    /// activation P3 proves before it forms a group at all.
+    ///
     /// # What still answers here, and it is two things
     ///
-    /// 1. **A `SWITCH`.** `IF` is one body behind one handle; a SWITCH is
-    ///    `arms` bodies behind one, and its arms are separate REGIONS the walk
-    ///    announces one after another — so the bracket would have to survive a
-    ///    `region_begin`, which is a second piece of state the sink does not
-    ///    carry. P3 only groups one at `max_lanes == 1` and no catalog row is
-    ///    baked at a one-lane budget, so nothing reaches it today.
+    /// 1. **A `SWITCH` WHOSE ARM CANNOT STATE A ROW COUNT.** A region P4 split
+    ///    into runs, or one on the patch axis with no boundary vector, has no
+    ///    single count to read. An `IF` answers that by taking its body —
+    ///    always-launch is the correctness mechanism and the guard has merely
+    ///    given up an optimization. A `SWITCH` has no such direction: exactly
+    ///    one body runs, so an arm guessed at is a different arm's fire
+    ///    computed wrong, and the group is refused instead.
     /// 2. **A load with no body stream.** `Context::open_conditional` is
     ///    called at load only for an artifact P3 stamped a lowering on; a
     ///    cursor reaching a bracket without it is a shell being asked for
@@ -778,12 +787,14 @@ impl fmt::Display for Fault {
             Self::Unlowered { region, lowering } => write!(
                 f,
                 "region {region} is baked as {lowering} and this capture has nowhere \
-                 to put it: an `If` records as a real conditional node on a load whose \
-                 context opened a body stream, but a `Switch` is unbuilt (its arms are \
-                 separate regions and the bracket would have to survive a region \
-                 boundary) and a load whose artifact declared no conditional opened no \
-                 stream to capture a body on. Bake with `fat_region_us: INFINITY` — \
-                 every region always-launch, which is the correctness mechanism"
+                 to put it: an `If` and a `Switch` both record as real conditional \
+                 nodes on a load whose context opened a body stream, but a load whose \
+                 artifact declared no conditional opened no stream to capture a body \
+                 on, and a `Switch` arm that cannot state a row count — split into \
+                 runs, or on an axis with no boundary vector — is refused rather than \
+                 guessed, because exactly one arm runs and a guess is another arm's \
+                 fire. Bake with `fat_region_us: INFINITY` — every region \
+                 always-launch, which is the correctness mechanism"
             ),
             Self::Unbound { what } => write!(
                 f,

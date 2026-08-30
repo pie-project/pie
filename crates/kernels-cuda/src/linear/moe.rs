@@ -308,6 +308,48 @@ impl ExpertTable {
     }
 }
 
+/// **WHERE A PACKED GROUP'S TWO PLANES ARE** (alto streaming §3 item 3, wave
+/// B7) — [`ExpertTable`]'s twin for the split-plane path, one granularity up.
+///
+/// The mxfp4 select computes each plane's expert base itself and dereferences
+/// no per-expert table (W-5's finding; `experts.rs`' header argues why that
+/// fixes the unit of residency at the GROUP). Until B7 that also fixed the
+/// group's TIER at load, because the two plane bases were kernel PARAMETERS
+/// and a captured graph holds its parameters forever (article 7). So a
+/// streamed group hands two addresses instead:
+///
+/// * `cell` — one 16-byte, 16-byte-aligned cell of DATA holding this group's
+///   `(codes, scales)` base pair. The kernel reads it with a single
+///   `ld.global.v2.u64` — **one extra load per group per launch**, at one
+///   address the whole grid shares, so it is an L1 broadcast and not a load
+///   per route. Writing it is how a promotion moves a group; the pair is one
+///   word, so no cell state can name one group's codes and another's scales.
+/// * `hits` — this group's usage counter, one `u32`. One `atomicAdd` per
+///   routed row per fire, by the block that owns that route's first row tile.
+///
+/// [`GroupSeat::RESIDENT`] is both zeros and is the DEGENERATE case, not an
+/// off switch: the kernel reads the bases it was handed and counts nothing,
+/// which is the launch this entry made before B7 existed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupSeat {
+    /// Device address of this group's 16-byte `(codes, scales)` base cell,
+    /// or 0.
+    pub cell: u64,
+    /// Device address of this group's `u32` usage counter, or 0.
+    pub hits: u64,
+}
+
+impl GroupSeat {
+    /// The whole group is where the launch says it is: no cell, no counter.
+    pub const RESIDENT: GroupSeat = GroupSeat { cell: 0, hits: 0 };
+
+    /// Does this group's tier move?
+    #[must_use]
+    pub const fn streams(&self) -> bool {
+        self.cell != 0
+    }
+}
+
 pub fn matmul_select(
     ctx: &Ctx,
     x: Tensor,
@@ -410,6 +452,7 @@ fn matmul_select_mxfp4(
     bias: Option<Tensor>,
     routes: Tensor,
     y: &mut Tensor,
+    seat: GroupSeat,
 ) -> Result<(), Error> {
     const MXFP4_BLOCK: u32 = 32;
 
@@ -462,6 +505,11 @@ fn matmul_select_mxfp4(
             act_div.arg(),
             n.arg(),
             k.arg(),
+            // THE TWO B7 SEATS, both zero for a group the store holds — see
+            // [`GroupSeat`]. A null cell is the arithmetic this entry did
+            // before the ladder existed, and a null counter counts nothing.
+            ArgValue::Ptr(seat.cell),
+            ArgValue::Ptr(seat.hits),
         ],
     )
 }
@@ -478,9 +526,10 @@ pub fn matmul_select_bias(
     bias: Tensor,
     routes: Tensor,
     y: &mut Tensor,
+    seat: GroupSeat,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_bias";
-    matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y)
+    matmul_select_mxfp4(ctx, OP, x, codes, scales, Some(bias), routes, y, seat)
 }
 
 /// Grouped matmul over an mxfp4 bank with nothing added — the down leg,
@@ -494,9 +543,10 @@ pub fn matmul_select_quant(
     scales: Tensor,
     routes: Tensor,
     y: &mut Tensor,
+    seat: GroupSeat,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
-    matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y)
+    matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat)
 }
 
 /// Folds the `top_k` routed rows back to one row per token, weighted.

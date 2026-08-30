@@ -430,7 +430,8 @@ pub fn put_u32(w: &mut Vec<u8>, v: u32) {
 /// A const port only ever carries a dtype ETA computes in, so the sub-byte
 /// codes' rounding-up in `bytes_ceil` is unreachable here.
 pub fn const_elem_size(dtype: Dtype) -> usize {
-    dtype.bytes_ceil() as usize
+    usize::try_from(dtype.bytes_ceil())
+        .expect("an element's byte count fits a usize on every served target")
 }
 
 // ===========================================================================

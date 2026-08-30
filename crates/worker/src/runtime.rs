@@ -1097,6 +1097,10 @@ fn create_engine_group(
                 // "derive one from the model text", which is what every config
                 // written before them says and what a vision SKU wants anyway.
                 m.patch_ceilings(),
+                // **AND THE ROW THE OPERATOR NAMED**, or `None` to identify
+                // one. `[model] sku` is the key; a vision checkpoint fits two
+                // rows and the cheap one is first, so the tower is asked for.
+                m.sku.as_deref(),
             )
             .with_context(|| {
                 format!(
@@ -1131,6 +1135,7 @@ fn create_engine_group(
         &m.adapters,
         m.residency(),
         m.patch_ceilings(),
+        m.sku.as_deref(),
     )
     .with_context(|| format!("creating engine for model {:?} group {group_idx}", m.name,))
 }

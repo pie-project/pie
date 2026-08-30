@@ -312,13 +312,28 @@ fn switch_groups(
         }
         // Consecutive, distinct, and in program order — a run, which is what
         // a recorder can bracket with one `cond_begin` .. `cond_end`.
-        let mut order = members.clone();
-        order.sort_unstable();
-        order.dedup();
-        if order.len() != members.len() || order[order.len() - 1] - order[0] + 1 != order.len() {
+        //
+        // **AND `members` ITSELF HAS TO BE THE ASCENDING RUN, NOT MERELY ITS
+        // SORTED IMAGE.** This used to sort a copy and check THAT for
+        // contiguity, which admits a group whose arms stand in a different
+        // order from the regions that define them — `[21, 20, 22, 23]` is a
+        // contiguous run and is arm 0 at region 21 with arm 1 in front of it.
+        // The walk brackets a group by the arm NUMBER (`model_exec::fire::walk`
+        // opens at `arm == 0` and closes at `arm + 1 == arms`, which is the
+        // "no second table and no state between regions" property this pass's
+        // own header claims), so an out-of-order group opens the bracket in the
+        // middle of its own run and leaves the arms in front of it outside the
+        // conditional altogether.
+        //
+        // **MEASURED, NOT ANTICIPATED** (B6): `qwen35-d0.8b` at
+        // `max_lanes == 1` produced exactly that shape, and the first pass that
+        // ever recorded a SWITCH found it. Requiring the ascending run declines
+        // the group instead — one fewer conditional, which costs an
+        // optimization and nothing else (decision #3).
+        if members.windows(2).any(|pair| pair[1] != pair[0] + 1) {
             continue;
         }
-        if order.iter().any(|&at| taken[at]) {
+        if members.iter().any(|&at| taken[at]) {
             continue;
         }
         let all = classes.classes.len();
@@ -326,6 +341,36 @@ fn switch_groups(
             .iter()
             .all(|&at| windowed(&regions[at], all) && fat(trace, &regions[at], profile))
         {
+            continue;
+        }
+        // **AND THE EXCLUSIVITY HAS TO HOLD OF THE REGIONS, NOT JUST OF THE
+        // ARMS** — the clause `fire_exclusive` cannot state, because it is
+        // about a merge and a SWITCH is about the regions that define one.
+        //
+        // `fire_exclusive` proves no COMPOSITION demands two ARMS. The graph
+        // node skips whole REGIONS, and a region is a coalesced run of nodes
+        // that share a mask — so the region defining an arm may carry nodes
+        // that arm's classes never asked for, and its mask is then a union
+        // wider than the arm's own guard. Two members whose masks overlap have
+        // rows in the same fire, and `cudaGraphCondTypeSwitch` runs exactly one
+        // body: the other arm's launches are silently dropped.
+        //
+        // **MEASURED, NOT ANTICIPATED** (B6). The first pass that ever recorded
+        // a SWITCH found `qwen35-d0.8b` at `max_lanes == 1` grouping four
+        // consecutive regions of which arms 1 AND 3 had rows in a plain decode
+        // fire, and the recorded graph answered different tokens from the eager
+        // walk. `fire_exclusive`'s one-lane reading — "a lane has one word,
+        // hence one class, hence one arm" — is true of arms and says nothing
+        // about the masks P2 coalesced them into.
+        //
+        // Pairwise-disjoint masks is the property the mechanism actually needs,
+        // stated in the terms the mechanism uses: a composition is a set of
+        // classes, a member has rows iff its mask meets that set, and disjoint
+        // masks cannot both be met. It subsumes both readings `fire_exclusive`
+        // offers rather than replacing them — that gate stays, because a merge
+        // whose arms are not exclusive is not a SWITCH whatever its regions
+        // look like.
+        if !pairwise_disjoint(regions, &members) {
             continue;
         }
         // What a SWITCH skips is every arm but the one taken, and the honest
@@ -341,12 +386,38 @@ fn switch_groups(
         if !profits(launches - widest, members.len() as u8, profile) {
             continue;
         }
-        for &at in &order {
+        for &at in &members {
             taken[at] = true;
         }
         groups.push(Group { merge, members });
     }
     groups
+}
+
+/// Do no two of these regions have rows in the same fire?
+///
+/// **THE SECOND HALF OF THE ACTIVATION PROOF, AND THE HALF ABOUT REGIONS.** A
+/// region's window is its mask's rows in the fire's descriptor, so two members
+/// are simultaneously live exactly when some composition meets both masks —
+/// and since a composition is an arbitrary set of classes, that is exactly
+/// when the masks intersect. Pairwise, because a SWITCH runs one body out of
+/// `arms` and any overlapping pair is a fire that loses one of them.
+///
+/// Quadratic in the arm count, which is two to four on every group the catalog
+/// has ever offered, over a mask whose `contains` is a bit test.
+fn pairwise_disjoint(regions: &[Region], members: &[usize]) -> bool {
+    for (at, &left) in members.iter().enumerate() {
+        for &right in &members[at + 1..] {
+            if regions[left]
+                .mask
+                .iter()
+                .any(|class| regions[right].mask.contains(class))
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// **CAN A FIRE HOLD TWO LIVE ARMS OF THIS MERGE?** — the proof obligation

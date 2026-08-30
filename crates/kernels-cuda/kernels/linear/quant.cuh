@@ -710,9 +710,57 @@ __global__ void mxfp4_moe_down_decode(
     }
 }
 
+// **WHERE A PACKED GROUP'S TWO PLANES ARE** (alto streaming §3 item 3, wave
+// B7) — the packed path's answer to `moe_expert_base`, one granularity up.
+//
+// A split-plane bank is CODES beside SCALES, both indexed by the same expert
+// id, and the select below computes both bases itself. That arithmetic is why
+// the unit of residency on this path is the GROUP and not the expert (W-5's
+// finding, `experts.rs`' header), and until this wave it was also why a group
+// placed at load could never move: the two plane addresses were kernel
+// PARAMETERS, and a captured graph holds its parameters forever (article 7).
+//
+// So the group gains one cell of DATA at a fixed device address, holding the
+// two addresses the launch used to carry. A promotion writes the cell; the
+// captured graph is untouched; the next fire reads the new tier.
+//
+// **THE PAIR IS ONE WORD, WHICH IS WHY A TORN PAIR STAYS UNCONSTRUCTIBLE.**
+// Both plane addresses live in ONE 16-byte, 16-byte-aligned cell, so there is
+// no cell state that names one group's codes and another's scales — the shell
+// writes the pair as a unit, and this reads it as a unit: `ld.global.v2.u64`,
+// **one extra load per group per launch**, issued once by every thread of a
+// grid that all read the same address, so it is one L1 broadcast and not one
+// load per route or per row.
+//
+// `nullptr` is the fully-resident load, and it is not the slow arm of a fast
+// one: the cell is not read at all and the bases are the kernel parameters
+// they always were. Same branch shape as `moe_expert_base`, same reason.
+struct alignas(16) MoeGroupBases {
+    const u8* codes;
+    const u8* scales;
+};
+
+// **THE ONE STATISTIC THE PACKED PATH PUBLISHES** — one `atomicAdd` per ROUTE
+// per launch, by the one block that owns the first row tile of that route, so
+// the count is "routed rows through this group" and not "blocks launched".
+// The dense path counts per EXPERT (`moe_note_expert`); this one counts per
+// GROUP, because the group is what can move.
+//
+// `nullptr` — the fully-resident load — costs the uniform branch and nothing.
+__device__ __forceinline__ void moe_note_group(
+    unsigned int* __restrict__ group_hits)
+{
+    if (group_hits != nullptr && blockIdx.y == 0 && threadIdx.x == 0) {
+        atomicAdd(group_hits, 1u);
+    }
+}
+
 // The routed matmul over an mxfp4 bank. `bias` is optional: a bank-cut leg
 // hands its per-expert row and the add lands inside the fold, a rows-cut one
 // hands nullptr and lets the routed bias mixture be stated after the reduce.
+//
+// `bases` and `group_hits` are the streamed seat, both `nullptr` for a
+// resident bank — see `MoeGroupBases`.
 template <class T, int kRowsT>
 __global__ void moe_matmul_select_mxfp4(
     const T* __restrict__ act,
@@ -723,7 +771,9 @@ __global__ void moe_matmul_select_mxfp4(
     T* __restrict__ out,
     int act_div,
     int n,
-    int k)
+    int k,
+    const MoeGroupBases* __restrict__ bases,
+    unsigned int* __restrict__ group_hits)
 {
     constexpr int kRows = kRowsT;
     const int route = blockIdx.x;
@@ -733,11 +783,23 @@ __global__ void moe_matmul_select_mxfp4(
     if (row0 >= n) return;
     const int expert = routes[route];
 
+    moe_note_group(group_hits);
+
     const int groups_per_row = k / 32;
     const int words_per_row = k / 8;
 
-    const u8* w = codes + static_cast<long long>(expert) * n * (k / 2);
-    const u8* s = scales + static_cast<long long>(expert) * n * groups_per_row;
+    // THE ONE EXTRA LOAD. Sixteen bytes, one address for the whole grid, and
+    // the pair is read as a pair — see `MoeGroupBases`.
+    const u8* codes_at = codes;
+    const u8* scales_at = scales;
+    if (bases != nullptr) {
+        const MoeGroupBases seat = *bases;
+        codes_at = seat.codes;
+        scales_at = seat.scales;
+    }
+
+    const u8* w = codes_at + static_cast<long long>(expert) * n * (k / 2);
+    const u8* s = scales_at + static_cast<long long>(expert) * n * groups_per_row;
     const T* x = act + static_cast<long long>(route / act_div) * k;
 
     int row_of[kRows];

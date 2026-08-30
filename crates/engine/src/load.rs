@@ -234,19 +234,19 @@ pub struct Residency {
 ///
 /// # What this type does NOT account for, said here so it is not assumed
 ///
-/// **The elastic pool and the safety floor.** Alto streaming §3 item 5 wants
-/// one sentence — *weight tiers + elastic pool + safety floor = the card* —
-/// and these three numbers are only the first term of it. Today the sum holds
-/// by ORDER rather than by arithmetic: an engine allocates its weight store
-/// first and opens its physical pool afterwards against whatever
-/// `cudaMemGetInfo` then reports, less its own floor. That is correct and
-/// unwritten, which means nothing can refuse AHEAD of it — a weight budget
-/// that leaves the pool under its minimum is discovered as an unrelated
-/// failure later. The concrete gap, with numbers, is recorded in
-/// streaming §3 item 5; the short of it is that `[engine] gpu_mem_utilization`
-/// is declared and validated by the worker's config and read by no shell at
-/// all. Closing it is a change to the elastic pool's own constructor, not to
-/// this statute.
+/// **The elastic pool and the safety floor**, and that is still true and is
+/// no longer a gap. Alto streaming §3 item 5 wants one sentence — *weight
+/// tiers + elastic pool + safety floor = the card* — and these three numbers
+/// are only its first term. The sentence is written down, but in the SHELL
+/// and not here: `engine_cuda::store::Accounting` states *card, ceiling,
+/// weights, floor, pool, minimum* and refuses ahead of every allocation, and
+/// `[engine] gpu_mem_utilization` reaches `PhysicalPool::open` (`next.md` B1
+/// and B2). It belongs there rather than here for the reason this statute is
+/// three numbers and a bit: what a card has, what a driver needs held back
+/// and what a pool must cover are all device facts, and a portable statute
+/// that named them would be naming a machine it cannot see. What crosses is
+/// what always crossed — the two budgets — and the refusal the shell adds is
+/// `Error::Impossible` beside these, drawn on the same statute/physics line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Tiers {
     /// T0: the weight bytes this load will hold on the device.

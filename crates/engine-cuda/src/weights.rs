@@ -95,6 +95,7 @@ use checkpoint::executor::{Execution, sink::TensorSink};
 use checkpoint::plan::{LoadPlan, StorageTarget, compile};
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_cuda::Tensor;
+use kernels_cuda::linear::moe::GroupSeat;
 use model_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::Buffer;
@@ -155,6 +156,17 @@ pub struct Weights {
     /// ran: the bytes are the same bytes a cold load would have produced,
     /// which is what the artifact's key and digest are for.
     from_cache: bool,
+    /// **THE ROTATING DENSE PUMP** (alto streaming §3 item 4, D2b), or `None`
+    /// for a load with nothing to rotate — which is every load whose budget
+    /// held the table, and every load whose spilled planes are all over the
+    /// slot cap.
+    ///
+    /// `Some` says a set of dense planes the device budget gave up are read
+    /// out of DEVICE SLOTS whose contents rotate during the fire rather than
+    /// out of the pinned tier over UVA. The addresses in the weight table are
+    /// the slots' and never move ([`crate::rotate`]'s whole premise); what
+    /// moves is the bytes, at the walk's region boundaries.
+    rotor: Option<crate::rotate::Rotor>,
 }
 
 /// One declared adapter bank: where its slots are and how big they are.
@@ -787,9 +799,24 @@ impl Weights {
             // handle are what a `{:?}` prints, and no entry reads a bank's
             // rows back as a promise (see `rectangle`).
             let row = match pairings.get(trace.params[at].name.as_str()) {
+                // **AND A STREAMED GROUP CARRIES ITS SEAT** (alto streaming §3
+                // item 3, wave B7). The two handles are where the plan seated
+                // the planes; the seat is the fixed-address cell the select
+                // reads the LIVE pair out of and the counter it notes the
+                // routing in, so that the ladder can move the group without
+                // touching a captured graph. Two zeros for a group the store
+                // holds whole with no tier open, which is every group of a
+                // fully-resident load.
                 Some(pairing) => WeightRow::Planes {
                     codes: packed(experts.as_ref(), &store, &places, at)?,
                     scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
+                    seat: experts
+                        .as_ref()
+                        .and_then(|tier| tier.group_handles(at))
+                        .map_or(GroupSeat::RESIDENT, |seat| GroupSeat {
+                            cell: seat.cell,
+                            hits: seat.hits,
+                        }),
                 },
                 None => {
                     let handle = Tensor::new(
@@ -823,7 +850,18 @@ impl Weights {
                 .iter()
                 .map(|bank| store.at(places[bank.param].offset))
                 .collect::<Result<_>>()?;
-            tier.land(&slabs, stream)?;
+            // **AND WHERE THE STORE PUT EVERY PLANE IT HOLDS** — what turns
+            // a T0 packed group into a berth the ladder can displace a group
+            // out of (wave B7). Only the loader can answer it: the offsets are
+            // its, and `store.at` is the one place they become addresses.
+            let store_at: Vec<(usize, u64)> = tier
+                .plan()
+                .seated()
+                .iter()
+                .flat_map(|group| group.planes.clone())
+                .map(|plane| Ok((plane.param, store.at(places[plane.param].offset)?)))
+                .collect::<Result<_>>()?;
+            tier.land(&slabs, &store_at, stream)?;
         }
         Ok(Weights {
             store,
@@ -831,7 +869,137 @@ impl Weights {
             banks: banks(trace, &places),
             experts,
             from_cache,
+            rotor: None,
         })
+    }
+
+    /// **ARM THE ROTATING DENSE PUMP** — the second half of D2b, and the one
+    /// call that turns a spilled dense plane from "read where it lies" into
+    /// "copied ahead into a slot whose address never moves" (alto streaming §3
+    /// item 4).
+    ///
+    /// Called once, at load, after [`Weights::resident`] and with the
+    /// `CompiledModel` in hand — because the pump works at REGION granularity
+    /// and a region is a thing the compiler decides, while the residency plan
+    /// is decided before the model is compiled. That split is
+    /// `prefetch::Schedule`'s own (`Schedule::of` reads nodes,
+    /// `Schedule::against` projects onto regions), and this is its consumer.
+    ///
+    /// **THE CANDIDATES ARE T1 DENSE PLANES AND NOTHING ELSE.** A routed bank
+    /// is the dynamic demand shape and has its own tier; a group held
+    /// `Held::Mapped` is T2, whose pages are not page-locked, so an async H2D
+    /// out of it is not async and the promotion it wants is streaming §3 item
+    /// 3's, not this one. Both stay exactly where they were.
+    ///
+    /// **AND THE WEIGHT ROWS ARE REWRITTEN HERE, NOT AT `resident`.** A
+    /// rotated plane's handle names its slot; everything else about the row —
+    /// the rectangle, the dtype — is what `places` already said, because the
+    /// only thing that changed is where the bytes are.
+    ///
+    /// Answers whether a pump was armed. A load that declines one is a correct
+    /// load and not a refusal: the planes are served by the tier that was
+    /// serving them.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Device`] for a slot, an event or a stream the runtime refused,
+    /// and [`Fault::Residency`] for a tier that cannot answer a planned
+    /// tenant's host address — which is a plan and a tier that disagree.
+    pub fn rotate(
+        &mut self,
+        trace: &Trace,
+        compiled: &model_compiler::CompiledModel,
+    ) -> Result<bool> {
+        let Some(tier) = self.experts.as_ref() else {
+            return Ok(false);
+        };
+        // A group of one plane, not routed, page-locked: the shape a spilled
+        // DENSE plane takes (`experts::Plan::of` makes it a `GroupPlan` with
+        // `experts: 0`, which is the point of making a dense plane a group).
+        let candidates: Vec<(usize, u64)> = tier
+            .plan()
+            .groups()
+            .iter()
+            .filter(|group| {
+                !group.routed
+                    && group.held == crate::experts::Held::Pinned
+                    && group.planes.len() == 1
+            })
+            .map(|group| (group.param, group.bytes))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let schedule = model_compiler::prefetch::Schedule::of(trace);
+        let rotation = match crate::rotate::Rotation::plan(
+            &schedule,
+            compiled,
+            &candidates,
+            crate::rotate::SLOT_CAP,
+            crate::rotate::ARENA_CAP,
+        ) {
+            Ok(rotation) => rotation,
+            // **A DECLINE IS NOT A FAULT.** Nothing rotates, every plane is
+            // read where it lies, and the load is the load it was before this
+            // method existed.
+            Err(_why) => return Ok(false),
+        };
+        // Each tenant's page-locked source, in the rotation's own order. The
+        // tier owns these bytes for the life of the load, which is what makes
+        // the raw pointer sound to hold.
+        let mut source: Vec<*const u8> = Vec::with_capacity(rotation.tenants().len());
+        for tenant in rotation.tenants() {
+            let at = tier.host_offset(tenant.param).ok_or_else(|| {
+                Fault::Residency(format!(
+                    "`{}` was planned to rotate and the pinned tier seats no bytes for it",
+                    trace.params[tenant.param].name
+                ))
+            })?;
+            // SAFETY: `host_offset` is an offset the tier itself laid out
+            // inside its own pinned allocation, and the allocation outlives
+            // this `Weights`.
+            source.push(unsafe {
+                tier.host()
+                    .host()
+                    .add(usize::try_from(at).unwrap_or(usize::MAX))
+                    .cast_const()
+            });
+        }
+        let rotor = crate::rotate::Rotor::open(rotation, source)?;
+        // ── AND THE ROWS NOW NAME THE SLOTS.
+        for tenant in rotor.rotation().tenants() {
+            let Some(seat) = rotor.seat(tenant.param) else {
+                continue;
+            };
+            let param = &trace.params[tenant.param];
+            let (rows, width) = rectangle(&param.shape);
+            self.table.0[tenant.param] = Some(WeightRow::Dense(Tensor::new(
+                seat,
+                u32::try_from(rows).unwrap_or(u32::MAX),
+                u32::try_from(width).unwrap_or(u32::MAX),
+                param.dtype,
+            )));
+        }
+        self.rotor = Some(rotor);
+        Ok(true)
+    }
+
+    /// **The rotating dense pump this load armed**, or `None`. What the fire
+    /// path hands its cursor at the region seam.
+    #[must_use]
+    pub fn rotor(&self) -> Option<&crate::rotate::Rotor> {
+        self.rotor.as_ref()
+    }
+
+    /// **Does this load rotate dense planes during a fire?**
+    ///
+    /// Read by the fire path for one reason: a rotating load takes the EAGER
+    /// walk, whatever mode the shell is in. See [`crate::rotate`]'s header for
+    /// the capture-legality argument — the same shape as design §6's sentence
+    /// about a buffered fire.
+    #[must_use]
+    pub fn rotating(&self) -> bool {
+        self.rotor.is_some()
     }
 
     /// **The routed-expert tier this load opened**, or `None` for a load whose

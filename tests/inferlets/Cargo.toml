@@ -6,7 +6,7 @@ members = [
     "tart-masked",
     "beam-search",
     "cacheback-speculative-decoding",
-    "chat-completion",
+    "chat-completion", "image-captioning",
     "consensus-decoding",
     "constrained-speculative-decoding",
     "contrastive-decoding",

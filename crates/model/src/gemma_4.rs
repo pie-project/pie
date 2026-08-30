@@ -8,6 +8,18 @@ use model_dsl::Dtype;
 
 pub const CATALOG: &[crate::Row] = model_dsl::catalog![
     (
+        "gemma4-e4b-eagle-bf16-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::e4b_eagle(Dtype::Bf16, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-e4b-vision-bf16-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::e4b_vision(Dtype::Bf16, Dtype::Bf16, 1)
+    ),
+    (
         "gemma4-e4b-bf16-kv-bf16",
         1,
         model_dsl::trace_hybrid,
@@ -51,6 +63,9 @@ pub const IMPORTS: &[crate::ImportRow] = &[
     ("gemma4-31b-mlxu4-kv-bf16", |src| {
         Model::b31(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
     }),
+    ("gemma4-e4b-eagle-bf16-kv-bf16", |src| {
+        Model::e4b_eagle(Dtype::Bf16, Dtype::Bf16, 1).import(src)
+    }),
     ("gemma4-e4b-bf16-kv-bf16", |src| {
         Model::e4b(Dtype::Bf16, Dtype::Bf16, 1).import(src)
     }),
@@ -60,10 +75,21 @@ pub const IMPORTS: &[crate::ImportRow] = &[
     ("gemma4-31b-bf16-kv-bf16-tp2", |src| {
         Model::b31(Dtype::Bf16, Dtype::Bf16, 1).import(src)
     }),
+    // **LAST, FOR THE REASON `qwen_3::IMPORTS` MEASURED** (campaign M-1/M-2).
+    // A tower row is strictly more demanding and the E4B checkpoint HAS the
+    // planes, so strictness would put it first — and a vision load stands its
+    // fold down, which cost the qwen row 14.9% at c256 against its text-only
+    // twin. Until the fold goes per-unit a deployment reaches this row by
+    // name, and a stock gemma4 import answers the text-only one.
+    ("gemma4-e4b-vision-bf16-kv-bf16", |src| {
+        Model::e4b_vision(Dtype::Bf16, Dtype::Bf16, 1).import(src)
+    }),
 ];
 
 pub const TEMPLATES: &[crate::template::TemplateRow] = &[
     ("gemma4-e4b-bf16-kv-bf16", template::gemma4),
+    ("gemma4-e4b-vision-bf16-kv-bf16", template::gemma4),
+    ("gemma4-e4b-eagle-bf16-kv-bf16", template::gemma4),
     ("gemma4-31b-bf16-kv-bf16", template::gemma4),
     ("gemma4-31b-mlxu4-kv-bf16", template::gemma4),
     ("gemma4-31b-bf16-kv-bf16-tp2", template::gemma4),

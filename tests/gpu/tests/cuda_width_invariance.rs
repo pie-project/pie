@@ -149,6 +149,7 @@ fn fire(probe: Lane, neighbours: &[Vec<u32>], width: usize) -> FrameSubmission {
     FrameSubmission::of(Step {
         lanes,
         attachments: Vec::new(),
+        media: Vec::new(),
     })
 }
 

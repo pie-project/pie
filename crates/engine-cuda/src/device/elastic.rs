@@ -25,7 +25,8 @@
 //! ```text
 //! logical page   2 MiB   the accounting unit the budget is counted in
 //! map unit       32 MiB  one `cuMemCreate` handle; the growth quantum
-//! budget         cudaMemGetInfo(free) - safety floor, at load
+//! budget         total x utilization - what is already on the card
+//!                        - safety floor, at load
 //! ```
 //!
 //! The logical page is dev's `kLogicalPageBytes` (elastic.hpp:24) and is
@@ -33,9 +34,34 @@
 //! declares, this is a number of bytes the allocator counts in. The map unit
 //! is dev's `cuda_vmm_handle_bytes()` default (context.cpp:132-145) — 32 MiB,
 //! there an env var and here a constant, because article 9 forbids a shell to
-//! read the environment. The budget is dev's context.cpp:1015-1020: what the
-//! card says is free at load, less a safety floor of `min(128 MiB, total/10)`
-//! so that a driver allocation made after ours still has somewhere to land.
+//! read the environment. The budget is dev's context.cpp:1015-1020 with the
+//! operator's fraction put back into it: a safety floor of
+//! `min(128 MiB, total/10)` is held back so that a driver allocation made
+//! after ours still has somewhere to land, and what is left is bounded by
+//! `[engine] gpu_mem_utilization` of the WHOLE CARD rather than by everything
+//! the card happens to have free.
+//!
+//! # The fraction, and why it is of the card and not of what is free
+//!
+//! **`[engine] gpu_mem_utilization` IS THE OPERATOR'S CEILING OVER PIE'S
+//! WHOLE FOOTPRINT** — weights included, which is what the key's own doc in
+//! `worker::config` says (*"Fraction of each GPU's memory pie may use, weights
+//! included"*). So the fraction multiplies `total`, and what is already on the
+//! card at the moment the pool opens — this load's weight store, the context,
+//! and anything another process holds — is SUBTRACTED from that ceiling rather
+//! than ignored:
+//!
+//! ```text
+//! budget = total x utilization - (total - free) - floor
+//! ```
+//!
+//! At `utilization = 1.0` the two middle terms collapse to `free` and this is
+//! byte for byte what the pool took before the fraction reached it, which is
+//! how the arm is checked. On the L40S this workspace serves from — a
+//! 48,305,799,168-byte card under a 13,761,281,792-byte gpt-oss weight store —
+//! it is the difference between the 34.4 GB the pool used to take and the
+//! 29.6 GB an operator who wrote `0.90` asked for (alto streaming §3 item 5,
+//! `next.md` B1).
 //!
 //! # Soft budget and hard ceiling
 //!
@@ -81,6 +107,62 @@ const HANDLES_PER_ARENA: u64 = 256;
 /// somewhere to land. Dev's `min(128 MiB, total/10)` (context.cpp:1016-1017).
 const SAFETY_FLOOR_BYTES: u64 = 128 * 1024 * 1024;
 
+/// **The floor this card holds back** — dev's `min(128 MiB, total/10)`, in one
+/// place so that the pool, the ahead-of-time accounting in
+/// [`crate::store::Accounting`] and every test that spells the sentence read
+/// one number.
+#[must_use]
+pub const fn safety_floor_bytes(total: u64) -> u64 {
+    let tenth = total / 10;
+    if SAFETY_FLOOR_BYTES < tenth {
+        SAFETY_FLOOR_BYTES
+    } else {
+        tenth
+    }
+}
+
+/// **What the elastic pool may hold, from three numbers and a fraction** —
+/// the whole of `[engine] gpu_mem_utilization`'s effect, written where a test
+/// can reach it without a device.
+///
+/// ```text
+/// budget = total x utilization - (total - free) - floor
+/// ```
+///
+/// `total - free` is everything already on the card when the pool opens: this
+/// load's weight store (allocated first, by order), the context, and whatever
+/// another process holds. Subtracting it is what makes the fraction a ceiling
+/// over pie's WHOLE footprint rather than over the kv pool alone.
+///
+/// **`utilization = 1.0` IS THE OLD ARITHMETIC EXACTLY.** The two middle terms
+/// collapse to `free`, so the pre-fraction pool is not a special case, it is
+/// the top of the range — which is what makes the A/B a number and not a
+/// branch. A fraction that lands under what is already on the card answers
+/// zero rather than wrapping.
+#[must_use]
+pub fn budget_bytes(free: u64, total: u64, utilization: f64) -> u64 {
+    // The fraction is validated in (0.0, 1.0] at boot, by the key's name, in
+    // `crate::boot`. Clamped again here because this is a `pub fn` a caller
+    // could reach with anything, and a NaN must not become a budget.
+    let fraction = if utilization.is_finite() {
+        utilization.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a byte count of a GPU card is far inside f64's exact integer \
+                  range, and the product is floored back into u64 deliberately"
+    )]
+    let ceiling = (total as f64 * fraction) as u64;
+    let already = total.saturating_sub(free);
+    ceiling
+        .saturating_sub(already)
+        .saturating_sub(safety_floor_bytes(total))
+}
+
 /// How many logical pages `bytes` occupies — dev's `pages_for_bytes`
 /// (elastic.hpp:26-31).
 #[must_use]
@@ -124,22 +206,40 @@ pub struct PhysicalPool {
     /// the ENGINE to own and report, rather than have the runtime re-derive
     /// it from a free-list scan.
     high_water_pages: u64,
+    /// **The operator's fraction of the card**, `[engine]
+    /// gpu_mem_utilization`, kept because [`PhysicalPool::recalibrate`] re-asks
+    /// the card and must re-apply the same ceiling. `1.0` is the whole card,
+    /// which is what every pre-fraction caller got.
+    utilization: f64,
 }
 
 impl PhysicalPool {
-    /// **Open the pool against this device's free memory** (dev
-    /// context.cpp:1013-1025).
+    /// **Open the pool against this device, at the operator's fraction of it**
+    /// (dev context.cpp:1013-1025; alto streaming §3 item 5, `next.md` B1).
     ///
-    /// `cudaMemGetInfo` at load, less the safety floor, is the budget. It is
-    /// read once here and re-read only by [`PhysicalPool::recalibrate`]: a
+    /// `cudaMemGetInfo` at load, bounded by [`budget_bytes`], is the budget. It
+    /// is read once here and re-read only by [`PhysicalPool::recalibrate`]: a
     /// `cudaMemGetInfo` on the fire path is a driver round trip, and the
     /// admission gate calls it only when a frame actually needs to grow.
+    ///
+    /// **`utilization` IS `[engine] gpu_mem_utilization`, AND THIS IS THE ONE
+    /// READER.** It was declared, defaulted to `0.90`, validated and schema'd
+    /// in the worker's config since before the palo rewrite and reached no
+    /// shell at all: the pool took everything the card had free, which on the
+    /// L40S this workspace serves from is 34.4 GB where an operator who wrote
+    /// `0.90` asked for 29.6. The fraction is of the WHOLE CARD and pie's
+    /// weight store is already on it by the time this runs, so the store's
+    /// bytes are charged against the fraction rather than left outside it —
+    /// which is the sentence [`crate::store::Accounting`] refuses ahead of.
+    ///
+    /// `1.0` is the arithmetic this constructor had before the fraction
+    /// arrived, byte for byte.
     ///
     /// # Errors
     ///
     /// [`Fault::Runtimeless`] with no runtime selected, [`Fault::Device`] for
     /// the granularity query or the memory query.
-    pub fn open(device: i32) -> Result<PhysicalPool> {
+    pub fn open(device: i32, utilization: f64) -> Result<PhysicalPool> {
         #[cfg(feature = "_cuda")]
         {
             use cudarc::runtime::sys as rt;
@@ -149,8 +249,7 @@ impl PhysicalPool {
             // SAFETY: two live locals; the call only writes them.
             let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            let floor = SAFETY_FLOOR_BYTES.min(total as u64 / 10);
-            let budget = (free as u64).saturating_sub(floor);
+            let budget = budget_bytes(free as u64, total as u64, utilization);
             let handle_bytes = align_up(MAP_UNIT_BYTES.max(granularity), granularity);
             let pages = budget / LOGICAL_PAGE_BYTES;
             Ok(PhysicalPool {
@@ -162,11 +261,12 @@ impl PhysicalPool {
                 held_pages: 0,
                 committed_pages: 0,
                 high_water_pages: 0,
+                utilization,
             })
         }
         #[cfg(not(feature = "_cuda"))]
         {
-            let _ = device;
+            let _ = (device, utilization);
             Err(Fault::Runtimeless)
         }
     }
@@ -186,7 +286,17 @@ impl PhysicalPool {
             held_pages: 0,
             committed_pages: 0,
             high_water_pages: 0,
+            // A stated budget IS the answer, so there is no card for a
+            // fraction to be a fraction OF. `recalibrate` on a runtimeless
+            // build leaves the budget where this put it either way.
+            utilization: 1.0,
         }
+    }
+
+    /// The operator's fraction of the card this pool was opened at.
+    #[must_use]
+    pub const fn utilization(&self) -> f64 {
+        self.utilization
     }
 
     /// Bytes one logical page holds.
@@ -263,10 +373,11 @@ impl PhysicalPool {
     /// `recalibrate_budget` (elastic.cpp:166-186) driven from
     /// `recalibrate_elastic_budget` (context.cpp:2075-2085).
     ///
-    /// The budget is what is charged plus what is free, because the free
-    /// figure already excludes our own mappings. The hard ceiling only ever
-    /// rises: it is the "this can never fit" line, and a transient shortage
-    /// must not turn a frame that fits into `Impossible`.
+    /// The budget is what is charged plus what [`budget_bytes`] says is left
+    /// under the operator's fraction, because the free figure already excludes
+    /// our own mappings and those are already in `charged`. The hard ceiling
+    /// only ever rises: it is the "this can never fit" line, and a transient
+    /// shortage must not turn a frame that fits into `Impossible`.
     ///
     /// # Errors
     ///
@@ -281,8 +392,12 @@ impl PhysicalPool {
             // SAFETY: two live locals; the call only writes them.
             let asked = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
             crate::device::ctx::check("cudaMemGetInfo", asked)?;
-            let floor = SAFETY_FLOOR_BYTES.min(total as u64 / 10);
-            let available = (free as u64).saturating_sub(floor) / LOGICAL_PAGE_BYTES;
+            // **THE SAME CEILING, RE-ASKED** — the fraction is a property of
+            // the deployment and not of the instant, so a recalibration that
+            // dropped it would hand back at the first grow exactly what the
+            // operator declined to give at load.
+            let available =
+                budget_bytes(free as u64, total as u64, self.utilization) / LOGICAL_PAGE_BYTES;
             let charged = self.committed_pages + self.held_pages;
             self.budget_pages = charged.saturating_add(available).max(charged);
             self.hard_pages = self.hard_pages.max(self.budget_pages);

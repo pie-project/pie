@@ -23,6 +23,9 @@
 pub mod channel;
 pub mod fire;
 pub mod instance;
+/// The media door's runtime half: the run scan, its refusals, and the shape
+/// the contract's `Step` wants (`.wiki/alto/media-door.md` §3/§6).
+pub mod media;
 pub mod offload;
 pub mod program;
 

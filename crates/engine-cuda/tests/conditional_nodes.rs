@@ -47,9 +47,10 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use cudarc::driver::sys as dr;
 use cudarc::runtime::sys as rt;
 
+use engine_cuda::device::conditional::Kind;
 use engine_cuda::device::{Buffer, Graph, conditional};
 use kernels_cuda::Ctx;
-use kernels_cuda::graph::{Arm, set_conditional, set_conditional_byte};
+use kernels_cuda::graph::{Arm, set_conditional, set_conditional_byte, set_switch};
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -70,7 +71,8 @@ struct Rig {
     main: *mut c_void,
     body: *mut c_void,
     bump: dr::CUfunction,
-    /// `[0]` is the body's counter, `[1]` the control's.
+    /// One `f32` counter per slot. `[0]` is the `IF` body's and `[1]` the
+    /// control's; a `SWITCH` gate uses one per arm and puts its control last.
     counts: Buffer,
     /// One byte: the predicate the setter kernel reads.
     live: Buffer,
@@ -118,7 +120,7 @@ impl Rig {
                 main,
                 body: body.cast(),
                 bump,
-                counts: Buffer::zeroed(8).expect("two floats"),
+                counts: Buffer::zeroed(32).expect("eight floats"),
                 live: Buffer::zeroed(1).expect("one byte"),
                 ctx: Ctx::on(main),
             })
@@ -161,14 +163,32 @@ impl Rig {
             .expect("one byte lands");
     }
 
-    /// `(body count, control count)`.
+    /// `(body count, control count)` — the two the `IF` gates use.
     fn read(&self) -> (f32, f32) {
-        let mut bytes = [0u8; 8];
-        self.counts.read(0, &mut bytes).expect("two floats come back");
-        (
-            f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-        )
+        let all = self.counters();
+        (all[0], all[1])
+    }
+
+    /// Every counter, in slot order.
+    fn counters(&self) -> [f32; 8] {
+        let mut bytes = [0u8; 32];
+        self.counts.read(0, &mut bytes).expect("eight floats come back");
+        let mut out = [0.0f32; 8];
+        for (at, slot) in out.iter_mut().enumerate() {
+            *slot = f32::from_le_bytes([
+                bytes[at * 4],
+                bytes[at * 4 + 1],
+                bytes[at * 4 + 2],
+                bytes[at * 4 + 3],
+            ]);
+        }
+        out
+    }
+
+    /// Zero every counter, so a launch's effect is read directly rather than
+    /// as a difference.
+    fn clear(&mut self) {
+        self.counts.write(0, &[0u8; 32]).expect("the counters clear");
     }
 
     fn settle(&self) {
@@ -207,13 +227,13 @@ fn a_recorded_if_node_takes_its_body_on_the_arm_a_device_byte_names() {
     rig.settle();
 
     let graph = Graph::capture(rig.main, || {
-        let handle = conditional::handle(rig.main)?;
+        let handle = conditional::handle(rig.main, Kind::If)?;
         // The predicate: a device-side store into the handle, from a byte the
         // host may rewrite between replays.
         set_conditional_byte(&rig.ctx, handle, rig.live.ptr(), false, Arm::Set)
             .expect("the setter enqueues into the capture");
-        let cond = conditional::open(rig.main, handle)?;
-        conditional::begin_body(rig.body, cond.body)?;
+        let cond = conditional::open(rig.main, handle, Kind::If)?;
+        conditional::begin_body(rig.body, cond.body(0).expect("an IF has one body"))?;
         rig.launch(rig.body, 0);
         conditional::end_body(rig.body)?;
         // Behind the bracket, on the parent: the control.
@@ -305,11 +325,11 @@ fn the_setter_reads_a_row_count_out_of_a_window_s_own_boundary_vector() {
     for (at, expected, what) in [(0u64, 1.0f32, "a window with rows"), (20, 0.0, "an empty one")] {
         let indptr = boundaries.at(at).expect("the vector is in the buffer");
         let graph = Graph::capture(rig.main, || {
-            let handle = conditional::handle(rig.main)?;
+            let handle = conditional::handle(rig.main, Kind::If)?;
             set_conditional(&rig.ctx, handle, indptr, LANES, false, Arm::Set)
                 .expect("the setter enqueues into the capture");
-            let cond = conditional::open(rig.main, handle)?;
-            conditional::begin_body(rig.body, cond.body)?;
+            let cond = conditional::open(rig.main, handle, Kind::If)?;
+            conditional::begin_body(rig.body, cond.body(0).expect("an IF has one body"))?;
             rig.launch(rig.body, 0);
             conditional::end_body(rig.body)?;
             rig.launch(rig.main, 1);
@@ -337,4 +357,130 @@ fn the_setter_reads_a_row_count_out_of_a_window_s_own_boundary_vector() {
              deciding",
         );
     }
+}
+
+/// **THE `SWITCH` FORM: ONE HANDLE, THREE BODIES, AND AN INDEX.**
+///
+/// An `IF` node asks "does this run"; a `SWITCH` asks "which of these does",
+/// and the difference is not a second mechanism — it is the same node with
+/// `size: arms` and a handle holding an index instead of a bool. So this is
+/// the same gate as the one above with the answers spread out:
+///
+/// ```text
+/// live arm    counters after one launch      what it says
+/// --------    ---------------------------    ---------------------------
+/// 0           [1, 0, 0, control 1]           the index picked arm 0
+/// 1           [0, 1, 0, control 1]           the same exec, a different arm
+/// 2           [0, 0, 1, control 1]
+/// none        [0, 0, 0, control 1]           the quiescent default runs none
+/// ```
+///
+/// **THE LAST ROW IS THE ONE THAT NEEDED A DECISION.** A `SWITCH` handle whose
+/// default were `0` would take arm 0 on a fire where no arm has rows, because
+/// "nothing stored" and "stored zero" are the same state. `Kind::quiescent`
+/// mints it at `arms` — past the last body — so a group with nothing to do
+/// does nothing, and the setters stay pure stores that only ever fire for a
+/// live arm.
+///
+/// The predicate is `arms` launches of `set_switch`, each reading its OWN
+/// arm's boundary vector, which is how the fire path drives it: a group's arms
+/// are separate regions with separate windows and there is no vector holding
+/// all their counts.
+#[test]
+fn a_switch_node_runs_the_arm_its_own_window_claims_and_none_when_none_claims() {
+    let _serial = serialized();
+    let Some(mut rig) = Rig::open("the switch-node gate") else {
+        return;
+    };
+
+    /// Three arms, so there is a middle one — a two-arm switch and an `IF`
+    /// with an else would be the same shape, and the index would be a bool
+    /// wearing a wider type.
+    const ARMS: u32 = 3;
+    /// Four lanes per window, so the row count is the fifth entry.
+    const LANES: u32 = 4;
+    /// Where the control counter lives, behind every arm.
+    const CONTROL: i32 = 3;
+
+    let kind = Kind::Switch { arms: ARMS };
+    assert_eq!(
+        kind.quiescent(),
+        ARMS,
+        "a switch's quiescent value has to be past its last body, or an empty \
+         group takes arm 0",
+    );
+
+    // One five-entry CSR per arm, `20` bytes apart.
+    let mut boundaries = Buffer::zeroed(20 * ARMS as usize).expect("three windows");
+    let claim = |rig: &mut Rig, boundaries: &mut Buffer, live: Option<u32>| {
+        let _ = rig;
+        for arm in 0..ARMS {
+            // `[0, 3, 7, 12, 20]` is a window with rows; all-zero is what
+            // `rebase` writes for a class this fire has none of.
+            let bounds: [i32; 5] = if live == Some(arm) {
+                [0, 3, 7, 12, 20]
+            } else {
+                [0, 0, 0, 0, 0]
+            };
+            let bytes: Vec<u8> = bounds.iter().flat_map(|v| v.to_le_bytes()).collect();
+            boundaries
+                .write(u64::from(arm) * 20, &bytes)
+                .expect("an arm's bounds land");
+        }
+    };
+
+    set_switch(&rig.ctx, 0, 0, 0, 0, Arm::Warm).expect("the switch setter warms");
+    rig.settle();
+
+    // **ONE CAPTURE, AND EVERY ANSWER BELOW COMES OUT OF IT.** The node's
+    // parameters are frozen at instantiation; what moves between the launches
+    // is three device words, which is the whole claim.
+    claim(&mut rig, &mut boundaries, Some(0));
+    let graph = Graph::capture(rig.main, || {
+        let handle = conditional::handle(rig.main, kind)?;
+        for arm in 0..ARMS {
+            let indptr = boundaries
+                .at(u64::from(arm) * 20)
+                .expect("the arm's vector is in the buffer");
+            set_switch(&rig.ctx, handle, arm, indptr, LANES, Arm::Set)
+                .expect("an arm's setter enqueues into the capture");
+        }
+        let cond = conditional::open(rig.main, handle, kind)?;
+        assert_eq!(cond.arms, ARMS, "the driver minted a body per arm");
+        for arm in 0..ARMS {
+            let body = cond.body(arm).expect("every arm has a body graph");
+            conditional::begin_body(rig.body, body)?;
+            rig.launch(rig.body, arm as i32);
+            conditional::end_body(rig.body)?;
+        }
+        rig.launch(rig.main, CONTROL);
+        Ok(())
+    })
+    .expect("a capture holding a three-armed switch ends cleanly");
+    let exec = graph.instantiate(rig.main).expect("it instantiates");
+
+    for live in [Some(0), Some(1), Some(2), None] {
+        claim(&mut rig, &mut boundaries, live);
+        rig.clear();
+        exec.launch(rig.main).expect("the switch launches");
+        rig.settle();
+        let counters = rig.counters();
+
+        for arm in 0..ARMS {
+            let want = f32::from(u8::from(live == Some(arm)));
+            assert!(
+                (counters[arm as usize] - want).abs() < 1e-6,
+                "with arm {live:?} live, arm {arm}'s body ran {} times and should \
+                 have run {want}: {counters:?}",
+                counters[arm as usize],
+            );
+        }
+        assert!(
+            (counters[CONTROL as usize] - 1.0).abs() < 1e-6,
+            "the control behind the switch did not run, so the exec stopped \
+             rather than choosing: {counters:?}",
+        );
+    }
+
+    eprintln!("switch node: {ARMS} arms, four launches of one exec, each answered by a device word");
 }

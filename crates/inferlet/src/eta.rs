@@ -2027,6 +2027,33 @@ impl Pass<wit_attention::ForwardPass> {
             },
         )
     }
+
+    /// `pie:inferlet/forward.media` — **THE PAYLOAD, BESIDE THE LEDGER**
+    /// (`.wiki/alto/media-door.md` §0/§1).
+    ///
+    /// A media span enters the sequence as the token run its handle answers —
+    /// `toks.extend(img.tokens())` — and as nothing else. This is the handle
+    /// crossing a SECOND time, carrying only the payload, order-matched to the
+    /// placeholder runs the tokens already carry. Nothing here says where the
+    /// two meet: the host scans the submitted tokens for the model's reserved
+    /// pad and matches the runs to these spans in order, refusing every
+    /// disagreement by name before anything launches.
+    ///
+    /// So the two calls belong together and neither stands alone: spans with
+    /// no runs is `MediaOrphanSpans`, runs with no spans is `MediaOrphanRuns`,
+    /// and a run one row short of its span is `MediaRunLength`.
+    ///
+    /// **ON THE ATTENTION INTERFACE ONLY**, which is where the WIT declares
+    /// it: the two towered families in the catalog are attention trunks, and a
+    /// verb on a hybrid or recurrent pass would be a verb no model could serve.
+    ///
+    /// # Errors
+    ///
+    /// The host's own sentence — the pass already carries spans, the pass
+    /// already has a program attached, or the bound model has no tower.
+    pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
+        wit_attention::ForwardPass::media(&self.wit, spans)
+    }
 }
 
 impl Pass<wit_hybrid::ForwardPass> {

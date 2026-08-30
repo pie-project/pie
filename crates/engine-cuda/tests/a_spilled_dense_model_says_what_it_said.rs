@@ -18,6 +18,11 @@
 //!     the plane the budget surrenders last, so the embedding stays and the
 //!     late layers leave — `model_compiler::prefetch` is where that order
 //!     comes from and it is a pure function of the plan.
+//! (d) THE PUMP IS ARMED AND IT MOVED THE BYTES (D2b's second half, wave B8):
+//!     the spilled planes under the slot cap are copied ahead into rotating
+//!     device slots on a copy stream, forked and joined against compute at
+//!     every region boundary. Structural, not timed — (b) is what says the
+//!     rotation is right, and the step times below are what say what it bought.
 //! ```
 //!
 //! # The physics, stated up front and measured, not gated
@@ -29,6 +34,14 @@
 //! step either way. This gate reports the measured step time beside the
 //! computed floor and asserts NOTHING about it — the deliverable is the
 //! capability and the identity; the speed is the trade, stated.
+//!
+//! And the SPEED is what the pump is for. Streaming §3 item 4 priced it before
+//! the wave was spent: the tier is bandwidth-bound (~28 GB/s effective), so a
+//! pump cannot buy bandwidth and can only buy OVERLAP — hiding the transfer
+//! under the compute it was not overlapped with. Best case the spilled step
+//! falls from `copy + compute` to `max(copy, compute)`, which on this rig is
+//! the PCIe floor plus a ramp. Still measured, still printed, still gated on
+//! nothing.
 //!
 //! ```text
 //! cargo test -p engine-cuda --features cuda-13 \
@@ -293,6 +306,31 @@ fn a_spilled_dense_model_says_what_it_said() {
     let (tokens, rows, spilled_step) = run(&mut streamed, &prompt);
     let also = rig.tokenizer.decode(&tokens, false);
 
+    // ── (d) THE PUMP. Armed at load, and it moved bytes on every fire.
+    let pumped = streamed.rotation();
+    match pumped {
+        Some((observed, slots, arena, rotating)) => eprintln!(
+            "the pump: {slots} slots over {arena} bytes of arena rotate {rotating} \
+             bytes a step; {observed:?}",
+        ),
+        None => eprintln!("the pump: nothing armed"),
+    }
+    let (observed, _, arena, rotating) = pumped.expect(
+        "a spilled dense load arms the rotating pump — that is D2b's second half",
+    );
+    assert!(rotating > 0, "the rotation moves no bytes at all");
+    assert!(
+        arena < rotating,
+        "an arena of {arena} bytes holding {rotating} rotating bytes is residency, \
+         not a pump",
+    );
+    assert!(
+        observed.copies >= (STEPS as u64),
+        "the pump issued {} copies over {} fires",
+        observed.copies,
+        STEPS + 1,
+    );
+
     // ── THE PHYSICS, MEASURED AND PRINTED, GATED ON NOTHING.
     let floor = spilled as f64 / PCIE_BYTES_PER_SEC;
     eprintln!(
@@ -304,6 +342,10 @@ fn a_spilled_dense_model_says_what_it_said() {
         floor * 1e3,
         (spilled_step - resident_step) * 1e3,
         spilled_step / resident_step,
+    );
+    eprintln!(
+        "the pump moved {} bytes over {} fires with {} late acquisitions",
+        observed.bytes, observed.fires, observed.late,
     );
 
     assert!(

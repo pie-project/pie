@@ -380,3 +380,458 @@ fn a_fire_with_one_image_answers_and_a_fire_without_one_answers_differently() {
          anything"
     );
 }
+
+// ── M-1's FIVE GATES ────────────────────────────────────────────────────
+//
+// The file above asks whether the LOAD happens and the launches run. These
+// ask the campaign's own five (`.wiki/alto/campaign.md` §2, M-1), which are
+// claims about what a fire ANSWERS, and four of them are asked here. What (b)
+// needs and does not have is written at the bottom.
+
+/// The text-only row this artifact also satisfies — gate (a)'s other side.
+const TEXT_SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+
+/// The same load, on a stated SKU. `ready` is this at [`SKU`] with the ladder
+/// returned; a gate that compares two readings of one artifact needs both.
+fn ready_as(sku: &str, what: &str) -> Option<Shell> {
+    let checkpoint = snapshot()?;
+    let trace = model::trace_of(sku).expect("the catalog ships the row")(Platform::Cuda);
+    let budgets = engine::load::Budgets {
+        max_tokens: 256,
+        max_lanes: 4,
+        ..engine::load::Budgets::default()
+    };
+    let patches = engine_cuda::api::patch_ladder(&trace, &budgets);
+    let container = checkpoint.join("archive.zt");
+    let source = ztensor_compat::index(&container).expect("the artifact opens");
+    let Ok(contract) = model::import_of(sku).expect("the catalog ships an import")(&source) else {
+        eprintln!("skipping {what}: {container:?} does not satisfy `{sku}`");
+        return None;
+    };
+    drop(source);
+    Some(
+        Shell::load(Boot {
+            residency: engine_cuda::experts::Plan::default(),
+            trace,
+            contract: &contract,
+            checkpoint: &container,
+            budget: Budget::new(budgets.max_lanes, budgets.max_tokens),
+            patches,
+            profile: None,
+            page_size: 16,
+            context: 512,
+            // **EIGHT, BECAUSE EVERY IDENTITY BELOW FIRES TWICE.** A slot is a
+            // sequence and a fire APPENDS to it, so re-firing one lane on the
+            // slot it already wrote compares nine keys against eighteen. Each
+            // comparison here gets disjoint, untouched slots on both sides.
+            slots: 8,
+            ordinal: 0,
+            graphs: engine_cuda::Graphs::Off,
+            knobs: engine_cuda::Knobs::default(),
+            program_cache_dir: None,
+            runahead: engine::runahead::Runahead::F1,
+            weight_cache_dir: None,
+        })
+        .expect("the shell loads"),
+    )
+}
+
+/// Every logit as its bits — the only comparison an identity claim may make.
+fn bits(logits: &[f32]) -> Vec<u32> {
+    logits.iter().map(|x| x.to_bits()).collect()
+}
+
+fn text_word(sku: &str, rows: u32) -> u64 {
+    model::classify_of(sku).expect("a classify")(&model_dsl::Request::new(rows, false))
+}
+
+fn media_word(sku: &str, rows: u32) -> u64 {
+    model::classify_of(sku).expect("a classify")(&model_dsl::Request::new(rows, false).with_media(true))
+}
+
+/// **GATE (a): A FIRE WITH NO IMAGE LANE IS THE FIRE THIS ENGINE ALWAYS
+/// FIRED** — asked as an identity between two READINGS of one artifact.
+///
+/// The campaign words it "byte-identical in tokens AND ms". The ms half is a
+/// throughput question and it has an answer of its own, measured at c256 and
+/// written into `qwen_3::IMPORTS` (a vision load stands its fold down and pays
+/// ~15% there). This is the half that is about ANSWERS, and it is the half a
+/// text lane's correctness rests on: the same tokens, fired against the
+/// text-only SKU and against the vision SKU of the same checkpoint, must come
+/// back bit for bit. If the tower or the merge touched a text lane at all,
+/// they would not.
+///
+/// Sequentially, not side by side: two shells of one model is two copies of
+/// the weights, and the claim needs neither of them alive at once.
+#[test]
+#[ignore = "real-hardware: needs a CUDA device and a local Qwen3.5-0.8B artifact; run it with `-- --ignored`"]
+fn a_text_only_fire_of_a_vision_load_is_the_text_only_load_bit_for_bit() {
+    const ROWS: u32 = 12;
+    let tokens: Vec<u32> = (0..ROWS).map(|i| 100 + i).collect();
+
+    let Some(mut vision) = ready_as(SKU, "gate (a), the vision reading") else {
+        return;
+    };
+    let mut scores = Vec::new();
+    let from_vision = vision
+        .fire_media(
+            &[Seated::of(engine_cuda::Lane {
+                slot: 0,
+                word: text_word(SKU, ROWS),
+                tokens: &tokens,
+            })],
+            &[],
+            &[],
+            &mut scores,
+        )
+        .expect("a text-only fire of a vision load answers");
+    let from_vision = bits(&from_vision[0]);
+    drop(vision);
+
+    let Some(mut text) = ready_as(TEXT_SKU, "gate (a), the text-only reading") else {
+        return;
+    };
+    let mut scores = Vec::new();
+    let from_text = text
+        .fire_media(
+            &[Seated::of(engine_cuda::Lane {
+                slot: 0,
+                word: text_word(TEXT_SKU, ROWS),
+                tokens: &tokens,
+            })],
+            &[],
+            &[],
+            &mut scores,
+        )
+        .expect("the text-only load answers");
+    let from_text = bits(&from_text[0]);
+
+    assert_eq!(from_vision.len(), from_text.len(), "two readouts, two widths");
+    let moved = from_vision
+        .iter()
+        .zip(&from_text)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        moved, 0,
+        "{moved} of {} logits differ between the vision reading of this checkpoint and \
+         the text-only one, on a fire that carried no image. A tower that costs a text \
+         lane one bit is a tower that is not windowed",
+        from_text.len(),
+    );
+}
+
+/// **GATE (c), THE POLYMORPHIC ONE: image lanes and text lanes in ONE fire,
+/// and the text lanes do not know.**
+///
+/// This is the thesis the second row axis exists for. A fire carries one lane
+/// that submitted an image and two that did not; every text lane's logits must
+/// be what the same lane answers in a fire with no image in it at all — bit
+/// for bit, because the two computations are the same computation and any
+/// difference is the axis leaking across lanes.
+#[test]
+#[ignore = "real-hardware: needs a CUDA device and a local Qwen3.5-0.8B artifact; run it with `-- --ignored`"]
+fn a_mixed_fire_leaves_its_text_lanes_bit_identical() {
+    const FIRST_PLACEHOLDER: i32 = 2;
+    let image_rows = FIRST_PLACEHOLDER as usize + SOFT_TOKENS + 2;
+    let image_tokens: Vec<u32> = (0..image_rows as u32).map(|i| 100 + i).collect();
+    let text_a: Vec<u32> = (0..9u32).map(|i| 300 + i).collect();
+    let text_b: Vec<u32> = (0..5u32).map(|i| 700 + i).collect();
+
+    let Some(mut shell) = ready_as(SKU, "gate (c), the mixed fire") else {
+        return;
+    };
+
+    // The text lanes alone, in a fire with no media at all.
+    // Fresh slots, and the mixed fire below uses different ones: a fire
+    // appends, so the same lane fired twice on one slot is a longer sequence
+    // the second time and the comparison would be measuring that.
+    let alone: Vec<Seated<'_>> = vec![
+        Seated::of(engine_cuda::Lane { slot: 4, word: text_word(SKU, text_a.len() as u32), tokens: &text_a }),
+        Seated::of(engine_cuda::Lane { slot: 5, word: text_word(SKU, text_b.len() as u32), tokens: &text_b }),
+    ];
+    let mut scores = Vec::new();
+    let solo = shell
+        .fire_media(&alone, &[], &[], &mut scores)
+        .expect("the text lanes answer alone");
+    let solo: Vec<Vec<u32>> = solo.iter().map(|l| bits(l)).collect();
+
+    // The same two lanes, beside an image lane, in one fire.
+    let shot = one_image(FIRST_PLACEHOLDER);
+    let media = [Media {
+        lane: 0,
+        rows: &shot.rows,
+        patches: &shot.patches,
+        routes: &shot.routes,
+        positions: &shot.positions,
+        token_positions: &[],
+        embed_rows: &shot.embed_rows,
+        embed_weights: &shot.embed_weights,
+    }];
+    let mixed_lanes: Vec<Seated<'_>> = vec![
+        Seated::of(engine_cuda::Lane { slot: 0, word: media_word(SKU, image_rows as u32), tokens: &image_tokens }),
+        Seated::of(engine_cuda::Lane { slot: 1, word: text_word(SKU, text_a.len() as u32), tokens: &text_a }),
+        Seated::of(engine_cuda::Lane { slot: 2, word: text_word(SKU, text_b.len() as u32), tokens: &text_b }),
+    ];
+    let mut scores = Vec::new();
+    let mixed = shell
+        .fire_media(&mixed_lanes, &[], &media, &mut scores)
+        .expect("a mixed fire answers");
+
+    assert_eq!(mixed.len(), 3, "three lanes in, three readouts out");
+    assert!(
+        mixed[0].iter().all(|l| l.is_finite()),
+        "the image lane's own readout came back non-finite"
+    );
+
+    // **AND THE CLAIM RUNS BOTH WAYS.** A text lane must not feel the image
+    // lane, and the image lane must not feel the text lanes: its own rows, its
+    // own patch rectangle and its own routes are unchanged, and the only thing
+    // that moved is where `compose` seriated it. The media class orders SECOND
+    // here, so the image lane's rows sit at a non-zero offset in the mixed fire
+    // and at zero in the solo one — which is exactly the rebase
+    // `Media::routes` promises, asked as an answer rather than as a doc.
+    let mut scores = Vec::new();
+    let image_solo = shell
+        .fire_media(
+            &[Seated::of(engine_cuda::Lane {
+                slot: 3,
+                word: media_word(SKU, image_rows as u32),
+                tokens: &image_tokens,
+            })],
+            &[],
+            &media,
+            &mut scores,
+        )
+        .expect("the image lane answers alone");
+    let moved = bits(&mixed[0])
+        .iter()
+        .zip(&bits(&image_solo[0]))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        moved, 0,
+        "the IMAGE lane moved {moved} of {} logits when two text lanes joined its fire;          its rows and its patch rectangle are unchanged, so what moved is the route          rebase or the seriated offset",
+        image_solo[0].len(),
+    );
+    for (at, want) in solo.iter().enumerate() {
+        let got = bits(&mixed[at + 1]);
+        let moved = got.iter().zip(want).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            moved, 0,
+            "text lane {at} moved {moved} of {} logits when an image lane joined its fire; \
+             the patch axis is leaking across the token rectangle",
+            want.len(),
+        );
+    }
+}
+
+/// **GATE (d): WIDTH INVARIANCE, ON THE AXIS THAT IS NEW.**
+///
+/// The token axis's width invariance is an existing gate (`cuda_width_invariance`)
+/// and this text does not move it. What is new is the PATCH ladder: a fire's
+/// patch count is rounded up to a rung, so the same image submitted in a fire
+/// that lands on a WIDER rung must answer the same logits — the padding rows
+/// are padding and not neighbours. Two images on the same rung would not ask
+/// it; a second lane whose image pushes the fire onto the next rung does.
+#[test]
+#[ignore = "real-hardware: needs a CUDA device and a local Qwen3.5-0.8B artifact; run it with `-- --ignored`"]
+fn a_wider_patch_rung_does_not_move_the_image_it_padded() {
+    const FIRST_PLACEHOLDER: i32 = 2;
+    let rows = FIRST_PLACEHOLDER as usize + SOFT_TOKENS + 2;
+    let tokens: Vec<u32> = (0..rows as u32).map(|i| 100 + i).collect();
+
+    let Some(mut shell) = ready_as(SKU, "gate (d), the patch rung") else {
+        return;
+    };
+    let shot = one_image(FIRST_PLACEHOLDER);
+    let one = [Media {
+        lane: 0,
+        rows: &shot.rows,
+        patches: &shot.patches,
+        routes: &shot.routes,
+        positions: &shot.positions,
+        token_positions: &[],
+        embed_rows: &shot.embed_rows,
+        embed_weights: &shot.embed_weights,
+    }];
+    let mut scores = Vec::new();
+    let narrow = shell
+        .fire_media(
+            &[Seated::of(engine_cuda::Lane {
+                slot: 0,
+                word: media_word(SKU, rows as u32),
+                tokens: &tokens,
+            })],
+            &[],
+            &one,
+            &mut scores,
+        )
+        .expect("one image answers");
+    let narrow = bits(&narrow[0]);
+
+    // A second lane with its own image: 128 patch rows, which is the ladder's
+    // SECOND rung, so lane 0's tower rows are now padded to a wider rectangle.
+    let second = one_image(FIRST_PLACEHOLDER);
+    let two = [
+        one[0],
+        Media {
+            lane: 1,
+            rows: &second.rows,
+            patches: &second.patches,
+            routes: &second.routes,
+            positions: &second.positions,
+            token_positions: &[],
+            embed_rows: &second.embed_rows,
+            embed_weights: &second.embed_weights,
+        },
+    ];
+    // Two FRESH slots, so the first lane of this fire is the same untouched
+    // sequence the fire above answered — the only difference between them is
+    // the width of the patch rectangle.
+    let lanes = vec![
+        Seated::of(engine_cuda::Lane {
+            slot: 2,
+            word: media_word(SKU, rows as u32),
+            tokens: &tokens,
+        }),
+        Seated::of(engine_cuda::Lane {
+            slot: 3,
+            word: media_word(SKU, rows as u32),
+            tokens: &tokens,
+        }),
+    ];
+    let mut scores = Vec::new();
+    let wide_all = shell
+        .fire_media(&lanes, &[], &two, &mut scores)
+        .expect("two images answer");
+    let wide = bits(&wide_all[0]);
+
+    // **LOCALIZE FIRST.** The two lanes of the wide fire carry the SAME tokens
+    // and the SAME image, so they must answer each other exactly. If they do
+    // not, the fault is per-lane — the patch segments, the route rebase — and
+    // has nothing to do with the rung; if they do, whatever moved moved for
+    // both, which is the rectangle.
+    let twin = bits(&wide_all[1]);
+    let across = wide.iter().zip(&twin).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        across, 0,
+        "two identical images in one fire answered differently ({across} of {} logits); \
+         the fault is per-lane and not the rung",
+        wide.len(),
+    );
+
+    let moved = narrow.iter().zip(&wide).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        moved, 0,
+        "the first image's readout moved {moved} of {} logits when a second image widened \
+         the patch rectangle; a rung's padding is being attended over",
+        narrow.len(),
+    );
+}
+
+/// **GATE (e): THE THREE REFUSALS, BY NAME.**
+///
+/// Every one of them is host-side and fires BEFORE a launch, which is the
+/// whole point: `layout.scatter_live_rows` is a copy with an index and the
+/// arena does not fault on an address that stays inside one `cudaMalloc`, so a
+/// submission that disagrees with itself has to be caught by arithmetic.
+#[test]
+#[ignore = "real-hardware: needs a CUDA device and a local Qwen3.5-0.8B artifact; run it with `-- --ignored`"]
+fn the_three_media_refusals_fire_by_name() {
+    const FIRST_PLACEHOLDER: i32 = 2;
+    let rows = FIRST_PLACEHOLDER as usize + SOFT_TOKENS + 2;
+    let tokens: Vec<u32> = (0..rows as u32).map(|i| 100 + i).collect();
+    let shot = one_image(FIRST_PLACEHOLDER);
+    let good = Media {
+        lane: 0,
+        rows: &shot.rows,
+        patches: &shot.patches,
+        routes: &shot.routes,
+        positions: &shot.positions,
+        token_positions: &[],
+        embed_rows: &shot.embed_rows,
+        embed_weights: &shot.embed_weights,
+    };
+
+    // (i) AN IMAGE AGAINST A TEXT WITH NO PATCH AXIS.
+    if let Some(mut text) = ready_as(TEXT_SKU, "refusal (i), towerless") {
+        let mut scores = Vec::new();
+        let refused = text.fire_media(
+            &[Seated::of(engine_cuda::Lane {
+                slot: 0,
+                word: text_word(TEXT_SKU, rows as u32),
+                tokens: &tokens,
+            })],
+            &[],
+            &[good],
+            &mut scores,
+        );
+        let why = refused.err().expect("a text-only load refuses an image").to_string();
+        assert!(
+            why.contains("tower") || why.contains("patch"),
+            "the towerless refusal does not name the axis it lacks: {why}"
+        );
+    }
+
+    let Some(mut shell) = ready_as(SKU, "refusals (ii) and (iii)") else {
+        return;
+    };
+    let lane = Seated::of(engine_cuda::Lane {
+        slot: 0,
+        word: media_word(SKU, rows as u32),
+        tokens: &tokens,
+    });
+
+    // (ii) GEOMETRY THAT DISAGREES WITH ITS PAYLOAD: the row count says one
+    // patch fewer than the bytes carry.
+    let short_rows = vec![shot.rows[0] - 1];
+    let mut scores = Vec::new();
+    let refused = shell.fire_media(
+        &[lane.clone()],
+        &[],
+        &[Media { rows: &short_rows, ..good }],
+        &mut scores,
+    );
+    let why = refused
+        .err()
+        .expect("a payload that disagrees with its geometry is refused")
+        .to_string();
+    assert!(
+        why.contains("patch") || why.contains("byte"),
+        "the payload refusal does not name what disagreed: {why}"
+    );
+
+    // (iii) A ROUTE PAST THE LANE'S OWN ROWS. Lane-relative, so `rows` is the
+    // bound, and one past it is the row this fire does not have.
+    let mut far = shot.routes.clone();
+    far[0] = rows as i32;
+    let mut scores = Vec::new();
+    let refused = shell.fire_media(
+        &[lane],
+        &[],
+        &[Media { routes: &far, ..good }],
+        &mut scores,
+    );
+    let why = refused
+        .err()
+        .expect("a route past the lane's rows is refused")
+        .to_string();
+    assert!(
+        why.contains("route") || why.contains("row"),
+        "the route refusal does not name the bound it broke: {why}"
+    );
+}
+
+// **GATE (b) IS NOT HERE, AND HERE IS WHAT IT WANTS.** "A deterministic,
+// sensible caption on a real image" needs three things this crate does not
+// have: a decoded image (an `image` dependency, which lives in `runtime`), the
+// resize-and-patchify policy that turns it into `[patches, C·T·P²]`
+// (`runtime::inferlet::host::media::multimodal::QwenImageConfig::
+// qwen_patchify_hwc`, one crate up and the wrong direction for a shell test),
+// and a tokenizer to read the answer back. A synthetic ramp answers
+// deterministically and says nothing about sense, so asserting on it would be
+// a gate that cannot fail for the reason it names. It belongs where the
+// preprocessing already is — a runtime-level gate, or an inferlet once §6.6's
+// guest door opens — and it is the one of the five that a Shell-level file
+// cannot honestly make.

@@ -21,7 +21,7 @@ use kernels_cuda::attn::plan::{
     DecodePlan, Device, MlaPlan, PrefillPlan, PrefillPlanSm90, Shape, Toggles, Workspace,
 };
 use kernels_cuda::linear::lora::Segments;
-use kernels_cuda::linear::moe::ExpertTable;
+use kernels_cuda::linear::moe::{ExpertTable, GroupSeat};
 use kernels_cuda::{Ctx, KvPool, Pad, RaggedTensor, RecurrentPool, Tensor};
 use model_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
@@ -38,7 +38,20 @@ pub enum WeightRow {
 
     /// A split-plane quantized bank — e2m1 `codes` beside e8m0 `scales` —
     /// resolved by [`Run::planes`], never as one tensor.
-    Planes { codes: Tensor, scales: Tensor },
+    ///
+    /// **`seat` IS WHICH TIER THE GROUP IS ON RIGHT NOW** (alto streaming §3
+    /// item 3, wave B7). The two handles carry the addresses the group was
+    /// SEATED at, which is what a `{:?}` prints and what the null-cell arm
+    /// reads; a streamed group also carries a base cell the kernel loads the
+    /// live pair out of, and a usage counter it notes the routing in. Both are
+    /// zero — [`GroupSeat::RESIDENT`] — for a group the store holds whole,
+    /// which is every group of a fully-resident load, and then the launch is
+    /// byte for byte the launch this row made before the ladder existed.
+    Planes {
+        codes: Tensor,
+        scales: Tensor,
+        seat: GroupSeat,
+    },
 
     /// **A STREAMED ROUTED-EXPERT BANK** (alto design §7, wave D2): a device
     /// slab of fewer slots than the bank has experts, plus the two device
@@ -1250,6 +1263,28 @@ impl<'c> Run<'c> {
         self.cut(id, self.whole(id))
     }
 
+    /// **THE FIRE-WIDE RECTANGLE, ASKED FOR BY NAME** — what a consumer takes
+    /// when its own index vector is already absolute.
+    ///
+    /// The embed merge is the one op that needs it. `layout.scatter_rows` and
+    /// `layout.scatter_live_rows` address their TOKEN destination with
+    /// `RuntimeInput::PatchRoutes`, which `serve::prepare` rebases to absolute
+    /// fire rows and which `Fault::PatchRoute` checks against the fire's own
+    /// row count. Cutting that destination at the region's window would make
+    /// the routes relative to the window and absolute at the same time, and
+    /// the offset would be counted twice.
+    ///
+    /// **THE SAME EXEMPTION `GeomKind::Indices` AND `RuntimeInput::Mask`
+    /// ALREADY TAKE** ([`Run::cut`] argues both): a `Dim`-shaped table whose
+    /// entries are not the rows that `Dim` counts goes over whole, and what
+    /// windows the launch is the vector beside it. It is spelled as an
+    /// accessor rather than as a third arm of `cut` because this one is a
+    /// property of the OP and not of the value — the same embedding column is
+    /// read cut by every other node that touches it.
+    pub(crate) fn fire_wide(&self, id: ValueId) -> Tensor {
+        self.whole(id)
+    }
+
     /// The same resolution, uncut — the fire-wide rectangle a value names.
     fn whole(&self, id: ValueId) -> Tensor {
         let at = id.0 as usize;
@@ -1409,17 +1444,21 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The `(codes, scales)` planes of a split-plane bank — the resolution
+    /// The `(codes, scales)` planes of a split-plane bank and the seat that
+    /// says where they are RIGHT NOW — the resolution
     /// `linear.moe_matmul_select_bias` needs where [`Run::tensor`] would
     /// have to lie with one handle.
-    pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor) {
+    ///
+    /// The seat is [`GroupSeat::RESIDENT`] — two zeros — for every group the
+    /// store holds whole; see [`WeightRow::Planes`].
+    pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor, GroupSeat) {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
             panic!("value {at} is not a weight, and split-plane banks live in the weight table");
         };
         let row = *w as usize;
         match self.weights.0.get(row).copied().flatten() {
-            Some(WeightRow::Planes { codes, scales }) => (codes, scales),
+            Some(WeightRow::Planes { codes, scales, seat }) => (codes, scales, seat),
             Some(WeightRow::Dense(_) | WeightRow::Streamed { .. }) => panic!(
                 "value {at} is weight {row}, bound as one dense handle, and this op reads \
                  a split-plane bank"

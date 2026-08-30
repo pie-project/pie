@@ -1,0 +1,15 @@
+[package]
+name = "image-captioning"
+version = "0.1.0"
+description = "Caption a synthesized solid-colour image through the media door"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+color = {type = "string", optional = true, description = "Fill colour of the synthesized square: red, green or blue (default: red)"}
+side = {type = "int", optional = true, description = "Side of the synthesized square in pixels (default: 224)"}
+question = {type = "string", optional = true, description = "What to ask about the image"}
+system = {type = "string", optional = true, description = "System prompt"}
+max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 16)"}

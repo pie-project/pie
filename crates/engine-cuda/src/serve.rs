@@ -242,7 +242,11 @@ impl Graphs {
 /// Every default below is what this shell did with the variable ABSENT, byte
 /// for byte, so a deployment that states nothing gets exactly what it got
 /// before the words died.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Eq` STOOD BESIDE `PartialEq` HERE and left with the fraction:
+// `gpu_mem_utilization` is an `f64`, and a total equality over a float is a
+// claim this struct has no business making. Nothing compares two `Knobs` for
+// equality in the tree; `PartialEq` is what the derives were for.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Knobs {
     /// **D4's PAD** (`PIE_CUDA_PAD`, `.wiki/palo/cuda-abi.md` §3). ON.
     ///
@@ -365,10 +369,39 @@ pub struct Knobs {
     /// PROFILE's, and a deployment that states its own profile has already
     /// answered: a plain number here would silently outrank it.
     pub side_streams: Option<u32>,
+    /// **WHAT FRACTION OF THE CARD THIS DEPLOYMENT LETS PIE HOLD** — `[engine]
+    /// gpu_mem_utilization`, weights included. `0.90`.
+    ///
+    /// **THE ONE FIELD HERE THAT WAS NEVER A `PIE_CUDA_*` WORD**, and it is
+    /// here for the reason the others are: it is an `[engine]` key, and this
+    /// struct is what the boot document's `[engine]` table parses into. What
+    /// makes it a knob rather than a `Boot` field is the same thing that makes
+    /// the eight above knobs — it describes THIS MACHINE's shell, not one
+    /// model's bake, so it is stated once when the engine is opened and
+    /// carried onto every load.
+    ///
+    /// It was declared, defaulted to `0.90`, validated and schema'd in
+    /// `worker::config` and **read by no shell at all** until this field
+    /// existed (alto streaming §3 item 5, `next.md` B1): the elastic pool took
+    /// ~100% of whatever the card had free, which on the L40S this workspace
+    /// serves from is 34.4 GB where an operator who wrote `0.90` asked for
+    /// 29.6. The route it takes is `worker::config` -> the boot document's
+    /// `[engine]` table -> `crate::boot::knobs` -> here -> `Shell::load` ->
+    /// `Pools::reserve` -> `PhysicalPool::open`, and there is exactly one
+    /// arithmetic at the end of it
+    /// ([`elastic::budget_bytes`](crate::device::elastic::budget_bytes)).
+    ///
+    /// The DEFAULT is `0.90` and not `1.0`, because `0.90` is what the key's
+    /// absence has meant in the worker's config since before the palo rewrite
+    /// — the operator's stated default, finally honoured. A deployment that
+    /// wants the pre-fraction pool writes `gpu_mem_utilization = 1.0` and gets
+    /// it byte for byte.
+    pub gpu_mem_utilization: f64,
 }
 
 impl Default for Knobs {
-    /// Every field at the value the absent environment variable meant.
+    /// Every field at the value the absent environment variable meant — and,
+    /// for the fraction, at what the absent config key has always meant.
     fn default() -> Knobs {
         Knobs {
             pad: true,
@@ -378,9 +411,15 @@ impl Default for Knobs {
             copies: true,
             grouped: true,
             side_streams: None,
+            gpu_mem_utilization: DEFAULT_GPU_MEM_UTILIZATION,
         }
     }
 }
+
+/// **What `[engine] gpu_mem_utilization` means when nobody wrote it** — the
+/// worker config's own default for the key (`worker::config`), spelled once
+/// here so the shell's absence and the operator's absence are one number.
+pub const DEFAULT_GPU_MEM_UTILIZATION: f64 = 0.90;
 
 /// Everything a load states.
 pub struct Boot<'a> {
@@ -765,6 +804,37 @@ fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64
     .unwrap_or(0)
 }
 
+/// **HOW MANY PATCH ROWS THIS PLAN FOLDS INTO ONE** (multimodal §17) — the
+/// product of every patch-axis fold's `side²`, or `1` for a plan that folds
+/// nothing.
+///
+/// `layout.merge_rows` concatenates `side²` rows into one and
+/// `layout.pool_rows` averages `side²` into one; both COMPACT, writing their
+/// answer into the leading `rows / side²` rows of the rectangle. So the rows
+/// `layout.scatter_live_rows` reads are not patch rows — they are the fold's
+/// output rows — and `RuntimeInput::PatchRoutes` has to be written in THAT
+/// space or the two are indexed differently the moment a fold sits between
+/// them.
+///
+/// Read off the trace for `declared_width`'s reason: it is the model text's
+/// number, stated in the ops it wrote, and a second spelling could disagree
+/// with them. A product rather than a single side because a plan that both
+/// merged and pooled would fold by both, and nothing here needs to know which
+/// of the two a given tower used.
+fn patch_fold(trace: &model_ir::Trace) -> u32 {
+    trace
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            model_ir::Operation::Layout(
+                model_ir::Layout::MergeRows { side, .. } | model_ir::Layout::PoolRows { side, .. },
+            ) => Some(side.saturating_mul(*side)),
+            _ => None,
+        })
+        .fold(1u32, |fold, side| fold.saturating_mul(side))
+        .max(1)
+}
+
 /// **"THIS TOWER ROW HAS NO DESTINATION"** (multimodal §8.6) — what a
 /// compacting fold's tail writes into `RuntimeInput::PatchRoutes`.
 ///
@@ -892,6 +962,17 @@ pub struct FireCost {
 
 pub struct Shell {
     device: Context,
+    /// **The unified accounting sentence this load was admitted under** (alto
+    /// streaming §3 item 5, `next.md` B2): the card, the operator's fraction
+    /// of it, the weight tier, the safety floor, what is left for the elastic
+    /// pool, and the one slot at the declared context that is the pool's
+    /// declared minimum.
+    ///
+    /// Kept because it is the PREDICTION the pool is then opened against, and
+    /// a prediction nobody can read back is a comment. `Shell::accounting`
+    /// answers it, and the gate for B1 checks it against what
+    /// [`Shell::elastic`](crate::Shell::elastic) says the pool actually took.
+    accounting: crate::store::Accounting,
     trace: Trace,
     compiled: CompiledModel,
     budget: Budget,
@@ -912,6 +993,11 @@ pub struct Shell {
     /// before the folds, whose `PatchRoutes` must therefore still name a row
     /// in every entry.
     drops_patch_rows: bool,
+    /// **HOW MANY PATCH ROWS THIS PLAN FOLDS INTO ONE** (multimodal §17), or
+    /// `1` for a plan that folds nothing. Read off the trace at load beside
+    /// `drops_patch_rows`, because it is what turns a lane's patch offset into
+    /// the offset its tower rows actually LAND at.
+    patch_fold: u32,
     /// **THE SAME CEILINGS, PLUS THE SECOND ROW AXIS'S** (multimodal §5.5).
     ///
     /// [`budget`](Shell::budget) above is the token rectangle's and is what
@@ -1230,25 +1316,57 @@ impl Shell {
         //    mode refuses. So the setter is fired once here, eagerly, on its
         //    warm arm: it returns before it reaches the handle and leaves the
         //    module resident for every capture that follows.
-        if compiled
-            .regions
-            .iter()
-            .any(|region| region.lowering != model_compiler::Lowering::AlwaysLaunch)
-        {
+        // **AND THE SETTER'S MODULE IS PER SPELLING, NOT PER FAMILY.** An `IF`
+        // stores a bool through `set_conditional` and a `SWITCH` stores an arm
+        // index through `set_switch`; those are two instantiations, two cubins
+        // and two module loads, and warming one does not warm the other. Each
+        // is fired only if the artifact holds the lowering that asks for it, so
+        // a plan with one kind pays for one.
+        let mut wants_if = false;
+        let mut wants_switch = false;
+        for region in &compiled.regions {
+            match region.lowering {
+                model_compiler::Lowering::AlwaysLaunch => {}
+                model_compiler::Lowering::If => wants_if = true,
+                model_compiler::Lowering::Switch { .. } => wants_switch = true,
+            }
+        }
+        if wants_if || wants_switch {
             device.open_conditional()?;
-            kernels_cuda::graph::set_conditional(
-                device.ctx(),
-                0,
-                0,
-                0,
-                false,
-                kernels_cuda::graph::Arm::Warm,
-            )
-            .map_err(|why| Fault::Unbound {
-                what: format!(
-                    "the conditional setter this artifact's baked conditional needs,                      which answered {why}"
-                ),
-            })?;
+            let warmed = |what: &str, outcome: core::result::Result<(), kernels_cuda::Error>| {
+                outcome.map_err(|why| Fault::Unbound {
+                    what: format!(
+                        "the {what} this artifact's baked conditional needs, which \
+                         answered {why}"
+                    ),
+                })
+            };
+            if wants_if {
+                warmed(
+                    "conditional setter",
+                    kernels_cuda::graph::set_conditional(
+                        device.ctx(),
+                        0,
+                        0,
+                        0,
+                        false,
+                        kernels_cuda::graph::Arm::Warm,
+                    ),
+                )?;
+            }
+            if wants_switch {
+                warmed(
+                    "switch setter",
+                    kernels_cuda::graph::set_switch(
+                        device.ctx(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        kernels_cuda::graph::Arm::Warm,
+                    ),
+                )?;
+            }
             crate::device::ctx::sync(device.stream())?;
         }
 
@@ -1273,8 +1391,25 @@ impl Shell {
         let masked = masked_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
         let paging = Paging::of(boot.page_size, boot.context, boot.slots)?;
+        // ── **THE UNIFIED ACCOUNTING SENTENCE, AHEAD OF EVERY BYTE** (alto
+        //    streaming §3 item 5, `next.md` B2). Weight tier + elastic pool +
+        //    safety floor = the card, written down rather than summed by the
+        //    ORDER of the two lines below it, so that a deployment whose
+        //    weights leave no room for its declared context refuses here — one
+        //    sentence naming all six numbers — instead of dying in a
+        //    `cudaMalloc` or on some later fire's `Exhausted`.
+        //
+        //    It runs BEFORE `Weights::resident` on purpose: the whole point is
+        //    to refuse ahead of the allocation, and every term of it is
+        //    knowable from the plan, the paging and the card.
+        let accounting = crate::store::admit_the_card(
+            boot.knobs.gpu_mem_utilization,
+            boot.residency.device_demand(),
+            &boot.trace,
+            paging,
+        )?;
 
-        let weights = Weights::resident(
+        let mut weights = Weights::resident(
             &boot.trace,
             boot.contract,
             boot.checkpoint,
@@ -1282,8 +1417,28 @@ impl Shell {
             boot.residency.clone(),
             device.stream(),
         )?;
+        // **AND THE DENSE PUMP, ARMED HERE BECAUSE HERE IS WHERE BOTH HALVES
+        // ARE IN HAND** (alto streaming §3 item 4, D2b). The residency plan is
+        // decided before the model is compiled — `experts::Plan::of` runs
+        // against the trace and the budgets — and the rotation is planned at
+        // REGION granularity, which is the compiler's word. So the one instant
+        // that holds a landed tier and a `CompiledModel` at once is this one.
+        // A load with nothing to rotate arms nothing and pays nothing.
+        weights.rotate(&boot.trace, &compiled)?;
         let arena = Arena::reserve(&compiled.arena)?;
-        let pools = Pools::reserve(device.ordinal(), &boot.trace, paging, &facts)?;
+        let pools = Pools::reserve(
+            device.ordinal(),
+            // **THE FRACTION'S LAST HOP** (`next.md` B1). `[engine]
+            // gpu_mem_utilization` reached no shell at all until this line:
+            // the pool took ~100% of what the card had free, which on the L40S
+            // this workspace serves from is 34.4 GB where an operator who
+            // wrote `0.90` asked for 29.6. `Knobs::default()` is `0.90`, which
+            // is the worker config's own default for the key.
+            boot.knobs.gpu_mem_utilization,
+            &boot.trace,
+            paging,
+            &facts,
+        )?;
         // **THE BUFFER IS SIZED BY THE PLAN AND THE BUDGET, AND BY NOTHING
         // ELSE** (design §6, dev's `configure_rs_buffer_pool`): per-token
         // bytes come off the recurrent ops' own in-projection widths,
@@ -1358,6 +1513,10 @@ impl Shell {
         // that folds its patch rows declares `layout.scatter_live_rows`; one
         // that does not keeps `layout.scatter_rows`' contract, under which a
         // negative route is a write below the base of the token rectangle.
+        // **AND BY HOW MUCH ITS TOWER ROWS COMPACT** (multimodal §17): the
+        // routes vector is written in the FOLD's output space, not in patch
+        // rows, because that is the space `layout.scatter_live_rows` reads.
+        let patch_fold = patch_fold(&boot.trace);
         let drops_patch_rows = boot.trace.nodes.iter().any(|node| {
             matches!(
                 node.op,
@@ -1438,6 +1597,7 @@ impl Shell {
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         Ok(Shell {
             device,
+            accounting,
             trace: boot.trace,
             compiled,
             budget: budgets.tokens.clone(),
@@ -1445,6 +1605,7 @@ impl Shell {
             patch_seat,
             mrope_seat,
             drops_patch_rows,
+            patch_fold,
             weights,
             arena,
             pools,
@@ -3159,7 +3320,18 @@ impl FrameShell for Shell {
         } else {
             let stride = row_bytes as usize;
             let mut payload = vec![0u8; composition.patch_rows() as usize * stride];
-            let mut routes = vec![0i32; composition.patch_rows() as usize];
+            // **THE SENTINEL IS THE DEFAULT, NOT ZERO** (multimodal §8.6, §17).
+            // Every entry no lane writes is a row with no destination: the
+            // fold's dead tail, and the rung padding past the last real image.
+            // Zero is a legal token row, so leaving them zero scatters the
+            // arena's leftovers over row 0 of the fire. A plan that declares no
+            // dropping scatter has no such rows — every route it states names a
+            // row — and keeps the zero it always had.
+            let mut routes =
+                vec![
+                    if self.drops_patch_rows { PATCH_ROUTE_DROP } else { 0 };
+                    composition.patch_rows() as usize
+                ];
             // **THE TOWER'S ROTATION STREAM, PLACED THE WAY THE PAYLOAD IS.**
             // A patch's `(t, h, w)` is its own image's grid coordinate, so it
             // is the submission's number verbatim — no rebasing, unlike the
@@ -3171,6 +3343,8 @@ impl FrameShell for Shell {
             // they ride through verbatim like the rotation stream and unlike
             // the routes. Zero-length when the plan declares no table, and
             // then the loop below copies nothing into them.
+            // How many patch rows this plan folds into one tower output row.
+            let fold = (self.patch_fold as usize).max(1);
             let taps = embed_taps as usize;
             let weight_taps = embed_weight_taps as usize;
             let mut embed_rows = vec![0i32; composition.patch_rows() as usize * taps];
@@ -3182,8 +3356,40 @@ impl FrameShell for Shell {
                 };
                 let at = row.patch_offset as usize * stride;
                 payload[at..at + shot.patches.len()].copy_from_slice(shot.patches);
-                for (j, &route) in shot.routes.iter().enumerate() {
-                    routes[row.patch_offset as usize + j] = route + row.row_offset as i32;
+                // **THE ROUTES GO IN THE FOLD'S OUTPUT SPACE, NOT IN PATCH
+                // ROWS** (multimodal §17). `layout.merge_rows` and
+                // `layout.pool_rows` COMPACT: `side²` patch rows become one row
+                // at the FRONT of the rectangle, so a lane whose patch rows
+                // start at `patch_offset` has its tower output at
+                // `patch_offset / fold` — and `layout.scatter_live_rows` pairs
+                // `src[j]` with `routes[j]` over THOSE rows.
+                //
+                // Writing them at `patch_offset` instead is right for exactly
+                // one lane and wrong for every lane after it, because lane 0's
+                // offset is zero and `0 / fold` is `0`. With two images the
+                // second lane's routes landed at 64 where the scatter read 16,
+                // so its soft tokens were dropped and its placeholder rows took
+                // the garbage past the fold's live prefix instead.
+                //
+                // **AND A SENTINEL IS NOT AN ADDRESS, SO IT IS NOT REBASED.** A
+                // route names a token row relative to its lane and `row_offset`
+                // is the fire's answer to that; a NEGATIVE route names no row,
+                // and adding an offset to it produces one — at `row_offset =
+                // 20` every dead tail row became token row 19, which is the
+                // PREVIOUS lane's last row.
+                let landed = (row.patch_offset as usize) / fold;
+                let live = shot
+                    .rows
+                    .iter()
+                    .map(|rows| *rows as usize)
+                    .sum::<usize>()
+                    / fold;
+                for (j, &route) in shot.routes.iter().take(live).enumerate() {
+                    routes[landed + j] = if route < 0 {
+                        route
+                    } else {
+                        route + row.row_offset as i32
+                    };
                 }
                 let triples = row.patch_offset as usize * AXES;
                 positions[triples..triples + shot.positions.len()]
@@ -4550,7 +4756,18 @@ impl Shell {
         // window's addressing over another window's tokens. So a fire that
         // moves buffered bytes takes the eager walk, whatever mode the shell
         // is in: the same walk, the same launches, nothing recorded.
-        let records = graphs.records() && !p.rs.buffered;
+        // **AND A ROTATING LOAD IS NOT GRAPH-REPLAYABLE EITHER**, for a
+        // reason with the same shape (alto streaming §3 item 4, D2b). The
+        // dense pump rotates a slot's contents at each region boundary, and
+        // its backpressure is a HOST cursor the walk advances; a replayed
+        // graph has no walk, so a captured rotation would bake one fire's ring
+        // state into an exec that outlives it — and the copies and their
+        // events would be nodes standing in no position of the parent chain,
+        // which is the hole `Tapped`'s census already declines a conditional
+        // for. So a load whose weights rotate takes the eager walk, whatever
+        // mode the shell is in: the same walk, the same launches, nothing
+        // recorded. `crate::rotate`'s header carries the whole argument.
+        let records = graphs.records() && !p.rs.buffered && !weights.rotating();
         let walked = if records {
             let fire = record::Fire {
                 trace,
@@ -4579,14 +4796,19 @@ impl Shell {
                 cache.fire(&fire, &mut run, &place).map(|_mode| ())
             }
         } else {
-            walk(
-                trace,
-                compiled,
-                &p.descriptor,
-                &mut run,
-                &mut Cursor::new(&place),
-            )
-            .map_err(Fault::from)
+            // **THE ROTATION RIDES THE EAGER CURSOR** (alto streaming §3 item
+            // 4). `Cursor::pumping` is the region seam: release, issue,
+            // acquire, once per `region_begin`, on the fire's own compute
+            // stream. `None` for every load that armed no pump, and then this
+            // is the line it always was.
+            let mut cursor = Cursor::new(&place);
+            if let Some(rotor) = weights.rotor() {
+                cursor = cursor.pumping(crate::window::Pump {
+                    rotor,
+                    compute: device.stream(),
+                });
+            }
+            walk(trace, compiled, &p.descriptor, &mut run, &mut cursor).map_err(Fault::from)
         };
         drop(run);
         // **THE PAD IS THE FIRE'S, SO IT ENDS WITH THE FIRE** — including the

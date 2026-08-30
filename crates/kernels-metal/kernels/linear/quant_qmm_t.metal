@@ -16,6 +16,37 @@ using namespace metal;
 #define MLX_MTL_CONST static constant constexpr const
 MLX_MTL_CONST int SIMD_SIZE = 32;
 
+// The simdgroup split down M, as a function of the row block — the DEFAULT
+// every template below takes for `WM`, so that a row block names its own
+// warp shape instead of each instantiation restating it.
+//
+// `mlx::steel::BlockMMA` computes `TM = BM / (kFragSize * WM)` with
+// `kFragSize = 8`, so `BM = 8` admits `WM = 1` AND NOTHING ELSE: at `WM = 2`
+// every simdgroup gets a zero-row warp tile and the MMA computes nothing at
+// all. That single constraint is why the 8 rung needed a source
+// instantiation rather than another argument to the stamp — see `BM_RUNGS`
+// in `kernels-metal/src/linear/quant.rs` for what it buys.
+//
+// The threadgroup shrinks with it: `WM * WN * SIMD_SIZE` is 64 lanes at the 8
+// rung against 128 at every rung above, which the host has to launch to match
+// (`quant::qmm_group`), because both block loaders divide their tile by
+// `tgp_size` and a loader told 128 while 64 arrive leaves half the tile
+// unwritten.
+template <int BM>
+inline constexpr int qmm_wm() {
+  return BM < 16 ? 1 : 2;
+}
+
+// The lanes a row block's threadgroup holds. `WN = 2` throughout this file —
+// the one place a column split of four appears is a hand-written
+// instantiation at the bottom — so a block loader that carries no `WN` of its
+// own reads its `tgp_size` from here rather than from a literal `4 *
+// SIMD_SIZE`, which was correct for exactly the rungs that predate the 8.
+template <int BM>
+inline constexpr int qmm_tgp() {
+  return qmm_wm<BM>() * 2 * SIMD_SIZE;
+}
+
 #include "../third_party/mlx_steel_prelude.metal"
 #include "../third_party/mlx_steel_transforms.metal"
 #include "../third_party/mlx_steel_mma.metal"
@@ -23,7 +54,8 @@ MLX_MTL_CONST int SIMD_SIZE = 32;
 #include "../third_party/mlx_quantized_block.metal"
 
 template <typename T, typename P, typename LoaderW, int BM, int BK, int BN,
-          bool WITH_RESIDUAL, bool WITH_BIAS, int WM = 2, int WN = 2>
+          bool WITH_RESIDUAL, bool WITH_BIAS, int WM = qmm_wm<BM>(),
+          int WN = 2>
 METAL_FUNC void qmm_t_loaded_impl(
     const device T* x,
     device P* y,
@@ -83,7 +115,7 @@ METAL_FUNC void qmm_t_loaded_impl(
 }
 
 template <typename T, typename LoaderW, int BM, int BK, int BN, bool WITH_BIAS,
-          bool WITH_RESIDUAL = false, int WM = 2, int WN = 2>
+          bool WITH_RESIDUAL = false, int WM = qmm_wm<BM>(), int WN = 2>
 METAL_FUNC void qmm_t_cast_loaded_impl(
     const device T* x,
     device T* y,
@@ -139,7 +171,8 @@ METAL_FUNC void qmm_t_cast_loaded_impl(
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
-          bool WITH_RESIDUAL, bool WITH_BIAS = false, int WM = 2, int WN = 2>
+          bool WITH_RESIDUAL, bool WITH_BIAS = false,
+          int WM = qmm_wm<BM>(), int WN = 2>
 METAL_FUNC void qmm_t_aligned_half_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -177,7 +210,8 @@ METAL_FUNC void qmm_t_aligned_half_impl(
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
-          bool WITH_RESIDUAL, bool WITH_BIAS = false, int WM = 2, int WN = 2>
+          bool WITH_RESIDUAL, bool WITH_BIAS = false,
+          int WM = qmm_wm<BM>(), int WN = 2>
 METAL_FUNC void qmm_t_aligned_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -213,7 +247,8 @@ METAL_FUNC void qmm_t_aligned_impl(
 }
 
 template <typename P, int group_size, int bits, int BM, int BK, int BN,
-          bool WITH_BIAS = false, bool WITH_RESIDUAL = false>
+          bool WITH_BIAS = false, bool WITH_RESIDUAL = false,
+          int WM = qmm_wm<BM>(), int WN = 2>
 METAL_FUNC void qmm_t_fp16_precast_impl(
     const device uint32_t* w,
     const device bfloat* scales,
@@ -234,7 +269,7 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   constexpr int BK_padded = BK + 16 / sizeof(half);
 
   using loader_w_t = QuantizedBlockLoader<
-      bfloat, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits, half>;
+      bfloat, BN, BK, BK_padded, 1, WM * WN * SIMD_SIZE, group_size, bits, half>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -245,7 +280,8 @@ METAL_FUNC void qmm_t_fp16_precast_impl(
   scales += y_col * K_g;
   biases += y_col * K_g;
   loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-  qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS>(
+  qmm_t_loaded_impl<half, P, loader_w_t, BM, BK, BN, WITH_RESIDUAL, WITH_BIAS,
+                    WM, WN>(
       x, y, bias, Xs, Ws, K, N, k_len,
       tid, simd_gid, simd_lid, loader_w);
 }
@@ -341,7 +377,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
 }
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
-          int WM = 2, int WN = 2>
+          int WM = qmm_wm<BM>(), int WN = 2>
 [[kernel]] void affine_qmm_t_aligned(
     const device uint32_t* w   [[buffer(0)]],
     const device T* scales     [[buffer(1)]],
@@ -433,7 +469,7 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
   constexpr int BK_padded = BK + 16 / sizeof(half);
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits, half>;
+      T, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits, half>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -470,7 +506,7 @@ template <typename T, int BM, int BK, int BN>
   if (e < 0) return;
 
   constexpr int BK_padded = BK + 16 / sizeof(half);
-  constexpr int tgp_size = 4 * SIMD_SIZE;
+  constexpr int tgp_size = qmm_tgp<BM>();
   const int y_col = int(tid.x) * BN;
   const size_t expert_w = size_t(e) * size_t(N) * size_t(K) / 2;
   const size_t expert_s = size_t(e) * size_t(N) * size_t(K / 32);
@@ -569,6 +605,31 @@ instantiate_qmm_t_fp16_precast(64, 16)
 instantiate_qmm_t_fp16_precast(64, 32)
 instantiate_qmm_t_fp16_precast(64, 64)
 
+// **THE 8 RUNG**, `WM = 1` by `qmm_wm` and 64 lanes to the threadgroup.
+// Three of the file's families are stamped at it and the rest are not:
+//
+//   * PRE-CAST, here and in its `_bias`/`_residual` forms below, is the one
+//     that matters. On a machine that emulates bfloat every dense projection
+//     of a 4-bit/g64 checkpoint takes this family (`quant::act_x_wt` rung 2),
+//     so a two-to-seven-lane decode is arithmetic that only this rung can cut.
+//   * SPLIT-K follows it, because rung 3 is reachable at the same row block
+//     whenever the pre-cast arm declines — and a `bm_rung` of 8 with no split
+//     point stamped at 8 is a refusal at fire time rather than a slower path.
+//   * PLAIN needs no line anywhere: it is minted by `PIE_STAMP_qmm_t`, and
+//     `affine_qmm_t_aligned` reads its `WM` from `qmm_wm<BM>()` like
+//     everything else, so the existing stamp mints the 8 rung unchanged and
+//     the macro's arity did not move.
+//
+// STRIDED, ROUTED and MXFP4 are deliberately left out. No Rust caller composes
+// a strided name at all, and the routed pair's row block comes from
+// `linear::moe`'s own `MOE_TILE_ROWS = [16, 32, 64]` — an expert's run is
+// `rows x top_k / experts`, which reaches a block this narrow only in a fleet
+// too small to take the batched arm in the first place. Stamping them would
+// compile entrypoints for a fire that cannot arrive.
+instantiate_qmm_t_fp16_precast(8, 16)
+instantiate_qmm_t_fp16_precast(8, 32)
+instantiate_qmm_t_fp16_precast(8, 64)
+
 #define instantiate_qmm_t_bias_fp16_precast(bm, bn)                          \
   template [[host_name("affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4"   \
                        "_bm_" #bm "_bn_" #bn)]]                              \
@@ -594,6 +655,9 @@ instantiate_qmm_t_residual_fp16_precast(32, 64)
 instantiate_qmm_t_residual_fp16_precast(64, 16)
 instantiate_qmm_t_residual_fp16_precast(64, 32)
 instantiate_qmm_t_residual_fp16_precast(64, 64)
+instantiate_qmm_t_residual_fp16_precast(8, 16)
+instantiate_qmm_t_residual_fp16_precast(8, 32)
+instantiate_qmm_t_residual_fp16_precast(8, 64)
 
 instantiate_qmm_t_bias_fp16_precast(16, 16)
 instantiate_qmm_t_bias_fp16_precast(16, 32)
@@ -604,6 +668,9 @@ instantiate_qmm_t_bias_fp16_precast(32, 64)
 instantiate_qmm_t_bias_fp16_precast(64, 16)
 instantiate_qmm_t_bias_fp16_precast(64, 32)
 instantiate_qmm_t_bias_fp16_precast(64, 64)
+instantiate_qmm_t_bias_fp16_precast(8, 16)
+instantiate_qmm_t_bias_fp16_precast(8, 32)
+instantiate_qmm_t_bias_fp16_precast(8, 64)
 
 template <typename T, int group_size, int bits, int BM, int BK, int BN,
           bool WITH_RESIDUAL>
@@ -627,7 +694,7 @@ METAL_FUNC void qmm_t_strided_impl(
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -718,7 +785,7 @@ METAL_FUNC void qmm_t_strided_fp16_precast_impl(
   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
 
   using loader_w_t = QuantizedBlockLoader<
-      bfloat, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits, half>;
+      bfloat, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits, half>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -904,7 +971,7 @@ METAL_FUNC void qmm_t_splitk_impl(
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
   using loader_w_t = QuantizedBlockLoader<
-      T, BN, BK, BK_padded, 1, 4 * SIMD_SIZE, group_size, bits>;
+      T, BN, BK, BK_padded, 1, qmm_tgp<BM>(), group_size, bits>;
 
   const int K_w = K * bytes_per_pack / pack_factor;
   const int K_g = K / group_size;
@@ -1036,6 +1103,12 @@ instantiate_qmm_t_splitk(128, 64, 32, 32, 4)
 instantiate_qmm_t_splitk(64, 64, 32, 32, 8)
 instantiate_qmm_t_splitk(32, 64, 32, 32, 8)
 instantiate_qmm_t_splitk(128, 64, 32, 32, 8)
+instantiate_qmm_t_splitk(64, 8, 32, 32, 4)
+instantiate_qmm_t_splitk(32, 8, 32, 32, 4)
+instantiate_qmm_t_splitk(128, 8, 32, 32, 4)
+instantiate_qmm_t_splitk(64, 8, 32, 32, 8)
+instantiate_qmm_t_splitk(32, 8, 32, 32, 8)
+instantiate_qmm_t_splitk(128, 8, 32, 32, 8)
 
 #define instantiate_qmm_t_splitk_fp16_precast(name, ptype, bm)              \
   template [[host_name("affine_qmm_t_splitk_fp16_precast_" #name            \
@@ -1052,6 +1125,8 @@ instantiate_qmm_t_splitk_fp16_precast(bfloat16, bfloat, 64)
 instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 16)
 instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 32)
 instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 64)
+instantiate_qmm_t_splitk_fp16_precast(bfloat16, bfloat, 8)
+instantiate_qmm_t_splitk_fp16_precast(f32_bfloat16, float, 8)
 
 template [[host_name("qmm_splitk_reduce_bfloat16")]] [[kernel]] void
 qmm_splitk_reduce<bfloat, bfloat>(

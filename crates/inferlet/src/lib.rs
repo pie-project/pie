@@ -141,10 +141,35 @@ pub mod grammar {
 /// Multimodal input. The inferlet hands the host raw encoded bytes —
 /// [`Image::from_bytes`](media::Image) (PNG/JPEG), [`Video::from_bytes`](media::Video)
 /// (animated GIF), [`Audio::from_bytes`](media::Audio) (WAV) — and the host
-/// decodes + preprocesses per the bound model. The returned handle's
-/// `token-count` / `position-span` / `grid` describe how it occupies the
-/// context. No model-specific code lives in the inferlet.
-/// (`MULTIMODAL.md` was the design; doc not in tree.)
+/// decodes + preprocesses per the bound model. No model-specific code lives in
+/// the inferlet.
+///
+/// **ONE LEDGER, ONE LINE** (`.wiki/alto/media-door.md` §0/§1). A span enters
+/// the sequence as the token run its handle answers, and the handle crosses
+/// again beside the tokens to carry the payload:
+///
+/// ```ignore
+/// let img = media::Image::from_bytes(&bytes)?;
+/// let mut toks = tokenizer.encode("Describe: ");
+/// toks.extend(img.tokens());          // <|vision_start|> + pad×N + <|vision_end|>
+/// toks.extend(tokenizer.encode(" briefly."));
+/// pass.embed(&tokens_ch, &indptr_ch)?;
+/// pass.media(&[media::Span::Image(&img)])?;
+/// ```
+///
+/// The host scans the submitted tokens for the placeholder runs and matches
+/// them to the attached spans in order, refusing every disagreement by name
+/// before anything launches — so the correspondence is checked, not promised.
+///
+/// **AND `digest()` IS NOT OPTIONAL IF YOU CACHE.** Two different images
+/// produce identical token lists, so any reuse keyed on tokens across a media
+/// run must fold the span's digest into its key. See the statute in
+/// `media.wit`'s interface doc.
 pub mod media {
     pub use crate::pie::inferlet::media::{Audio, Image, Video};
+    /// One attached span, by the resource you hold — `forward-pass.media`'s
+    /// argument. Re-exported here rather than from `forward` because it is
+    /// about media, and because a guest that names it is holding one of the
+    /// resources above.
+    pub use crate::pie::inferlet::forward::MediaSpan as Span;
 }

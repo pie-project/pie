@@ -123,7 +123,11 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
-                &mut self.tensor(*y),
+                // **THE DESTINATION GOES OVER WHOLE** (multimodal §18): the
+                // routes are absolute fire rows, so a window-cut `y` would
+                // count the region's offset twice. `Run::fire_wide` carries
+                // the argument.
+                &mut self.fire_wide(*y),
             ),
             // THE EMBED MERGE. `src` resolves at the PATCH window and `y` at
             // the token one — the one node in a tower plan whose two operands
@@ -140,7 +144,8 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*src),
                 self.tensor(*routes),
-                &mut self.tensor(*y),
+                // Whole, for `scatter_live_rows`' reason one arm up.
+                &mut self.fire_wide(*y),
             ),
             Layout::Select {
                 table,

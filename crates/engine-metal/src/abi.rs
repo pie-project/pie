@@ -48,11 +48,14 @@
 //!
 //! # Arms: a slot is one ENTRY and not one PIPELINE
 //!
-//! `kernels_metal::linear::gemm::act_x_wt` takes `dense_gemv_t_bfloat16`
-//! below `TILE_M = 32` rows and `dense_gemm_t_bfloat16_bm_32_bn_32` at or
-//! above it. 127 of qwen35-d0.8b's 465 slots do that. Build log 30 named them
-//! and left them out of the fit; here they are fitted ONE TABLE PER ARM, and
-//! which arm runs is [`Pick::Rows`] — a threshold on the window's rows,
+//! `kernels_metal::linear::gemm::act_x_wt` takes
+//! `dense_gemm_t_bfloat16_bm_8_bk_64_bn_32` below `TILE_M = 32` rows and
+//! `dense_gemm_t_bfloat16_bm_32_bk_32_bn_32` at or above it — one kernel at
+//! two row blocks, which is what makes the pick invisible in the ANSWER
+//! (that entry's header) and still two shader points here. 127 of
+//! qwen35-d0.8b's 465 slots do that. Build log 30 named them and left them
+//! out of the fit; here they are fitted ONE TABLE PER ARM, and which arm
+//! runs is [`Pick::Rows`] — a threshold on the window's rows,
 //! bracketed to the row by the ladder that crosses it. That is the form the
 //! rebind shader can evaluate, which is the whole reason it is a threshold
 //! and not a lookup.

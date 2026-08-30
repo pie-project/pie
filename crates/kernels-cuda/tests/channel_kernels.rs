@@ -40,6 +40,10 @@
 //! (i) a committed fire's SETTLEMENT advances the guest endpoint's own
 //!     counters to the prediction plus one — and only the counters a ticket
 //!     names, and only for a lane that committed
+//! (j) a ticket's PULL is predicated on that ticket alone: it happens whether
+//!     the veto that refuses the fire arrives before it or after it, which is
+//!     the one exception to "the bump is the only writer" and the property a
+//!     parallel vote could quietly lose
 //! ```
 //!
 //! # How it is set up
@@ -1086,4 +1090,110 @@ fn a_committed_fires_settlement_advances_exactly_the_counters_its_tickets_name()
         "a refused lane settles nothing, so the guest's endpoint stands exactly \
          where it stood and the next fire predicts the same numbers",
     );
+}
+
+
+// ───────────────────────────────── (j) ───────────────────────────────────
+
+/// **A PULL IS PREDICATED ON ITS OWN TICKET, AND ON NOTHING ELSE IN THE FIRE.**
+///
+/// The module header's one documented exception to "`commit_bump` is the only
+/// writer": a ticket that passes copies its mirror cell in and sets the full
+/// byte, and a LATER ticket in the same lane can still veto the fire — leaving
+/// that byte set on a pass that did not commit. It is safe because the byte
+/// records something the GUEST published, the head does not move, and the next
+/// fire re-pulls the same cell and sets the same byte.
+///
+/// What makes it worth a gate of its own is that the exception is stated in
+/// TICKET ORDER, and the kernel no longer walks its tickets in order: the vote
+/// is taken one thread per ticket, all the loads in flight together, and the
+/// pulls follow one warp per ticket. So this asks the property in both
+/// directions at once — one lane whose veto arrives AFTER the pulling ticket,
+/// one whose veto arrives BEFORE it — and demands the same answer from both.
+/// A kernel that gated the pull on the lane's running commit word would pass
+/// the first lane and fail the second; one that gated it on the whole fire
+/// would fail both.
+#[test]
+fn a_pulled_cell_lands_whether_the_veto_comes_before_it_or_after_it() {
+    let mut gpu = Gpu::open();
+    // Four slots, one per ticket: two lanes of (host writer, stale peek), in
+    // opposite orders. Every ring stands at 0/1 in the registry.
+    let registry = Registry::seed(&mut gpu, &[4, 4, 4, 4], &[0, 0, 0, 0], &[1, 1, 1, 1], &[]);
+
+    const PAYLOAD: [u8; 16] = [
+        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE,
+        0xAF,
+    ];
+
+    // The two pulling tickets — slot 0 for the lane vetoed after it, slot 2
+    // for the lane vetoed before it. Both predict truly.
+    let mut cells = Vec::new();
+    let mut pullers = Vec::new();
+    for slot in [0u32, 2] {
+        let words = gpu.words(0, 1);
+        let (host, mirror) = gpu.mapped(4 * PAYLOAD.len());
+        // SAFETY: `mapped` just allocated `4 * PAYLOAD.len()` bytes at `host`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(PAYLOAD.as_ptr(), host, PAYLOAD.len());
+        }
+        let cell = gpu.zeros(4 * PAYLOAD.len());
+        cells.push(cell);
+        let mut puller = ticket(
+            slot,
+            Ticket::CONSUME | Ticket::REQUIRE_INPUT | Ticket::HOST_WRITER,
+            4,
+            words,
+        );
+        puller.expected_head = 0;
+        puller.mirror = mirror;
+        puller.cells = cell;
+        puller.wire_bytes = PAYLOAD.len() as u32;
+        puller.native_bytes = PAYLOAD.len() as u32;
+        pullers.push(puller);
+    }
+
+    // The two vetoing tickets: the endpoint stands at 9 and the fire believes 3.
+    let mut vetoes = Vec::new();
+    for slot in [1u32, 3] {
+        let words = gpu.words(9, 10);
+        let mut veto = ticket(slot, Ticket::CONSUME, 4, words);
+        veto.expected_head = 3;
+        vetoes.push(veto);
+    }
+
+    // Lane 0: pull, then veto. Lane 1: veto, then pull.
+    let tickets = gpu.up(&[pullers[0], vetoes[0], vetoes[1], pullers[1]]);
+    let (after, after_commit) = lane(&mut gpu, registry.rings, 0, 2);
+    let (before, before_commit) = lane(&mut gpu, registry.rings, 2, 2);
+    let lanes = gpu.up(&[after, before]);
+
+    let ctx = gpu.ctx();
+    channel::pull_validate(&ctx, tickets, lanes, 2).expect("enqueues");
+    gpu.sync();
+
+    assert_eq!(
+        gpu.down::<u32>(after_commit, 2)[0],
+        0,
+        "the stale ticket refuses the fire whatever order it sits in",
+    );
+    assert_eq!(
+        gpu.down::<u32>(before_commit, 2)[0],
+        0,
+        "and so does the one that sits first",
+    );
+
+    for (which, (cell, slot)) in [(cells[0], 0u32), (cells[1], 2)].into_iter().enumerate() {
+        let order = if which == 0 { "after" } else { "before" };
+        let bytes: Vec<u8> = gpu.down(cell, 4 * PAYLOAD.len());
+        assert_eq!(
+            &bytes[..PAYLOAD.len()],
+            &PAYLOAD,
+            "the veto arriving {order} the pull suppressed it; a pull is              predicated on its own ticket, not on the fire's commit word",
+        );
+        assert_eq!(
+            registry.full(&gpu, slot, 4),
+            vec![1, 0, 0, 0],
+            "and the full byte the pull sets is set on a pass that did not              commit — the header's documented exception, veto {order}",
+        );
+    }
 }

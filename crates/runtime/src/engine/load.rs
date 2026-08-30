@@ -342,27 +342,35 @@ pub fn request(
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
-    let sku = identify(checkpoint, platform)?;
-    Ok(LoadRequest {
-        trace: trace(sku, platform)?,
-        checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
-        budgets,
-        residency,
-        ordinal,
-        frames_in_flight,
-    })
+    request_of(None, checkpoint, platform, budgets, residency, ordinal, frames_in_flight)
 }
 
-/// Everything a load states, for a checkpoint whose SKU the caller already
-/// knows.
+/// **THE ONE DOOR, WITH THE OPERATOR'S ROW OR WITHOUT IT.**
 ///
-/// `frames_in_flight` as [`request`].
+/// `sku` is `[model] sku`: `None` identifies one ([`identify`]), and a name
+/// takes that row's trace without asking the checkpoint a second question.
+///
+/// **NAMING A ROW IS NOT A SECOND KIND OF LOAD**, which is why this is one
+/// function and not two — `request_for` stood beside `request` with no caller
+/// in the tree, and two doors onto the same load is what let the second one
+/// rot. A checkpoint that fits two rows is the whole reason the key exists: a
+/// vision artifact holds a text trunk AND a tower, so it fits its family's
+/// text row and its own, and identification takes the first — deliberately the
+/// cheap one, because a two-unit load stands the fold down. An operator who
+/// wants the tower says so.
+///
+/// A named row that does NOT fit is refused where every mismatched load is:
+/// `checkpoint::plan::compile`, inside the weight residency, naming the param
+/// and both shapes. That is later than [`identify`]'s own verdict and it is
+/// the honest place for it — the operator named a row, so "this checkpoint
+/// does not hold it" is an answer about the row they named.
 ///
 /// # Errors
 ///
-/// A SKU whose trace this build does not ship.
-pub fn request_for(
-    sku: &str,
+/// A checkpoint no SKU claims (when identifying), or a SKU whose trace this
+/// build does not ship.
+pub fn request_of(
+    sku: Option<&str>,
     checkpoint: &Path,
     platform: Platform,
     budgets: Budgets,
@@ -370,8 +378,19 @@ pub fn request_for(
     ordinal: i32,
     frames_in_flight: u8,
 ) -> Result<LoadRequest> {
+    let sku = match sku {
+        Some(named) => {
+            tracing::info!(sku = named, ?checkpoint, "serving the sku the config named");
+            named.to_string()
+        }
+        None => {
+            let found = identify(checkpoint, platform)?;
+            tracing::info!(sku = found, ?checkpoint, "identified");
+            found.to_string()
+        }
+    };
     Ok(LoadRequest {
-        trace: trace(sku, platform)?,
+        trace: trace(&sku, platform)?,
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
         budgets,
         residency,

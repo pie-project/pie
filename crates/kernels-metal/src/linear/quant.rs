@@ -51,13 +51,50 @@ const GROUPS: [i32; 3] = [32, 64, 128];
 /// Bit widths they instantiate.
 const WIDTHS: [i32; 2] = [4, 8];
 
-/// Row and column tiles the qmm point is stamped at, WIDEST FIRST, because
-/// the selection takes the first that divides the rectangle.
+/// Column tiles the qmm point is stamped at, WIDEST FIRST, because the
+/// selection takes the first that divides the rectangle. Also the ROW tiles
+/// of the routed families, which stop at 16 — see [`ROW_TILES`] for why the
+/// dense ones do not.
 const TILES: [i32; 3] = [64, 32, 16];
 
-/// Threadgroup of the tiled point: `WM * WN * SIMD_SIZE` = 128 lanes, laid
-/// out the way `qmm_grid` counts them.
-const QMM_GROUP: [u32; 3] = [32, 2, 2];
+/// Row tiles the DENSE families are stamped at, widest first — [`TILES`] plus
+/// the 8 rung.
+///
+/// A separate list because the two are no longer the same set and the
+/// difference is a fact about what is instantiated, not a convenience.
+/// `quant_qmm_t.metal` stamps 8 for the pre-cast, split and plain families
+/// alone; the routed pair keeps `TILES` because `linear::moe` selects its row
+/// block from its own `MOE_TILE_ROWS` and never asks for one this narrow.
+/// Checking a routed name against this list would accept a tile the compiler
+/// will not mint.
+const ROW_TILES: [i32; 4] = [64, 32, 16, 8];
+
+/// The threadgroup a row block of `bm` launches at — `[SIMD_SIZE, WN, WM]`,
+/// which is the layout `quant_qmm_t.metal` reads `simd_gid` out of.
+///
+/// **IT IS NOT ONE CONSTANT ANY MORE, AND THAT IS THE 8 RUNG'S DOING.**
+/// `mlx::steel::BlockMMA` gives each simdgroup a warp tile `BM / (8 * WM)`
+/// rows tall, so an 8-row block admits `WM = 1` and nothing else — the
+/// shader's own `qmm_wm` is where that is written down. Half the row split is
+/// half the threadgroup: 64 lanes at the 8 rung, 128 above it.
+///
+/// **LAUNCHING THE WRONG ONE IS A WRONG ANSWER, NOT A SLOW ONE.** Both block
+/// loaders divide their tile by `tgp_size` and read `load_unsafe` with no
+/// bound check, so 64 lanes arriving at a point compiled for 128 leave half
+/// of every staged tile whatever the threadgroup memory last held.
+///
+/// The threshold is `kFragSize * 2` and not a rung of [`BM_RUNGS`]: it is the
+/// narrowest block two simdgroups can each take a whole fragment row of, so
+/// it would still be sixteen if the rungs were renumbered tomorrow.
+#[must_use]
+pub fn qmm_group(bm: i32) -> [u32; 3] {
+    [32, 2, if bm < 2 * FRAG_ROWS { 1 } else { 2 }]
+}
+
+/// Rows of one `simdgroup_matrix` fragment — `mlx::steel::BaseMMAFrag`'s
+/// `kFragRows`, which `static_assert`s itself to 8 and is the unit every row
+/// block above is a multiple of.
+const FRAG_ROWS: i32 = 8;
 
 /// Threadgroup of the vector point: two simdgroups, four result rows each.
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
@@ -93,7 +130,52 @@ const QMM_BK: i32 = 32;
 /// since the block loader asserts `BCOLS <= group_size`; WM=4 is slower
 /// (1714), because splitting a 64-row block four ways puts each lane back to
 /// sixteen accumulators and that is not what the kernel is short of.
-const BM_RUNGS: [i32; 3] = [16, 32, 64];
+///
+/// # The floor is 8, and it is the cheapest rung on the ladder
+///
+/// The list used to start at 16, so the ladder's bottom step ran sixteen rows
+/// of arithmetic for whatever the batch actually brought — a four-lane decode
+/// paid four times over. Eight is where the same template stops:
+/// `mlx::steel::BlockMMA`'s warp tile is `BM / (8 * WM)` rows, so `BM = 8`
+/// needs `WM = 1` (`quant_qmm_t.metal`'s `qmm_wm`, which is where that
+/// constraint is written down) and `BM = 4` has nowhere left to go.
+///
+/// **THE RUNG IS NOT FREE AND IT PAYS ANYWAY.** Halving `WM` halves the
+/// threadgroup with it — 64 lanes against 128 — so each threadgroup
+/// dequantizes the same `BN x BK` weight tile over half the lanes and only
+/// the ARITHMETIC halves. The GEMM arm forced at every width with
+/// `qmm_min_batch = 2`, ms/fire over 32 warm decode fires through
+/// `throughput_probe`, lower is better:
+///
+/// ```text
+///          qwen36-27b        gemma4-31b      gpt-oss-20b     qwen35-0.8b
+///   N     BM16    BM8      BM16    BM8      BM16   BM8      BM16   BM8
+///    2   229.4  206.2     250.2  222.1      26.4  24.8      11.7  10.2
+///    3   241.8  218.9     251.2  223.0      32.3  30.6      14.3  12.7
+///    4   250.9  228.0     251.7  223.6      38.0  36.4      14.3  12.8
+///    5   262.3  239.4     252.4  224.3      43.9  42.1      17.6  16.0
+///    6   269.1  246.5     253.1  225.0      49.7  47.9      17.6  16.1
+///    7   282.0  259.4     254.2  226.1      55.6  53.9      19.6  18.2
+///    8   289.3  266.8     255.0  226.8      61.4  59.6      19.5  18.2
+///   16   355.0  355.0     260.5  260.6      98.3  98.3      29.8  29.7
+/// ```
+///
+/// 8 to 11% off the two giants at every width the rung reaches, 3 to 6% off
+/// the mixture's dense projections and 7 to 13% off the small vehicle. The
+/// sixteen-lane row is the CONTROL and it is the reason to believe the rest:
+/// sixteen rows select the 16 rung under both lists, so the two columns are
+/// the same launch and a difference there would have been drift rather than
+/// the rung.
+///
+/// It is not the 57% a fire-count model predicted, and the model's error is
+/// worth keeping: it priced one weight-table read as independent of `BM`,
+/// which at these widths it is not — the launch has ONE row tile either way,
+/// so halving the lanes per threadgroup halves the dequantize throughput
+/// alongside the arithmetic and only the difference between them is left
+/// over. What the rung actually moved is
+/// [`crate::tuning::DeviceTuning::qmm_min_batch`], which the same sweep took
+/// from six to five.
+const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 
 /// Column tiles, narrowest first — the order [`bn`] walks to take the widest
 /// that divides.
@@ -141,7 +223,7 @@ pub fn composed() -> Vec<Fire> {
         for &b in &WIDTHS {
             let point = qmv_point("quant.qmv", "fast", gs, b).expect("an axis point");
             out.push(Fire::at(QMV_FILE, point.entry));
-            for &bm in &TILES {
+            for &bm in &ROW_TILES {
                 for &bn in &TILES {
                     let point = qmm_point("quant.qmm_t", "", QMM_STAMP, gs, b, bm, bn)
                         .expect("an axis point, by construction");
@@ -173,7 +255,7 @@ pub fn qmm_point(
 ) -> Result<Point, Error> {
     check(op, &GROUPS, group, "group size")?;
     check(op, &WIDTHS, bits, "bit width")?;
-    check(op, &TILES, bm, "row tile")?;
+    check(op, &ROW_TILES, bm, "row tile")?;
     check(op, &TILES, bn, "column tile")?;
     let entry = symbol(&format!(
         "affine_qmm_t{form}_bfloat16_gs_{group}_b_{bits}_bm_{bm}_bn_{bn}"
@@ -208,7 +290,7 @@ pub fn qmm_precast_name(
     bm: i32,
     bn: i32,
 ) -> Result<&'static str, Error> {
-    check(op, &TILES, bm, "row tile")?;
+    check(op, &ROW_TILES, bm, "row tile")?;
     check(op, &TILES, bn, "column tile")?;
     Ok(symbol(&format!(
         "affine_qmm_t{before}_fp16_precast{after}_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}"
@@ -291,7 +373,12 @@ pub fn bm_rung(rows: i32) -> i32 {
 ///     past the measured crossover. A 2-row fire padded to 16 would launch
 ///     eight times the arithmetic it needs.
 ///   * `padded > capacity` — a wider write would run into the next
-///     activation's slot.
+///     activation's slot. **THE FLOOR THIS IMPOSES MOVED WITH THE 8 RUNG.**
+///     It used to be sixteen: any fire at or above the crossover needed a
+///     slot sixteen rows deep or it fell straight back to the vector point.
+///     `bm_rung` now answers 8 below sixteen rows, so a 2-15 row fire needs
+///     EIGHT and a slot of 8-15 rows — which used to decline every time —
+///     reaches the GEMM.
 #[must_use]
 pub fn mb_rows(rows: i32, capacity: i32, min_batch: i32) -> i32 {
     let rows = rows.max(1);
@@ -393,7 +480,7 @@ pub fn split_k(out_width: i32, rows: i32, contraction: i32, bm: i32) -> i32 {
 /// because that is the only format whose weight loader dequantizes straight
 /// to `half`.
 pub fn precast_point(op: &'static str, form: &str, bm: i32, bn: i32) -> Result<&'static str, Error> {
-    check(op, &TILES, bm, "row tile")?;
+    check(op, &ROW_TILES, bm, "row tile")?;
     check(op, &TILES, bn, "column tile")?;
     Ok(symbol(&format!(
         "affine_qmm_t{form}_fp16_precast_bfloat16_gs_64_b_4_bm_{bm}_bn_{bn}"
@@ -450,7 +537,7 @@ pub fn splitk_point(
 ) -> Result<&'static str, Error> {
     check(op, &GROUPS, group, "group size")?;
     check(op, &WIDTHS, bits, "bit width")?;
-    check(op, &TILES, bm, "row tile")?;
+    check(op, &ROW_TILES, bm, "row tile")?;
     Ok(symbol(&format!(
         "affine_qmm_t_splitk_{partials}_gs_{group}_b_{bits}_bm_{bm}_bn_{SPLIT_BN}"
     )))
@@ -470,18 +557,27 @@ pub fn splitk_reduce_point(partials: &str) -> &'static str {
 }
 
 /// The split dispatch's grid: `out/BN` column tiles, `ceil(M/BM)` row tiles,
-/// and one z-plane per split, each `32x2x2 = 128` threads.
+/// and one z-plane per split, at [`qmm_group`]'s threadgroup for the row
+/// block — `32x2x2 = 128` threads from the 16 rung up and `32x2x1 = 64` at
+/// the 8.
+///
+/// The z axis carries BOTH the split index and the `WM` lanes, which is why
+/// its multiplier is the group's own z extent and not a literal 2: the shader
+/// reads `tid.z` as the partition and `simd_gid` as the row split, and a grid
+/// that doubled z at a point compiled for one row simdgroup would run every
+/// partition twice.
 pub fn splitk_grid(op: &'static str, out_width: i32, rows: i32, bm: i32, split: i32) -> Result<Grid, Error> {
     if out_width <= 0 || rows <= 0 || bm <= 0 || split <= 0 {
         return Err(refuse(op, "the split dispatch has a zero extent"));
     }
+    let group = qmm_group(bm);
     Ok(Grid::of(
         [
             32 * (out_width.unsigned_abs() / SPLIT_BN.unsigned_abs()),
-            2 * rows.unsigned_abs().div_ceil(bm.unsigned_abs()),
-            2 * split.unsigned_abs(),
+            group[1] * rows.unsigned_abs().div_ceil(bm.unsigned_abs()),
+            group[2] * split.unsigned_abs(),
         ],
-        [32, 2, 2],
+        group,
     ))
 }
 
@@ -542,14 +638,18 @@ pub fn qmm_grid(
             .checked_mul(local)
             .ok_or_else(|| refuse(op, format!("{what} will not launch at {groups} groups")))
     };
+    // The three multipliers are the THREADGROUP's extents and not constants —
+    // see [`qmm_group`], whose z extent is 1 at the 8 rung because a row
+    // block that narrow admits one simdgroup down M.
+    let group = qmm_group(bm);
     Ok([
         lanes(
             n.unsigned_abs().div_ceil(bn.unsigned_abs()),
-            32,
+            group[0],
             "the column tiles",
         )?,
-        lanes(m.unsigned_abs() / bm.unsigned_abs(), 2, "the row tiles")?,
-        lanes(split_k.unsigned_abs(), 2, "the k splits")?,
+        lanes(m.unsigned_abs() / bm.unsigned_abs(), group[1], "the row tiles")?,
+        lanes(split_k.unsigned_abs(), group[2], "the k splits")?,
     ])
 }
 
@@ -814,7 +914,7 @@ pub fn act_x_wt(
             gemm.push(staged.arg());
             return ctx.fire(
                 Fire::at(QMM_FILE, precast_point(op, "", bm, bn)?)
-                    .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, QMM_GROUP)),
+                    .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
                 &gemm,
             );
         }
@@ -888,7 +988,7 @@ pub fn act_x_wt(
             return ctx.fire(
                 Fire::at(QMM_FILE, point.entry)
                     .stamp(point.stamp)
-                    .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, QMM_GROUP)),
+                    .apply(Grid::of(qmm_grid(op, n, bn, padded, bm, 1)?, qmm_group(bm))),
                 &[
                     w.codes.arg(),
                     w.scales.arg(),
@@ -916,9 +1016,13 @@ pub fn act_x_wt(
     )
 }
 
-/// The widest stamped tile that divides `extent`, or `None` when none does.
+/// The widest stamped ROW tile that divides `extent`, or `None` when none
+/// does. [`ROW_TILES`] and not [`TILES`], because the one caller is choosing
+/// a row block for a launch `mb_rows` declined to pad — and the 8 rung is
+/// what lets an odd multiple of eight take the GEMM at all instead of falling
+/// to the vector point.
 fn tile(extent: i32) -> Option<i32> {
-    TILES.iter().copied().find(|t| extent % t == 0)
+    ROW_TILES.iter().copied().find(|t| extent % t == 0)
 }
 
 /// The three extents, of which exactly one may be zero.
@@ -948,8 +1052,9 @@ mod tests {
 
     #[test]
     fn a_rung_is_the_widest_a_batch_can_cover() {
-        assert_eq!(bm_rung(1), 16);
-        assert_eq!(bm_rung(15), 16);
+        assert_eq!(bm_rung(1), 8);
+        assert_eq!(bm_rung(8), 8);
+        assert_eq!(bm_rung(15), 8);
         assert_eq!(bm_rung(16), 16);
         assert_eq!(bm_rung(31), 16);
         assert_eq!(bm_rung(32), 32);
@@ -964,12 +1069,36 @@ mod tests {
         // divide a rung, which is how it reaches the matvec.
         assert_eq!(mb_rows(2, 4096, 8), 2);
         assert_eq!(mb_rows(7, 4096, 8), 7);
-        // At and above it, up to the rung the batch can cover.
-        assert_eq!(mb_rows(8, 4096, 8), 16);
+        // At and above it, up to the rung the batch can cover — and the
+        // rung a batch of eight to fifteen covers is the 8.
+        assert_eq!(mb_rows(8, 4096, 8), 8);
+        assert_eq!(mb_rows(15, 4096, 8), 16);
         assert_eq!(mb_rows(20, 4096, 8), 32);
         assert_eq!(mb_rows(65, 4096, 8), 128);
         // And never past the rows the caller says it holds.
         assert_eq!(mb_rows(20, 24, 8), 20);
+        // The capacity floor the 8 rung moved: a three-row fire at a
+        // crossover of two pads to eight, which a slot of eight holds and a
+        // slot of seven does not.
+        assert_eq!(mb_rows(3, 8, 2), 8);
+        assert_eq!(mb_rows(3, 7, 2), 3);
+    }
+
+    #[test]
+    fn the_eight_rung_launches_one_simdgroup_down_m() {
+        // `BlockMMA`'s warp tile is `BM / (8 * WM)` rows, so the 8 rung is
+        // `WM = 1` and 64 lanes; every rung above it is `WM = 2` and 128.
+        assert_eq!(qmm_group(8), [32, 2, 1]);
+        assert_eq!(qmm_group(16), [32, 2, 2]);
+        assert_eq!(qmm_group(64), [32, 2, 2]);
+        // And the grid's z multiplier follows it, or every split would run
+        // twice.
+        let narrow = qmm_grid("t", 128, 32, 8, 8, 4).unwrap();
+        let wide = qmm_grid("t", 128, 32, 16, 16, 4).unwrap();
+        // Same column tiles and same one row tile; the z axis is where the
+        // rungs part — four splits at one `WM` lane against four at two.
+        assert_eq!(narrow, [4 * 32, 2, 4]);
+        assert_eq!(wide, [4 * 32, 2, 8]);
     }
 
     #[test]
@@ -1021,6 +1150,14 @@ mod tests {
             "affine_qmm_t_bias_fp16_precast_bfloat16_gs_64_b_4_bm_16_bn_64"
         );
         assert!(precast_point("t", "", 128, 32).is_err());
+        // The 8 rung, stamped in source for the pre-cast family.
+        assert_eq!(
+            precast_point("t", "", 8, 16).unwrap(),
+            "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_8_bn_16"
+        );
+        // Eight is a ROW tile and not a column one: no point is stamped 8
+        // wide, and `bn`/`bn_unsplit` never answer it.
+        assert!(precast_point("t", "", 16, 8).is_err());
     }
 
     #[test]
@@ -1032,6 +1169,10 @@ mod tests {
         assert_eq!(
             splitk_point("t", "f32_bfloat16", 64, 4, 32).unwrap(),
             "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_32_bn_32"
+        );
+        assert_eq!(
+            splitk_point("t", "f32_bfloat16", 64, 4, 8).unwrap(),
+            "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_8_bn_32"
         );
         assert_eq!(splitk_reduce_point("f32_bfloat16"), "qmm_splitk_reduce_f32_bfloat16");
     }

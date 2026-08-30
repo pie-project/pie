@@ -173,9 +173,30 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 //
 // CUDA is untouched -- its handler has read a per-binding storage mode since it
 // was written -- so its row does not move.
+// Re-pinned a tenth time, WITH a metal bump, and this one is a change in what
+// an engine COMPUTES rather than in what it binds. `ptir_m1_runtime.metal`'s
+// `0x58` (`PivotThreshold`) carried the two forms the CUDA runtime deleted:
+// `RankLe` re-scanned the whole row per element and `CummassLe` re-scanned the
+// already-picked list per candidate, which is O(len^2) and O(len^3) on ONE
+// thread. This shell runs only `KernelKind::Fused`, so those loops ARE the
+// sampler -- at qwen35-d0.8b's 248320-token vocabulary the second is >10^16
+// steps, and every inferlet that samples hung the device rather than answering
+// slowly. Both arms are now `ptir_m1_runtime_body.cuh`'s, verbatim: a 4-pass
+// 8-bit MSB radix select on a new `m1_desc_key`, and the last pick's
+// total-order key as the availability threshold:
+//
+//   38 -> 39  the pivot predicates stop being quadratic. The picks and the keep
+//             bits are bit-identical -- `m1_sort_better` is a strict total
+//             order and the radix key is monotone in it -- which is what
+//             `engine-metal`'s `program_parity` holds them to.
+//
+// The runtime text is spliced into every fused source, so this moves the whole
+// metal fingerprint; what moved in `golden-msl/` is again only the version
+// spelled into `ptir_m3_generic_{ready,commit}_v39`. CUDA took this fix first
+// and its row does not move.
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 24, 0xc692_ce36_f07d_34df),
-    ("metal", 38, 0xaa46_6075_2d3a_4660),
+    ("metal", 39, 0x95ca_0859_8ea8_afeb),
 ];
 
 /// Everything an engine receives for both corpora, hashed.

@@ -65,20 +65,104 @@ pub struct Adapters {
 /// against, so it is declared in the plan's compute element the way every norm
 /// in these texts is (`crate::dense`).
 ///
-/// **THE NAME CARRIES NO SITE, AND THAT IS A KNOWN LIMIT** (A-2's report).
-/// `engine_cuda::blob::role_of` reads a bank name as `layer.{n}.{role}` and
-/// matches `role` against `lora_a`/`lora_b` literally, so a site-tagged name
-/// (`layer.{n}.mixer.lora_a`) parses as its own role at layer zero and every
-/// shared-adapter bind refuses. Which site a text corrects is therefore the
-/// text's alone, and a guest that binds an adapter gets the one site the
-/// family below chose. Widening it is an engine-cuda edit (`role_of`,
-/// `layer_of`, and the manifest's `role` key), not a model-text one.
+/// **AND THE NAME MAY NOW CARRY THE SITE** (alto next B3, closing A-2's
+/// report). It could not until this wave: `engine_cuda::blob::role_of` read a
+/// bank name as `layer.{n}.{role}` and matched `role` literally, so a
+/// site-tagged name parsed as its own role at layer zero and every shared
+/// bind refused — which meant a guest's `Site::Q` silently got whichever site
+/// the family below chose. The parser now accepts an optional site segment
+/// (`layer.{n}.{site}.{lora_a|lora_b}`) and the bind path refuses a guest that
+/// asked for a site the banks do not declare, by name.
+///
+/// [`banks_at`] is how a text states one. **THIS FUNCTION IS THE UNSTATED
+/// DEFAULT** and its names are what they have always been — the six family
+/// texts call it and are byte-identical across this wave.
 #[must_use]
 pub fn banks(prefix: &str, a: Adapters, hidden: u64, dense: Dtype) -> (Weight, Weight) {
+    banks_at(prefix, None, a, hidden, dense)
+}
+
+/// [`banks`]'s sited twin: the same pair, named at the correction site the
+/// text says they correct.
+///
+/// `Some(site)` names them `{prefix}.{site}.lora_a` / `.lora_b`, which is what
+/// lets the engine check a guest's `Pass::adapter(Site::Q, …)` against what
+/// this text actually corrects instead of serving it the default site
+/// unchecked. `None` is [`banks`] — the pre-B3 pair, unstated, meaning the
+/// text's own one site — and it is not a wildcard: on a load whose banks name
+/// sites, a bind that states none is refused like any other mismatch.
+///
+/// **THE SPELLINGS ARE THE CONTRACT** and they are the guest surface's:
+/// [`Site`] is `inferlet::eta::adapter::Site` in snake case, and
+/// `engine_cuda::blob::Site` is the same six words on the other side of the
+/// name. Three copies of a vocabulary because a name crosses a crate boundary
+/// as a string — the same reason `lora_a` is written here and matched there —
+/// and a spelling the engine does not know is REFUSED rather than guessed at.
+///
+/// **A TEXT THAT STATES A SITE MUST MEAN IT.** The site named here is where
+/// the family's `lora_correct` actually stands in `forward.rs`; naming a
+/// second site's banks without correcting at it would declare a capacity that
+/// answers nothing, which is a bank the engine will seat and no fire will
+/// read.
+#[must_use]
+pub fn banks_at(
+    prefix: &str,
+    site: Option<Site>,
+    a: Adapters,
+    hidden: u64,
+    dense: Dtype,
+) -> (Weight, Weight) {
     let slots = u64::from(a.slots);
     let rank = u64::from(a.rank);
+    // The unstated default is an EMPTY infix and not a word, which is what
+    // makes `banks` byte-identical to the function it replaced: the names it
+    // builds are `{prefix}.lora_a` and `{prefix}.lora_b`, character for
+    // character what the six family texts have always declared.
+    let at = match site {
+        Some(site) => format!(".{}", site.spelled()),
+        None => String::new(),
+    };
     (
-        Weight::sym(format!("{prefix}.lora_a"), [slots, rank, hidden], dense).registered(),
-        Weight::sym(format!("{prefix}.lora_b"), [slots, hidden, rank], dense).registered(),
+        Weight::sym(format!("{prefix}{at}.lora_a"), [slots, rank, hidden], dense).registered(),
+        Weight::sym(format!("{prefix}{at}.lora_b"), [slots, hidden, rank], dense).registered(),
     )
+}
+
+/// **WHICH PROJECTION A TEXT'S BANKS CORRECT** — the guest surface's own site
+/// vocabulary (`inferlet::eta::adapter::Site`), spelled as a name segment.
+///
+/// Six llama-like projection sites, which is the whole of what
+/// `Pass::adapter` can ask for. Every family text corrects [`Site::O`] today
+/// — the mixer's output after its collective — and states it by not stating
+/// it (see [`banks`]); this enum is what a text uses when it grows a second
+/// correction site and the two have to be told apart by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Site {
+    /// The query projection.
+    Q,
+    /// The key projection.
+    K,
+    /// The value projection.
+    V,
+    /// The mixer's output projection.
+    O,
+    /// The fused gate/up projection of the feed-forward sublayer.
+    GateUp,
+    /// Its down projection.
+    Down,
+}
+
+impl Site {
+    /// The one segment a bank name spells it with.
+    #[must_use]
+    pub const fn spelled(self) -> &'static str {
+        match self {
+            Site::Q => "q",
+            Site::K => "k",
+            Site::V => "v",
+            Site::O => "o",
+            Site::GateUp => "gate_up",
+            Site::Down => "down",
+        }
+    }
 }

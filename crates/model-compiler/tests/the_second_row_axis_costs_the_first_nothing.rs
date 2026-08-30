@@ -39,50 +39,28 @@
 use model_compiler::{
     Budget, Budgets, DeviceProfile, PatchLadder, Phase, RowAxis, compile, compile_axes,
 };
-use model_dsl::Platform;
+mod common;
+use common::{PLATFORMS, bake, budgets_for, patch_ladder_for, states_patches};
 use model_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Operation, Param, ParamSource, Seam, Trace, Ty,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Operation, Param, Seam, Trace, Ty,
     ValueDecl, ValueId,
 };
-
-/// Every platform a plan can be traced at — a model text may emit a different
-/// op per platform, so the region table is not the same graph on each.
-const PLATFORMS: [Platform; 4] = [
-    Platform::Cuda,
-    Platform::Metal,
-    Platform::Wgpu,
-    Platform::Vulkan,
-];
-
-/// A budget the catalog can actually seat: each plan asked for its own bank
-/// capacity, as the two live catalog files already do.
-fn budgets_for(trace: &Trace) -> Budget {
-    let seats = trace
-        .params
-        .iter()
-        .filter(|param| param.source == ParamSource::Registered)
-        .map(|param| param.shape.first().copied().unwrap_or(0))
-        .min()
-        .unwrap_or(0);
-    Budget {
-        max_lanes: 256,
-        max_tokens: 8192,
-        buckets: vec![
-            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
-        ],
-        max_adapters: u32::try_from(seats).unwrap_or(u32::MAX),
-    }
-}
 
 /// The same deployment, having also declared a patch axis it will never use on
 /// a text-only model. Rungs at whole images from the floor
 /// (`PATCH_LATTICE_FLOOR`) up, which is what a tower-serving deployment states.
 fn also_admitting_patches(trace: &Trace) -> Budgets {
-    Budgets::of(budgets_for(trace)).with_patches(PatchLadder {
-        max_patches: 4096,
-        buckets: vec![64, 128, 256, 512, 1024, 2048, 4096],
-        max_images: 16,
-    })
+    // **THE SHAPE IS DERIVED, THE ONE OVERRIDE IS STATED.** The rungs and the
+    // ceiling used to be written out here as a literal list, which made this
+    // the fourth statement of a rule that lives in `common::patch_ladder_for`
+    // (and, authoritatively, in `engine_cuda::api::patch_ladder`). It is now
+    // the derived ladder with `max_images` overridden — which is not a drift
+    // but the documented operator door: a deployment that has measured its
+    // traffic states its own image bound instead of taking the ceiling at the
+    // floor, and sixteen is what this fixture states.
+    let mut ladder = patch_ladder_for(&budgets_for(trace));
+    ladder.max_images = 16;
+    Budgets::of(budgets_for(trace)).with_patches(ladder)
 }
 
 /// G4, first half: one capture unit, and the fold is not asked to stand down.
@@ -90,15 +68,61 @@ fn also_admitting_patches(trace: &Trace) -> Budgets {
 #[ignore = "catalog sweep: bakes every SKU on every platform; minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn every_pre_campaign_sku_is_exactly_one_capture_unit() {
     let mut wrong: Vec<String> = Vec::new();
-    let mut baked = 0usize;
+    let (mut baked, mut towers) = (0usize, 0usize);
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default())
-            else {
+            let Ok(compiled) = bake(&trace) else {
                 continue; // `every_sku_carves_an_arena` is what says so.
             };
+
+            // **THE TOWERS BAKE NOW, AND THEY ARE THIS CLAIM'S OTHER HALF.**
+            // Until this file derived a patch ladder, a tower row refused the
+            // token-only door and the sweep swept past it — so "every SKU is
+            // one capture unit" was being asked of every SKU that could be
+            // asked, which is not the same sentence. A row that STATES the
+            // second axis must answer the dual of everything below: two units,
+            // the fold stood down, a patch order, a script per unit. The
+            // numbers are the hand-built plan's at the bottom of this file,
+            // now asked of the shipping texts.
+            if states_patches(&trace) {
+                towers += 1;
+                if compiled.units != vec![RowAxis::Patches, RowAxis::Tokens] {
+                    wrong.push(format!(
+                        "`{sku}` as {platform:?}: a tower baked units {:?} — a plan \
+                         that states patch rows states two row spaces and therefore \
+                         two execs",
+                        compiled.units,
+                    ));
+                }
+                if !compiled.fold_refused {
+                    wrong.push(format!(
+                        "`{sku}` as {platform:?}: the fold stayed armed on a two-unit \
+                         artifact — `fold_refused` IS the multi-unit escape hatch",
+                    ));
+                }
+                if compiled.patches.is_none() {
+                    wrong.push(format!(
+                        "`{sku}` as {platform:?}: a tower baked no patch ladder",
+                    ));
+                }
+                if compiled.order_for(RowAxis::Patches).is_none() {
+                    wrong.push(format!(
+                        "`{sku}` as {platform:?}: a tower baked no class order for its \
+                         own axis, so its window table has nothing to slice",
+                    ));
+                }
+                for unit in 0..compiled.units.len() as u32 {
+                    if compiled.unit_script(unit).is_none() {
+                        wrong.push(format!(
+                            "`{sku}` as {platform:?}: unit {unit} of {} has no script",
+                            compiled.units.len(),
+                        ));
+                    }
+                }
+                continue;
+            }
             baked += 1;
 
             if compiled.units != vec![RowAxis::Tokens] {
@@ -152,6 +176,18 @@ fn every_pre_campaign_sku_is_exactly_one_capture_unit() {
     }
 
     assert!(baked > 0, "the sweep baked nothing, so it asserted nothing");
+    // BOTH HALVES, COUNTED. A run that saw no tower is the run this file used
+    // to be — the one-unit claim asked only of rows that could be asked — and
+    // a run that saw nothing else would have stopped being about the catalog.
+    assert!(
+        towers > 0,
+        "no row of the catalog states the second axis, so the two-unit half of \
+         this gate is never taken and only the hand-built plan below tests it",
+    );
+    assert!(
+        towers < baked + towers,
+        "every row states the second axis, so the one-unit claim is vacuous",
+    );
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
@@ -164,12 +200,24 @@ fn every_pre_campaign_sku_is_exactly_one_capture_unit() {
 #[ignore = "catalog sweep: bakes every SKU on every platform TWICE; minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn admitting_a_patch_axis_does_not_move_one_byte_of_a_text_only_artifact() {
     let mut moved: Vec<String> = Vec::new();
-    let mut compared = 0usize;
+    let (mut compared, mut towers) = (0usize, 0usize);
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let profile = DeviceProfile::default();
+            // **NOT ASKED OF A TOWER, AND THAT IS NOT A GAP.** The claim here
+            // is that admitting an axis the PLAN DOES NOT STATE changes
+            // nothing — so a plan that states it has no "before" to compare
+            // against: `compile`'s token-only door refuses it by name, and
+            // rightly, because token ceilings size no patch rectangle. The
+            // skip used to happen silently through that refusal; now it is
+            // named, counted, and asserted to be non-empty, and the tower's
+            // own claims are made in the sweep above.
+            if states_patches(&trace) {
+                towers += 1;
+                continue;
+            }
             let Ok(before) = compile(&trace, &budgets_for(&trace), &profile) else {
                 continue;
             };
@@ -233,6 +281,11 @@ fn admitting_a_patch_axis_does_not_move_one_byte_of_a_text_only_artifact() {
     }
 
     assert!(compared > 0, "the sweep compared nothing");
+    assert!(
+        towers > 0,
+        "no row of the catalog states the second axis, so the skip above is \
+         doing nothing and this claim has quietly become the whole catalog's",
+    );
     assert!(moved.is_empty(), "\n{}\n", moved.join("\n"));
 }
 

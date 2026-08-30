@@ -135,6 +135,7 @@
 
 use std::cell::Cell;
 
+use crate::device::conditional::Kind;
 use crate::device::graph::Event;
 use kernels_cuda::Tensor;
 use model_compiler::{CompiledModel, Lowering, Phase, Region};
@@ -1075,6 +1076,30 @@ pub struct Conditionals<'a> {
     pub at: &'a Cell<u32>,
 }
 
+/// What a [`Cursor`] needs to ROTATE A SLOT'S CONTENTS at a region boundary
+/// (alto streaming §3 item 4, D2b).
+///
+/// **HANDED IN, NEVER OWNED**, exactly as [`Lanes`] and [`Conditionals`] are:
+/// the rotor is the LOAD's — its slots are pointer-stable for the life of the
+/// load, which is the whole reason a weight row may name one — and the stream
+/// is this fire's compute stream, the one the region's launches are about to
+/// go on.
+///
+/// **ONLY AN EAGER CURSOR IS GIVEN ONE.** A captured graph is replayed without
+/// the walk that owns the pump's issue cursor, so a recording cursor that
+/// pumped would bake one fire's copies into a graph replayed for every
+/// composition; the fold declines a rotating load by name instead
+/// (`crate::rotate`'s header carries the argument, and `serve.rs` is where the
+/// decline is taken).
+#[derive(Clone, Copy)]
+pub struct Pump<'a> {
+    /// The load's rotor: the slots, the two event rings, and the copy stream.
+    pub rotor: &'a crate::rotate::Rotor,
+    /// The stream this fire's launches are on — where `free` is recorded and
+    /// `ready` is waited.
+    pub compute: *mut core::ffi::c_void,
+}
+
 /// This shell's [`Sink`]: the region counter a [`Run`](crate::run::Run) reads
 /// its window out of, and — when the artifact forked — the stream switch and
 /// the event points.
@@ -1119,10 +1144,24 @@ pub struct Cursor<'a> {
     /// [`Conditionals`]. `None` is a cursor that refuses a conditional region
     /// by name, which is what every load whose artifact holds none gets.
     cond: Option<Conditionals<'a>>,
-    /// The bracket currently open, and the stream to put the walk back on when
-    /// it closes. `Some` only between [`cond_begin`](Sink::cond_begin) and
-    /// [`cond_end`](Sink::cond_end).
-    open: Option<(crate::device::conditional::Conditional, u32)>,
+    /// The bracket currently open, the stream to put the walk back on when it
+    /// closes, and whether a body capture is running right now.
+    ///
+    /// `Some` only between [`cond_begin`](Sink::cond_begin) and
+    /// [`cond_end`](Sink::cond_end) — which for a `SWITCH` spans `arms`
+    /// regions, because a group's arms are consecutive regions under one node.
+    ///
+    /// **THE THIRD FIELD IS NOT REDUNDANT WITH THE FIRST.** An `IF` opens its
+    /// node and begins its body in one breath; a `SWITCH` opens its node in
+    /// `cond_begin` and does not begin a body until `cond_arm(0)`, and between
+    /// arms it is briefly open with no body. It is also what keeps the stream
+    /// cell honest when a `begin_body` refuses: the cell says `BODY` only while
+    /// a capture is actually running on that stream.
+    open: Option<(crate::device::conditional::Conditional, u32, bool)>,
+    /// The rotating dense pump, when this load armed one — see [`Pump`].
+    /// `None` is every load whose weights are where the fire expects them,
+    /// and the region seam below is then the line it was before D2b.
+    pump: Option<Pump<'a>>,
     fault: Option<Fault>,
 }
 
@@ -1135,6 +1174,7 @@ impl core::fmt::Debug for Cursor<'_> {
             .field("at", &self.at)
             .field("recording", &self.recording)
             .field("conditionals", &self.cond.is_some())
+            .field("pump", &self.pump.is_some())
             .field("open", &self.open.is_some())
             .field("fault", &self.fault)
             .finish()
@@ -1154,6 +1194,7 @@ impl<'a> Cursor<'a> {
             recording: false,
             cond: None,
             open: None,
+            pump: None,
             fault: None,
         }
     }
@@ -1184,6 +1225,7 @@ impl<'a> Cursor<'a> {
             recording: false,
             cond: None,
             open: None,
+            pump: None,
             fault: None,
         }
     }
@@ -1201,6 +1243,24 @@ impl<'a> Cursor<'a> {
     pub fn conditionals(self, cond: Conditionals<'a>) -> Cursor<'a> {
         Cursor {
             cond: Some(cond),
+            ..self
+        }
+    }
+
+    /// **The same cursor, told to rotate this load's dense slots** (alto
+    /// streaming §3 item 4).
+    ///
+    /// **ADDITIVE, AND ONLY AN EAGER PASS IS GIVEN IT.** The rotation's
+    /// backpressure is a HOST cursor advanced at each region boundary, and a
+    /// replayed graph has no walk to advance it; a recording cursor handed one
+    /// would enqueue copies into the capture and bake a single fire's ring
+    /// state into a graph that outlives it. `crate::rotate`'s header carries
+    /// the whole argument; the decline itself is taken where the mode is
+    /// chosen, so that a rotating load never reaches a recording walk at all.
+    #[must_use]
+    pub fn pumping(self, pump: Pump<'a>) -> Cursor<'a> {
+        Cursor {
+            pump: Some(pump),
             ..self
         }
     }
@@ -1223,6 +1283,82 @@ impl<'a> Cursor<'a> {
         match self.fault {
             Some(fault) => Err(fault),
             None => Ok(()),
+        }
+    }
+
+    /// **WHAT THE SETTER READS FOR ONE REGION**: the device address of its
+    /// window's rebased row CSR, the lane count to index it at, and whether
+    /// this region can state a count at all.
+    ///
+    /// The third value is the interesting one, and the two kinds do opposite
+    /// things with it. `true` means "no readable count here", which happens two
+    /// ways: a region P4 could not seat runs once per interval of its class set
+    /// and there is no single count to read; and a region on the PATCH axis
+    /// carries no rebased qo boundaries at all — `indptr_host` is empty by
+    /// construction, because that vector is the token rectangle's per-lane
+    /// bounds and a tower region's span indexes images, while its staged
+    /// `Tensor` is a zero-length seat whose address is the NEXT window's first
+    /// int. Reading a count out of that would be reading somebody else's.
+    fn count_of(&self, cond: Conditionals<'a>, region: u32) -> (u64, u32, bool) {
+        match cond.windows.runs(region) {
+            1 if !cond.windows.at(region, 0).indptr_host.is_empty() => {
+                let window = cond.windows.at(region, 0);
+                let lanes = window.indptr_host.len().saturating_sub(1) as u32;
+                (window.indptr.ptr, lanes, false)
+            }
+            _ => (0, 0, true),
+        }
+    }
+
+    /// Close whatever body is recording and begin `arm`'s, leaving the walk's
+    /// launches pointed at the body stream.
+    ///
+    /// **THE CELL SAYS `BODY` ONLY WHILE A CAPTURE IS ACTUALLY RUNNING ON THAT
+    /// STREAM**, which is why the write is after the begin and the restore is
+    /// on the failure path. A cell left at `BODY` over a stream that is not
+    /// capturing would send every launch after it somewhere it would EXECUTE,
+    /// mid-capture, and the graph would come out empty where the body should
+    /// be — silent, and exactly the shape a conditional exists to prevent.
+    fn enter(&mut self, arm: u32) {
+        let Some((open, was, body)) = self.open else {
+            return;
+        };
+        let Some(cond) = self.cond else {
+            return;
+        };
+        if body && let Err(fault) = crate::device::conditional::end_body(cond.body) {
+            self.open = Some((open, was, false));
+            cond.at.set(was);
+            if self.fault.is_none() {
+                self.fault = Some(fault);
+            }
+            return;
+        }
+        let Some(graph) = open.body(arm) else {
+            self.open = Some((open, was, false));
+            cond.at.set(was);
+            if self.fault.is_none() {
+                self.fault = Some(Fault::Unbound {
+                    what: format!(
+                        "arm {arm} of a conditional node the driver minted {} bodies for",
+                        open.arms,
+                    ),
+                });
+            }
+            return;
+        };
+        match crate::device::conditional::begin_body(cond.body, graph) {
+            Ok(()) => {
+                self.open = Some((open, was, true));
+                cond.at.set(BODY);
+            }
+            Err(fault) => {
+                self.open = Some((open, was, false));
+                cond.at.set(was);
+                if self.fault.is_none() {
+                    self.fault = Some(fault);
+                }
+            }
         }
     }
 
@@ -1282,6 +1418,24 @@ impl Sink for Cursor<'_> {
     fn region_begin(&mut self, region: &Region) {
         self.place.region.set(self.at);
         self.place.run.set(0);
+        // **THE ROTATION'S SEAM, AND THE WALK HAS EXACTLY ONE** (alto
+        // streaming §3 item 4). Before anything of this region is dispatched:
+        // release the slots whose tenants the previous region finished with,
+        // issue the copies coming due, and make the compute stream wait for
+        // the planes this region is about to read. Every one of those is an
+        // enqueue — nothing here synchronizes, and the fire path never waits
+        // on a demand read by design.
+        //
+        // **THE ORDINAL IS THE TEMPLATE'S AND NOT THE PASS'S**, which is what
+        // makes it the index the rotation was planned against: `walk_phases`
+        // announces every region of `CompiledModel::regions` in order,
+        // including the ones a phase filter dispatches nothing for.
+        if let Some(pump) = self.pump
+            && self.fault.is_none()
+            && let Err(fault) = pump.rotor.at(self.at, pump.compute)
+        {
+            self.fault = Some(fault);
+        }
         self.at += 1;
         // The stream switch, and it is the whole of it: everything the `Run`
         // resolves afterwards fires on whatever this names, until the next
@@ -1292,6 +1446,20 @@ impl Sink for Cursor<'_> {
         // opened a conditional body carries it on [`Conditionals`]; they are
         // the same `Cell` when both are present, so writing through whichever
         // is there writes the one the `Run` reads.
+        //
+        // **AND NOT AT ALL WHILE A BRACKET IS OPEN**, which is the one line a
+        // `SWITCH` needed here. A group's arms are `arms` consecutive REGIONS
+        // under ONE conditional node, so the walk crosses this seam `arms - 1`
+        // times with a body capture running; a write here would put the next
+        // arm's launches back on the main stream, inside a `SWITCH` that is
+        // still recording, and the body would be empty while its contents ran
+        // unconditionally. Skipping it costs nothing: a conditional region is
+        // never forkable (`model_compiler::stream::forkable` has read
+        // `lowering == AlwaysLaunch` since D1), so every arm names stream 0 and
+        // the value being skipped is the one already there.
+        if self.open.is_some() {
+            return;
+        }
         if let Some(lanes) = self.lanes {
             lanes.at.set(region.stream);
         } else if let Some(cond) = self.cond {
@@ -1331,16 +1499,44 @@ impl Sink for Cursor<'_> {
     /// "the kernel reads the count" and the reason the decision is inside the
     /// graph rather than beside it.
     ///
-    /// # What a region in PIECES gets, and why it is the safe direction
+    /// # A `SWITCH` IS THE SAME NODE ASKED `arms` TIMES OVER `arms` REGIONS
     ///
-    /// A region P4 could not seat runs once per interval of its class set, so
-    /// there is no single row count to read and one node stands over all of
-    /// them. Such a region takes its body unconditionally — a null table with
-    /// `absent` set, which the setter stores as 1 — and that is the
-    /// conservative half of decision #3: always-launch is the correctness
-    /// mechanism, and a conditional that declines to decide has given up an
-    /// optimization and nothing else. The per-run zero-row skips inside the
-    /// body are untouched.
+    /// P3 groups a merge's arms into one `SWITCH` when it can prove at most one
+    /// of them is demanded by any admissible composition, and hands them over
+    /// as CONSECUTIVE regions each stamped `Lowering::Switch { arm, arms }`.
+    /// So the walk opens the bracket at arm 0, announces
+    /// [`cond_arm`](Sink::cond_arm) once per arm, and closes at the last — and
+    /// the bracket lives ACROSS `arms - 1` region boundaries, which is what
+    /// `region_begin`'s one guard above is for. The node is minted with
+    /// `size: arms` and `phGraph_out` holds one child graph per arm, indexed by
+    /// the same number the walk announces; `cond_arm` is where one body is
+    /// closed and the next begun.
+    ///
+    /// The predicate is `arms` launches of `set_switch` rather than one of
+    /// `set_conditional`, because each arm's row count lives in its own
+    /// window and there is no vector holding all of them. Each stores its own
+    /// index only if its own window has rows; at most one does, which is the
+    /// activation P3 proved before it formed the group; and if none does, the
+    /// handle keeps the out-of-range default [`Kind::quiescent`] minted it
+    /// with and no body runs.
+    ///
+    /// # What a region that cannot state a count gets, and it differs by kind
+    ///
+    /// A region P4 could not seat runs once per interval of its class set has
+    /// no single row count to read, and a region on the patch axis has no
+    /// boundary vector at all. For an `IF` such a region takes its body
+    /// unconditionally — a null table with `absent` set, which the setter
+    /// stores as 1 — and that is the conservative half of decision #3:
+    /// always-launch is the correctness mechanism, and a conditional that
+    /// declines to decide has given up an optimization and nothing else. The
+    /// per-run zero-row skips inside the body are untouched.
+    ///
+    /// **A `SWITCH` HAS NO SUCH DIRECTION AND SO IT REFUSES.** Exactly one body
+    /// runs; "take it anyway" is not available, and an arm guessed at is
+    /// another arm's fire computed wrong. So a group with an unreadable arm is
+    /// [`Fault::Unlowered`] naming the region, and the deployment's recourse is
+    /// the same as every other conditional's: bake with
+    /// `fat_region_us: INFINITY` and every region is always-launch.
     ///
     /// # A shell with no conditional machinery still refuses by name
     ///
@@ -1357,72 +1553,116 @@ impl Sink for Cursor<'_> {
             region,
             lowering: format!("{why:?}"),
         };
-        // **SWITCH IS NOT BUILT AND SAYS SO.** An `IF` is one body behind one
-        // handle; a SWITCH is `arms` bodies behind one, and the arms are
-        // separate REGIONS the walk announces one after another — so the
-        // bracket would have to stay open across `region_begin`, which is a
-        // second piece of state this sink does not carry. P3 only ever groups
-        // one when `max_lanes == 1`, and no row of the catalog is baked at a
-        // one-lane budget.
-        if !matches!(lowering, Lowering::If) {
-            self.fault = Some(unlowered(lowering));
-            return;
-        }
+        let kind = match *lowering {
+            Lowering::If => Kind::If,
+            Lowering::Switch { arms, .. } => Kind::Switch { arms: u32::from(arms) },
+            Lowering::AlwaysLaunch => {
+                self.fault = Some(unlowered(lowering));
+                return;
+            }
+        };
         let Some(cond) = self.cond else {
             self.fault = Some(unlowered(lowering));
             return;
         };
         let outcome = (|| {
-            let handle = crate::device::conditional::handle(cond.main)?;
-            // The predicate, and the one launch of this whole sequence. A
-            // region with exactly one run hands its staged boundary vector and
-            // the setter reads `indptr[lanes]`; anything else hands nothing and
-            // states that an absent table means "take it".
-            let (indptr, lanes, absent) = match cond.windows.runs(region) {
-                // **AND THE VECTOR HAS TO BE THERE, NOT JUST THE WINDOW.** A
-                // region on the PATCH axis carries no rebased qo boundaries at
-                // all — `indptr_host` is empty by construction, because that
-                // vector is the token rectangle's per-lane bounds and a tower
-                // region's span indexes images — and its staged `Tensor` is a
-                // zero-length seat whose address is the NEXT window's first
-                // int. Reading a count out of it would be reading somebody
-                // else's, so an empty vector is a table this region does not
-                // have and takes the `absent` arm with the pointer nulled.
-                1 if !cond.windows.at(region, 0).indptr_host.is_empty() => {
-                    let window = cond.windows.at(region, 0);
-                    let lanes = window.indptr_host.len().saturating_sub(1) as u32;
-                    (window.indptr.ptr, lanes, false)
+            let handle = crate::device::conditional::handle(cond.main, kind)?;
+            match kind {
+                // **AN `IF` ASKS ONE QUESTION ABOUT ONE REGION.** The predicate
+                // is the one launch of the whole sequence: a region with
+                // exactly one run hands its staged boundary vector and the
+                // setter reads `indptr[lanes]`; anything else hands nothing and
+                // states that an absent table means "take it".
+                Kind::If => {
+                    let (indptr, lanes, absent) = self.count_of(cond, region);
+                    kernels_cuda::graph::set_conditional(
+                        cond.setter,
+                        handle,
+                        indptr,
+                        lanes,
+                        absent,
+                        kernels_cuda::graph::Arm::Set,
+                    )
+                    .map_err(|why| Fault::Unbound {
+                        what: format!(
+                            "the conditional setter for region {region}, which answered {why}"
+                        ),
+                    })?;
                 }
-                _ => (0, 0, true),
-            };
-            kernels_cuda::graph::set_conditional(
-                cond.setter,
-                handle,
-                indptr,
-                lanes,
-                absent,
-                kernels_cuda::graph::Arm::Set,
-            )
-            .map_err(|why| Fault::Unbound {
-                what: format!("the conditional setter for region {region}, which answered {why}"),
-            })?;
-            let open = crate::device::conditional::open(cond.main, handle)?;
-            crate::device::conditional::begin_body(cond.body, open.body)?;
-            Ok(open)
+                // **A `SWITCH` ASKS THE SAME QUESTION `arms` TIMES, ONE REGION
+                // APART.** The arms are CONSECUTIVE regions — that is what P2
+                // hands P3 and what `switch_groups` requires to form a group at
+                // all — so this region's index plus the arm number is that
+                // arm's index, and its window is already in the table. Each
+                // setter stores its own number only if its own window has rows,
+                // and at most one of them does: `switch_groups` proves no
+                // admissible composition demands two arms, which is the
+                // activation proof P3 asks for before it forms a group.
+                Kind::Switch { arms } => {
+                    for arm in 0..arms {
+                        let (indptr, lanes, absent) = self.count_of(cond, region + arm);
+                        // **AND AN ARM THAT CANNOT STATE A COUNT REFUSES THE
+                        // GROUP.** For an `IF` "cannot tell" resolves to "take
+                        // it", which is always-launch and is the correctness
+                        // mechanism. A `SWITCH` has no such direction — exactly
+                        // one body runs — so an arm with no readable row count
+                        // would have to be guessed at, and a guess here picks
+                        // somebody else's arm. `Fault::Unlowered` naming the
+                        // region is the honest answer.
+                        if absent {
+                            return Err(unlowered(lowering));
+                        }
+                        kernels_cuda::graph::set_switch(
+                            cond.setter,
+                            handle,
+                            arm,
+                            indptr,
+                            lanes,
+                            kernels_cuda::graph::Arm::Set,
+                        )
+                        .map_err(|why| Fault::Unbound {
+                            what: format!(
+                                "the switch setter for arm {arm} of the group at region \
+                                 {region}, which answered {why}"
+                            ),
+                        })?;
+                    }
+                }
+            }
+            crate::device::conditional::open(cond.main, handle, kind)
         })();
         match outcome {
             Ok(open) => {
-                self.open = Some((open, cond.at.get()));
-                cond.at.set(BODY);
+                let was = cond.at.get();
+                self.open = Some((open, was, false));
+                // An `IF` has no `cond_arm`, so its one body opens here; a
+                // `SWITCH`'s opens at `cond_arm(0)`, which the walk calls
+                // before anything of arm 0 is dispatched.
+                if kind == Kind::If {
+                    self.enter(0);
+                }
             }
             Err(fault) => self.fault = Some(fault),
         }
     }
 
-    /// One arm of a SWITCH — never reached, because
-    /// [`cond_begin`](Sink::cond_begin) refuses the lowering that produces
-    /// them before the walk gets here.
-    fn cond_arm(&mut self, _arm: u8) {}
+    /// **ONE ARM OF A `SWITCH`, AND THE SEAM BETWEEN TWO BODIES.**
+    ///
+    /// The walk announces this once per arm, including arm 0, between that
+    /// arm's `region_begin` and its first launch. So it is exactly the instant
+    /// to close whatever body was recording and open this arm's — `phGraph_out`
+    /// is indexed by the same arm number, because the driver mints the array in
+    /// the order `size` states and `Def::Merge`'s arm order is what P3 grouped.
+    ///
+    /// Never called for an `IF` (`walk` passes `None` for its arm), so the
+    /// no-bracket case here is a walk that reached an arm without an open node,
+    /// which `cond_begin` has already faulted about.
+    fn cond_arm(&mut self, arm: u8) {
+        if !self.recording || self.open.is_none() {
+            return;
+        }
+        self.enter(u32::from(arm));
+    }
 
     /// Close the body and put the walk back on the stream the region named.
     ///
@@ -1433,18 +1673,20 @@ impl Sink for Cursor<'_> {
     /// fault still wins — a close that also fails is a second sentence about
     /// the same failure.
     fn cond_end(&mut self) {
-        let Some((_, was)) = self.open.take() else {
+        let Some((_, was, body)) = self.open.take() else {
             return;
         };
         let Some(cond) = self.cond else {
             return;
         };
-        let closed = crate::device::conditional::end_body(cond.body);
+        let closed = body
+            .then(|| crate::device::conditional::end_body(cond.body))
+            .unwrap_or(Ok(()));
         cond.at.set(was);
-        if let Err(fault) = closed {
-            if self.fault.is_none() {
-                self.fault = Some(fault);
-            }
+        if let Err(fault) = closed
+            && self.fault.is_none()
+        {
+            self.fault = Some(fault);
         }
     }
     fn fork(&mut self, event: EventId) {

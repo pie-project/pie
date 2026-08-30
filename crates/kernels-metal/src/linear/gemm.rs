@@ -1,6 +1,52 @@
-//! `Gemm`: dense projections against a transposed weight. The gemv-vs-tile
+//! `Gemm`: dense projections against a transposed weight. The narrow-vs-wide
 //! choice lives here, inside the entry (decision #13) — a dispatch arm never
 //! sees it.
+//!
+//! # A LANE'S LOGITS MUST NOT DEPEND ON HOW MANY LANES RODE WITH IT
+//!
+//! The row count this entry keys its arm on is the FIRE'S, and a fire's rows
+//! are however many rows the composition put in it — which is to say, who
+//! else was being served at that instant. So an arm chosen on that number is
+//! a lane's answer chosen on its neighbours, and the only thing that makes
+//! that legal is two arms that land the same bits.
+//!
+//! **THEY DID NOT.** Until this was fixed the narrow rung was
+//! `dense_gemv_t_bfloat16`, which splits K across a simdgroup's 32 lanes and
+//! folds the pieces with `simd_sum`; the wide rung walks K in ascending
+//! 8-wide chunks on the matrix unit. Same arithmetic, different order,
+//! different rounding — and a 31-token prompt is 31 rows alone (the vector
+//! kernel) and 248 rows eight ways at once (the tile), so the same prompt at
+//! temperature 0 answered differently in a crowd. Measured on an M1 Max over
+//! qwen35-d0.8b-bf16: 0.45 of a logit at the prefill readout, and a different
+//! sentence by the ninth token. `test_curated.py`'s
+//! `greedy-decoding-is-the-same-alone-and-in-a-crowd` is the gate that says
+//! so at the serving door; `engine-metal`'s own
+//! `a_lane_answers_the_same_in_a_crowd` is the same claim with the feedback
+//! loop cut.
+//!
+//! The fix is `engine-cuda`'s, in this plane's terms: the narrow rung is now
+//! the SAME kernel at an 8-row block. `BM`, `BK`, `WM` and `WN` decide who
+//! holds which element, never the order k is walked in, so the two rungs are
+//! bit-identical and the threshold between them is invisible in the answer.
+//! The vector kernel is gone rather than demoted — an arm nobody may take is
+//! not an arm.
+//!
+//! **WHAT IT COST, STATED.** The matrix unit multiplies 8x8 fragments, so the
+//! narrow rung's floor is eight rows and a one-row decode pays for eight.
+//! One decode fire of qwen35-d0.8b on an M1 Max, before against after:
+//!
+//! ```text
+//!   lanes    1      2      4      8     16     31
+//!   before  10.3   12.9   22.1   40.3   76.9  145.1  ms  (the vector rung)
+//!   after   13.5   13.8   16.7   22.2   37.7   66.7  ms  (the 8-row block)
+//! ```
+//!
+//! One lane is 24% slower, two are 6% slower, and every width above that is
+//! 1.3x to 2.2x FASTER — because the vector rung gave each output column one
+//! simdgroup and no reuse of the weight across the rows sharing it, so a
+//! fleet of decodes walked the whole weight table once per ROW. The correctness
+//! this was done for is not paid for out of throughput; it is paid for out of
+//! one-lane latency, and only there.
 
 use crate::error::Error;
 
@@ -11,19 +57,24 @@ pub const TILE_M: u32 = 32;
 
 pub const TILE_N: u32 = 32;
 
-const TILE_ENTRY: &str = "dense_gemm_t_bfloat16_bm_32_bn_32";
+/// The wide rung — [`TILE_M`] rows of output per threadgroup, over the four
+/// simdgroups `TILE_GROUP` launches.
+const TILE_ENTRY: &str = "dense_gemm_t_bfloat16_bm_32_bk_32_bn_32";
 
-const VECTOR_ENTRY: &str = "dense_gemv_t_bfloat16";
+const TILE_GROUP: [u32; 3] = [32, 2, 2];
+
+/// The narrow rung: the same kernel at the smallest row block the matrix
+/// unit has (an 8x8 fragment is what it multiplies), over one simdgroup of
+/// rows rather than two.
+const NARROW_M: u32 = 8;
+
+const NARROW_ENTRY: &str = "dense_gemm_t_bfloat16_bm_8_bk_64_bn_32";
+
+const NARROW_GROUP: [u32; 3] = [32, 1, 2];
 
 const FILE: &str = "linear/gemm_dense.metal";
 
 const LANES_PER_TILE: u32 = 32;
-
-const TILE_GROUP: [u32; 3] = [32, 2, 2];
-
-const VECTOR_GROUP: u32 = 128;
-
-const LANES_PER_COLUMN: u32 = 32;
 
 pub fn matmul(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.matmul", act, w, y)
@@ -34,9 +85,11 @@ pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), E
 }
 
 /// `y = act x w^T`. Skinny fires (fewer than [`TILE_M`] rows — the decode
-/// path) take the simdgroup gemv; everything else takes the 32x32 tile. A fire
-/// with no rows lands nothing and encodes nothing: see [`extent`] for which of
-/// the three extents is allowed to be zero and why.
+/// path) take the 8-row block; everything else takes the 32x32 tile. The two
+/// are one kernel at two row blocks and land the same bits, which is what
+/// makes a threshold on a number the composition owns legal at all — see this
+/// module's header. A fire with no rows lands nothing and encodes nothing: see
+/// [`extent`] for which of the three extents is allowed to be zero and why.
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
     op: &'static str,
@@ -50,9 +103,15 @@ pub fn act_x_wt(
         return Ok(());
     }
     let (entry, grid) = if rows < TILE_M {
-        (VECTOR_ENTRY, vector_grid(op, rows, columns)?)
+        (
+            NARROW_ENTRY,
+            tile_grid(op, rows, columns, NARROW_M, NARROW_GROUP)?,
+        )
     } else {
-        (TILE_ENTRY, tile_grid(op, rows, columns)?)
+        (
+            TILE_ENTRY,
+            tile_grid(op, rows, columns, TILE_M, TILE_GROUP)?,
+        )
     };
     ctx.fire(
         Fire::at(FILE, entry).apply(grid),
@@ -91,7 +150,17 @@ fn extent(op: &'static str, act: Tensor, y: Tensor) -> Result<(u32, u32, u32), E
     Ok((y.rows, y.width, act.width))
 }
 
-fn tile_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error> {
+/// The grid one rung launches: column tiles across, row blocks down, and the
+/// rung's own threadgroup. `block` is the rung's `BM`; `group` is the shape
+/// the kernel was instantiated at, whose `y` is how many simdgroups share the
+/// block's rows.
+fn tile_grid(
+    op: &'static str,
+    rows: u32,
+    columns: u32,
+    block: u32,
+    group: [u32; 3],
+) -> Result<Grid, Error> {
     let tiles = |extent: u32, tile: u32, per: u32, what: &'static str| -> Result<u32, Error> {
         extent
             .div_ceil(tile)
@@ -101,22 +170,9 @@ fn tile_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error> {
     Ok(Grid::of(
         [
             tiles(columns, TILE_N, LANES_PER_TILE, "the column tiles")?,
-            tiles(rows, TILE_M, TILE_GROUP[1], "the row tiles")?,
-            TILE_GROUP[2],
+            tiles(rows, block, group[1], "the row tiles")?,
+            group[2],
         ],
-        TILE_GROUP,
+        group,
     ))
-}
-
-fn vector_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error> {
-    let lanes = columns
-        .div_ceil(VECTOR_GROUP / LANES_PER_COLUMN)
-        .checked_mul(VECTOR_GROUP)
-        .ok_or_else(|| {
-            refuse(
-                op,
-                format!("the {columns} columns, one simdgroup each, will not launch"),
-            )
-        })?;
-    Ok(Grid::of([lanes, rows, 1], [VECTOR_GROUP, 1, 1]))
 }

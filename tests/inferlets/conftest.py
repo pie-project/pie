@@ -55,6 +55,12 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     # rather than reporting thirty-nine failures. The CUDA engines take the
     # unquantised release as it is, which is why this default is what it is.
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
+    # WHICH ROW OF THAT CHECKPOINT (`[model] sku`). A vision artifact fits its
+    # family's text row and its own, and the load identifies the cheap one
+    # first -- deliberately, because a two-unit load stands the fold down. A
+    # suite that wants the tower names the row.
+    parser.add_argument("--sku", default=None,
+                        help="Catalog SKU to serve (default: identify one from the checkpoint)")
     parser.add_argument("--device", default=None,
                         help="Device(s), comma-separated. Default: 'metal:0' for --engine metal, "
                              "'gpu:0' for --engine wgpu or vulkan, else 'cuda:0'")
@@ -327,6 +333,7 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         model=ModelConfig(
             name="default",
             hf_repo=args.model,
+            sku=args.sku,
             engine=EngineConfig(
                 type=args.engine,
                 device=device,

@@ -262,14 +262,17 @@ __device__ __forceinline__ void store_system_relaxed(u64* word, u64 value) {
 
 // ─────────────────────────── the three kernels ───────────────────────────
 
-// **THE ADMISSION DECISION** (channels.hpp:277-376
-// `k_pull_validate_host_channels_batch`). One block per fire; thread 0 votes,
-// the whole block copies.
-//
-// Seeds the commit pair — [0] to the caller's `initial_commit`, [1] to zero,
-// because a ringed snapshot may carry a stale kill from a previous occurrence
-// of the same slot — then, per ticket, checks the host's prediction against
-// the live words and `atomicAnd`s [0] to zero on any mismatch:
+// ────────────────────────── the admission decision ───────────────────────
+
+// How many of a lane's tickets one pass of the vote covers, and the width of
+// the shared bitmap the vote writes into. Never more than the launch's block
+// (`channel::PULL_BLOCK`, 256): a fire carries a handful of tickets, so a lane
+// takes one pass and the chunking exists only so that a fire with more than a
+// block's worth is SLOW rather than wrong.
+constexpr u32 PULL_CHUNK = 256;
+constexpr u32 PULL_CHUNK_WORDS = PULL_CHUNK / 32;
+
+// **DOES ONE TICKET'S BELIEF SURVIVE CONTACT WITH THE LIVE RING WORDS?**
 //
 //   * Consume       — `head == expected_head`: nobody else consumed this cell.
 //   * RequireInput  — `tail > head`: there IS a committed item to take.
@@ -279,11 +282,122 @@ __device__ __forceinline__ void store_system_relaxed(u64* word, u64 value) {
 //                     cell the put needs, in the same pass, so a ring that is
 //                     full to a pure producer is not full to a ping-pong.
 //
-// A ticket that passes AND is flagged HostWriter|Consume then PULLS: the
-// host's staging cell in mapped pinned memory is copied block-strided into
-// the device cell and the full byte is set, so the fire's readers address a
-// device cell like any other. A bool channel arrives bit-packed and is
-// widened one byte per element on the way in.
+// Both loads are PCIe reads out of the guest's mapped pinned memory, and they
+// are the entire reason this is a function called by one thread per ticket
+// rather than a loop body walked by thread 0 (see the kernel below).
+__device__ __forceinline__ bool ticket_holds(const Ticket& ticket, u64& head, u64& tail)
+{
+    head = load_system_acquire(ticket.words + 0);
+    tail = load_system_acquire(ticket.words + 1);
+    bool ok = true;
+    if ((ticket.flags & TICKET_CONSUME) != 0) {
+        ok = head == ticket.expected_head;
+    }
+    if ((ticket.flags & TICKET_REQUIRE_INPUT) != 0) {
+        ok = ok && tail > head;
+    }
+    if ((ticket.flags & TICKET_PUBLISH) != 0) {
+        const u64 same_fire_consume = (ticket.flags & TICKET_CONSUME) != 0 ? 1u : 0u;
+        ok = ok && tail == ticket.expected_tail &&
+             tail - head < static_cast<u64>(ticket.cap1 - 1) + same_fire_consume;
+    }
+    return ok;
+}
+
+// **THE HOST WRITER'S CELL, MIRROR TO SLAB**, strided over ONE GROUP of
+// threads — a warp, at the launch's block width — rather than over the whole
+// block, so that a fire's several cells cross the aperture at once instead of
+// one after another. `at`/`width` are the caller's position in its group; the
+// call is group-uniform, never block-uniform.
+//
+// SIXTEEN BYTES A THREAD WHERE THE CELL ALLOWS IT. The source is mapped pinned
+// memory, so each load crosses PCIe; a byte per thread per instruction asks
+// the aperture for a quarter of what a `uint4` asks for in the same
+// instruction count, and a group of 32 reading `uint4` is still one fully
+// coalesced 512-byte request. The guard is the honest one — the widening
+// applies only when the cell's width and BOTH addresses are 16-byte aligned,
+// which is the common case (a slab base is `cudaMalloc`-aligned and the ring
+// stride is the cell width) and never an assumption. A bool channel arrives
+// bit-packed and is widened one byte per element on the way in, which has no
+// vector form.
+__device__ __forceinline__ void pull_cell(const Ticket& ticket, u32 ring, u32 at, u32 width)
+{
+    const u8* source = ticket.mirror + static_cast<usize>(ring) * ticket.wire_bytes;
+    u8* destination = ticket.cells + static_cast<usize>(ring) * ticket.native_bytes;
+    if ((ticket.flags & TICKET_PACKED_BOOL) != 0) {
+        for (u32 i = at; i < ticket.native_bytes; i += width) {
+            destination[i] = static_cast<u8>((source[i / 8] >> (i % 8)) & 1u);
+        }
+        return;
+    }
+    const bool wide = ticket.native_bytes % sizeof(uint4) == 0 &&
+                      reinterpret_cast<usize>(source) % sizeof(uint4) == 0 &&
+                      reinterpret_cast<usize>(destination) % sizeof(uint4) == 0;
+    if (wide) {
+        const uint4* in = reinterpret_cast<const uint4*>(source);
+        uint4* out = reinterpret_cast<uint4*>(destination);
+        const u32 quads = ticket.native_bytes / sizeof(uint4);
+        for (u32 i = at; i < quads; i += width) {
+            out[i] = in[i];
+        }
+        return;
+    }
+    for (u32 i = at; i < ticket.native_bytes; i += width) {
+        destination[i] = source[i];
+    }
+}
+
+// **THE ADMISSION DECISION** (channels.hpp:277-376
+// `k_pull_validate_host_channels_batch`). One block per fire; ONE THREAD PER
+// TICKET votes, and the whole block copies.
+//
+// Seeds the commit pair — [0] to the caller's `initial_commit`, [1] to zero,
+// because a ringed snapshot may carry a stale kill from a previous occurrence
+// of the same slot — then checks every ticket's prediction against the live
+// words and `atomicAnd`s [0] to zero for each one that is wrong. A ticket that
+// passes AND is flagged HostWriter|Consume then PULLS: the host's staging cell
+// in mapped pinned memory is copied block-strided into the device cell and the
+// full byte is set, so the fire's readers address a device cell like any other.
+//
+// ───────────────── THE VOTE IS TAKEN IN PARALLEL, AND THAT IS WHERE THIS
+//                   KERNEL'S COST LIVES ─────────────────
+//
+// Every predicate above reads `ticket.words` — the guest's live counters, in
+// MAPPED PINNED memory, which means a PCIe read per load and a round trip of
+// latency that no arithmetic hides. This kernel used to walk a lane's tickets
+// in a `for` loop with thread 0 doing both loads and the rest of the block
+// waiting on a `__syncthreads()`, so a fire paid ONE ROUND TRIP PER ENDPOINT
+// IT ADDRESSED, in series, in its own prologue. Measured on an L40S at 64
+// lanes (`tests/channel_pull_cost.rs`): 6.6 us at one ticket a lane, 29.4 us
+// at eight — 3.3 us of pure latency added per ticket. Overlapped, the same
+// four points are 6.4 / 6.4 / 6.8 / 7.9 us.
+//
+// The tickets are INDEPENDENT — each is a claim about a different ring, and
+// the vote is an `and` over the answers, which is order-free — so the loads
+// belong in flight together. One thread per ticket issues its own pair, the
+// answers land in a shared bitmap, and the block waits out one round trip
+// instead of `n`. Nothing about the DECISION changes: the same predicates over
+// the same words, the same `atomicAnd` per failing ticket, and the same pull
+// gated on the same per-ticket validity.
+//
+// TWO CONSEQUENCES WORTH WRITING DOWN. A ticket's pull now happens after every
+// ticket has voted rather than immediately after its own vote — invisible,
+// because the pull was never predicated on anything but that ticket's own
+// validity (the header's "one exception to the bump is the only writer" says
+// exactly this, and still holds word for word). And the `diagnose` printf now
+// reports rejects in whatever order the warps finish rather than in ticket
+// order; it names the slot in every line, which is what a reader of it needs.
+//
+// WHAT IS NOT DONE HERE, AND WHY. A fire that PEEKS the same committed cell
+// again — a `read` addresses the head without moving it — re-drags mirror
+// bytes that are provably identical to the ones already in the slab, and the
+// skip would be exact if the kernel could tell "this cell is already pulled"
+// from "this cell is full". It cannot: `full[slot][ring]` is also set at BIND
+// for a channel declared `from(seed)`, and a host-writer's seed lands in the
+// mirror alone (`program::launch::Rings::write_cell` writes no slab for an
+// endpoint with a guest end), so a first fire would read a zeroed cell.
+// Distinguishing them wants a per-slot "last pulled counter" in the registry,
+// which is an ENGINE-side structure — recorded here rather than half-built.
 __global__ void pull_validate(
     const Ticket* __restrict__ tickets,
     const PullLane* __restrict__ lanes,
@@ -293,33 +407,51 @@ __global__ void pull_validate(
     if (lane_index >= lane_count) return;
     const PullLane lane = lanes[lane_index];
 
-    __shared__ u32 valid;
+    // One bit per ticket of the chunk being voted on: set means the ticket's
+    // belief held, which is the only thing the pull below is predicated on.
+    __shared__ u32 held[PULL_CHUNK_WORDS];
+    // Whether ANY ticket of this lane vetoed, across every chunk. The veto is
+    // gathered here and spent once, at the end, by the thread that seeded the
+    // word — so the commit pair, which is MAPPED PINNED memory in production
+    // (the session's own), takes two stores and at most one atomic per fire
+    // rather than one atomic per failing ticket across the PCIe aperture.
+    // Identical outcome: `atomicAnd(w, 0)` is idempotent and order-free, so
+    // "and-ed to zero by k tickets" and "stored zero once because k > 0" are
+    // the same word.
+    __shared__ u32 vetoed;
+
     if (threadIdx.x == 0) {
+        vetoed = 0;
         lane.pass_commit[0] = lane.initial_commit;
         lane.pass_commit[1] = 0;
     }
-    __syncthreads();
 
-    for (u32 index = 0; index < lane.ticket_count; ++index) {
-        const Ticket ticket = tickets[lane.ticket_offset + index];
-        if (threadIdx.x == 0) {
-            const u64 head = load_system_acquire(ticket.words + 0);
-            const u64 tail = load_system_acquire(ticket.words + 1);
-            bool ok = true;
-            if ((ticket.flags & TICKET_CONSUME) != 0) {
-                ok = head == ticket.expected_head;
-            }
-            if ((ticket.flags & TICKET_REQUIRE_INPUT) != 0) {
-                ok = ok && tail > head;
-            }
-            if ((ticket.flags & TICKET_PUBLISH) != 0) {
-                const u64 same_fire_consume =
-                    (ticket.flags & TICKET_CONSUME) != 0 ? 1u : 0u;
-                ok = ok && tail == ticket.expected_tail &&
-                     tail - head < static_cast<u64>(ticket.cap1 - 1) + same_fire_consume;
-            }
-            valid = ok ? 1u : 0u;
-            if (!ok) {
+    // The block, cut into groups of a warp for the copies below. Written off
+    // `blockDim` rather than assuming 256: a group is a warp at every launch
+    // this crate makes, and a narrower block degrades to one group rather than
+    // to a division by zero.
+    const u32 group = blockDim.x < 32u ? blockDim.x : 32u;
+    const u32 groups = blockDim.x / group;
+    const u32 mine = threadIdx.x / group;
+    const u32 within = threadIdx.x % group;
+
+    const u32 width = blockDim.x < PULL_CHUNK ? blockDim.x : PULL_CHUNK;
+    for (u32 base = 0; base < lane.ticket_count; base += width) {
+        const u32 left = lane.ticket_count - base;
+        const u32 span = left < width ? left : width;
+
+        for (u32 word = threadIdx.x; word < PULL_CHUNK_WORDS; word += blockDim.x) {
+            held[word] = 0;
+        }
+        __syncthreads();
+
+        if (threadIdx.x < span) {
+            const Ticket ticket = tickets[lane.ticket_offset + base + threadIdx.x];
+            u64 head = 0;
+            u64 tail = 0;
+            if (ticket_holds(ticket, head, tail)) {
+                atomicOr(&held[threadIdx.x >> 5], 1u << (threadIdx.x & 31u));
+            } else {
                 if (lane.diagnose != 0) {
                     printf(
                         "[kernels-cuda] pull-validate reject: slot=%u flags=0x%x "
@@ -332,34 +464,43 @@ __global__ void pull_validate(
                         static_cast<unsigned long long>(ticket.expected_tail),
                         ticket.cap1);
                 }
-                atomicAnd(lane.pass_commit, 0u);
+                atomicOr(&vetoed, 1u);
             }
         }
         __syncthreads();
 
-        const bool pull = valid != 0 &&
-                          (ticket.flags & TICKET_HOST_WRITER) != 0 &&
-                          (ticket.flags & TICKET_CONSUME) != 0;
-        u32 ring = 0;
-        if (pull) {
-            ring = static_cast<u32>(ticket.expected_head % ticket.cap1);
-            const u8* source = ticket.mirror + static_cast<usize>(ring) * ticket.wire_bytes;
-            u8* destination = ticket.cells + static_cast<usize>(ring) * ticket.native_bytes;
-            if ((ticket.flags & TICKET_PACKED_BOOL) != 0) {
-                for (u32 i = threadIdx.x; i < ticket.native_bytes; i += blockDim.x) {
-                    destination[i] = static_cast<u8>((source[i / 8] >> (i % 8)) & 1u);
-                }
-            } else {
-                for (u32 i = threadIdx.x; i < ticket.native_bytes; i += blockDim.x) {
-                    destination[i] = source[i];
-                }
+        // **THE PULLS, ONE GROUP PER TICKET** — the same argument as the vote,
+        // one level down. A cell copy is a stream of PCIe reads; two cells
+        // read by two groups overlap, while two cells read one after another
+        // by the whole block do not. At the launch's 256-thread block a group
+        // is a warp and eight cells cross at once. Aggregate work per thread
+        // is unchanged, so a wide cell loses nothing: 32 threads reading
+        // `uint4` is one fully coalesced request either way.
+        //
+        // NOTHING IN HERE NEEDS A BARRIER. The full byte and the cell bytes
+        // are read by LATER KERNELS on this stream, never by this one, and
+        // kernel completion is the release that orders them — the header's
+        // ordering note, applied to the pull's own two writes.
+        for (u32 index = mine; index < span; index += groups) {
+            const Ticket ticket = tickets[lane.ticket_offset + base + index];
+            const bool valid = ((held[index >> 5] >> (index & 31u)) & 1u) != 0;
+            const bool pull = valid &&
+                              (ticket.flags & TICKET_HOST_WRITER) != 0 &&
+                              (ticket.flags & TICKET_CONSUME) != 0;
+            if (!pull) continue;
+            const u32 ring = static_cast<u32>(ticket.expected_head % ticket.cap1);
+            pull_cell(ticket, ring, within, group);
+            if (within == 0) {
+                lane.full[static_cast<usize>(ticket.slot) * MAX_RING + ring] = 1;
             }
         }
         __syncthreads();
-        if (pull && threadIdx.x == 0) {
-            lane.full[static_cast<usize>(ticket.slot) * MAX_RING + ring] = 1;
-        }
-        __syncthreads();
+    }
+
+    // ATOMIC AND NOT A STORE, for the one reason dev's was: the word is the
+    // fire's, and nothing here may assume it is only ever this block's.
+    if (threadIdx.x == 0 && vetoed != 0) {
+        atomicAnd(lane.pass_commit, 0u);
     }
 }
 

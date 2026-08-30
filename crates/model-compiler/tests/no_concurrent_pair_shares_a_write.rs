@@ -36,48 +36,27 @@
 //! assertion above, because nothing shares anything when nothing is
 //! concurrent.
 
-use model_compiler::{ArenaMap, Budget, DeviceProfile, Phase, Region, Placement, compile};
+use model_compiler::{ArenaMap, DeviceProfile, Phase, Region, Placement};
 use model_dsl::Platform;
+
+mod common;
+use common::{PLATFORMS, bake, bake_with};
 use model_ir::{Operands, Trace, ValueId};
-
-/// Every platform a plan can be traced at — a model text may emit a different op
-/// per platform, so the DAG is not the same DAG on each.
-const PLATFORMS: [Platform; 4] = [
-    Platform::Cuda,
-    Platform::Metal,
-    Platform::Wgpu,
-    Platform::Vulkan,
-];
-
-fn budgets_for(trace: &Trace) -> Budget {
-    let seats = trace
-        .params
-        .iter()
-        .filter(|param| param.source == model_ir::ParamSource::Registered)
-        .map(|param| param.shape.first().copied().unwrap_or(0))
-        .min()
-        .unwrap_or(0);
-    Budget {
-        max_lanes: 256,
-        max_tokens: 8192,
-        buckets: vec![
-            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
-        ],
-        max_adapters: u32::try_from(seats).unwrap_or(u32::MAX),
-    }
-}
 
 #[test]
 #[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn no_concurrent_pair_shares_a_written_value() {
     let mut wrong: Vec<String> = Vec::new();
+    let (mut baked, mut two_unit) = (0usize, 0usize);
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue; // `every_sku_carves_an_arena` is what says so.
             };
+            baked += 1;
+            two_unit += usize::from(compiled.units.len() > 1);
             for &(a, b) in &compiled.streams.pairs {
                 let (ra, rb) = (&compiled.regions[a as usize], &compiled.regions[b as usize]);
                 let shared: Vec<ValueId> = writes(&trace, ra)
@@ -118,6 +97,18 @@ fn no_concurrent_pair_shares_a_written_value() {
         }
     }
 
+    // **AND THE TWO-UNIT ARENAS WERE ACTUALLY LOOKED AT.** This file swept the
+    // catalog through the token-only door until it learned to derive a patch
+    // ladder, so a tower row refused the bake and every clause above stepped
+    // over it. A green run then said "no trunk and tower share a live byte"
+    // while never having carved one. Counted, so it cannot say that again.
+    assert!(baked > 0, "the sweep baked nothing, so it asserted nothing");
+    assert!(
+        two_unit > 0,
+        "no artifact in this sweep carved more than one capture unit, so the \
+         trunk-and-tower half of the clash rule is untested here",
+    );
+
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
@@ -125,13 +116,16 @@ fn no_concurrent_pair_shares_a_written_value() {
 #[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn no_concurrent_pair_shares_an_arena_byte_it_writes() {
     let mut wrong: Vec<String> = Vec::new();
+    let (mut baked, mut two_unit) = (0usize, 0usize);
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue;
             };
+            baked += 1;
+            two_unit += usize::from(compiled.units.len() > 1);
 
             // The global statement first: the arena's own invariant, asked
             // with P6's wider notion of "live at one instant".
@@ -193,6 +187,18 @@ fn no_concurrent_pair_shares_an_arena_byte_it_writes() {
         }
     }
 
+    // **AND THE TWO-UNIT ARENAS WERE ACTUALLY LOOKED AT.** This file swept the
+    // catalog through the token-only door until it learned to derive a patch
+    // ladder, so a tower row refused the bake and every clause above stepped
+    // over it. A green run then said "no trunk and tower share a live byte"
+    // while never having carved one. Counted, so it cannot say that again.
+    assert!(baked > 0, "the sweep baked nothing, so it asserted nothing");
+    assert!(
+        two_unit > 0,
+        "no artifact in this sweep carved more than one capture unit, so the \
+         trunk-and-tower half of the clash rule is untested here",
+    );
+
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
@@ -221,8 +227,7 @@ fn the_catalog_forks_where_it_declares_disjoint_windows() {
     let mut wrong: Vec<String> = Vec::new();
     for (sku, _, trace, _) in model::catalog() {
         let trace = trace(Platform::Cuda);
-        let compiled =
-            compile(&trace, &budgets_for(&trace), &DeviceProfile::default()).expect("bakes");
+        let compiled = bake(&trace).expect("bakes");
         let forked = compiled.regions.iter().filter(|r| r.stream != 0).count();
         table.push(format!(
             "  {sku}: {} streams, {} events, {forked} forked of {} regions",
@@ -293,11 +298,7 @@ fn the_off_arm_bakes_what_the_pass_never_ran_and_costs_no_bytes() {
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let budget = budgets_for(&trace);
-            let (Ok(on), Ok(quiet)) = (
-                compile(&trace, &budget, &DeviceProfile::default()),
-                compile(&trace, &budget, &off),
-            ) else {
+            let (Ok(on), Ok(quiet)) = (bake(&trace), bake_with(&trace, &off)) else {
                 continue;
             };
             if quiet.regions.iter().any(|r| {

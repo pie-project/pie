@@ -1,7 +1,11 @@
 use checkpoint::contract::{Expr, ModelContract};
 
 use super::model::{AttnBanks, Model};
-use crate::contract::{ALIGNMENT, ModelError, copy, declare, fused, planes, planes_fused};
+use checkpoint::contract::TensorType;
+
+use crate::contract::{
+    ALIGNMENT, ModelError, copy, declare, extents, fused, planes, planes_fused,
+};
 
 /// **WHERE A SAFETENSORS CHECKPOINT OF THIS FAMILY PUTS ITS TRUNK.** Two
 /// spellings, and the difference is one swapped pair of path components —
@@ -242,6 +246,128 @@ impl Model {
             }
         }
 
+        // **THE TOWER, PLANE FOR PLANE** (multimodal §12, campaign M-2).
+        //
+        // Every entry a `copy` but one: the norms are RMSNorm and applied by
+        // ops, the clip bounds are read as `[1]` weights rather than baked
+        // into a plan constant, and the only rewrite is the position table.
+        // `position_embedding_table` is stored `[2, positions, hidden]` — an
+        // x table and a y table — and the plan reads ONE `[2 · positions,
+        // hidden]` bank so that a single `layout.embed_weighted` at two taps
+        // answers `table[0][x] + table[1][y]`. Same bytes, same order: the
+        // leading axis is contiguous, so it is a transmute and not a
+        // transform.
+        if let Some(t) = &self.tower {
+            let v = |s: &str| format!("model.vision_tower.{s}");
+            tensors.push(copy(
+                src,
+                &t.patch_embed,
+                v("patch_embedder.input_proj.weight"),
+            )?);
+            tensors.push(declare(
+                src,
+                &t.pos_embed,
+                flattened(
+                    src,
+                    v("patch_embedder.position_embedding_table"),
+                    extents(&t.pos_embed),
+                )?,
+            )?);
+            tensors.push(copy(
+                src,
+                &t.projection,
+                "model.embed_vision.embedding_projection.weight",
+            )?);
+            for (l, b) in t.blocks.iter().enumerate() {
+                let n = |s: &str| v(&format!("encoder.layers.{l}.{s}"));
+                for (weight, from) in [
+                    (&b.attn_norm, n("input_layernorm.weight")),
+                    (&b.post_attn_norm, n("post_attention_layernorm.weight")),
+                    (&b.pre_ffw_norm, n("pre_feedforward_layernorm.weight")),
+                    (&b.post_ffw_norm, n("post_feedforward_layernorm.weight")),
+                    (&b.q_norm, n("self_attn.q_norm.weight")),
+                    (&b.k_norm, n("self_attn.k_norm.weight")),
+                ] {
+                    tensors.push(copy(src, weight, from)?);
+                }
+                for (c, stem) in [
+                    (&b.q, n("self_attn.q_proj")),
+                    (&b.k, n("self_attn.k_proj")),
+                    (&b.v, n("self_attn.v_proj")),
+                    (&b.o, n("self_attn.o_proj")),
+                    (&b.gate, n("mlp.gate_proj")),
+                    (&b.up, n("mlp.up_proj")),
+                    (&b.down, n("mlp.down_proj")),
+                ] {
+                    tensors.push(copy(src, &c.bank, format!("{stem}.linear.weight"))?);
+                    // The four bounds. Stored as rank-0 scalars, read as `[1]`.
+                    for (weight, suffix) in [
+                        (&c.in_lo, "input_min"),
+                        (&c.in_hi, "input_max"),
+                        (&c.out_lo, "output_min"),
+                        (&c.out_hi, "output_max"),
+                    ] {
+                        tensors.push(declare(
+                            src,
+                            weight,
+                            flattened(src, format!("{stem}.{suffix}"), extents(weight))?,
+                        )?);
+                    }
+                }
+            }
+        }
+
+        // **THE OVERLAY HEAD** (campaign M-4). `pie model import --aux`
+        // prefixes a second checkpoint's names with `aux.`, so what makes
+        // those bytes a draft head is this block naming them — in the
+        // FAMILY'S OWN block spelling, which is how a head trained for gemma
+        // is written.
+        if let Some(a) = &self.draft {
+            // The one stored bank, cut at its own seam: `aux.fc.weight` is
+            // `[hidden, 2·hidden]` over `[embedding | hidden]`, embedding
+            // first.
+            let half = extents(&a.fc_embed)[1];
+            tensors.push(declare(
+                src,
+                &a.fc_embed,
+                Expr::src("aux.fc.weight").slice(1, 0, half),
+            )?);
+            tensors.push(declare(
+                src,
+                &a.fc_hidden,
+                Expr::src("aux.fc.weight").slice(1, half, half),
+            )?);
+            let n = |s: &str| format!("aux.layers.0.{s}");
+            for (weight, from) in [
+                (&a.attn_norm, n("input_layernorm.weight")),
+                (&a.post_attn_norm, n("post_attention_layernorm.weight")),
+                (&a.pre_ffw_norm, n("pre_feedforward_layernorm.weight")),
+                (&a.post_ffw_norm, n("post_feedforward_layernorm.weight")),
+                (&a.attn.q_norm, n("self_attn.q_norm.weight")),
+                (&a.o_proj, n("self_attn.o_proj.weight")),
+            ] {
+                tensors.push(copy(src, weight, from)?);
+            }
+            if let AttnBanks::Owned { qkv, k_norm, .. } = &a.attn.banks {
+                tensors.extend(planes_fused(
+                    src,
+                    qkv,
+                    [
+                        n("self_attn.q_proj.weight"),
+                        n("self_attn.k_proj.weight"),
+                        n("self_attn.v_proj.weight"),
+                    ],
+                )?);
+                tensors.push(copy(src, k_norm, n("self_attn.k_norm.weight"))?);
+            }
+            tensors.push(fused(
+                src,
+                &a.gate_up,
+                [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
+            )?);
+            tensors.push(copy(src, &a.down, n("mlp.down_proj.weight"))?);
+        }
+
         Ok(ModelContract {
             alignment: ALIGNMENT,
             tensors,
@@ -251,6 +377,28 @@ impl Model {
     }
 
     pub fn import_from_gguf(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
+        // No GGUF converter writes `model.vision_tower.*` under any settled
+        // spelling, and inventing one would publish a contract whose first
+        // symptom is a load that lands the trunk and zeroes four hundred
+        // planes.
+        if self.draft.is_some() {
+            return Err(ModelError::Illegible {
+                name: "aux".to_string(),
+                detail: "this SKU declares an aux draft head and no GGUF \
+                         spelling of one is settled; import it from the \
+                         safetensors artifact"
+                    .to_string(),
+            });
+        }
+        if self.tower.is_some() {
+            return Err(ModelError::Illegible {
+                name: "vision_tower".to_string(),
+                detail: "this SKU declares a vision tower and no GGUF spelling \
+                         of one is settled; import it from the safetensors \
+                         checkpoint"
+                    .to_string(),
+            });
+        }
         let mut tensors = Vec::new();
 
         tensors.push(copy(src, &self.embed, "token_embd.weight")?);
@@ -343,4 +491,35 @@ impl Model {
             groups: Vec::new(),
         })
     }
+}
+
+/// The same tensor re-typed to a stated shape — a `[2, n, h]` pair of tables
+/// read as one `[2n, h]` bank, and a rank-0 scalar read as `[1]`.
+///
+/// **A TRANSMUTE AND NOT A TRANSFORM**: the leading axis is contiguous, so the
+/// bytes and their order are unchanged and this checks the element count and
+/// restates the type. A source that states no extents — the name census
+/// `the_checkpoints_state_what_the_texts_read` writes — is let through for
+/// `qwen_3::import`'s reason, and the plan compiler checks it where the
+/// extents are real.
+fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, ModelError> {
+    let Some(tensor) = src.get(&from) else {
+        return Err(ModelError::Missing(from));
+    };
+    let illegible = |why: &dyn std::fmt::Display| ModelError::Illegible {
+        name: from.clone(),
+        detail: why.to_string(),
+    };
+    let shape = tensor.shape();
+    let stored: i128 = shape.iter().map(|&n| i128::from(n)).product();
+    let asked: i128 = want.iter().map(|&n| i128::from(n)).product();
+    if stored > 1 && stored != asked {
+        return Err(illegible(&format!(
+            "is stored {shape:?} ({stored} elements) and the plan reads it as \
+             {want:?} ({asked} elements)"
+        )));
+    }
+    let part = tensor.part("data").map_err(|why| illegible(&why))?;
+    let encoding = checkpoint::file::encoding_of(&tensor, &part).map_err(|why| illegible(&why))?;
+    Ok(Expr::src(from).transmute(TensorType::new(want, encoding)))
 }

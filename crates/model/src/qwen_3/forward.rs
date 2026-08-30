@@ -619,8 +619,26 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     };
     y = ops::elemwise::residual_add(&pos, &y);
 
+    // **`nn.LayerNorm` IS ONE OP, BECAUSE THE IMPORT CANNOT SAY IT IN NONE**
+    // (§6.1, §9.1; the saving is next.md B5, the settlement §20). The fold
+    // §6.1 proposed — `w` into the following GEMM, `b·Mᵀ` into its bias — is
+    // HALF expressible: `Expr::Scale`'s `PerBlock` factor is exactly
+    // `W · diag(w)`, and `Expr::Bias` adds one compile-time constant where a
+    // matrix-vector product is owed. The halves do not compose either, since
+    // a runtime `add_bias` behind a scaled bank contributes `(b ⊙ w)·Mᵀ`. So
+    // the text says the whole norm at runtime and the import contract stays a
+    // copy.
+    //
+    // It said it in THREE ops until B5 — `add_bias(b, rmsnorm(
+    // layernorm_no_scale(x, eps), w, eps))`, where the middle `rmsnorm`
+    // normalized nothing (its input's rms is 1 by construction) and served
+    // only to read the weight. Twenty-five norms a qwen35 tower fire, so 75
+    // launches became 25 and fifty intermediate rectangles became none. The
+    // numbers moved, toward the reference: the retired `add_bias` stored
+    // `c·w` to bf16 before adding `b`, and §20's table measures what that
+    // cost where the bias cancels the scaled row.
     for b in &t.blocks {
-        let n = layernorm(&y, &b.norm1, &b.norm1_bias, t.norm_eps);
+        let n = ops::elemwise::layernorm(&y, &b.norm1, &b.norm1_bias, t.norm_eps);
         let (q, k, v) = ops::layout::split_qkv(
             &ops::elemwise::add_bias(&b.qkv_bias, &ops::linear::matmul(&n, &b.qkv)),
             t.hidden,
@@ -646,7 +664,7 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
             &y,
         );
 
-        let n = layernorm(&y, &b.norm2, &b.norm2_bias, t.norm_eps);
+        let n = ops::elemwise::layernorm(&y, &b.norm2, &b.norm2_bias, t.norm_eps);
         let h = ops::elemwise::add_bias(&b.fc1_bias, &ops::linear::matmul(&n, &b.fc1));
         let a = ops::linear::mlp_gelu_tanh(&h);
         y = ops::elemwise::residual_add(
@@ -660,36 +678,11 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
     // `use_postshuffle_norm: false` read off the shapes — and the fold comes
     // after it.
     let m = &t.merger;
-    let n = layernorm(&y, &m.norm, &m.norm_bias, t.norm_eps);
+    let n = ops::elemwise::layernorm(&y, &m.norm, &m.norm_bias, t.norm_eps);
     let folded = ops::layout::merge_rows(&n, t.merge);
     let h = ops::elemwise::add_bias(&m.fc1_bias, &ops::linear::matmul(&folded, &m.fc1));
     let a = ops::linear::mlp_gelu_tanh(&h);
     ops::elemwise::add_bias(&m.fc2_bias, &ops::linear::matmul(&a, &m.fc2))
-}
-
-/// **`nn.LayerNorm`, SAID IN THREE OPS BECAUSE THE IMPORT CANNOT SAY IT IN
-/// ONE** (multimodal §6.1, §9.1).
-///
-/// `layernorm_no_scale` answers `(x − mean) · rsqrt(var + eps)`, a row whose
-/// rms is 1 by construction — so the `rmsnorm` on top of it normalizes
-/// nothing and multiplies by its weight, which is the scale, and `add_bias` is
-/// the bias. The second reduction costs a uniform per-row factor of
-/// `1 ± 1.4e-4` (the bf16 rounding of an already-normalized row, averaged over
-/// the width), which is thirty times inside bf16's own quantum.
-///
-/// The fold §6.1 proposed — `w` into the following GEMM, `b·Mᵀ` into its bias
-/// — is HALF expressible: `Expr::Scale`'s `PerBlock` factor is exactly
-/// `W · diag(w)`, and `Expr::Bias` adds one compile-time constant where a
-/// matrix-vector product is owed. And the two halves do not compose, because a
-/// runtime `add_bias` behind a scaled bank contributes `(b ⊙ w)·Mᵀ`. So the
-/// text says the whole norm and the import contract stays a copy. What is
-/// owed is a saving and not a correction: `elemwise::layernorm(x, w, eps)`
-/// would retire the middle line.
-fn layernorm(x: &Value, weight: &model_dsl::Weight, bias: &model_dsl::Weight, eps: f32) -> Value {
-    ops::elemwise::add_bias(
-        bias,
-        &ops::elemwise::rmsnorm(&ops::elemwise::layernorm_no_scale(x, eps), weight, eps),
-    )
 }
 
 fn attn_mixer(

@@ -60,6 +60,8 @@
 //! role = "lora_b"
 //! file = "lora_b.bin"
 //! layout = "out_major"    # [layers, hidden, rank] — HF's native orientation
+//! # site = "o"            # optional (alto next B3): which projection these
+//! #                       # banks correct, when the text named a site
 //! ```
 //!
 //! **THE FILE DECLARES ITS ORIENTATION BECAUSE BYTES CANNOT.** §6.3's statute
@@ -67,6 +69,16 @@
 //! repacked — and orientation is not observable in a byte string, so it has to
 //! be said. It is said in the file rather than at the API because §3.3's
 //! hot-add is a file drop: nobody is standing there to state it.
+//!
+//! **AND `site` IS OPTIONAL BECAUSE A NAME'S SITE IS** (alto next B3). Until
+//! this wave a bank name was `layer.{l}.{role}` and could not say WHICH
+//! projection it corrected, so a guest's `Site::Q` silently took the one site
+//! the text happened to correct. A name may now carry the site
+//! (`layer.{l}.o.lora_a`, [`Site`]) and a manifest may state it; a manifest
+//! that states none takes the banks that declare none, which is every bank of
+//! every text written before this wave. Absent is not a wildcard — it is a
+//! VALUE, the unstated default site — which is why the widening costs the six
+//! family texts nothing and still refuses a mismatch by name.
 //!
 //! `role` is the bank's name with its `layer.{l}.` prefix cut, which is how
 //! §6.3's "the resolver slices, per layer" is spelled: a `[layers, …]` source
@@ -84,6 +96,10 @@
 //!   [`Fault::Blob`] with BOTH numbers
 //! * a rank-major source into an out-major bank — [`Fault::Blob`], naming the
 //!   repack kernel this shell does not ship
+//! * a `site` outside the vocabulary — [`Fault::Blob`], naming the six
+//!   spellings a bank can be named at ([`Site::vocabulary`])
+//! * a `site` no bank of this load declares — [`Fault::Blob`], naming the
+//!   site asked for and the banks there are
 //! * every slot pinned by a live bind — [`Fault::AdapterSlots`], refused at
 //!   the keying moment rather than by evicting something in flight (§5)
 
@@ -225,6 +241,12 @@ pub struct PlaneSpec {
     pub file: String,
     /// Which way its bytes run.
     pub layout: Layout,
+    /// **WHICH CORRECTION SITE'S BANKS IT FILLS** (alto next B3), or `None`
+    /// for a manifest that states none — today's meaning, and the banks a
+    /// text named without a site. `site = "o"` beside `role = "lora_a"`
+    /// selects `layer.{l}.o.lora_a`; a spelling outside the vocabulary is a
+    /// refusal at [`Manifest::read`] and never a fallback.
+    pub site: Option<Site>,
 }
 
 /// What an adapter directory declares about itself.
@@ -303,38 +325,212 @@ impl Manifest {
                         )));
                     }
                 };
-                Ok(PlaneSpec { role, file, layout })
+                // **THE OPTIONAL SITE, WITH THE SAME REFUSAL DISCIPLINE AS
+                //   EVERY OTHER KEY** (alto next B3). Absent is today's
+                //   meaning — the banks a text named without a site — so
+                //   every manifest written before this wave reads the same.
+                //   A spelling outside the vocabulary is refused BY NAME
+                //   rather than ignored, because a `site = "mixer"` that
+                //   silently became "wherever the text corrects" is the one
+                //   wrong answer this axis must never give.
+                let site = match plane.get("site") {
+                    None => None,
+                    Some(value) => {
+                        let word = value.as_str().ok_or_else(|| {
+                            refuse(format!(
+                                "declares plane `{role}`'s `site` as something that is \
+                                 not a string; a site is one word of {}",
+                                Site::vocabulary()
+                            ))
+                        })?;
+                        Some(Site::parse(word).ok_or_else(|| {
+                            refuse(format!(
+                                "declares plane `{role}` at site `{word}`, and the \
+                                 correction sites a bank can be named at are {}; a site \
+                                 nobody can name is refused rather than landed at \
+                                 whatever site the model text happens to correct",
+                                Site::vocabulary()
+                            ))
+                        })?)
+                    }
+                };
+                Ok(PlaneSpec {
+                    role,
+                    file,
+                    layout,
+                    site,
+                })
             })
             .collect::<Result<Vec<PlaneSpec>>>()?;
         Ok(Manifest { rank, planes })
     }
 }
 
-/// The bank name's role — everything after a `layer.{l}.` prefix.
+// ── the name convention ──────────────────────────────────────────────────
+
+/// **WHICH PROJECTION A BANK CORRECTS** (alto next B3; the vocabulary is the
+/// guest surface's, verbatim).
 ///
-/// `layer.7.lora_a` is the seventh layer's `lora_a`; a bank named without a
-/// numbered component is its own role at layer zero. This is the ONLY name
-/// convention in the adapter axis and it lives here rather than in
-/// [`crate::weights`] on purpose (§6.3: the resolver slices).
+/// `inferlet::eta::adapter::Site` is the ONE site vocabulary in this tree —
+/// six llama-like projection sites, `Q`/`K`/`V`/`O`/`GateUp`/`Down`, carried
+/// to the engine as the trace-known placement constant `Site::bit()` sets
+/// (`1 << 0` … `1 << 5`, `crates/inferlet/src/eta.rs:883`). A bank name and a
+/// manifest spell the same six in snake case, and the bits here are that
+/// enum's bits so a guest's ask and a bank's declaration are ONE number to
+/// compare.
+///
+/// **THE SPELLING IS THE CONTRACT AND IT IS WRITTEN IN THREE PLACES** — the
+/// guest's `Site`, the model text's [`model::adapter::Site`], and this one —
+/// for exactly the reason `lora_a` is: a name crosses a crate boundary as a
+/// string, and the three crates cannot depend on each other in a circle. What
+/// keeps them one vocabulary is that a spelling nobody here knows is REFUSED
+/// rather than guessed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Site {
+    /// The query projection.
+    Q,
+    /// The key projection.
+    K,
+    /// The value projection.
+    V,
+    /// The mixer's output projection — the site every family text corrects
+    /// today, and therefore the one an untagged bank means.
+    O,
+    /// The fused gate/up projection of the feed-forward sublayer.
+    GateUp,
+    /// Its down projection.
+    Down,
+}
+
+impl Site {
+    /// The vocabulary, in bit order.
+    pub const ALL: [Site; 6] = [
+        Site::Q,
+        Site::K,
+        Site::V,
+        Site::O,
+        Site::GateUp,
+        Site::Down,
+    ];
+
+    /// How a bank name and a manifest spell it.
+    #[must_use]
+    pub const fn spelled(self) -> &'static str {
+        match self {
+            Site::Q => "q",
+            Site::K => "k",
+            Site::V => "v",
+            Site::O => "o",
+            Site::GateUp => "gate_up",
+            Site::Down => "down",
+        }
+    }
+
+    /// The guest surface's own bit for it — `inferlet::eta::adapter::Site`'s
+    /// `bit()`, which is what rides the `lora` sink's placement constant.
+    #[must_use]
+    pub const fn bit(self) -> u32 {
+        match self {
+            Site::Q => 1 << 0,
+            Site::K => 1 << 1,
+            Site::V => 1 << 2,
+            Site::O => 1 << 3,
+            Site::GateUp => 1 << 4,
+            Site::Down => 1 << 5,
+        }
+    }
+
+    /// A spelling, or `None` for a word outside the vocabulary.
+    ///
+    /// `None` is what keeps `layer.3.mixer.lora_a` refusing exactly as it did
+    /// before this widening: an unknown middle segment is not a site, so the
+    /// name has no `layer.{l}.` prefix to cut and the WHOLE name is its role —
+    /// which matches no bank.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Site> {
+        Site::ALL.into_iter().find(|site| site.spelled() == word)
+    }
+
+    /// The vocabulary as a message names it.
+    #[must_use]
+    pub fn vocabulary() -> String {
+        Site::ALL
+            .iter()
+            .map(|site| format!("`{}`", site.spelled()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// How a message spells "at this site", including the absent one.
+    #[must_use]
+    pub fn stated(site: Option<Site>) -> String {
+        match site {
+            Some(site) => format!("at site `{}`", site.spelled()),
+            None => "at no stated site".to_string(),
+        }
+    }
+}
+
+/// The bank name's role — everything after a `layer.{l}.` prefix and the
+/// OPTIONAL site segment that may follow it.
+///
+/// `layer.7.lora_a` is the seventh layer's `lora_a` and states no site;
+/// `layer.7.o.lora_a` is the same role at the same layer, declaring that it
+/// corrects [`Site::O`]. A bank named without a numbered component is its own
+/// role at layer zero, and a middle segment outside the site vocabulary is NOT
+/// a site — `layer.3.mixer.lora_a` is a role called `layer.3.mixer.lora_a`,
+/// which is how an unknown site goes on being refused rather than landed at
+/// whatever the text's default happens to be.
+///
+/// This is the ONLY name convention in the adapter axis and it lives here
+/// rather than in [`crate::weights`] on purpose (§6.3: the resolver slices).
 #[must_use]
 pub fn role_of(bank: &str) -> &str {
-    match bank.rsplit_once('.') {
-        Some((head, tail)) if head.rsplit('.').next().is_some_and(numbered) => tail,
-        _ => bank,
-    }
+    parsed(bank).map_or(bank, |(_, _, role)| role)
 }
 
 /// Which layer a bank name puts itself at, or zero for an unnumbered one.
 #[must_use]
 pub fn layer_of(bank: &str) -> u64 {
-    bank.rsplit_once('.')
-        .and_then(|(head, _)| head.rsplit('.').next())
-        .and_then(|part| part.parse::<u64>().ok())
-        .unwrap_or(0)
+    parsed(bank).map_or(0, |(layer, _, _)| layer)
 }
 
-fn numbered(part: &str) -> bool {
-    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+/// **WHICH SITE A BANK DECLARES IT CORRECTS**, or `None` for a name that
+/// declares none.
+///
+/// `None` is not "no site": it is TODAY'S MEANING — the text's own default
+/// site, the one every A-6 family text corrects, unstated because until this
+/// wave a name had no way to state it. What it buys is the byte-compatible
+/// half of the widening: a load whose banks all answer `None` behaves exactly
+/// as it did, and only a text that opts in gets a site checked against it.
+#[must_use]
+pub fn site_of(bank: &str) -> Option<Site> {
+    parsed(bank).and_then(|(_, site, _)| site)
+}
+
+/// `layer.{l}[.{site}].{role}`, read once — the whole grammar in one place.
+fn parsed(bank: &str) -> Option<(u64, Option<Site>, &str)> {
+    let (head, role) = bank.rsplit_once('.')?;
+    let last = head.rsplit('.').next()?;
+    // `layer.{l}.{role}` — the pre-B3 spelling, and the one the six family
+    // texts write. Read first, so nothing about the widening costs it a step.
+    if let Some(layer) = numbered(last) {
+        return Some((layer, None, role));
+    }
+    // `layer.{l}.{site}.{role}` — a site of the vocabulary, with the layer
+    // right in front of it. Anything else falls through to `None` and the
+    // caller reads the whole name as a role.
+    let site = Site::parse(last)?;
+    let (rest, _) = head.rsplit_once('.')?;
+    let layer = numbered(rest.rsplit('.').next()?)?;
+    Some((layer, Some(site), role))
+}
+
+fn numbered(part: &str) -> Option<u64> {
+    match !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) {
+        true => part.parse().ok(),
+        false => None,
+    }
 }
 
 // ── the host byte cache ──────────────────────────────────────────────────
@@ -908,16 +1104,21 @@ impl Adapters {
         let mut out = Vec::new();
         let mut fingerprint = 0u64;
         for spec in &manifest.planes {
+            // **THE ROLE AND THE SITE TOGETHER PICK THE BANKS** (alto next
+            // B3). A manifest that states no site takes the banks that
+            // declare none, which on a text written before this wave is all
+            // of them — byte for byte the filter this line used to be.
             let mut banks: Vec<&BankSeat> = seats
                 .iter()
-                .filter(|seat| role_of(&seat.name) == spec.role)
+                .filter(|seat| role_of(&seat.name) == spec.role && site_of(&seat.name) == spec.site)
                 .collect();
             banks.sort_by_key(|seat| layer_of(&seat.name));
             let seat = *banks.first().ok_or_else(|| {
                 refuse(format!(
-                    "declares a plane for role `{}` and this load declares no bank by \
+                    "declares a plane for role `{}` {} and this load declares no bank by \
                      that name; its banks are {:?}",
                     spec.role,
+                    Site::stated(spec.site),
                     seats.iter().map(|seat| &seat.name).collect::<Vec<_>>()
                 ))
             })?;

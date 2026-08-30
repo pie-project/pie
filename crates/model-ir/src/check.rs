@@ -472,6 +472,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::RmsnormPerHeadPlusOne { .. }
             | Elementwise::RmsnormNoScale { .. }
             | Elementwise::LayernormNoScale { .. }
+            | Elementwise::Layernorm { .. }
             | Elementwise::Clamp { .. }
             | Elementwise::ClampLearned { .. }
             | Elementwise::RmsnormGated { .. }

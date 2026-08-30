@@ -98,22 +98,86 @@ pub struct DeviceTuning {
     /// [`qmm_min_batch_emulated`](Self::qmm_min_batch_emulated) for the one
     /// that does not.
     ///
-    /// M1 Max: 8. It read 12 while the batched GEMM was still emulating a
-    /// bfloat matrix unit; it is not any more, and the same sweep re-run
-    /// against the same binary — arms alternated twice, eight lanes,
-    /// 128-token prompt, 64 decode steps, aggregate tok/s — gives
-    /// Qwen3.6-27B 23.0 → 32.1 (+40%), gemma-4-31b 17.9 → 30.0 (+68%),
-    /// gemma-4-26b-a4b 107.3 → 130.1 (+21%), gpt-oss-20b 108.2 → 116.2 (+7%).
-    /// What moved is not the GEMM's speed but which side of the crossover
-    /// eight sits on: the old number was measuring a GEMM the device could
-    /// not really run.
+    /// M1 Max: 5.
     ///
-    /// M2 Max (Apple8, 38 cores) agrees at 8 — the first batch where the GEMM
-    /// wins on all four dense checkpoints (Llama-1B +17.6%, Llama-3B +19.2%,
-    /// Qwen3-1.7B +14.4%, gemma-4-E2B +4.6%) and the first with no measured
-    /// regression on any. M4 Pro (Apple9, 20 cores) agrees at 8 too, measured
-    /// on gemma-4-E4B at concurrency 8, the batch where 12 and 8 provably
-    /// take different paths: 138.90 against 144.04 tok/s, +3.7%.
+    /// **WHAT THIS CROSSOVER ACTUALLY SEPARATES**, because the two arms are
+    /// not two speeds of one kernel. `quant_qmv.metal`'s fast point walks one
+    /// threadgroup per ROW (`x += tid.x * in_vec_size`), so an N-row fire
+    /// reads the whole weight table N times; the tiled point reads it ONCE
+    /// and does `BM` rows of arithmetic against it, at the narrowest rung
+    /// `BM = 8` whether the fire brought eight rows or two. So the GEMV
+    /// climbs with N and the GEMM is FLAT in it, and the crossover is where
+    /// one line cuts the other — measured on gemma-4-31b, the GEMM arm moves
+    /// 222.1 → 260.6 ms/fire from two lanes to sixteen while the GEMV arm
+    /// moves 106.4 → 801.4.
+    ///
+    /// This read 12 while the batched GEMM was still emulating a bfloat
+    /// matrix unit, then 8 once it stopped — arms alternated twice, eight
+    /// lanes, 128-token prompt, 64 decode steps, aggregate tok/s: Qwen3.6-27B
+    /// 23.0 → 32.1 (+40%), gemma-4-31b 17.9 → 30.0 (+68%), gemma-4-26b-a4b
+    /// 107.3 → 130.1 (+21%), gpt-oss-20b 108.2 → 116.2 (+7%). What moved then
+    /// was not the GEMM's speed but which side of the crossover eight sat on.
+    ///
+    /// **THE CROSSOVER IS A PROPERTY OF THE GEMM AND MOVES WHEN THE GEMM
+    /// DOES**, of which the paragraph above is one instance and this is the
+    /// next two: 8 → 6 when four checkpoints were finally swept a width at a
+    /// time, and 6 → 5 now that [`crate::linear::quant`]'s `BM_RUNGS` has an
+    /// 8 rung under its 16. A narrower row block is a cheaper GEMM at every
+    /// width below sixteen, so the flat line moved DOWN and the crossing
+    /// point moved left with it. Nothing about the GEMV changed either time.
+    ///
+    /// `throughput_probe` sweeps a rung at a time and can pin either arm
+    /// through the boot document, so both curves are available at every
+    /// width: ms/fire over 32 warm decode fires, the GEMV arm forced with
+    /// `qmm_min_batch = 999` and the GEMM arm with `= 2`, lower is better,
+    /// winner starred:
+    ///
+    /// ```text
+    ///        qwen36-27b        gemma4-31b       gpt-oss-20b      qwen35-0.8b
+    ///   N    GEMV    GEMM     GEMV    GEMM     GEMV   GEMM      GEMV   GEMM
+    ///   2  *107.4*  206.2   *106.4*  222.1   *19.1*  24.8      *7.1*  10.2
+    ///   3  *159.3*  218.9   *156.1*  223.0   *27.0*  30.6     *10.6*  12.7
+    ///   4  *207.7*  228.0   *205.5*  223.6   *34.8*  36.4     *12.3*  12.8
+    ///   5   258.7 *239.4*    254.7 *224.3*    42.7 *42.1*      16.8 *16.0*
+    ///   6   304.8 *246.5*    304.0 *225.0*    50.5 *47.9*      18.3 *16.1*
+    ///   7   357.2 *259.4*    354.1 *226.1*    58.4 *53.9*      21.9 *18.2*
+    ///   8   405.8 *266.8*    403.8 *226.8*    66.3 *59.6*      23.3 *18.2*
+    /// ```
+    ///
+    /// Five is the first width where the GEMM wins on ALL FOUR (+8.0, +13.6,
+    /// +1.3, +4.6%) and four is the last where it loses on any — at four it
+    /// loses on all four, by 9.7 / 8.8 / 4.7 / 4.0%, so unlike the sweep that
+    /// set six there is no borderline here to argue about in either
+    /// direction. The value is the one with no measured regression anywhere,
+    /// which is the rule the M2 sweep below applied when it chose eight over
+    /// seven.
+    ///
+    /// 6 → 5 is worth exactly the five-lane column, +8.0 / +13.6 / +1.3 /
+    /// +4.6%: at every other width both values select the same kernel and
+    /// measure the same. What the 8 rung is worth INSIDE the GEMM arm — the
+    /// other half of the same sweep, and larger — is tabulated on
+    /// `linear::quant::BM_RUNGS` rather than restated here.
+    ///
+    /// **AND IT IS THE MACHINE'S NUMBER AND NOT THE SHAPE'S**, which is worth
+    /// writing down because the sweeps that set 8 ran on 1-3B checkpoints and
+    /// the ones above run on four spanning 0.8B to 31B, hidden widths 2048 to
+    /// 5120. All four cross between five and six. The arithmetic says why: the
+    /// GEMV reads `bytes` per row and the GEMM reads `bytes` once for `BM`
+    /// rows of arithmetic, so the crossover is a ratio of the device's
+    /// bandwidth to its matrix throughput and the weight table's SIZE cancels.
+    /// There is therefore no width-keyed rule here to add.
+    ///
+    /// M2 Max (Apple8, 38 cores) and M4 Pro (Apple9, 20 cores) both name 8 in
+    /// [`of`](Self::of) rather than inheriting, and they keep naming it
+    /// through this move: their sweeps ran on the 16-rung GEMM, and a machine
+    /// whose curve nobody has re-drawn since the 8 rung landed gets the
+    /// number that was MEASURED on it. The M2's is the first batch
+    /// where the GEMM won on all four dense checkpoints it swept (Llama-1B
+    /// +17.6%, Llama-3B +19.2%, Qwen3-1.7B +14.4%, gemma-4-E2B +4.6%) and the
+    /// M4's is gemma-4-E4B at concurrency 8, 138.90 against 144.04 tok/s
+    /// (+3.7%). Neither swept the widths between four and eight, and a
+    /// default that moved under them would hand both machines a number no run
+    /// on them has ever produced.
     ///
     /// DENSE only: see [`qmm_min_batch_moe`](Self::qmm_min_batch_moe).
     pub qmm_min_batch: u32,
@@ -134,6 +198,17 @@ pub struct DeviceTuning {
     /// GEMV won or tied on every mixture measured — Qwen3-30B by 8%,
     /// gemma-4-26B by 12%, gpt-oss-20B by nothing either way — and nothing
     /// has re-run that machine since the FP16 wiring.
+    ///
+    /// **NO CALL SITE IN THIS TREE REACHES IT AND SO NOTHING RE-SWEPT IT**
+    /// when [`qmm_min_batch`](Self::qmm_min_batch) moved to six, or again
+    /// when it moved to five.
+    /// `linear::quant::act_x_wt` is the only reader of
+    /// [`qmm_min_batch`](Self::qmm_min_batch(routed:fp16_gemm:)) and it passes
+    /// `routed: false` unconditionally, for the reason stated at that call:
+    /// whether a checkpoint's FFN is routed is a fact about the MODEL, and no
+    /// operand of `linear.matmul` carries it. So gpt-oss-20b's attention four
+    /// and its head took the DENSE number in the sweep above and take it now,
+    /// which is why that column is in that table and not this one.
     pub qmm_min_batch_moe: u32,
 
     /// The same crossover for a checkpoint whose quantization does NOT reach
@@ -295,42 +370,65 @@ pub struct DeviceTuning {
     /// Rows an expert's run must hold before the mixture sorts and batches at
     /// all, rather than running the routed projections as matvecs.
     ///
-    /// M1 Max: 1. It was 8 — half a narrow tile — on the model that the
-    /// padding is wasted work and the break-even is where a run half fills a
-    /// tile. Measured, that model is wrong in the direction that matters: a
-    /// 4-bit mixture is bandwidth-bound, and what batching buys is reading
-    /// each expert's slice ONCE instead of once per pair, which is worth far
-    /// more than the arithmetic a half-empty tile throws away.
+    /// M1 Max: 2 — the sorted arm from `2 · experts` pairs up, which for
+    /// gpt-oss-20b's 32 experts at top-4 is sixteen lanes.
     ///
-    /// The cost of a high value is a step function on a SERVING fleet, not a
-    /// rounding error. gpt-oss-20b is 32 experts at top-4, so `4·n ≥ 32·4`
-    /// first holds at exactly 32 lanes — and until it does, the largest
-    /// weights in the model run as a per-row matvec. Aggregate tok/s,
-    /// 128-token prompt, 64 decode steps, arms alternated:
+    /// It was 8 — half a narrow tile — on the model that the padding is
+    /// wasted work and the break-even is where a run half fills a tile. That
+    /// model is wrong in the direction that matters: a 4-bit mixture is
+    /// bandwidth-bound, and what batching buys is reading each expert's slice
+    /// ONCE instead of once per pair, which is worth far more than the
+    /// arithmetic a half-empty tile throws away. It then read 1 — "batch from
+    /// one pair an expert up" — off an aggregate sweep whose window carried a
+    /// 128-token prefill per lane beside its decodes.
+    ///
+    /// **THE STEP IS ON THE DECODE RUNGS, SO IT IS MEASURED THERE.**
+    /// `throughput_probe` seats N lanes, fires a warm window of decodes alone,
+    /// and PRINTS which arm each rung took, so the two arms can be pinned
+    /// through the boot document and read off against each other rung by rung.
+    /// gpt-oss-20b, ms/fire over 32 warm decode fires, the per-row arm forced
+    /// with `moe_batch_min_per_expert = 3` and the sorted arm with `= 0`,
+    /// lower is better, winner starred:
     ///
     /// ```text
-    ///  model              lanes       4        1     delta
-    ///  gpt-oss-20b            4   103.5    103.3       -0%
-    ///  gpt-oss-20b            8   116.9    174.7      +49%
-    ///  gpt-oss-20b           16   134.1    310.7     +132%
-    ///  gemma-4-26b-a4b        8   128.9    130.3       +1%
-    ///  gemma-4-26b-a4b       16   174.3    269.3      +55%
+    ///  lanes   pairs   per-row    sorted    delta
+    ///      1       4    *11.4*      20.1     +77%
+    ///      2       8    *19.1*      31.1     +63%
+    ///      4      16    *34.6*      49.1     +42%
+    ///      8      32    *61.5*      71.5     +16%
+    ///     16      64     108.2   *98.5*      +10%
     /// ```
     ///
-    /// The two neutral rows are neutral off the arithmetic and not the
-    /// weather: the gate compares `n_pairs` to `n_experts · this`, and at
-    /// those widths neither fire clears it either way.
+    /// The lines cross between 32 pairs and 64, so the threshold is `2 ·
+    /// experts` and not `1 ·` — and 1 is a MEASURED regression rather than a
+    /// neutral one, because 32 pairs is exactly where it switches the arm:
+    /// 16% of a gpt-oss decode at eight lanes. Alternated in fresh processes
+    /// at that rung alone, twice each: sorted 76.63 and 76.63, per-row 66.36
+    /// and 66.37.
+    ///
+    /// **AND IT IS ONE MIXTURE'S SHAPE.** The crossover is stated in pairs an
+    /// expert, so a checkpoint routed differently — more experts, a wider
+    /// top-k, a different expert width — moves the LANE count this lands on
+    /// without necessarily moving the pair count, and no other mixture has
+    /// been swept on this machine since the routed GEMM took the FP16 matrix
+    /// path. gemma-4-26b-a4b in particular owes its own table. What the
+    /// earlier aggregate sweep recorded stands as a measurement of the window
+    /// it took: 128 prompt tokens a lane is 512 pairs a lane at prefill, past
+    /// every threshold either arm names, so the arm it separated was the
+    /// decode one and the number it reported was diluted by a prefill both
+    /// arms sorted.
     ///
     /// ZERO IS A VALUE, not a typo: "batch at any width" is the only way to
     /// reach the routed GEMM below its crossover, which is how a wrong-answer
-    /// bug in that kernel gets bisected.
+    /// bug in that kernel gets bisected — and it is how the sorted column
+    /// above was taken.
     pub moe_batch_min_per_expert: u32,
 }
 
 impl Default for DeviceTuning {
     fn default() -> Self {
         Self {
-            qmm_min_batch: 8,
+            qmm_min_batch: 5,
             qmm_min_batch_moe: 8,
             qmm_min_batch_emulated: 12,
             qmm_bn_crossover_tg: 160,
@@ -341,7 +439,7 @@ impl Default for DeviceTuning {
             sdpa_mma: true,
             gdn_scan_lanes: 32,
             gdn_scan_rows: 4,
-            moe_batch_min_per_expert: 1,
+            moe_batch_min_per_expert: 2,
         }
     }
 }
@@ -356,11 +454,17 @@ impl DeviceTuning {
     pub fn of(info: DeviceInfo) -> Self {
         let mut t = Self::default();
         match info.apple_family {
-            // M3/M4. Both crossovers are the struct's defaults now — the M1
-            // measured its way to the same pair — so this entry no longer
-            // restates them. What is left is the tile crossover: with twenty
-            // cores rather than thirty-two the wide tile's smaller grid fills
-            // the machine sooner, so it moves DOWN. Re-swept at BM=64,
+            // M3/M4. The DENSE crossover is eight here and is named rather
+            // than inherited, because the default moved UNDER it: the M1's
+            // own re-sweep found the lines cross at six, and it found that by
+            // measuring the widths between four and eight, which no run on
+            // THIS machine has ever sampled. What the M4 measured is
+            // gemma-4-E4B at concurrency 8 — 12 against 8, 138.90 against
+            // 144.04 tok/s, +3.7% — and that number says nothing about six.
+            //
+            // The tile crossover is the other entry: with twenty cores rather
+            // than thirty-two the wide tile's smaller grid fills the machine
+            // sooner, so it moves DOWN. Re-swept at BM=64,
             // GFLOP/s, threadgroups counted as `(N/32)·ceil(M/64)`:
             //
             //   tg@32    BN=16    BN=32    delta
@@ -375,18 +479,33 @@ impl DeviceTuning {
             // was measured. Applied by FAMILY and not by core count: the
             // crossover is set by per-core matrix throughput, which the
             // family names and the count does not.
-            9 => t.qmm_bn_crossover_tg = 96,
-            // M2. The DENSE crossover here is eight, which is the default and
-            // is not restated. The ROUTED one is twelve, and that is the
-            // finding rather than an omission — at the same batches the GEMV
-            // still won on every mixture measured. It is named HERE rather
-            // than inherited because the default moved UNDER it: the M1
-            // reversed its own routed number once the expert GEMM stopped
-            // emulating a bfloat matrix unit, this machine has not been
-            // re-measured since, and inheriting a default that changed for a
-            // reason this device was never tested against would be a guess
-            // wearing a measurement's clothes.
-            8 => t.qmm_min_batch_moe = 12,
+            9 => {
+                t.qmm_min_batch = 8;
+                t.qmm_bn_crossover_tg = 96;
+            }
+            // M2. The DENSE crossover here is eight — the first batch where
+            // the GEMM won on all four dense checkpoints this machine swept
+            // (Llama-1B +17.6%, Llama-3B +19.2%, Qwen3-1.7B +14.4%,
+            // gemma-4-E2B +4.6%) and the last where it lost on any is seven.
+            // That sweep DID sample six, and at six the GEMV won all four
+            // (386.9/393.0, 166.7/167.6, 270.9/283.8, 173.9/197.9 tok/s,
+            // GEMM/GEMV) — so this machine's own evidence puts its crossover
+            // where it already reads it, and the M1 moving to six is a
+            // statement about the M1.
+            //
+            // The ROUTED one is twelve, and that is the finding rather than
+            // an omission — at the same batches the GEMV still won on every
+            // mixture measured. It is named HERE rather than inherited
+            // because the default moved UNDER it too: the M1 reversed its own
+            // routed number once the expert GEMM stopped emulating a bfloat
+            // matrix unit, this machine has not been re-measured since, and
+            // inheriting a default that changed for a reason this device was
+            // never tested against would be a guess wearing a measurement's
+            // clothes.
+            8 => {
+                t.qmm_min_batch = 8;
+                t.qmm_min_batch_moe = 12;
+            }
             _ => {}
         }
         t
@@ -507,9 +626,9 @@ mod tests {
         assert_eq!(DeviceTuning::of(DeviceInfo::default()), m1);
         assert_eq!(DeviceTuning::of(DeviceInfo::of_name("Apple M9 Ultra")), m1);
         assert_eq!(DeviceTuning::of(DeviceInfo::of_name("Apple M1 Max")), m1);
-        assert_eq!(m1.qmm_min_batch, 8);
+        assert_eq!(m1.qmm_min_batch, 5);
         assert_eq!(m1.qmm_bn_crossover_tg, 160);
-        assert_eq!(m1.moe_batch_min_per_expert, 1);
+        assert_eq!(m1.moe_batch_min_per_expert, 2);
     }
 
     #[test]
@@ -517,13 +636,20 @@ mod tests {
         let m1 = DeviceTuning::default();
         let m4 = DeviceTuning::of(DeviceInfo::of_name("Apple M4 Pro"));
         assert_eq!(m4.qmm_bn_crossover_tg, 96);
-        assert_eq!(m4.qmm_min_batch, m1.qmm_min_batch);
         assert_eq!(m4.qmm_min_batch_moe, m1.qmm_min_batch_moe);
 
         let m2 = DeviceTuning::of(DeviceInfo::of_name("Apple M2 Max"));
         assert_eq!(m2.qmm_min_batch_moe, 12);
-        assert_eq!(m2.qmm_min_batch, 8);
         assert_eq!(m2.qmm_bn_crossover_tg, m1.qmm_bn_crossover_tg);
+
+        // **THE DENSE CROSSOVER IS THE ONE FIELD ALL THREE NAME**, and the
+        // two older families name the value the DEFAULT used to carry. That
+        // is the module header's rule caught in the act: six is the M1 Max's
+        // own re-sweep of the widths between four and eight, and neither of
+        // the other machines has ever run one.
+        assert_eq!(m1.qmm_min_batch, 5);
+        assert_eq!(m2.qmm_min_batch, 8);
+        assert_eq!(m4.qmm_min_batch, 8);
     }
 
     #[test]
@@ -551,7 +677,7 @@ mod tests {
         assert!(t.fp16_gemm_format(4, 64));
         assert!(!t.fp16_gemm_format(4, 128));
         assert!(!t.fp16_gemm_format(8, 64));
-        assert_eq!(t.qmm_min_batch(false, true), 8);
+        assert_eq!(t.qmm_min_batch(false, true), 5);
         assert_eq!(t.qmm_min_batch(false, false), 12);
         assert_eq!(t.qmm_min_batch(true, false), 12);
     }

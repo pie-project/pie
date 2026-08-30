@@ -67,9 +67,9 @@
 //!
 //! # And what the batched ladder found
 //!
-//! First light's prompt is eight tokens, which is `qmm_min_batch` exactly, so
-//! it reaches `linear::quant`'s batched ladder at its narrowest rung and
-//! nowhere else — one row tile of one 16-row block, per projection. The three
+//! First light's prompt is eight tokens, two clear of `qmm_min_batch`, so it
+//! reaches `linear::quant`'s batched ladder at its narrowest rung and nowhere
+//! else — one row tile of one 16-row block, per projection. The three
 //! tests after the first two carry prompts chosen for their ROW COUNTS rather
 //! than their words, and between them they fire every rung and every arm that
 //! ladder has: the pre-cast pair at all three row blocks, the split-K pair and
@@ -165,17 +165,17 @@ const STEPS: usize = 8;
 
 /// **THE PADDED PREFILL, AND WHY THE ROW COUNT IS THE POINT.**
 ///
-/// [`PROMPT`] encodes to eight tokens, which is `qmm_min_batch` exactly — so
-/// the first-light prompt does reach the batched ladder, and reaches only its
-/// narrowest step of it: `bm_rung` answers 16, `mb_rows` pads 8 up to 16, and
-/// every projection in the stack launches ONE row tile holding ONE row block,
-/// half of whose rows the fire did not write. Everything the ladder does
-/// above that — a second row tile, the wider rungs, the column tile the
-/// second tile selects — had never been fired against a checkpoint.
+/// [`PROMPT`] encodes to eight tokens, over `qmm_min_batch` — so the
+/// first-light prompt does reach the batched ladder, and since the 8 rung
+/// landed it sits exactly on the narrowest step: `bm_rung` answers 8,
+/// `mb_rows` pads nothing, and every projection launches ONE row tile whose
+/// every row the fire wrote. Everything the ladder does above that — a
+/// second row tile, the wider rungs, the column tile the second tile
+/// selects — is what the wider prompts below exist for.
 ///
-/// Twenty tokens is the same rung with the pad and the tiling doing real
-/// work: `bm_rung` still answers 16, `mb_rows` pads to 32, and the launch is
-/// TWO row tiles of which twelve rows hold nothing.
+/// Twenty tokens is where the pad and the tiling do real work: `bm_rung`
+/// answers 16, `mb_rows` pads 20 up to 32, and the launch is TWO row tiles
+/// of which twelve rows hold nothing.
 const PADDED_PROMPT: &str = "1, 2, 3, 4, 5, 6, 7,";
 
 /// The rows [`PADDED_PROMPT`] encodes to.

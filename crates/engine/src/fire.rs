@@ -740,19 +740,177 @@ pub struct Attachment {
     pub at: Boundary,
 }
 
+/// **ONE LANE'S MEDIA SPANS, AS THE SUBMISSION CARRIES THEM** (media-door §6).
+///
+/// **A PARALLEL SLICE KEYED BY LANE, WHICH IS [`Attachment`]'S PRECEDENT AND
+/// NOT A NEW IDEA.** A guest attachment is a property of one lane that most
+/// lanes do not have, so it rides beside the lanes rather than as a field on
+/// every [`Lane`]; media is exactly the same shape of fact, and a text-only
+/// submission constructs nothing, assembles no vector and stages no byte.
+///
+/// It is `runtime::pipeline::media::LaneMedia` field for field, and that is
+/// deliberate: MD-A derives every one of these numbers from the run scan, so
+/// the contract is where they are STATED and not where they are computed.
+/// Below it, `engine_cuda::serve::Media` borrows straight out of this record —
+/// the same fields, borrowed rather than owned — so the marshal at an engine's
+/// submit is a borrow and one conversion, and no arithmetic of its own.
+///
+/// # `patches` is `f32`, and the conversion is the ENGINE's
+///
+/// The payload a front-end computes is real-valued; the element a plan
+/// computes in is the plan's — `bf16` for every tower in this catalog, and a
+/// fact no party above the load knows. So the contract carries the numbers and
+/// the engine converts them at the marshal, where `PatchSeat::dtype` is a
+/// value it can read. A submission stated in bytes would have had to guess it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StepMedia {
+    /// Which lane of THIS STEP the spans belong to. A submission states its
+    /// own lane numbering and the batcher rebases it, exactly as it rebases
+    /// [`Attachment::lane`].
+    pub lane: u32,
+    /// How many payload rows each span contributes, in submission order. Its
+    /// length is the lane's span count and its sum is its payload row count.
+    pub rows: Vec<u32>,
+    /// The payload rows themselves, concatenated over this lane's spans:
+    /// `rows.iter().sum()` rows of the plan's declared patch width, in the
+    /// order the front-end laid them (merge- or pool-block-major, by statute).
+    pub patches: Vec<f32>,
+    /// Where each payload row's tower output lands in the TOKEN rectangle —
+    /// one entry per payload row, as an offset into THIS LANE's token rows.
+    ///
+    /// **LANE-RELATIVE, AND REBASED BY THE ENGINE.** A submission cannot know
+    /// the seriated fire it will land in, so a route says "my seventh token
+    /// row" and the shell adds the lane's own row offset. `-1` is the
+    /// fold-space tail — a merge that folds four payload rows into one token
+    /// spends the surplus on rows that go nowhere — and an engine admits it
+    /// only for a plan that declares an op honouring it.
+    pub routes: Vec<i32>,
+    /// **THE TOWER'S ROTATION STREAM**: three `i32` per payload row — each
+    /// row's own `(t, h, w)` in its span's grid, in [`patches`](StepMedia::patches)'
+    /// own order.
+    ///
+    /// **NOT REBASED, AND THAT IS THE DIFFERENCE FROM `routes`.** A route
+    /// names a token row, which only the seriated fire knows the number of; a
+    /// grid coordinate is a property of the span and means the same thing in
+    /// every fire it lands in.
+    pub positions: Vec<i32>,
+    /// **WHICH ROWS OF THE LEARNED POSITION TABLE EACH ROW GATHERS**: `taps`
+    /// entries per payload row, in `patches`' own order. Both this and
+    /// [`embed_weights`](StepMedia::embed_weights) are EMPTY on the native
+    /// grid — the cheap path, where the plan declares no resampling and
+    /// nothing is staged. `taps` is the PLAN's, so the engine is what checks
+    /// the length.
+    pub embed_rows: Vec<i32>,
+    /// Beside [`embed_rows`](StepMedia::embed_rows), same length.
+    pub embed_weights: Vec<f32>,
+    /// **THE TRUNK'S ROTATION STREAM FOR THIS LANE**: three `i32` per TOKEN
+    /// row of the lane.
+    ///
+    /// **EMPTY IS LEGAL AND MEANS SCALAR `(p, p, p)`**, which is what every
+    /// lane under 1-D RoPE writes and what an engine fills for every lane that
+    /// submitted nothing at all. A lane under M-RoPE owes one triple per token
+    /// row.
+    pub token_positions: Vec<i32>,
+}
+
+impl StepMedia {
+    /// How many payload rows this lane's spans contribute in total.
+    #[must_use]
+    pub fn payload_rows(&self) -> u32 {
+        self.rows.iter().copied().fold(0u32, u32::saturating_add)
+    }
+
+    /// **THE PARTS A CONTRACT CAN CHECK, AND NOT ONE MORE.**
+    ///
+    /// Every length here is a function of `rows` alone. The two that are NOT
+    /// — the payload's width (`C·T·P²`) and the position table's tap count —
+    /// are the PLAN's numbers, read off a trace an engine holds and this
+    /// crate does not, so they are refused at the shell by name
+    /// (`Fault::PatchPayload`) and stating a second opinion here would be a
+    /// check that could disagree with the one that matters.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] with the first thing that is wrong.
+    pub fn validate(&self, lane_rows: u32) -> Result<()> {
+        let rows = self.payload_rows();
+        if self.rows.is_empty() {
+            return Err(Error::Invalid(format!(
+                "lane {} carries a media row naming no spans; a lane with no span \
+                 constructs no media row at all",
+                self.lane
+            )));
+        }
+        if rows == 0 {
+            return Err(Error::Invalid(format!(
+                "lane {}'s spans occupy no payload rows, and a span the tower reads \
+                 nothing of has nothing to scatter",
+                self.lane
+            )));
+        }
+        for (what, have, owed) in [
+            ("routes", self.routes.len(), rows as usize),
+            ("grid positions", self.positions.len(), 3 * rows as usize),
+        ] {
+            if have != owed {
+                return Err(Error::Invalid(format!(
+                    "lane {}'s media carries {have} {what} for {rows} payload rows, \
+                     and {owed} are owed",
+                    self.lane
+                )));
+            }
+        }
+        if self.embed_rows.len() != self.embed_weights.len() {
+            return Err(Error::Invalid(format!(
+                "lane {}'s media carries {} position-table rows and {} weights; the \
+                 two streams are read together and are the same length or both empty",
+                self.lane,
+                self.embed_rows.len(),
+                self.embed_weights.len()
+            )));
+        }
+        // Empty is the scalar-rope answer; anything else is one triple per
+        // token row of the lane it names.
+        if !self.token_positions.is_empty()
+            && self.token_positions.len() != 3 * lane_rows as usize
+        {
+            return Err(Error::Invalid(format!(
+                "lane {}'s trunk rotation stream carries {} entries for {lane_rows} \
+                 token rows; it is empty (scalar `(p, p, p)`) or three per row",
+                self.lane,
+                self.token_positions.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// **One forward pass over the assembled batch — one STEP of a frame.**
 ///
 /// This is what `FireSubmission` was, under the name the execution plane gives
 /// it (alto design §2). A frame is 1..=k of these, sealed in order; the
 /// degenerate one-step frame is exactly the fire that used to be the contract's
 /// unit of work.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// **`Eq` CAME OFF WHEN THE MEDIA ROWS WENT ON.** A payload row is real-valued
+/// and `f32` is not `Eq`; the derive was never load-bearing (nothing in the
+/// tree keyed a `Step`), and `PartialEq` — which every test that compares two
+/// submissions actually uses — survives.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     /// The requests in this fire, in submission order. Answers come back in
     /// the same order, whatever order the fire ran them in.
     pub lanes: Vec<Lane>,
     /// The guest programs attached at this fire's boundaries.
     pub attachments: Vec<Attachment>,
+    /// **THE MEDIA SPANS THIS FIRE'S LANES SUBMITTED** (media-door §6), keyed
+    /// by lane and empty for every text-only fire — which is every fire in
+    /// this tree before the media door was cut.
+    ///
+    /// A `Vec` that a text-only submission never allocates is the whole point
+    /// of the shape: `Step::default()` is the struct it always was, and the
+    /// engines that refuse media refuse it by looking at one `is_empty`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<StepMedia>,
 }
 
 impl Step {
@@ -814,6 +972,28 @@ impl Step {
                 )));
             }
         }
+        // **AND THE MEDIA ROWS, ON THE ATTACHMENTS' OWN TERMS** (media-door
+        // §6). The same two batch-wide questions an attachment answers — does
+        // the lane it names exist, and is one lane named twice — plus the
+        // lengths [`StepMedia::validate`] can settle from `rows` alone. A lane
+        // handed two media rows is two concatenations with two payload orders
+        // for one rectangle, which is not a submission any engine can seriate.
+        for (index, media) in self.media.iter().enumerate() {
+            let Some(lane) = self.lanes.get(media.lane as usize) else {
+                return Err(Error::Invalid(format!(
+                    "media row {index} names lane {} of the {lanes} this fire has",
+                    media.lane
+                )));
+            };
+            if self.media[..index].iter().any(|earlier| earlier.lane == media.lane) {
+                return Err(Error::Invalid(format!(
+                    "lane {} carries two media rows, at media row {index}; a lane's \
+                     spans are one concatenation with one payload order",
+                    media.lane
+                )));
+            }
+            media.validate(lane.rows())?;
+        }
         Ok(())
     }
 }
@@ -842,7 +1022,7 @@ impl Step {
 /// frame's steps back to back, synchronously, and a k-step frame costs exactly
 /// what k fires cost. What changed is that the seam where the saturation goes
 /// now exists and the runtime speaks through it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FrameSubmission {
     /// The steps, in the order the device runs them. At least one.
     pub steps: Vec<Step>,

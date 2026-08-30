@@ -37,35 +37,13 @@
 //!    from the plan.
 
 use model_compiler::{
-    CompiledModel, Budget, DeviceProfile, Lowering, Phase, Region, collectives_are_never_elided, compile,
+    CompiledModel, DeviceProfile, Lowering, Phase, Region, collectives_are_never_elided,
 };
 use model_dsl::Platform;
+
+mod common;
+use common::{PLATFORMS, bake_with, states_patches};
 use model_ir::Trace;
-
-const PLATFORMS: [Platform; 4] = [
-    Platform::Cuda,
-    Platform::Metal,
-    Platform::Wgpu,
-    Platform::Vulkan,
-];
-
-fn budgets_for(trace: &Trace) -> Budget {
-    let seats = trace
-        .params
-        .iter()
-        .filter(|param| param.source == model_ir::ParamSource::Registered)
-        .map(|param| param.shape.first().copied().unwrap_or(0))
-        .min()
-        .unwrap_or(0);
-    Budget {
-        max_lanes: 256,
-        max_tokens: 8192,
-        buckets: vec![
-            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
-        ],
-        max_adapters: u32::try_from(seats).unwrap_or(u32::MAX),
-    }
-}
 
 /// A profile that takes everything a windowed region offers: no fatness floor
 /// and an evaluation point cheaper than one launch.
@@ -123,9 +101,8 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let budget = budgets_for(&trace);
             for profile in [DeviceProfile::default(), forced()] {
-                let Ok(compiled) = compile(&trace, &budget, &profile) else {
+                let Ok(compiled) = bake_with(&trace, &profile) else {
                     continue; // `every_sku_carves_an_arena` is what says so.
                 };
                 for at in 0..compiled.regions.len() {
@@ -187,14 +164,13 @@ fn turning_conditionals_on_moves_one_field_and_nothing_else() {
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let budget = budgets_for(&trace);
             let off = DeviceProfile {
                 fat_region_us: f32::INFINITY,
                 ..forced()
             };
             let (Ok(with), Ok(without)) = (
-                compile(&trace, &budget, &forced()),
-                compile(&trace, &budget, &off),
+                bake_with(&trace, &forced()),
+                bake_with(&trace, &off),
             ) else {
                 continue;
             };
@@ -239,8 +215,7 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
 
     for (sku, _, trace, _) in model::catalog() {
         let trace = trace(Platform::Cuda);
-        let budget = budgets_for(&trace);
-        let Ok(compiled) = compile(&trace, &budget, &profile) else {
+        let Ok(compiled) = bake_with(&trace, &profile) else {
             continue;
         };
         let classes = compiled.classes.classes.len();
@@ -277,7 +252,7 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
             "`{sku}`: P3's answer is not the gates' answer",
         );
 
-        let forced_on = compile(&trace, &budget, &forced()).expect("bakes");
+        let forced_on = bake_with(&trace, &forced()).expect("bakes");
         let would = forced_on
             .regions
             .iter()
@@ -294,29 +269,67 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
     }
 
     println!("{}", report.join("\n"));
-    // **TWO, AND BOTH OF THEM ARE A DRAFT HEAD.** qwen36-27b's plan ends in a
-    // whole extra decoder layer plus its own `lm_head` — 26 nodes and 576 µs,
-    // guarded on the multi-token-prediction fact — and
-    // `qwen35-d0.8b-eagle`'s ends in the same shape at 23 nodes and 564 µs,
-    // which is the overlaid EAGLE head the M-4 wave imported. They are the only
-    // regions in the whole catalog on either side of both gates, and they are
-    // exactly the shape design §8's "prefix-tuning / structural PEFT ->
-    // IF/SWITCH" row predicts. Every other guarded region in every other text
-    // is one to seven operators.
+    // **NINE, AND EVERY ONE OF THEM IS A DRAFT HEAD OR A VISION TOWER.**
     //
-    // **THE SECOND ONE ARRIVED WITH A ROW AND NOT WITH A THRESHOLD**, which is
-    // the count doing its job: `qwen35-d0.8b-eagle-bf16-kv-bf16` joined the
-    // catalog in the M-4 wave and brought a structural arm with it. Nothing
-    // about the gates moved — the plain `qwen35-d0.8b` row beside it still
-    // reports a 184 µs fattest against the same 250 µs floor and still chooses
-    // nothing.
+    // A draft head is a whole extra decoder layer plus its own `lm_head`,
+    // guarded on the multi-token-prediction fact: qwen36-27b's is 26 nodes and
+    // 576 µs, `qwen35-d0.8b-eagle`'s the overlaid EAGLE head the M-4 wave
+    // imported at 23 nodes and 564 µs, and `gemma4-e4b-eagle`'s the same shape
+    // again at 26 and 560. They are exactly the shape design §8's
+    // "prefix-tuning / structural PEFT -> IF/SWITCH" row predicts. Five rows
+    // carry one.
+    //
+    // A TOWER IS THE OTHER KIND AND MUCH THE FATTER — 203 nodes and 3788 µs on
+    // the 0.8b rows, 443 and 8288 on the 27b, 534 and 7712 on gemma — guarded
+    // on `Facts::media`, so a fire whose lanes carry no image skips it rather
+    // than launching it over an empty window. That is the whole reason the
+    // media fact exists, and it is the same "structural, deliberate, rare" the
+    // draft heads are. Four rows carry one. Every other guarded region in
+    // every other text is one to seven operators and reports a fattest under
+    // the 250 µs floor.
+    //
+    // **THE COUNT KEEPS ARRIVING WITH A ROW AND NOT WITH A THRESHOLD**, which
+    // is it doing its job. Two arrived together this time and both are gemma's:
+    // `2617762b8` gave `gemma4-e4b` an aux head and `4cc9096b5` declared its
+    // tower, so the family that had neither axis now has one of each. Nothing
+    // about the gates moved — the plain `qwen35-d0.8b` beside them still
+    // reports 184 µs against the same floor and still chooses nothing.
     //
     // A COUNT AND NOT A PREDICATE, DELIBERATELY, AND ONLY THIS ONE: the tests
     // above pin the rule, and this pins the catalog's own answer to it so that
-    // a text which gains or loses a structural axis has to say so here.
+    // a text which gains or loses a structural axis has to say so here. The
+    // towers were invisible to it until this file learned to derive a patch
+    // ladder — a tower row refused the bake and the sweep swept past it — so
+    // the count once read two while the catalog already held seven.
+    //
+    // THE COUNT AND THE RULE, SEPARATELY, AND THE SPLIT HAS NOW EARNED ITSELF.
+    // A bare total says a text moved and not which way; the derived sum beside
+    // it says whether what moved obeyed the rule. At seven-becoming-nine the
+    // rule assert passed and only the census moved, which is exactly how a
+    // reader is meant to learn "two rows joined the catalog" rather than "the
+    // lowering changed its mind". A conditional region that is neither a draft
+    // head nor a tower trips the rule instead, and sends them to the pass.
+
+    let derived: usize = model::catalog()
+        .into_iter()
+        .map(|(_, _, trace, _)| {
+            let trace = trace(Platform::Cuda);
+            usize::from(trace.seams.iter().any(|seam| seam.seam == "mtp"))
+                + usize::from(states_patches(&trace))
+        })
+        .sum();
     assert_eq!(
-        chosen, 2,
+        chosen, derived,
+        "the catalog chose {chosen} conditional regions and states {derived} \
+         structural arms — one of them is neither a draft head nor a tower, or \
+         one of them was declined; the report above says which text",
+    );
+    assert_eq!(
+        chosen, 9,
         "the catalog's conditional count moved — one text gained or lost a \
-         structural arm, and the report above says which",
+         structural arm, and the report above says which. The rule assert just \
+         above this one passed, so every arm counted IS a draft head or a \
+         tower: this is a catalog that grew, not a lowering that changed its \
+         mind, and the fix is to re-read the report and move the number",
     );
 }

@@ -187,6 +187,11 @@ image = { version = "0.25", default-features = false, features = [
     "gif",
 ] }
 blake3 = "1.8.5"
+# The media door's front-end contract (.wiki/alto/media-door.md §4): the trait
+# `image.from-bytes` dispatches to on `ROWS.arch`, and the `EncodedSpan` the
+# submission carries toward the contract. The runtime names the seam; the
+# per-architecture preprocessing behind it names nothing here.
+media-frontend = { path = "../media-frontend" }
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"
 wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }

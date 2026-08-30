@@ -239,6 +239,7 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
             readout: Readout::Last,
         }],
         attachments: Vec::new(),
+        media: Vec::new(),
     };
     submission
         .validate()

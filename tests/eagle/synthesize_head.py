@@ -32,8 +32,18 @@ Writes the twelve tensors `model::qwen_3`'s `Recipe::Eagle` binds, in the
 family's OWN block spelling, so that `pie model import <base> --aux <this>`
 prefixes them to `aux.*` and the text finds them there.
 
+**TWO FAMILIES, ONE CONSTRUCTION.** qwen35 was the first rig and gemma4 is
+where the identity gate can actually close (multimodal §17: qwen35 is a
+HYBRID, and a rejected draft row folds into a gated-delta state no mask can
+cut; gemma attends and does not recur). The derivation is the same sentence in
+both — zero-and-identity fusion, then a copy of a full-attention layer — and
+what differs is which layer is full-attention and what its tensors are called.
+
 Usage:
     python tests/eagle/synthesize_head.py <base-snapshot-dir> <out.safetensors>
+                                          [--family qwen35|gemma4]
+
+The family is inferred from the snapshot's own tensor names when not stated.
 """
 
 import json
@@ -128,11 +138,98 @@ def write_safetensors(path: Path, tensors: dict[str, np.ndarray]) -> None:
             fh.write(blob)
 
 
+#: gemma-4-E4B's own numbers, off `text_config`. The donor must be a layer
+#: that is BOTH full-attention (`l % 6 == 5`) and owns its banks (below the
+#: 18-layer shared tail, so `l < 24`): 23 is the last such layer.
+GEMMA = {
+    "hidden": 2560,
+    "q_w": 8 * 512,
+    "kv_w": 2 * 512,
+    "head_dim": 512,
+    "inter": 10240,
+    "donor": 23,
+    "prefix": "model.language_model.layers.{l}",
+}
+
+
+def gemma_head(table) -> dict[str, np.ndarray]:
+    """The same construction as qwen's, in gemma's four-norm block spelling."""
+    layer = GEMMA["prefix"].format(l=GEMMA["donor"])
+    h = GEMMA["hidden"]
+
+    def donor(suffix: str, want: tuple) -> np.ndarray:
+        array = load(table, f"{layer}.{suffix}")
+        if tuple(array.shape) != want:
+            raise SystemExit(
+                f"`{layer}.{suffix}` is {tuple(array.shape)} and this rig expects {want}; "
+                "the donor is not the full-attention layer it was read for"
+            )
+        return array
+
+    return {
+        # `[fc_embed | fc_hidden]` = `[0 | I]`, so the block below reads the
+        # trunk's own final-normed hidden and nothing of the embedding. The
+        # text slices this bank at column `hidden`, embedding half first.
+        "fc.weight": np.concatenate(
+            [bf16_zeros((h, h)), bf16_identity(h)], axis=1
+        ),
+        "layers.0.input_layernorm.weight": donor("input_layernorm.weight", (h,)),
+        "layers.0.post_attention_layernorm.weight": donor(
+            "post_attention_layernorm.weight", (h,)
+        ),
+        "layers.0.pre_feedforward_layernorm.weight": donor(
+            "pre_feedforward_layernorm.weight", (h,)
+        ),
+        "layers.0.post_feedforward_layernorm.weight": donor(
+            "post_feedforward_layernorm.weight", (h,)
+        ),
+        "layers.0.self_attn.q_proj.weight": donor(
+            "self_attn.q_proj.weight", (GEMMA["q_w"], h)
+        ),
+        "layers.0.self_attn.k_proj.weight": donor(
+            "self_attn.k_proj.weight", (GEMMA["kv_w"], h)
+        ),
+        "layers.0.self_attn.v_proj.weight": donor(
+            "self_attn.v_proj.weight", (GEMMA["kv_w"], h)
+        ),
+        "layers.0.self_attn.o_proj.weight": donor(
+            "self_attn.o_proj.weight", (h, GEMMA["q_w"])
+        ),
+        "layers.0.self_attn.q_norm.weight": donor(
+            "self_attn.q_norm.weight", (GEMMA["head_dim"],)
+        ),
+        "layers.0.self_attn.k_norm.weight": donor(
+            "self_attn.k_norm.weight", (GEMMA["head_dim"],)
+        ),
+        "layers.0.mlp.gate_proj.weight": donor("mlp.gate_proj.weight", (GEMMA["inter"], h)),
+        "layers.0.mlp.up_proj.weight": donor("mlp.up_proj.weight", (GEMMA["inter"], h)),
+        "layers.0.mlp.down_proj.weight": donor("mlp.down_proj.weight", (h, GEMMA["inter"])),
+    }
+
+
 def main() -> None:
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 5):
         raise SystemExit(__doc__)
     snapshot, out = Path(sys.argv[1]), Path(sys.argv[2])
     table = read_index(snapshot)
+    family = None
+    if len(sys.argv) == 5 and sys.argv[3] == "--family":
+        family = sys.argv[4]
+    if family is None:
+        # The snapshot names itself: gemma publishes a vision tower under
+        # `model.vision_tower.*` and qwen under `model.visual.*`.
+        family = "gemma4" if any("vision_tower" in k for k in table) else "qwen35"
+    if family not in ("qwen35", "gemma4"):
+        raise SystemExit(f"unknown family {family!r}")
+
+    if family == "gemma4":
+        tensors = gemma_head(table)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_safetensors(out, tensors)
+        total = sum(t.size * 2 for t in tensors.values())
+        print(f"wrote {len(tensors)} gemma4 tensors, {total / 1024 / 1024:.1f} MiB -> {out}")
+        return
+
     layer = f"model.language_model.layers.{DONOR_LAYER}"
 
     def donor(suffix: str, want: tuple) -> np.ndarray:

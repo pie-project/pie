@@ -46,10 +46,11 @@ const PLATFORMS: [Platform; 4] = [
 
 /// The rows that declare a tower. Named rather than sniffed, so a row that
 /// stopped declaring one fails here instead of quietly leaving the sweep.
-const TOWERED: [&str; 3] = [
+const TOWERED: [&str; 4] = [
     "qwen35-d0.8b-vision-bf16-kv-bf16",
     "qwen35-d0.8b-vision-eagle-bf16-kv-bf16",
     "qwen36-27b-vision-bf16-kv-bf16",
+    "gemma4-e4b-vision-bf16-kv-bf16",
 ];
 
 fn budget(trace: &model_dsl::Trace) -> Budget {

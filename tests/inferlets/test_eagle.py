@@ -34,7 +34,21 @@ head, and gating on it would make this file a quality measurement of an
 artifact the campaign explicitly says is not the deliverable (§3: "a REAL EAGLE
 head is out; M-4 gates the mechanism with a synthetic head").
 
-**THIS FILE NEEDS THE EAGLE ARTIFACT**, not the plain one — a base checkpoint
+**TWO RIGS, AND WHICH CLAIMS EACH CAN MAKE** (multimodal §17, §14).
+
+  `gemma4-e4b-eagle`   pure attention. Every claim below is asked and must
+                       pass: gemma attends and does not recur, so a rejected
+                       draft row leaves nothing behind but a kv cell the next
+                       fire overwrites, which is the whole contract
+                       speculation rests on.
+  `qwen35-d0.8b-eagle` a HYBRID. Its gated-delta layers carry a recurrent
+                       state that a rejected draft row FOLDS INTO, and no mask
+                       cuts a fold. Claims 1 and 2 pass there; the width and
+                       identity claims do not, and that is a property of the
+                       text and not of this loop. Run it there to reproduce
+                       §14's isolation, not to expect green.
+
+**THIS FILE NEEDS AN EAGLE ARTIFACT**, not the plain one — a base checkpoint
 with the head overlaid by `pie model import <base> --aux <head>`. Against a
 plain artifact the load has no draft head, `mtp_logits` is not advertised, and
 the run refuses at bind. Run it the way the other standalone gates are run,
@@ -272,4 +286,8 @@ if __name__ == "__main__":
     # the capability is exactly "does this load's text declare a draft head".
     # Against the overlay artifact it is true; against a plain one the suite
     # refuses at bind, which is the honest failure and not a skip.
-    run_tests(tests(), description="M-4 EAGLE mechanism (needs the --aux overlay artifact)")
+    run_tests(
+        tests(),
+        description="M-4 EAGLE mechanism (needs an --aux overlay artifact; "
+        "green on the pure-attention rig, see the header for the hybrid)",
+    )

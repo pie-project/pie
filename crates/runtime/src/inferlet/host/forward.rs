@@ -531,6 +531,53 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
+    /// **THE PAYLOAD BESIDE THE LEDGER** (media-door.md §0/§3).
+    ///
+    /// The spans are read out of the resource table and cloned by handle — an
+    /// `Arc` each, so a decoded image submitted to two passes is decoded once
+    /// and its patches copied never. Nothing about WHERE they sit in the
+    /// sequence is recorded, because nothing about that is the guest's to
+    /// state: the runs are SCANNED out of the submitted tokens at submit
+    /// (`pipeline::media::scan`), when both the tokens and the spans are
+    /// final, and every disagreement is refused there by name.
+    ///
+    /// Attaching twice is a re-statement of the same fact and is refused for
+    /// `embed`'s reason: two lists in submission order are two orders.
+    async fn core_media(
+        &mut self,
+        this: Resource<ForwardPass>,
+        spans: Vec<pie::inferlet::forward::MediaSpan>,
+    ) -> Anyhow<Result<(), String>> {
+        use pie::inferlet::forward::MediaSpan;
+        let mut attached = Vec::with_capacity(spans.len());
+        for span in &spans {
+            let encoded = match span {
+                MediaSpan::Image(image) => {
+                    let handle: Resource<crate::inferlet::host::media::Image> =
+                        Resource::new_borrow(image.rep());
+                    std::sync::Arc::clone(&self.ctx().table.get(&handle)?.span)
+                }
+                MediaSpan::Audio(audio) => {
+                    let handle: Resource<crate::inferlet::host::media::Audio> =
+                        Resource::new_borrow(audio.rep());
+                    std::sync::Arc::clone(&self.ctx().table.get(&handle)?.span)
+                }
+            };
+            attached.push(encoded);
+        }
+        let pass = self.ctx().table.get_mut(&this)?;
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
+        }
+        if !pass.bindings.media.is_empty() {
+            return Ok(Err(
+                "forward pass media spans are already attached".to_string()
+            ));
+        }
+        pass.bindings.media = attached;
+        Ok(Ok(()))
+    }
+
     async fn core_program(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1386,6 +1433,18 @@ impl pie::inferlet::forward::Host for ProcessCtx {
 
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward, PassKind::Attention);
+
+    /// **THE ATTENTION INTERFACE ALONE CARRIES THE VERB**, for now
+    /// (media-door.md §2): hybrid and recurrent get the same one when a tower
+    /// family needs them, and adding it there before then would be a surface
+    /// with nothing behind it in two more places.
+    async fn media(
+        &mut self,
+        this: Resource<ForwardPass>,
+        spans: Vec<pie::inferlet::forward::MediaSpan>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_media(this, spans).await
+    }
 
     async fn attention(
         &mut self,

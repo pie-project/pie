@@ -5062,6 +5062,7 @@ mod tests {
                         submission: crate::engine::Step {
                             lanes: vec![crate::engine::Lane::decode(0, 0, 1, 0)],
                             attachments: Vec::new(),
+                            media: Vec::new(),
                         },
                         terminal_cells: Vec::new(),
                         instances: vec![0],
@@ -5170,6 +5171,7 @@ mod tests {
                     submission: crate::engine::Step {
                         lanes: vec![crate::engine::Lane::decode(0, 0, 1, 0)],
                         attachments: Vec::new(),
+                        media: Vec::new(),
                     },
                     terminal_cells: Vec::new(),
                     instances: vec![0],
@@ -5287,6 +5289,7 @@ mod tests {
                         submission: crate::engine::Step {
                             lanes: vec![crate::engine::Lane::decode(0, word, 1, 0)],
                             attachments: Vec::new(),
+                            media: Vec::new(),
                         },
                         terminal_cells: Vec::new(),
                         instances: vec![0],
