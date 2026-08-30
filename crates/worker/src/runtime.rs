@@ -359,14 +359,15 @@ pub fn build_runtime(user_cfg: &config::Config) -> Result<tokio::runtime::Runtim
         .context("building tokio runtime")
 }
 
-/// Create native engines, bootstrap the runtime, and return the registration
-/// caps plus the runtime handle. Shared by every server entry point.
+/// Create native engines, bootstrap the runtime, and return the engine's
+/// capability record plus the runtime handle. Shared by every server entry
+/// point.
 struct LoadedModelEngines {
     model: String,
     caps: EngineCapabilities,
     full_identity: crate::executor::ModelIdentity,
     encode_identity: crate::executor::ModelIdentity,
-    kv_handle: Option<engine_api::KvHandle>,
+    kv_handle: Option<engine::KvHandle>,
     engines: ModelEngines,
     /// The model's compiled metadata, read once while resolving it. Present
     /// for either input form: an artifact carries the config, a snapshot's
@@ -377,7 +378,7 @@ struct LoadedModelEngines {
 struct LoadedPartnerMetadata {
     full_identity: crate::executor::ModelIdentity,
     encode_identity: crate::executor::ModelIdentity,
-    kv_handle: Option<engine_api::KvHandle>,
+    kv_handle: Option<engine::KvHandle>,
     page_size: u32,
     supports_media_encode: bool,
     hidden_size: u32,
@@ -414,7 +415,7 @@ fn model_identity(
     hasher.update(&caps.profile.vocab.to_le_bytes());
     hasher.update(&caps.profile.num_layers.to_le_bytes());
     hasher.update(&caps.limits.max_context.to_le_bytes());
-    hasher.update(caps.profile.activation.name().as_bytes());
+    hasher.update(caps.profile.activation_name().as_bytes());
     hasher.update(&caps.pools.kv_page_size.to_le_bytes());
     hasher.update(format!("{:?}", user_cfg.model.engine.kind).as_bytes());
     hasher.update(user_cfg.model.engine.activation_dtype.as_bytes());
@@ -450,7 +451,7 @@ fn model_identity(
 /// The loader answers what identifies a checkpoint; this only folds its answer
 /// into the 32-byte shape the identity plumbing expects.
 fn manifest_digest(path: &Path) -> Result<Option<[u8; 32]>> {
-    let identity = model_loader::checkpoint::zt::artifact_identity(path)
+    let identity = checkpoint::file::zt::artifact_identity(path)
         .map_err(|err| anyhow!("reading the identity of {path:?}: {err}"))?;
     Ok(identity.map(|bytes| *blake3::hash(&bytes).as_bytes()))
 }
@@ -684,7 +685,6 @@ async fn boot_engine(
     user_cfg: &config::Config,
 ) -> Result<(
     String,
-    EngineCapabilities,
     LoadedPartnerMetadata,
     ::runtime::bootstrap::BootstrapHandle,
 )> {
@@ -723,7 +723,6 @@ async fn boot_engine(
     let hidden_size = metadata_hidden_size;
     Ok((
         model,
-        caps,
         LoadedPartnerMetadata {
             full_identity,
             encode_identity,
@@ -782,7 +781,6 @@ async fn boot_executor(
             role,
             model: loaded.model,
             addr: server.endpoint().to_string(),
-            capability: loaded.caps,
         },
     )
     .await
@@ -821,10 +819,10 @@ pub async fn start_runtime(
     user_cfg: config::Config,
     coordinator: Coordinator,
 ) -> Result<RuntimeHandle> {
-    let (model, caps, partner_metadata, runtime) = boot_engine(&user_cfg).await?;
+    let (model, partner_metadata, runtime) = boot_engine(&user_cfg).await?;
     let partner_bootstrap = build_partner_bootstrap(&user_cfg, partner_metadata, runtime.model_idx);
     let (edge_server, control_tasks, control_plane, partners, url) =
-        assemble_control_and_edge(coordinator, &user_cfg, model, caps, partner_bootstrap).await?;
+        assemble_control_and_edge(coordinator, &user_cfg, model, partner_bootstrap).await?;
     log_serving(&user_cfg, &url);
     Ok(RuntimeHandle {
         url,
@@ -846,7 +844,7 @@ pub async fn start_runtime_embedded<C: ControlLink>(
     gateways: Vec<String>,
     client_edge: Option<String>,
 ) -> Result<RuntimeHandle> {
-    let (model, caps, partner_metadata, runtime) = boot_engine(&user_cfg).await?;
+    let (model, partner_metadata, runtime) = boot_engine(&user_cfg).await?;
     let partner_bootstrap = build_partner_bootstrap(&user_cfg, partner_metadata, runtime.model_idx);
     let addr = topology::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
     // A single-node-monolithic worker serves all stages; routing doesn't filter
@@ -857,7 +855,6 @@ pub async fn start_runtime_embedded<C: ControlLink>(
         Role::Decode,
         model,
         addr,
-        caps,
         partner_bootstrap,
     )
     .await?;
@@ -927,8 +924,7 @@ fn log_serving(cfg: &config::Config, url: &str) {
 }
 
 /// Build the client-facing edge server + control plane for the resolved
-/// topology, after the runtime is bootstrapped and engine capabilities are
-/// known. Returns the edge server, the worker's control-loop tasks, the live
+/// topology, after the runtime is bootstrapped. Returns the edge server, the worker's control-loop tasks, the live
 /// control-plane resources to hold for the server's lifetime, and the URL to
 /// advertise.
 ///
@@ -941,7 +937,6 @@ async fn assemble_control_and_edge(
     coordinator: Coordinator,
     user_cfg: &config::Config,
     model: String,
-    caps: EngineCapabilities,
     partner_bootstrap: Option<partner::PartnerBootstrap>,
 ) -> Result<(
     EdgeServer,
@@ -967,7 +962,6 @@ async fn assemble_control_and_edge(
                 role,
                 model,
                 coordinator.control_addr.clone(),
-                caps,
                 partner_bootstrap,
             )
             .await?;
@@ -985,9 +979,9 @@ async fn assemble_control_and_edge(
         }
         TopologyMode::SingleNode => {
             // Gateway-free local inference: the worker terminates client
-            // WebSockets itself and never registers, so the model name and
-            // capabilities have no controller to be registered with.
-            let _ = (model, caps, partner_bootstrap);
+            // WebSockets itself and never registers, so the model name has no
+            // controller to be registered with.
+            let _ = (model, partner_bootstrap);
             let listen = format!("{}:{}", user_cfg.server.host, user_cfg.server.port);
             let edge = EdgeServer::Standalone(
                 client_server::spawn(&listen)
@@ -1017,7 +1011,6 @@ async fn assemble_distributed<C: ControlLink>(
     role: Role,
     model: String,
     addr: String,
-    caps: EngineCapabilities,
     partner_bootstrap: Option<partner::PartnerBootstrap>,
 ) -> Result<(
     EdgeServer,
@@ -1025,12 +1018,7 @@ async fn assemble_distributed<C: ControlLink>(
     WorkerId,
     Option<std::sync::Arc<tokio::sync::Mutex<partner::PartnerLinkManager>>>,
 )> {
-    let info = WorkerInfo {
-        role,
-        model,
-        addr,
-        capability: caps,
-    };
+    let info = WorkerInfo { role, model, addr };
     let worker_id = ControlLink::register_worker(&control, info)
         .await
         .context("registering worker with controller")?;
@@ -1099,6 +1087,16 @@ fn create_engine_group(
                 component,
                 frames_in_flight,
                 &m.adapters,
+                // **THE OPERATOR'S TWO WEIGHT BUDGETS, CROSSING ONCE.**
+                // `[model] device_weight_budget` / `host_weight_budget`;
+                // both absent is uncapped, which is what every config
+                // written before them says.
+                m.residency(),
+                // **AND THE SECOND ROW AXIS'S TWO CEILINGS**, the same way:
+                // `[model] max_patches` / `max_images`, both absent meaning
+                // "derive one from the model text", which is what every config
+                // written before them says and what a vision SKU wants anyway.
+                m.patch_ceilings(),
             )
             .with_context(|| {
                 format!(
@@ -1131,6 +1129,8 @@ fn create_engine_group(
         component,
         frames_in_flight,
         &m.adapters,
+        m.residency(),
+        m.patch_ceilings(),
     )
     .with_context(|| format!("creating engine for model {:?} group {group_idx}", m.name,))
 }
@@ -1300,12 +1300,12 @@ mod tests {
 
     #[test]
     fn an_artifacts_identity_is_its_contents_and_survives_a_move() {
-        use model_loader::checkpoint::write::CheckpointWriter;
-        use model_loader::types::{DType, Encoding, TensorDecl, TensorId};
+        use checkpoint::file::write::Writer;
+        use checkpoint::types::{DType, Encoding, TensorDecl, TensorId};
 
         let dir = tempfile::tempdir().unwrap();
         let write = |path: &std::path::Path, bytes: &[u8]| {
-            let mut writer = CheckpointWriter::create(path, &Default::default()).unwrap();
+            let mut writer = Writer::create(path, &Default::default()).unwrap();
             writer
                 .add_tensor(
                     &TensorDecl {

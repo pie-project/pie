@@ -1,6 +1,6 @@
+use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
+use checkpoint::types::Encoding;
 use model_dsl::{Shard, Weight};
-use model_loader::contract::{Expr, ModelContract, TensorContract, TensorType};
-use model_loader::types::Encoding;
 
 use super::model::{Kda, Mixer, Mla, Mlp, Model};
 use crate::contract::{ModelError, copy, declare, fused};
@@ -354,8 +354,7 @@ fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, ModelError> {
         )));
     };
     let part = tensor.part("data").map_err(|why| illegible(&why))?;
-    let stored =
-        model_loader::checkpoint::encoding_of(&tensor, &part).map_err(|why| illegible(&why))?;
+    let stored = checkpoint::file::encoding_of(&tensor, &part).map_err(|why| illegible(&why))?;
     Ok(Expr::src(from).transmute(TensorType::new(
         vec![extent(channels), extent(kernel)],
         stored,

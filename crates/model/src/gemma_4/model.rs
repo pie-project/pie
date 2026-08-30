@@ -1,5 +1,5 @@
+use checkpoint::contract::ModelContract;
 use model_dsl::{Dtype, Weight};
-use model_loader::contract::ModelContract;
 
 pub struct Model {
     pub hidden: u32,
@@ -13,6 +13,11 @@ pub struct Model {
     /// names one of them and states nothing about it itself.
     pub sliding: Sliding,
     pub global: Global,
+
+    /// The adapter banks this family seats (palo design §8). Per layer, and
+    /// the same two numbers at every one of them: the correction is a
+    /// per-lane axis, not a per-layer one.
+    pub adapters: Adapters,
 
     pub kv: Dtype,
     pub softcap: Option<f32>,
@@ -40,6 +45,8 @@ pub struct PleLayer {
     pub scalar: Weight,
 }
 
+pub use crate::adapter::Adapters;
+
 pub struct Layer {
     pub attn: Attn,
     pub o_proj: Weight,
@@ -55,6 +62,64 @@ pub struct Layer {
     pub gate_up: Weight,
     pub inter: u32,
     pub down: Weight,
+
+    /// **THE PER-LAYER OUTPUT SCALAR, AND IT IS NOT A PLE FACT.**
+    ///
+    /// `mlx_lm/models/gemma4_text.py`'s decoder layer ends with two
+    /// statements, in this order and both unconditional on the second:
+    ///
+    /// ```python
+    /// if self.post_per_layer_input_norm is not None:   # the PLE relay
+    ///     h = residual + gate
+    /// if self.layer_scalar is not None:
+    ///     h = h * self.layer_scalar
+    /// ```
+    ///
+    /// The scalar multiplies whatever the layer produced, PLE or no PLE.
+    /// This text had it only under [`PleLayer::scalar`], where it is the last
+    /// term of the relay — which is right for `e4b`, and left `b31` with
+    /// nothing: sixty `layers.{l}.layer_scalar` planes in
+    /// `mlx-community/gemma-4-31b-it-4bit`, every one of them read by nobody.
+    ///
+    /// **THEY ARE NOT ONES.** Measured over all sixty: 0.0894 at layer 0,
+    /// 0.0654 at layer 1, 0.0364 at layer 59, and between 0.75 and 0.99
+    /// through the middle of the stack — a factor of twenty-seven between the
+    /// smallest and the largest. Dropping them is not a rounding difference,
+    /// it is a different model.
+    ///
+    /// `Some` exactly when this text declares no PLE, so the scalar is
+    /// claimed, imported and applied ONCE whichever stack it is in. A PLE
+    /// stack's stays where `e4b` already had it, and neither the `e4b`
+    /// contract nor its tensor names move.
+    pub scalar: Option<Weight>,
+
+    /// This layer's adapter bank, `[slots, rank, hidden]` and
+    /// `[slots, hidden, rank]` — the down and up planes of one correction site
+    /// (palo design §8, campaign A-6).
+    ///
+    /// **THE SITE IS THE ATTENTION SUBLAYER, AND IT IS THE SITE BECAUSE OF THE
+    /// COLLECTIVE.** Both ends are REPLICATED values: the input is this
+    /// layer's `attn_norm`ed residual and the output is `o_proj`'s result
+    /// AFTER `all_reduce`. A correction stated one statement earlier — on
+    /// `o_proj`'s own output per rank, which is what a checkpoint's `o_proj`
+    /// LoRA names — reads a rows-cut partial product and lands before the
+    /// reduce, so every rank would contribute the whole `ΔW·x` and the sum
+    /// would carry it `tp` times.
+    ///
+    /// AND BEFORE `post_attn_norm`, which is where a `o_proj` LoRA belongs:
+    /// this family normalizes the sublayer's OUTPUT before the residual add,
+    /// so a correction stated after that norm would be corrected-then-not
+    /// normalized — a different function of the same weights, and not the one
+    /// the adapter was trained as.
+    ///
+    /// **A SHARED-KV LAYER CARRIES ITS OWN BANK ANYWAY.** The tail layers of
+    /// e4b borrow another layer's kv row and publish only a `q_proj`, but the
+    /// correction site is not an attention bank — it is the sublayer's two
+    /// replicated ends, and those exist at every layer. A skipped bank there
+    /// would make a bound adapter mean something different in the tail than in
+    /// the trunk.
+    pub lora_a: Weight,
+    pub lora_b: Weight,
 }
 
 pub struct Attn {
@@ -180,7 +245,15 @@ impl Model {
                 shared_tail: None,
                 ple_dim: None,
                 softcap: Some(30.0),
-                window: 512,
+                // **`text_config.sliding_window`, READ OFF THE CHECKPOINT
+                // THAT SHIPS THE WEIGHTS.** `mlx-community/gemma-4-31b-it-4bit`
+                // says 1024 and this had said 512 — half of what the model was
+                // trained to look back over, which is a difference no prompt
+                // short enough to fit inside either number can notice, and
+                // every longer one does. `e4b` above keeps its own 512;
+                // the two stacks state their windows separately because they
+                // are separate models.
+                window: 1024,
                 norm_eps: 1e-6,
             },
         )
@@ -191,6 +264,10 @@ impl Model {
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
         );
+        // Everything this text declares that is NOT a matmul bank: the norms
+        // — of which this family has more per layer than any other here — and
+        // the per-layer-embedding scalar. See `crate::dense`.
+        let dense = crate::dense(w);
         let q_heads = d.q_heads / tp;
         let kv_heads = d.kv_heads / tp;
         let global_kv_heads = d.global_kv_heads / tp;
@@ -233,7 +310,9 @@ impl Model {
         let layers = (0..d.layers)
             .map(|l| {
                 let n = |s: &str| format!("layer.{l}.{s}");
-                let norm = |s: &str, len: u64| Weight::sym(n(s), [len], w);
+                let norm = |s: &str, len: u64| Weight::sym(n(s), [len], dense);
+                let (lora_a, lora_b) =
+                    crate::adapter::banks(&format!("layer.{l}"), ADAPTERS, hidden, dense);
                 let reading = if full_at(l) {
                     Reading::Global
                 } else {
@@ -279,6 +358,12 @@ impl Model {
                     gate_up: Weight::sym(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
                     inter: intermediate,
                     down: Weight::sym(n("down"), [hidden, iw], w).rows(),
+                    scalar: d
+                        .ple_dim
+                        .is_none()
+                        .then(|| Weight::sym(n("scalar"), [1], dense)),
+                    lora_a,
+                    lora_b,
                 }
             })
             .collect();
@@ -290,6 +375,7 @@ impl Model {
             q_heads,
             sliding,
             global,
+            adapters: ADAPTERS,
             kv,
             softcap: d.softcap,
             embed: Weight::sym("embed", [d.vocab as u64, hidden], w),
@@ -298,7 +384,7 @@ impl Model {
                 Ple {
                     dim,
                     model_proj: Weight::sym("ple.model_proj", [d.layers as u64 * ple, hidden], w),
-                    model_norm: Weight::sym("ple.model_norm", [ple], w),
+                    model_norm: Weight::sym("ple.model_norm", [ple], dense),
                     model_norm_eps: d.norm_eps,
                     per_layer: (0..d.layers)
                         .map(|l| PleLayer {
@@ -309,19 +395,33 @@ impl Model {
                             ),
                             gate: Weight::sym(format!("layer.{l}.ple_gate"), [ple, hidden], w),
                             proj: Weight::sym(format!("layer.{l}.ple_proj"), [hidden, ple], w),
-                            norm: Weight::sym(format!("layer.{l}.ple_norm"), [hidden], w),
+                            norm: Weight::sym(format!("layer.{l}.ple_norm"), [hidden], dense),
                             norm_eps: d.norm_eps,
-                            scalar: Weight::sym(format!("layer.{l}.ple_scalar"), [1], w),
+                            scalar: Weight::sym(format!("layer.{l}.ple_scalar"), [1], dense),
                         })
                         .collect(),
                 }
             }),
             layers,
-            final_norm: Weight::sym("final_norm", [hidden], w),
+            final_norm: Weight::sym("final_norm", [hidden], dense),
             final_norm_eps: d.norm_eps,
         }
     }
 }
+
+/// What every SKU of this family seats.
+///
+/// Not a `Dims` field, because it is not a fact about the checkpoint the way
+/// `hidden` and `layers` are — no pretrained artifact states it. It is the
+/// DEPLOYMENT's ceiling written where a shape has to be written, and a
+/// deployment that wants a different one changes this line and re-traces,
+/// which is exactly the "load-time recompile, never a runtime extension"
+/// design §9 asks for.
+///
+/// Eight slots of rank sixteen costs e4b 1.25 MiB a layer — two planes of
+/// `8 x 16 x 2560` in the compute element — and 52.5 MiB over forty-two;
+/// b31 pays 2.63 MiB a layer and 157.5 MiB over sixty.
+const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
 impl Model {
     pub fn load(
@@ -353,6 +453,9 @@ impl Model {
             claim(&layer.o_proj);
             claim(&layer.gate_up);
             claim(&layer.down);
+            if let Some(scalar) = &layer.scalar {
+                claim(scalar);
+            }
         }
 
         if let Some(ple) = &self.ple {

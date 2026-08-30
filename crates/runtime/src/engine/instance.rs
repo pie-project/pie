@@ -2,36 +2,36 @@
 //!
 //! **THIS CODE IS A LIFT, NOT A REWRITE**, on the same terms as
 //! [`completion`](crate::engine::completion): it stood in
-//! `engine-api::instance` and it is runtime bookkeeping, not a statement about
+//! `engine::instance` and it is runtime bookkeeping, not a statement about
 //! what an engine is. It arrived comment-stripped and stays that way; what is
 //! documented is what this wave changed.
 //!
 //! # What changed on the way over
 //!
 //! * [`InstanceBindingPlan`] is now the runtime's THREE fields plus the
-//!   contract's [`InstanceBinding`](engine_api::InstanceBinding). The old
+//!   contract's [`InstanceBinding`](engine::InstanceBinding). The old
 //!   struct carried `engine_id`, `pacing_wait_id` and
 //!   `requested_instance_id` *through* the engine so they could come back
 //!   unchanged; the engine mints the id and the runtime keeps its own tables
-//!   (`engine-api::program`'s note on `InstanceBinding`). So the plan holds
+//!   (`engine::program`'s note on `InstanceBinding`). So the plan holds
 //!   the runtime's half and hands the engine only `binding`.
 //! * `validate_binding` no longer re-checks a native struct's fields. The
 //!   engine answers a typed
-//!   [`BoundInstance`](engine_api::BoundInstance) whose geometry class is an
+//!   [`BoundInstance`](engine::BoundInstance) whose geometry class is an
 //!   enum; the one thing left to say is whether it acknowledged the class
 //!   that was asked for.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use engine_api::channel::ChannelSeed;
-use engine_api::program::{BindExtents, InstanceBinding};
-use tensor_ir::registry::GeometryClass;
+use engine::channel::ChannelSeed;
+use engine::program::{BindExtents, InstanceBinding};
+use eta_ir::registry::GeometryClass;
 
 /// A registered program's id, as the engine minted it.
-pub type ProgramId = engine_api::ProgramId;
+pub type ProgramId = engine::ProgramId;
 /// A bound instance's id, as the engine minted it.
-pub type InstanceId = engine_api::InstanceId;
+pub type InstanceId = engine::InstanceId;
 
 /// One instance binding, runtime bookkeeping and contract argument together.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +94,7 @@ impl InstanceBindingPlan {
     /// When it bound a different one — which means the engine resolves a
     /// different amount of the fire geometry on the device than the runtime
     /// staged for, and every fire after would read a descriptor nobody wrote.
-    pub fn validate_binding(&self, bound: &engine_api::BoundInstance) -> anyhow::Result<()> {
+    pub fn validate_binding(&self, bound: &engine::BoundInstance) -> anyhow::Result<()> {
         anyhow::ensure!(
             bound.geometry == self.binding.geometry,
             "engine acknowledged geometry class {:?} for a binding that asked for {:?}",
@@ -235,13 +235,13 @@ pub struct BoundInstance {
 impl BoundInstance {
     /// Wrap the engine's answer in the runtime's bookkeeping.
     ///
-    /// Takes the contract's [`BoundInstance`](engine_api::BoundInstance)
+    /// Takes the contract's [`BoundInstance`](engine::BoundInstance)
     /// whole, where the lifted version took a `#[repr(C)]` binding struct and
     /// re-derived a geometry class out of a `u32` it had already validated.
     #[must_use]
     pub fn new(
         engine_id: usize,
-        bound: &engine_api::BoundInstance,
+        bound: &engine::BoundInstance,
         pacing_wait_id: u64,
     ) -> Self {
         Self {

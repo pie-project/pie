@@ -3,11 +3,11 @@
 //!
 //! **THE BYTES ARE THE INTERFACE** (design §6). Everything an emitted region
 //! reads is a `#[repr(C)]` record whose one definition lives in the shared
-//! crate — [`engine::LaneHeader`], [`engine::LaneRecord`],
-//! [`engine::LaneChannelSlot`], [`engine::ValueDesc`], [`engine::OpParams`] —
+//! crate — [`eta_exec::LaneHeader`], [`eta_exec::LaneRecord`],
+//! [`eta_exec::LaneChannelSlot`], [`eta_exec::ValueDesc`], [`eta_exec::OpParams`] —
 //! and this module's whole job is to pack those records and hand their
 //! addresses to `cuLaunchKernel`. Nothing here decides anything: which values
-//! exist is the plan's, where they sit in scratch is [`engine::layout`]'s,
+//! exist is the plan's, where they sit in scratch is [`eta_exec::layout`]'s,
 //! what each op does is the emitter's.
 //!
 //! **TWO SPELLINGS OF A CELL, AND ONLY BOOL DIFFERS.** On the device a cell is
@@ -25,17 +25,19 @@
 //! not decoration: it is what lets the parity test compare two rings slot for
 //! slot.
 //!
-//! [`ChannelState`]: engine::ChannelState
+//! [`ChannelState`]: eta_exec::ChannelState
 
-use engine::engine_api::program::LaunchStagePlan;
-use engine::tensor_ir::container::HostRole;
-use engine::tensor_ir::DType;
-use engine::tensor_ir::op::{IntrinsicId, tags};
-use engine::{
+use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
+use eta_compiler::plan::{LibraryOp, RegionKind};
+use eta_exec::{
     Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader,
     LaneRecord, LaneShape, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN, ValueDesc, describe,
     layout,
 };
+use eta_ir::Dtype;
+use eta_ir::container::HostRole;
+use eta_ir::op::{IntrinsicId, tags};
+use eta_ir::types::{MAX_RANK, name_or_unknown};
 
 use std::sync::Arc;
 
@@ -49,7 +51,7 @@ use super::endpoint::Endpoint;
 
 /// The sixteen arguments a generated fused region takes.
 ///
-/// From `tensor-compiler/runtime/cuda/fused_block1.cuh`, which is the
+/// From `eta-compiler/runtime/cuda/fused_block1.cuh`, which is the
 /// signature every emitted region is spliced into. CUDA validates nothing:
 /// fifteen bound arguments read the sixteenth out of whatever follows the
 /// array, which is a wrong answer rather than an error.
@@ -104,7 +106,7 @@ pub const BOOL_STORAGE_WIRE_PACKED: u32 = 1;
 
 /// One op's parameters, in the layout the generated kernels read.
 ///
-/// [`engine::OpParams`] is 64 bytes (sixteen `u32`); CUDA's `M1OpParams` is 88
+/// [`eta_exec::OpParams`] is 64 bytes (sixteen `u32`); CUDA's `M1OpParams` is 88
 /// — twenty `u32` plus a `u64` `rng_seed` whose eight-byte alignment pads the
 /// record to 88 and not the 84 a hand-summed field list gives. The first
 /// sixteen words match by name and order; [`CudaOpParams::widen`] adds the
@@ -203,7 +205,7 @@ impl CudaOpParams {
     /// defaults the C++ wrote for an op that binds no intrinsic.
     ///
     /// The sixteen shared words are copied BY NAME rather than transmuted out
-    /// of the 64-byte prefix, so a field inserted into [`engine::OpParams`] is
+    /// of the 64-byte prefix, so a field inserted into [`eta_exec::OpParams`] is
     /// a compile error here instead of a silent shift.
     #[must_use]
     pub const fn widen(shared: OpParams) -> CudaOpParams {
@@ -240,8 +242,8 @@ impl CudaOpParams {
 /// Native device bytes for a cell of `numel` lanes of `dtype`: one byte per
 /// bool lane, four per anything else.
 #[must_use]
-pub fn native_cell_bytes(dtype: DType, numel: usize) -> usize {
-    if dtype == DType::Bool {
+pub fn native_cell_bytes(dtype: Dtype, numel: usize) -> usize {
+    if dtype == Dtype::Bool {
         numel.max(1)
     } else {
         numel.max(1) * 4
@@ -254,20 +256,20 @@ pub fn native_cell_bytes(dtype: DType, numel: usize) -> usize {
 ///
 /// [`Fault::Program`] when `wire` is not exactly one wire cell; a short cell
 /// reads real-looking garbage past its end.
-pub fn wire_to_native(dtype: DType, numel: usize, wire: &[u8]) -> Result<Vec<u8>> {
+pub fn wire_to_native(dtype: Dtype, numel: usize, wire: &[u8]) -> Result<Vec<u8>> {
     let numel = numel.max(1);
-    let want = engine::wire_cell_bytes(dtype, numel);
+    let want = eta_exec::wire_cell_bytes(dtype, numel);
     if wire.len() != want {
         return Err(Fault::program(
             "program::launch",
             format!(
                 "a {} wire cell of {numel} lane(s) is {want} bytes and {} were offered",
-                dtype.name(),
+                name_or_unknown(dtype),
                 wire.len()
             ),
         ));
     }
-    if dtype != DType::Bool {
+    if dtype != Dtype::Bool {
         return Ok(wire.to_vec());
     }
     Ok((0..numel)
@@ -283,7 +285,7 @@ pub fn wire_to_native(dtype: DType, numel: usize, wire: &[u8]) -> Result<Vec<u8>
 /// # Errors
 ///
 /// [`Fault::Program`] when `native` is not exactly one native cell.
-pub fn native_to_wire(dtype: DType, numel: usize, native: &[u8]) -> Result<Vec<u8>> {
+pub fn native_to_wire(dtype: Dtype, numel: usize, native: &[u8]) -> Result<Vec<u8>> {
     let numel = numel.max(1);
     let want = native_cell_bytes(dtype, numel);
     if native.len() != want {
@@ -291,15 +293,15 @@ pub fn native_to_wire(dtype: DType, numel: usize, native: &[u8]) -> Result<Vec<u
             "program::launch",
             format!(
                 "a {} native cell of {numel} lane(s) is {want} bytes and {} were offered",
-                dtype.name(),
+                name_or_unknown(dtype),
                 native.len()
             ),
         ));
     }
-    if dtype != DType::Bool {
+    if dtype != Dtype::Bool {
         return Ok(native.to_vec());
     }
-    let mut out = vec![0u8; engine::wire_cell_bytes(dtype, numel)];
+    let mut out = vec![0u8; eta_exec::wire_cell_bytes(dtype, numel)];
     for (i, &byte) in native.iter().enumerate().take(numel) {
         if byte != 0 {
             out[i / 8] |= 1 << (i % 8);
@@ -314,7 +316,7 @@ pub struct ChannelShape {
     /// Lanes in one cell.
     pub numel: usize,
     /// The cell's element type.
-    pub dtype: DType,
+    pub dtype: Dtype,
     /// How many unconsumed items the channel holds. The ring is one longer.
     pub capacity: u32,
 }
@@ -322,7 +324,7 @@ pub struct ChannelShape {
 impl ChannelShape {
     /// The channel a launch package declares at this slot.
     #[must_use]
-    pub fn of(declared: &engine::engine_api::program::LaunchChannel) -> ChannelShape {
+    pub fn of(declared: &eta_compiler::codegen::launch::LaunchChannel) -> ChannelShape {
         ChannelShape {
             numel: declared
                 .shape
@@ -330,7 +332,7 @@ impl ChannelShape {
                 .map(|&d| d as usize)
                 .product::<usize>()
                 .max(1),
-            dtype: engine::concrete_dtype(declared.dtype),
+            dtype: eta_exec::concrete_dtype(declared.dtype),
             capacity: declared.capacity.max(1),
         }
     }
@@ -755,7 +757,7 @@ pub struct Cursor {
 /// ```
 ///
 /// **THE TWO SHARED ONES ARE WHY EXTENTS ARE PART OF THE KEY.** `offsets` is
-/// [`engine::layout`]'s answer for one descriptor set and the kernel does not
+/// [`eta_exec::layout`]'s answer for one descriptor set and the kernel does not
 /// stride it, so two lanes whose values are different sizes cannot share this
 /// structure — and `describe` resolves a value's size against the extents.
 /// Rather than pad every lane to an envelope, a batch is cut per `Extents`
@@ -826,13 +828,199 @@ pub struct Prepared {
     bindings: Vec<u32>,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Which of a stage's values a fire actually carries
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **THE REGIONS THIS SHELL LAUNCHES ARE THE GENERATED ONES.**
+///
+/// A `Library(SecondParty)` region is a `kernel_call` or a `sink_call`: a NAME
+/// the shell would have to launch itself, not a body the emitter could write.
+/// [`super::compile`] emits nothing for one and this shell launches nothing in
+/// its place, so the region simply does not run.
+///
+/// **ONE PREDICATE, TWO READERS, ON PURPOSE.** The compiler asks it to skip
+/// the region; [`describe_values`] asks it to find out which values are left
+/// with no reader. Two spellings of "this region does not run" that drifted
+/// apart would put back exactly the trap below — scratch budgeted for a
+/// region nobody launches.
+#[must_use]
+pub(crate) fn shell_launches(region: &LaunchRegion) -> bool {
+    region.kind != RegionKind::Library(LibraryOp::SecondParty)
+}
+
+/// **A VALUE ONLY A SKIPPED REGION READS IS NOT MATERIALISED** — alto adapter
+/// §6.1's named trap, closed.
+///
+/// The trap: the `lora` sink is a `sink_call` in a second-party region that
+/// [`shell_launches`] says does not run, and its operands are `chan_read`s of
+/// the adapter's `A` and `B` cells. The sink is skipped; the reads are not.
+/// Every one of them is an ordinary generated op in an ordinary region, so
+/// the plan went on budgeting `[layers, rank, hidden]` of per-lane scratch for
+/// each — and [`eta_exec::layout`] sizes the shared temporary block off the
+/// WIDEST value, so an adapter plane cost its own bytes four times over again
+/// on top. At qwen35-d0.8b's 24 × 16 × 1024 that is 3 MiB of value slots and
+/// 6 MiB of temporaries a lane, re-zeroed at every fire
+/// ([`Prepared::commit_lanes`]) for weights §6.1 lands ONCE at instance bind.
+///
+/// So the answer is per-value and structural: a value that
+///
+/// 1. is read by an op inside a region this shell does not launch,
+/// 2. is read by no op it DOES launch, and
+/// 3. is produced by a `chan_read`/`chan_take` — a materialisation of a
+///    channel cell and nothing else —
+///
+/// is described as EMPTY. Condition 3 is what makes this safe rather than
+/// merely small: the emitted body of a channel read is
+/// `ptir_parallel_copy(cell, slot, descriptors[o0].len, …)`, so a descriptor
+/// with no elements makes the copy that would have filled the slot copy
+/// nothing. The slot, the copy and the memset all go at once, and no kernel
+/// that runs can tell. A value a launched op reads — or a computed one, whose
+/// producer this shell cannot prove is bounded by its own descriptor — stays,
+/// whatever else reads it.
+///
+/// The `attn_page_mask` sink is the same shape and gets the same answer:
+/// nothing in this shell launches its region either.
+#[must_use]
+fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
+    let values = plan.value_types.len();
+
+    // Value → the op that defines it, in the walk `Prepared::build` uses to
+    // number results.
+    let mut producer = vec![usize::MAX; values];
+    let mut result_base = 0u32;
+    for (node, op) in plan.ops.iter().enumerate() {
+        for result in 0..u32::from(op.result_count) {
+            if let Some(slot) = producer.get_mut((result_base + result) as usize) {
+                *slot = node;
+            }
+        }
+        result_base += u32::from(op.result_count);
+    }
+
+    // The ops inside a region nothing launches, and the values they read.
+    let mut skipped = vec![false; plan.ops.len()];
+    let mut unread = vec![false; values];
+    for region in plan.fused.iter().filter(|region| !shell_launches(region)) {
+        for &node in &region.nodes {
+            if let Some(node) = skipped.get_mut(node as usize) {
+                *node = true;
+            }
+        }
+        for &value in region.inputs.iter().chain(
+            region
+                .nodes
+                .iter()
+                .filter_map(|&node| plan.ops.get(node as usize))
+                .flat_map(|op| op.args.iter()),
+        ) {
+            if let Some(value) = unread.get_mut(value as usize) {
+                *value = true;
+            }
+        }
+    }
+
+    // Anything an op that DOES run reads is read, and that settles it.
+    for (node, op) in plan.ops.iter().enumerate() {
+        if skipped.get(node).copied().unwrap_or(false) {
+            continue;
+        }
+        let predicate = (op.tag == tags::PIVOT_THRESHOLD).then_some(op.pred_payload);
+        for value in op.args.iter().copied().chain(predicate) {
+            if let Some(value) = unread.get_mut(value as usize) {
+                *value = false;
+            }
+        }
+    }
+    // So is anything a launched region commits to a channel.
+    for region in plan.fused.iter().filter(|region| shell_launches(region)) {
+        for sink in &region.sinks {
+            if let Some(value) = unread.get_mut(sink.value as usize) {
+                *value = false;
+            }
+        }
+    }
+
+    // Condition 3: only a channel materialisation may be described as empty.
+    for (value, drop) in unread.iter_mut().enumerate() {
+        let tag = producer
+            .get(value)
+            .and_then(|&node| plan.ops.get(node))
+            .map(|op| op.tag);
+        if !matches!(tag, Some(tags::CHAN_READ | tags::CHAN_TAKE)) {
+            *drop = false;
+        }
+    }
+    unread
+}
+
+/// **EVERY VALUE'S DEVICE DESCRIPTOR FOR ONE FIRE'S EXTENTS**, with the ones
+/// [`read_only_by_skipped_regions`] names described as empty.
+///
+/// A dropped value is still DESCRIBED — a plan whose shapes do not resolve is
+/// still refused at the door, for the value nobody reads as much as for the
+/// rest — and then emptied: the declared rank and dtype stay, the extents go
+/// to zero, and `len` with them. [`eta_exec::layout`] gives an empty value the
+/// four-byte floor every value gets and stops counting it toward the widest,
+/// which is the whole saving.
+///
+/// # Errors
+///
+/// [`Fault::Program`] when a value's shape does not resolve against `extents`.
+pub fn describe_values(plan: &LaunchStagePlan, extents: Extents) -> Result<Vec<ValueDesc>> {
+    let empty = read_only_by_skipped_regions(plan);
+    plan.value_types
+        .iter()
+        .enumerate()
+        .map(|(value, declared)| {
+            let described = describe(declared, &extents).map_err(|why| {
+                Fault::program(
+                    "program::launch",
+                    format!("a value's shape does not resolve against this fire: {why:?}"),
+                )
+            })?;
+            Ok(if empty.get(value).copied().unwrap_or(false) {
+                ValueDesc {
+                    len: 0,
+                    rows: 0,
+                    last: 0,
+                    dims: [0; MAX_RANK],
+                    ..described
+                }
+            } else {
+                described
+            })
+        })
+        .collect()
+}
+
+/// **WHAT ONE LANE'S SCRATCH COSTS** for `plan` at `extents` — the stride
+/// [`Prepared::build`] cuts and [`Prepared::commit_lanes`] re-zeroes, before
+/// any device is involved.
+///
+/// # Errors
+///
+/// [`Fault::Program`] when a value's shape does not resolve or the scratch
+/// exceeds what [`eta_exec::layout`] permits.
+pub fn scratch_bytes(plan: &LaunchStagePlan, extents: Extents) -> Result<u64> {
+    let descriptors = describe_values(plan, extents)?;
+    layout(&descriptors)
+        .map(|layout| layout.total)
+        .map_err(|why| {
+            Fault::program(
+                "program::launch",
+                format!("this fire's scratch does not fit: {why:?}"),
+            )
+        })
+}
+
 impl Prepared {
     /// Carve every buffer one stage needs, for `lanes` lanes.
     ///
     /// # Errors
     ///
     /// [`Fault::Program`] when a value's shape does not resolve against
-    /// `extents` or the scratch exceeds what [`engine::layout`] permits, and
+    /// `extents` or the scratch exceeds what [`eta_exec::layout`] permits, and
     /// whatever the allocations said.
     pub fn build(
         plan: &LaunchStagePlan,
@@ -846,18 +1034,7 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "more values than a u32 can count"))?;
 
         // ── The value descriptors, and the scratch they size. ──
-        let descriptors: Vec<ValueDesc> = plan
-            .value_types
-            .iter()
-            .map(|value| {
-                describe(value, &extents).map_err(|why| {
-                    Fault::program(
-                        "program::launch",
-                        format!("a value's shape does not resolve against this fire: {why:?}"),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let descriptors = describe_values(plan, extents)?;
         let scratch_layout = layout(&descriptors).map_err(|why| {
             Fault::program(
                 "program::launch",
@@ -967,21 +1144,21 @@ impl Prepared {
     /// # Errors
     ///
     /// [`Fault::Program`] when the lane table or the scratch outgrows what
-    /// [`engine::layout`] permits, and whatever the allocations said.
+    /// [`eta_exec::layout`] permits, and whatever the allocations said.
     fn grow(&mut self, extents: Extents, lanes: u32) -> Result<()> {
         if lanes <= self.lanes {
             return Ok(());
         }
-        // **THE SCRATCH CEILING IS A WAVE'S, NOT A LANE'S** (`engine::scratch`
+        // **THE SCRATCH CEILING IS A WAVE'S, NOT A LANE'S** (`eta_exec::scratch`
         // MAX_BYTES). A stride that fits on its own can still refuse at
         // sixty-four, and the answer is a smaller batch rather than a dead
         // shell — so this is a named refusal the caller halves and retries.
         let total = u64::from(self.scratch_stride) * u64::from(lanes);
-        if total > engine::SCRATCH_MAX_BYTES {
+        if total > eta_exec::SCRATCH_MAX_BYTES {
             return Err(Fault::Ceiling {
                 what: "a wave's fused-region scratch",
                 need: total,
-                have: engine::SCRATCH_MAX_BYTES,
+                have: eta_exec::SCRATCH_MAX_BYTES,
             });
         }
         let shape = LaneShape::of(lanes, self.channel_count);
@@ -994,7 +1171,7 @@ impl Prepared {
             &mut table_host,
             0,
             &LaneHeader {
-                abi_version: engine::LANE_ABI_VERSION,
+                abi_version: eta_exec::LANE_ABI_VERSION,
                 // Seeded at the ceiling and rewritten at every commit with
                 // what the boundary actually staged; the kernel reads it as
                 // its own bound.
@@ -1217,7 +1394,7 @@ impl Prepared {
             &mut self.table_host,
             0,
             &LaneHeader {
-                abi_version: engine::LANE_ABI_VERSION,
+                abi_version: eta_exec::LANE_ABI_VERSION,
                 lane_count: self.filled,
                 channel_slots_per_lane: self.channel_count,
                 flags: 0,
@@ -1253,9 +1430,14 @@ impl Prepared {
     /// Point one lane's intrinsic at the buffer a model fire produced.
     ///
     /// The side tables are zeroed at bind, so an unbound intrinsic reads
-    /// address zero. `modes` is a STORAGE mode, not a `DType` wire code: they
-    /// collide only at `DType::F32 as u8 == 0 == INTRINSIC_STORAGE_F32`, so
-    /// passing a dtype for a bf16 buffer misreads every logit, silently.
+    /// address zero. `modes` is a STORAGE mode, not a `Dtype` wire code: they
+    /// collide only at `eta_ir::types::to_wire(Dtype::F32) == Some(0) ==
+    /// INTRINSIC_STORAGE_F32`, so passing a dtype for a bf16 buffer misreads
+    /// every logit, silently. (This read `Dtype::F32 as u8` while the dtype
+    /// was a `#[repr(u8)]` enum of ETA's own. The cast still compiles on the
+    /// shared `dtype::Dtype` and still happens to answer `0`, but what it
+    /// answers now is the leaf's declaration order, which is not this
+    /// numbering — so the sentence names the function instead.)
     ///
     /// **HOST-SIDE, AND STAGED WITH THE REST AT [`Prepared::commit_lanes`].**
     /// It used to be five `cudaMemcpyAsync` calls of four and eight bytes,
@@ -1349,20 +1531,20 @@ impl Prepared {
 
     /// **HOW MANY LANES THIS STAGE CAN CARRY IN ONE LAUNCH.**
     ///
-    /// The scratch ceiling ([`engine::SCRATCH_MAX_BYTES`], 512 MiB) is a
+    /// The scratch ceiling ([`eta_exec::SCRATCH_MAX_BYTES`], 512 MiB) is a
     /// WAVE's and not a lane's: a stride that fits on its own can refuse at
     /// sixty-four. Answering the number rather than faulting is what lets a
     /// caller split a group into launches that fit — which is one more kernel
     /// and no lost work, where a refusal would be a dead boundary.
     ///
     /// At least one, always: a single lane that does not fit was refused at
-    /// bind by [`engine::layout`] itself.
+    /// bind by [`eta_exec::layout`] itself.
     #[must_use]
     pub fn lane_ceiling(&self) -> u32 {
         if self.scratch_stride == 0 {
             return u32::MAX;
         }
-        u32::try_from(engine::SCRATCH_MAX_BYTES / u64::from(self.scratch_stride))
+        u32::try_from(eta_exec::SCRATCH_MAX_BYTES / u64::from(self.scratch_stride))
             .unwrap_or(u32::MAX)
             .max(1)
     }
@@ -1572,7 +1754,7 @@ pub fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::LANE_SLOT_BYTES;
+    use eta_exec::LANE_SLOT_BYTES;
 
     /// One wrong record size has every lane after the first read the last
     /// one's tail, and a single-lane fire never shows it.
@@ -1717,14 +1899,14 @@ mod tests {
     #[test]
     fn only_bool_is_packed_and_the_round_trip_is_lossless() {
         for (dtype, numel) in [
-            (DType::F32, 3),
-            (DType::I32, 5),
-            (DType::U32, 1),
-            (DType::Bool, 11),
+            (Dtype::F32, 3),
+            (Dtype::I32, 5),
+            (Dtype::U32, 1),
+            (Dtype::Bool, 11),
         ] {
             let native = native_cell_bytes(dtype, numel);
-            let wire = engine::wire_cell_bytes(dtype, numel);
-            if dtype == DType::Bool {
+            let wire = eta_exec::wire_cell_bytes(dtype, numel);
+            if dtype == Dtype::Bool {
                 assert_eq!(native, numel, "a byte per lane on the device");
                 assert_eq!(wire, numel.div_ceil(8), "a bit per lane on the wire");
             } else {
@@ -1734,7 +1916,7 @@ mod tests {
             let there = wire_to_native(dtype, numel, &bytes).expect("one wire cell");
             assert_eq!(there.len(), native);
             let back = native_to_wire(dtype, numel, &there).expect("one native cell");
-            if dtype == DType::Bool {
+            if dtype == Dtype::Bool {
                 // The high bits of the last wire byte are past `numel` and are
                 // not carried; compare only the lanes that exist.
                 for lane in 0..numel {
@@ -1754,8 +1936,8 @@ mod tests {
     /// short one reads real-looking garbage past its end.
     #[test]
     fn a_cell_of_the_wrong_width_is_refused() {
-        assert!(wire_to_native(DType::I32, 2, &[0u8; 4]).is_err());
-        assert!(native_to_wire(DType::Bool, 4, &[0u8; 3]).is_err());
+        assert!(wire_to_native(Dtype::I32, 2, &[0u8; 4]).is_err());
+        assert!(native_to_wire(Dtype::Bool, 4, &[0u8; 3]).is_err());
     }
 
     /// A `Vec<u64>` backing would reallocate on append and dangle every

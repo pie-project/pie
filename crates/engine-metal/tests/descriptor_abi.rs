@@ -28,11 +28,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use engine::fire::{Lane as FireLane, compose};
 use engine_metal::abi::{self, At, Axis};
 use engine_metal::{Boot, Lane, Recording, Shell};
 use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
+use model_exec::fire::{Lane as FireLane, compose};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
@@ -94,7 +94,7 @@ fn ready(what: &str) -> Option<Shell> {
         .expect("the import contract fits its own checkpoint");
     drop(source);
     let shell = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(16, 640),
@@ -102,6 +102,16 @@ fn ready(what: &str) -> Option<Shell> {
         page_size: 16,
         context: 512,
         slots: 16,
+        // F1's depth: one step in flight, one A/B seat set. Stated rather
+        // than defaulted because these are goldens — the eager shell is what
+        // a byte-identity arm compares against — and because a second seat
+        // set is a second whole `Inputs` reservation on a machine this test
+        // is already sized carefully for.
+        runahead: engine::runahead::Runahead::F1,
+        // Full residency: the whole weight table on the device, no
+        // wired-slab tier, no segment cuts — the load every gate in
+        // this directory measures.
+        residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the shell loads");
     Some(shell)
@@ -163,6 +173,132 @@ fn classes_of(shell: &Shell, batch: &[Synthetic]) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// The five batches the probe basis is walked with, named once because two
+/// tests below walk the same ones and a copy of a batch is a copy that can
+/// drift from the basis it defines.
+fn base_batch() -> Vec<Synthetic> {
+    batch(&[(2, 1), (2, 8)])
+}
+
+fn one_more_decode_lane() -> Vec<Synthetic> {
+    batch(&[(3, 1), (2, 8)])
+}
+
+fn one_more_prefill_lane() -> Vec<Synthetic> {
+    batch(&[(2, 1), (3, 8)])
+}
+
+/// **ONE TOKEN, NOT EIGHT, AND THAT IS AN INTEGRALITY CONSTRAINT AND NOT A
+/// TASTE.** `fit::invert` reads a fire's class table back into these
+/// coordinates by inverting the step matrix OVER THE INTEGERS. A prefill lane
+/// moves that class by `(8, 1)` and this direction moves its rows alone; at
+/// eight rows a step the pair generates only `rows ≡ 0 (mod 8)`, so a real
+/// composition like a single 12-token lane has no integer coordinates and the
+/// basis is refused by name. At one row a step the two directions saturate
+/// the class's `(rows, lanes)` lattice and the inverse is exact.
+fn one_more_prefill_token() -> Vec<Synthetic> {
+    let mut out = batch(&[(2, 1), (1, 8)]);
+    out.push(Synthetic {
+        tokens: vec![1u32; 9],
+        slot: 3,
+        word: word(9),
+    });
+    out
+}
+
+/// The held-out composition: every direction stepped, and none of them by
+/// one.
+fn check_batch() -> Vec<Synthetic> {
+    let mut out = batch(&[(5, 1), (3, 8)]);
+    out.push(Synthetic {
+        tokens: vec![1u32; 24],
+        slot: 8,
+        word: word(24),
+    });
+    out
+}
+
+/// Where [`check_batch`] stands: five decode lanes (+3), four prefill lanes
+/// (+2), and `48 − 8·4 = 16` prefill rows past what those lanes carry at
+/// eight each.
+const CHECK_AT: [i128; 3] = [3, 2, 16];
+
+/// What one rung did to the class table, componentwise.
+///
+/// **AN AXIS IS A DIFFERENCE OF COMPOSITIONS, SO IT IS TAKEN AS ONE.** This
+/// used to be three `(rows, lanes)` pairs written out beside the batches, and
+/// the transcription went stale the moment the artifact baked more than one
+/// class: a step stated over one class against a twelve-class table is
+/// refused by `fit::invert` before any law is fitted. The composer is the
+/// only thing that knows how wide the table is, so the basis is read off it.
+fn step_between(shell: &Shell, from: &[Synthetic], to: &[Synthetic]) -> Vec<(i32, i32)> {
+    let from = classes_of(shell, from);
+    let to = classes_of(shell, to);
+    assert_eq!(
+        from.len(),
+        to.len(),
+        "two compositions of one artifact carry one class table"
+    );
+    let step: Vec<(i32, i32)> = to
+        .iter()
+        .zip(&from)
+        .map(|(&(there_rows, there_lanes), &(here_rows, here_lanes))| {
+            (
+                there_rows as i32 - here_rows as i32,
+                there_lanes as i32 - here_lanes as i32,
+            )
+        })
+        .collect();
+    assert_eq!(
+        step.iter().filter(|&&pair| pair != (0, 0)).count(),
+        1,
+        "a probe direction moves ONE class, or the slope it yields is two \
+         derivatives wearing one name: {step:?}"
+    );
+    step
+}
+
+/// The three directions the composition can genuinely be stepped along, and
+/// no fourth: a decode lane's word says one token, so that class's rows and
+/// lanes move together and pretending they were two axes would fit a slope to
+/// a direction no batch can walk.
+fn basis(shell: &Shell) -> Vec<Axis> {
+    let base = base_batch();
+    vec![
+        Axis::new(
+            "a decode lane",
+            step_between(shell, &base, &one_more_decode_lane()),
+        ),
+        Axis::new(
+            "a prefill lane of 8 tokens",
+            step_between(shell, &base, &one_more_prefill_lane()),
+        ),
+        Axis::new(
+            "one more token in a prefill lane",
+            step_between(shell, &base, &one_more_prefill_token()),
+        ),
+    ]
+}
+
+/// A slot's DISPATCH, which is the whole of what the table re-derives.
+///
+/// **`window_lanes` IS AN ANNOTATION AND NOT A COMPONENT.** `record::Slot`
+/// says so in as many words — "nothing an ICB slot holds is this number" —
+/// and the table is built to be diffed against `icb::rebind`, which carries
+/// exactly ONE extra law per slot and it is `rows`: an arm is picked off the
+/// window's rows (`abi::Pick::Rows`) and a tiling ceiling divides them, so
+/// the lane count reaches neither `SlotAbi` nor the packed device tables.
+/// `DescriptorAbi::slot_at` therefore leaves it at the skeleton's reading,
+/// and asking it about a number it never fitted is a question about the
+/// recorder rather than about the derivation. Everything the derivation does
+/// claim — the shader point, the grid, the threadgroup, every argument, the
+/// region, the run and the window's ROWS — is compared.
+fn dispatch(slot: &engine_metal::Slot) -> engine_metal::Slot {
+    let mut out = slot.clone();
+    out.window_lanes = 0;
+    out
+}
+
 /// Record one batch, at the coordinates the caller places it at.
 fn record(shell: &mut Shell, batch: &[Synthetic], coords: Vec<i128>) -> Recording {
     for lane in batch {
@@ -189,56 +325,34 @@ fn the_extent_table_is_derived_from_two_walks_and_verified_on_a_third() {
     eprintln!("  one decode lane   lands as {decode:?}");
     eprintln!("  one prefill lane  lands as {prefill:?}");
 
-    // THE PROBE BASIS. Three directions the composition can genuinely be
-    // stepped along, and no fourth: a decode lane's word says one token, so
-    // that class's rows and lanes move together and pretending they were two
-    // axes would fit a slope to a direction no batch can walk.
+    // THE PROBE BASIS, read off the composer rather than transcribed beside
+    // it — see [`basis`] and [`step_between`] for why the transcription is
+    // the thing that went stale.
     //
     //   d : one more decode lane          (decode rows +1, decode lanes +1)
     //   p : one more prefill lane of 8    (prefill rows +8, prefill lanes +1)
-    //   t : eight more prefill tokens     (prefill rows +8, prefill lanes +0)
-    let axes = vec![
-        Axis::new("a decode lane", vec![(1, 1)]),
-        Axis::new("a prefill lane of 8 tokens", vec![(8, 1)]),
-        Axis::new("8 more tokens in a prefill lane", vec![(8, 0)]),
-    ];
+    //   t : one more prefill token        (prefill rows +1, prefill lanes +0)
+    let axes = basis(&shell);
+    eprintln!(
+        "  the probe basis, as the composer states it: {}",
+        axes.iter()
+            .map(|axis| format!("{axis} {:?}", axis.step))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
 
     // base: 2 decode lanes, 2 prefill lanes of 8.
-    let base = record(&mut shell, &batch(&[(2, 1), (2, 8)]), vec![0, 0, 0]);
+    let base = record(&mut shell, &base_batch(), vec![0, 0, 0]);
     let bumps = vec![
         // +1 decode lane
-        record(&mut shell, &batch(&[(3, 1), (2, 8)]), vec![1, 0, 0]),
+        record(&mut shell, &one_more_decode_lane(), vec![1, 0, 0]),
         // +1 prefill lane of 8
-        record(&mut shell, &batch(&[(2, 1), (3, 8)]), vec![0, 1, 0]),
-        // one prefill lane grows by 8 tokens
-        record(
-            &mut shell,
-            &{
-                let mut b = batch(&[(2, 1), (1, 8)]);
-                b.push(Synthetic {
-                    tokens: vec![1u32; 16],
-                    slot: 3,
-                    word: word(16),
-                });
-                b
-            },
-            vec![0, 0, 1],
-        ),
+        record(&mut shell, &one_more_prefill_lane(), vec![0, 1, 0]),
+        // one prefill lane grows by one token
+        record(&mut shell, &one_more_prefill_token(), vec![0, 0, 1]),
     ];
     // check: every direction stepped, and none of them by one.
-    let check = record(
-        &mut shell,
-        &{
-            let mut b = batch(&[(5, 1), (3, 8)]);
-            b.push(Synthetic {
-                tokens: vec![1u32; 24],
-                slot: 8,
-                word: word(24),
-            });
-            b
-        },
-        vec![3, 2, 2],
-    );
+    let check = record(&mut shell, &check_batch(), CHECK_AT.to_vec());
 
     eprintln!(
         "probes: base {} slots at {:?}; bumps {:?}; check {} slots at {:?}",
@@ -249,8 +363,20 @@ fn the_extent_table_is_derived_from_two_walks_and_verified_on_a_third() {
         check.classes,
     );
 
-    let surveyed = abi::survey(&axes, &base, &bumps, &check).expect("the probes walk one template");
+    // ONE PROBE, AND ONE RUNG PER DIRECTION. The bumps above are exactly
+    // `base + 1·e_k`, which is the pair an affine slope is read off; a longer
+    // ladder is what a tiling law's divisor would be solved against, and this
+    // file's claim is the affine one.
+    let probes = abi::Probes {
+        probes: vec![abi::Probe {
+            base,
+            ladders: bumps.into_iter().map(|bump| vec![bump]).collect(),
+        }],
+        check,
+    };
+    let surveyed = abi::survey(&axes, &probes).expect("the probes walk one template");
     let table = &surveyed.abi;
+    let check = &probes.check;
 
     // ---- the census -------------------------------------------------
     eprintln!();
@@ -266,16 +392,26 @@ fn the_extent_table_is_derived_from_two_walks_and_verified_on_a_third() {
     // Which KIND of component moves, and along which direction.
     let mut by_place: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut by_axis: Vec<usize> = vec![0; axes.len()];
+    // ONE LAW TABLE PER ARM, so a slot that picks its shader off the window
+    // is counted once per point it is — which is what the per-point census
+    // below prints too.
     for slot in &table.slots {
-        for (at, law) in &slot.laws {
-            let key = match at {
-                At::Lane(_) => "grid axis",
-                At::Group(_) => "threadgroup axis",
-                At::Arg(_) => "argument",
-            };
-            *by_place.entry(key).or_default() += 1;
-            for axis in law.reads() {
-                by_axis[axis] += 1;
+        for arm in &slot.arms {
+            for (at, law) in &arm.laws {
+                let key = match at {
+                    At::Grid(_) => "grid axis",
+                    At::Block(_) => "threadgroup axis",
+                    At::Arg { .. } => "argument",
+                    // The recorder enumerates exactly the grid axes, the
+                    // threadgroup axes and the arguments, so a Metal law
+                    // table holds no entry, shared-memory or shape component
+                    // and there is nothing here to count.
+                    At::Entry | At::Shared | At::Shape => "not on this plane",
+                };
+                *by_place.entry(key).or_default() += 1;
+                for axis in law.reads() {
+                    by_axis[axis] += 1;
+                }
             }
         }
     }
@@ -290,11 +426,13 @@ fn the_extent_table_is_derived_from_two_walks_and_verified_on_a_third() {
     let mut offsets = 0usize;
     let mut scalars = 0usize;
     for slot in &table.slots {
-        for (at, _) in &slot.laws {
-            if let At::Arg(index) = at {
-                match slot.skeleton.args[*index as usize] {
-                    engine_metal::Arg::Buffer { .. } => offsets += 1,
-                    _ => scalars += 1,
+        for arm in &slot.arms {
+            for (at, _) in &arm.laws {
+                if let At::Arg { at: index, .. } = at {
+                    match arm.skeleton.args[*index as usize] {
+                        engine_metal::Arg::Buffer { .. } => offsets += 1,
+                        _ => scalars += 1,
+                    }
                 }
             }
         }
@@ -369,9 +507,10 @@ fn the_extent_table_is_derived_from_two_walks_and_verified_on_a_third() {
             .slot_at(index, &check.coords)
             .expect("the table holds this slot");
         assert_eq!(
-            rebuilt, check.slots[index],
+            dispatch(&rebuilt),
+            dispatch(&check.slots[index]),
             "slot {index} ({}) re-derived from the table is not the slot the walk produced",
-            table.slots[index].point
+            table.slots[index].point()
         );
     }
     eprintln!(
@@ -388,43 +527,22 @@ fn a_composition_the_probes_never_visited_is_re_derived_exactly() {
     let Some(mut shell) = ready("the abi's out-of-sample check") else {
         return;
     };
-    let axes = vec![
-        Axis::new("a decode lane", vec![(1, 1)]),
-        Axis::new("a prefill lane of 8 tokens", vec![(8, 1)]),
-        Axis::new("8 more tokens in a prefill lane", vec![(8, 0)]),
-    ];
-    let base = record(&mut shell, &batch(&[(2, 1), (2, 8)]), vec![0, 0, 0]);
+    let axes = basis(&shell);
+    let base = record(&mut shell, &base_batch(), vec![0, 0, 0]);
     let bumps = vec![
-        record(&mut shell, &batch(&[(3, 1), (2, 8)]), vec![1, 0, 0]),
-        record(&mut shell, &batch(&[(2, 1), (3, 8)]), vec![0, 1, 0]),
-        record(
-            &mut shell,
-            &{
-                let mut b = batch(&[(2, 1), (1, 8)]);
-                b.push(Synthetic {
-                    tokens: vec![1u32; 16],
-                    slot: 3,
-                    word: word(16),
-                });
-                b
-            },
-            vec![0, 0, 1],
-        ),
+        record(&mut shell, &one_more_decode_lane(), vec![1, 0, 0]),
+        record(&mut shell, &one_more_prefill_lane(), vec![0, 1, 0]),
+        record(&mut shell, &one_more_prefill_token(), vec![0, 0, 1]),
     ];
-    let check = record(
-        &mut shell,
-        &{
-            let mut b = batch(&[(5, 1), (3, 8)]);
-            b.push(Synthetic {
-                tokens: vec![1u32; 24],
-                slot: 8,
-                word: word(24),
-            });
-            b
-        },
-        vec![3, 2, 2],
-    );
-    let surveyed = abi::survey(&axes, &base, &bumps, &check).expect("the probes walk one template");
+    let check = record(&mut shell, &check_batch(), CHECK_AT.to_vec());
+    let probes = abi::Probes {
+        probes: vec![abi::Probe {
+            base,
+            ladders: bumps.into_iter().map(|bump| vec![bump]).collect(),
+        }],
+        check,
+    };
+    let surveyed = abi::survey(&axes, &probes).expect("the probes walk one template");
     let table = &surveyed.abi;
     let switching: std::collections::BTreeSet<u32> =
         surveyed.armed.iter().map(|entry| entry.slot).collect();
@@ -439,16 +557,17 @@ fn a_composition_the_probes_never_visited_is_re_derived_exactly() {
     );
     let mut derived = 0usize;
     for (index, produced) in out_of_sample.slots.iter().enumerate() {
-        if switching.contains(&(index as u32)) || produced.point != table.slots[index].point {
+        if switching.contains(&(index as u32)) || produced.point != table.slots[index].point() {
             continue;
         }
         let rebuilt = table
             .slot_at(index, &out_of_sample.coords)
             .expect("the table holds this slot");
         assert_eq!(
-            &rebuilt, produced,
+            dispatch(&rebuilt),
+            dispatch(produced),
             "slot {index} ({}) at an unvisited composition",
-            table.slots[index].point
+            table.slots[index].point()
         );
         derived += 1;
     }

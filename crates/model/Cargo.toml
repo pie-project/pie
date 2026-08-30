@@ -33,7 +33,7 @@ model-dsl = { path = "../model-dsl" }
 # declarer that module's doc names — so a `<model>/import.rs` states where its
 # bytes come from in the language the loader checks and runs, rather than in a
 # second one beside it.
-model-loader = { path = "../model-loader" }
+checkpoint = { path = "../checkpoint" }
 # The tool arguments a family's chat template renders, and the plan `bin/trace`
 # prints.
 serde_json = "1"

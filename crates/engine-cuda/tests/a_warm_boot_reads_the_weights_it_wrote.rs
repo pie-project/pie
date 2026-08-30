@@ -62,6 +62,7 @@ fn scratch(what: &str) -> Scratch {
 }
 
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_warm_boot_reads_the_weights_it_wrote_and_refuses_the_ones_that_rotted() {
     let Some((checkpoint, container)) = ready("the weight artifact cache gate") else {
         return;
@@ -243,6 +244,7 @@ fn load(checkpoint: &Path, container: &Path, cache_dir: Option<&Path>) -> Shell 
         contract: &contract,
         checkpoint,
         budget: Budget::new(2, 64),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 128,

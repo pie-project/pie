@@ -53,7 +53,7 @@ fire `k` before the host can publish its green mask. This is one of the depth-1
 cases called out in
 `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-The PTIR epilogue itself is small: take the host-provided boolean mask, select a
+The ETA epilogue itself is small: take the host-provided boolean mask, select a
 `delta` or zero bias for every vocabulary entry, add it to `intrinsics::logits()`,
 and draw with `gumbel_max`.
 

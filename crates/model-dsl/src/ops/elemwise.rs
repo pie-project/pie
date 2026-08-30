@@ -80,6 +80,77 @@ pub fn rmsnorm_no_scale(x: &Value, head_dim: u32, eps: f32) -> Value {
     y
 }
 
+/// **THE CENTRED NORM** (multimodal §6.1): mean-subtract, then rms-normalize,
+/// with no scale and no bias.
+///
+/// The vision towers' `nn.LayerNorm`, minus the two learned vectors, which
+/// BAKE: `LN(x)·Mᵀ = (c/rms(c))·diag(w)·Mᵀ + b·Mᵀ` for `c = x − mean(x)`, so
+/// a text folds `w` into the GEMM that reads the norm and `b·Mᵀ` into that
+/// GEMM's bias at import, and writes this. Whole rows, no head grouping.
+pub fn layernorm_no_scale(x: &Value, eps: f32) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::LayernormNoScale {
+            x: x.id(),
+            eps,
+            y: y.id(),
+        },
+        &[x],
+    );
+    y
+}
+
+/// **THE CLIPPED LINEAR'S CLAMP** (multimodal §6.5): `min(max(x, lo), hi)`,
+/// in place, both bounds trace constants.
+///
+/// gemma4's `use_clipped_linears` publishes `{input,output}_{min,max}` beside
+/// every vision projection; a text writes `clamp` before the matmul and after
+/// it. Both bounds are the checkpoint's own numbers, so they are stated here
+/// and never read from device memory.
+/// **THE SAME CLAMP, WITH THE BOUNDS THE CHECKPOINT SHIPS** (multimodal
+/// §12.2): `lo` and `hi` are `[1]` weight planes.
+///
+/// gemma4's `use_clipped_linears` is not a flag, it is 448 learned scalars —
+/// `input_min`/`input_max` and `output_min`/`output_max` beside every vision
+/// projection, all finite in the E4B checkpoint and all different. A text
+/// cannot state them: `Model::new(w, kv, tp, dims)` has no checkpoint in the
+/// room, and a catalog row carrying 448 numbers would be a checkpoint
+/// transcribed into a `const`.
+///
+/// [`clamp`] stays for a bound the CONFIG states — `swiglu_limit` is one — the
+/// way [`mul_scalar`] and [`scale`] both stay. Which one a text writes is a
+/// question about where the number lives, and that is the only question.
+pub fn clamp_learned(x: &Value, lo: &Weight, hi: &Weight) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::ClampLearned {
+            x: x.id(),
+            lo: r.weight(lo),
+            hi: r.weight(hi),
+            x_out: x_out.id(),
+        },
+        &[x],
+    );
+    x_out
+}
+
+pub fn clamp(x: &Value, lo: f32, hi: f32) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Clamp {
+            x: x.id(),
+            lo,
+            hi,
+            x_out: x_out.id(),
+        },
+        &[x],
+    );
+    x_out
+}
+
 pub fn rmsnorm_gated(x: &Value, gate: &Value, weight: &Weight, head_dim: u32, eps: f32) -> Value {
     let r = x.rec();
     let y = r.fresh(gate.ty().clone());
@@ -429,4 +500,49 @@ pub fn hc_fold(x: &Value, streams: &Value, post_mix: &Value, comb_mix: &Value) -
         &[x, streams, post_mix, comb_mix],
     );
     y
+}
+
+/// **THE MULTIMODAL ROTARY**: [`rope_partial`] over a position that is a
+/// triple (multimodal §2's second op).
+///
+/// `positions` is `[rows, 3]` `i32`, one `(t, h, w)` per rotated row, and
+/// `sections` is the checkpoint's own `mrope_section` — a trace constant, so
+/// it is stated here rather than read from device memory. Rotates in place,
+/// like every rope arm beside it.
+///
+/// `form` is the section LAYOUT (multimodal §6.3): the trunk states
+/// [`MropeForm::Interleaved`] (`mrope_interleaved: true`), the tower states
+/// [`MropeForm::Blocked`], and the feeder is
+/// [`Input::mrope_positions`](crate::Input::mrope_positions) on the token axis
+/// or [`Input::patch_positions`](crate::Input::patch_positions) on the patch
+/// one.
+pub fn rope_mrope(
+    q: &Value,
+    k: &Value,
+    positions: &Value,
+    sections: [u32; 3],
+    form: MropeForm,
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+) -> (Value, Value) {
+    let r = q.rec();
+    let q_out = r.fresh(q.ty().clone());
+    let k_out = r.fresh(k.ty().clone());
+    r.push(
+        Elementwise::RopeMrope {
+            q: q.id(),
+            k: k.id(),
+            positions: positions.id(),
+            sections,
+            form,
+            rotary_dim,
+            head_dim,
+            theta,
+            q_out: q_out.id(),
+            k_out: k_out.id(),
+        },
+        &[q, k, positions],
+    );
+    (q_out, k_out)
 }

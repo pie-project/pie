@@ -14,15 +14,11 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
-// Every `with_context` in this file is inside cuda-gated code: the one
-// bootstrap-TOML writer left, and the two seams that read back what it wrote.
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-use anyhow::Context;
+// `Context` is NOT cuda-gated, though it was: `register_operator_adapters`
+// reads its plane files and registers them on every build, so a gate that
+// named only the cuda and apple-metal seams left `cargo test -p worker` (which
+// builds the lib with `cfg(test)` false) unable to resolve `with_context`.
+use anyhow::{Context, Result, anyhow};
 
 #[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
 use crate::config::MetalEngineOptions;
@@ -43,7 +39,7 @@ use crate::engine_ffi::Flavor;
 // were the C++ engines, which link after Rust, so without a reference from
 // reachable Rust the entry points were simply absent at final link.
 //
-// Both engines are Rust now. `model-loader` and `model` are called directly,
+// Both engines are Rust now. `checkpoint` and `model` are called directly,
 // through their own types, and there is nothing on the far side of an FFI
 // boundary to keep alive.
 
@@ -176,7 +172,7 @@ fn weight_cache_dir() -> String {
 /// caches derived from `$XDG_CACHE_HOME`/`$HOME/.cache` instead, not as a
 /// choice but because the engine had never been told `$PIE_HOME`. That split
 /// pie's state across two roots: `pie serve` wrote programs, logs and
-/// optimized checkpoints under one and compiled PTIR, GEMM tuning and planner
+/// optimized checkpoints under one and compiled ETA, GEMM tuning and planner
 /// profiles under another.
 static CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
@@ -436,20 +432,20 @@ pub fn remove_launch_state() {
 ///
 /// A rename, not an alias with a new spelling behind it: the 30-field
 /// `EngineCapabilities` mixed three subjects (the device, the load, and the
-/// MODEL) and the contract's [`Capabilities`](engine_api::Capabilities)
+/// MODEL) and the contract's [`Capabilities`](engine::Capabilities)
 /// separates them — `device`, `pools`, `limits`, and a
 /// `ModelProfile` carried whole rather than rebuilt from eight booleans
-/// (`engine-api::caps`'s header). Three of the old fields have no successor
+/// (`engine::caps`'s header). Three of the old fields have no successor
 /// because they were never the engine's to answer: `snapshot_dir`,
 /// `model_id` and `arch_name` say where the CALLER's checkpoint came from,
 /// and the caller is this crate. They are on
 /// [`GroupEngine`](crate::translate::GroupEngine) now.
-pub use engine_api::Capabilities as EngineCapabilities;
+pub use engine::Capabilities as EngineCapabilities;
 
 /// The ceilings a load is baked against, out of what the operator stated.
 ///
 /// **THIS IS WHERE `ModelLoadDesc` WENT.** Its four fields said nothing this
-/// does not: `snapshot_dir` is [`Checkpoint::Path`](engine_api::Checkpoint),
+/// does not: `snapshot_dir` is [`Checkpoint::Path`](engine::Checkpoint),
 /// `component` is which `Trace` you hand over, and `runtime_quant`/`mxfp4_moe`
 /// were a quantization word and a MoE lowering name that a backend
 /// string-matched — the plan's params carry their own dtypes, and which
@@ -461,14 +457,18 @@ pub use engine_api::Capabilities as EngineCapabilities;
 /// each seated sequence one block of `max_context / page_size` pages: how
 /// many sequences fit is that division, not a third knob to keep in step.
 #[cfg(any(feature = "_engine-cuda", test))]
-fn cuda_budgets(opts: &CudaNativeEngineOptions, adapter_seats: u32) -> engine_api::Budgets {
+fn cuda_budgets(
+    opts: &CudaNativeEngineOptions,
+    adapter_seats: u32,
+    patch_ceilings: (Option<u32>, Option<u32>),
+) -> engine::Budgets {
     let page_size = opts.kv_page_size.unwrap_or(16).max(1);
     // No CUDA knob states a context ceiling — `max_model_len` is the Metal
     // options' — so this is the contract's own default, stated once here
     // rather than guessed twice.
-    let max_context = engine_api::Budgets::default().max_context;
+    let max_context = engine::Budgets::default().max_context;
     let pages_per_slot = max_context.div_ceil(page_size).max(1);
-    engine_api::Budgets {
+    engine::Budgets {
         max_lanes: opts.max_forward_requests.unwrap_or(256).max(1),
         max_tokens: opts.max_forward_tokens.unwrap_or(8192).max(1),
         // Empty is a DEFERRAL, not "no buckets": `engine_cuda::api::lattice`
@@ -500,6 +500,17 @@ fn cuda_budgets(opts: &CudaNativeEngineOptions, adapter_seats: u32) -> engine_ap
         slots: opts
             .max_total_pages
             .map_or(256, |pages| (pages / pages_per_slot).max(1)),
+        // **THE SECOND ROW AXIS, AND `None` IS THE ANSWER FOR ALMOST EVERY
+        // DEPLOYMENT** (alto multimodal §5.5). Both absent means the shell
+        // derives a ladder from the loaded TEXT — rungs at whole images when
+        // the plan states a patch axis, and no ladder at all when it does not
+        // — so a vision SKU serves with zero configuration and a text-only
+        // one is byte-for-byte the load it always was.
+        //
+        // `[model]` rather than `[model.engine.options]` for `max_adapters`'
+        // reason: a ceiling on a row axis is not a fact about a backend.
+        max_patches: patch_ceilings.0,
+        max_images: patch_ceilings.1,
     }
 }
 
@@ -513,11 +524,12 @@ fn cuda_budgets(opts: &CudaNativeEngineOptions, adapter_seats: u32) -> engine_ap
 fn land(
     backend: &mut ::runtime::engine::EngineBox,
     snapshot_dir: &Path,
-    budgets: engine_api::Budgets,
-    platform: engine_api::model_ir::Platform,
+    budgets: engine::Budgets,
+    residency: engine::Residency,
+    platform: model_ir::Platform,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
-) -> Result<engine_api::Loaded> {
+) -> Result<engine::Loaded> {
     if component != crate::executor::ModelComponent::Full {
         // palo B-component: an encoder is a traced plan like any other, and
         // the catalog ships no encoder trace. Refused by name rather than
@@ -536,14 +548,20 @@ fn land(
         snapshot_dir,
         platform,
         budgets,
-        // **UNCAPPED, WHICH IS WHAT THIS DEPLOYMENT HAS ALWAYS ASKED FOR**
-        // (alto design §7). The residency policy is two budgets and `None`
-        // is uncapped; no shell in this workspace streams weights, so the
-        // only budget a worker could state that would change anything is one
-        // that refuses the load. Stated by name rather than left to
-        // `Default` so that the day `[model]` grows a weight budget, this is
-        // the line it arrives at.
-        engine_api::Residency::uncapped(),
+        // **THE DAY ARRIVED: `[model]`'S TWO WEIGHT BUDGETS LAND HERE**
+        // (alto design §7, W-3). The residency policy is two budgets and
+        // `None` is uncapped, so a config that states neither reaches the
+        // engine as `Residency::uncapped()` and this deployment behaves
+        // exactly as it did before the keys existed -- the whole weight table
+        // on the device, never moving. A budget a shell cannot meet by
+        // holding LESS refuses the load by name, with both numbers, rather
+        // than being rounded to the nearest thing that is built.
+        //
+        // `[model] device_weight_budget` is not `[engine]
+        // gpu_mem_utilization`: this one bounds the model's weight table,
+        // that one bounds the elastic physical pool (KV pages and scratch).
+        // `crate::config::ModelConfig::residency` carries the whole argument.
+        residency,
         -1,
         frames_in_flight,
     )?;
@@ -559,14 +577,14 @@ fn land(
 /// and nothing in the tree walked through either. This is the first caller,
 /// and boot is the right instant for it — registration is a control-plane
 /// RESIDENCY verb, once per adapter and never again
-/// (`engine_api::adapter`'s own argument for why it is not a `transfer`), so
+/// (`engine::adapter`'s own argument for why it is not a `transfer`), so
 /// it belongs beside the load rather than on any request path.
 ///
 /// It runs HERE, between `land` and the engine's handover to the scheduler,
 /// because that is the last instant the worker holds the `EngineBox` itself.
 ///
 /// A plane file is one bank's slot, verbatim: the padding is the caller's
-/// (`engine_api::adapter` argues why a shell cannot do it), and a file whose
+/// (`engine::adapter` argues why a shell cannot do it), and a file whose
 /// length is not the slot's is refused by the engine with both numbers in it.
 ///
 /// # Errors
@@ -721,7 +739,10 @@ pub(crate) fn write_cuda_startup_toml(
     // **`[engine]`: THE SHELL'S OWN WORDS** (alto article 9 — shells read no
     // environment). Nine `PIE_CUDA_*` variables were read inside the shell at
     // load and are typed `Boot` fields now; this is the table they arrive
-    // through, and `runtime::engine::backend::cuda::knobs` is the one reader.
+    // through, and `engine_cuda::boot::knobs` is the one reader. It was
+    // `runtime::engine::backend::cuda::knobs` until the reader moved into the
+    // shell that declares the `Knobs` it parses into; what this comment claims
+    // — ONE reader — is what the move preserved.
     //
     // EVERY KEY IS OMITTED WHEN THE OPERATOR STATED NOTHING, like the derived
     // keys above and for the same reason: the shell's own default IS the
@@ -897,6 +918,12 @@ pub(crate) fn create_engine_backend_group(
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     adapters: &crate::config::AdapterConfig,
+    residency: engine::Residency,
+    // **THE SECOND ROW AXIS'S CEILINGS, OR BOTH `None` TO DERIVE THEM** (alto
+    // multimodal §5.5) — `[model] max_patches` / `[model] max_images`, threaded
+    // as VALUES beside `residency` for W-3's reason: this layer holds a boot
+    // document and an adapter roster, not the worker's `Config`.
+    patch_ceilings: (Option<u32>, Option<u32>),
 ) -> Result<crate::translate::GroupEngine> {
     validate_snapshot_dir(snapshot_dir)?;
     if rank_options.is_empty() {
@@ -975,8 +1002,9 @@ pub(crate) fn create_engine_backend_group(
     let loaded = land(
         &mut backend,
         snapshot_dir,
-        cuda_budgets(opts, adapters.seats()),
-        engine_api::model_ir::Platform::Cuda,
+        cuda_budgets(opts, adapters.seats(), patch_ceilings),
+        residency,
+        model_ir::Platform::Cuda,
         component,
         frames_in_flight,
     )?;
@@ -1011,6 +1039,12 @@ pub(crate) fn create_engine_backend(
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     adapters: &crate::config::AdapterConfig,
+    residency: engine::Residency,
+    // **THE SECOND ROW AXIS'S CEILINGS, OR BOTH `None` TO DERIVE THEM** (alto
+    // multimodal §5.5) — `[model] max_patches` / `[model] max_images`, threaded
+    // as VALUES beside `residency` for W-3's reason: this layer holds a boot
+    // document and an adapter roster, not the worker's `Config`.
+    patch_ceilings: (Option<u32>, Option<u32>),
 ) -> Result<crate::translate::GroupEngine> {
     // Each is used only inside a `#[cfg(feature = "engine-…")]` arm below.
     let _ = (group_id, tp, config, weight_dtype);
@@ -1023,8 +1057,8 @@ pub(crate) fn create_engine_backend(
     // fall back to.
     let (mut backend, budgets, platform): (
         ::runtime::engine::EngineBox,
-        engine_api::Budgets,
-        engine_api::model_ir::Platform,
+        engine::Budgets,
+        model_ir::Platform,
     ) = match options {
             #[cfg(not(any(
                 feature = "_engine-cuda",
@@ -1072,8 +1106,8 @@ pub(crate) fn create_engine_backend(
                 let backend = ::runtime::engine::backend::open::cuda(&boot_doc)?;
                 (
                     backend,
-                    cuda_budgets(opts, adapters.seats()),
-                    engine_api::model_ir::Platform::Cuda,
+                    cuda_budgets(opts, adapters.seats(), patch_ceilings),
+                    model_ir::Platform::Cuda,
                 )
             }
             // METAL, BACK AT P5, AND IT HANDS OVER THE DOCUMENT — the same
@@ -1101,7 +1135,7 @@ pub(crate) fn create_engine_backend(
                 let backend = ::runtime::engine::backend::open::metal(&boot_doc)?;
                 (
                     backend,
-                    engine_api::Budgets {
+                    engine::Budgets {
                         max_lanes: opts.max_forward_requests.max(1),
                         max_tokens: opts.max_forward_tokens.max(1),
                         buckets: Vec::new(),
@@ -1114,10 +1148,16 @@ pub(crate) fn create_engine_backend(
                         page_size: opts.kv_page_size.max(1),
                         max_context: opts
                             .max_model_len
-                            .unwrap_or_else(|| engine_api::Budgets::default().max_context),
+                            .unwrap_or_else(|| engine::Budgets::default().max_context),
                         slots: opts.total_pages.max(1),
+                        // The metal mirror binds no patch seat and refuses
+                        // every patch-axis input by name, so a ladder here
+                        // would be a ceiling on a rectangle this plane cannot
+                        // resolve. `None` is the honest answer, not a default.
+                        max_patches: None,
+                        max_images: None,
                     },
-                    engine_api::model_ir::Platform::Metal,
+                    model_ir::Platform::Metal,
                 )
             }
         };
@@ -1135,6 +1175,7 @@ pub(crate) fn create_engine_backend(
         &mut backend,
         snapshot_dir,
         budgets,
+        residency,
         platform,
         component,
         frames_in_flight,
@@ -1169,7 +1210,7 @@ mod tests {
             max_total_pages: Some(1024),
             ..Default::default()
         };
-        let budgets = cuda_budgets(&opts, 0);
+        let budgets = cuda_budgets(&opts, 0, (None, None));
         assert_eq!(budgets.page_size, 16);
         // 4096 tokens of context is 256 pages a slot; 1024 pages seats four.
         assert_eq!(budgets.max_context, 4096);
@@ -1178,12 +1219,12 @@ mod tests {
         // No cap stated: the contract's own default seat count, not a
         // division by nothing.
         opts.max_total_pages = None;
-        assert_eq!(cuda_budgets(&opts, 0).slots, 256);
+        assert_eq!(cuda_budgets(&opts, 0, (None, None)).slots, 256);
 
         // A cap smaller than one slot's block still seats one — a pool that
         // seats nothing is a load that cannot fire.
         opts.max_total_pages = Some(1);
-        assert_eq!(cuda_budgets(&opts, 0).slots, 1);
+        assert_eq!(cuda_budgets(&opts, 0, (None, None)).slots, 1);
     }
 
     /// **THE OPERATOR'S SEAT COUNT REACHES THE BUDGET**, which is the half of
@@ -1199,11 +1240,11 @@ mod tests {
     fn the_adapter_seat_count_crosses_into_the_budget() {
         let opts = CudaNativeEngineOptions::default();
         assert_eq!(
-            cuda_budgets(&opts, 0).max_adapters,
+            cuda_budgets(&opts, 0, (None, None)).max_adapters,
             0,
             "a deployment that states no adapters still registers none"
         );
-        assert_eq!(cuda_budgets(&opts, 8).max_adapters, 8);
+        assert_eq!(cuda_budgets(&opts, 8, (None, None)).max_adapters, 8);
     }
 
     /// A stand-in checkpoint config for the tests that are about something

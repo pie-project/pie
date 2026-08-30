@@ -99,6 +99,55 @@ impl Shell {
         !self.exports.scores.is_empty()
     }
 
+    /// Whether this load can serve `IntrinsicId::AttnScore` — the artifact
+    /// declares a capture column AND the slab that observes it was carved.
+    ///
+    /// Two conditions and not one, because they can disagree honestly: a
+    /// deployment whose lane budget or head count made the slab impossible
+    /// declares the seam and observes nothing, and a program that bound
+    /// against it would read address zero. `has_attn_score` is the answer to
+    /// "will a fire of this load write scores", not to "does this text have a
+    /// capture arm".
+    #[must_use]
+    pub fn observes_scores(&self) -> bool {
+        self.scores.is_some()
+    }
+
+    /// How many planes the slab holds per lane — exported attention layers ×
+    /// query heads, and the ceiling a program's declared plane count is
+    /// refused against. `0` for a load that observes nothing.
+    #[must_use]
+    pub fn score_planes(&self) -> u32 {
+        self.scores.as_ref().map_or(0, crate::scores::Scores::planes)
+    }
+
+    /// How many query heads each exported layer contributes to the slab.
+    /// `0` for a load that observes nothing.
+    #[must_use]
+    pub fn score_heads(&self) -> u32 {
+        self.scores.as_ref().map_or(0, crate::scores::Scores::heads)
+    }
+
+    /// **THE OBSERVABILITY CONTRACT, READ BACK** — one lane's whole block of
+    /// score planes, `score_planes()` rows of
+    /// [`ATTN_SCORE_KV_MAX`](eta_ir::registry::ATTN_SCORE_KV_MAX) F32 each,
+    /// row-major and layer-major.
+    ///
+    /// The bytes the epilogue's `attn_score` intrinsic is pointed at, at the
+    /// address it is pointed at, copied to the host for a gate that cannot
+    /// attach a guest program. `None` for a load that observes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`](crate::error::Fault::Ceiling) for a lane past the
+    /// slab; the device's own for the copy.
+    pub fn observed(&self, lane: u32) -> crate::error::Result<Option<Vec<f32>>> {
+        self.scores
+            .as_ref()
+            .map(|scores| scores.read_lane(lane))
+            .transpose()
+    }
+
     /// The attention layers this load exports a capture column for, in the
     /// plan's own order.
     #[must_use]
@@ -120,7 +169,7 @@ impl Shell {
 
     /// **Is the whole weight table on the device?** (alto design §7.)
     ///
-    /// What [`LoadFacts::weights_resident`](engine::engine_api::load::LoadFacts)
+    /// What [`LoadFacts::weights_resident`](engine::load::LoadFacts)
     /// reports. `false` says this load opened the routed-expert tier, and
     /// [`Shell::expert_residency`] is what says how much of it is where.
     #[must_use]

@@ -62,9 +62,9 @@
 //! [`Run::tensor`]: crate::run::Run
 //! [`SlotTable`]: crate::run::SlotTable
 
-use engine::store::arena::rect;
 use kernels_metal::Tensor;
-use model_compiler::ArenaMap;
+use model_compiler::{ArenaMap, FireRows};
+use model_exec::store::arena::rect;
 use model_ir::ValueId;
 
 use crate::device::{Buffer, Context, Handles};
@@ -208,7 +208,7 @@ impl Arena {
 /// buffer, and a buffer is a device call. What survives is the property
 /// underneath it, that every value resolves to the rectangle its root names
 /// at the row count this fire has, and that is
-/// [`engine::store::arena::rect`] — neutral, and held to account host-side
+/// [`model_exec::store::arena::rect`] — neutral, and held to account host-side
 /// in the tests beside it. What is left here is the one line a Metal view
 /// is: an `(offset, bytes)` pair minted into a bounds-checked handle row,
 /// where the CUDA plane adds `base + offset` and hands out a `u64`.
@@ -227,7 +227,10 @@ pub fn carve(
     let mut rows: Vec<Option<Tensor>> = Vec::with_capacity(map.placements.len());
     for value in 0..map.placements.len() {
         let value = ValueId(value as u32);
-        rows.push(match rect(map, value, tokens, lanes) {
+        // **`text_only`, AND IT IS TRUE HERE RATHER THAN DEFAULTED**: this plane
+        // binds no patch seat and refuses every patch-axis input by name, so a
+        // fire it serves has no patch rows to size a rectangle at.
+        rows.push(match rect(map, value, FireRows::text_only(tokens, lanes)) {
             Some(rect) => Some(Tensor::new(
                 handles.bind(store, rect.offset, rect.bytes)?,
                 rect.rows,
@@ -238,4 +241,44 @@ pub fn carve(
         });
     }
     Ok(SlotTable(rows))
+}
+
+/// How many ROWS each value's slot can hold, `ValueId`-indexed.
+///
+/// **THE SLOT'S RESERVATION, NOT THE FIRE'S EXTENT**, and that is the whole
+/// reason this is a second table rather than a field of [`SlotTable`]. A
+/// carved rectangle states what THIS fire touches ([`rect`]'s `bytes`); what a
+/// padding decision needs is the other number — how far past its own last row
+/// a launch may write before it runs into the next value's slot. `Placement::
+/// Arena::bytes` is that number, carved once at the budget's ceiling, so this
+/// is a load-time constant and is asked for once.
+///
+/// `0` for a value the arena binds no rectangle for and for one whose element
+/// has no byte size, which is the answer that makes a caller fall back to the
+/// unpadded width rather than pad into somebody else's bytes.
+///
+/// The consumer is `kernels_metal::linear::quant::mb_rows`, whose `capacity`
+/// argument is exactly this: "the rows its activation and result rectangles
+/// actually hold, not the rows this fire uses".
+#[must_use]
+pub fn capacities(map: &ArenaMap) -> Vec<u32> {
+    (0..map.placements.len())
+        .map(|at| {
+            let root = map.root(ValueId(at as u32));
+            let Some(model_compiler::Placement::Arena {
+                bytes,
+                width,
+                dtype,
+                ..
+            }) = map.placements.get(root.0 as usize)
+            else {
+                return 0;
+            };
+            let row = width.saturating_mul(model_compiler::arena::elem_bytes(*dtype).unwrap_or(0));
+            if row == 0 {
+                return 0;
+            }
+            u32::try_from(bytes / row).unwrap_or(u32::MAX)
+        })
+        .collect()
 }

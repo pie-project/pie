@@ -21,13 +21,13 @@ pub struct GroupEngine {
     /// guest-visible profile.
     pub caps: EngineCapabilities,
     /// What the load came out as: its plan's name and the bytes it landed.
-    pub facts: engine_api::LoadFacts,
+    pub facts: engine::LoadFacts,
     /// Where this worker resolved the checkpoint.
     ///
     /// **THE CALLER'S ANSWER, NOT THE ENGINE'S.** It was
     /// `EngineCapabilities::snapshot_dir`, echoed back by an engine that had
     /// just been handed it; the contract dropped it for exactly that reason
-    /// (`engine-api::caps`: "`snapshot_dir`/`model_id`/`arch_name` say where
+    /// (`engine::caps`: "`snapshot_dir`/`model_id`/`arch_name` say where
     /// the caller's own checkpoint came from").
     pub snapshot_dir: PathBuf,
     /// The device behind it.
@@ -139,7 +139,7 @@ fn build_model(
             // the half of `Capabilities` its own subject lives in — `pools`
             // for capacities, `limits` for ceilings, `profile` for what a
             // guest program may name — which is the split
-            // `engine-api::caps`'s header argues for.
+            // `engine::caps`'s header argues for.
             ::runtime::bootstrap::EngineConfig {
                 total_pages: g.caps.pools.kv_pages as usize,
                 // The host-swap pool is a DEPLOYMENT's, not a load's: the
@@ -155,8 +155,8 @@ fn build_model(
                 has_mtp_drafts: g.caps.profile.has_mtp_drafts,
                 has_value_head: g.caps.profile.has_value_head,
                 // `has_kv_envelopes` has no successor: it advertised a
-                // model-gated PTIR intrinsic the profile does not carry, and
-                // the runtime's `PtirCaps` is the only reader.
+                // model-gated ETA intrinsic the profile does not carry, and
+                // the runtime's `EtaCaps` is the only reader.
                 has_kv_envelopes: false,
                 has_attn_page_mask: g.caps.profile.has_attn_page_mask,
                 has_attn_score: g.caps.profile.has_attn_score,

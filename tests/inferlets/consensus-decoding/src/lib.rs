@@ -9,7 +9,7 @@
 //! Independent Gumbel noise drives top-p sampling in each lane.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 use std::time::Instant;
 

@@ -46,7 +46,7 @@
 //! this inferlet does not carry. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]

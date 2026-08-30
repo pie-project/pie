@@ -18,6 +18,16 @@
 //! truncate — and a stale fire handle cannot survive into the next fire to
 //! be resolved against the wrong offset.
 //!
+//! **THE REWIND IS AT ENQUEUE AND NOT AT SETTLE, AND THAT IS WHAT LETS TWO
+//! STEPS BE IN FLIGHT.** A row is read by the ENCODER, at
+//! `setBuffer:offset:`, and a command buffer retains what it was bound to —
+//! so a step's rows are dead the moment its last dispatch is encoded, long
+//! before the device has finished the work. Held until settlement instead,
+//! the table would have no room for the step behind. The one row a settlement
+//! still needs — the out seam's, for the readout copy — is resolved into a
+//! retained buffer and a `u64` offset while it is still alive, which is why
+//! nothing downstream of `enqueue` holds a handle at all.
+//!
 //! A row RETAINS its buffer. That is what lets the arena, the pools and the
 //! inputs slab each be owned by their own module while the sink resolves a
 //! handle without borrowing any of them.

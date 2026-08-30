@@ -1,4 +1,4 @@
-//! `Fallback::Copy`: `impl engine::fire::Serve for Run<'_>` — the shell's
+//! `Fallback::Copy`: `impl model_exec::fire::Serve for Run<'_>` — the shell's
 //! half of the answer P4's menu asks for below the copy/split crossover
 //! (design §3, `model_compiler::layout`'s `CROSSOVER_ROWS`).
 //!
@@ -47,10 +47,10 @@
 //! reading its input from one slab rectangle and writing its output to
 //! another would not be in place any more.
 
-use engine::fire::Serve;
-use kernels::KernelError;
 use kernels_cuda::{Tensor, layout};
 use model_compiler::Region;
+use model_exec::KernelError;
+use model_exec::fire::Serve;
 use model_ir::{Def, Dim, Operands, Operation, Ty, ValueId};
 
 use crate::run::Run;
@@ -217,7 +217,13 @@ impl Run<'_> {
     /// these launches write are one arithmetic — asking the scratch plane
     /// twice for the same name in one fire answers the same pointer, but
     /// deriving both from one call is what makes that not need to be true.
-    fn move_rows(&mut self, region: &Region, out: bool) -> Result<(), KernelError> {
+    ///
+    /// Answers [`kernels_cuda::Error`] and not the contract's `KernelError`,
+    /// for the reason the `Dispatch*` families answer it: every call in the
+    /// body is a `kernels-cuda` entry, and `?` converts to the enclosing
+    /// function's error type. [`Serve::gather`] and [`Serve::scatter`] below
+    /// are the two lines that lift it (`crate::error::kernel`).
+    fn move_rows(&mut self, region: &Region, out: bool) -> Result<(), kernels_cuda::Error> {
         let mut plan = self.copy_plan(region);
         if plan.slots.is_empty() {
             // A prepare region's copy is not a movement at all: its builder
@@ -283,10 +289,10 @@ impl Serve for Run<'_> {
     }
 
     fn gather(&mut self, region: &Region) -> Result<(), KernelError> {
-        self.move_rows(region, false)
+        self.move_rows(region, false).map_err(crate::error::kernel)
     }
 
     fn scatter(&mut self, region: &Region) -> Result<(), KernelError> {
-        self.move_rows(region, true)
+        self.move_rows(region, true).map_err(crate::error::kernel)
     }
 }

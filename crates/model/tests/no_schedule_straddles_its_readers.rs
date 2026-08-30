@@ -5,14 +5,22 @@
 //! row-shaped table that slices — it is a carving. How many requests it
 //! batches, where each request's query rows begin, how its work items split
 //! the kv and how much of its grant it padded to are all fixed when the
-//! builder walks the window it was dispatched in. The compiler then narrows a
-//! prepare node by DEMAND to the union of the classes reading its struct
-//! (design build log 7), which is the right answer for a shared tensor and the
-//! wrong SHAPE for two windowed readers: an arm standing in a narrower window
-//! hands the schedule its own rebased boundaries, and every work item past the
-//! first request indexes a `qo_indptr` that has already ended. Nothing faults
-//! on the device — the reads land in whatever follows a `[lanes + 1]` vector —
-//! and the answer is wrong logits.
+//! builder walks the window it was dispatched in. What goes wrong when a
+//! second arm borrows one is a shape error: an arm standing in a narrower
+//! window hands the schedule its own rebased boundaries, and every work item
+//! past the first request indexes a `qo_indptr` that has already ended.
+//! Nothing faults on the device — the reads land in whatever follows a
+//! `[lanes + 1]` vector — and the answer is wrong logits.
+//!
+//! **HOW THE CLASS SET OF A SCHEDULE IS DECIDED, SINCE menlo M20.** A plan is
+//! an op built off ONE class's arm of `inputs.split(..)` and "the node's guard
+//! IS its class". So the demand walk in `resolve_classes` cannot widen it: it
+//! reaches the plan value from a borrowing arm, finds a producer whose guard
+//! does not hold in that class, and stops. Before M20 a plan carried no class
+//! of its own and demand DID widen it to the union of its readers (design
+//! build log 7) — the right answer for a shared tensor and the wrong shape for
+//! two windowed readers. The union is gone, which means a borrowed schedule is
+//! now caught once, at the borrower, rather than twice.
 //!
 //! So it is a property of the MODEL TEXT, and the cheapest instant to say so
 //! is the sweep the author already runs. `resolve_classes` gives the per-node
@@ -155,20 +163,40 @@ fn a_schedule_shared_by_two_classes_is_caught() {
     }
     assert!(rewritten > 0, "gemma declares masked arms to rewrite");
 
-    // Both readers of each now-shared schedule are named, which is the point:
-    // demand widened the prepare node to the union {prefill, masked}, so the
-    // prefill arm is straddling its own schedule too.
+    // ONE LINE PER BORROWED SCHEDULE, NOT TWO.
+    //
+    // This asserted `2 * rewritten` when it was written, and that was right
+    // then: a plan carried no class of its own, demand widened it to the union
+    // {prefill, masked}, and the prefill arm was left straddling its OWN
+    // schedule because the union no longer matched its mask. menlo M20 made
+    // the plan an op built off one arm of `inputs.split(..)` — "the node's
+    // guard IS its class" — so the walk now stops at that guard. The schedule
+    // keeps the prefill arm's mask, the prefill arm still matches it exactly,
+    // and only the borrower is caught.
+    //
+    // That is the better regime and not a weaker one: the defect is named once
+    // rather than twice, at the arm that borrowed and therefore at the arm
+    // that has the fix, and `Recorder::push` refuses the borrow at authoring
+    // time besides. What this control still proves is the only thing it was
+    // ever for — that the sweep is not vacuous.
     let caught = straddles(&trace);
     assert_eq!(
         caught.len(),
-        2 * rewritten,
-        "each shared schedule is straddled from both sides — by the masked arm that \
-         borrowed it and by the prefill arm it was carved for:\n{}",
+        rewritten,
+        "each borrowed schedule is straddled exactly once, by the arm that borrowed \
+         it:\n{}",
+        caught.join("\n"),
+    );
+    // ALL, not ANY. Every line is the same defect seen at the same place, so a
+    // run where some other pair crept in is a run asserting something else.
+    assert!(
+        caught.iter().all(|line| line.contains("attention.masked")),
+        "the borrower is the masked arm, and every line should name it:\n{}",
         caught.join("\n"),
     );
     assert!(
-        caught.iter().any(|line| line.contains("attention.masked"))
-            && caught.iter().any(|line| line.contains("attention.prefill")),
-        "both arms are named"
+        caught.iter().all(|line| line.contains("attention.plan_prefill")),
+        "and what it borrowed is the prefill arm's schedule:\n{}",
+        caught.join("\n"),
     );
 }

@@ -5,7 +5,7 @@ the workspace, and a list is a claim about the workspace that nothing
 checks. This tree has already paid for that claim twice.
 
 The rename of 2026-08-08 collapsed six crate names onto three. It left
-`-p tensor-compiler` in one clippy step FOUR TIMES, which is harmless in
+`-p eta-compiler` in one clippy step FOUR TIMES, which is harmless in
 itself -- but the reason it took months to notice is the same reason a
 crate DROPPING OUT would have taken months to notice: nobody reads a
 fifteen-entry `-p` list. When the duplication was finally found, the

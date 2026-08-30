@@ -1,7 +1,7 @@
 //! The seam between the two halves of `pie.tokenizer/1`.
 //!
 //! `runtime/tokenizer` proves a tokenizer survives serialization, and
-//! `model-loader` proves a metadata object survives an artifact. Neither proves
+//! `checkpoint` proves a metadata object survives an artifact. Neither proves
 //! the join: that the objects `to_canonical` produces, written under
 //! `__meta__/` and read back out of a `.zt` file by name, rebuild the same
 //! tokenizer. That join is the whole load path a served artifact uses, and it
@@ -10,10 +10,10 @@
 
 use std::collections::HashMap;
 
-use model_loader::checkpoint::meta;
-use model_loader::checkpoint::read::parse_checkpoint_metadata;
-use model_loader::checkpoint::write::CheckpointWriter;
-use model_loader::types::{DType, Encoding, TensorDecl, TensorId, Visibility};
+use checkpoint::file::meta;
+use checkpoint::file::read;
+use checkpoint::file::write::Writer;
+use checkpoint::types::{DType, Encoding, TensorDecl, TensorId, Visibility};
 use tokenizer::Tokenizer;
 use tokenizer::canonical::CanonicalTokenizer;
 // The object the checkpoint's own `config.json` is carried under, from the
@@ -30,7 +30,7 @@ fn read_tokenizer(artifact: &std::path::Path) -> anyhow::Result<Tokenizer> {
 }
 
 fn parse_metadata(artifact: &std::path::Path) -> anyhow::Result<HashMap<String, Vec<u8>>> {
-    let checkpoint = parse_checkpoint_metadata(artifact)
+    let checkpoint = read::parse_metadata(artifact)
         .map_err(|err| anyhow::anyhow!("reading {}: {err}", artifact.display()))?;
     let mut objects = HashMap::new();
     for object in checkpoint.meta_objects() {
@@ -68,7 +68,7 @@ fn a_tokenizer_survives_the_artifact() {
 
     // Weights and metadata go in together, in one ascending name order —
     // `__meta__/` (0x5F) sorts before a lowercase weight name.
-    let mut writer = CheckpointWriter::create(&artifact, &Default::default()).unwrap();
+    let mut writer = Writer::create(&artifact, &Default::default()).unwrap();
     for (path, bytes) in canonical.objects() {
         writer.add_meta(path, bytes).unwrap();
     }
@@ -96,7 +96,7 @@ fn a_tokenizer_survives_the_artifact() {
     }
 
     // The weight is still a weight, and the tokenizer objects are still not.
-    let checkpoint = parse_checkpoint_metadata(&artifact).unwrap();
+    let checkpoint = read::parse_metadata(&artifact).unwrap();
     let weights: Vec<&str> = checkpoint.weights().map(|t| t.name.as_str()).collect();
     assert_eq!(weights, ["model.embed.weight"]);
     assert_eq!(checkpoint.meta_objects().count(), 5);
@@ -112,7 +112,7 @@ fn an_incomplete_tokenizer_is_refused_by_name() {
     let vocab: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
     let canonical = Tokenizer::from_vocab(&vocab).to_canonical().unwrap();
 
-    let mut writer = CheckpointWriter::create(&artifact, &Default::default()).unwrap();
+    let mut writer = Writer::create(&artifact, &Default::default()).unwrap();
     for (path, bytes) in canonical.objects() {
         if path == tokenizer::canonical::MERGE_TABLE {
             continue;

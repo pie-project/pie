@@ -1,7 +1,7 @@
 # text-completion-bench
 
 Benchmarking and reference text-completion harness. This is not an algorithm
-inferlet; it exists to drive the same PTIR completion path under benchmark
+inferlet; it exists to drive the same ETA completion path under benchmark
 controls and to return exact token-count envelopes.
 
 ## Purpose

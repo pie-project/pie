@@ -406,6 +406,36 @@ constant constexpr uint kMaxExperts = 1024;
         sel < 0 ? bfloat(0) : x[(uint(sel) / k) * pitch + gid.x];
 }
 
+/* The inverse of `route_gather`: sorted rows back into ROUTE order.
+ *
+ * `combine_sorted` beside this one weights and folds in the same pass, which
+ * is what the reference driver's mixture does because its dataflow owns both
+ * halves. This plane's IR does not: `linear.moe_matmul_select_*` lands a
+ * result of `tokens * top_k` rows and `linear.moe_weighted_sum` folds it,
+ * two statements a dispatch arm cannot merge. So the batched arm undoes its
+ * own permutation and hands the fold the rectangle it was promised.
+ *
+ * The inverse costs nothing to compute -- `route_sort` writes `inv` as it
+ * places each pair -- and one elementwise pass over `n_pairs x width` against
+ * a GEMM that reads every expert's slice once is not the term that decides
+ * anything.
+ */
+[[kernel]] void route_scatter(
+    const device bfloat* sorted [[buffer(0)]],
+    device bfloat* out         [[buffer(1)]],
+    const device int* inv      [[buffer(2)]],
+
+    const constant uint& rows      [[buffer(3)]],
+    const constant uint& width     [[buffer(4)]],
+    const constant uint& out_pitch [[buffer(5)]],
+    uint2 gid                  [[thread_position_in_grid]]) {
+    if (gid.x >= width || gid.y >= rows) return;
+    const int at = inv[gid.y];
+    const uint pitch = out_pitch != 0u ? out_pitch : width;
+    out[uint(gid.y) * pitch + gid.x] =
+        at < 0 ? bfloat(0) : sorted[uint(at) * width + gid.x];
+}
+
 [[kernel]] void expert_combine(
     const device bfloat* y             [[buffer(0)]],
     const device float* expert_weights [[buffer(1)]],

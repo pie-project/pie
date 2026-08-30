@@ -46,23 +46,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // THE RING IS THE RUNTIME'S NOW. `ChannelBinding` was
-// `engine_api::local::ChannelBinding` — an engine's private ring layout,
+// `engine::local::ChannelBinding` — an engine's private ring layout,
 // published into the contract so a C caller could poke it — and the palo
 // rewrite deleted it. Every word of arithmetic below is unchanged; what
 // changed is that the bytes it reads belong to a `HostRing` this runtime
 // allocated (`crate::engine::channel`, whose header argues it) rather than to
 // an engine's device memory.
 use crate::engine::{ChannelBinding, ChannelEndpoint};
-use tensor_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
-use tensor_ir::types::DType;
+use eta_ir::container::{self, ChanDType, ChannelDecl, ExternDir, HostRole};
+use eta_ir::types::Dtype;
 
 /// The ticket a channel endpoint that neither consumes nor publishes states.
 ///
-/// Was `engine_api::plan::CHANNEL_TICKET_NONE`, and it moved for the reason
+/// Was `engine::plan::CHANNEL_TICKET_NONE`, and it moved for the reason
 /// every sentinel in the rewrite moved: it is the runtime's own bookkeeping —
 /// the run-ahead cursor a fire reserves and rolls back. What DOES cross is a
 /// stated prediction on the lane that carries the pass
-/// ([`engine_api::Ticket`] via `Lane::channels`), and it crosses only for an
+/// ([`engine::Ticket`] via `Lane::channels`), and it crosses only for an
 /// engine whose control kernels check it; this sentinel never travels.
 pub const TICKET_NONE: u64 = u64::MAX;
 
@@ -87,7 +87,7 @@ pub struct ChannelCell {
     /// Declared dims (guest constructor). Checked against the container decl
     /// at bind.
     pub shape: Vec<u32>,
-    pub dtype: DType,
+    pub dtype: Dtype,
     pub capacity: u32,
     /// The container's role, stamped at bind (`None` = not yet bound to a
     /// forward pass).
@@ -200,7 +200,7 @@ impl std::error::Error for ChannelError {}
 impl ChannelCell {
     /// A fresh, unbound cell (the guest `channel` constructor). Mints a fresh
     /// global channel id (the engine's device-registry key).
-    pub fn new(shape: Vec<u32>, dtype: DType, capacity: u32) -> Self {
+    pub fn new(shape: Vec<u32>, dtype: Dtype, capacity: u32) -> Self {
         ChannelCell {
             global_id: next_channel_id(),
             shape,
@@ -665,7 +665,7 @@ impl ChannelCell {
         native: &[u8],
     ) -> Result<(), ChannelError> {
         let cell_bytes = binding.cell_bytes as usize;
-        let wire_len = if self.dtype == DType::Bool {
+        let wire_len = if self.dtype == Dtype::Bool {
             native.len().div_ceil(8)
         } else {
             native.len()
@@ -681,7 +681,7 @@ impl ChannelCell {
         let cell = unsafe {
             std::slice::from_raw_parts_mut((binding.mirror_base + offset) as *mut u8, cell_bytes)
         };
-        if self.dtype == DType::Bool {
+        if self.dtype == Dtype::Bool {
             pack_bool_into(native, cell);
         } else {
             cell.copy_from_slice(native);
@@ -725,7 +725,7 @@ impl ChannelCell {
             return Err(ChannelError::Full);
         }
         let cell_bytes = binding.cell_bytes as usize;
-        let wire_len = if self.dtype == DType::Bool {
+        let wire_len = if self.dtype == Dtype::Bool {
             native.len().div_ceil(8)
         } else {
             native.len()
@@ -744,7 +744,7 @@ impl ChannelCell {
         let cell = unsafe {
             std::slice::from_raw_parts_mut((binding.mirror_base + offset) as *mut u8, cell_bytes)
         };
-        if self.dtype == DType::Bool {
+        if self.dtype == Dtype::Bool {
             pack_bool_into(native, cell);
         } else {
             cell.copy_from_slice(native);
@@ -902,7 +902,7 @@ impl ChannelCell {
     ///
     /// # The seed is not in the host ring, and the ring has to know
     ///
-    /// A seed rides [`InstanceBinding::seeds`](engine_api::InstanceBinding)
+    /// A seed rides [`InstanceBinding::seeds`](engine::InstanceBinding)
     /// straight into the shell's ring — it never travels through the host
     /// ring the runtime owns, so both of that ring's words are still zero when
     /// the bind returns. [`ChannelCell::bind`] meanwhile charges
@@ -1007,7 +1007,7 @@ impl ChannelCell {
         let native_len = self.native_len();
         let packed_bool_len = self.numel().div_ceil(8);
         let cell_bytes = cell_bytes as usize;
-        if cell_bytes != native_len && !(self.dtype == DType::Bool && cell_bytes == packed_bool_len)
+        if cell_bytes != native_len && !(self.dtype == Dtype::Bool && cell_bytes == packed_bool_len)
         {
             return Err(format!(
                 "channel {}: mirror cell has {cell_bytes} bytes, expected {native_len}",
@@ -1198,12 +1198,12 @@ fn read_mirror_cell(reader: &ReaderMirror, sequence: u64) -> Vec<u8> {
 }
 
 fn decode_reader_cell(
-    dtype: DType,
+    dtype: Dtype,
     numel: usize,
     native_len: usize,
     wire: Vec<u8>,
 ) -> Result<Vec<u8>, ChannelError> {
-    let native = if dtype == DType::Bool {
+    let native = if dtype == Dtype::Bool {
         if wire.len() == native_len {
             wire.into_iter().map(|byte| u8::from(byte != 0)).collect()
         } else {
@@ -1255,10 +1255,10 @@ pub fn unpack_bool(wire: &[u8], numel: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tensor_ir::container::{ChanDType, ChannelDecl};
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::container::{ChanDType, ChannelDecl};
+    use eta_ir::types::{Dtype, Shape};
 
-    fn decl(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
+    fn decl(shape: Shape, dtype: Dtype, role: HostRole, seeded: bool) -> ChannelDecl {
         ChannelDecl {
             shape,
             dtype: ChanDType::Concrete(dtype),
@@ -1280,18 +1280,18 @@ mod tests {
         vec![
             mk(
                 vec![8],
-                DType::Bool,
-                &decl(Shape::vector(8), DType::Bool, HostRole::Writer, false),
+                Dtype::Bool,
+                &decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, false),
             ),
             mk(
                 vec![1],
-                DType::I32,
-                &decl(Shape::vector(1), DType::I32, HostRole::Reader, false),
+                Dtype::I32,
+                &decl(Shape::vector(1), Dtype::I32, HostRole::Reader, false),
             ),
             mk(
                 vec![1],
-                DType::I32,
-                &decl(Shape::vector(1), DType::I32, HostRole::None, true),
+                Dtype::I32,
+                &decl(Shape::vector(1), Dtype::I32, HostRole::None, true),
             ),
         ]
     }
@@ -1333,9 +1333,9 @@ mod tests {
     #[test]
     fn prebind_put_stages_and_seed_pops() {
         // A guest seeds a channel BEFORE any forward pass exists.
-        let mut c = ChannelCell::new(vec![1], DType::I32, 1);
+        let mut c = ChannelCell::new(vec![1], Dtype::I32, 1);
         c.put(7i32.to_le_bytes().to_vec()).unwrap();
-        c.bind(&decl(Shape::vector(1), DType::I32, HostRole::None, true));
+        c.bind(&decl(Shape::vector(1), Dtype::I32, HostRole::None, true));
         assert_eq!(c.take_seed().unwrap(), 7i32.to_le_bytes().to_vec());
         assert!(c.seed_taken);
         // A second put on the fired device-private channel is illegal.
@@ -1347,14 +1347,14 @@ mod tests {
             }
         );
         // A missing seed is a first-fire error.
-        let mut m = ChannelCell::new(vec![1], DType::I32, 1);
-        m.bind(&decl(Shape::vector(1), DType::I32, HostRole::None, true));
+        let mut m = ChannelCell::new(vec![1], Dtype::I32, 1);
+        m.bind(&decl(Shape::vector(1), Dtype::I32, HostRole::None, true));
         assert_eq!(m.take_seed().unwrap_err(), ChannelError::MissingSeed);
     }
 
     #[test]
     fn set_empty_and_errors_without_changing_staging() {
-        let mut cell = ChannelCell::new(vec![1], DType::I32, 2);
+        let mut cell = ChannelCell::new(vec![1], Dtype::I32, 2);
         assert_eq!(
             cell.set(1i32.to_le_bytes().to_vec()).unwrap_err(),
             ChannelError::Empty
@@ -1390,24 +1390,24 @@ mod tests {
 
     #[test]
     fn bind_validates_constructor_geometry() {
-        let c = ChannelCell::new(vec![2, 3], DType::U32, 1);
+        let c = ChannelCell::new(vec![2, 3], Dtype::U32, 1);
         assert!(
             c.matches_decl(&decl(
                 Shape::matrix(2, 3),
-                DType::U32,
+                Dtype::U32,
                 HostRole::None,
                 false
             ))
             .is_ok()
         );
         assert!(
-            c.matches_decl(&decl(Shape::vector(6), DType::U32, HostRole::None, false))
+            c.matches_decl(&decl(Shape::vector(6), Dtype::U32, HostRole::None, false))
                 .is_err()
         );
         assert!(
             c.matches_decl(&decl(
                 Shape::matrix(2, 3),
-                DType::I32,
+                Dtype::I32,
                 HostRole::None,
                 false
             ))
@@ -1484,10 +1484,10 @@ mod tests {
 
     #[test]
     fn packed_bool_mirror_decodes_to_native_bytes() {
-        let mut cell = ChannelCell::new(vec![10], DType::Bool, 1);
+        let mut cell = ChannelCell::new(vec![10], Dtype::Bool, 1);
         cell.bind(&decl(
             Shape::vector(10),
-            DType::Bool,
+            Dtype::Bool,
             HostRole::Reader,
             false,
         ));
@@ -1573,9 +1573,9 @@ mod tests {
         &'static [AtomicU64],
         &'static crate::engine::RegisteredChannel,
     ) {
-        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, false);
+        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, false);
         declaration.capacity = capacity;
-        let mut writer = ChannelCell::new(vec![8], DType::Bool, capacity);
+        let mut writer = ChannelCell::new(vec![8], Dtype::Bool, capacity);
         writer.matches_decl(&declaration).unwrap();
         writer.bind(&declaration);
         let table = waker::WakerTable::global();
@@ -1659,7 +1659,7 @@ mod tests {
     /// [`ChannelCell::commit_seed`] is where the two are reconciled.
     #[test]
     fn a_seeded_writers_second_put_is_not_full_for_ever() {
-        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, true);
+        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, true);
         declaration.capacity = 1;
         let (mut writer, mirror, words, registered) = writer_ring(1, 1);
         // The seed, as the guest staged it before the bind.
@@ -1703,7 +1703,7 @@ mod tests {
     /// is written to the ring or published to the tail word.
     #[test]
     fn a_seeded_latest_value_writers_set_replaces_the_delivered_seed() {
-        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, true);
+        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, true);
         declaration.capacity = 1;
         let (mut writer, mirror, words, registered) = writer_ring(1, 1);
         // The seed, as the guest staged it before the bind.
@@ -1749,7 +1749,7 @@ mod tests {
 
     #[test]
     fn writer_set_replaces_only_committed_front_and_rejects_in_flight_use() {
-        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, true);
+        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, true);
         declaration.capacity = 2;
         let (mut writer, mirror, words, registered) = writer_ring(2, 1);
         writer.bind(&declaration);
@@ -1786,7 +1786,7 @@ mod tests {
 
     #[test]
     fn cold_rebind_resynchronizes_device_tickets_from_the_live_ring() {
-        let mut declaration = decl(Shape::vector(8), DType::Bool, HostRole::Writer, false);
+        let mut declaration = decl(Shape::vector(8), Dtype::Bool, HostRole::Writer, false);
         declaration.capacity = 2;
         let (mut writer, _mirror, words, registered) = writer_ring(2, 1);
         writer.attach(11, &declaration, None).unwrap();

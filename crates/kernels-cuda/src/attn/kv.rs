@@ -3,8 +3,8 @@
 //! keys, the active-page dequant prelude the fa2 entries run, and the mla
 //! latent writer the mla/index appends share.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
@@ -38,7 +38,7 @@ impl KvScheme {
     }
 }
 
-fn scheme_of(op: &'static str, pool: &KvPool) -> Result<KvScheme, KernelError> {
+fn scheme_of(op: &'static str, pool: &KvPool) -> Result<KvScheme, Error> {
     KvScheme::of_byte(pool.scheme_byte).ok_or_else(|| {
         refuse(
             op,
@@ -82,7 +82,7 @@ pub(crate) fn head_split(
     op: &'static str,
     pool: &KvPool,
     row_width: u32,
-) -> Result<(i32, i32), KernelError> {
+) -> Result<(i32, i32), Error> {
     let wide = if pool.layout != 0 {
         pool.seq_stride
     } else {
@@ -106,9 +106,20 @@ pub(crate) fn head_split(
     Ok((row / head_dim, head_dim))
 }
 
-/// The lane count an indptr spells: `rows - 1`, refused when degenerate.
-pub(crate) fn lanes_of(op: &'static str, indptr: Tensor) -> Result<i32, KernelError> {
-    debug_assert_eq!(indptr.dtype, Dtype::I32, "`{op}` walks an i32 indptr");
+/// The lane count an indptr spells: `rows - 1`, refused when degenerate. The
+/// boundary vector is driver-assembled, not an operand the validator sees, so
+/// a wrong dtype is refused on the same footing as a degenerate length, not
+/// asserted (the boundary rule at [`refuse`]).
+pub(crate) fn lanes_of(op: &'static str, indptr: Tensor) -> Result<i32, Error> {
+    if indptr.dtype != Dtype::I32 {
+        return Err(refuse(
+            op,
+            format!(
+                "the fire's indptr is {:?}, and this entry walks an i32 boundary vector",
+                indptr.dtype
+            ),
+        ));
+    }
     let lanes = indptr.rows.saturating_sub(1);
     if lanes == 0 {
         return Err(refuse(op, "the fire's indptr spells no requests"));
@@ -130,7 +141,7 @@ pub(crate) fn write_kv_to_pages(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let (kv_heads, head_dim) = head_split(op, pool, k.width)?;
     if native_bf16(pool) {
         write_kv_bf16(
@@ -172,7 +183,7 @@ fn write_kv_bf16(
     write_offset: Tensor,
     kv_heads: i32,
     head_dim: i32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let hnd = pool.layout != 0;
     let instantiation = if hnd {
         "::pie::attn::kv_append_explicit<::pie::true_type::value>"
@@ -224,7 +235,7 @@ fn envelope_update_appended(
     max_touched: i32,
     kv_heads: i32,
     head_dim: i32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const fn threads_for(head_dim: i32) -> u32 {
         if head_dim < 256 {
             head_dim.unsigned_abs()
@@ -269,7 +280,7 @@ fn write_kv_quantised(
     pool: &KvPool,
     kv_heads: i32,
     head_dim: i32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let num_requests = lanes_of(op, indptr)?;
     let tokens = k.rows;
     let heads = kv_heads.unsigned_abs();
@@ -386,7 +397,7 @@ pub(crate) fn dequant_active(
     pool: &KvPool,
     num_kv_heads: i32,
     head_dim: i32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     if native_bf16(pool) {
         return Ok(());
     }
@@ -489,7 +500,7 @@ pub(crate) fn write_mla_to_pages(
     pool: &KvPool,
     kv_lora_rank: i32,
     rope_dim: i32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const MLA_WRITE_BLOCK: u32 = 256;
 
     let num_requests = lanes_of(op, indptr)?;

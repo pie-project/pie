@@ -1,5 +1,5 @@
-use model_loader::contract::{Expr, ModelContract, TensorType};
-use model_loader::types::Encoding;
+use checkpoint::contract::{Expr, ModelContract, TensorType};
+use checkpoint::types::Encoding;
 
 use super::model::{Mlp, Model};
 use crate::contract::{ALIGNMENT, ModelError, copy, declare, fused};

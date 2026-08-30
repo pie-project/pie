@@ -29,7 +29,7 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;

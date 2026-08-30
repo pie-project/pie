@@ -184,11 +184,11 @@ impl DevGeo {
 ///
 /// Returns the lane count (`EmbedTokens` extent).
 pub fn detect_pooled_device_geometry(
-    container: &tensor_ir::container::TraceContainer,
+    container: &eta_ir::container::TraceContainer,
 ) -> Option<usize> {
-    use tensor_ir::container::{ChanDType, PortSource};
-    use tensor_ir::registry::Port;
-    use tensor_ir::types::DType;
+    use eta_ir::container::{ChanDType, PortSource};
+    use eta_ir::registry::Port;
+    use eta_ir::types::Dtype;
 
     let channel_of = |port: Port| {
         container
@@ -202,7 +202,7 @@ pub fn detect_pooled_device_geometry(
     let republished = |channel: usize| {
         container.stages.iter().any(|stage| {
             stage.ops.iter().any(|op| {
-                matches!(op, tensor_ir::op::Op::ChanPut { chan, .. } if *chan as usize == channel)
+                matches!(op, eta_ir::op::Op::ChanPut { chan, .. } if *chan as usize == channel)
             })
         })
     };
@@ -211,7 +211,7 @@ pub fn detect_pooled_device_geometry(
     let mask = channel_of(Port::AttnMask)?;
     if !matches!(
         container.channels.get(mask)?.dtype,
-        ChanDType::Concrete(DType::Bool)
+        ChanDType::Concrete(Dtype::Bool)
     ) {
         return None;
     }
@@ -241,7 +241,7 @@ pub fn detect_pooled_device_geometry(
     }
     if !matches!(
         tokens.dtype,
-        ChanDType::Concrete(DType::I32) | ChanDType::Concrete(DType::U32)
+        ChanDType::Concrete(Dtype::I32) | ChanDType::Concrete(Dtype::U32)
     ) {
         return None;
     }
@@ -255,12 +255,12 @@ pub fn detect_pooled_device_geometry(
 /// host-writer channel is `fresh`; the host-reader `[B]` bool channel is
 /// `w_cont` (the reclaim signal). `None` for an ordinary decode.
 pub fn detect_device_geometry(
-    container: &tensor_ir::container::TraceContainer,
+    container: &eta_ir::container::TraceContainer,
 ) -> Option<(usize, usize, usize)> {
-    use tensor_ir::container::HostRole;
-    use tensor_ir::container::{ChanDType, PortSource};
-    use tensor_ir::registry::Port;
-    use tensor_ir::types::DType;
+    use eta_ir::container::HostRole;
+    use eta_ir::container::{ChanDType, PortSource};
+    use eta_ir::registry::Port;
+    use eta_ir::types::Dtype;
 
     let has_write_desc = container
         .ports
@@ -290,7 +290,7 @@ pub fn detect_device_geometry(
         .iter()
         .position(|c| c.host_role == HostRole::Writer)?;
     let w_cont_dense = container.channels.iter().position(|c| {
-        c.host_role == HostRole::Reader && matches!(c.dtype, ChanDType::Concrete(DType::Bool))
+        c.host_role == HostRole::Reader && matches!(c.dtype, ChanDType::Concrete(Dtype::Bool))
     })?;
     Some((b, fresh_dense, w_cont_dense))
 }
@@ -368,12 +368,12 @@ mod tests {
         assert_eq!(lease.in_flight(), 0);
     }
 
-    use tensor_ir::container::{ChanDType, ChannelDecl, HostRole, PortBinding, PortSource};
-    use tensor_ir::container::{StageProgram, TraceContainer};
-    use tensor_ir::registry::{Port, Stage};
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::container::{ChanDType, ChannelDecl, HostRole, PortBinding, PortSource};
+    use eta_ir::container::{StageProgram, TraceContainer};
+    use eta_ir::registry::{Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
 
-    fn ch(shape: Shape, dtype: DType, role: HostRole) -> ChannelDecl {
+    fn ch(shape: Shape, dtype: Dtype, role: HostRole) -> ChannelDecl {
         ChannelDecl {
             shape,
             dtype: ChanDType::Concrete(dtype),
@@ -391,11 +391,11 @@ mod tests {
         TraceContainer {
             names: vec![],
             channels: vec![
-                ch(Shape::matrix(b, p), DType::U32, HostRole::None), // 0 pages
-                ch(Shape::vector(b), DType::U32, HostRole::None),    // 1 w_slot
-                ch(Shape::vector(b), DType::U32, HostRole::None),    // 2 w_off
-                ch(Shape::vector(b), DType::U32, HostRole::Writer),  // 3 fresh
-                ch(Shape::vector(b), DType::Bool, HostRole::Reader), // 4 w_cont
+                ch(Shape::matrix(b, p), Dtype::U32, HostRole::None), // 0 pages
+                ch(Shape::vector(b), Dtype::U32, HostRole::None),    // 1 w_slot
+                ch(Shape::vector(b), Dtype::U32, HostRole::None),    // 2 w_off
+                ch(Shape::vector(b), Dtype::U32, HostRole::Writer),  // 3 fresh
+                ch(Shape::vector(b), Dtype::Bool, HostRole::Reader), // 4 w_cont
             ],
             ports: vec![
                 PortBinding {
@@ -433,7 +433,7 @@ mod tests {
         // A plain decode: KvLen only (no WSlot/WOff write descriptors), P == 1.
         let c = TraceContainer {
             names: vec![],
-            channels: vec![ch(Shape::vector(1), DType::I32, HostRole::None)],
+            channels: vec![ch(Shape::vector(1), Dtype::I32, HostRole::None)],
             ports: vec![PortBinding {
                 port: Port::KvLen,
                 source: PortSource::Channel(0),
@@ -455,7 +455,7 @@ mod tests {
         // WSlot/WOff present but Pages is [B,1] (P == 1) — not a multi-page beam.
         let mut c = devgeo_container(2, 1);
         // pages [B,1]
-        c.channels[0] = ch(Shape::matrix(2, 1), DType::U32, HostRole::None);
+        c.channels[0] = ch(Shape::matrix(2, 1), Dtype::U32, HostRole::None);
         assert!(
             detect_device_geometry(&c).is_none(),
             "P == 1 ⇒ not device-geometry"
@@ -466,14 +466,14 @@ mod tests {
 #[cfg(test)]
 mod pooled_tests {
     use super::detect_pooled_device_geometry;
-    use tensor_ir::container::{
+    use eta_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use tensor_ir::op::Op;
-    use tensor_ir::registry::{Port, Stage};
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
 
-    fn chan(shape: Shape, dtype: DType) -> ChannelDecl {
+    fn chan(shape: Shape, dtype: Dtype) -> ChannelDecl {
         ChannelDecl {
             shape,
             dtype: ChanDType::Concrete(dtype),
@@ -488,14 +488,14 @@ mod pooled_tests {
     /// `is_loop_carried_explicit_geometry_trace` contract).
     fn masked_decode(lanes: u32, pool: u32) -> TraceContainer {
         let decls = [
-            (Port::EmbedTokens, Shape::vector(lanes), DType::I32),
-            (Port::Positions, Shape::vector(lanes), DType::U32),
-            (Port::Pages, Shape::vector(lanes * 2), DType::U32),
-            (Port::PageIndptr, Shape::vector(lanes + 1), DType::U32),
-            (Port::KvLen, Shape::vector(lanes), DType::U32),
-            (Port::WSlot, Shape::vector(lanes), DType::U32),
-            (Port::WOff, Shape::vector(lanes), DType::U32),
-            (Port::AttnMask, Shape::matrix(lanes, pool), DType::Bool),
+            (Port::EmbedTokens, Shape::vector(lanes), Dtype::I32),
+            (Port::Positions, Shape::vector(lanes), Dtype::U32),
+            (Port::Pages, Shape::vector(lanes * 2), Dtype::U32),
+            (Port::PageIndptr, Shape::vector(lanes + 1), Dtype::U32),
+            (Port::KvLen, Shape::vector(lanes), Dtype::U32),
+            (Port::WSlot, Shape::vector(lanes), Dtype::U32),
+            (Port::WOff, Shape::vector(lanes), Dtype::U32),
+            (Port::AttnMask, Shape::matrix(lanes, pool), Dtype::Bool),
         ];
         let mut container = TraceContainer {
             names: vec![],

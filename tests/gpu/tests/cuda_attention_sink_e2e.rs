@@ -1,11 +1,11 @@
 //! A4 mask-migration DEVICE e2e — real engine. Second exercise of the
-//! token-at-a-time, B=1 explicit-write PTIR geometry the A4 mask inferlets
+//! token-at-a-time, B=1 explicit-write ETA geometry the A4 mask inferlets
 //! migrated onto (superseding the classic `forward-pass` +
 //! `attention_mask(list<brle>)` surface). The `attention-sink` inferlet drives a
 //! single-sequence masked decode: one token per pass, the input token DEVICE
 //! loop-carried (argmax fed back), and ALL geometry — position, KV length,
 //! WSlot/WOff write descriptor, and the sink+window `attn_mask` — evolved in-graph
-//! in the epilogue, submitted through the `inferlet::ptir` bridge
+//! in the epilogue, submitted through the `inferlet::eta` bridge
 //! (`forward-pass.new` / `pipeline.submit`):
 //!
 //!   guest sink-decode program

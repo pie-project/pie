@@ -101,6 +101,17 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
                         help="Enable engine-supplied NGRAM speculative-decoding drafts.")
     parser.add_argument("--spec-num-drafts", type=int, default=4,
                         help="Number of NGRAM draft tokens proposed per iteration.")
+    # **THE RECORDING POLICY, AS A HARNESS KNOB** (`[engine] graphs`).
+    #
+    # A suite whose plan bakes a CONDITIONAL region cannot be served by the
+    # cuda shell's recorded path — `cudaGraphSetConditional` wants an rdc +
+    # cudadevrt link stage this crate does not have — and the MTP draft head is
+    # the catalog's one conditional (`model-compiler`'s
+    # `which_skus_get_a_conditional`: "the MTP head and nothing else"). Eager
+    # is slow and correct, so a gate about a draft head can ask for it and say
+    # in its own header that it did.
+    parser.add_argument("--graphs", default=None, choices=["on", "off", "shaped"],
+                        help="engine graph-recording policy ([engine] graphs)")
     parser.add_argument("--output-dir", default=None,
                         help="If set, write each test's captured inferlet output to "
                              "<dir>/<test-name>.txt (one file per test, multiple "
@@ -307,6 +318,8 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     if args.spec_ngram:
         engine_subsection["spec_ngram_enabled"] = True
         engine_subsection["spec_ngram_num_drafts"] = args.spec_num_drafts
+    if args.graphs is not None:
+        engine_subsection["graphs"] = args.graphs
 
     cfg = Config(
         server=ServerConfig(port=0),
@@ -377,26 +390,27 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
 
 #: Engine capabilities that NO engine in this repository advertises.
 #:
-#: `PtirCaps` (`crates/engine-api/src/capabilities.rs`) declares
-#: `has_kv_envelopes`, `has_attn_score` and `has_attn_page_mask`, and every
-#: engine that fills one in states it as a literal `false`: `engine-cuda/src/
-#: serve/load.rs`, `engine-vulkan/src/shell.rs`, `engine-metal/src/serve/
-#: load.rs`, and the runtime-side `vulkan.rs` and `wgpu.rs` adapters. All five,
-#: all three fields, no condition and no environment variable.
+#: `EtaCaps` (`crates/runtime/src/model.rs`) declares `has_kv_envelopes`,
+#: `has_attn_score` and `has_attn_page_mask`. A suite whose inferlets bind a
+#: name listed here cannot pass anywhere, on any backend, on any checkpoint --
+#: not a bug in the suite, but the repo-side regression floor for a feature
+#: that is partly built. Running one without knowing costs a model boot and
+#: produces a screen of identical bind refusals, which is exactly the shape of
+#: output that teaches nothing.
 #:
-#: So a suite whose inferlets bind `envelope_dot`, `attn_score` or
-#: `attn_page_mask` cannot pass anywhere, on any backend, on any checkpoint.
-#: That is not a bug in the suite -- these are the repo-side regression floor
-#: for a feature that is partly built and not finished -- but running one
-#: without knowing it costs a model boot and produces a screen of identical
-#: bind refusals, which is exactly the shape of output that teaches nothing.
-#:
-#: `crates/engine-api/tests/nothing_advertises_the_attention_taps.rs` holds
-#: the other end: when someone flips a literal, that gate fails and names this
-#: constant, so the skip below cannot outlive the gap it describes.
+#: **`attn_score` CAME OFF THIS LIST** (`.wiki/alto/attn-score.md` §4, wave
+#: S1). The CUDA shell carves an observability slab, the capture arm writes a
+#: per-key rectangle into it as the graph runs, and the epilogue binds it --
+#: so `engine-cuda`'s `profile()` answers `shell.observes_scores()` rather
+#: than a literal `false`, and a program reading the intrinsic at
+#: `Stage::Epilogue` binds and fires. What did NOT come off is the other two:
+#: `envelope_dot` wants a second-party page-envelope kernel that no shell
+#: ships (a separate design, `attn-score.md` §3's closing line), and
+#: `attn_page_mask` wants a shell that CONSUMES the sink -- a different door
+#: from this one, and the reason `trackb-h2o` and `trackb-snapkv` still stop
+#: at bind while `tova-attention` and `snapkv-eviction` do not.
 UNADVERTISED = {
     "envelope_dot": "has_kv_envelopes",
-    "attn_score": "has_attn_score",
     "attn_page_mask": "has_attn_page_mask",
 }
 
@@ -425,7 +439,7 @@ def run_tests(
             "engine-metal and the two engine-side adapters, so the suite would boot "
             "a model and then fail every case at bind with the same message.\n"
             "See `conftest.UNADVERTISED`; when the capability lands, "
-            "`crates/engine-api/tests/nothing_advertises_the_attention_taps.rs` "
+            "`crates/engine/tests/nothing_advertises_the_attention_taps.rs` "
             "fails and points back here."
         )
         sys.exit(0)

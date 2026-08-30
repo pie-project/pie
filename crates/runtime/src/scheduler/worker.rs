@@ -1029,7 +1029,7 @@ impl EngineLoop {
         {
             let book = std::sync::Arc::clone(&settlements);
             let published = broker.clone();
-            engine.on_complete(std::sync::Arc::new(move |at: engine_api::StepDone, outcome| {
+            engine.on_complete(std::sync::Arc::new(move |at: engine::StepDone, outcome| {
                 book.settled(at.frame, &outcome, &published);
             }));
         }
@@ -1917,7 +1917,7 @@ impl EngineLoop {
     /// error it re-logs on every teardown.
     fn close_channel(engine: &mut EngineBox, id: u64) -> Result<()> {
         match engine.close_channel(id) {
-            Ok(()) | Err(engine_api::Error::Unsupported { .. }) => Ok(()),
+            Ok(()) | Err(engine::Error::Unsupported { .. }) => Ok(()),
             Err(error) => Err(anyhow::Error::from(error)),
         }
     }
@@ -2463,7 +2463,7 @@ struct SchedulerControl {
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
-    program_ids: Mutex<HashMap<u64, (u64, ::engine_api::program::LaunchPackage)>>,
+    program_ids: Mutex<HashMap<u64, (u64, ::eta_compiler::codegen::launch::LaunchPackage)>>,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
     /// Which memory this engine's KV pages live in.
@@ -2472,7 +2472,7 @@ struct SchedulerControl {
     /// handle and no engine id, and a `KvCopyPlan` they build has to name the
     /// right memory. See `scheduler::device_domain` for what naming the wrong
     /// one cost.
-    device_domain: ::engine_api::MemoryDomain,
+    device_domain: ::engine::MemoryDomain,
 }
 
 #[derive(Clone)]
@@ -2482,7 +2482,7 @@ pub(crate) struct SchedulerHandle {
 
 impl SchedulerHandle {
     /// The memory this scheduler's engine keeps its KV pages in.
-    pub(crate) fn device_domain(&self) -> ::engine_api::MemoryDomain {
+    pub(crate) fn device_domain(&self) -> ::engine::MemoryDomain {
         self.inner.device_domain
     }
 
@@ -4136,7 +4136,7 @@ impl BatchScheduler {
             // `requested_instance_id` was already in the instance map — a
             // check that only meant anything while the RUNTIME chose the id
             // and handed it across for the engine to acknowledge. The engine
-            // mints it (`engine-api::program`'s note on `InstanceBinding`:
+            // mints it (`engine::program`'s note on `InstanceBinding`:
             // "the engine mints the id; the runtime keeps its own tables"), so
             // a collision is not something a caller can ask for.
             _ => {}
@@ -5011,22 +5011,22 @@ mod tests {
     /// anywhere else it calls through this trait.
     struct PanickingEngine;
 
-    impl engine_api::Engine for PanickingEngine {
+    impl engine::Engine for PanickingEngine {
         fn kind(&self) -> &'static str {
             "panicking"
         }
 
         fn load(
             &mut self,
-            _request: engine_api::LoadRequest,
-        ) -> engine_api::Result<engine_api::Loaded> {
-            Err(engine_api::Error::Load("no model".into()))
+            _request: engine::LoadRequest,
+        ) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
         }
 
         fn submit(
             &mut self,
-            _frame: &engine_api::FrameSubmission,
-        ) -> engine_api::Result<engine_api::FrameTicket> {
+            _frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
             panic!("the shape of an interpreter reading lane zero of an empty cell");
         }
     }
@@ -5106,24 +5106,24 @@ mod tests {
         submits: Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl engine_api::Engine for ExhaustedEngine {
+    impl engine::Engine for ExhaustedEngine {
         fn kind(&self) -> &'static str {
             "exhausted"
         }
 
         fn load(
             &mut self,
-            _request: engine_api::LoadRequest,
-        ) -> engine_api::Result<engine_api::Loaded> {
-            Err(engine_api::Error::Load("no model".into()))
+            _request: engine::LoadRequest,
+        ) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
         }
 
         fn submit(
             &mut self,
-            _frame: &engine_api::FrameSubmission,
-        ) -> engine_api::Result<engine_api::FrameTicket> {
+            _frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
             self.submits.fetch_add(1, Ordering::Relaxed);
-            Err(engine_api::Error::Exhausted {
+            Err(engine::Error::Exhausted {
                 resource: "guest channel cells",
                 wanted: 2,
                 available: 1,
@@ -5217,32 +5217,32 @@ mod tests {
     }
 
     impl RecordingEngine {
-        fn hear(&self, verb: &'static str, submission: &engine_api::Step) {
+        fn hear(&self, verb: &'static str, submission: &engine::Step) {
             let word = submission.lanes.first().map_or(u64::MAX, |lane| lane.word);
             self.heard.lock().unwrap().push((verb, word));
         }
     }
 
-    impl engine_api::Engine for RecordingEngine {
+    impl engine::Engine for RecordingEngine {
         fn kind(&self) -> &'static str {
             "recording"
         }
 
         fn load(
             &mut self,
-            _request: engine_api::LoadRequest,
-        ) -> engine_api::Result<engine_api::Loaded> {
-            Err(engine_api::Error::Load("no model".into()))
+            _request: engine::LoadRequest,
+        ) -> engine::Result<engine::Loaded> {
+            Err(engine::Error::Load("no model".into()))
         }
 
-        fn expect_fire(&mut self, submission: &engine_api::Step) {
+        fn expect_fire(&mut self, submission: &engine::Step) {
             self.hear("expect", submission);
         }
 
         fn submit(
             &mut self,
-            frame: &engine_api::FrameSubmission,
-        ) -> engine_api::Result<engine_api::FrameTicket> {
+            frame: &engine::FrameSubmission,
+        ) -> engine::Result<engine::FrameTicket> {
             // ONE `fire` PER STEP, STILL — the recorder's whole job is to say
             // in which order the engine heard about compositions, and a frame
             // is its steps. What changed is that it hears about all of them in
@@ -5264,12 +5264,12 @@ mod tests {
                 self.hear("fire", step);
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Ok(engine_api::FrameTicket {
+            Ok(engine::FrameTicket {
                 id: 0,
                 steps: frame
                     .steps
                     .iter()
-                    .map(|_| engine_api::FireTicket::default())
+                    .map(|_| engine::FireTicket::default())
                     .collect(),
             })
         }

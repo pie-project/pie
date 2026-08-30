@@ -1,13 +1,18 @@
 //! `Moe`: routers, routed matmuls, and the folds that bring the fan-out
-//! back. One entry per IR variant. The one quantized bank form this plane
-//! stamps is mxfp4, spelled in source — the composed affine namespace in
-//! [`quant`](crate::linear::quant) has no routed point here.
+//! back. One entry per IR variant.
+//!
+//! Both quantized bank forms reach the routed matmul, and the entry picks
+//! between them off the [`Bank`] the driver resolved — an mxfp4 bank has no
+//! zero points and an affine one does, which is the same discriminator the
+//! loader seated the row by. Both live in `quant_qmv.metal`, spelled in
+//! source at their own group and width, so neither needs the jit stamp the
+//! tiled affine points in [`quant`](crate::linear::quant) carry.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
-use crate::tensor::Tensor;
+use crate::tensor::{Bank, Tensor};
 
 const ROUTER_MAX_EXPERTS: u32 = 1024;
 
@@ -23,13 +28,115 @@ const MXFP4_BLOCK: u32 = 32;
 /// selected k.
 const SOFTMAX_OVER_SELECTED: u32 = 0;
 
-fn router_lanes(op: &'static str, experts: u32) -> Result<u32, KernelError> {
+/// The file the sort, the gather and the scatter live in.
+const ROUTE_FILE: &str = "linear/moe_route.metal";
+
+/// The file the routed tiled points live in.
+const QMM_FILE: &str = "linear/quant_qmm_t.metal";
+
+/// Threadgroup of the tiled point: `WM * WN * SIMD_SIZE` lanes.
+const QMM_GROUP: [u32; 3] = [32, 2, 2];
+
+/// The contraction step the tiled points walk.
+const QMM_BK: u32 = 32;
+
+/// The three row tiles a routed GEMM is compiled for, narrow first.
+const MOE_TILE_ROWS: [u32; 3] = [16, 32, 64];
+
+/// The column tiles it is compiled for, narrow first.
+const MOE_TILE_COLS: [u32; 3] = [16, 32, 64];
+
+/// When sorting the rows by expert pays for itself.
+///
+/// The sort turns `n_pairs` matvecs into `ceil(count_e / tile)` summed over
+/// the experts — fewer reads of each expert's weights, but a tile that is
+/// only part full does the arithmetic of a whole one. The obvious model says
+/// the two meet where an expert's run half fills a tile.
+///
+/// **THAT MODEL IS WRONG IN THE DIRECTION THAT MATTERS**, and the threshold
+/// carries the measurement instead. A 4-bit mixture is bandwidth-bound: what
+/// batching buys is reading each expert's slice ONCE instead of once per
+/// pair, which is worth far more than the arithmetic a half-empty tile throws
+/// away. On the M1 Max the threshold measured its way from 8 down to 1, and
+/// the difference on a serving fleet is a step function rather than a margin
+/// — gpt-oss-20b at 16 lanes runs 134.1 tok/s at 4 and 310.7 at 1.
+///
+/// Written against the narrow tile, because that is the cheapest way in: a
+/// batch that cannot pay for a 16-row tile cannot pay for a wider one either,
+/// and [`tile_rows`] widens only after this has said yes.
+#[must_use]
+pub fn should_batch(pairs: u32, experts: u32, min_per_expert: u32) -> bool {
+    experts > 0 && u64::from(pairs) >= u64::from(experts) * u64::from(min_per_expert)
+}
+
+/// Rows each expert's run is padded to, for a batch of `pairs` — 1 when the
+/// mixture does not batch at all.
+///
+/// Priced off ROWS PER EXPERT, because that is what decides how much of a
+/// tile a run fills, and measured END TO END rather than modelled: a roofline
+/// probe reads ONE expert with a hot cache and a mixture's threadgroups read
+/// thirty-two, which is why the probe preferred 64 at 448 rows where the
+/// machine wants 32, and preferred a 128-row tile that measures 558.5 → 545.5
+/// tok/s slower in a real mixture. The thresholds are a table of measurements
+/// and not a curve; they live in `DeviceTuning`, and the reason they must be
+/// re-swept whenever the routed GEMM changes lives here.
+///
+/// What a wider tile does NOT cost is the allocation's worst case:
+/// [`sorted_rows`] is deliberately pessimistic and the tiles past the routing
+/// decline at `tile_expert < 0`, so a wider tile dispatches more threadgroups
+/// that do NOTHING rather than more arithmetic.
+#[must_use]
+pub fn tile_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 {
+    if !should_batch(pairs, experts, tuning.moe_batch_min_per_expert) {
+        return 1;
+    }
+    let per = pairs / experts;
+    if per >= tuning.moe_tile_wide_per {
+        return MOE_TILE_ROWS[2];
+    }
+    if per >= tuning.moe_tile_mid_per {
+        MOE_TILE_ROWS[1]
+    } else {
+        MOE_TILE_ROWS[0]
+    }
+}
+
+/// How many sorted rows a batch of `pairs` can produce.
+///
+/// The WORST case and not the actual: the real count depends on how the
+/// router spread the rows, which is a number the GPU has and the host would
+/// have to stall to read. Every touched expert can waste `tile - 1` rows and
+/// at most `min(pairs, experts)` experts are touched, so this bound is
+/// reached and cannot be tightened without the routing itself.
+#[must_use]
+pub fn sorted_rows(pairs: u32, experts: u32, tuning: &crate::DeviceTuning) -> u32 {
+    let tile = tile_rows(pairs, experts, tuning);
+    if tile <= 1 {
+        return pairs;
+    }
+    let touched = pairs.min(experts);
+    let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
+    bound.div_ceil(tile) * tile
+}
+
+/// The widest column tile that divides the output, or `None` when no stamped
+/// one does. Wider is strictly fewer dequantizations of each weight tile.
+#[must_use]
+pub fn tile_cols(out_width: u32) -> Option<u32> {
+    MOE_TILE_COLS
+        .iter()
+        .rev()
+        .copied()
+        .find(|tile| out_width % tile == 0)
+}
+
+fn router_lanes(op: &'static str, experts: u32) -> Result<u32, Error> {
     nonzero(op, "the expert count this router states", experts)?;
     Ok(experts.min(1024).div_ceil(32) * 32)
 }
 
 /// One thread per element, one threadgroup row per token row.
-fn route_rows(op: &'static str, width: u32, rows: u32) -> Result<Grid, KernelError> {
+fn route_rows(op: &'static str, width: u32, rows: u32) -> Result<Grid, Error> {
     nonzero(op, "width", width)?;
     nonzero(op, "rows", rows)?;
     Ok(Grid::of([width, rows, 1], [width.min(256), 1, 1]))
@@ -57,7 +164,7 @@ fn ranked(
     top_k: u32,
     routes: Tensor,
     weights: Tensor,
-) -> Result<Grid, KernelError> {
+) -> Result<Grid, Error> {
     debug_assert_eq!(
         logits.width, experts,
         "the router's row is the expert count the statement states"
@@ -94,7 +201,7 @@ pub fn topk_softmax(
     top_k: u32,
     routes: Tensor,
     weights: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_topk_softmax";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_f32w_bfloat16" });
     debug_assert_eq!(
@@ -131,7 +238,7 @@ pub fn topk_sigmoid(
     scaling: f32,
     routes: Tensor,
     weights: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_topk_sigmoid";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sigmoid" });
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
@@ -162,7 +269,7 @@ pub fn topk_sqrt_softplus(
     scaling: f32,
     routes: Tensor,
     weights: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_topk_sqrt_softplus";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sqrt_softplus" });
     debug_assert_eq!(
@@ -203,7 +310,7 @@ fn selected(
     x: Tensor,
     routes: Tensor,
     y: Tensor,
-) -> Result<Selected, KernelError> {
+) -> Result<Selected, Error> {
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{op}` walks i32 routes");
     nonzero(op, "the routed fan-out", routes.width)?;
     nonzero(op, "K, the activation's width", x.width)?;
@@ -248,7 +355,7 @@ fn selected(
     })
 }
 
-fn select_gemv_grid(op: &'static str, out_width: u32, routed_rows: u32) -> Result<Grid, KernelError> {
+fn select_gemv_grid(op: &'static str, out_width: u32, routed_rows: u32) -> Result<Grid, Error> {
     let lanes = out_width.checked_mul(32).ok_or_else(|| {
         refuse(
             op,
@@ -263,7 +370,7 @@ fn routed_qmv_grid(
     tokens: u32,
     out_width: u32,
     top_k: u32,
-) -> Result<[u32; 3], KernelError> {
+) -> Result<[u32; 3], Error> {
     let x = tokens.checked_mul(32).ok_or_else(|| {
         refuse(
             op,
@@ -281,7 +388,7 @@ pub fn matmul_select(
     bank: Tensor,
     routes: Tensor,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "select_gemv" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
@@ -302,42 +409,86 @@ pub fn matmul_select(
     )
 }
 
-/// Grouped matmul over an mxfp4 bank, with a per-expert bias — the one bank
-/// form this plane stamps. The driver resolves the bank weight to its
-/// `(codes, scales)` planes before calling.
-pub fn matmul_select_bias(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    codes: Tensor,
-    scales: Tensor,
-    bias: Tensor,
-    routes: Tensor,
-    y: Tensor,
-) -> Result<(), KernelError> {
-    const OP: &str = "linear.moe_matmul_select_bias";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4" });
-    debug_assert_eq!(codes.dtype, Dtype::U8, "an mxfp4 bank's codes are u8");
-    debug_assert_eq!(scales.dtype, Dtype::U8, "an mxfp4 bank's scales are u8");
-    debug_assert_eq!(bias.dtype, x.dtype, "the expert bias rides the activation's dtype");
-    let fan = selected(OP, x, routes, y)?;
-    if x.width % MXFP4_BLOCK != 0 {
-        return Err(refuse(
-            OP,
+/// The routed qmv point one bank arrives at.
+///
+/// **THE DISCRIMINATOR IS THE THIRD PLANE, NOT THE GROUP SIZE.** Both codecs
+/// are four bits and both are read by the same `qmv_routed` template; what
+/// separates them is that mxfp4's e8m0 byte IS the whole dequantization while
+/// affine's bf16 factor is half of it, and the other half is the bank's zero
+/// points. So a bank that carries biases takes the affine instantiation and
+/// one that does not takes the mxfp4 one, and the group size is then CHECKED
+/// against the point rather than used to pick it — which is what the loader
+/// asks for by carrying `(group, bits)` on the row instead of assuming a
+/// checkpoint is uniform in them.
+fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static str, Error> {
+    match (bank.affine(), bank.group, bank.bits) {
+        (true, 64, 4) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_64_b_4"),
+        (true, 64, 4) => Ok("affine_qmv_routed_bfloat16_gs_64_b_4"),
+        (false, MXFP4_BLOCK, 4) if biased => Ok("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4"),
+        (false, MXFP4_BLOCK, 4) => Ok("mxfp4_qmv_routed_bfloat16_gs_32_b_4"),
+        (affine, group, bits) => Err(refuse(
+            op,
             format!(
-                "K is {}, not a whole number of {MXFP4_BLOCK}-code mxfp4 blocks",
-                x.width
+                "the bank is {} at {bits} bits in groups of {group}, and `quant_qmv.metal` \
+                 instantiates the routed shapes at affine/64/4 and mxfp4/32/4 only",
+                if affine { "affine" } else { "symmetric" }
+            ),
+        )),
+    }
+}
+
+/// What both routed arms share: the planes agree with the codec the point
+/// was picked for, and K is a whole number of groups.
+fn routed_bank(op: &'static str, x: Tensor, bank: Bank) -> Result<(), Error> {
+    if bank.affine() {
+        debug_assert_eq!(
+            bank.scales.dtype, x.dtype,
+            "an affine bank's factors ride the activation's dtype"
+        );
+    } else {
+        debug_assert!(
+            matches!(bank.scales.dtype, Dtype::E8m0 | Dtype::U8),
+            "an mxfp4 bank's scales are e8m0 exponent bytes"
+        );
+    }
+    if x.width % bank.group != 0 {
+        return Err(refuse(
+            op,
+            format!(
+                "K is {}, not a whole number of {}-code groups",
+                x.width, bank.group
             ),
         ));
     }
+    Ok(())
+}
+
+/// Grouped matmul over a quantized bank, with a per-expert bias: each routed
+/// row multiplies the expert its route selects. The driver resolves the bank
+/// weight to its planes before calling.
+pub fn matmul_select_bias(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    bank: Bank,
+    bias: Tensor,
+    routes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_matmul_select_bias";
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    let entry = routed_point(OP, bank, true)?;
+    debug_assert_eq!(bias.dtype, x.dtype, "the expert bias rides the activation's dtype");
+    let fan = selected(OP, x, routes, y)?;
+    routed_bank(OP, x, bank)?;
     ctx.fire(
         Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
             routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
             QMV_GROUP,
         )),
         &[
-            codes.arg(),
-            scales.arg(),
-            ctx.absent()?, // the affine biases seat; mxfp4 carries none
+            bank.codes.arg(),
+            bank.scales.arg(),
+            zero_points(ctx, bank)?,
             x.arg(),
             y.arg_mut(),
             stated(OP, x.width)?.arg(),
@@ -351,42 +502,30 @@ pub fn matmul_select_bias(
     )
 }
 
-/// Grouped matmul over an mxfp4 bank with nothing added — the bias-free twin
-/// of [`matmul_select_bias`], for the rows-cut expert down-projection, whose
-/// routed bias lands after the reduce through [`bias_sum`] instead. The
-/// driver resolves the bank weight to its `(codes, scales)` planes before
-/// calling, exactly as the biased entry's does.
+/// Grouped matmul over a quantized bank with nothing added — the bias-free
+/// twin of [`matmul_select_bias`], for the rows-cut expert down-projection,
+/// whose routed bias lands after the reduce through [`bias_sum`] instead.
 pub fn matmul_select_quant(
     ctx: &Ctx<'_>,
     x: Tensor,
-    codes: Tensor,
-    scales: Tensor,
+    bank: Bank,
     routes: Tensor,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
-    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "mxfp4_qmv_routed_bfloat16_gs_32_b_4" });
-    debug_assert_eq!(codes.dtype, Dtype::U8, "an mxfp4 bank's codes are u8");
-    debug_assert_eq!(scales.dtype, Dtype::U8, "an mxfp4 bank's scales are u8");
+    dtype_dispatch!(OP, x.dtype, { Bf16 => () });
+    let entry = routed_point(OP, bank, false)?;
     let fan = selected(OP, x, routes, y)?;
-    if x.width % MXFP4_BLOCK != 0 {
-        return Err(refuse(
-            OP,
-            format!(
-                "K is {}, not a whole number of {MXFP4_BLOCK}-code mxfp4 blocks",
-                x.width
-            ),
-        ));
-    }
+    routed_bank(OP, x, bank)?;
     ctx.fire(
         Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
             routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
             QMV_GROUP,
         )),
         &[
-            codes.arg(),
-            scales.arg(),
-            ctx.absent()?, // the affine biases seat; mxfp4 carries none
+            bank.codes.arg(),
+            bank.scales.arg(),
+            zero_points(ctx, bank)?,
             x.arg(),
             y.arg_mut(),
             stated(OP, x.width)?.arg(),
@@ -400,13 +539,248 @@ pub fn matmul_select_quant(
     )
 }
 
+/// The device planes the sorted arm works in, beside the operands the op
+/// named.
+///
+/// **NOTHING HERE IS AN OUTPUT.** Every field is a working rectangle whose
+/// contents are dead the moment [`matmul_select_batched`] returns, and every
+/// one is sized off `n_pairs`, `n_experts` and [`sorted_rows`] — quantities
+/// the host knows before the fire and the router decides during it. They are
+/// a parameter rather than something this plane carves because `kernels-metal`
+/// allocates nothing; the shell that owns the arena hands them in.
+#[derive(Clone, Copy, Debug)]
+pub struct RoutedScratch {
+    /// `i32`, [`sorted_rows`] long: the pair index each sorted row came from,
+    /// or −1 for a row the padding invented.
+    pub perm: Tensor,
+
+    /// `i32`, [`sorted_rows`] long: which expert each sorted row belongs to.
+    pub row_expert: Tensor,
+
+    /// `i32`, one per TILE of the sorted stack: the expert that tile serves,
+    /// or −1 for a tile past the routing. **This is what makes the padding
+    /// free** — a declined tile returns before it reads a weight.
+    pub tile_expert: Tensor,
+
+    /// `i32`, `n_pairs` long: where each pair landed. The inverse permutation
+    /// comes free from the sort, which is why the scatter costs no second
+    /// pass to build one.
+    pub inv: Tensor,
+
+    /// The activation gathered into expert-major order: `sorted_rows x K`.
+    pub x: Tensor,
+
+    /// The routed product in that same order: `sorted_rows x N`.
+    pub y: Tensor,
+}
+
+/// The routed tiled point one bank and one tile arrive at, or `None` when the
+/// shader stamps none for that combination.
+///
+/// Three families are stamped and the fourth and fifth are absent on purpose,
+/// as they are in the reference: `affine_qmm_t_routed` carries no bias seat
+/// and `mxfp4_qmm_t_routed_bias` requires one, so an affine bank WITH a
+/// per-expert bias and an mxfp4 bank WITHOUT one both take the matvec arm.
+/// Answering either with the point beside it would read an unbound buffer.
+fn batched_point(
+    op: &'static str,
+    bank: Bank,
+    biased: bool,
+    bm: u32,
+    bn: u32,
+    fp16: bool,
+) -> Result<Option<crate::linear::quant::Point>, Error> {
+    let (bm, bn) = (stated(op, bm)?, stated(op, bn)?);
+    match (bank.affine(), bank.group, bank.bits, biased) {
+        // The FP16 staged-weight arm: the loader dequantizes straight to
+        // `half` and feeds the instruction pre-Apple9 silicon actually has,
+        // which is ~40% of the routed GEMM's arithmetic. Stamped in source,
+        // so no jit stamp.
+        (true, 64, 4, false) if fp16 => Ok(Some(crate::linear::quant::Point {
+            entry: crate::linear::quant::routed_fp16_point(op, bm, bn)?,
+            stamp: "",
+        })),
+        (true, group, bits, false) => Ok(Some(crate::linear::quant::qmm_point(
+            op,
+            "_routed",
+            "PIE_STAMP_qmm_t_routed",
+            stated(op, group)?,
+            stated(op, bits)?,
+            bm,
+            bn,
+        )?)),
+        (false, MXFP4_BLOCK, 4, true) => Ok(Some(crate::linear::quant::Point {
+            entry: crate::linear::quant::mxfp4_routed_point(op, bm, bn)?,
+            stamp: "",
+        })),
+        _ => Ok(None),
+    }
+}
+
+/// The sorted, batched routed matmul: one GEMM over runs of equal expert,
+/// where the matvec arm runs one simdgroup per (row, four columns).
+///
+/// **THE SORT IS THE WHOLE OF IT.** `route_sort` histograms the routing
+/// decision into per-expert counts, lays each expert's run out on a TILE
+/// BOUNDARY, and writes the permutation and its inverse in one threadgroup
+/// pass. The gather makes the rows of a run contiguous; the GEMM then reads
+/// each expert's weight slice ONCE for the whole run instead of once per
+/// routed row, which is what a bandwidth-bound 4-bit mixture is short of.
+/// Measured on gpt-oss-20b at 16 lanes, that is 134 → 311 tok/s.
+///
+/// `tile_rows = 1` collapses the sort to plain grouping, so a decode and a
+/// prefill share one dataflow rather than one of them being the special case.
+///
+/// The permutation is UNDONE rather than folded through, unlike the reference
+/// driver's `combine_sorted`: this plane's IR lands `tokens * top_k` routed
+/// rows and folds them in a separate statement, so the arm owes its caller
+/// that rectangle. See `route_scatter` in `moe_route.metal`.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_select_batched(
+    ctx: &Ctx<'_>,
+    op: &'static str,
+    x: Tensor,
+    bank: Bank,
+    bias: Option<Tensor>,
+    routes: Tensor,
+    experts: u32,
+    scratch: RoutedScratch,
+    y: Tensor,
+    tuning: &crate::DeviceTuning,
+) -> Result<bool, Error> {
+    dtype_dispatch!(op, x.dtype, { Bf16 => () });
+    let fan = selected(op, x, routes, y)?;
+    routed_bank(op, x, bank)?;
+    // The routed rectangle's own rows: `selected` has already agreed them
+    // with `tokens x top_k` and refused the multiply that would not fit.
+    let pairs = y.rows;
+    let tile = tile_rows(pairs, experts, tuning);
+    if tile <= 1 {
+        return Ok(false);
+    }
+    let Some(bn) = tile_cols(y.width) else {
+        return Ok(false);
+    };
+    if x.width % QMM_BK != 0 {
+        return Ok(false);
+    }
+    let fp16 = tuning.fp16_gemm_format(bank.bits, bank.group);
+    let Some(point) = batched_point(op, bank, bias.is_some(), tile, bn, fp16)? else {
+        return Ok(false);
+    };
+    let padded = sorted_rows(pairs, experts, tuning);
+    debug_assert!(
+        scratch.x.rows >= padded && scratch.y.rows >= padded,
+        "`{op}`'s sorted stack is `sorted_rows` deep"
+    );
+
+    // Whether the activation is one row per TOKEN or one per ROUTE is said to
+    // the gather as its fan-out: at `1` the pair index IS the row, which is
+    // the layout `selected` recognises by a nonzero slot stride.
+    let gather_fan = if fan.x_slot_stride == 0 { fan.top_k } else { 1 };
+    let sort = [
+        routes.arg(),
+        scratch.perm.arg_mut(),
+        scratch.row_expert.arg_mut(),
+        scratch.tile_expert.arg_mut(),
+        scratch.inv.arg_mut(),
+        pairs.arg(),
+        experts.arg(),
+        fan.top_k.arg(),
+        tile.arg(),
+        padded.arg(),
+        x.width.arg(),
+        0u32.arg(),
+    ];
+    let lanes = router_lanes(op, experts)?;
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "route_sort").apply(Grid::of([lanes, 1, 1], [lanes, 1, 1])),
+        &sort,
+    )?;
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "route_gather").apply(route_rows(op, x.width, padded)?),
+        &[
+            x.arg(),
+            scratch.x.arg_mut(),
+            scratch.perm.arg(),
+            pairs.arg(),
+            experts.arg(),
+            gather_fan.arg(),
+            tile.arg(),
+            padded.arg(),
+            x.width.arg(),
+            0u32.arg(),
+        ],
+    )?;
+
+    let mut args = vec![
+        bank.codes.arg(),
+        bank.scales.arg(),
+        zero_points(ctx, bank)?,
+        scratch.x.arg(),
+        scratch.y.arg_mut(),
+        stated(op, x.width)?.arg(),
+        stated(op, y.width)?.arg(),
+    ];
+    // Buffers 7..12 are the seats this family leaves unbound; `tile_expert`
+    // is read at 12 and an argument binds at its own index, so the gap is
+    // stated rather than closed up.
+    args.push(match bias {
+        Some(bias) => bias.arg(),
+        None => ctx.absent()?,
+    });
+    for _ in 8..12 {
+        args.push(ctx.absent()?);
+    }
+    args.push(scratch.tile_expert.arg());
+    ctx.fire(
+        Fire::at(QMM_FILE, point.entry)
+            .stamp(point.stamp)
+            .apply(Grid::of(
+                crate::linear::quant::qmm_grid(
+                    op,
+                    stated(op, y.width)?,
+                    stated(op, bn)?,
+                    stated(op, padded)?,
+                    stated(op, tile)?,
+                    1,
+                )?,
+                QMM_GROUP,
+            )),
+        &args,
+    )?;
+
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "route_scatter").apply(route_rows(op, y.width, pairs)?),
+        &[
+            scratch.y.arg(),
+            y.arg_mut(),
+            scratch.inv.arg(),
+            pairs.arg(),
+            y.width.arg(),
+            0u32.arg(),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// The zero-point seat, bound or null. Both templates hold it — the mxfp4
+/// codec's `dot` never reads it — so an absent plane is a null binding and
+/// not a second entry.
+fn zero_points(ctx: &Ctx<'_>, bank: Bank) -> Result<crate::encode::ArgValue, Error> {
+    match bank.biases {
+        Some(biases) => Ok(biases.arg()),
+        None => ctx.absent(),
+    }
+}
+
 /// Folds the `top_k` routed rows back to one row per token, weighted.
 pub fn weighted_sum(
     ctx: &Ctx<'_>,
     routed: Tensor,
     weights: Tensor,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_weighted_sum";
     let entry = dtype_dispatch!(OP, routed.dtype, { Bf16 => "expert_combine" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
@@ -460,7 +834,7 @@ pub fn bias_sum(
     routes: Tensor,
     weights: Tensor,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_bias_sum";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "expert_bias_combine" });
     debug_assert_eq!(
@@ -508,16 +882,21 @@ pub fn sigmoid_gate_add(
     shared: Tensor,
     gate: Tensor,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.moe_sigmoid_gate_add";
     let entry = dtype_dispatch!(OP, routed.dtype, { Bf16 => "shared_expert_combine" });
     debug_assert!(
         shared.rows == routed.rows && shared.width == routed.width,
         "the shared expert's rectangle is the routed one"
     );
-    debug_assert!(
-        gate.rows == routed.rows && gate.width == routed.width,
-        "the gate plane rides the rectangle it gates"
+    debug_assert_eq!(
+        gate.rows, routed.rows,
+        "the gate column is one scalar per row"
+    );
+    debug_assert_eq!(
+        gate.width, 1,
+        "`shared_expert_combine` reads `gate[row]`, so the gate is a column and \
+         not a plane the width of what it gates"
     );
     let grid = route_rows(OP, routed.width, routed.rows)?;
     ctx.fire(
@@ -530,4 +909,62 @@ pub fn sigmoid_gate_add(
             stated(OP, routed.width)?.arg(),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DeviceTuning;
+
+    #[test]
+    fn a_fleet_batches_where_a_single_decode_does_not() {
+        let t = DeviceTuning::default();
+        // gpt-oss-20b: 32 experts at top-4. One row is four pairs, which is
+        // an eighth of a row an expert.
+        assert!(!should_batch(4, 32, 8));
+        // At the measured threshold of one, the same fire batches -- which is
+        // the 134 -> 311 tok/s step at 16 lanes.
+        assert!(should_batch(4 * 16, 32, t.moe_batch_min_per_expert));
+        assert_eq!(tile_rows(4 * 16, 32, &t), 16);
+    }
+
+    #[test]
+    fn the_wide_tile_is_out_of_reach_and_the_mid_one_is_not() {
+        let t = DeviceTuning::default();
+        // 31 rows an expert still takes the narrow tile, 32 takes the mid --
+        // the threshold that moved 12 -> 32 when the routed GEMM stopped
+        // emulating a bfloat matrix unit.
+        assert_eq!(tile_rows(31 * 32, 32, &t), 16);
+        assert_eq!(tile_rows(32 * 32, 32, &t), 32);
+        // And nothing reaches 64 on this table.
+        assert_eq!(tile_rows(4096 * 32, 32, &t), 32);
+    }
+
+    #[test]
+    fn the_sorted_bound_is_reachable_and_a_whole_number_of_tiles() {
+        let t = DeviceTuning::default();
+        let (pairs, experts) = (4 * 16u32, 32u32);
+        let tile = tile_rows(pairs, experts, &t);
+        let rows = sorted_rows(pairs, experts, &t);
+        assert_eq!(rows % tile, 0);
+        assert!(rows >= pairs);
+        // Every touched expert can waste `tile - 1` rows, and at most
+        // `min(pairs, experts)` are touched.
+        assert!(rows >= pairs + pairs.min(experts) * (tile - 1));
+    }
+
+    #[test]
+    fn a_mixture_that_does_not_batch_reports_its_own_rows() {
+        let t = DeviceTuning::default();
+        assert_eq!(tile_rows(4, 128, &t), 1);
+        assert_eq!(sorted_rows(4, 128, &t), 4);
+    }
+
+    #[test]
+    fn the_column_tile_is_the_widest_that_divides() {
+        assert_eq!(tile_cols(2880), Some(64));
+        assert_eq!(tile_cols(1024), Some(64));
+        assert_eq!(tile_cols(48), Some(16));
+        assert_eq!(tile_cols(100), None);
+    }
 }

@@ -25,7 +25,7 @@ fn cuda_native_text_and_device_geometry_decode() {
         // (2) Install + drive a basic text-gen inferlet in-proc (no client edge).
         //
         // `text-completion` STOOD HERE and is not in `tests/inferlets` any
-        // more; `text-completion-bench` is the one that survived the PTIR
+        // more; `text-completion-bench` is the one that survived the ETA
         // bridge rewrite and takes the same `{prompt, max_tokens}` input.
         let program = common::install_inferlet("text-completion-bench").await;
         let result = common::spawn_text(&program, "The capital of France is", 16).await;
@@ -39,7 +39,7 @@ fn cuda_native_text_and_device_geometry_decode() {
         common::assert_coherent(&text, 3);
 
         // (4) STOOD HERE: a second spawn that drove `windowed-attention` and
-        // matched its `WINDOWED_ATTENTION...` verdict, to exercise the PTIR
+        // matched its `WINDOWED_ATTENTION...` verdict, to exercise the ETA
         // device-geometry wire form. RETIRED, and not for want of hardware.
         //
         // `windowed-attention` is not in `tests/inferlets` any more. Its

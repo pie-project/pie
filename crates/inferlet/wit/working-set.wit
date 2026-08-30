@@ -34,14 +34,14 @@ interface working-set {
     // KV working set: a logical page address space over the runtime's KV
     // mapping trie (kv_refact.md). It is a migration and memory-accounting
     // domain and a handle to one terminal in a persistent prefix-sharing
-    // trie — not a physical allocator. PTIR geometry addresses pages by these
+    // trie — not a physical allocator. ETA geometry addresses pages by these
     // relative indexes; the runtime translates them to physical pages at the
     // kernel through the working set's flattened table.
     //
     // reserve is purely logical: no memory is held until a forward actually
     // computes pages, so a fully cached prefix never holds pool space.
     // discard removes ranges with no tombstone: all indexes at or after a
-    // removed range shift down and the inferlet must publish new PTIR
+    // removed range shift down and the inferlet must publish new ETA
     // geometry afterwards. On a shared path (after fork/slice), a discard
     // range must fall within the terminal region, reach the tail, or reach
     // the front; an interior range that would reroute a shared suffix is

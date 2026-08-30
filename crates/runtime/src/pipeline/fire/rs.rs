@@ -5,7 +5,7 @@
 //! (fresh+reset / CoW-after-fork / in-place), PUBLISHES the resulting mapping
 //! under the same store lock — in guest submission order, before the launch
 //! reaches the scheduler, exactly as `fire::kv::prepare` does — and returns
-//! the engine lowering (one `engine_api::RsVerb` and one `RsReset` per
+//! the engine lowering (one `engine::RsVerb` and one `RsReset` per
 //! request row, plus the pre-launch d2d copy) and an [`RsTxn`] receipt the
 //! fire holds until [`settle`].
 //!
@@ -25,7 +25,7 @@ use crate::store::rs::write::RsBufferIntent;
 use crate::store::rs::write::{RsPreparedWrite, RsPublished};
 use crate::store::rs::{RsStore, RsWorkingSetId};
 
-/// The published RS write for one in-flight PTIR fire, held across
+/// The published RS write for one in-flight ETA fire, held across
 /// `submit_async` until [`settle`].
 #[derive(Debug)]
 pub struct RsTxn {
@@ -223,7 +223,7 @@ pub struct PreparedRs {
     pub buffer_heads: Vec<u32>,
     /// **The verb each request row asks the engine for**, one per row, in
     /// resolved request order — what [`PreparedRs::apply_to`] stamps onto the
-    /// lane that carries the row (`engine_api::Lane::rs`).
+    /// lane that carries the row (`engine::Lane::rs`).
     ///
     /// **THIS IS WHERE THE `translation` VECTORS WENT** (wave F3-tail). A
     /// `translation` / `translation_indptr` pair stood here: the working
@@ -235,7 +235,7 @@ pub struct PreparedRs {
     /// buffer order, which is what the engine indexes to find the page a
     /// buffer token lives in. So the list IS the translation, and there is
     /// one spelling of it rather than two (article 8).
-    pub verbs: Vec<engine_api::fire::RsVerb>,
+    pub verbs: Vec<engine::fire::RsVerb>,
     pub txn: Option<RsTxn>,
 }
 
@@ -252,7 +252,7 @@ impl PreparedRs {
     /// could read, kept because the runtime's own store was built on them —
     /// and the recurrent verb reached no shell at all: a fire that meant to
     /// scatter a speculative window into a buffer was submitted as an
-    /// ordinary fold and the device folded it. `engine_api::RsVerb` is that
+    /// ordinary fold and the device folded it. `engine::RsVerb` is that
     /// vocabulary and `RsReset` is the fact beside it, so what used to be
     /// eleven CSR arms addressed to nobody is one verb per lane addressed to
     /// the lane's own engine.
@@ -274,9 +274,9 @@ impl PreparedRs {
             // the KV count to guess at.
             if let Some(&flags) = self.slot_flags.get(row) {
                 lane.rs_reset = if flags & crate::engine::RS_FLAG_RESET != 0 {
-                    engine_api::fire::RsReset::Fresh
+                    engine::fire::RsReset::Fresh
                 } else {
-                    engine_api::fire::RsReset::Held
+                    engine::fire::RsReset::Held
                 };
             }
         }
@@ -592,7 +592,7 @@ fn prepare_many_impl(
                 row[..=last.min(row.len() - 1)].to_vec()
             };
             out.verbs.push(match plan {
-                RsPlan::Fold => engine_api::fire::RsVerb::Fold,
+                RsPlan::Fold => engine::fire::RsVerb::Fold,
                 RsPlan::Buffer {
                     start_tokens,
                     row_tokens,
@@ -603,11 +603,11 @@ fn prepare_many_impl(
                     // new tokens in the forward, exactly as `RsPlan::Fold`
                     // does, while riding in a fire whose peers buffer.
                     if in_forward.get(index).copied().unwrap_or(false) {
-                        engine_api::fire::RsVerb::Fold
+                        engine::fire::RsVerb::Fold
                     } else {
                         let at =
                             head.saturating_add(start_tokens.get(index).copied().unwrap_or(0));
-                        engine_api::fire::RsVerb::Buffer {
+                        engine::fire::RsVerb::Buffer {
                             pages: run_through(
                                 at.saturating_add(row_tokens.get(index).copied().unwrap_or(0)),
                             ),
@@ -631,7 +631,7 @@ fn prepare_many_impl(
                             // reached behind this fire's own tokens states a
                             // count past the lane's rows, and `Lane::validate`
                             // is what says so.
-                            fold: engine_api::fire::FoldLen::Host(
+                            fold: engine::fire::FoldLen::Host(
                                 fold_tokens.get(index).copied().unwrap_or(0),
                             ),
                         }
@@ -654,7 +654,7 @@ fn prepare_many_impl(
                     // number, from the same origin `RsVerb::Buffer::at`
                     // counts in, so one page list serves the write and the
                     // replay that reads it back.
-                    engine_api::fire::RsVerb::FoldBuffered {
+                    engine::fire::RsVerb::FoldBuffered {
                         pages: run_through(head.saturating_add(bound)),
                         at: head,
                         bound,
@@ -663,11 +663,11 @@ fn prepare_many_impl(
                         // count is read off the `rs_fold_len` port at compose
                         // and clamped to the bound the host published here.
                         len: if *fold_len_is_device {
-                            engine_api::fire::FoldLen::Device(
-                                tensor_ir::registry::Port::RsFoldLen,
+                            engine::fire::FoldLen::Device(
+                                eta_ir::registry::Port::RsFoldLen,
                             )
                         } else {
-                            engine_api::fire::FoldLen::Host(bound)
+                            engine::fire::FoldLen::Host(bound)
                         },
                     }
                 }
@@ -719,7 +719,7 @@ pub fn settle(store: &mut RsStore, txn: Option<RsTxn>) {
 
 #[cfg(test)]
 mod tests {
-    use engine_api::fire::{FoldLen, RsReset, RsVerb};
+    use engine::fire::{FoldLen, RsReset, RsVerb};
 
     use super::*;
     use crate::store::rs::RsGeometry;
@@ -1009,7 +1009,7 @@ mod tests {
                     pages: slabs,
                     at: 0,
                     bound: 12,
-                    len: FoldLen::Device(tensor_ir::registry::Port::RsFoldLen),
+                    len: FoldLen::Device(eta_ir::registry::Port::RsFoldLen),
                 },
                 RsReset::Held,
             )],
@@ -1088,7 +1088,7 @@ mod tests {
             (FoldLen::Host(2), 0),
         );
         req.lanes[0]
-            .validate_for(engine_api::fire::Serves {
+            .validate_for(engine::fire::Serves {
                 device_channel_commit: false,
                 rs_verbs: true,
             })
@@ -1141,7 +1141,7 @@ mod tests {
             "the count crosses in the extended frame it was planned in"
         );
         let error = req.lanes[0]
-            .validate_for(engine_api::fire::Serves {
+            .validate_for(engine::fire::Serves {
                 device_channel_commit: false,
                 rs_verbs: true,
             })

@@ -11,8 +11,8 @@
 //! (`moe::matmul_select_bias`), so no descriptor is needed on the routed
 //! path.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
@@ -45,7 +45,7 @@ fn route_rows(rows: u32, width: u32) -> Launch {
 /// A 32-bit launch extent, refused rather than truncated — a clamped grid
 /// would launch over the low 32 bits and leave the rest of the destination
 /// unwritten.
-fn extent(op: &'static str, n: u64) -> Result<u32, KernelError> {
+fn extent(op: &'static str, n: u64) -> Result<u32, Error> {
     u32::try_from(n).map_err(|_| {
         refuse(
             op,
@@ -54,7 +54,7 @@ fn extent(op: &'static str, n: u64) -> Result<u32, KernelError> {
     })
 }
 
-pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), KernelError> {
+pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "linear.quant_cast_fp32_to";
     debug_assert_eq!(src.dtype, Dtype::F32, "`{OP}` casts an f32 source");
     let t = dtype_dispatch!(OP, dst.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
@@ -69,7 +69,7 @@ pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), Kern
 }
 
 /// Scales each row of `buf` by the matching row of `l`, in place.
-pub fn scale_rows(ctx: &Ctx, l: Tensor, buf: &mut Tensor) -> Result<(), KernelError> {
+pub fn scale_rows(ctx: &Ctx, l: Tensor, buf: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "linear.quant_scale_rows";
     let t = dtype_dispatch!(OP, buf.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "rows", buf.rows)?;
@@ -89,7 +89,7 @@ pub fn quantize_bf16_to_mxfp4_e2m1_per_block(
     w: Tensor,
     packed: &mut Tensor,
     scales: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.quant_bf16_to_mxfp4";
     dtype_dispatch!(OP, w.dtype, { Bf16 => () });
     if w.width < 32 {
@@ -120,7 +120,7 @@ pub fn quantize_bf16_to_fp8_e4m3_per_channel(
     w: Tensor,
     fp8: &mut Tensor,
     scale_inv: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.quant_bf16_to_fp8";
     dtype_dispatch!(OP, w.dtype, { Bf16 => () });
     debug_assert_eq!(

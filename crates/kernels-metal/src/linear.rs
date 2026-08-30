@@ -4,6 +4,7 @@
 //! weight; the entries inside are one per IR variant.
 
 pub mod gemm;
+pub mod lora;
 pub mod mlp;
 pub mod moe;
 pub mod quant;

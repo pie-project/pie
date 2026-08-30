@@ -24,8 +24,8 @@ wit-bindgen = { version = "0.59.0", features = ["async-spawn"] }
 inferlet-macros = { version = "0.4.0", path = "../inferlet-macros" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# The PTIR authoring DSL (eDSL + neutral trace Builder). Host-`cargo test`able,
+# The ETA authoring DSL (eDSL + neutral trace Builder). Host-`cargo test`able,
 # wasm-buildable, no wit-bindgen (the single `wit_bindgen::generate!` stays here
-# in `inferlet`). The `inferlet::ptir` bridge wraps the WIT ptir resources and
+# in `inferlet`). The `inferlet::eta` bridge wraps the WIT forward resources and
 # drives this crate's `Builder`.
-tensor-dsl = { path = "../tensor-dsl" }
+eta-dsl = { path = "../eta-dsl" }

@@ -294,19 +294,28 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
     }
 
     println!("{}", report.join("\n"));
-    // **ONE, AND IT IS THE MTP HEAD.** qwen36-27b's plan ends in a whole extra
-    // decoder layer plus its own `lm_head`, 26 nodes and 576 µs, guarded on
-    // the multi-token-prediction fact — a genuinely structural arm, absent in
-    // every fire no lane asked it for. It is the only region in the whole
-    // catalog on either side of both gates, and it is exactly the shape design
-    // §8's "prefix-tuning / structural PEFT -> IF/SWITCH" row predicts. Every
-    // other guarded region in every other text is one to seven operators.
+    // **TWO, AND BOTH OF THEM ARE A DRAFT HEAD.** qwen36-27b's plan ends in a
+    // whole extra decoder layer plus its own `lm_head` — 26 nodes and 576 µs,
+    // guarded on the multi-token-prediction fact — and
+    // `qwen35-d0.8b-eagle`'s ends in the same shape at 23 nodes and 564 µs,
+    // which is the overlaid EAGLE head the M-4 wave imported. They are the only
+    // regions in the whole catalog on either side of both gates, and they are
+    // exactly the shape design §8's "prefix-tuning / structural PEFT ->
+    // IF/SWITCH" row predicts. Every other guarded region in every other text
+    // is one to seven operators.
+    //
+    // **THE SECOND ONE ARRIVED WITH A ROW AND NOT WITH A THRESHOLD**, which is
+    // the count doing its job: `qwen35-d0.8b-eagle-bf16-kv-bf16` joined the
+    // catalog in the M-4 wave and brought a structural arm with it. Nothing
+    // about the gates moved — the plain `qwen35-d0.8b` row beside it still
+    // reports a 184 µs fattest against the same 250 µs floor and still chooses
+    // nothing.
     //
     // A COUNT AND NOT A PREDICATE, DELIBERATELY, AND ONLY THIS ONE: the tests
     // above pin the rule, and this pins the catalog's own answer to it so that
     // a text which gains or loses a structural axis has to say so here.
     assert_eq!(
-        chosen, 1,
+        chosen, 2,
         "the catalog's conditional count moved — one text gained or lost a \
          structural arm, and the report above says which",
     );

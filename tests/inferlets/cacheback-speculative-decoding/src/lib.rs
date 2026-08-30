@@ -22,7 +22,7 @@
 //! stopped isolating rejected drafts, the two would diverge.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]

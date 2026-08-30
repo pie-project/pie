@@ -16,10 +16,27 @@
 //! beside them. `gate` left for [`elemwise::gate`](crate::elemwise::gate):
 //! it is elementwise, not attention.
 
+pub mod arbiter;
+
+/// The vision towers' bidirectional attention over the patch window — a
+/// file of its own beside this one, sharing nothing with the paged family
+/// but the word (`.wiki/alto/multimodal.md` §2). The CUDA twin had to be
+/// re-homed by `#[path]` because its wave could not touch `attn.rs`; this
+/// line is the declaration that one is owed.
+pub mod dense;
+
+pub mod merge;
+
+/// The alto observability door's capture — per-key attention mass over an
+/// observation window, a file of its own beside this one for the reason
+/// `.wiki/alto/attn-score.md` §5 states in as many words ("agent-built in a
+/// NEW FILE outside `attn.rs`/`attn/kv.rs`").
+pub mod score;
+
 pub mod ssm;
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::encode::{
     Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, head_grid, head_group, nonzero, refuse,
@@ -49,11 +66,21 @@ const SDPA_TILED: [&str; 4] = [
     "sdpa_paged_tiled_bfloat16_d_512",
 ];
 
-const SDPA_LSE_WIDTHS: [u32; 1] = [64];
+const SDPA_LSE_WIDTHS: [u32; 4] = [64, 128, 256, 512];
 
-const SDPA_DECODE_LSE: [&str; 1] = ["sdpa_paged_decode_lse_bfloat16_d_64"];
+const SDPA_DECODE_LSE: [&str; 4] = [
+    "sdpa_paged_decode_lse_bfloat16_d_64",
+    "sdpa_paged_decode_lse_bfloat16_d_128",
+    "sdpa_paged_decode_lse_bfloat16_d_256",
+    "sdpa_paged_decode_lse_bfloat16_d_512",
+];
 
-const SDPA_TILED_LSE: [&str; 1] = ["sdpa_paged_tiled_lse_bfloat16_d_64"];
+const SDPA_TILED_LSE: [&str; 4] = [
+    "sdpa_paged_tiled_lse_bfloat16_d_64",
+    "sdpa_paged_tiled_lse_bfloat16_d_128",
+    "sdpa_paged_tiled_lse_bfloat16_d_256",
+    "sdpa_paged_tiled_lse_bfloat16_d_512",
+];
 
 /// What a decode fire needs beside the pool: the fire tables the vector sdpa
 /// shader reads per token. Built once per fire by [`plan_decode`].
@@ -107,7 +134,7 @@ fn tables_agree(
     request_of_token: Tensor,
     mask: Tensor,
     mask_enabled: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     if positions.dtype != Dtype::I32 {
         return Err(refuse(
             op,
@@ -178,7 +205,7 @@ pub fn plan_decode(
     mask: Tensor,
     mask_enabled: Tensor,
     mask_stride: u32,
-) -> Result<DecodePlan, KernelError> {
+) -> Result<DecodePlan, Error> {
     let _ = (ctx, kv_len);
     tables_agree(
         "attention.plan_decode",
@@ -210,7 +237,7 @@ pub fn plan_prefill(
     mask: Tensor,
     mask_enabled: Tensor,
     mask_stride: u32,
-) -> Result<PrefillPlan, KernelError> {
+) -> Result<PrefillPlan, Error> {
     let _ = (ctx, kv_len);
     tables_agree(
         "attention.plan_prefill",
@@ -228,7 +255,7 @@ pub fn plan_prefill(
     })
 }
 
-fn head_point(op: &'static str, head_dim: u32, points: &[u32]) -> Result<usize, KernelError> {
+fn head_point(op: &'static str, head_dim: u32, points: &[u32]) -> Result<usize, Error> {
     points
         .iter()
         .position(|&p| p == head_dim)
@@ -237,7 +264,7 @@ fn head_point(op: &'static str, head_dim: u32, points: &[u32]) -> Result<usize, 
 
 /// The sliding extent the shader reads: 0 is "no window", so a stated window
 /// of zero is a degenerate statement, not an unwindowed one.
-fn window_extent(op: &'static str, window: Option<u32>) -> Result<i32, KernelError> {
+fn window_extent(op: &'static str, window: Option<u32>) -> Result<i32, Error> {
     match window {
         None => Ok(0),
         Some(w) => {
@@ -250,7 +277,7 @@ fn window_extent(op: &'static str, window: Option<u32>) -> Result<i32, KernelErr
 /// The kv head count the pool row's strides spell, against the stated head
 /// width. Pool strides are driver facts the validator never sees, so
 /// disagreement is refused, not asserted.
-fn pool_heads(op: &'static str, pool: &KvPool, head_dim: u32) -> Result<u32, KernelError> {
+fn pool_heads(op: &'static str, pool: &KvPool, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the head width this attention states", head_dim)?;
     if pool.head_stride != u64::from(head_dim) {
         return Err(refuse(
@@ -283,7 +310,7 @@ fn kv_heads_agree(
     pool: &KvPool,
     head_dim: u32,
     kv_heads: u32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let spelled = pool_heads(op, pool, head_dim)?;
     if kv_heads != spelled {
         return Err(refuse(
@@ -297,7 +324,7 @@ fn kv_heads_agree(
     Ok(())
 }
 
-fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, KernelError> {
+fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the head width this attention states", head_dim)?;
     if width == 0 || width % head_dim != 0 {
         return Err(refuse(
@@ -331,7 +358,7 @@ impl Paged {
         pool: &KvPool,
         window: Option<u32>,
         head_dim: u32,
-    ) -> Result<Self, KernelError> {
+    ) -> Result<Self, Error> {
         if pool.page_size <= 0 {
             return Err(refuse(op, "the kv page size is zero"));
         }
@@ -365,7 +392,7 @@ fn lse_plane(op: &'static str, lse: Tensor, shape: &Paged) {
     );
 }
 
-fn vector_grid(op: &'static str, q_heads: u32, rows: u32) -> Result<[u32; 3], KernelError> {
+fn vector_grid(op: &'static str, q_heads: u32, rows: u32) -> Result<[u32; 3], Error> {
     let x = q_heads.checked_mul(SDPA_THREADS).ok_or_else(|| {
         refuse(
             op,
@@ -375,7 +402,7 @@ fn vector_grid(op: &'static str, q_heads: u32, rows: u32) -> Result<[u32; 3], Ke
     Ok([x, rows, 1])
 }
 
-fn tiled_grid(op: &'static str, q_heads: u32, rows: u32) -> Result<[u32; 3], KernelError> {
+fn tiled_grid(op: &'static str, q_heads: u32, rows: u32) -> Result<[u32; 3], Error> {
     let x = q_heads.checked_mul(SDPA_THREADS).ok_or_else(|| {
         refuse(
             op,
@@ -398,7 +425,7 @@ fn vector(
     sm_scale: f32,
     o: Tensor,
     lse: Option<Tensor>,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
     debug_assert!(
         o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
@@ -458,7 +485,7 @@ fn tiled(
     sm_scale: f32,
     o: Tensor,
     lse: Option<Tensor>,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
     debug_assert!(
         o.rows == q.rows && o.width == q.width && o.dtype == q.dtype,
@@ -512,7 +539,7 @@ pub fn decode(
     head_dim: u32,
     sm_scale: f32,
     o: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     vector(
         ctx,
         "attention.decode",
@@ -538,7 +565,7 @@ pub fn decode_lse(
     sm_scale: f32,
     o: Tensor,
     lse: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     vector(
         ctx,
         "attention.decode_lse",
@@ -567,7 +594,7 @@ pub fn prefill(
     kv_heads: u32,
     sm_scale: f32,
     o: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     tiled(
@@ -587,7 +614,7 @@ pub fn prefill_lse(
     sm_scale: f32,
     o: Tensor,
     lse: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.prefill_lse";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     tiled(
@@ -625,7 +652,7 @@ pub fn masked(
     head_dim: u32,
     sm_scale: f32,
     o: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.masked";
     if mask.dtype != Dtype::U8 {
         return Err(refuse(
@@ -648,7 +675,7 @@ pub fn sink(
     lse: Tensor,
     sink: Tensor,
     head_dim: u32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.sink";
     let entry = dtype_dispatch!(OP, o.dtype, { Bf16 => "attn_sink_rescale_bfloat16" });
     debug_assert_eq!(lse.dtype, Dtype::F32, "`{OP}` reads an f32 log-sum-exp plane");
@@ -664,26 +691,25 @@ pub fn sink(
     )
 }
 
-/// The metal plane never claimed this point; the refusal is typed now.
+/// Merges two attention readings over disjoint key sets by their
+/// log-sum-exps — the fold lives in [`merge`].
 #[allow(clippy::too_many_arguments)]
 pub fn merge_lse(
-    _ctx: &Ctx<'_>,
-    _o1: Tensor,
-    _lse1: Tensor,
-    _o2: Tensor,
-    _lse2: Tensor,
-    _heads: u32,
-    _head_dim: u32,
-    _o: Tensor,
-    _lse: Tensor,
-) -> Result<(), KernelError> {
-    Err(KernelError::Unsupported {
-        op: "attention.merge_lse",
-    })
+    ctx: &Ctx<'_>,
+    o1: Tensor,
+    lse1: Tensor,
+    o2: Tensor,
+    lse2: Tensor,
+    heads: u32,
+    head_dim: u32,
+    o: Tensor,
+    lse: Tensor,
+) -> Result<(), Error> {
+    merge::merge_lse(ctx, o1, lse1, o2, lse2, heads, head_dim, o, lse)
 }
 
 /// `x = cap * tanh(x / cap)`, in place on `x`.
-pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), KernelError> {
+pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), Error> {
     const OP: &str = "attention.logit_softcap";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "logit_softcap_bfloat16" });
     ctx.fire(
@@ -695,7 +721,7 @@ pub fn logit_softcap(ctx: &Ctx<'_>, x: Tensor, cap: f32) -> Result<(), KernelErr
 
 /// The row split the pool strides spell for an appended `[heads x head_dim]`
 /// row; strides are driver facts, so disagreement is refused.
-fn head_split(op: &'static str, pool: &KvPool, row: u32) -> Result<(u32, u32), KernelError> {
+fn head_split(op: &'static str, pool: &KvPool, row: u32) -> Result<(u32, u32), Error> {
     let head_dim = u32::try_from(pool.head_stride)
         .ok()
         .filter(|&d| d > 0)
@@ -733,7 +759,7 @@ fn append_paged(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, k.dtype, { Bf16 => "kv_append_paged_bfloat16" });
     if pool.page_size <= 0 {
         return Err(refuse(op, "the kv page size is zero"));
@@ -782,7 +808,7 @@ pub fn kv_append(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     append_paged(
         ctx,
         "attention.kv_append",
@@ -801,7 +827,7 @@ pub fn kv_append_shared(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     append_paged(
         ctx,
         "attention.kv_append_shared",
@@ -817,7 +843,7 @@ pub fn kv_append_shared(
 /// these points — the old file held an empty claims impl — so every entry is
 /// a typed refusal and the driver arm stays destructure → resolve → call.
 pub mod mla {
-    use kernels::KernelError;
+    use crate::error::Error;
 
     use crate::encode::Ctx;
     use crate::tensor::{KvPool, RaggedTensor, Tensor};
@@ -833,8 +859,8 @@ pub mod mla {
         _kv_indices: Tensor,
         _last_page_len: Tensor,
         _kv_len: Tensor,
-    ) -> Result<MlaPlan, KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<MlaPlan, Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_plan",
         })
     }
@@ -848,8 +874,8 @@ pub mod mla {
         _kv_lora_rank: u32,
         _kv_c: Tensor,
         _k_pe: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_latents",
         })
     }
@@ -866,8 +892,8 @@ pub mod mla {
         _theta: f32,
         _kv_c: Tensor,
         _k_pe: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_latents_rope",
         })
     }
@@ -881,8 +907,8 @@ pub mod mla {
         _rope_dim: u32,
         _q_nope: Tensor,
         _q_pe: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_split_q_b",
         })
     }
@@ -897,8 +923,8 @@ pub mod mla {
         _nope_dim: u32,
         _v_head_dim: u32,
         _q_latent: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_absorb_q",
         })
     }
@@ -913,8 +939,8 @@ pub mod mla {
         _v_head_dim: u32,
         _nope_dim: u32,
         _o: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_absorb_out",
         })
     }
@@ -926,8 +952,8 @@ pub mod mla {
         _pool: &KvPool,
         _write_page: Tensor,
         _write_offset: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_kv_append",
         })
     }
@@ -943,8 +969,8 @@ pub mod mla {
         _kv_lora_rank: u32,
         _sm_scale: f32,
         _o: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_decode",
         })
     }
@@ -960,8 +986,8 @@ pub mod mla {
         _kv_lora_rank: u32,
         _sm_scale: f32,
         _o: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_prefill",
         })
     }
@@ -978,8 +1004,8 @@ pub mod mla {
         _kv_lora_rank: u32,
         _sm_scale: f32,
         _o: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_decode_selected",
         })
     }
@@ -996,8 +1022,8 @@ pub mod mla {
         _kv_lora_rank: u32,
         _sm_scale: f32,
         _o: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.mla_prefill_selected",
         })
     }
@@ -1006,7 +1032,7 @@ pub mod mla {
 /// `Index`: the sparse-attention indexer. Unclaimed on metal, as before —
 /// typed refusals only.
 pub mod index {
-    use kernels::KernelError;
+    use crate::error::Error;
 
     use crate::encode::Ctx;
     use crate::tensor::{KvPool, Tensor};
@@ -1021,8 +1047,8 @@ pub mod index {
         _eps: f32,
         _rope_dim: u32,
         _theta: f32,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.index_layernorm_rope",
         })
     }
@@ -1036,8 +1062,8 @@ pub mod index {
         _head_dim: u32,
         _rope_dim: u32,
         _theta: f32,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.index_rope",
         })
     }
@@ -1052,8 +1078,8 @@ pub mod index {
         _head_dim: u32,
         _top_k: u32,
         _selection: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.index_topk",
         })
     }
@@ -1064,8 +1090,8 @@ pub mod index {
         _keys: &KvPool,
         _write_page: Tensor,
         _write_offset: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.index_kv_append",
         })
     }
@@ -1074,7 +1100,7 @@ pub mod index {
 /// `Pool`: pooled (compressed) attention. Unclaimed on metal, as before —
 /// typed refusals only.
 pub mod pool {
-    use kernels::KernelError;
+    use crate::error::Error;
 
     use crate::encode::Ctx;
     use crate::tensor::{KvPool, RaggedTensor, Tensor};
@@ -1086,8 +1112,8 @@ pub mod pool {
         _ratio: u32,
         _boundary_pos: Tensor,
         _boundary_req: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.pool_boundary_decode",
         })
     }
@@ -1099,8 +1125,8 @@ pub mod pool {
         _ratio: u32,
         _boundary_pos: Tensor,
         _boundary_req: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.pool_boundary_prefill",
         })
     }
@@ -1114,8 +1140,8 @@ pub mod pool {
         _head_dim: u32,
         _ratio: u32,
         _entries: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.pool_gather",
         })
     }
@@ -1129,8 +1155,8 @@ pub mod pool {
         _pool: &KvPool,
         _write_page: Tensor,
         _write_offset: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.pool_kv_append",
         })
     }
@@ -1148,8 +1174,8 @@ pub mod pool {
         _sm_scale: f32,
         _o: Tensor,
         _lse: Tensor,
-    ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported {
+    ) -> Result<(), Error> {
+        Err(Error::Unsupported {
             op: "attention.pool_lse",
         })
     }

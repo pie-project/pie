@@ -2,7 +2,7 @@
 //!
 //! **THIS FILE ADDS NO SECOND INTERPRETER.** It is one more implementation of
 //! `kernels_metal::Encode`, standing exactly where [`Sink`](crate::Sink)
-//! stands, and the walk over it is `engine::fire::walk` over the same
+//! stands, and the walk over it is `model_exec::fire::walk` over the same
 //! [`Run`](crate::Run) resolving through the same tables. Decision #11's
 //! "captured is eager by construction" extended by one mode: what a `Sink`
 //! turns into a `dispatchThreads`, a [`Tape`] turns into a row.
@@ -32,7 +32,7 @@
 
 use std::cell::RefCell;
 
-use kernels_metal::{ArgValue, Encode, Fire, KernelError};
+use kernels_metal::{ArgValue, Encode, Error, Fire};
 
 use crate::device::{Handles, handles::NIL};
 use crate::window::{At, Windows};
@@ -263,7 +263,7 @@ impl<'a> Tape<'a> {
     }
 
     /// Resolve one argument the way the sink would bind it.
-    fn resolve(&self, fire: Fire, at: usize, arg: ArgValue) -> Result<Arg, KernelError> {
+    fn resolve(&self, fire: Fire, at: usize, arg: ArgValue) -> Result<Arg, Error> {
         let (handle, mutable) = match arg {
             ArgValue::Buffer(handle) => (handle, false),
             ArgValue::BufferMut(handle) => (handle, true),
@@ -275,7 +275,7 @@ impl<'a> Tape<'a> {
         if handle == NIL {
             return Ok(Arg::Absent);
         }
-        let binding = self.handles.get(handle).ok_or_else(|| KernelError::Backend {
+        let binding = self.handles.get(handle).ok_or_else(|| Error::Backend {
             op: fire.entrypoint,
             detail: format!("handle {handle} at argument {at}, which this fire minted no row for"),
         })?;
@@ -291,7 +291,7 @@ impl Encode for Tape<'_> {
     /// Write the dispatch down. **Every argument is resolved here**, not at
     /// fit time, because the handle table is rewound at the end of the fire
     /// and a row that outlived it would resolve against the next fire's carve.
-    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), KernelError> {
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         let mut resolved = Vec::with_capacity(args.len());
         for (at, arg) in args.iter().enumerate() {
             resolved.push(self.resolve(fire, at, *arg)?);
@@ -312,7 +312,7 @@ impl Encode for Tape<'_> {
         Ok(())
     }
 
-    fn absent(&self) -> Result<ArgValue, KernelError> {
+    fn absent(&self) -> Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
     }
 }

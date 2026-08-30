@@ -38,42 +38,44 @@
 //! SILENT ON PURPOSE, like its sibling: the numbers ride in the assert
 //! messages.
 
-use model_compiler::{Budget, DeviceProfile, Phase, PqTree, Region, compile};
-use model_dsl::Platform;
+use model_compiler::{DeviceProfile, Phase, PqTree, Region};
 use model_ir::ClassTable;
 
-const PLATFORMS: [Platform; 4] = [
-    Platform::Cuda,
-    Platform::Metal,
-    Platform::Wgpu,
-    Platform::Vulkan,
-];
+mod common;
+use common::{PLATFORMS, bake, bake_with};
 
-/// A budget the catalog can actually seat.
+/// How many arms the text's attention merge has — the widest merge in the
+/// trace any of whose arms an attention op produces.
 ///
-/// **NOT `max_adapters: 32`, WHICH IS WHY THIS FILE ASSERTED NOTHING.**
-/// Capacity is a SHAPE — the leading axis of every bank a text marked
-/// `Registered` — and no catalog text seats more than eight, so a flat 32
-/// refused all 68 pairs. Asking each plan for its own seat count is what the
-/// two live catalog files (`every_sku_carves_an_arena`,
-/// `no_concurrent_pair_shares_a_write`) already do; the non-vacuity asserts
-/// below are the other half of not repeating the mistake.
-fn budgets_for(trace: &model_ir::Trace) -> Budget {
-    let seats = trace
-        .params
-        .iter()
-        .filter(|param| param.source == model_ir::ParamSource::Registered)
-        .map(|param| param.shape.first().copied().unwrap_or(0))
-        .min()
-        .unwrap_or(0);
-    Budget {
-        max_lanes: 256,
-        max_tokens: 8192,
-        buckets: vec![
-            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
-        ],
-        max_adapters: u32::try_from(seats).unwrap_or(u32::MAX),
+/// **THIS IS THE TAX BASE.** The halves arithmetic below counts crossing axes
+/// and cannot see a merge: a text that partitions its classes around an
+/// attention arm has seated that partition in blocks that constrain harder
+/// than the axis they hid, and each arm past the two every text has —
+/// prefill and decode — pins one more withdrawal out. Two arms cost nothing,
+/// gemma's three cost one, qwen's four cost two. Read off the trace rather
+/// than off a `masked` flag, because the flag could only ever say WHETHER
+/// there was a tax and never how much.
+fn attention_merge_arms(trace: &model_ir::Trace) -> usize {
+    let mut widest = 0usize;
+    for value in &trace.values {
+        let model_ir::Def::Merge(arms) = &value.def else {
+            continue;
+        };
+        let attention = arms.iter().any(|(arm, _)| {
+            matches!(
+                trace.values.get(arm.0 as usize).map(|v| &v.def),
+                Some(model_ir::Def::Op(node))
+                    if matches!(
+                        trace.nodes.get(*node as usize).map(|n| &n.op),
+                        Some(model_ir::Operation::Attention(_))
+                    )
+            )
+        });
+        if attention {
+            widest = widest.max(arms.len());
+        }
     }
+    widest
 }
 
 /// The rows of the C1P matrix, deduplicated: a capture-phase region whose mask
@@ -97,21 +99,37 @@ fn constraints(regions: &[Region], classes: &ClassTable) -> Vec<Vec<u8>> {
 
 /// **WHICH TEXTS OWE, AND THAT THEY OWE BECAUSE THEIR MASKS CROSS.**
 ///
-/// A laminar family — any two masks nested or disjoint — is always C1P, and
-/// twelve of the catalog's seventeen SKUs still are one: `masked` inside
-/// everything, `qo_one` inside `masked`, no pair sharing a part of itself. The
-/// five qwen texts are not, and this asserts the two halves together so that
-/// neither can drift from the other: a text owes a fallback IF AND ONLY IF two
-/// of its constrained masks cross.
+/// A laminar family — any two masks nested or disjoint — is always C1P: no
+/// pair sharing a part of itself, and an order seating them all always exists.
+/// So a text that owes a fallback MUST have a crossing pair, and that
+/// implication is asserted below.
+///
+/// **THE CONVERSE IS NOT TRUE, AND THIS FILE USED TO ASSERT IT.** Crossing is
+/// necessary for a withdrawal and nowhere near sufficient — C1P is a property
+/// of the whole family, not of any pair in it. `dsv4` and `glm5` state
+/// `{0,2}`, `{1,3}` and `{2,3}` over four classes, which is two crossing
+/// pairs, and the order `[0, 2, 3, 1]` makes all three of them intervals.
+/// P4 finds it and the texts owe nothing. The old two-way reading called that
+/// a failure — it was asking the compiler to be worse than it is — and it went
+/// unnoticed because a stale census literal above it fired first and this half
+/// was never reached.
+///
+/// What IS an iff, checked here across every pair, is the text's own shape:
+/// a text owes a fallback exactly when its attention merge has more than two
+/// arms. Prefill and decode nest; an arm past them is what turns a nested
+/// family into a crossing one. That is the same premise
+/// `a_text_withdraws_exactly_two_fewer_than_its_crossing_axes` prices, so the
+/// two files' claims stand or fall together rather than drifting apart.
 #[test]
-fn a_text_owes_a_fallback_exactly_when_two_of_its_windows_cross() {
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
+fn a_text_owes_a_fallback_exactly_when_its_attention_merge_grows_a_third_arm() {
     let mut wrong: Vec<String> = Vec::new();
-    let (mut compiled, mut owing) = (0usize, 0usize);
+    let (mut compiled, mut owing, mut merged) = (0usize, 0usize, 0usize);
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(baked_one) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default())
+            let Ok(baked_one) = bake(&trace)
             else {
                 wrong.push(format!("`{sku}` as {platform:?}: refused at its own seat count"));
                 continue;
@@ -133,11 +151,22 @@ fn a_text_owes_a_fallback_exactly_when_two_of_its_windows_cross() {
             if owes {
                 owing += 1;
             }
+            // The family property the count below is stated as, rather than as
+            // a census: an attention merge of more than two arms is exactly
+            // what makes a text's masks cross. Two arms — prefill and decode —
+            // nest, and a nested family is laminar and seats whole.
+            if attention_merge_arms(&trace) > 2 {
+                merged += 1;
+            }
 
-            if owes != !crossing.is_empty() {
+            // THE SOUND DIRECTION. A laminar family is always C1P, so a text
+            // that owes a fallback has to have a crossing pair somewhere. The
+            // other direction is not checked because it is not true — see the
+            // doc above, and `dsv4`, which crosses twice and seats everything.
+            if owes && crossing.is_empty() {
                 wrong.push(format!(
-                    "`{sku}` as {platform:?}: owes {} rows over {} nodes, and {} crossing \
-                     pairs — {}",
+                    "`{sku}` as {platform:?}: owes {} rows over {} nodes and no two of \
+                     its masks cross — a laminar family cannot need one",
                     baked_one.fallback.rows.len(),
                     baked_one
                         .fallback
@@ -146,12 +175,6 @@ fn a_text_owes_a_fallback_exactly_when_two_of_its_windows_cross() {
                         .map(|row| row.node)
                         .collect::<std::collections::BTreeSet<_>>()
                         .len(),
-                    crossing.len(),
-                    if crossing.is_empty() {
-                        "a laminar family cannot need one".to_string()
-                    } else {
-                        format!("but seated them all: {}", crossing.join(" "))
-                    },
                 ));
             }
         }
@@ -160,23 +183,42 @@ fn a_text_owes_a_fallback_exactly_when_two_of_its_windows_cross() {
     // NOT VACUOUS, BOTH WAYS. The budget above is what this file got wrong for
     // so long; a green run has to prove the catalog compiled AND that both
     // sides of the iff were exercised.
-    assert_eq!(compiled, 68, "only {compiled} of 68 SKU x platform pairs compiled");
+    //
+    // **COUNTED, NOT WRITTEN DOWN.** Both of these used to be literals — 68
+    // pairs and 20 owing — and both were census figures that rot the moment
+    // the catalog grows a row. The 68 became 80 when the metal node added its
+    // mlxu4 SKUs, which says nothing about seriation; the 20 became 44 when
+    // alto A-6 put the correction in five more texts, which says nothing
+    // either. So the ceiling is derived from the catalog's own size, and the
+    // owing count is derived from the property that decides it.
+    let pairs = model::catalog().into_iter().count() * PLATFORMS.len();
     assert_eq!(
-        owing, 20,
-        "{owing} pairs owe a fallback, where the five qwen texts on four \
-         platforms are twenty — a text joined or left the crossing family",
+        compiled, pairs,
+        "only {compiled} of {pairs} SKU x platform pairs compiled",
+    );
+    assert_eq!(
+        owing, merged,
+        "{owing} pairs owe a fallback and {merged} state an attention merge of \
+         more than two arms — those are the same texts, because an arm past \
+         prefill and decode is what makes a mask cross rather than nest",
+    );
+    assert!(
+        owing > 0 && owing < compiled,
+        "{owing} of {compiled} pairs owe a fallback, so one side of the iff is \
+         never exercised and a green run proves only the other",
     );
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue;
             };
             let classes = compiled.classes.classes.len();
@@ -294,6 +336,7 @@ fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
 /// A withdrawal count above the bound is a search that gave up early; below
 /// it is arithmetic that stopped being true.
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
     let mut wrong: Vec<String> = Vec::new();
     let mut with_axes = 0usize;
@@ -301,7 +344,7 @@ fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue;
             };
             let classes = compiled.classes.classes.len();
@@ -342,21 +385,24 @@ fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
                         .is_some_and(|tree| !PqTree::is_interval(tree.frontier(), mask))
                 })
                 .count();
-            // The masked tax (see above): a text whose attention merge has a
-            // masked arm partitioned its classes around that window, and the
-            // partition costs two seats the halves arithmetic cannot count.
-            let masked = trace.nodes.iter().any(|node| {
-                matches!(
-                    node.op,
-                    model_ir::Operation::Attention(model_ir::Attention::Masked { .. })
-                )
-            });
-            let bound = axes.saturating_sub(2) + if masked { 2 } else { 0 };
+            // THE MERGE TAX, WHICH USED TO BE A MASKED TAX. The `+ 2` here was
+            // read off qwen, whose attention merge has FOUR arms — masked,
+            // the score capture, decode, prefill — and stated as `if masked`,
+            // which made "has a masked arm" the premise when the arm COUNT was
+            // doing the work. Gemma declares a masked arm too and its merge
+            // has three, so it pays one and not two: it withdraws a single
+            // mask where the flag predicted a pair. Widening the premise
+            // rather than patching the number collapses both branches into one
+            // term, and the flag disappears — two arms cost nothing because
+            // prefill and decode are what the halves arithmetic already
+            // counts.
+            let arms = attention_merge_arms(&trace);
+            let bound = axes.saturating_sub(2) + arms.saturating_sub(2);
             if withdrawn != bound {
                 wrong.push(format!(
-                    "`{sku}` as {platform:?}: {classes} classes, {axes} crossing axes, so the \
-                     bound is {bound} — but {withdrawn} masks are not intervals of the order \
-                     it ships",
+                    "`{sku}` as {platform:?}: {classes} classes, {axes} crossing axes and \
+                     {arms} attention merge arms, so the bound is {bound} — but \
+                     {withdrawn} masks are not intervals of the order it ships",
                 ));
             }
         }
@@ -371,6 +417,7 @@ fn a_text_withdraws_exactly_two_fewer_than_its_crossing_axes() {
 }
 
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn the_same_text_seriates_the_same_way_twice() {
     let mut wrong: Vec<String> = Vec::new();
 
@@ -379,8 +426,8 @@ fn the_same_text_seriates_the_same_way_twice() {
             let trace = trace(platform);
             let profile = DeviceProfile::default();
             let (Ok(once), Ok(twice)) = (
-                compile(&trace, &budgets_for(&trace), &profile),
-                compile(&trace, &budgets_for(&trace), &profile),
+                bake_with(&trace, &profile),
+                bake_with(&trace, &profile),
             ) else {
                 continue;
             };

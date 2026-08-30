@@ -48,13 +48,13 @@ use cudarc::driver::sys as dr;
 use cudarc::runtime::sys as rt;
 
 use engine_cuda::device::graph::Event;
-use engine::law::{At, Law, Refuse};
 use engine_cuda::device::map::{self, Component, Diff, NodeMap, Refused};
 use engine_cuda::device::nodes::{self, Walked};
 use engine_cuda::device::{Buffer, Graph};
 use engine_cuda::{Boot, Graphs, Lane, Shell};
 use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
+use model_exec::law::{At, Law, Refuse};
 
 /// One device at a time: every test here binds device 0 and captures on its
 /// own stream, and the last one loads a whole shell whose scratch slabs are
@@ -427,6 +427,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(4, 512),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 1024,

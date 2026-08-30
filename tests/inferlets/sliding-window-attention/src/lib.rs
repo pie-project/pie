@@ -5,7 +5,7 @@
 //! example masks old KV cells but does not evict their backing pages.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 
 #[derive(Deserialize)]

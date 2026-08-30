@@ -42,13 +42,21 @@ cuda-13 = ["_cuda", "cudarc/cuda-13000"]
 _cuda = ["dep:cudarc"]
 
 [dependencies]
-# `KernelError` — the shared answer vocabulary every kernel entry returns
-# (design §8: `Unsupported`/`DtypeUnsupported` exist exactly for these fns).
-kernels = { path = "../kernels" }
-# `Dtype` only. kernels does not re-export it, so this edge is named
-# directly — it adds a name, not a dependency: kernels already carries
-# model-ir into the tree. Nothing else of the IR is spoken here.
-model-ir = { path = "../model-ir" }
+# `kernels` STOOD HERE for `KernelError`, the answer vocabulary every entry
+# function returns, and it was this crate's last edge to anything above it.
+# That crate is gone: its dispatch traits went to `model-exec`, beside the one
+# walk that calls them, and the error is `src/error.rs` here -- an `Error` of
+# this crate's own, named for the crate that owns it rather than for the
+# contract it used to be. `engine-cuda` translates it at eight points -- one
+# per `Dispatch*` impl and one per `Serve` half -- in a total match that
+# cannot go stale in silence.
+#
+# `Dtype`, and it is the whole edge now. `model-ir` STOOD HERE for exactly this
+# one name, which meant a kernel crate that knows nothing about the IR still
+# carried the IR's op enums, its validator and its `Trace` in reach. The enum
+# moved to a leaf of its own that deps serde and nothing else, so this is now
+# a name AND a dependency, and both are the right size.
+dtype = { path = "../dtype" }
 
 # The runtime, and the whole reason this crate can exist at all. Dynamically
 # loaded (`fallback-dynamic-loading`), so nothing links against a toolkit and

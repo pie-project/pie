@@ -7,7 +7,7 @@ forks into independent leaves for generation.
 
 Zheng et al., ***SGLang: Efficient Execution of Structured Language Model
 Programs*** — <https://arxiv.org/abs/2312.07104>. Demonstrates the RadixAttention
-prefix-sharing mechanism in explicit PTIR working sets.
+prefix-sharing mechanism in explicit ETA working sets.
 
 **Faithfulness: Structural — explicit copy-on-write tree, not runtime RadixAttention.**
 It shows prefix KV reuse over a fixed two-level tree, but the tree is authored by

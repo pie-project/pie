@@ -136,7 +136,7 @@ impl AdmissionLimits {
 /// are per instance; mid-graph hooks are abolished at the contract (design
 /// §9 — a guest program runs at a BOUNDARY); no shell in this workspace can
 /// truncate depth at all; and the recurrent verb is per LANE
-/// (`engine_api::RsVerb`, wave F3-tail), so a fire whose rows fold, scatter
+/// (`engine::RsVerb`, wave F3-tail), so a fire whose rows fold, scatter
 /// and replay in any mixture is one submission rather than a co-batching
 /// rule.
 ///
@@ -282,15 +282,15 @@ pub(crate) fn build_batch_request(
 /// * **the roster** (`instance_ids` + `roster_rows`) — a per-frame table of
 ///   bound instances that the step tables indexed. `StepFire::instances` is
 ///   the same association said per lane, and the members that run a pass at
-///   the fire's boundary become [`Attachment`](engine_api::fire::Attachment)s
+///   the fire's boundary become [`Attachment`](engine::fire::Attachment)s
 ///   of the submission itself.
 /// * **`kv_translation` / `kv_translation_indptr`** — a per-roster-lane page
 ///   rewrite, gathered from each lane's LAST fire in the frame, for a fork
 ///   mover no shell in this tree has. Both spellings are deleted (alto E);
-///   see `engine_api::KvDelta` for what replaces it when one lands.
+///   see `engine::KvDelta` for what replaces it when one lands.
 /// * **`required_kv_pages`** — the frame-union page high-water, so an engine
 ///   could refuse before it started. An engine makes that check for itself and
-///   answers [`Exhausted`](engine_api::Error::Exhausted) with the two numbers
+///   answers [`Exhausted`](engine::Error::Exhausted) with the two numbers
 ///   in it. The per-request field that fed the union had no reader either and
 ///   is deleted (alto E).
 /// * **`sub_batch_indptr` / `sub_batch_class`** — the runs of equal geometry
@@ -301,7 +301,7 @@ pub(crate) fn build_batch_request(
 ///   splits from it. The palo shell derives every window from the lanes'
 ///   words (`engine::fire::compose`), which is the same decision made from
 ///   the same facts one layer down; the six `PIE_REGION_SIG_*` bits it was
-///   encoded in are gone with `engine-api::plan`.
+///   encoded in are gone with `engine::plan`.
 #[allow(
     clippy::vec_box,
     reason = "measured: `PendingRequest` is 1408 bytes. This vec is not a store but a \
@@ -439,7 +439,7 @@ pub(crate) fn build_frame_submission(
 mod tests {
     use super::*;
     use crate::engine::{FireRequest, WorkItemCompletion};
-    use tensor_ir::registry::GeometryClass;
+    use eta_ir::registry::GeometryClass;
 
     fn pending(request: FireRequest, instance_id: u64) -> Box<PendingRequest> {
         Box::new(PendingRequest {
@@ -515,7 +515,7 @@ mod tests {
         };
         // The recurrent half is the LANE's since wave F3-tail: a verb and a
         // reset fact, carried through the merge like every other lane field.
-        two.lanes[1].rs_reset = engine_api::fire::RsReset::Fresh;
+        two.lanes[1].rs_reset = engine::fire::RsReset::Fresh;
         let expected = two.lanes.clone();
 
         let step = build_batch_request(&[pending(two, 1)], 16, &SchedulerStats::default());

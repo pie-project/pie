@@ -300,8 +300,10 @@ static FRAME_SIZE: AtomicUsize = AtomicUsize::new(0);
 /// Guests never read this. They get `model.channel-capacity()`, which is
 /// [`channel_capacity`].
 pub fn configured_submit_depth() -> usize {
-    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
-        .submit_depth()
+    ::engine::runahead::Runahead::of(
+        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
+    )
+    .submit_depth()
 }
 
 /// Install the configured dispatch depth at bootstrap.
@@ -353,7 +355,7 @@ impl std::error::Error for ReconfigureRefused {}
 /// That is not sufficient here, because [`configured_frame_size`] is not
 /// runtime-internal state: it is handed to guests through `model.frame-size()`
 /// (`crate::inferlet::host::model`), and the SDK caches it for the life of the
-/// program (`ptir.rs`, a per-thread `OnceLock`). A value already read cannot be
+/// program (`eta.rs`, a per-thread `OnceLock`). A value already read cannot be
 /// recalled by anything the runtime does afterwards, so a guest that survives
 /// the swap keeps building frames to the old k while the runtime expects the
 /// new one. No barrier fixes that; only the absence of guests does.
@@ -403,8 +405,10 @@ pub fn reconfigure(frame_size: usize, dispatch_depth: usize) -> Result<(), Recon
 /// that OVERFILLS a device ring gets the engine's loud non-commit fault
 /// instead of back-pressure. Sizing to this number is the contract.
 pub fn channel_capacity() -> usize {
-    ::engine::runahead::Runahead::of(u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX))
-        .channel_capacity(configured_frame_size())
+    ::engine::runahead::Runahead::of(
+        u8::try_from(configured_dispatch_depth()).unwrap_or(u8::MAX),
+    )
+    .channel_capacity(configured_frame_size())
 }
 
 // =============================================================================
@@ -503,7 +507,7 @@ fn rs_state_copy_plan(
     let slot_ranges = src_slots
         .into_iter()
         .zip(dst_slots)
-        .map(|(src_slot_id, dst_slot_id)| ::engine_api::StateMove {
+        .map(|(src_slot_id, dst_slot_id)| ::engine::StateMove {
             src_slot_id,
             dst_slot_id,
             src_token_offset: 0,
@@ -554,8 +558,8 @@ pub fn submit_async(
 /// rather than accepted as one of its own. The call sites cannot return an
 /// error from inside a struct literal, and the id they hold has already been
 /// used to reach a scheduler handle on the next line.
-pub(crate) fn device_domain(engine_idx: usize) -> ::engine_api::MemoryDomain {
-    crate::engine::get_spec(engine_idx).map_or(::engine_api::MemoryDomain::HostPinned, |s| {
+pub(crate) fn device_domain(engine_idx: usize) -> ::engine::MemoryDomain {
+    crate::engine::get_spec(engine_idx).map_or(::engine::MemoryDomain::HostPinned, |s| {
         s.device_domain
     })
 }
@@ -757,9 +761,9 @@ mod tests {
     #[test]
     fn an_unregistered_engine_names_no_devices_memory() {
         let domain = super::device_domain(usize::MAX);
-        assert_eq!(domain, ::engine_api::MemoryDomain::HostPinned);
-        assert_ne!(domain, ::engine_api::MemoryDomain::CudaDevice(0));
-        assert_ne!(domain, ::engine_api::MemoryDomain::VulkanDevice(0));
-        assert_ne!(domain, ::engine_api::MemoryDomain::MetalPrivate);
+        assert_eq!(domain, ::engine::MemoryDomain::HostPinned);
+        assert_ne!(domain, ::engine::MemoryDomain::CudaDevice(0));
+        assert_ne!(domain, ::engine::MemoryDomain::VulkanDevice(0));
+        assert_ne!(domain, ::engine::MemoryDomain::MetalPrivate);
     }
 }

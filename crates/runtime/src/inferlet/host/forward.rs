@@ -31,9 +31,9 @@ use crate::pipeline::instance::{
 use crate::store::kv::working_set::KvWorkingSet;
 use crate::store::rs::working_set::RsWorkingSet;
 
-use tensor_ir::container::{HostRole, PortSource, TraceContainer};
-use tensor_ir::registry::{GeometryClass, Port, PortMask};
-use tensor_ir::types::DType;
+use eta_ir::container::{HostRole, PortSource, TraceContainer};
+use eta_ir::registry::{GeometryClass, Port, PortMask};
+use eta_ir::types::Dtype;
 
 use super::pie;
 
@@ -308,10 +308,10 @@ impl pie::inferlet::channel::HostChannel for ProcessCtx {
         // errors at forward-pass.new / submit).
         use pie::inferlet::types::Dtype;
         let dtype = match dtype {
-            Dtype::F32 => tensor_ir::types::DType::F32,
-            Dtype::I32 => tensor_ir::types::DType::I32,
-            Dtype::U32 => tensor_ir::types::DType::U32,
-            Dtype::Bool => tensor_ir::types::DType::Bool,
+            Dtype::F32 => eta_ir::types::Dtype::F32,
+            Dtype::I32 => eta_ir::types::Dtype::I32,
+            Dtype::U32 => eta_ir::types::Dtype::U32,
+            Dtype::Bool => eta_ir::types::Dtype::Bool,
         };
         let cell = Arc::new(Mutex::new(ChannelCell::new(shape, dtype, capacity)));
         Ok(self.ctx().table.push(Channel { cell, fires: None })?)
@@ -742,12 +742,12 @@ impl ProcessCtx {
             // ("descriptor channel not ready"). Such a pass takes the same
             // loud Host fallback as a geometry-incapable engine.
             let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
-                matches!(binding.port, tensor_ir::registry::Port::AttnMask)
-                    && matches!(binding.source, tensor_ir::container::PortSource::Channel(_))
+                matches!(binding.port, eta_ir::registry::Port::AttnMask)
+                    && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
             });
             // THE PORTS WENT HOME (decision 19): `PIE_DEVICE_GEOMETRY_PORTS`
             // and its twelve siblings were a private bit numbering in
-            // `engine-api` that disagreed with the registry's, and nothing
+            // `engine` that disagreed with the registry's, and nothing
             // checked the two. `covers` is the registry's own subset test.
             let devgeo_capable = device_port_mask.covers(PortMask::DEVICE_GEOMETRY)
                 && (!needs_mask_port || device_port_mask.covers(PortMask::of(&[Port::AttnMask])));
@@ -788,8 +788,8 @@ impl ProcessCtx {
                     let mut lease = crate::pipeline::fire::lease::PageLease::new(b);
                     lease.seed(seed_pages);
                     let has_mask = prog.bound.container.ports.iter().any(|p| {
-                        matches!(p.port, tensor_ir::registry::Port::AttnMask)
-                            && matches!(p.source, tensor_ir::container::PortSource::Channel(_))
+                        matches!(p.port, eta_ir::registry::Port::AttnMask)
+                            && matches!(p.source, eta_ir::container::PortSource::Channel(_))
                     });
                     Some(DevGeo {
                         lease,
@@ -916,12 +916,12 @@ impl ProcessCtx {
                 }
                 let extern_binding = extern_bindings[dense].as_ref();
                 missing_dense.push(dense);
-                // THE TAGS ARE PTIR'S OWN NOW. `dtype: u8`, `host_role: u8`
+                // THE TAGS ARE ETA'S OWN NOW. `dtype: u8`, `host_role: u8`
                 // and `extern_dir: u8` were three tag bytes re-spelling
-                // `tensor_ir::container`'s enums in a second numbering
+                // `eta_ir::container`'s enums in a second numbering
                 // (`PIE_CHANNEL_DTYPE_*`, `PIE_CHANNEL_HOST_ROLE_*`,
                 // `PIE_CHANNEL_EXTERN_*`), with nothing checking the two
-                // agreed — and `engine-api::program`'s header records the
+                // agreed — and `engine::program`'s header records the
                 // place the disagreement was visible. A declaration names the
                 // enums, so the re-spelling has nowhere left to drift.
                 //
@@ -979,7 +979,7 @@ impl ProcessCtx {
                 // bytes straight to both worked for all of them and only Bool
                 // bounced: the engine read a seed eight times the width it
                 // declared and refused the bind.
-                let wire = if cell.dtype == tensor_ir::types::DType::Bool {
+                let wire = if cell.dtype == eta_ir::types::Dtype::Bool {
                     let mut packed = vec![0u8; bytes.len().div_ceil(8)];
                     crate::pipeline::channel::pack_bool_into(&bytes, &mut packed);
                     packed
@@ -1019,9 +1019,9 @@ impl ProcessCtx {
                     // in a fire-time quantity — a decode-envelope pass resolves
                     // its token on the device (`palo B3`) but its stage
                     // buffers are still carved at one row apiece.
-                    ::engine_api::BindExtents {
+                    ::engine::BindExtents {
                         sampled_rows: pricing_rows.max(1),
-                        ..::engine_api::BindExtents::default()
+                        ..::engine::BindExtents::default()
                     },
                 )
                 .await
@@ -1235,7 +1235,7 @@ impl ProcessCtx {
         let resource: Resource<Channel> = Resource::new_borrow(geometry.fold_len);
         let cell = self.ctx().table.get(&resource)?.cell.clone();
         let cell = cell.lock().unwrap();
-        if !matches!(cell.dtype, DType::U32 | DType::I32) {
+        if !matches!(cell.dtype, Dtype::U32 | Dtype::I32) {
             return Ok(Err(format!(
                 "forward pass: rs-geometry.fold-len must be a u32/i32 channel, got {:?}",
                 cell.dtype
@@ -1511,8 +1511,8 @@ impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
 #[cfg(test)]
 mod descriptor_binding_tests {
     use super::*;
-    use tensor_ir::container::PortBinding;
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::container::PortBinding;
+    use eta_ir::types::{Dtype, Shape};
 
     fn container(ports: Vec<PortBinding>) -> TraceContainer {
         TraceContainer {
@@ -1546,7 +1546,7 @@ mod descriptor_binding_tests {
         let constant = container(vec![PortBinding {
             port: Port::EmbedIndptr,
             source: PortSource::Const {
-                dtype: DType::U32,
+                dtype: Dtype::U32,
                 shape: Shape::vector(2),
                 data: [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect(),
             },

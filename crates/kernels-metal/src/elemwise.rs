@@ -6,3 +6,8 @@ pub mod gate;
 pub mod hc;
 pub mod norm;
 pub mod rope;
+
+/// The multimodal rotary — `rope`'s partial arm over an `(t, h, w)` triple.
+/// Its own member of the family because it reads its own position stream
+/// under its own statute, not because the rotation differs.
+pub mod rope_mrope;

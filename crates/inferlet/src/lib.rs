@@ -72,17 +72,17 @@ pub use wit_bindgen;
 pub use pie::inferlet::types;
 
 /// The runtime working-set resources (KV page-slot array + recurrent state).
-/// The generated WIT resources, unwrapped; [`ptir::WorkingSet`] is the
+/// The generated WIT resources, unwrapped; [`eta::WorkingSet`] is the
 /// pass-facing handle built over them.
 pub mod working_set {
     pub use crate::pie::inferlet::working_set::*;
 }
 
 pub mod mask;
-/// The author-facing PTIR bridge (overview §3/§5): `ForwardPass`/`Pipeline`/
-/// `WorkingSet`/`Channel` over the WIT `ptir` resources, driving the `tensor-dsl`
-/// trace `Builder`. The single home of the PTIR authoring surface.
-pub mod ptir;
+/// The author-facing ETA bridge (overview §3/§5): `ForwardPass`/`Pipeline`/
+/// `WorkingSet`/`Channel` over the WIT forward resources, driving the `eta-dsl`
+/// trace `Builder`. The single home of the ETA authoring surface.
+pub mod eta;
 
 pub mod chat;
 

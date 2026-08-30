@@ -71,6 +71,30 @@ pub enum Attention {
         sm_scale: f32,
         o: ValueId,
     },
+    /// **BIDIRECTIONAL ATTENTION OVER THE PATCH WINDOW, BLOCK-DIAGONAL PER
+    /// IMAGE** — the vision towers' one real kernel (multimodal §2).
+    ///
+    /// It is an `Attention` by rule 1 and by nothing else it shares with the
+    /// paged family: no cache, no plan struct, no page table, no append, no
+    /// mask ladder, no log-sum-exp. `segments` is the PATCH axis's own indptr
+    /// (`RuntimeInput::PatchSegments`, `i32`, `[Dim::ImagesPlus(1)]`): patch
+    /// row `n` attends over the rows of the image whose span contains it, in
+    /// both directions, and over nothing else — which is the same batching
+    /// grammar the token axis runs, recursed one axis down with IMAGES where
+    /// the lanes were.
+    ///
+    /// `q`, `k`, `v` and `o` are patch rectangles, so this op's row axis is
+    /// [`RowAxis::Patches`](crate::RowAxis::Patches) and the capture-unit
+    /// partition reads that off the shapes rather than off the op's name.
+    Dense {
+        q: ValueId,
+        k: ValueId,
+        v: ValueId,
+        segments: ValueId,
+        head_dim: u32,
+        sm_scale: f32,
+        o: ValueId,
+    },
     DecodeLse {
         q: ValueId,
         plan: ValueId,
@@ -420,6 +444,7 @@ impl Operands for Attention {
             Self::Decode { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::Prefill { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::Masked { q, plan, mask, cache, .. } => sink.extend([*q, *plan, *mask, *cache]),
+            Self::Dense { q, k, v, segments, .. } => sink.extend([*q, *k, *v, *segments]),
             Self::DecodeLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             Self::PrefillLse { q, plan, cache, .. } => sink.extend([*q, *plan, *cache]),
             // The `sink` input field is bound as `sink_id`: its name collides with
@@ -521,6 +546,7 @@ impl Operands for Attention {
             Self::Decode { o, .. } => sink.push(*o),
             Self::Prefill { o, .. } => sink.push(*o),
             Self::Masked { o, .. } => sink.push(*o),
+            Self::Dense { o, .. } => sink.push(*o),
             Self::DecodeLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::PrefillLse { o, lse, .. } => sink.extend([*o, *lse]),
             Self::Sink { o_out, .. } => sink.push(*o_out),
@@ -568,6 +594,7 @@ impl Operands for Attention {
             Self::Decode { .. } => {}
             Self::Prefill { .. } => {}
             Self::Masked { .. } => {}
+            Self::Dense { .. } => {}
             Self::DecodeLse { .. } => {}
             Self::PrefillLse { .. } => {}
             Self::Sink { o_out, o, .. } => sink.push((*o_out, *o)),
@@ -611,6 +638,7 @@ impl Operands for Attention {
             Self::Decode { .. } => "attention.decode",
             Self::Prefill { .. } => "attention.prefill",
             Self::Masked { .. } => "attention.masked",
+            Self::Dense { .. } => "attention.dense",
             Self::DecodeLse { .. } => "attention.decode_lse",
             Self::PrefillLse { .. } => "attention.prefill_lse",
             Self::Sink { .. } => "attention.sink",

@@ -7,7 +7,7 @@
 //! port reads, and the host never sees it. Everything else those epilogues
 //! carry — the position, the readable extent, the write slot and offset, the
 //! page CSR — is pure arithmetic over the KV length, which the runtime's host
-//! shadow (`tensor_compiler::eval::pareval`) folds per fire. So the gap
+//! shadow (`eta_compiler::eval::pareval`) folds per fire. So the gap
 //! between a servable decode loop and an unservable one is exactly one line
 //! of guest source (`tok_in.put(&token)`), and exactly one port:
 //! [`Port::EmbedTokens`].
@@ -36,14 +36,30 @@
 //! from tickets so a chained fire never waited; the Rust rewrite withdrew that
 //! to `fire::envelope::compose`, a host function that `read_cell`s the
 //! committed front of each bound port. Prediction bought a wait that this
-//! plane does not have to pay for at all: a ring lives in a
+//! plane pays in one place and one place only: a ring lives in a
 //! `StorageModeShared` buffer on unified memory, so the committed cell is at a
-//! host address the whole time, and [`Prepared::launch_region`] has already
-//! waited on the command buffer that wrote it before it returns. Reading a
-//! port is therefore a `memcpy` out of mapped memory — not a `cudaMemcpy`, not
-//! a staging hop, and measurable against nothing. What the read DOES buy is
-//! the whole point: the token stops travelling through the runtime's
-//! asynchronous host plane (`take_channel` out, a guest await,
+//! host address the whole time and no transfer is involved at any point.
+//! Reading a port is a `memcpy` out of mapped memory — not a `cudaMemcpy`, not
+//! a staging hop, and measurable against nothing.
+//!
+//! **WHAT IT DOES COST IS A FENCE, AND THE FENCE IS THE CALLER'S.** The
+//! sentence that stood here said [`Prepared::launch_region`] had already
+//! waited on the command buffer that wrote the cell, which was true of a fire
+//! path that waited and is not true of this one: an epilogue is encoded into
+//! the MODEL fire's buffer ([`Plane::stage_into`](super::Plane::stage_into))
+//! and its cursors advance one frame later, at
+//! [`Plane::settle_launched`](super::Plane::settle_launched), out of the
+//! harvest. So a `head` read taken while a previous epilogue is still airborne
+//! is the cell of the fire before last — which on a loop-carried decode
+//! channel is the token of two steps ago, a wrong answer that looks like a
+//! right one. `Shell::fence_instances` is what makes the read honest, and
+//! `serve::stage` takes it over exactly the attached instances before it
+//! resolves anything. What it costs is what the dependency already implied: a
+//! decode loop is serial by construction, and two unrelated inferlets in one
+//! frame fence nothing of each other's.
+//!
+//! What the read BUYS is the whole point: the token stops travelling through
+//! the runtime's asynchronous host plane (`take_channel` out, a guest await,
 //! `publish_channel` back in), and a second decode step can be submitted
 //! behind the first inside one frame.
 //!
@@ -75,16 +91,17 @@
 //! It is invisible below, because a geometry index is `I32` or `U32` and those
 //! are four bytes on both.
 //!
-//! [`Port::consumes`]: engine::tensor_ir::registry::Port::consumes
-//! [`PortMask::DECODE_ENVELOPE`]: engine::tensor_ir::registry::PortMask::DECODE_ENVELOPE
-//! [`PortMask::DEVICE_GEOMETRY`]: engine::tensor_ir::registry::PortMask::DEVICE_GEOMETRY
+//! [`Port::consumes`]: eta_ir::registry::Port::consumes
+//! [`PortMask::DECODE_ENVELOPE`]: eta_ir::registry::PortMask::DECODE_ENVELOPE
+//! [`PortMask::DEVICE_GEOMETRY`]: eta_ir::registry::PortMask::DEVICE_GEOMETRY
 //! [`Prepared::launch_region`]: super::launch::Prepared::launch_region
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use engine::tensor_ir::DType;
-use engine::tensor_ir::registry::Port;
-use engine::{ExecPlan, Value};
+use eta_exec::{ExecPlan, Value};
+use eta_ir::Dtype;
+use eta_ir::registry::Port;
+use eta_ir::types::name_or_unknown;
 
 use crate::error::{Fault, Result};
 
@@ -129,9 +146,11 @@ pub struct Envelope {
 
 impl Envelope {
     /// True when nothing was bound — the shape an attached program with no
-    /// descriptor port at all resolves to, and the one
-    /// `crates/runtime/tests/cuda_program_epilogue.rs` authors on purpose for
-    /// the other shell.
+    /// descriptor port at all resolves to.
+    ///
+    /// The test that authored this shape on purpose for the other shell
+    /// (runtime/tests/cuda_program_epilogue.rs) is gone — deleted as
+    /// misplaced, not superseded — so nothing exercises it today.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tokens.is_none() && self.positions.is_none() && self.kv_len.is_none()
@@ -340,14 +359,36 @@ fn read_cell(
             ),
         ));
     };
-    if !matches!(shape.dtype, DType::I32 | DType::U32) {
+    if !matches!(shape.dtype, Dtype::I32 | Dtype::U32) {
         return Err(Fault::program(
             "program::ports",
             format!(
                 "port {}'s channel {channel} holds {}, and a geometry index is not an \
                  activation",
                 port.name(),
-                shape.dtype.name()
+                name_or_unknown(shape.dtype)
+            ),
+        ));
+    }
+    // **AN EMPTY RING IS A REFUSAL AND NOT A ZERO.** `head == tail` is a
+    // channel nothing has committed into — a fresh instance nobody seeded and
+    // whose epilogue has not run — and the cell at `head` then holds whatever
+    // the allocation came with. A shell that read it would embed token zero,
+    // or garbage, on the first fire of every decode loop and never say so.
+    // The readiness gate (`Session::blocked_channel`) catches this for a
+    // channel whose program DECLARES `NeedsFull`, which is every decode
+    // fixture; this is the same fact asked of the port itself, so a program
+    // that declares no readiness on the channel it binds a port to is refused
+    // here rather than answered from an unwritten cell.
+    if cursor.tail == cursor.head {
+        return Err(Fault::program(
+            "program::ports",
+            format!(
+                "port {} names channel {channel}, whose ring holds nothing committed \
+                 (head and tail are both {}); the port's value for this fire is the \
+                 cell the guest's own pass takes, and no pass has published one",
+                port.name(),
+                cursor.head
             ),
         ));
     }
@@ -380,7 +421,7 @@ fn as_u32(port: Port, value: &Value) -> Result<Vec<u32>> {
                 "the folded constant for port {} is {}, and a geometry index is not an \
                  activation",
                 port.name(),
-                other.dtype().name()
+                name_or_unknown(other.dtype())
             ),
         )),
     }

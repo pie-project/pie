@@ -79,7 +79,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use engine::tensor_ir::container::HostRole;
+use eta_ir::container::HostRole;
 
 use crate::device::{Buffer, Pinned};
 use crate::error::{Fault, Result};

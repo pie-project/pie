@@ -17,8 +17,8 @@
 //! rows, and what a particular fire does with that is
 //! [`ArenaMap::window`]'s arithmetic, not a recapture.
 //!
-//! The two meet at the budget. A column is RESERVED at its maximum under
-//! [`Budget`] — `Tokens` at `max_tokens`, `TokensTimes(k)` at
+//! The two meet at the budgets. A column is RESERVED at its maximum under
+//! [`Budgets`] — `Tokens` at `max_tokens`, `TokensTimes(k)` at
 //! `max_tokens * k`, `Lanes` at `max_lanes`, `LanesPlus(k)` at
 //! `max_lanes + k` — and a smaller fire writes its first rows and leaves the
 //! tail alone. The arena buffer has to be that big anyway, since it is
@@ -86,11 +86,12 @@
 //! overlap even if their node ranges do not.
 
 use model_ir::{
-    ClassSet, ClassTable, Def, Dim, Dtype, Operands, Trace, RuntimeInput, StructKind, Ty, ValueId,
+    ClassSet, ClassTable, Def, Dim, Dtype, Operands, RowAxis, Trace, RuntimeInput, StructKind, Ty,
+    ValueId,
 };
 
 use crate::compiled::Region;
-use crate::budget::Budget;
+use crate::budget::Budgets;
 use crate::error::{Error, Share, Unrectangled};
 
 /// Who reads an export after the graph has run — which is the only thing the
@@ -200,6 +201,23 @@ pub enum RowExpr {
     /// `lanes + k` — indptr-shaped, the bounds vector that needs its closing
     /// entry.
     LanesPlus(u32),
+    /// One row per PATCH this fire carries — the second row axis, reserved at
+    /// `Budgets::max_patches` and cut by the patch window rather than the token
+    /// one (`RowAxis::Patches`).
+    ///
+    /// A DIFFERENT SYMBOL AND THEREFORE A DIFFERENT COLUMN. Nothing here has
+    /// to say so twice: [`co_tenants`](ArenaMap::co_tenants) already demands
+    /// equal `rows`, so a patch rectangle and a token rectangle can never be
+    /// two row windows of one column — which is the arithmetic reason the two
+    /// axes cannot leak into each other's bytes even though they share one
+    /// arena and one `cudaMalloc` (multimodal §5.2).
+    Patches,
+    /// One row per IMAGE this fire carries — the patch axis's lane space,
+    /// which is what [`Lanes`](RowExpr::Lanes) is to the token axis.
+    Images,
+    /// `images + k` — the patch axis's indptr shape, and the one
+    /// `attention.dense` cuts each image's patch run out of.
+    ImagesPlus(u32),
 }
 
 impl RowExpr {
@@ -213,13 +231,30 @@ impl RowExpr {
             Dim::TokensTimes(k) => RowExpr::TokensTimes(k),
             Dim::Lanes => RowExpr::Lanes,
             Dim::LanesPlus(k) => RowExpr::LanesPlus(k),
+            Dim::Patches => RowExpr::Patches,
+            Dim::Images => RowExpr::Images,
+            Dim::ImagesPlus(k) => RowExpr::ImagesPlus(k),
+        }
+    }
+
+    /// Which row space this expression is measured in — the axis the fire's
+    /// window for it comes from. `None` for a [`Const`](RowExpr::Const), which
+    /// is not fire-aligned at all.
+    #[must_use]
+    pub fn axis(self) -> Option<RowAxis> {
+        match self {
+            RowExpr::Const(_) => None,
+            RowExpr::Tokens | RowExpr::TokensTimes(_) | RowExpr::Lanes | RowExpr::LanesPlus(_) => {
+                Some(RowAxis::Tokens)
+            }
+            RowExpr::Patches | RowExpr::Images | RowExpr::ImagesPlus(_) => Some(RowAxis::Patches),
         }
     }
 
     /// The most rows this can be under `budgets` — what the column reserves.
     #[must_use]
-    pub fn max(self, budget: &Budget) -> u64 {
-        self.at(u64::from(budget.max_tokens), u64::from(budget.max_lanes))
+    pub fn max(self, budgets: &Budgets) -> u64 {
+        self.at(FireRows::ceilings(budgets))
     }
 
     /// Does a windowed reader see only its OWN classes' rows of this column?
@@ -238,20 +273,92 @@ impl RowExpr {
     #[must_use]
     pub fn cut_per_class(self) -> bool {
         match self {
-            RowExpr::Tokens | RowExpr::TokensTimes(_) | RowExpr::Lanes => true,
-            RowExpr::Const(_) | RowExpr::LanesPlus(_) => false,
+            // `Patches` cuts for `Tokens`' reason, one axis over: the patch
+            // window gives every class present its own interval of PATCH rows,
+            // so a node running in one class touches that class's patch rows
+            // and no others. What it may never co-tenant with is a rectangle
+            // on the OTHER axis, and the equal-`rows` clause of `co_tenants`
+            // is what says so.
+            RowExpr::Tokens
+            | RowExpr::TokensTimes(_)
+            | RowExpr::Lanes
+            | RowExpr::Patches
+            | RowExpr::Images => true,
+            RowExpr::Const(_) | RowExpr::LanesPlus(_) | RowExpr::ImagesPlus(_) => false,
         }
     }
 
-    /// The rows a fire of `tokens` rows over `lanes` requests actually has.
+    /// The rows this expression actually has in a fire of these counts.
+    ///
+    /// **A RECORD AND NOT FOUR POSITIONAL COUNTS.** There are two row axes
+    /// and each has a row count and a lane count, so the question takes four
+    /// numbers of one type; swapping two of them does not fault, it computes,
+    /// over a rectangle of the wrong length. Naming them at the call site is
+    /// what stops that, and it is also what makes the third axis
+    /// (attn-score §6.1) one more field rather than a fifth argument.
     #[must_use]
-    pub fn at(self, tokens: u64, lanes: u64) -> u64 {
+    pub fn at(self, fire: FireRows) -> u64 {
         match self {
             RowExpr::Const(n) => n,
-            RowExpr::Tokens => tokens,
-            RowExpr::TokensTimes(k) => tokens.saturating_mul(u64::from(k)),
-            RowExpr::Lanes => lanes,
-            RowExpr::LanesPlus(k) => lanes.saturating_add(u64::from(k)),
+            RowExpr::Tokens => fire.tokens,
+            RowExpr::TokensTimes(k) => fire.tokens.saturating_mul(u64::from(k)),
+            RowExpr::Lanes => fire.lanes,
+            RowExpr::LanesPlus(k) => fire.lanes.saturating_add(u64::from(k)),
+            RowExpr::Patches => fire.patches,
+            RowExpr::Images => fire.images,
+            RowExpr::ImagesPlus(k) => fire.images.saturating_add(u64::from(k)),
+        }
+    }
+}
+
+/// What one fire is, as far as a rectangle's LENGTH is concerned: a row count
+/// and a lane count per row axis.
+///
+/// **FOUR NUMBERS AND NOT TWO, BECAUSE NEITHER PAIR DERIVES THE OTHER**
+/// (multimodal §5.1). A lane may carry no image or three, so a fire's patch
+/// count is not a function of its token count and its image count is not a
+/// function of its lane count; the patch axis arrives in its own window pair,
+/// out of its own seriation. A text-only fire states zeros for the second
+/// pair, which is the true answer for it rather than a default — see
+/// [`text_only`](FireRows::text_only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FireRows {
+    /// Token rows this fire carries.
+    pub tokens: u64,
+    /// Lanes — requests — this fire carries.
+    pub lanes: u64,
+    /// Patch rows this fire carries, over every image of every lane.
+    pub patches: u64,
+    /// Images this fire carries — the patch axis's lane count.
+    pub images: u64,
+}
+
+impl FireRows {
+    /// A fire on the token axis alone: no images, and therefore no patch rows.
+    ///
+    /// TRUE RATHER THAN DEFAULTED, which is the whole reason it is a named
+    /// constructor: a fire whose lanes submitted no image HAS zero patch rows
+    /// and zero images, and a caller that means "I do not know" has to say
+    /// something else.
+    #[must_use]
+    pub fn text_only(tokens: u64, lanes: u64) -> FireRows {
+        FireRows {
+            tokens,
+            lanes,
+            patches: 0,
+            images: 0,
+        }
+    }
+
+    /// The largest fire these budgets admit — what every column is reserved
+    /// at, on both axes at once.
+    #[must_use]
+    pub fn ceilings(budgets: &Budgets) -> FireRows {
+        FireRows {
+            tokens: u64::from(budgets.tokens.max_tokens),
+            lanes: u64::from(budgets.tokens.max_lanes),
+            patches: u64::from(budgets.max_patches()),
+            images: u64::from(budgets.max_images()),
         }
     }
 }
@@ -549,8 +656,13 @@ impl ArenaMap {
     ///
     /// THE ENGINE'S WHOLE ARITHMETIC, and it is this short because the offset
     /// is static: only the length moves with the bucket.
+    /// **THE SECOND AXIS'S COUNTS ARE NOT OPTIONAL.** A door that defaulted
+    /// them to zero would size every tower rectangle at nothing and hand back
+    /// an `Extent` of zero bytes — which does not fault, it computes, over
+    /// whatever the offset points at. So a caller states its fire whole, and
+    /// a text-only one says so with [`FireRows::text_only`].
     #[must_use]
-    pub fn window(&self, value: ValueId, tokens: u64, lanes: u64) -> Option<Extent> {
+    pub fn window(&self, value: ValueId, fire: FireRows) -> Option<Extent> {
         let root = self.root(value);
         match self.placements.get(root.0 as usize)? {
             Placement::Arena {
@@ -562,7 +674,7 @@ impl ArenaMap {
             } => Some(Extent {
                 offset: *offset,
                 bytes: rows
-                    .at(tokens, lanes)
+                    .at(fire)
                     .saturating_mul(*width)
                     .saturating_mul(elem_bytes(*dtype).unwrap_or(0)),
             }),
@@ -765,11 +877,11 @@ impl ArenaMap {
 /// declares at different sizes.
 pub(crate) fn carve(
     trace: &Trace,
-    budget: &Budget,
+    budgets: &Budgets,
     classes: &ClassTable,
     conc: &Concurrency,
 ) -> Result<ArenaMap, Error> {
-    let mut placements = rectangles(trace, budget)?;
+    let mut placements = rectangles(trace, budgets)?;
     fold_in_place(trace, &mut placements)?;
     fold_merges(trace, &mut placements)?;
     flatten(&mut placements);
@@ -802,7 +914,7 @@ pub(crate) fn carve(
 
 /// One slot per value, every rectangle sized at the budget's ceiling and every
 /// offset still zero.
-fn rectangles(trace: &Trace, budget: &Budget) -> Result<Vec<Placement>, Error> {
+fn rectangles(trace: &Trace, budgets: &Budgets) -> Result<Vec<Placement>, Error> {
     trace.values
         .iter()
         .enumerate()
@@ -832,7 +944,7 @@ fn rectangles(trace: &Trace, budget: &Budget) -> Result<Vec<Placement>, Error> {
                         })?;
                         Ok(Placement::Arena {
                             offset: 0,
-                            bytes: rows.max(budget).saturating_mul(width).saturating_mul(elem),
+                            bytes: rows.max(budgets).saturating_mul(width).saturating_mul(elem),
                             rows,
                             width,
                             dtype: *dtype,
@@ -862,7 +974,13 @@ fn rect(shape: &[Dim]) -> Result<(RowExpr, u64), Unrectangled> {
     for dim in shape.iter().skip(1) {
         match dim {
             Dim::Const(n) => width = width.saturating_mul(*n),
-            Dim::Tokens | Dim::TokensTimes(_) | Dim::Lanes | Dim::LanesPlus(_) => {
+            Dim::Tokens
+            | Dim::TokensTimes(_)
+            | Dim::Lanes
+            | Dim::LanesPlus(_)
+            | Dim::Patches
+            | Dim::Images
+            | Dim::ImagesPlus(_) => {
                 return Err(Unrectangled::SymbolicWidth);
             }
         }
@@ -881,10 +999,21 @@ fn rect(shape: &[Dim]) -> Result<(RowExpr, u64), Unrectangled> {
 #[must_use]
 pub fn elem_bytes(dtype: Dtype) -> Option<u64> {
     match dtype {
-        Dtype::Bf16 | Dtype::F16 => Some(2),
+        Dtype::Bf16 | Dtype::F16 | Dtype::I16 | Dtype::U16 => Some(2),
         Dtype::F32 | Dtype::I32 | Dtype::U32 => Some(4),
-        Dtype::U8 | Dtype::I8 | Dtype::Fp8E4m3 | Dtype::E8m0 => Some(1),
-        Dtype::Fp4 | Dtype::Mxfp4 => None,
+        Dtype::I64 | Dtype::U64 => Some(8),
+        Dtype::U8
+        | Dtype::I8
+        | Dtype::Fp8E4m3
+        | Dtype::Fp8E5m2
+        | Dtype::E8m0
+        | Dtype::Bool => Some(1),
+        // `MlxU8` is byte-wide and still belongs here: it names a WEIGHT
+        // bank's affine codes, and a code is only a number beside its group's
+        // scale and offset. An arena rectangle of them would be an op that
+        // declared its output in a storage element, which is what this refusal
+        // is for.
+        Dtype::Fp4 | Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 => None,
     }
 }
 
@@ -1354,11 +1483,11 @@ mod tests {
     use model_ir::{Guard, resolve_classes};
 
     /// Carve a fixture plan the way `compile` would.
-    fn carved(b: &Build, budget: &Budget) -> (ArenaMap, Concurrency) {
+    fn carved(b: &Build, budgets: &Budgets) -> (ArenaMap, Concurrency) {
         let classes = resolve_classes(&b.trace).expect("the fixture plans resolve");
         let regions = region::coalesce(&b.trace, &classes);
         let conc = Concurrency::sequential(&regions, b.trace.nodes.len());
-        let arena = carve(&b.trace, budget, &classes, &conc).expect("the fixture plans carve");
+        let arena = carve(&b.trace, budgets, &classes, &conc).expect("the fixture plans carve");
         (arena, conc)
     }
 
@@ -1369,11 +1498,11 @@ mod tests {
     /// implementation — everything up to [`place`] is shared, and the only
     /// thing that differs is the [`Columns`] mode, which is exactly the
     /// difference under test.
-    fn conservative(b: &Build, budget: &Budget) -> u64 {
+    fn conservative(b: &Build, budgets: &Budgets) -> u64 {
         let classes = resolve_classes(&b.trace).expect("the fixture plans resolve");
         let regions = region::coalesce(&b.trace, &classes);
         let conc = Concurrency::sequential(&regions, b.trace.nodes.len());
-        let mut placements = rectangles(&b.trace, budget).expect("the fixture plans carve");
+        let mut placements = rectangles(&b.trace, budgets).expect("the fixture plans carve");
         fold_in_place(&b.trace, &mut placements).expect("the fixture plans carve");
         fold_merges(&b.trace, &mut placements).expect("the fixture plans carve");
         flatten(&mut placements);
@@ -1407,21 +1536,21 @@ mod tests {
         (b, d1, p1)
     }
 
-    fn budget() -> Budget {
-        Budget::new(4, 16)
+    fn budget() -> Budgets {
+        Budgets::of(crate::Budget::new(4, 16))
     }
 
     #[test]
     fn the_row_algebra_sizes_every_dim_at_its_ceiling() {
-        let b = Budget::new(4, 16);
+        let b = Budgets::of(crate::Budget::new(4, 16));
         assert_eq!(RowExpr::of(Dim::Tokens).max(&b), 16);
         assert_eq!(RowExpr::of(Dim::TokensTimes(3)).max(&b), 48);
         assert_eq!(RowExpr::of(Dim::Lanes).max(&b), 4);
         assert_eq!(RowExpr::of(Dim::LanesPlus(1)).max(&b), 5);
         assert_eq!(RowExpr::of(Dim::Const(7)).max(&b), 7);
         // …and a fire smaller than the ceiling uses fewer.
-        assert_eq!(RowExpr::of(Dim::Tokens).at(3, 2), 3);
-        assert_eq!(RowExpr::of(Dim::LanesPlus(1)).at(3, 2), 3);
+        assert_eq!(RowExpr::of(Dim::Tokens).at(FireRows::text_only(3, 2)), 3);
+        assert_eq!(RowExpr::of(Dim::LanesPlus(1)).at(FireRows::text_only(3, 2)), 3);
     }
 
     #[test]
@@ -1506,7 +1635,8 @@ mod tests {
         assert!(arena.clashes(&conc).is_empty());
         // The two arms are the same bytes ON PURPOSE — that is what makes
         // a merge free — and the clash guard must not call it a clash.
-        assert_eq!(arena.window(d, 4, 2), arena.window(p, 4, 2));
+        let fire = FireRows::text_only(4, 2);
+        assert_eq!(arena.window(d, fire), arena.window(p, fire));
     }
 
     #[test]
@@ -1575,7 +1705,10 @@ mod tests {
         // 5 rows (lanes + 1), one element wide, 4 bytes each.
         assert_eq!(bytes, 5 * 4, "lanes + 1 rows of i32, not tokens");
         // …and in a fire of 2 lanes it touches three rows.
-        assert_eq!(arena.window(indptr, 7, 2).unwrap().bytes, 3 * 4);
+        assert_eq!(
+            arena.window(indptr, FireRows::text_only(7, 2)).unwrap().bytes,
+            3 * 4,
+        );
     }
 
     #[test]
@@ -1787,7 +1920,8 @@ mod tests {
         let (arena, conc) = carved(&b, &budget());
         assert_eq!(arena.placements[d.0 as usize], Placement::Alias(o));
         assert!(!arena.co_tenants(d, p), "they are one rectangle already");
-        assert_eq!(arena.window(d, 4, 2), arena.window(p, 4, 2));
+        let fire = FireRows::text_only(4, 2);
+        assert_eq!(arena.window(d, fire), arena.window(p, fire));
         // The column collects both arms' classes, so IT co-tenants with
         // nobody — which is right: an unguarded reader takes all of its rows.
         assert_eq!(arena.live_in[o.0 as usize].len(), 2);

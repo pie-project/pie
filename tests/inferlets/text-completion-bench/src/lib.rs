@@ -1,4 +1,4 @@
-//! Text completion inferlet for benchmarking — PTIR bridge rewrite.
+//! Text completion inferlet for benchmarking — ETA bridge rewrite.
 //!
 //! Same harness contract as the classic version (exact token counts in the
 //! final `Return` envelope, no per-token streaming, `ignore_eos` forces the
@@ -22,7 +22,7 @@
 //! runs in parallel, off the critical path. `close()` ends the stream after
 //! the submitted tail is drained.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use inferlet::{chat, session};
 use serde::{Deserialize, Serialize};
 use std::ops::RangeBounds;
@@ -208,7 +208,7 @@ trait BindState {
         W: RangeBounds<u32>;
 }
 
-impl BindState for inferlet::ptir::attention::ForwardPass {
+impl BindState for inferlet::eta::attention::ForwardPass {
     fn bind_state<R, W>(
         &self,
         ws: &WorkingSet,
@@ -226,7 +226,7 @@ impl BindState for inferlet::ptir::attention::ForwardPass {
     }
 }
 
-impl BindState for inferlet::ptir::hybrid::ForwardPass {
+impl BindState for inferlet::eta::hybrid::ForwardPass {
     fn bind_state<R, W>(
         &self,
         ws: &WorkingSet,
@@ -264,7 +264,7 @@ macro_rules! define_run_one {
             rng_seed: u32,
             main_pre_us: Option<u64>,
         ) -> Result<RunResult> {
-            use inferlet::ptir::$kind::{ForwardPass, submit_frame};
+            use inferlet::eta::$kind::{ForwardPass, submit_frame};
 
             let mut prologue_us: Vec<u64> = Vec::new();
             if input.report_timing {
@@ -653,7 +653,7 @@ macro_rules! define_run_one {
                     // a frame start from `window_fires - 1` and overshoot to
                     // `window_fires + live_slots - 1`, which is past the ring and is
                     // rejected outright at k >= 3 ("frame would need 8 reader cells,
-                    // capacity 7"). This is the same discipline `ptir::run_ahead`
+                    // capacity 7"). This is the same discipline `eta::run_ahead`
                     // uses, and it is what makes `channel_capacity()`'s single spare
                     // cell the correct margin.
                     while submitted < budget {

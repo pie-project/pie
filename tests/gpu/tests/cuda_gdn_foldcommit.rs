@@ -114,7 +114,7 @@ async fn run_foldcommit(input: &str) -> Result<std::result::Result<String, Strin
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
+            `RsWOff` -- is RESERVED in `eta-ir`'s registry and served by \
             no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
@@ -154,7 +154,7 @@ async fn one_chunk_folds_from_the_buffer() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
+            `RsWOff` -- is RESERVED in `eta-ir`'s registry and served by \
             no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
@@ -206,7 +206,7 @@ async fn two_chunks_need_the_buffer_read_path() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
+            `RsWOff` -- is RESERVED in `eta-ir`'s registry and served by \
             no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
@@ -242,7 +242,7 @@ async fn a_fire_can_append_to_a_buffer_and_fold_through_it() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
+            `RsWOff` -- is RESERVED in `eta-ir`'s registry and served by \
             no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
@@ -281,7 +281,7 @@ async fn one_fire_can_fold_one_request_while_another_only_buffers() -> Result<()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
+            `RsWOff` -- is RESERVED in `eta-ir`'s registry and served by \
             no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
@@ -317,7 +317,7 @@ async fn the_fold_length_can_live_on_device() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
+            `RsWOff` -- is RESERVED in `eta-ir`'s registry and served by \
             no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
@@ -346,7 +346,7 @@ async fn the_fold_boundary_can_land_inside_a_fires_own_tokens() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
+            `RsWOff` -- is RESERVED in `eta-ir`'s registry and served by \
             no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \
@@ -372,7 +372,7 @@ async fn a_commit_may_carry_no_tokens_of_its_own() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and served by \
+            `RsWOff` -- is RESERVED in `eta-ir`'s registry and served by \
             no engine in this tree, so a recurrent fold that appends to a \
             buffered slot and commits on its length has no port to read. The \
             `gdn-foldcommit` guest is gone with the workspace move to \

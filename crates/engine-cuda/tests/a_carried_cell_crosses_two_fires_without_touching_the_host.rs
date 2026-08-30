@@ -33,7 +33,7 @@
 //!
 //! # The three claims
 //!
-//! **(a) Byte-identical to the host-pump path.** `engine::program::step` is
+//! **(a) Byte-identical to the host-pump path.** `eta_exec::step` is
 //! the same interpreter `program_parity` diffs against and it is the OLD
 //! path's semantics exactly: host-owned cursors, host-owned rings, a commit
 //! the host decides. Both halves run the same program over the same fires and
@@ -78,19 +78,19 @@
 
 use std::collections::BTreeMap;
 
-use engine::engine_api::program::LaunchChannel;
-use engine::tensor_ir::container::HostRole;
-use engine::{
+use engine_cuda::device::{Context, present};
+use engine_cuda::program::{Disk, Fired, Plane};
+use eta_compiler::codegen::launch::LaunchChannel;
+use eta_exec::{
     Boundaries, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value,
     adopt_launch_package_with, concrete_dtype, encode_wire, host_take, make_host_instance, step,
     wire_cell_bytes,
 };
-use engine_cuda::device::{Context, present};
-use engine_cuda::program::{Disk, Fired, Plane};
-use tensor_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
-use tensor_ir::op::Op;
-use tensor_ir::registry::{GeometryClass, ModelProfile, Stage};
-use tensor_ir::types::{DType, Literal, Shape};
+use eta_ir::container::HostRole;
+use eta_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
+use eta_ir::op::Op;
+use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::types::{Dtype, Literal, Shape};
 
 /// The channels, in the package's declaration order.
 const LINK: u32 = 0;
@@ -122,7 +122,7 @@ fn carry() -> TraceContainer {
             // point: no host end, no pinned mirror, no door.
             ChannelDecl {
                 shape: Shape::vector(1),
-                dtype: ChanDType::Concrete(DType::I32),
+                dtype: ChanDType::Concrete(Dtype::I32),
                 capacity: 1,
                 host_role: HostRole::None,
                 seeded: true,
@@ -131,7 +131,7 @@ fn carry() -> TraceContainer {
             // previous fire's epilogue left there.
             ChannelDecl {
                 shape: Shape::vector(1),
-                dtype: ChanDType::Concrete(DType::I32),
+                dtype: ChanDType::Concrete(Dtype::I32),
                 capacity: 8,
                 host_role: HostRole::Reader,
                 seeded: false,
@@ -139,7 +139,7 @@ fn carry() -> TraceContainer {
             // OUT — what THIS fire's epilogue put into `link`.
             ChannelDecl {
                 shape: Shape::vector(1),
-                dtype: ChanDType::Concrete(DType::I32),
+                dtype: ChanDType::Concrete(Dtype::I32),
                 capacity: 8,
                 host_role: HostRole::Reader,
                 seeded: false,
@@ -175,13 +175,13 @@ fn carry() -> TraceContainer {
 }
 
 /// The subject, all the way to what `Plane::register` takes.
-fn registration() -> engine::engine_api::program::ProgramRegistration {
-    let bound = tensor_ir::validate::bind(carry(), ModelProfile::dummy())
+fn registration() -> engine::program::ProgramRegistration {
+    let bound = eta_ir::validate::bind(carry(), ModelProfile::dummy())
         .unwrap_or_else(|why| panic!("the carry program does not bind: {why:?}"));
-    let stages = tensor_compiler::plan::compile_bound(&bound);
-    let launch = tensor_compiler::codegen::launch::build(&bound, &stages);
-    let backend = tensor_compiler::codegen::program::Backend::Cuda;
-    let emitted = tensor_compiler::codegen::program::emit_program(backend, &stages, &bound);
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    let launch = eta_compiler::codegen::launch::build(&bound, &stages);
+    let backend = eta_compiler::codegen::program::Backend::Cuda;
+    let emitted = eta_compiler::codegen::program::emit_program(backend, &stages, &bound);
     for kernel in &emitted {
         assert!(
             kernel.error.is_empty(),
@@ -189,19 +189,9 @@ fn registration() -> engine::engine_api::program::ProgramRegistration {
             kernel.error
         );
     }
-    engine::engine_api::program::ProgramRegistration {
+    engine::program::ProgramRegistration {
         program_hash: bound.hash,
-        emitted_kernels: emitted
-            .into_iter()
-            .map(|kernel| engine::engine_api::program::EmittedKernel {
-                kind: kernel.kind,
-                stage_index: kernel.stage_index,
-                region_index: kernel.region_index,
-                entry_name: kernel.entry_name,
-                source: kernel.source,
-                error: kernel.error,
-            })
-            .collect(),
+        emitted_kernels: emitted,
         emitter_version: backend.emitter_version(),
         region_analysis: Vec::new(),
         launch,
@@ -278,7 +268,7 @@ fn a_carried_cell_crosses_two_fires_without_touching_the_host() {
         .bind(
             program,
             &[(LINK, seed.clone())],
-            engine::Extents::default(),
+            eta_exec::Extents::default(),
             GeometryClass::Host,
             &[],
             &[],
@@ -428,7 +418,7 @@ fn a_carried_cell_crosses_two_fires_without_touching_the_host() {
 fn ring_snapshot(
     plane: &Plane,
     instance: u64,
-    package: &engine::engine_api::program::LaunchPackage,
+    package: &eta_compiler::codegen::launch::LaunchPackage,
 ) -> Vec<(u64, u64, Vec<Vec<u8>>)> {
     let session = plane.instance(instance).expect("bound");
     package
@@ -452,7 +442,7 @@ fn compare_rings(
     plane: &Plane,
     instance: u64,
     interp: &InterpInstance,
-    package: &engine::engine_api::program::LaunchPackage,
+    package: &eta_compiler::codegen::launch::LaunchPackage,
     round: usize,
 ) {
     let session = plane.instance(instance).expect("bound");

@@ -5,7 +5,7 @@
 // The runtime's guest-facing forward-pass surface was replaced. The old
 // `pie:core/inference` interface, which exposed a fixed host-side sampler
 // (`Sampler.argmax()`, probes, `Generator`), is gone. In its place the guest
-// traces a program and ships canonical PTIR container bytes through one of
+// traces a program and ships canonical ETA container bytes through one of
 // `pie:inferlet/forward`, `forward-recurrent`, or `forward-hybrid`.
 //
 // Nothing in this package can produce those bytes. The Rust SDK does it with

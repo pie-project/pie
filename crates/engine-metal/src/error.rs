@@ -1,8 +1,8 @@
 //! The shell's answer vocabulary: one enum, one `Result`, and the rule that
 //! a refusal names what refused.
 //!
-//! The split this file keeps is `kernels::error`'s, restated one layer up: a
-//! [`KernelError`] is about the BACKEND — a geometry no shader is stamped
+//! The split this file keeps is the dispatch contract's, restated one layer
+//! up: a [`KernelError`] is about the BACKEND — a geometry no shader is stamped
 //! for, a dtype no entry carries — and a [`Fault`] is about the SHELL: a
 //! device that would not allocate, a checkpoint that does not answer the
 //! plan, a count past a reserved ceiling. Integrity failures of the compiler
@@ -17,8 +17,16 @@
 //! went wrong. A shader that fails to compile says so in a paragraph with
 //! line numbers in it, and throwing that away for a number would be the
 //! worst trade in this file.
+//!
+//! **A THIRD VOCABULARY ARRIVES FROM BELOW** and is translated rather than
+//! carried: `kernels_metal::Error`, which the kernel library kept when the
+//! crate it shared with the contract was taken apart. [`kernel`] at the foot
+//! of this file is that seam, and its doc says why it is a function where a
+//! `From` impl would read better.
 
 use std::fmt;
+
+use model_exec::KernelError;
 
 /// Every way this shell answers "no".
 #[derive(Debug)]
@@ -61,10 +69,20 @@ pub enum Fault {
     Bake(model_compiler::Error),
 
     /// The loader refused to land the checkpoint against this plan.
-    Load(model_loader::error::Error),
+    Load(checkpoint::error::Error),
 
     /// The fire substrate refused the batch, or a dispatch refused the op.
-    Fire(engine::Error),
+    ///
+    /// **IT USED TO CARRY A THIRD THING AND SHOULD NOT HAVE.** The substrate
+    /// was one crate with one `Error` enum, and its `Program { message }`
+    /// variant — a launch program the ETA interpreter could not read — arrived
+    /// here as a `Fire` like any other. `fault()` sorts `Fire` to
+    /// `Error::Invalid` and the guest-program refusals to `Error::Program`, so
+    /// every interpreter refusal crossed the contract wearing the wrong noun,
+    /// and a holder of this variant had to match an inner enum to find out
+    /// which. The substrate is two crates now and so is this: what is left
+    /// here is a batch the artifact cannot describe, and nothing else.
+    Fire(model_exec::Error),
 
     /// A param the plan names that the checkpoint never published, or
     /// published at another shape.
@@ -82,7 +100,7 @@ pub enum Fault {
     /// **NOT THE SLOW PATH, WHICH IS SERVED.** P4 writes a `Fallback` row for
     /// every consumer it could not seat, and such a region is encoded once per
     /// interval of its window (`crate::window::Windows`,
-    /// `engine::fire::fallback`). What is left here is the case where the bake
+    /// `model_exec::fire::fallback`). What is left here is the case where the bake
     /// and the fire disagree: a mask P4 promised consecutive that came back in
     /// pieces, or one whose pieces outnumber the `Fallback::Split { r }` P4
     /// counted on the order it shipped. Neither can happen to a `CompiledModel` and a
@@ -125,29 +143,62 @@ pub enum Fault {
     },
 
     /// A lane carries a mask and this artifact bakes no masked class.
+    ///
+    /// The ARTIFACT's answer, not the plane's: `attention.masked` is a live
+    /// entry here and [`crate::mask`] stages both forms, so what is missing
+    /// when this is raised is a window for the rows to run in — a model text
+    /// that never states the masked arm has nowhere to put a masked lane, and
+    /// the unmasked continuation is the wrong answer that would look right.
     Maskless {
         /// The lane, in submission order.
         lane: u32,
     },
 
-    /// A lane states a PER-ROW mask (`Masking::Rows`) and this plane serves
-    /// only `Masking::Extent`.
+    /// A lane's PER-ROW mask (`Masking::Rows`) states a different number of
+    /// rows than the lane feeds.
     ///
-    /// **REFUSED BY NAME, AND THE NAME IS THE FORM.** A windowed prefill
-    /// states one restriction per query row — row `i` keeps `[i - w, i]` —
-    /// which no single restriction of the lane's extent is. The CUDA shell
-    /// expands the form (`engine_cuda::mask`, one walk per row under that
-    /// row's causal bound); this one does not, and metal parity for it was
-    /// deliberately left out of the wave that landed the form. Serving it as
-    /// the extent form — that is, as row zero's mask on every row — is the
-    /// silent substitution the whole form exists to end, so the shape is
-    /// named here instead. This sits BESIDE [`Fault::Maskless`] rather than
-    /// inside it because they are different sentences: `Maskless` is "this
-    /// plane stages no mask bits at all yet", and this one survives the day
-    /// that stops being true.
+    /// **THE FORM EXPANDS; THE HEIGHT IS WHAT IS REFUSED.** A windowed
+    /// prefill states one restriction per query row — row `i` keeps
+    /// `[i - w, i]` — and [`crate::mask`] walks each row under its own causal
+    /// bound, as the CUDA sibling does. What has no reading is a vector of
+    /// some other length: `Masking::Rows` is parallel to `Lane::tokens`, so a
+    /// short one would leave rows with no restriction and a long one would
+    /// state restrictions for rows nobody fires. The reading it would be
+    /// tempting to invent — row zero's mask on every row — is the silent
+    /// substitution the whole form exists to end, so the count is named here
+    /// instead. This sits BESIDE [`Fault::Maskless`] because they are
+    /// different sentences: that one is about the ARTIFACT having no masked
+    /// class, this one about the submission's own shape.
     MaskRows {
         /// The lane, in submission order.
         lane: u32,
+        /// How many rows the masking states.
+        stated: u64,
+        /// How many rows the lane feeds.
+        rows: u32,
+    },
+
+    /// A lane states its own token positions and states a different number
+    /// of them than it feeds tokens.
+    ///
+    /// **THE ONLY CHECK A STATED RUN GETS, AND IT IS THE ONLY ONE THERE IS AN
+    /// ANSWER TO.** Positions reach exactly one place on this plane — rope's
+    /// seat, one `i32` per fire row — so a vector of the lane's height is
+    /// servable whatever is in it, and the two neighbouring temptations are
+    /// both wrong: padding a short one would rotate the tail at position
+    /// zero, and clipping a long one would silently agree with a caller that
+    /// disagrees with the composition about how many rows this lane has.
+    /// Monotonicity and a page bound are NOT checked, and deliberately: the
+    /// page CSR and the write descriptors are carved from `held` and the row
+    /// count, never from this, so a non-monotone run is a rotation the caller
+    /// meant (an mRoPE lane, a re-fed rejected draft) and not a geometry.
+    Positions {
+        /// The lane, in submission order.
+        lane: u32,
+        /// How many positions it states.
+        stated: u64,
+        /// How many token rows it feeds.
+        rows: u64,
     },
 
     /// A lane's word and its mask disagree, in either direction.
@@ -160,14 +211,47 @@ pub enum Fault {
         runs_masked_arm: bool,
     },
 
+    /// An adapted lane in a fire whose loaded artifact bakes no correction.
+    ///
+    /// [`Fault::Maskless`]'s twin, for the axis beside it and for the same
+    /// reason: an adapter bank is a seat the model text either declares or
+    /// does not (design §8), and a lane routed against a plan with no
+    /// `linear.lora_correct` arm would get the base model's answer under an
+    /// adapter's name. Named against the BAKE rather than against the class,
+    /// because when the correction is absent from the artifact no word could
+    /// have put the lane inside it.
+    Adapterless {
+        /// The lane, in submission order.
+        lane: u32,
+    },
+
+    /// A lane whose fact word and whose adapter do not agree, in either
+    /// direction.
+    ///
+    /// [`Fault::MaskWord`]'s twin. The word chooses the class and the class
+    /// chooses whether this lane's rows fall inside the correction's WINDOW,
+    /// which is what design §8 means by "a correction op over the adapter
+    /// window". A lane inside the window with no adapter id would send the
+    /// arm at a routes vector this fire never staged; a lane outside it
+    /// carrying one would have its id staged and never read, and answer with
+    /// the base model's continuation under the adapter's name.
+    AdapterWord {
+        /// The lane, in submission order.
+        lane: u32,
+        /// The word the caller stamped.
+        word: u64,
+        /// Whether the word's class runs the correction.
+        runs_correction: bool,
+    },
+
     /// A guest program this device would not compile.
     ///
-    /// Carries `engine::Failure`'s own split — a `Deterministic` refusal is
+    /// Carries `eta_exec::Failure`'s own split — a `Deterministic` refusal is
     /// remembered forever (the source will not compile on this device, ever)
     /// and a `Retryable` one is not (the machine was out of something). On
     /// this plane the split comes off `MTLLibraryError`: a compile failure
     /// is the source's, and anything else is the moment's.
-    Compile(engine::Failure),
+    Compile(eta_exec::Failure),
 
     /// The guest-program plane refused a call, and this is where and why.
     Program {
@@ -177,16 +261,31 @@ pub enum Fault {
         why: String,
     },
 
+    /// The ETA substrate refused a launch program, in its own words.
+    ///
+    /// [`Fault::Program`] above is THIS crate's refusals about the guest-
+    /// program plane — a door here, spelled the way the rest of this enum
+    /// spells one. This is the substrate's, forwarded whole: a package whose
+    /// values do not resolve, an op the interpreter does not know, a channel
+    /// the plan does not declare. It is a separate variant because it is a
+    /// separate author, and it carries the error rather than a string because
+    /// the type is the only thing that says which author it was.
+    ///
+    /// Both sort to `Error::Program` at the contract, which is the point: the
+    /// crossing this replaces sorted to `Error::Invalid`, by riding inside
+    /// [`Fault::Fire`].
+    Interpret(eta_exec::Error),
+
     /// An adapter registration this load's banks cannot seat.
     ///
-    /// Reachable even though `linear.lora_correct` is `Unsupported` on this
-    /// plane: a bank is a `ParamSource::Registered` weight, so
-    /// [`Weights`](crate::Weights) reserves and zeroes one for any plan that
-    /// declares it and `register_adapter` can be called against it. What
-    /// cannot happen yet is the CORRECTION — the op refuses by name at its
-    /// first node — so a caller that registered planes here has a residency
-    /// that nothing reads. That is a truthful state and not an error, which
-    /// is why this variant is about the registration and not about the axis.
+    /// **THE REGISTRATION'S REFUSAL, AND NOT THE AXIS'S.** A bank is a
+    /// `ParamSource::Registered` weight, so [`Weights`](crate::Weights)
+    /// reserves and zeroes one for any plan that declares it; this names the
+    /// three ways a caller's planes fail to describe it — a bank name the
+    /// plan never declared, an id past the capacity the model text stated,
+    /// and a plane that is not one whole slot. The axis's own two refusals
+    /// are [`Fault::Adapterless`] and [`Fault::AdapterWord`], which are about
+    /// a FIRE and not about a write.
     Adapter {
         /// The bank, as the plan's param names it.
         bank: String,
@@ -234,6 +333,56 @@ pub enum Fault {
     Unbound {
         /// What went unbound.
         what: String,
+    },
+
+    /// **A residency this shell cannot arrange** (alto design §7,
+    /// `crate::experts`).
+    ///
+    /// Every sentence in it names both numbers, because there is exactly one
+    /// deployment action behind each: a `device_weight_budget` under the dense
+    /// planes, a budget under one expert seat, a capped budget over a plan
+    /// with nothing routed to hold less of, a segment routing to more distinct
+    /// experts than its slab seats, or a bake whose regions carry two
+    /// mixtures each.
+    ///
+    /// Carries a sentence rather than fields for the reason the constitution
+    /// gives a refusal: the five shapes share no arithmetic, and a struct
+    /// wide enough for all of them would print an empty half at every site.
+    /// It lifts to `Error::Impossible` and never to `Exhausted` — nothing the
+    /// deployment frees changes the answer.
+    Residency(String),
+
+    // attn-score — appended, so every prior variant keeps its ordinal.
+    /// A capturing lane in a fire whose loaded artifact declares no capture
+    /// arm (`.wiki/alto/attn-score.md` §4, palo C4).
+    ///
+    /// [`Fault::Maskless`]'s and [`Fault::Adapterless`]'s twin, one axis over
+    /// and for their reason: the observability column is a fact the MODEL
+    /// declares, so a plan with no `attn.scores` export has nowhere for the
+    /// mass to go, and answering `Ok` would hand the caller an empty capture
+    /// it could not tell from a captured nothing.
+    Scoreless {
+        /// The lane, in submission order.
+        lane: u32,
+    },
+
+    /// A lane whose fact word and whose capture ask do not agree, in either
+    /// direction.
+    ///
+    /// [`Fault::MaskWord`]'s and [`Fault::AdapterWord`]'s twin, and the same
+    /// sentence: the word chooses the class and the class chooses whether this
+    /// lane's rows fall inside the CAPTURE window. A capturing word with no
+    /// ask behind it writes a plane the shell bound no epilogue at; an ask
+    /// with a plain word lands the lane on a kernel that produces no mass at
+    /// all, and the caller is handed a row of zeros that reads as "this lane
+    /// attended to nothing".
+    ScoreWord {
+        /// The lane, in submission order.
+        lane: u32,
+        /// The word the caller stamped.
+        word: u64,
+        /// Whether the word's class runs the capture arm.
+        runs_capture_arm: bool,
     },
 }
 
@@ -316,12 +465,25 @@ impl fmt::Display for Fault {
                 f,
                 "lane {lane} carries a mask and this artifact bakes no masked class"
             ),
-            Self::MaskRows { lane } => write!(
+            Self::MaskRows {
+                lane,
+                stated,
+                rows,
+            } => write!(
                 f,
-                "lane {lane} states a per-row attention mask (`Masking::Rows`) and this \
-                 plane serves only `Masking::Extent`: a windowed prefill's rows are one \
-                 restriction each, and serving them as row zero's is the substitution \
-                 the form exists to end"
+                "lane {lane} states a per-row attention mask (`Masking::Rows`) of \
+                 {stated} rows and feeds {rows}; the form is parallel to the lane's \
+                 tokens, and serving a short one as row zero's mask on every row is \
+                 the substitution the form exists to end"
+            ),
+            Self::Positions {
+                lane,
+                stated,
+                rows,
+            } => write!(
+                f,
+                "lane {lane} states {stated} token positions and feeds {rows} tokens; a \
+                 stated run is parallel to the lane's tokens or it is not stated at all"
             ),
             Self::MaskWord {
                 lane,
@@ -333,6 +495,63 @@ impl fmt::Display for Fault {
                  other thing",
                 if *runs_masked_arm { "runs" } else { "skips" }
             ),
+            Self::Adapterless { lane } => write!(
+                f,
+                "lane {lane} routes to an adapter bank and this load's artifact bakes \
+                 no corrected class: an adapter axis is a fact the MODEL declares \
+                 (design §8) and this plan has no `linear.lora_correct` arm for the id \
+                 to reach"
+            ),
+            Self::AdapterWord {
+                lane,
+                word,
+                runs_correction,
+            } => {
+                if *runs_correction {
+                    write!(
+                        f,
+                        "lane {lane}'s word {word:#x} puts it in a class that runs \
+                         `linear.lora_correct`, and it names no adapter for that arm to \
+                         route with"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "lane {lane} routes to an adapter and its word {word:#x} puts \
+                         it in a class outside the correction's window, so the id would \
+                         be staged and never read and the lane would answer with the \
+                         base model"
+                    )
+                }
+            }
+            Self::Scoreless { lane } => write!(
+                f,
+                "lane {lane} asks to capture its attention mass and this load's artifact \
+                 declares no capture arm: a score axis is a fact the MODEL states and \
+                 this plan carries no `attn.scores` export to read"
+            ),
+            Self::ScoreWord {
+                lane,
+                word,
+                runs_capture_arm,
+            } => {
+                if *runs_capture_arm {
+                    write!(
+                        f,
+                        "lane {lane}'s word {word:#x} puts it in a class that writes a \
+                         capture column, and it did not ask to be observed, so the mass \
+                         would be computed into a plane no epilogue is pointed at"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "lane {lane} asks to capture its attention mass and its word \
+                         {word:#x} puts it in a class outside the capture window, so no \
+                         mass would be computed and a row of zeros would be \
+                         indistinguishable from a capture of nothing"
+                    )
+                }
+            }
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),
             Self::Compile(failure) => write!(
                 f,
@@ -340,6 +559,7 @@ impl fmt::Display for Fault {
                 failure.reason()
             ),
             Self::Program { at, why } => write!(f, "`{at}` refused: {why}"),
+            Self::Interpret(error) => write!(f, "{error}"),
             Self::Unaffine {
                 slot,
                 point,
@@ -357,6 +577,7 @@ impl fmt::Display for Fault {
                 f,
                 "the plan names {what}, which this shell binds no seat for"
             ),
+            Self::Residency(why) => write!(f, "{why}"),
         }
     }
 }
@@ -369,30 +590,91 @@ impl From<model_compiler::Error> for Fault {
     }
 }
 
-impl From<model_loader::error::Error> for Fault {
-    fn from(error: model_loader::error::Error) -> Self {
+impl From<checkpoint::error::Error> for Fault {
+    fn from(error: checkpoint::error::Error) -> Self {
         Self::Load(error)
     }
 }
 
-impl From<engine::Error> for Fault {
-    fn from(error: engine::Error) -> Self {
+impl From<model_exec::Error> for Fault {
+    fn from(error: model_exec::Error) -> Self {
         Self::Fire(error)
     }
 }
 
-impl From<kernels::KernelError> for Fault {
-    fn from(error: kernels::KernelError) -> Self {
-        Self::Fire(engine::Error::from(error))
+impl From<model_exec::KernelError> for Fault {
+    fn from(error: model_exec::KernelError) -> Self {
+        Self::Fire(model_exec::Error::from(error))
     }
 }
 
-impl From<engine::Failure> for Fault {
-    fn from(failure: engine::Failure) -> Self {
+impl From<eta_exec::Failure> for Fault {
+    fn from(failure: eta_exec::Failure) -> Self {
         Self::Compile(failure)
+    }
+}
+
+impl From<eta_exec::Error> for Fault {
+    fn from(error: eta_exec::Error) -> Self {
+        Self::Interpret(error)
     }
 }
 
 
 /// What every fallible entry in this shell answers.
 pub type Result<T> = std::result::Result<T, Fault>;
+
+/// A kernel entry's refusal, reaching a shell path that answers [`Fault`].
+///
+/// **NOT EVERY CALL INTO `kernels-metal` IS A DISPATCH ARM.** Weight staging,
+/// the wave's control launches and the fire's own scratch work all call
+/// entries there and answer `Fault`, not the contract; before the shared
+/// error crate came apart this was `From<KernelError>` and `?` did the work.
+/// It still can, because `Fault` is this crate's own type and the orphan rule
+/// only bites when NEITHER side is — which is the whole difference between
+/// this impl and [`kernel`] below.
+impl From<kernels_metal::Error> for Fault {
+    fn from(error: kernels_metal::Error) -> Self {
+        Fault::from(kernel(error))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the seam: this backend's refusal, said in the contract's words
+// ---------------------------------------------------------------------------
+
+/// Say a [`kernels_metal::Error`] in the dispatch contract's words.
+///
+/// **THIS IS A FUNCTION AND NOT A `From` IMPL, AND THAT IS NOT A STYLE
+/// CHOICE.** Both types are foreign to this crate — one is the kernel
+/// library's, the other the contract's — and Rust's orphan rule (E0117)
+/// forbids a third crate from implementing `From` between two types it owns
+/// neither of. No arrangement of these three crates gets `?` to convert here
+/// without one of them naming a crate it must not: the kernel library would
+/// have to depend on `model-exec`, and so on `model-compiler` and `model-ir`,
+/// which is the whole edge deleting `crates/kernels` bought — or the two
+/// enums would have to be one type again in a shared leaf. So the conversion
+/// is called instead, once per `Dispatch*` impl, and each family's arms live
+/// in an inherent method that answers [`kernels_metal::Error`] so their own
+/// `?` still converts.
+///
+/// **The match is total on purpose.** The two enums are variant for variant
+/// identical today; they were one type until `crates/kernels` came apart, and
+/// `model_exec::KernelError`'s own doc says plainly that three copies is a
+/// prediction rather than a fact, with the falsifier written out. What makes
+/// the prediction safe to hold is this function: the day `kernels-metal`
+/// grows the `MTLLibrary` compile-failure variant it is expected to, this stops
+/// compiling, at the one line that has to decide what the new refusal means
+/// to a caller who can make nothing of a shader diagnostic. Nothing has to watch the
+/// copy — and a copy that needs watching is the one
+/// `crates/eta-exec/Cargo.toml` rules out: "a copy that is only safe because
+/// something watches it is a copy that costs the watch".
+pub fn kernel(error: kernels_metal::Error) -> KernelError {
+    match error {
+        kernels_metal::Error::Unsupported { op } => KernelError::Unsupported { op },
+        kernels_metal::Error::DtypeUnsupported { op, dtype } => {
+            KernelError::DtypeUnsupported { op, dtype }
+        }
+        kernels_metal::Error::Backend { op, detail } => KernelError::Backend { op, detail },
+    }
+}

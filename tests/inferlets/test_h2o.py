@@ -91,12 +91,12 @@ async def test_h2o_enforces_its_keep_set(client, args):
     assert tight["scores_nan"] == 0, tight
     assert tight["text"].strip(), tight
     assert wide["text"] != tight["text"], (
-        "attn_page_mask is not enforced for H2O: a 1-page budget produced the "
+        "the keep-set is not enforced for H2O: a 1-page budget produced the "
         "same continuation as an all-page one"
     )
     assert wide["text"] == base["text"], (
-        "an all-keep page mask perturbed the output; compaction is not "
-        f"equivalent to the original page table\n  {wide['text']!r}\n"
+        "an all-keep mask perturbed the output; the masked attention arm is "
+        f"not reproducing the causal one\n  {wide['text']!r}\n"
         f"  {base['text']!r}"
     )
     print("  [ ok ] budget 1 diverges, full budget matches the baseline exactly")
@@ -134,5 +134,5 @@ if __name__ == "__main__":
             test_h2o_keeps_what_it_scored,
         ],
         "H2O heavy-hitter accumulation + enforcement",
-        requires=("attn_score", "attn_page_mask"),
+        requires=("attn_score",),
     )

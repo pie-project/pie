@@ -6,7 +6,7 @@
 #
 # Guest-target crates (`crates/inferlet`, wasm32-wasip2) are MEMBERS but sit
 # outside `default-members`: that is what gives them this lockfile — the old
-# excluded `sdk/rust` workspace resolved tensor-dsl a second, independent time —
+# excluded `sdk/rust` workspace resolved eta-dsl a second, independent time —
 # while keeping them out of host sweeps. CI builds them explicitly with
 # `--target wasm32-wasip2`. `tests/inferlets` stays excluded: those carry their
 # own lockfiles on purpose, as fixtures of a published guest contract.
@@ -23,7 +23,17 @@ members = [
     # the `pie-env` diagnostic bin ("do this role's boot preconditions hold").
     "crates/bootstrap",
     "crates/runtime",
-    # Role libraries (pure libs: run(Config) -> Handle; no bin, never dep each other).
+    # Role libraries (pure libs: run(Config) -> Handle; no bin).
+    #
+    # "…and never dep each other" STOOD HERE, and it is not true: `worker`
+    # takes `client` (`crates/worker/Cargo.toml:157`), to drive an inferlet
+    # against the engine subprocess it boots. One edge among the four, and it
+    # is a role using another role's CLIENT rather than its service — which is
+    # the shape that does not couple two servers. The sentence is written this
+    # way rather than deleted because the property it was reaching for is
+    # still worth having: no role library depends on another role's SERVER.
+    # `tests/crate_layering.rs` is where a rule of that shape would go if it
+    # is ever worth enforcing; it is not enforced today.
     "crates/controller",
     "crates/gateway",
     "crates/worker",
@@ -37,47 +47,62 @@ members = [
     "crates/waker",
     # Id atoms, serde leaf — what the roles and the contracts all sit on.
     "crates/ids",
+    # The element type, serde leaf — the one enum the IR, the loader, the
+    # kernels and the transfer contract all name.
+    "crates/dtype",
 
     # -- boundary contracts, suffix-named after their subject ---------------
-    # `-api` = wire/message contract. They stay extracted because roles never
-    # dep each other and bidirectional pairs would cycle.
+    # `-api` = wire/message contract. They stay extracted because a
+    # bidirectional pair of roles naming each other's types directly would
+    # cycle. (Not because roles never depend on each other -- see the note
+    # above `crates/controller`: `worker` takes `client`.)
     #
     # `-abi` was the other suffix, for the repr(C) FFI contract, and no crate
     # carries it any more: every engine on the far side is Rust, so the
-    # marshalling shapes went. `engine-api` kept the shape of one for a while
+    # marshalling shapes went. `engine` kept the shape of one for a while
     # after the C++ left -- an `i32` status ladder, an ABI version on an
-    # in-process call, `u8` tag constants re-spelling `tensor-ir`'s vocabulary
+    # in-process call, `u8` tag constants re-spelling `eta-ir`'s vocabulary
     # -- and the palo rewrite (design §7) deleted the last of it. It is owned
-    # Rust types over `model-ir` and `tensor-ir` now, with no `#[repr(C)]` left
+    # Rust types over `model-ir` and `eta-ir` now, with no `#[repr(C)]` left
     # in it at all.
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
-    "crates/engine-api",
-
-    # -- engine-*: execution shells ----------------------------------------
-    # The PTIR channel plane, shared by both Rust shells. It was `src/pipeline/`
-    # inside `engine-metal` until the CUDA shell reached the same file, and
-    # the move cost nothing because not one line of it named a Metal type --
-    # the directory already built and tested on Linux while the crate around it
-    # did not. A `default-member`, unlike every engine below it: it needs no
-    # GPU, no toolkit and no OS, so there is no reason a workspace sweep should
-    # not carry its tests.
     "crates/engine",
 
-    # -- model-*: what a model IS, and how it gets onto a device ------------
-    # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
-    # engines at cold start, not by the serving runtime. One crate: the engines
-    # link the rlib and pass Rust types, and a device's arena crosses as an
-    # `ArenaBacking` rather than as a second executor inside each engine.
-    "crates/model-loader",
+    # -- engine-*: execution shells ----------------------------------------
+    # The two deviceless execution substrates, shared by both Rust shells. One
+    # crate held both until they were measured: `fire`/`store`/`law` reach for
+    # the model toolchain, the guest-program plane reaches for the ETA
+    # toolchain, and the cross-references between them were zero. The half that
+    # was `src/pipeline/` inside `engine-metal` until the CUDA shell reached
+    # the same file is `eta-exec`; the move cost nothing then because not one
+    # line of it named a Metal type, and this one costs nothing because neither
+    # half named the other. Both are `default-member`s, unlike every engine
+    # below them: they need no GPU, no toolkit and no OS, so there is no reason
+    # a workspace sweep should not carry their tests.
+    "crates/model-exec",
+    "crates/eta-exec",
 
-    # -- tensor-*: the guest-program toolchain ------------------------------
-    # authoring eDSL -> PTIR -> planning -> CUDA/Metal codegen, plus the
+    # -- how a checkpoint gets onto a device -------------------------------
+    # Checkpoints -> verified memory layouts a device can be pointed at.
+    # Consumed by engines at cold start, not by the serving runtime. One
+    # crate: the engines link the rlib and pass Rust types, and a device's
+    # arena crosses as an `ArenaBacking` rather than as a second executor
+    # inside each engine.
+    #
+    # It was crates/model-loader, and it sat under a `model-*` heading it
+    # never belonged to: nothing in it knows a model family, which is the
+    # property `crates/checkpoint/tests/standalone.rs` exists to pin. What it
+    # knows is a checkpoint.
+    "crates/checkpoint",
+
+    # -- eta-*: the guest-program toolchain ---------------------------------
+    # authoring eDSL -> ETA -> planning -> CUDA/Metal codegen, plus the
     # reference interpreter every backend diffs against.
-    "crates/tensor-ir",
-    "crates/tensor-dsl",
-    "crates/tensor-compiler",
+    "crates/eta-ir",
+    "crates/eta-dsl",
+    "crates/eta-compiler",
 
     # -- guest-target members (outside default-members, see below) ----------
     # `inferlet` owns the canonical `pie:inferlet` WIT package (`wit/`) AND is
@@ -91,10 +116,11 @@ members = [
     # -- menlo: the typed-IR rewrite (.wiki/menlo/design.md) ------------------
     # The old model/kernel stack (string plans, #[points], claim tables, the
     # per-plane baker shells) was deleted in one commit and these took the
-    # names. Layering: model-ir is a leaf of pure data; kernels is the
-    # dispatch contract; kernels-* are entry functions with no IR knowledge;
-    # kernels also carries the one walk written over that contract;
-    # engine-* own the Run.
+    # names. Layering: model-ir is a leaf of pure data; kernels-* are entry
+    # functions with no IR knowledge, each answering with an `Error` of its
+    # own; model-exec holds the dispatch contract AND the one walk written
+    # over it; engine-* own the Run and translate the kernel library's
+    # refusal into the contract's at six points apiece.
     # The IR: typed op enums, Def x Ty value declarations, the validator.
     "crates/model-ir",
     # The authoring surface: Recorder/Value, wrappers that own their shapes.
@@ -105,8 +131,6 @@ members = [
     "crates/model",
     # The prompt formats: ChatML/Harmony/Gemma/DeepSeek/Kimi, both directions.
     "crates/chat-template",
-    # The dispatch contract (15 traits, aggregate exec) and the shared walk.
-    "crates/kernels",
     # Pure CUDA kernel definitions: jit machinery, owned attention plans,
     # NCCL collectives; device text carried in-tree.
     "crates/kernels-cuda",
@@ -142,11 +166,13 @@ default-members = [
     "crates/grammar",
     "crates/waker",
     "crates/ids",
+    "crates/dtype",
     "crates/client-api",
     "crates/controller-api",
     "crates/worker-api",
-    "crates/engine-api",
     "crates/engine",
+    "crates/model-exec",
+    "crates/eta-exec",
     # The three shader drivers stood here through R2's quarantine and are out
     # of the workspace altogether now — see `exclude`.
     "crates/model",
@@ -154,13 +180,12 @@ default-members = [
     "crates/model-dsl",
     # Pure, deviceless and fast to check — a workspace sweep should carry it.
     "crates/model-compiler",
-    "crates/model-loader",
-    "crates/kernels",
+    "crates/checkpoint",
     "crates/kernels-cuda",
     "crates/kernels-metal",
-    "crates/tensor-ir",
-    "crates/tensor-dsl",
-    "crates/tensor-compiler",
+    "crates/eta-ir",
+    "crates/eta-dsl",
+    "crates/eta-compiler",
     "crates/inferlet-macros",
     "sdk/server/python",
     "tests/gpu",
@@ -254,8 +279,10 @@ gateway = { path = "crates/gateway" }
 worker = { path = "crates/worker", default-features = false }
 runtime = { path = "crates/runtime" }  # program/manifest types for `pie inferlet`
 # `pie model import` — the host-side load-plan executor and checkpoint
-# writer. Pure Rust; needs no driver and no GPU.
-model-loader = { path = "crates/model-loader" }
+# writer. Pure Rust; needs no driver and no GPU, in every configuration:
+# the CUDA arena it used to gate behind a `cuda` feature is `engine-cuda`'s
+# now, and nothing here names a kernel crate.
+checkpoint = { path = "crates/checkpoint" }
 # The tokenizer compiler — `pie model import` runs it once and serializes the
 # result into the artifact (`pie.tokenizer/1`), so the runtime never parses
 # `tokenizer.json` again.
@@ -320,7 +347,7 @@ libc = "0.2"
 # The floor is verified, not assumed: `cargo +1.91.1 check --all-targets` builds
 # all six compiler crates. `rust-toolchain.toml` pins 1.97.1 because that is the
 # version CI's `-D warnings` gate is calibrated against, but pinning a toolchain
-# is not the same claim as requiring one — a consumer of `tensor-ir` needs only
+# is not the same claim as requiring one — a consumer of `eta-ir` needs only
 # what the source actually uses.
 #
 # Lowering this further needs a toolchain to check it against; raising it needs
@@ -402,11 +429,11 @@ ztensor-compat = "2.1.1"
 # confident wrong one. Turning the lint on would now mean 26 `#[allow]`s or 26
 # hand-written variant lists that drift, which buys less than it costs.
 [workspace.lints.rust]
-# Promoted from `tensor-dsl`, which was the only crate carrying it. There is no
-# `unsafe` anywhere in the tensor toolchain, so this extends that crate's
-# existing guarantee to `tensor-ir` and `tensor-compiler` at zero cost.
+# Promoted from `eta-dsl`, which was the only crate carrying it. There is no
+# `unsafe` anywhere in the ETA toolchain, so this extends that crate's
+# existing guarantee to `eta-ir` and `eta-compiler` at zero cost.
 unsafe_code = "forbid"
-# Every public item in the tensor toolchain is documented, and this keeps it
+# Every public item in the ETA toolchain is documented, and this keeps it
 # that way. These crates are read far more often than they are written -- the op
 # table, the wire layout and the type rules are all consulted from other
 # crates and from generated backend sources -- so an undocumented public item
@@ -426,7 +453,7 @@ print_stderr = "deny"
 # `cast_possible_truncation` is deliberately NOT set here. It fires on ~130
 # `usize as u32` sites that are all bounded -- by the container ceilings, by
 # the `u32` value-id space, or by `usize` being 64 bits on the only targets
-# `tensor-compiler` and `tensor-compiler` build for -- so denying it workspace-wide buys
+# `eta-compiler` and `eta-compiler` build for -- so denying it workspace-wide buys
 # ~130 `#[allow]` and no guarantee.
 #
 # It is denied at the top of `compiler/ir/src/lib.rs` instead, which is where

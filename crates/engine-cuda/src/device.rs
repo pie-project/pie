@@ -23,6 +23,7 @@
 //! the eager plane's is.
 
 pub mod alloc;
+pub mod conditional;
 pub mod ctx;
 /// **The elastic supply** (alto design §8, wave C): a budgeted pool of
 /// physical pages, and virtual ranges whose backing grows and trims under a

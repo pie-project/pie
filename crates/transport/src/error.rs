@@ -10,18 +10,18 @@ pub type Result<T> = std::result::Result<T, TransportError>;
 pub enum TransportError {
     /// The requested path does not participate / is not built. metal and vulkan
     /// are single-node — their engine shim never exports a handle, so they never
-    /// reach an engine. Also raised when a transfer is routed to the `nixl`
-    /// engine in a build compiled without `feature = "nixl"`. Callers treat this
+    /// reach a backend. Also raised when a transfer is routed to the `nixl`
+    /// backend in a build compiled without `feature = "nixl"`. Callers treat this
     /// as "this path simply isn't on the fabric", not a bug.
     #[error("transport path not available: {0}")]
     Unsupported(&'static str),
 
-    /// A transfer engine could not register an engine-exported handle (out of resources,
+    /// A transfer backend could not register an engine-exported handle (out of resources,
     /// unpinnable memory, a region that isn't actually device-resident, ...).
     #[error("failed to register KV handle: {0}")]
     Registration(String),
 
-    /// A transfer (or its completion) failed at the engine level.
+    /// A transfer (or its completion) failed at the backend level.
     #[error("KV transfer failed: {0}")]
     Transfer(String),
 
@@ -35,8 +35,8 @@ pub enum TransportError {
     #[error("page {page} is out of bounds for the KV region")]
     PageOutOfBounds { page: u32 },
 
-    /// `send`/`recv` named a worker the engine has no registered handle for. For
-    /// the local engine this means the peer is not co-located (not registered on
+    /// `send`/`recv` named a worker the backend has no registered handle for. For
+    /// the local backend this means the peer is not co-located (not registered on
     /// this node).
     #[error("no registered KV handle for worker {worker}")]
     UnknownPeer { worker: u64 },

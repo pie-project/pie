@@ -1,14 +1,25 @@
 //! The `elementwise` family: `impl DispatchElementwise for Run<'_>`, holding
 //! the norm arms plus the absorbed `rope`, `gate`, and `hc` groups.
 
-use kernels::{DispatchElementwise, KernelError};
 use kernels_metal::{Tensor, elemwise};
-use model_ir::Elementwise;
+use model_exec::{DispatchElementwise, KernelError};
+use model_ir::{Elementwise, MropeForm, Operands};
 
 use crate::run::Run;
 
 impl DispatchElementwise for Run<'_> {
     fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError> {
+        self.elementwise(op).map_err(crate::error::kernel)
+    }
+}
+
+impl Run<'_> {
+    /// The arms themselves, in `kernels-metal`'s error vocabulary and not
+    /// the contract's — which is what keeps each one a plain tail call with
+    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
+    /// above that lifts the family, and says why it is a call and not a
+    /// `From` impl.
+    fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_metal::Error> {
         match op {
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
                 self.ctx(),
@@ -64,6 +75,19 @@ impl DispatchElementwise for Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
+            // **THE CENTRED NORM AND THE CLAMP, REFUSED BY NAME** (multimodal
+            // §6.1, §6.5). This plane's `elemwise::norm` ships no centred
+            // entry and its `elemwise` no free-standing clamp, so the arms
+            // that exist here are the two names — which is the family's rule
+            // the other way round from `attn::dense`'s: a written shader gets
+            // a forwarding arm, an unwritten one gets its own refusal rather
+            // than a shader that norms the wrong thing. One `kernels-metal`
+            // entry each retires these, and nothing else moves.
+            Elementwise::LayernormNoScale { .. }
+            | Elementwise::Clamp { .. }
+            | Elementwise::ClampLearned { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
             Elementwise::RmsnormGated {
                 x,
                 gate,
@@ -168,6 +192,37 @@ impl DispatchElementwise for Run<'_> {
                 *head_dim,
                 *theta,
             ),
+            // The interleaved section layout forwards, as it always did; the
+            // tower's BLOCKED one refuses by name, because this plane's
+            // `elemwise::rope_mrope` ships one entry and a rotation that
+            // handed the sections out the other way would answer plausible
+            // numbers for the wrong checkpoint. One entry beside
+            // `interleaved` retires the refusal.
+            Elementwise::RopeMrope {
+                q,
+                k,
+                positions,
+                sections,
+                form: MropeForm::Interleaved,
+                rotary_dim,
+                head_dim,
+                theta,
+                q_out: _,
+                k_out: _,
+            } => elemwise::rope_mrope::interleaved(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*positions),
+                *sections,
+                *rotary_dim,
+                *head_dim,
+                *theta,
+            ),
+            Elementwise::RopeMrope {
+                form: MropeForm::Blocked,
+                ..
+            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Elementwise::RopePartialQ {
                 q,
                 positions,

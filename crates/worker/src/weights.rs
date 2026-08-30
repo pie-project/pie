@@ -25,6 +25,11 @@ use std::path::{Path, PathBuf};
 
 use ::runtime::model::ModelMetadata;
 use anyhow::{Result, anyhow, bail};
+// By item, not by module. The crate is `checkpoint` and the local below is
+// also called `checkpoint`; spelling the calls `checkpoint::file::read::…`
+// would put a third use of the word between them, and both names here say
+// what they do without the path.
+use checkpoint::file::read::{parse_metadata, read_meta};
 
 /// The artifact object the checkpoint's own `config.json` is written under.
 ///
@@ -84,10 +89,10 @@ impl Model {
         };
         // One parse. For a sharded artifact the manifest read opens and
         // validates every shard, so doing it per consumer is not free.
-        let checkpoint = model_loader::checkpoint::read::parse_checkpoint_metadata(path)
-            .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
+        let checkpoint =
+            parse_metadata(path).map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
 
-        let config = model_loader::checkpoint::read::read_meta(&checkpoint, CONFIG_OBJECT)?
+        let config = read_meta(&checkpoint, CONFIG_OBJECT)?
             .ok_or_else(|| {
                 anyhow!(
                     "artifact {} carries no {}; it was written when an artifact \
@@ -100,7 +105,7 @@ impl Model {
 
         let mut tokenizer = Vec::with_capacity(tokenizer::canonical::OBJECTS.len());
         for name in tokenizer::canonical::OBJECTS {
-            let Some(bytes) = model_loader::checkpoint::read::read_meta(&checkpoint, name)? else {
+            let Some(bytes) = read_meta(&checkpoint, name)? else {
                 tokenizer.clear();
                 break;
             };
@@ -268,8 +273,8 @@ fn looks_like_path(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_loader::checkpoint::write::CheckpointWriter;
-    use model_loader::types::{DType, Encoding, TensorDecl, TensorId};
+    use checkpoint::file::write::Writer;
+    use checkpoint::types::{DType, Encoding, TensorDecl, TensorId};
 
     #[test]
     fn a_path_is_a_path_and_a_name_is_a_name() {
@@ -367,7 +372,7 @@ mod tests {
         let canonical = tokenizer::Tokenizer::from_vocab(&["a".to_string(), "b".to_string()])
             .to_canonical()
             .unwrap();
-        let mut writer = CheckpointWriter::create(&path, &Default::default()).unwrap();
+        let mut writer = Writer::create(&path, &Default::default()).unwrap();
         // Ascending names: `model/…` sorts before `tokenizer/…`.
         writer.add_meta(CONFIG_OBJECT, config).unwrap();
         for (name, bytes) in canonical.objects() {

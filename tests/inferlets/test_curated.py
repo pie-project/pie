@@ -481,6 +481,29 @@ _QUEST_PROMPT = (
 _COHERENCE_TAU = 0.001
 
 
+# The EVICTION pair's prompt, and it is not `_QUEST_PROMPT` for a measured
+# reason. `_QUEST_PROMPT` is one sentence repeated twenty-four times: every
+# page carries the same information, so a policy that drops sixteen of
+# seventeen loses nothing the model was going to say, and both `trackb-snapkv`
+# and `trackb-h2o` return the baseline continuation VERBATIM at a one-page
+# budget. Under it "the policy is enforced" is untestable through the text --
+# not because enforcement fails but because there is nothing to lose. (It is
+# also why its end-of-prompt attention profile does not separate: with the
+# same sentence everywhere, the observation window's mass is spread by
+# position rather than by content.)
+#
+# This one puts a fact at the HEAD that the filler never repeats and asks for
+# it at the TAIL. The head page and the question page are then the only two
+# that matter, which is exactly the Λ shape (attention sink + recency) that
+# H2O and SnapKV both claim to find -- so a keep-set that finds it answers,
+# and a budget too small to hold both does not.
+_EVICT_PROMPT = (
+    "Remember this: the secret code word is banana. "
+    + "The weather in the valley is mild and the roads are clear. " * 20
+    + " What is the secret code word? The secret code word is"
+)
+
+
 async def test_quest_attention(client, args):
     # `max_tokens` is deliberately large relative to the prompt so the page
     # channel's DECLARED capacity runs ahead of the pages the request actually
@@ -604,10 +627,26 @@ async def test_tova_attention(client, args):
 
 
 async def test_h2o_attention(client, args):
-    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8,
+    """H2O: a cumulative heavy-hitter statistic, and a mask that serves it.
+
+    H2O is the one Track B policy that wants to OBSERVE and ENFORCE on the same
+    fire, and it cannot: a lane that brings a mask takes the masked attention
+    arm and keeps no scores (`crates/model/src/qwen_3/forward.rs` orders
+    `masked` ahead of `captures_scores` as a correctness ruling). So the
+    program splits its generation -- `observe_fires` unmasked capturing fires
+    accumulate the statistic, then `enforce_tokens` masked fires are served the
+    keep-set it chose. What that costs against the paper is the per-step
+    re-ranking; what it keeps, and what the staircase below measures, is the
+    CUMULATIVE ranking that is H2O's entire difference from TOVA.
+    """
+    common = {"prompt": _EVICT_PROMPT, "max_tokens": 12,
               "temperature": _COHERENCE_TAU, "seed": 4242}
     report = await _report(
         client, args, "trackb-h2o", {**common, "page_budget": 4096})
+    # The split is real: both halves ran, and together they are the generation.
+    assert report["observe_fires"] > 0, report
+    assert report["enforce_tokens"] > 0, report
+    assert report["observe_fires"] + report["enforce_tokens"] + 1 == report["count"], report
     # H2O's whole claim is the CARRY: the score row is accumulated across fires
     # rather than re-seeded from the latest one. Each fire adds one softmax row
     # per layer, so the mass must grow by exactly `layers_per_fire` every time.
@@ -627,30 +666,52 @@ async def test_h2o_attention(client, args):
     # so the bar is the seed ceiling.)
     assert report["tail_polluted"] == 0, report
     assert report["scores_nan"] == 0, report
-    # The heavy hitters must be heavy: a uniform row would pass everything
-    # above. On a real model the attention sink at the head of the sequence
-    # dominates by orders of magnitude over the repeated filler.
+    # The heavy hitters must be HEAVY: a uniform row would pass everything
+    # above. H2O accumulates DECODE attention, so what a real model produces is
+    # the Λ that StreamingLLM named and that H2O's own keep-sets converge to --
+    # an attention sink at the head, a recency window at the tail, and a thin
+    # middle. Asserting the shape is what separates "the carry works" from "the
+    # carry carries the signal the algorithm needs"; `tova-attention` is
+    # checked the same way on its own single-step row.
     page_mass = [float(m) for m in report["page_mass"]]
-    assert page_mass[0] == max(page_mass), report
-    assert page_mass[0] > 10 * sorted(page_mass)[len(page_mass) // 2], report
-    # ...and the policy must be ENFORCED, not merely computed. Same pair as
-    # Quest: a one-page budget has to change the continuation, and an all-keep
-    # budget has to reproduce the unmasked answer verbatim.
+    assert len(page_mass) > 8, report
+    tail = len(page_mass) - 3
+    # The recency window is the heaviest thing in the row...
+    assert page_mass.index(max(page_mass)) >= tail, report
+    # ...the sink is the heaviest thing that is NOT recent...
+    assert page_mass[0] == max(page_mass[:tail]), report
+    # ...and it stands clear of the middle it is being distinguished from.
+    assert page_mass[0] > 2 * sorted(page_mass)[len(page_mass) // 2], report
+    # The page H2O drops first is in the middle, where the Λ is thin -- not the
+    # sink and not the recency window, or it is not this policy.
+    assert 2 < report["evicted_first"] < tail, report
+    # ...and the policy must be ENFORCED, not merely computed. The mask IS the
+    # measurement: the all-keep arm serves every live page, the tight arm
+    # serves strictly fewer KV positions than an unmasked decode attends over.
     tight = await _report(
         client, args, "trackb-h2o", {**common, "page_budget": 1})
     base = await _report(client, args, "naive-baseline", common)
+    assert report["served_pages"] == report["selected_pages"], report
+    assert report["served_kv"] == report["full_kv"], report
+    assert tight["served_pages"] == 1, tight
+    assert tight["served_kv"] < tight["full_kv"], tight
+    # And enforcement has to reach the text: a one-page budget changes the
+    # continuation, an all-keep mask reproduces the unmasked one verbatim. Only
+    # the enforcement half can differ -- the observation half is unmasked in
+    # both arms and decodes the baseline's own tokens.
     assert report["text"] != tight["text"], (
-        "attn_page_mask is not enforced under H2O: a 1-page budget produced "
+        "the keep-set is not enforced under H2O: a 1-page budget produced "
         "the same continuation as an all-keep one"
     )
     assert report["text"] == base["text"], (
-        "an all-keep page mask perturbed the output\n"
+        "an all-keep mask perturbed the output; the masked attention arm is "
+        "not reproducing the causal one\n"
         f"  {report['text']!r}\n  {base['text']!r}"
     )
 
 
 async def test_snapkv_attention(client, args):
-    common = {"prompt": _QUEST_PROMPT, "max_tokens": 8,
+    common = {"prompt": _EVICT_PROMPT, "max_tokens": 12,
               "temperature": _COHERENCE_TAU, "seed": 4242}
     report = await _report(
         client, args, "trackb-snapkv", {**common, "page_budget": 4096})
@@ -692,18 +753,26 @@ async def test_snapkv_attention(client, args):
         f"the prompt (max {max(mid):.5f}); the capture is not describing an "
         f"END-of-prompt window\n  {report['page_mass']}"
     )
-    # ...and the policy must be ENFORCED, not merely computed. Same pair as
-    # Quest and H2O: a one-page budget has to change the continuation, and an
-    # all-keep budget has to reproduce the unmasked answer verbatim.
+    # ...and the policy must be ENFORCED, not merely computed. The eviction
+    # goes through the attention mask (`.wiki/alto/attn-score.md` §4's first
+    # honest delta: "evict" executes as CUSTOM MASK updates), so the mask IS
+    # the measurement -- a count of set bits in the row the decode carried.
     tight = await _report(
         client, args, "trackb-snapkv", {**common, "page_budget": 1})
     base = await _report(client, args, "naive-baseline", common)
+    assert report["served_pages"] == report["prompt_pages"], report
+    assert report["served_kv"] == report["full_kv"] == report["prompt_len"], report
+    assert tight["served_pages"] == 1, tight
+    assert tight["served_kv"] < tight["full_kv"], tight
+    # And the shrink has to reach the text: a one-page budget changes the
+    # continuation, an all-keep mask reproduces the unmasked one verbatim.
     assert report["text"] != tight["text"], (
-        "attn_page_mask is not enforced under SnapKV: a 1-page budget produced "
+        "the keep-set is not enforced under SnapKV: a 1-page budget produced "
         "the same continuation as an all-keep one"
     )
     assert report["text"] == base["text"], (
-        "an all-keep page mask perturbed the output\n"
+        "an all-keep mask perturbed the output; the masked attention arm is "
+        "not reproducing the causal one\n"
         f"  {report['text']!r}\n  {base['text']!r}"
     )
 
@@ -711,6 +780,60 @@ async def test_snapkv_attention(client, args):
 async def test_naive_baseline(client, args):
     report = await _report(client, args, "naive-baseline", {"max_tokens": 4})
     assert report["sampler"] == "naive-baseline", report
+
+
+async def test_lora_probe(client, args):
+    """A-1: a zero-B adapter is the base model, bit for bit; a live one moves.
+
+    `lora-probe` IS `naive-baseline` plus one `Pass::adapter` at the
+    mixer-output site -- same prompt, same seed, same temperature, same
+    Gumbel-max draw -- so the two are comparable by construction, which is what
+    makes this the one LoRA claim checkable with no reference implementation.
+
+    At `adapter_scale: 0.0` the B plane is all zeros, so the correction
+    `B(Ax)` is EXACTLY zero (adding a bf16 zero is exact) and the two strings
+    must be equal. That fails on every way the plumbing can be wrong: an
+    adapter that never landed, a mis-strided bank, a routes vector read at a
+    lane offset instead of a row offset, a lane whose fact word missed the
+    correction window.
+
+    The temperature is collapsed for the reason
+    `crates/worker/tests/cuda_lora_parity.rs` collapses it: at 1.0 this
+    fixture's seeded Gumbel-max draw wanders on about one fire in sixteen over
+    logits that are bit-identical, and asserting the sampler here would make an
+    adapter gate red for a sampler defect.
+
+    The live scale is 8.0 and not 0.5 because the fixture's A and B are
+    random: a small correction is a real delta that is simply entitled not to
+    move the argmax on this prompt. What is asserted is that a nonzero adapter
+    CHANGES the answer -- without which the parity above passes just as well
+    when the adapter was never staged at all.
+    """
+    fixed = {
+        "prompt": "The capital of France is",
+        "max_tokens": 6,
+        "temperature": 0.01,
+        "seed": 7,
+    }
+    base = await _report(client, args, "naive-baseline", dict(fixed))
+    zero = await _report(client, args, "lora-probe", {**fixed, "adapter_scale": 0.0})
+    assert zero["text"] == base["text"], (
+        "a zero-B adapter changed the answer -- the correction term is exactly "
+        "zero, so the adapter path wrote something it should not have, or read "
+        "an operand that was not the one the lowering named\n"
+        f"  base    = {base['text']!r}\n  adapted = {zero['text']!r}"
+    )
+    live = await _report(client, args, "lora-probe", {**fixed, "adapter_scale": 8.0})
+    assert live["text"] != base["text"], (
+        "a nonzero adapter left the answer unchanged -- the correction is not "
+        "reaching the projections, and the parity above proves nothing"
+    )
+    again = await _report(client, args, "lora-probe", {**fixed, "adapter_scale": 8.0})
+    assert again["text"] == live["text"], (
+        "a nonzero adapter answered differently twice -- the correction is not "
+        "a function of its inputs\n"
+        f"  {live['text']!r}\n  {again['text']!r}"
+    )
 
 
 async def test_chat_completion_attends_prompt(client, args):
@@ -798,6 +921,7 @@ def tests():
         test_asap_grammar_aligned_decoding,
         test_token_healing,
         test_naive_baseline,
+        test_lora_probe,
         test_greedy_decoding_is_the_same_alone_and_in_a_crowd,
         test_quest_attention,
         test_tova_attention,

@@ -2,8 +2,8 @@
 //! IR variant. Selection (which shader, which dtype stamp) lives here, so
 //! the driver's dispatch arm stays destructure → resolve → call.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::encode::{
     Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, elementwise_rows, nonzero, refuse, stated,
@@ -21,12 +21,12 @@ const OFFSET_BANK: u32 = 1;
 
 const UNIT_GAIN: f32 = 1.0;
 
-fn rms_threads(op: &'static str, axis: u32) -> Result<u32, KernelError> {
+fn rms_threads(op: &'static str, axis: u32) -> Result<u32, Error> {
     nonzero(op, "the normed axis", axis)?;
     Ok(axis.div_ceil(4).min(1024))
 }
 
-fn rms_grid(op: &'static str, width: u32, axis: u32, rows: u32) -> Result<Grid, KernelError> {
+fn rms_grid(op: &'static str, width: u32, axis: u32, rows: u32) -> Result<Grid, Error> {
     nonzero(op, "width", width)?;
     nonzero(op, "rows", rows)?;
     if axis > width {
@@ -51,12 +51,7 @@ fn rms_grid(op: &'static str, width: u32, axis: u32, rows: u32) -> Result<Grid, 
     Ok(Grid::of([lanes, 1, 1], [t, 1, 1]))
 }
 
-fn head_row_grid(
-    op: &'static str,
-    threads: u32,
-    heads: u32,
-    rows: u32,
-) -> Result<[u32; 3], KernelError> {
+fn head_row_grid(op: &'static str, threads: u32, heads: u32, rows: u32) -> Result<[u32; 3], Error> {
     Ok([
         threads,
         nonzero(op, "heads", heads)?,
@@ -65,7 +60,7 @@ fn head_row_grid(
 }
 
 /// A per-head width that fits one threadgroup.
-fn head_width(op: &'static str, vd: u32) -> Result<u32, KernelError> {
+fn head_width(op: &'static str, vd: u32) -> Result<u32, Error> {
     nonzero(op, "the value-head width", vd)?;
     if vd > 1024 {
         return Err(refuse(
@@ -88,7 +83,7 @@ fn rms_row(
     w_stride: u32,
     plus_one: u32,
     gain: f32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "rms_single_row_bfloat16" });
     let grid = rms_grid(op, x.width, axis, x.rows)?;
     ctx.fire(
@@ -106,13 +101,7 @@ fn rms_row(
     )
 }
 
-pub fn rmsnorm(
-    ctx: &Ctx<'_>,
-    x: Tensor,
-    weight: Tensor,
-    eps: f32,
-    y: Tensor,
-) -> Result<(), KernelError> {
+pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
     rms_row(
         ctx,
         "elementwise.rmsnorm",
@@ -134,7 +123,7 @@ pub fn rmsnorm_per_head(
     head_dim: u32,
     eps: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     rms_row(
         ctx,
         "elementwise.rmsnorm_per_head",
@@ -155,7 +144,7 @@ pub fn rmsnorm_plus_one(
     weight: Tensor,
     eps: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     rms_row(
         ctx,
         "elementwise.rmsnorm_plus_one",
@@ -177,7 +166,7 @@ pub fn rmsnorm_per_head_plus_one(
     head_dim: u32,
     eps: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     rms_row(
         ctx,
         "elementwise.rmsnorm_per_head_plus_one",
@@ -198,7 +187,7 @@ pub fn rmsnorm_no_scale(
     head_dim: u32,
     eps: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_no_scale";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "vnorm_single_row_bfloat16" });
     let grid = rms_grid(OP, x.width, head_dim, x.rows)?;
@@ -223,7 +212,7 @@ pub fn rmsnorm_gated(
     head_dim: u32,
     eps: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_gated";
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
@@ -262,7 +251,7 @@ pub fn rmsnorm_gated_by(
     heads: u32,
     eps: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_gated_by";
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
@@ -293,7 +282,7 @@ pub fn rmsnorm_gated_by(
 }
 
 /// `y += x`, in place on `y` (the IR aliases `y_out` onto `y`).
-pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), KernelError> {
+pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.residual_add";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "residual_add_bfloat16" });
     ctx.fire(
@@ -304,7 +293,7 @@ pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), KernelErr
 }
 
 /// `out += bias` per row, in place on `out`.
-pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), KernelError> {
+pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.add_bias";
     let entry = dtype_dispatch!(OP, out.dtype, { Bf16 => "add_bias_bfloat16" });
     let lanes = elementwise_rows(OP, out.width, out.rows)?;
@@ -320,7 +309,7 @@ pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), KernelEr
 }
 
 /// `x *= s` for a plan-stated scalar, in place on `x`.
-pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), KernelError> {
+pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.mul_scalar";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layer_scalar_mul_stated_bfloat16" });
     ctx.fire(
@@ -331,7 +320,7 @@ pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), KernelError> {
 }
 
 /// `x *= s` for a device-held scalar, in place on `x`.
-pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), KernelError> {
+pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.scale";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layer_scalar_mul_bfloat16" });
     ctx.fire(
@@ -350,8 +339,8 @@ pub fn res_blend(
     _eps: f32,
     _proj: Tensor,
     _y: Tensor,
-) -> Result<(), KernelError> {
-    Err(KernelError::Unsupported {
+) -> Result<(), Error> {
+    Err(Error::Unsupported {
         op: "elementwise.res_blend",
     })
 }

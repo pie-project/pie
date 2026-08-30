@@ -5,7 +5,7 @@
 //! valid and deterministic, not byte-identical to the C++ reference (see
 //! [`sched`](crate::attn::sched)).
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::attn::plan::{Built, DecodePlanInfo, Sizes, Toggles};
 use crate::attn::sched::{at, AlignedAllocator, Staging, narrow, narrow_all, spans};
@@ -37,7 +37,7 @@ pub fn estimate(
     op: &'static str,
     req: &Request<'_>,
     max_grid_size: u32,
-) -> Result<WorkEstimate, KernelError> {
+) -> Result<WorkEstimate, Error> {
     let pages = spans(op, "kv_indptr", req.kv_indptr, req.batch_size as usize)?;
     if req.gqa_group_size == 0 {
         return Err(refuse(op, "the GQA group this schedule states is zero"));
@@ -101,7 +101,7 @@ pub fn schedule(
     op: &'static str,
     req: &Request<'_>,
     max_grid_size: u32,
-) -> Result<Schedule, KernelError> {
+) -> Result<Schedule, Error> {
     let est = estimate(op, req, max_grid_size)?;
     let pages = spans(op, "kv_indptr", req.kv_indptr, req.batch_size as usize)?;
 
@@ -167,7 +167,7 @@ fn layout(
     sched: &Schedule,
     int_space: usize,
     float_space: usize,
-) -> Result<Laid, KernelError> {
+) -> Result<Laid, Error> {
     let padded = sched.padded_batch_size;
     let mut info = DecodePlanInfo {
         enable_cuda_graph: sched.enable_cuda_graph,
@@ -203,7 +203,7 @@ fn stage(
     sched: &Schedule,
     page_size: u32,
     laid: &Laid,
-) -> Result<Vec<u8>, KernelError> {
+) -> Result<Vec<u8>, Error> {
     let info = &laid.info;
     let mut staging = Staging::new(op, laid.int_bytes);
     staging.put_i32s(
@@ -246,7 +246,7 @@ pub fn plan(
     max_grid_size: u32,
     int_bytes: usize,
     float_bytes: usize,
-) -> Result<Built<DecodePlanInfo>, KernelError> {
+) -> Result<Built<DecodePlanInfo>, Error> {
     let sched = schedule(op, req, max_grid_size)?;
     let laid = layout(op, req.num_qo_heads, req.head_dim, &sched, int_bytes, float_bytes)?;
     let int_upload = stage(op, &sched, req.page_size, &laid)?;
@@ -264,7 +264,7 @@ pub fn workspace_size(
     op: &'static str,
     req: &Request<'_>,
     max_grid_size: u32,
-) -> Result<Sizes, KernelError> {
+) -> Result<Sizes, Error> {
     let sched = schedule(op, req, max_grid_size)?;
     let laid = layout(
         op,
@@ -300,7 +300,7 @@ pub fn static_nonsplit(
     page_size: u32,
     enable_cuda_graph: bool,
     int_bytes: usize,
-) -> Result<Built<DecodePlanInfo>, KernelError> {
+) -> Result<Built<DecodePlanInfo>, Error> {
     let n = narrow(op, "batch_decode_request_indices", i64::from(num_requests))?;
     let sched = Schedule {
         split_kv: false,

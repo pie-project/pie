@@ -1,7 +1,7 @@
 //! `Mlp`: gated activations over a packed `[gate | up]` row (and one
 //! two-tensor form). One entry per IR variant.
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, elementwise_rows, refuse};
 use crate::tensor::Tensor;
@@ -16,12 +16,7 @@ struct Halves {
     intermediate: u32,
 }
 
-fn halves(
-    op: &'static str,
-    packed: Tensor,
-    intermediate: u32,
-    y: Tensor,
-) -> Result<Halves, KernelError> {
+fn halves(op: &'static str, packed: Tensor, intermediate: u32, y: Tensor) -> Result<Halves, Error> {
     debug_assert_eq!(
         packed.width,
         intermediate.saturating_mul(2),
@@ -44,12 +39,7 @@ fn halves(
     })
 }
 
-pub fn swiglu(
-    ctx: &Ctx<'_>,
-    packed: Tensor,
-    intermediate: u32,
-    y: Tensor,
-) -> Result<(), KernelError> {
+pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_swiglu";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
@@ -65,7 +55,7 @@ pub fn swiglu_clamp(
     intermediate: u32,
     limit: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.mlp_swiglu_clamp";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_swiglu_clamp_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
@@ -87,7 +77,7 @@ pub fn swiglu_clamp_alpha(
     limit: f32,
     alpha: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.mlp_swiglu_clamp_alpha";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_gptoss_swiglu_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
@@ -103,7 +93,7 @@ pub fn swiglu_clamp_alpha(
     )
 }
 
-pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), KernelError> {
+pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_geglu_tanh";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "geglu_tanh_bfloat16" });
     ctx.fire(
@@ -120,7 +110,7 @@ pub fn geglu_tanh_packed(
     packed: Tensor,
     intermediate: u32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.mlp_geglu_tanh_packed";
     let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "packed_geglu_tanh_bfloat16" });
     let cut = halves(OP, packed, intermediate, y)?;
@@ -139,7 +129,7 @@ pub fn situ(
     beta: f32,
     up_cap: Option<f32>,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.mlp_situ";
     if beta == 0.0 {
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));

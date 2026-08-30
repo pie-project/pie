@@ -103,7 +103,7 @@ fn word(query_len: u32, captures: bool) -> u64 {
 
 /// The word a DRAFTING request carries, which this SKU's artifact has no arm
 /// for — `ClassTable::mask` drops the bit, so the lane composes as the word it
-/// would have had. That is the masking `engine::fire::compose` documents, and
+/// would have had. That is the masking `model_exec::fire::compose` documents, and
 /// it is why the draft refusal below is `Draftless` rather than
 /// `UnknownWord`: the two halves agree perfectly, and what is missing is the
 /// ARM.
@@ -214,6 +214,7 @@ fn drift(left: &[LayerScores], right: &[LayerScores]) -> f32 {
 /// between two fires of the same lane. Bit-for-bit equality over two identical
 /// fires is what an unpinned column cannot produce.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_capturing_lane_reads_its_attention_mass_and_reads_the_same_thing_twice() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the capture readout") else {
@@ -303,6 +304,7 @@ fn a_capturing_lane_reads_its_attention_mass_and_reads_the_same_thing_twice() {
 /// window at two offsets; their masses are functions of their own tokens and
 /// must differ. Read at a fixed offset they would be one lane's bytes twice.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn two_capturing_lanes_in_one_fire_read_their_own_rows() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the capture row offset") else {
@@ -365,6 +367,7 @@ fn two_capturing_lanes_in_one_fire_read_their_own_rows() {
 /// ulp at a magnitude of ~20. Tokens do not move, and a leak from a
 /// vocabulary-wide arm is nowhere near an ulp.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_capturing_lane_beside_two_others_leaves_them_the_fire_they_had_alone() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the three-class capture fire") else {
@@ -461,6 +464,7 @@ fn a_capturing_lane_beside_two_others_leaves_them_the_fire_they_had_alone() {
 /// half here, because a graph that replayed a stale arena address would still
 /// produce the right tokens and the wrong capture.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_capture_composition_captures_once_and_replays_identically() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the capture replay") else {
@@ -510,12 +514,13 @@ fn a_capture_composition_captures_once_and_replays_identically() {
 /// columns' own bytes and nothing else. This is the runtime half: a fire no
 /// lane captured must issue the launches it always issued. The mechanism is
 /// design §0's and not a special case — the capture arm is guarded, a fire
-/// nobody captured has zero rows in its classes, and `engine::fire::walk`
+/// nobody captured has zero rows in its classes, and `model_exec::fire::walk`
 /// skips a zero-row region before it dispatches a node — so what is asserted
 /// is that the RECORDED GRAPH of a plain composition holds the same node count
 /// whether or not any other fire in the process captured, and that the tokens
 /// are the ones every other suite's golden states.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_fire_no_lane_captured_costs_the_axis_nothing() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the uncaptured floor") else {
@@ -597,7 +602,7 @@ fn a_fire_no_lane_captured_costs_the_axis_nothing() {
 /// plain lane's rows between them, and the capture window is then two row
 /// intervals rather than one — as is the `attention.plan_prefill` region that
 /// carves their schedule, which P4 offers no constraint for and therefore owes
-/// no row (`engine::fire::fallback::promised`) but which splits all the same.
+/// no row (`model_exec::fire::fallback::promised`) but which splits all the same.
 ///
 /// Until this was fixed that fire was `Fault::Fragmented` and the batch died.
 /// What it is now is `Fallback::Split { r }`: the walk dispatches the region
@@ -615,6 +620,7 @@ fn a_fire_no_lane_captured_costs_the_axis_nothing() {
 /// arrive to prefill capturing while lane 0 has moved on to decoding. That one
 /// fire is the fragmented one, and the assert below says so rather than hoping.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_capturing_prefill_beside_a_capturing_decode_is_two_launches_and_the_same_tokens() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the split-window fire") else {
@@ -634,11 +640,11 @@ fn a_capturing_prefill_beside_a_capturing_decode_is_two_launches_and_the_same_to
         let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
         let compiled = compile(&trace, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
         let words = [
-            engine::fire::Lane::new(word(1, true), 1),
-            engine::fire::Lane::new(word(late.len() as u32, true), late.len() as u32),
-            engine::fire::Lane::new(word(1, false), 1),
+            model_exec::fire::Lane::new(word(1, true), 1),
+            model_exec::fire::Lane::new(word(late.len() as u32, true), late.len() as u32),
+            model_exec::fire::Lane::new(word(1, false), 1),
         ];
-        let fire = engine::fire::compose(&compiled, &BUDGETS, &words).expect("the fire composes");
+        let fire = model_exec::fire::compose(&compiled, &BUDGETS, &words).expect("the fire composes");
         compiled
             .template()
             .iter()
@@ -748,6 +754,7 @@ fn a_capturing_prefill_beside_a_capturing_decode_is_two_launches_and_the_same_to
 /// Eager first, then the same sequence under `Graphs::On`, and the tokens and
 /// the captured mass both have to be identical.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_split_composition_captures_once_and_replays_identically() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the split replay") else {
@@ -849,6 +856,7 @@ fn a_split_composition_captures_once_and_replays_identically() {
 /// is indistinguishable from a captured nothing. Both are refused before
 /// anything launches.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_capture_and_a_word_that_disagree_are_refused() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the capture refusals") else {
@@ -906,12 +914,13 @@ fn a_capture_and_a_word_that_disagree_are_refused() {
 /// the trunk's continuation with a draft's name on it.
 ///
 /// **AND A DRAFTING WORD ALONE IS NOT A REFUSAL, WHICH IS ALSO THE DESIGN.**
-/// `engine::fire::compose` masks a lane's word to the bits some guard READS,
+/// `model_exec::fire::compose` masks a lane's word to the bits some guard READS,
 /// so a `drafts` bit against an artifact that splits on no such guard is
 /// dropped and the lane composes as the word it would have had. That is the
 /// right answer — a model may state a fact it does not split on — and it is
 /// why the refusal below is about the ASK.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_draft_against_a_text_that_declares_no_head_is_refused() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the draft refusal") else {
@@ -972,6 +981,7 @@ fn a_draft_against_a_text_that_declares_no_head_is_refused() {
 /// handed an empty `LaneReadout::scores` it cannot tell from a captured
 /// nothing.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_capture_against_a_text_that_declares_no_arm_is_refused() {
     let _serial = serialized();
     let Some((mut shell, tok)) = gemma::ready("the capture refusal on a plain text") else {
@@ -1069,6 +1079,7 @@ mod gemma {
             contract: &contract,
             checkpoint: &checkpoint,
             budget: Budget::new(4, 768),
+            patches: None,
             profile: None,
             page_size: 16,
             context: 1024,
@@ -1107,6 +1118,7 @@ mod gemma {
 /// Skipped, not failed, on a machine with no such snapshot — the point is the
 /// refusal's shape, and there is nothing to refuse without the checkpoint.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_drafting_sku_does_not_fit_this_device() {
     let _serial = serialized();
     if !engine_cuda::device::present() {
@@ -1152,6 +1164,7 @@ fn the_drafting_sku_does_not_fit_this_device() {
         contract: &contract,
         checkpoint: &checkpoint,
         budget: BUDGETS,
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,
@@ -1310,6 +1323,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         contract: &contract,
         checkpoint: &checkpoint,
         budget: BUDGETS,
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,

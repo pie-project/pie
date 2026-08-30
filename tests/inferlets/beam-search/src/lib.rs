@@ -10,7 +10,7 @@
 //! This compact example uses a fixed pool and therefore bounds generation
 //! instead of compacting dead cells.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 use std::ops::RangeBounds;
 
@@ -92,7 +92,7 @@ trait BindBeams {
         W: RangeBounds<u32>;
 }
 
-impl BindBeams for inferlet::ptir::attention::ForwardPass {
+impl BindBeams for inferlet::eta::attention::ForwardPass {
     fn bind_beams<R, W>(
         &self,
         ws: &WorkingSet,
@@ -110,7 +110,7 @@ impl BindBeams for inferlet::ptir::attention::ForwardPass {
     }
 }
 
-impl BindBeams for inferlet::ptir::hybrid::ForwardPass {
+impl BindBeams for inferlet::eta::hybrid::ForwardPass {
     fn bind_beams<R, W>(
         &self,
         ws: &WorkingSet,
@@ -140,7 +140,7 @@ impl BindBeams for inferlet::ptir::hybrid::ForwardPass {
 macro_rules! define_beam_search {
     ($name:ident, $kind:ident) => {
         async fn $name(input: &Input) -> Result<String> {
-            use inferlet::ptir::$kind::{ForwardPass, run_ahead};
+            use inferlet::eta::$kind::{ForwardPass, run_ahead};
 
         let max_steps = input.max_tokens;
         let b = input.beams;

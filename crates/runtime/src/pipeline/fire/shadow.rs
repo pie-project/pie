@@ -3,7 +3,7 @@
 //!
 //! The runtime mirrors, per bound pass, what each channel's committed cells
 //! hold: seeds at bind, then per fire the net effect of folding the trace's
-//! stage programs through [`tensor_compiler::eval::pareval`] (a device-decided value —
+//! stage programs through [`eta_compiler::eval::pareval`] (a device-decided value —
 //! sampler output, kernel result — shadows as *unknown* rather than a wrong
 //! guess). A fire's submission-time value for a channel is the Writer put
 //! staged for that fire, else the shadow's front cell.
@@ -16,12 +16,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-use tensor_compiler::eval::interp::Value;
-use tensor_compiler::eval::pareval::{EvalBlocker, fold_stage};
-use tensor_ir::container::PortSource;
-use tensor_ir::op::Op;
-use tensor_ir::registry::Stage;
-use tensor_ir::validate::BoundTrace;
+use eta_compiler::eval::interp::Value;
+use eta_compiler::eval::pareval::{EvalBlocker, fold_stage};
+use eta_ir::container::PortSource;
+use eta_ir::op::Op;
+use eta_ir::registry::Stage;
+use eta_ir::validate::BoundTrace;
 
 use crate::pipeline::channel::{BoundCells, staged_put_bytes};
 use crate::pipeline::instance::ChannelSeed;
@@ -89,7 +89,7 @@ impl ShadowPlan {
         //    decode trace the sampler feeds the epilogue's put, which is
         //    exactly this case — so the last surviving whole-trace evaluation
         //    goes too.
-        let device_decided = tensor_compiler::eval::pareval::geometry_taint(bound).device_decided;
+        let device_decided = eta_compiler::eval::pareval::geometry_taint(bound).device_decided;
         let phase_of = |stage: Stage| -> Option<Phase> {
             let mut puts: Vec<u32> = Vec::new();
             let mut all_tainted = true;
@@ -100,7 +100,7 @@ impl ShadowPlan {
                 .filter(|program| program.stage == stage)
             {
                 for (chan, tainted) in
-                    tensor_compiler::eval::pareval::stage_put_taint(&program.ops, &device_decided)
+                    eta_compiler::eval::pareval::stage_put_taint(&program.ops, &device_decided)
                 {
                     puts.push(chan);
                     all_tainted &= tainted;
@@ -155,7 +155,7 @@ impl HostShadow {
                 .get(seed.channel as usize)
                 .map(|decl| decl.dtype)
             {
-                Some(tensor_ir::container::ChanDType::Concrete(dtype)) => dtype,
+                Some(eta_ir::container::ChanDType::Concrete(dtype)) => dtype,
                 _ => continue,
             };
             let value = Value::from_le_bytes(dtype, &seed.data);
@@ -179,7 +179,7 @@ impl HostShadow {
             && let Some(bytes) = staged_put_bytes(cell)
         {
             let dtype = match bound.container.channels.get(chan as usize)?.dtype {
-                tensor_ir::container::ChanDType::Concrete(dtype) => dtype,
+                eta_ir::container::ChanDType::Concrete(dtype) => dtype,
                 _ => return None,
             };
             return Value::from_le_bytes(dtype, &bytes);
@@ -188,7 +188,7 @@ impl HostShadow {
             && let Some(bytes) = cell.lock().unwrap().front_override()
         {
             let dtype = match bound.container.channels.get(chan as usize)?.dtype {
-                tensor_ir::container::ChanDType::Concrete(dtype) => dtype,
+                eta_ir::container::ChanDType::Concrete(dtype) => dtype,
                 _ => return None,
             };
             return Value::from_le_bytes(dtype, &bytes);
@@ -263,14 +263,14 @@ impl HostShadow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tensor_ir::container::{
+    use eta_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use tensor_ir::op::{IntrinsicId, Op};
-    use tensor_ir::registry::{ModelProfile, Port, Stage};
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::op::{IntrinsicId, Op};
+    use eta_ir::registry::{ModelProfile, Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
 
-    fn channel(shape: Shape, dtype: DType) -> ChannelDecl {
+    fn channel(shape: Shape, dtype: Dtype) -> ChannelDecl {
         ChannelDecl {
             shape,
             dtype: ChanDType::Concrete(dtype),
@@ -280,16 +280,16 @@ mod tests {
         }
     }
 
-    fn trace(epilogue: Vec<Op>) -> tensor_ir::validate::BoundTrace {
+    fn trace(epilogue: Vec<Op>) -> eta_ir::validate::BoundTrace {
         let mut profile = ModelProfile::dummy();
         profile.vocab = 4;
         let container = TraceContainer {
             names: vec![],
             externs: vec![],
             channels: vec![
-                channel(Shape::vector(1), DType::I32),
-                channel(Shape::vector(1), DType::U32),
-                channel(Shape::matrix(1, 4), DType::Bool),
+                channel(Shape::vector(1), Dtype::I32),
+                channel(Shape::vector(1), Dtype::U32),
+                channel(Shape::matrix(1, 4), Dtype::Bool),
             ],
             ports: vec![
                 PortBinding {
@@ -299,7 +299,7 @@ mod tests {
                 PortBinding {
                     port: Port::EmbedIndptr,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(2),
                         data: [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect(),
                     },
@@ -307,7 +307,7 @@ mod tests {
                 PortBinding {
                     port: Port::Positions,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(1),
                         data: 0u32.to_le_bytes().to_vec(),
                     },
@@ -315,7 +315,7 @@ mod tests {
                 PortBinding {
                     port: Port::Pages,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(1),
                         data: 0u32.to_le_bytes().to_vec(),
                     },
@@ -323,7 +323,7 @@ mod tests {
                 PortBinding {
                     port: Port::PageIndptr,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(2),
                         data: [0u32, 1].into_iter().flat_map(u32::to_le_bytes).collect(),
                     },
@@ -335,7 +335,7 @@ mod tests {
                 PortBinding {
                     port: Port::WSlot,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(1),
                         data: 0u32.to_le_bytes().to_vec(),
                     },
@@ -343,7 +343,7 @@ mod tests {
                 PortBinding {
                     port: Port::WOff,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(1),
                         data: 0u32.to_le_bytes().to_vec(),
                     },
@@ -358,18 +358,18 @@ mod tests {
                 ops: epilogue,
             }],
         };
-        tensor_ir::validate::bind(container, profile).unwrap()
+        eta_ir::validate::bind(container, profile).unwrap()
     }
 
     /// The trace the tests above and below share: an epilogue that takes the
     /// mask channel and puts a value back, so the mask is the only channel
     /// whose per-fire derivability is in question.
-    fn device_put_trace() -> tensor_ir::validate::BoundTrace {
+    fn device_put_trace() -> eta_ir::validate::BoundTrace {
         trace(vec![
             Op::IntrinsicVal {
                 intr: IntrinsicId::Logits,
                 shape: Shape::matrix(1, 4),
-                dtype: DType::F32,
+                dtype: Dtype::F32,
             },
             Op::Eq(0, 0),
             Op::ChanTake(2),

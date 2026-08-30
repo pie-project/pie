@@ -37,6 +37,7 @@ pub struct Request {
     adapter: bool,
     drafts: bool,
     captures_scores: bool,
+    media: bool,
 }
 
 impl Request {
@@ -48,6 +49,7 @@ impl Request {
             adapter: false,
             drafts: false,
             captures_scores: false,
+            media: false,
         }
     }
 
@@ -84,6 +86,26 @@ impl Request {
         self
     }
 
+    /// **THE SAME REQUEST, CARRYING IMAGES** (multimodal §1's `media` fact).
+    ///
+    /// A BUILDER FOR `adapted`'s REASON, and one that is about a different
+    /// axis than the tower's own. The tower's nodes live on the PATCH
+    /// rectangle and are free without this: an axis-empty fire has zero patch
+    /// rows and `engine::fire::walk` skips a zero-row region. What is NOT free
+    /// is the embed merge — `layout.scatter_live_rows` writes TOKEN rows, so
+    /// the partition puts it in the token unit and the walk reads its TOKEN
+    /// window, which is full on every fire. Without this bit a text-only fire
+    /// of a vision load resolves `RuntimeInput::PatchRoutes` and panics on it
+    /// (measured: 1024 of 1024 requests, `qwen_3::IMPORTS`' own note).
+    ///
+    /// So the fact is about the MERGE and not about the tower, which is why it
+    /// is one bit and one guard rather than a window over the second axis.
+    #[must_use]
+    pub fn with_media(mut self, media: bool) -> Request {
+        self.media = media;
+        self
+    }
+
     #[must_use]
     pub fn query_len(&self) -> u32 {
         self.query_len
@@ -107,6 +129,11 @@ impl Request {
     #[must_use]
     pub fn captures_scores(&self) -> bool {
         self.captures_scores
+    }
+
+    #[must_use]
+    pub fn has_media(&self) -> bool {
+        self.media
     }
 }
 
@@ -370,6 +397,33 @@ impl<F> Input<F> {
             .refined(self.over.clone())
     }
 
+    /// **THE TRUNK'S TRIPLE-WIDE POSITION STREAM**: `[Dim::Tokens, 3]` `i32`,
+    /// one `(t, h, w)` per TOKEN row (multimodal §6.3).
+    ///
+    /// What [`rope_mrope`](crate::ops::elemwise::rope_mrope) reads on the
+    /// token axis, and the reason that op was unreachable from any text until
+    /// this row existed: [`positions`](Input::positions) is one scalar per
+    /// row and the rotation reads a rectangle. Both qwen SKUs' trunks rotate
+    /// this way (`mrope_interleaved: true`, `mrope_section: [11, 11, 10]`),
+    /// and a text lane's triple is `(p, p, p)` — scalar rope, which is why a
+    /// text-only fire is unaffected and why an image-carrying one cannot skip
+    /// it.
+    ///
+    /// A text that never names this pays nothing for it: the shell reserves
+    /// the stream only when the plan declares it.
+    #[must_use]
+    pub fn mrope_positions(&self) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::MropePositions,
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(3)],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
     /// The model's paged-kv space's custom attention mask: packed `u8` mask
     /// bits, token-aligned, read by `attention.masked`. Both platforms carry
     /// the bits this way — metal's fire tables and the cuda plan's `Mask`
@@ -405,6 +459,137 @@ impl<F> Input<F> {
                 Ty::Tensor {
                     shape: vec![Dim::Tokens],
                     dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// The fire's PATCH ROWS, pre-unfolded: `[Dim::Patches, width]`, one row
+    /// per patch, every image of every lane concatenated in the fire's patch
+    /// order (multimodal §2). `width` is `C · T · P²` — the channels times the
+    /// temporal and spatial patch extents the resize policy fixed — so the
+    /// patch embed is the matmul this IR already has and no convolution op is
+    /// owed.
+    ///
+    /// **THE SECOND ROW AXIS ENTERS HERE AND NOWHERE ELSE.** A text that
+    /// reaches for this states a `Dim::Patches` rectangle, which is the whole
+    /// of what makes its plan a two-unit one: `model_compiler::unit` reads the
+    /// axis off the shapes rather than off a declaration, so there is no
+    /// second place for a tower to be announced and no way for the two to
+    /// disagree.
+    #[must_use]
+    pub fn patches(&self, width: impl Into<u64>) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::Patches,
+                Ty::Tensor {
+                    shape: vec![Dim::Patches, Dim::Const(width.into())],
+                    dtype: Dtype::Bf16,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// The patch axis's own indptr: `i32`, `images + 1` long, where image `i`
+    /// owns patch rows `[segments[i], segments[i + 1])`. Read by
+    /// `attention.dense`, which is block-diagonal per image.
+    #[must_use]
+    pub fn patch_segments(&self) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::PatchSegments,
+                Ty::Tensor {
+                    shape: vec![Dim::ImagesPlus(1)],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// Where each tower row lands in the TOKEN rectangle: `i32`, one
+    /// destination token row per patch row, read by `layout.scatter_rows` as
+    /// the embed merge.
+    #[must_use]
+    pub fn patch_routes(&self) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::PatchRoutes,
+                Ty::Tensor {
+                    shape: vec![Dim::Patches],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// **THE TOWER'S OWN POSITION STREAM**: `[Dim::Patches, 3]` `i32`, one
+    /// `(t, h, w)` per PATCH row (multimodal §6.3).
+    ///
+    /// Each patch's `(h, w)` in its own image's grid, which is what
+    /// `apply_rotary_pos_emb_vision` turns by; the `t` column is zero for the
+    /// still images this campaign serves and is read by nothing, because the
+    /// tower states `sections[0] == 0`. Cut from the same submission as
+    /// [`patches`](Input::patches), [`patch_segments`](Input::patch_segments)
+    /// and [`patch_routes`](Input::patch_routes), and staged with them.
+    #[must_use]
+    pub fn patch_positions(&self) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::PatchPositions,
+                Ty::Tensor {
+                    shape: vec![Dim::Patches, Dim::Const(3)],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// **WHICH ROW OF THE LEARNED POSITION TABLE EACH PATCH READS**
+    /// (multimodal §9.2): `[Dim::Patches, taps]` `i32`.
+    ///
+    /// `taps` is the resample's width — state `1` on the NATIVE grid, where
+    /// the answer is one table row per patch and the whole positional sentence
+    /// is `residual_add(layout::embed(&ids, pos_embed, vocab), y)`; state `4`
+    /// for bilinear or `16` for bicubic and pair it with
+    /// [`patch_embed_weights`](Input::patch_embed_weights) through
+    /// [`embed_weighted`](crate::ops::layout::embed_weighted).
+    ///
+    /// A `taps` of 1 declares `[Dim::Patches, 1]`, which is one id per patch
+    /// row and the same bytes a bare `[Dim::Patches]` would be — spelled with
+    /// the width so the shell reads the tap count off one declaration rather
+    /// than off the presence of a second.
+    #[must_use]
+    pub fn patch_embed_rows(&self, taps: u32) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::PatchEmbedRows,
+                Ty::Tensor {
+                    shape: vec![Dim::Patches, Dim::Const(u64::from(taps))],
+                    dtype: Dtype::I32,
+                },
+            )
+            .refined(self.over.clone())
+    }
+
+    /// **HOW MUCH OF EACH TAP** (multimodal §9.2): `[Dim::Patches, taps]`
+    /// `f32`, read by [`embed_weighted`](crate::ops::layout::embed_weighted).
+    ///
+    /// The preprocessor's arithmetic, not the device's:
+    /// `_interpolation_axis_taps_weights` computes the per-axis hat (or Keys)
+    /// weights and the 2-D case is their outer product, all of it decided by
+    /// the resize policy that already fixed the grid.
+    ///
+    /// **A NATIVE-GRID TOWER NEVER CALLS THIS.** The shell reserves the stream
+    /// only for a plan that names it, so the absence is the cheap path rather
+    /// than a vector of ones.
+    #[must_use]
+    pub fn patch_embed_weights(&self, taps: u32) -> Value {
+        self.rec
+            .input(
+                RuntimeInput::PatchEmbedWeights,
+                Ty::Tensor {
+                    shape: vec![Dim::Patches, Dim::Const(u64::from(taps))],
+                    dtype: Dtype::F32,
                 },
             )
             .refined(self.over.clone())

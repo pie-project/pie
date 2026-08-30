@@ -378,7 +378,7 @@ impl Buffer {
     /// Zero the whole allocation on `stream`, ordered with the fire.
     ///
     /// THE FIRE-PATH COUNTERPART OF [`Buffer::zeroed`], and the guest-program
-    /// plane is what wants it: a PTIR fire's scratch, its per-channel pending
+    /// plane is what wants it: an ETA fire's scratch, its per-channel pending
     /// flags and its commit slot are re-used allocation-for-allocation across
     /// fires (nothing allocates on the fire path), so each fire has to start
     /// from the state the emitted kernels assume — zeros — rather than from

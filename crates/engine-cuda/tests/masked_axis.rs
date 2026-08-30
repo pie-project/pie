@@ -21,12 +21,21 @@
 //!                                                       VariantCustom IS it
 //! ```
 //!
+//! **THE AXIS IS NO LONGER GEMMA'S ALONE, AND THIS FILE IS STILL GEMMA'S.**
+//! `8cb1b6ce6` seated `attention.masked` in the qwen text as well, so the
+//! catalog now has two declaring families and four documented-maskless ones.
+//! The device gates below stay gemma's — it is the family that also states a
+//! sliding window on most of its masked arms, so its arm exercises both terms
+//! at once — but two things moved with the catalog: the sentinel names both
+//! families and pins the four gaps, and the maskless-refusal gate boots
+//! gpt-oss, because the qwen it used to call maskless is not one any more.
+//!
 //! ```text
 //! cargo test -p engine-cuda --test masked_axis
 //! cargo test -p engine-cuda --features cuda-13 --test masked_axis -- --nocapture
 //! ```
 
-use engine::engine_api::fire::{Mask, Masking};
+use engine::fire::{Mask, Masking};
 use engine_cuda::{Fault, LaneMask, Seated};
 use model_compiler::{Budget, DeviceProfile, compile};
 use model_dsl::Platform;
@@ -46,33 +55,93 @@ fn masked_arms(trace: &Trace) -> usize {
         .count()
 }
 
-/// **GEMMA IS THE ONLY FAMILY THAT DECLARES THE AXIS.**
+/// **WHO DECLARES THE AXIS, AND WHO IS DOCUMENTED AS NOT.**
 ///
-/// Stated rather than assumed, because every other claim in this file is
-/// about gemma and a reader is entitled to know why: `masked` is a
+/// Stated rather than assumed, because the device gates below are gemma's and
+/// a reader is entitled to know that this is a choice about where the hardware
+/// coverage is rather than a fact about the catalog. `masked` is a
 /// model-declared fact (design §8), the bits are a runtime input, and a plan
-/// with no `attention.masked` node has nowhere for them to go. A qwen lane
-/// carrying a mask is not "the axis without the gemma facts" — it is a mask
-/// nothing reads.
+/// with no `attention.masked` node has nowhere for them to go.
+///
+/// **TWO FAMILIES DECLARE IT.** Gemma always did. Qwen joined at `8cb1b6ce6`,
+/// which added `Facts::masked` as a fifth fact FIRST in the priority split and
+/// `ops::attn::masked` as a fourth arm of the attention merge. So "a qwen lane
+/// carrying a mask is a mask nothing reads", which this gate used to say, is
+/// no longer true — and the maskless-refusal gate below had to move off qwen
+/// to keep meaning anything.
+///
+/// **THE OTHER FOUR ARE MASKLESS ON PURPOSE**, each for a written reason
+/// (`8cb1b6ce6`'s report): gpt-oss and deepseek-v4 fold learned sinks — and
+/// deepseek's pooled long-range merge — through the LSE, which
+/// `Attention::Masked` does not export; glm-5 and kimi-k3 attend through MLA
+/// latent caches with absorbed queries, and no masked MLA variant exists in
+/// the vocabulary. This gate is the sentinel on that pair of claims: the day
+/// one of those four grows the arm, or one of the two loses it, is the day
+/// this fails and says which.
+///
+/// PURE CPU, and not `#[ignore]`d for that reason: it reads the catalog's
+/// traces and loads no checkpoint and no device.
 #[test]
-fn gemma_is_the_only_family_that_declares_the_masked_axis() {
+fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
+    // The two families whose texts state `attention.masked`, by SKU prefix.
+    const DECLARE: [&str; 3] = ["gemma4-", "qwen35-", "qwen36-"];
+    // And the four with a written kernel gap, which must stay maskless.
+    const GAPPED: [&str; 4] = ["dsv4-", "glm5-", "gptoss-", "kimik3-"];
+
     let mut declaring: Vec<(String, usize)> = Vec::new();
+    let mut maskless: Vec<String> = Vec::new();
     for (sku, _, trace, _) in model::catalog() {
         let arms = masked_arms(&trace(Platform::Cuda));
         if arms > 0 {
             declaring.push((sku.to_string(), arms));
+        } else {
+            maskless.push(sku.to_string());
         }
     }
+
     assert!(
-        declaring.iter().all(|(sku, _)| sku.starts_with("gemma4-")),
-        "a family beyond gemma declares `attention.masked`, and the gates in \
-         this file were written against gemma alone: {declaring:?}"
+        declaring
+            .iter()
+            .all(|(sku, _)| DECLARE.iter().any(|family| sku.starts_with(family))),
+        "a family beyond gemma and qwen declares `attention.masked`, and the \
+         device gates in this file were written against gemma: {declaring:?}"
     );
     assert!(
         !declaring.is_empty(),
         "no SKU declares `attention.masked` at all, and then the axis has no \
          model text to be exercised by"
     );
+
+    // BOTH of them, and not just one. A text that DROPPED the arm would pass
+    // the prefix check above by simply not appearing in the list.
+    for family in DECLARE {
+        assert!(
+            declaring.iter().any(|(sku, _)| sku.starts_with(family)),
+            "no `{family}*` SKU declares `attention.masked` any more, so the \
+             axis lost a family: {declaring:?}"
+        );
+    }
+
+    // And the documented gaps stay gaps. This is the half that gives the
+    // maskless-refusal gate below an artifact to stand on: it boots
+    // `gptoss-20b-*` precisely because this asserts gpt-oss bakes no arm.
+    for family in GAPPED {
+        let grew: Vec<&(String, usize)> = declaring
+            .iter()
+            .filter(|(sku, _)| sku.starts_with(family))
+            .collect();
+        assert!(
+            grew.is_empty(),
+            "`{family}*` grew an `attention.masked` arm, and a kernel gap was \
+             written down as the reason it could not have one — the note and \
+             the text now disagree: {grew:?}"
+        );
+        assert!(
+            maskless.iter().any(|sku| sku.starts_with(family)),
+            "no `{family}*` SKU is in the catalog at all, so this gate asserts \
+             nothing about it"
+        );
+    }
 }
 
 /// **BLOCKER 1, FLIPPED: one kv space, two readings, and the facts are keyed
@@ -97,6 +166,7 @@ fn gemma_is_the_only_family_that_declares_the_masked_axis() {
 /// `per_layer_num_kv_heads_` vectors beside a `per_layer_window_left` on the
 /// weights.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn gemma_s_one_kv_space_carries_two_readings_and_probes_them_apart() {
     let trace = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
         Platform::Cuda,
@@ -161,6 +231,7 @@ fn gemma_s_one_kv_space_carries_two_readings_and_probes_them_apart() {
 /// about the window — and it cleared the same way, by minting one schedule
 /// per reading in its own model text.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn every_sku_probes_its_caches() {
     let mut refused: Vec<String> = Vec::new();
     for (sku, _, trace, _) in model::catalog() {
@@ -189,6 +260,7 @@ fn every_sku_probes_its_caches() {
 /// shell's own restatement over a `CompiledModel`, kept because the shell asks it at
 /// load and a `CompiledModel` can arrive from anywhere.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn no_sku_straddles_a_schedule() {
     let mut straddled: Vec<String> = Vec::new();
     for (sku, _, trace, _) in model::catalog() {
@@ -225,6 +297,7 @@ fn no_sku_straddles_a_schedule() {
 /// arm is partly windowed and the gate below exercises both halves. The
 /// arithmetic is [`the_masked_arm_says_what_the_causal_arm_says`].
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn gemma_states_a_sliding_window_on_most_of_its_masked_arms() {
     let trace = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
         Platform::Cuda,
@@ -251,6 +324,7 @@ fn gemma_states_a_sliding_window_on_most_of_its_masked_arms() {
 /// lanes are DIFFERENT lengths and whose masked lane is not the first, so the
 /// span table is doing real work.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_staged_bits_read_back_the_way_the_device_text_addresses_them() {
     // Lane 0: unmasked, 3 held, 2 new. Lane 1: masked, 5 held, 3 new, with
     // positions 0 and 6 dropped. Lane 2: unmasked decode.
@@ -309,39 +383,56 @@ fn the_staged_bits_read_back_the_way_the_device_text_addresses_them() {
 /// the refusal is now `Fault::Maskless` and it is asked against the loaded
 /// plan.
 ///
+/// **AND WHY THE ARTIFACT MOVED.** This gate booted qwen, because qwen baked
+/// no masked arm. `8cb1b6ce6` gave it one. A gate that kept booting qwen would
+/// have gone on passing for exactly as long as it took somebody to notice it
+/// was now asserting that a masked lane against a MASKED artifact is refused —
+/// which is the opposite claim, and a real bug if it were ever true. So it
+/// boots `gptoss-20b-*` instead: gpt-oss folds a learned sink through the LSE,
+/// which `Attention::Masked` does not export, and
+/// `the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else` is the
+/// sentinel that keeps that true. Both halves stand against the SAME artifact,
+/// so the second one is still a control on the first.
+///
 /// Skips without a device and a checkpoint, like every other test in this
 /// tree that needs one.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_mask_against_a_maskless_artifact_is_refused_by_name() {
     if !engine_cuda::device::present() {
         eprintln!("skipping the maskless refusal: no CUDA device on this machine");
         return;
     }
-    let Some((mut shell, _)) = common::ready("the maskless refusal") else {
+    let Some((mut shell, tok)) = maskless::ready("the maskless refusal") else {
         return;
     };
     shell.open(0).expect("slot 0 opens");
-    let tokens = [9707u32, 11, 1879];
-    let mask = Masking::Extent(Mask::new(vec![0, 3], 3));
+    // Encoded rather than written down: the ids are this checkpoint's, and a
+    // literal from another vocabulary would be a different lane than the one
+    // this gate means to fire.
+    let tokens = tok.encode("Hello, world");
+    let held = tokens.len() as u32;
+    assert!(held > 1, "the refusal is asked of a prefill lane");
+    let mask = Masking::Extent(Mask::new(vec![0, held], u64::from(held)));
     let refused = shell.fire_seated(&[engine_cuda::Seated::masked(
         engine_cuda::Lane {
             slot: 0,
-            word: common::word(tokens.len() as u32),
+            word: maskless::word(held),
             tokens: &tokens,
         },
         &mask,
     )]);
     assert!(
         matches!(refused, Err(Fault::Maskless { lane: 0 })),
-        "a masked lane against qwen — which bakes no `attention.masked` arm — \
-         must be refused by name, not run unmasked: {refused:?}"
+        "a masked lane against gpt-oss — which bakes no `attention.masked` arm \
+         — must be refused by name, not run unmasked: {refused:?}"
     );
 
     // And the same lane WITHOUT a mask still fires, so the refusal is about
     // the mask and not about the submission around it.
     let fired = shell.fire(&[engine_cuda::Lane {
         slot: 0,
-        word: common::word(tokens.len() as u32),
+        word: maskless::word(held),
         tokens: &tokens,
     }]);
     assert!(
@@ -366,6 +457,7 @@ fn a_mask_against_a_maskless_artifact_is_refused_by_name() {
 /// Greedy, because an identity between two runs is only available if the
 /// sampling is a function of the logits alone.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_mixed_fire_of_all_three_classes_says_what_each_lane_says_alone() {
     let _serial = gemma::serialized();
     let Some((mut shell, tok)) = gemma::ready("the three-class golden") else {
@@ -495,6 +587,7 @@ fn a_mixed_fire_of_all_three_classes_says_what_each_lane_says_alone() {
 /// two would disagree here and only here, because a short prompt never
 /// reaches back past 512 and hides the whole question.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_masked_arm_says_what_the_causal_arm_says() {
     let _serial = gemma::serialized();
     let Some((mut shell, tok)) = gemma::ready("the windowed masked arm") else {
@@ -560,6 +653,7 @@ fn the_masked_arm_says_what_the_causal_arm_says() {
 /// this fire's value instead of this KEY's. The counter is watched because
 /// "it did not capture again" is not a property any output has.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_masked_composition_captures_once_and_replays_identically() {
     let _serial = gemma::serialized();
     let Some((mut shell, tok)) = gemma::ready("the masked replay") else {
@@ -627,6 +721,7 @@ fn a_masked_composition_captures_once_and_replays_identically() {
 /// kv pool and the mask slab: a second sequence must not be able to tell that
 /// the first one used the same pages.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn two_sequences_through_one_boot_say_the_same_thing() {
     let _serial = gemma::serialized();
     let Some((mut shell, tok)) = gemma::ready("gemma launch isolation") else {
@@ -683,6 +778,7 @@ fn two_sequences_through_one_boot_say_the_same_thing() {
 /// (row 0's mask is the all-keeping one here) and land on the CAUSAL answer,
 /// which is exactly what the second assertion refuses.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_windowed_prefill_masks_each_row_with_its_own_window() {
     let _serial = gemma::serialized();
     let Some((mut shell, tok)) = gemma::ready("the per-row window") else {
@@ -784,36 +880,62 @@ fn a_windowed_prefill_masks_each_row_with_its_own_window() {
 
 /// The load, shared with `serve_smoke` in shape and stated here rather than
 /// imported because a test binary is its own crate.
-mod common {
+
+/// The maskless rig: the family with a WRITTEN reason it cannot carry the arm.
+///
+/// **IT REPLACED A QWEN RIG THAT HAD EXACTLY ONE USER.** The refusal gate below
+/// used to boot qwen through a `common` module, because qwen baked no masked
+/// arm; `8cb1b6ce6` gave it one, and the module went from "the maskless rig" to
+/// "a second masked rig" without a line of it changing. Nothing else in this
+/// file read it — the device gates all stand on `gemma` — so it is gone rather
+/// than kept beside this one, and the name here states the property the gate
+/// actually depends on instead of the model that happened to have it.
+///
+/// gpt-oss folds a learned sink through the LSE, which `Attention::Masked` does
+/// not export. That is a written reason rather than an accident, and the
+/// sentinel at the top of this file fails the day it stops being true.
+mod maskless {
     use std::path::{Path, PathBuf};
 
     use engine_cuda::{Boot, Shell};
     use model_compiler::Budget;
     use model_dsl::{Classify, Platform, Request};
 
-    const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
+    const SKU: &str = "gptoss-20b-bf16-mxfp4-kv-bf16";
 
+    /// gpt-oss states ONE fact, `qo_one`, so its class word has no bit a mask
+    /// could set even if the arm existed. That is what "maskless" looks like
+    /// at the text; the refusal this module serves is what it looks like at
+    /// the fire.
     pub fn word(query_len: u32) -> u64 {
-        model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+        model::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
     }
 
     fn snapshot() -> Option<PathBuf> {
-        if let Ok(stated) = std::env::var("PIE_SMOKE_SNAPSHOT") {
+        if let Ok(stated) = std::env::var("PIE_MASKLESS_SNAPSHOT") {
             let path = PathBuf::from(stated);
             return path.is_dir().then_some(path);
         }
         let home = std::env::var("HOME").ok()?;
-        let snapshots =
-            Path::new(&home).join(".cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots");
+        let snapshots = Path::new(&home)
+            .join(".cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots");
         std::fs::read_dir(snapshots)
             .ok()?
             .filter_map(|entry| Some(entry.ok()?.path()))
             .find(|path| path.join("tokenizer.json").exists())
     }
 
-    fn container(snapshot: &Path) -> Option<PathBuf> {
+    /// Every container in the snapshot, sorted.
+    ///
+    /// **ALL THREE SHARDS, NOT THE FIRST.** `gemma` indexes a single container
+    /// because its checkpoint is one file; gpt-oss-20b
+    /// ships three, and an import contract built over shard zero refuses for a
+    /// reason that has nothing to do with this gate. The same `index_all` call
+    /// `export_axes`'s sharded load makes, for the same reason.
+    fn shards(snapshot: &Path) -> Vec<PathBuf> {
         let mut found: Vec<PathBuf> = std::fs::read_dir(snapshot)
-            .ok()?
+            .into_iter()
+            .flatten()
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
                 let name = path.file_name()?.to_str()?;
@@ -821,33 +943,45 @@ mod common {
             })
             .collect();
         found.sort();
-        found.into_iter().next()
+        found
     }
 
+    /// A loaded gpt-oss, or `None` and a sentence saying what was missing.
+    ///
+    /// The ceilings are the retired qwen rig's: this gate fires one short lane twice
+    /// and reads no logit, so nothing here wants a wider budget than the qwen
+    /// rig had. What it does want is room for ~13.8 GiB of mxfp4 weights,
+    /// which is the whole of why it is a real-hardware test.
     pub fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         let Some(checkpoint) = snapshot() else {
-            eprintln!("skipping {what}: no Qwen3.5-0.8B snapshot (set PIE_SMOKE_SNAPSHOT)");
+            eprintln!(
+                "skipping {what}: no gpt-oss-20b snapshot in the hugging face \
+                 cache (set PIE_MASKLESS_SNAPSHOT)"
+            );
             return None;
         };
-        let Some(container) = container(&checkpoint) else {
+        let shards = shards(&checkpoint);
+        if shards.is_empty() {
             eprintln!("skipping {what}: {checkpoint:?} holds no tensor container");
             return None;
-        };
+        }
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
         let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
-        let source = ztensor_compat::index(&container).expect("the checkpoint opens");
+        let source =
+            ztensor_compat::index_all(&shards).expect("the checkpoint's shards open as one");
         let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
-        // Full residency: the whole weight table on the device, which is what
-        // an uncapped `Residency` plans (alto design §7).
-        residency: engine_cuda::experts::Plan::default(),
+            // Full residency: the whole weight table on the device, which is
+            // what an uncapped `Residency` plans (alto design §7).
+            residency: engine_cuda::experts::Plan::default(),
             trace,
             contract: &contract,
             checkpoint: &checkpoint,
             budget: Budget::new(4, 256),
+            patches: None,
             profile: None,
             page_size: 16,
             context: 512,
@@ -856,19 +990,26 @@ mod common {
             graphs: engine_cuda::Graphs::Off,
             knobs: engine_cuda::Knobs::default(),
             program_cache_dir: None,
-            // F1's depth, kept: these gates fire one step at a time and
-            // read its numbers, so a deeper ring would carve slots nothing
-            // claims. `Runahead::of` is the door a deployment comes through.
+            // F1's depth, kept: these gates fire one step at a time and read
+            // its numbers, so a deeper ring would carve slots nothing claims.
             runahead: engine::runahead::Runahead::F1,
             // The warm-boot weight artifact cache is off for a gate: a test
             // that shared one would be asserting about the last run.
             weight_cache_dir: None,
-        })
-        .expect("the shell loads");
+        });
+        // **THE `no element size` SKIP ARM STOOD HERE, AND W-5 RETIRED IT.**
+        // This rig's SKU carries mxfp4 expert banks, and until wave W-5 the
+        // cuda weight table had no row for a split-plane one: the load refused
+        // at its first bank param, so the gate skipped with the reason rather
+        // than reporting a failure that was not its subject. `weights.rs` now
+        // seats `WeightRow::Planes` and `plane_bytes` sizes a packed plane, so
+        // the load SUCCEEDS — and an arm that can no longer fire is an arm
+        // that would silently swallow the next real refusal instead. It is
+        // gone, and the load speaks for itself.
+        let shell = shell.expect("the shell loads");
         Some((shell, tokenizer))
     }
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // THE DEVICE-GEOMETRY CLASS, AGAINST THE HOST-GEOMETRY FIRE IT MUST EQUAL
@@ -892,12 +1033,16 @@ mod common {
 /// cell early, a mask packed MSB-first, the token ids read from `tail` instead
 /// of `head` — each of them moves a logit.
 ///
-/// **GEMMA BECAUSE THE MASK NEEDS AN ARM.** The device-resolved mask is half
-/// the class (a beam search's ancestry is `gather(mask, parent)` and lives
-/// nowhere but the device), and `attention.masked` is gemma's alone — see
-/// `gemma_is_the_only_family_that_declares_the_masked_axis` at the top of this
-/// file.
+/// **GEMMA BECAUSE THE MASK NEEDS AN ARM AND THIS ONE SLIDES.** The
+/// device-resolved mask is half the class (a beam search's ancestry is
+/// `gather(mask, parent)` and lives nowhere but the device). Qwen declares
+/// `attention.masked` too since `8cb1b6ce6` — see
+/// `the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else` at the
+/// top of this file — but gemma is the family that also states a sliding
+/// window on most of its masked arms, so it is the one whose arm exercises
+/// both terms at once.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_device_geometry_fire_is_the_host_geometry_fire_it_describes() {
     let _one = gemma::serialized();
     let Some((mut shell, tokenizer)) = gemma::ready("the device-geometry gate") else {
@@ -971,6 +1116,7 @@ fn a_device_geometry_fire_is_the_host_geometry_fire_it_describes() {
 /// seat's `have + row` arithmetic cannot name, and a shell that read the
 /// descriptor without using it would serve every beam the first beam's cell.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn an_explicit_write_descriptor_lands_somewhere_the_seat_would_not_have() {
     let _one = gemma::serialized();
     let Some((mut shell, tokenizer)) = gemma::ready("the write-descriptor gate") else {
@@ -1017,15 +1163,15 @@ fn an_explicit_write_descriptor_lands_somewhere_the_seat_would_not_have() {
 /// is the shell's reading of it.
 mod devgeo {
     use crate::gemma;
-    use engine::engine_api::fire::{Mask, Masking};
-    use engine::engine_api::program::ProgramRegistration;
-    use engine::tensor_ir::registry::GeometryClass;
+    use engine::fire::{Mask, Masking};
+    use engine::program::ProgramRegistration;
+    use eta_ir::registry::GeometryClass;
     use engine_cuda::{Lane, Seated, Shell};
-    use tensor_ir::container::{
+    use eta_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use tensor_ir::registry::{ModelProfile, Port, Stage};
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::registry::{ModelProfile, Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
 
     /// Two lanes: the smallest fire in which "which lane does this value
     /// belong to" is a question at all.
@@ -1139,7 +1285,7 @@ mod devgeo {
                 &[engine_cuda::serve::Attached {
                     lane: 0,
                     instance,
-                    at: engine::engine_api::fire::Boundary::Epilogue,
+                    at: engine::fire::Boundary::Epilogue,
                 }],
             )
             .expect("the device-geometry fire runs")
@@ -1186,7 +1332,7 @@ mod devgeo {
             Seed::i32(Port::EmbedTokens, Shape::vector(LANES as u32), feed.iter().map(|&t| t as i32).collect()),
             Seed::u32(Port::EmbedIndptr, Shape::vector(LANES as u32 + 1), (0..=LANES as u32).collect()),
             Seed::u32(Port::Positions, Shape::vector(LANES as u32), vec![held; LANES]),
-            // IN WIRE-TAG ORDER, which is what `tensor_ir::validate` requires
+            // IN WIRE-TAG ORDER, which is what `eta_ir::validate` requires
             // of a container's port table (`PortsUnsorted`): pages (3) and its
             // CSR (4) stand before the extent (5).
             Seed::u32(Port::Pages, Shape::vector(pages.len() as u32), pages),
@@ -1210,7 +1356,7 @@ mod devgeo {
             .bind_program(
                 program,
                 &wire,
-                engine::Extents::default(),
+                eta_exec::Extents::default(),
                 GeometryClass::DeviceGeometry,
                 &[],
                 &ids,
@@ -1223,30 +1369,30 @@ mod devgeo {
     pub struct Seed {
         port: Port,
         shape: Shape,
-        dtype: DType,
-        value: engine::Value,
+        dtype: Dtype,
+        value: eta_exec::Value,
     }
 
     impl Seed {
         fn i32(port: Port, shape: Shape, lanes: Vec<i32>) -> Seed {
-            Seed { port, shape, dtype: DType::I32, value: engine::Value::I32(lanes) }
+            Seed { port, shape, dtype: Dtype::I32, value: eta_exec::Value::I32(lanes) }
         }
         fn u32(port: Port, shape: Shape, lanes: Vec<u32>) -> Seed {
-            Seed { port, shape, dtype: DType::U32, value: engine::Value::U32(lanes) }
+            Seed { port, shape, dtype: Dtype::U32, value: eta_exec::Value::U32(lanes) }
         }
         fn bools(port: Port, shape: Shape, lanes: Vec<bool>) -> Seed {
             Seed {
                 port,
                 shape,
-                dtype: DType::Bool,
-                value: engine::Value::Bool(lanes.into_iter().map(u8::from).collect()),
+                dtype: Dtype::Bool,
+                value: eta_exec::Value::Bool(lanes.into_iter().map(u8::from).collect()),
             }
         }
         /// The seed as the wire cell `bind_program` takes.
         fn wire(&self) -> Vec<u8> {
             let lanes = self.shape.numel() as usize;
-            let mut bytes = vec![0u8; engine::wire_cell_bytes(self.dtype, lanes)];
-            engine::encode_wire(&self.value, &mut bytes);
+            let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(self.dtype, lanes)];
+            eta_exec::encode_wire(&self.value, &mut bytes);
             bytes
         }
     }
@@ -1276,25 +1422,15 @@ mod devgeo {
                 source: PortSource::Channel(index as u32),
             });
         }
-        let bound = tensor_ir::validate::bind(container, ModelProfile::dummy())
+        let bound = eta_ir::validate::bind(container, ModelProfile::dummy())
             .expect("a port-only container binds");
-        let stages = tensor_compiler::plan::compile_bound(&bound);
-        let launch = tensor_compiler::codegen::launch::build(&bound, &stages);
-        let backend = tensor_compiler::codegen::program::Backend::Cuda;
-        let emitted = tensor_compiler::codegen::program::emit_program(backend, &stages, &bound);
+        let stages = eta_compiler::plan::compile_bound(&bound);
+        let launch = eta_compiler::codegen::launch::build(&bound, &stages);
+        let backend = eta_compiler::codegen::program::Backend::Cuda;
+        let emitted = eta_compiler::codegen::program::emit_program(backend, &stages, &bound);
         ProgramRegistration {
             program_hash: bound.hash,
-            emitted_kernels: emitted
-                .into_iter()
-                .map(|kernel| engine::engine_api::program::EmittedKernel {
-                    kind: kernel.kind,
-                    stage_index: kernel.stage_index,
-                    region_index: kernel.region_index,
-                    entry_name: kernel.entry_name,
-                    source: kernel.source,
-                    error: kernel.error,
-                })
-                .collect(),
+            emitted_kernels: emitted,
             emitter_version: backend.emitter_version(),
             region_analysis: Vec::new(),
             launch,
@@ -1308,7 +1444,7 @@ mod gemma {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
-    use engine::engine_api::fire::Masking;
+    use engine::fire::Masking;
     use engine_cuda::{Boot, Lane, Seated, Shell};
     use model_compiler::Budget;
     use model_dsl::{Classify, Platform, Request};
@@ -1493,6 +1629,7 @@ mod gemma {
             contract: &contract,
             checkpoint: &checkpoint,
             budget: Budget::new(4, 768),
+            patches: None,
             profile: None,
             page_size: 16,
             context: 1024,

@@ -45,11 +45,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 
-use model_loader::checkpoint::read::parse_checkpoint_metadata;
+use checkpoint::file::read::parse_metadata;
 
 // Same names `convert` writes under, taken from the same place rather than
 // mirrored here.
-use model_loader::checkpoint::meta::{SOURCE_KEY, VERSION_KEY};
+use checkpoint::file::meta::{SOURCE_KEY, VERSION_KEY};
 
 /// The archive's filename inside a model directory.
 ///
@@ -190,13 +190,13 @@ fn entries_in(dir: &Path) -> Result<Vec<Entry>> {
 
 /// Reads one artifact root into an entry, or nothing if it cannot be opened.
 fn read_entry(root: &Path, name: String) -> Option<Entry> {
-    let metadata = parse_checkpoint_metadata(root).ok()?;
+    let metadata = parse_metadata(root).ok()?;
     let files: Vec<PathBuf> = metadata
         .files
         .iter()
         .map(|file| PathBuf::from(&file.path))
         .collect();
-    let attributes = model_loader::checkpoint::zt::read_attributes(root).unwrap_or_default();
+    let attributes = checkpoint::file::zt::read_attributes(root).unwrap_or_default();
     Some(Entry {
         name,
         dir: None,
@@ -235,9 +235,9 @@ fn read_runtimes(dir: &Path) -> Vec<Runtime> {
         .map(|entry| Runtime {
             key: entry.name,
             bytes: entry.bytes,
-            runtime_quant: model_loader::checkpoint::zt::read_attributes(&entry.root)
+            runtime_quant: checkpoint::file::zt::read_attributes(&entry.root)
                 .unwrap_or_default()
-                .get(model_loader::checkpoint::meta::RUNTIME_QUANT_KEY)
+                .get(checkpoint::file::meta::RUNTIME_QUANT_KEY)
                 .cloned(),
             files: entry.files,
         })
@@ -338,8 +338,8 @@ pub fn staging_bytes(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_loader::checkpoint::write::CheckpointWriter;
-    use model_loader::types::{DType, Encoding, TensorDecl, TensorId, Visibility};
+    use checkpoint::file::write::Writer;
+    use checkpoint::types::{DType, Encoding, TensorDecl, TensorId, Visibility};
 
     fn decl(name: &str) -> TensorDecl {
         TensorDecl {
@@ -364,13 +364,12 @@ mod tests {
         let payload = vec![7u8; 32_000];
 
         let single = dir.path().join("solo.zt");
-        let mut writer = CheckpointWriter::create(&single, &Default::default()).unwrap();
+        let mut writer = Writer::create(&single, &Default::default()).unwrap();
         writer.add_tensor(&decl("w"), &payload).unwrap();
         writer.finish().unwrap();
 
         let sharded = dir.path().join("split.zt");
-        let mut writer =
-            CheckpointWriter::create_sharded(&sharded, &Default::default(), 40_000).unwrap();
+        let mut writer = Writer::create_sharded(&sharded, &Default::default(), 40_000).unwrap();
         for i in 0..3 {
             writer
                 .add_tensor(&decl(&format!("w{i}")), &payload)
@@ -426,19 +425,18 @@ mod tests {
         let payload = vec![7u8; 32_000];
 
         let archive = model.join(ARCHIVE_FILE);
-        let mut writer = CheckpointWriter::create(&archive, &Default::default()).unwrap();
+        let mut writer = Writer::create(&archive, &Default::default()).unwrap();
         writer.add_tensor(&decl("w"), &payload).unwrap();
         writer.finish().unwrap();
 
         // Two builds of the same model, one of them sharded.
         let plain = model.join(RUNTIME_DIR).join("0123456789abcdef.zt");
-        let mut writer = CheckpointWriter::create(&plain, &Default::default()).unwrap();
+        let mut writer = Writer::create(&plain, &Default::default()).unwrap();
         writer.add_tensor(&decl("w"), &payload).unwrap();
         writer.finish().unwrap();
 
         let split = model.join(RUNTIME_DIR).join("fedcba9876543210.zt");
-        let mut writer =
-            CheckpointWriter::create_sharded(&split, &Default::default(), 40_000).unwrap();
+        let mut writer = Writer::create_sharded(&split, &Default::default(), 40_000).unwrap();
         for i in 0..3 {
             writer
                 .add_tensor(&decl(&format!("w{i}")), &payload)
@@ -489,13 +487,13 @@ mod tests {
 
         // The older layout, with one tensor.
         let flat = root.path().join("qwen.zt");
-        let mut writer = CheckpointWriter::create(&flat, &Default::default()).unwrap();
+        let mut writer = Writer::create(&flat, &Default::default()).unwrap();
         writer.add_tensor(&decl("w"), &payload).unwrap();
         writer.finish().unwrap();
 
         // The re-import, with two, so the entries are told apart by content.
         let archive = root.path().join("qwen").join(ARCHIVE_FILE);
-        let mut writer = CheckpointWriter::create(&archive, &Default::default()).unwrap();
+        let mut writer = Writer::create(&archive, &Default::default()).unwrap();
         writer.add_tensor(&decl("a"), &payload).unwrap();
         writer.add_tensor(&decl("b"), &payload).unwrap();
         writer.finish().unwrap();
@@ -508,7 +506,7 @@ mod tests {
 
         // A flat file whose name nothing has taken is still an entry.
         let other = root.path().join("legacy.zt");
-        let mut writer = CheckpointWriter::create(&other, &Default::default()).unwrap();
+        let mut writer = Writer::create(&other, &Default::default()).unwrap();
         writer.add_tensor(&decl("w"), &payload).unwrap();
         writer.finish().unwrap();
         let names: Vec<String> = entries_in(root.path())
@@ -529,7 +527,7 @@ mod tests {
     fn a_flat_artifact_from_an_older_pie_is_still_an_entry() {
         let dir = tempfile::tempdir().unwrap();
         let flat = dir.path().join("legacy.zt");
-        let mut writer = CheckpointWriter::create(&flat, &Default::default()).unwrap();
+        let mut writer = Writer::create(&flat, &Default::default()).unwrap();
         writer.add_tensor(&decl("w"), &vec![7u8; 32_000]).unwrap();
         writer.finish().unwrap();
 

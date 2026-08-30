@@ -162,6 +162,7 @@ fn load(pad: bool, lattice: Option<&[u32]>) -> Option<(Shell, tokenizer::Tokeniz
             }
             budget
         },
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,
@@ -253,6 +254,7 @@ fn warm(millis: &[f64]) -> f64 {
 /// with it, and every one of those is upstream of the logits — so the pin is a
 /// bounds check with a vocabulary attached.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_padded_fire_stays_in_bounds_and_says_the_pinned_thing() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = load(true, None) else {
@@ -283,6 +285,7 @@ fn a_padded_fire_stays_in_bounds_and_says_the_pinned_thing() {
 /// order of magnitude, which is the shape of a regression (a bucket rounding
 /// a decode fire up to a prefill-sized gemm) rather than of noise.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_tail_a_padded_decode_computes_rides_the_weight_reads() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = load(true, None) else {
@@ -330,6 +333,7 @@ fn the_tail_a_padded_decode_computes_rides_the_weight_reads() {
 /// kill factor 3) observed from the outside: what freezes inside a bucket is
 /// not only the kernel NAME the probe counts but the numbers it computes.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_solo_lane_and_a_batched_one_agree_inside_one_bucket() {
     let _serial = serialized();
     // Sixteen holds every fire below — a 5-token prompt on three lanes is 15

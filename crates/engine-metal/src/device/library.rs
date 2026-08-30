@@ -20,12 +20,24 @@
 //! flattened by `kernels_metal::resolve` before the source is handed over,
 //! because `newLibraryWithSource:` has no header search path.
 //!
-//! **The `stamp` is carried and refused.** `Fire::stamp` is the jit
-//! instantiation point a specialized entry would name, and no entry in
-//! `kernels-metal` sets one today. Rather than ignore the field — which
-//! would silently fire the unspecialized point for a specialized ask — a
-//! non-empty stamp is a named refusal until there is a specialization path
-//! to route it into.
+//! **The `stamp` is a LINE OF SOURCE, and that is the whole specialization
+//! path.** `Fire::stamp` is the jit instantiation point a specialized entry
+//! names — `PIE_STAMP_qmm_t("affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
+//! 64, 4, 32, 32, 32)`, composed by `kernels_metal::linear::quant`. The
+//! shader declares the macro and instantiates NOTHING with it; the driver
+//! appends the one invocation it selected to the flattened source and
+//! compiles that. The reference driver spelled all 216 affine qmm points out
+//! in the file instead, and paid the Metal compiler for every one of them on
+//! a load that fires two.
+//!
+//! So the stamp is part of the source, and the cache keys say so: a library
+//! is `(file, stamp)` and a pipeline is `(file, entrypoint, stamp)`. Two
+//! stamps of one file are two libraries, which is the honest cost — a plan
+//! reaches a handful of tile shapes, and a pipeline already compiled stays
+//! valid when the next stamp arrives. A stamp that names no macro, or a
+//! macro that mints no such entrypoint, is a compile refusal carrying the
+//! Metal compiler's own paragraph, which is what the field being carried
+//! rather than ignored was always for.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -59,8 +71,8 @@ pub(crate) type Pipeline = ();
 /// cache and a plan uses a fraction of them.
 #[derive(Default)]
 pub struct Pipelines {
-    libraries: RefCell<HashMap<&'static str, Library>>,
-    pipelines: RefCell<HashMap<(&'static str, &'static str), Pipeline>>,
+    libraries: RefCell<HashMap<(&'static str, &'static str), Library>>,
+    pipelines: RefCell<HashMap<(&'static str, &'static str, &'static str), Pipeline>>,
     /// Every compile this load performed, for the warm/cold gate.
     compiles: std::cell::Cell<u64>,
 }
@@ -102,36 +114,36 @@ impl Pipelines {
     /// # Errors
     ///
     /// [`Fault::Shader`] for a source this crate does not ship, an
-    /// entrypoint the library does not hold, a source the Metal compiler
-    /// refused, or a stamp there is no specialization path for.
+    /// entrypoint the library does not hold — including one a jit stamp
+    /// promised and its macro did not mint — or a source the Metal compiler
+    /// refused.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn at(
         &self,
         device: &ProtocolObject<dyn MTLDevice>,
         fire: kernels_metal::Fire,
     ) -> Result<Pipeline> {
-        if !fire.stamp.is_empty() {
-            return Err(Fault::Shader {
-                file: fire.file,
-                entrypoint: fire.entrypoint,
-                why: format!(
-                    "names the jit stamp `{}`, and this shell compiles the sources as \
-                     they are shipped — there is no specialization path to route it into",
-                    fire.stamp
-                ),
-            });
-        }
-        let key = (fire.file, fire.entrypoint);
+        let key = (fire.file, fire.entrypoint, fire.stamp);
         if let Some(pipeline) = self.pipelines.borrow().get(&key) {
             return Ok(pipeline.clone());
         }
         let library = self.library(device, fire)?;
         let name = super::ctx::nsstring(fire.entrypoint);
-        let function = library.newFunctionWithName(&name).ok_or(Fault::Shader {
-            file: fire.file,
-            entrypoint: fire.entrypoint,
-            why: "the compiled library holds no such entrypoint".to_string(),
-        })?;
+        let function = library
+            .newFunctionWithName(&name)
+            .ok_or_else(|| Fault::Shader {
+                file: fire.file,
+                entrypoint: fire.entrypoint,
+                why: if fire.stamp.is_empty() {
+                    "the compiled library holds no such entrypoint".to_string()
+                } else {
+                    format!(
+                        "the stamp `{}` compiled and minted no entrypoint by that name — \
+                         the macro and the symbol the driver composed do not agree",
+                        fire.stamp
+                    )
+                },
+            })?;
         // **EVERY PIPELINE IS BUILT FOR AN INDIRECT COMMAND BUFFER, AND ONE
         // PATH SERVES BOTH CONSUMERS.** `supportIndirectCommandBuffers` is
         // false by default and cannot be turned on afterwards, and a pipeline
@@ -217,14 +229,23 @@ impl Pipelines {
         device: &ProtocolObject<dyn MTLDevice>,
         fire: kernels_metal::Fire,
     ) -> Result<Library> {
-        if let Some(library) = self.libraries.borrow().get(fire.file) {
+        let key = (fire.file, fire.stamp);
+        if let Some(library) = self.libraries.borrow().get(&key) {
             return Ok(library.clone());
         }
-        let flat = kernels_metal::resolve(fire.file).map_err(|missing| Fault::Shader {
+        let mut flat = kernels_metal::resolve(fire.file).map_err(|missing| Fault::Shader {
             file: fire.file,
             entrypoint: fire.entrypoint,
             why: format!("includes `{missing}`, which this crate does not ship"),
         })?;
+        // Appended and not substituted: the stamp is a macro invocation the
+        // file itself declares, so it belongs after every declaration and
+        // template it names.
+        if !fire.stamp.is_empty() {
+            flat.push('\n');
+            flat.push_str(fire.stamp);
+            flat.push('\n');
+        }
         let source = super::ctx::nsstring(&flat);
         let library = device
             .newLibraryWithSource_options_error(&source, None)
@@ -233,7 +254,7 @@ impl Pipelines {
                 entrypoint: fire.entrypoint,
                 why: error.localizedDescription().to_string(),
             })?;
-        self.libraries.borrow_mut().insert(fire.file, library.clone());
+        self.libraries.borrow_mut().insert(key, library.clone());
         Ok(library)
     }
 }

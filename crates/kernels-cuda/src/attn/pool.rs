@@ -5,8 +5,8 @@
 //! geometry the ops once smuggled (`row_valid`, `request_of_token`) is
 //! op-named now (see the remaining MENLO-SEAM notes per entry).
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::attn::kv;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse};
@@ -38,13 +38,13 @@ const fn compressor_coff(ratio: i32) -> i32 {
     if ratio == 4 { 2 } else { 1 }
 }
 
-fn pooling_ratio(op: &'static str, ratio: u32) -> Result<i32, KernelError> {
+fn pooling_ratio(op: &'static str, ratio: u32) -> Result<i32, Error> {
     count(op, "the pooling ratio this statement states", ratio)
 }
 
 /// The boundary kernels' rope-position side channel: token-shaped scratch
 /// no later op reads back host-side.
-fn boundary_rope(ctx: &Ctx, op: &'static str, rows: u32) -> Result<ArgValue, KernelError> {
+fn boundary_rope(ctx: &Ctx, op: &'static str, rows: u32) -> Result<ArgValue, Error> {
     let bytes = rows as usize * core::mem::size_of::<i32>();
     Ok(ArgValue::Ptr(
         ctx.scratch(op, "attn.pool_boundary_rope", bytes)? as usize as u64,
@@ -78,7 +78,7 @@ pub fn boundary_decode(
     ratio: u32,
     boundary_pos: &mut Tensor,
     boundary_req: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.pool_boundary_decode";
     boundary_tables(OP, boundary_pos, boundary_req);
     let ratio = pooling_ratio(OP, ratio)?;
@@ -110,7 +110,7 @@ pub fn boundary_prefill(
     ratio: u32,
     boundary_pos: &mut Tensor,
     boundary_req: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.pool_boundary_prefill";
     boundary_tables(OP, boundary_pos, boundary_req);
     let ratio = pooling_ratio(OP, ratio)?;
@@ -151,7 +151,7 @@ pub fn gather(
     state_score: Tensor,
     ape: Tensor,
     entries: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.pool_gather";
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
     boundary_tables(OP, &boundary_pos, &boundary_req);
@@ -203,7 +203,7 @@ pub fn kv_append(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.pool_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, entries.dtype, { Bf16 => () });
@@ -243,7 +243,7 @@ pub fn attention_lse(
     sm_scale: f32,
     o: &mut Tensor,
     lse: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.pool_lse";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(

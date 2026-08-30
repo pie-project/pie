@@ -26,7 +26,7 @@ path = "src/lib.rs"
 # the same walk at authoring time, and a second implementation on this side
 # would be a second answer to "does this merge cover its classes".
 model-ir = { path = "../model-ir" }
-# The workspace's one error idiom (`transport`, `engine-api`, `model-loader`
+# The workspace's one error idiom (`transport`, `engine`, `checkpoint`
 # all carry it the same way): `#[error]` attributes over the refusal enum,
 # with the message texts kept exactly as the handwritten `Display` spelled
 # them.

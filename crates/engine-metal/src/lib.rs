@@ -11,7 +11,7 @@
 //! **Portability.** No Metal API is named here. The `Run` encodes through
 //! [`kernels_metal::Ctx`] (`dyn Encode`), which the real shell
 //! implements against its command buffers — so this crate, like the walk
-//! that drives it (`engine::fire::walk`), builds and tests on any OS; only
+//! that drives it (`model_exec::fire::walk`), builds and tests on any OS; only
 //! the shell behind the sink is macOS-bound.
 //!
 //! **The seam** — the engine side of the `MENLO-SEAM` markers in
@@ -35,10 +35,13 @@
 pub mod abi;
 pub mod api;
 pub mod arena;
+/// Reading a boot document — this crate's half of it, in this crate.
+pub mod boot;
 pub mod device;
 mod dispatch;
 pub mod encode;
 mod error;
+pub mod experts;
 /// The indirect command buffer — Metal-only, and the one module of this
 /// crate that is.
 ///
@@ -56,27 +59,41 @@ pub mod mask;
 pub mod program;
 pub mod record;
 pub mod run;
+/// The observability slab the attention capture arm writes and an
+/// epilogue's `attn_score` intrinsic reads (`.wiki/alto/attn-score.md` §4).
+pub mod scores;
+pub mod scratch;
 pub mod serve;
+/// The settlement plane: the run-ahead counters, the completion seam and
+/// the A/B seat ring the asynchronous fire path is built on.
+pub mod settle;
 pub mod store;
 pub mod weights;
 pub mod window;
 
 pub use abi::{Armed, At as AbiAt, Axis, DescriptorAbi, Law, SlotAbi, Survey};
 pub use api::{ContractFor, DeviceBoot, Metal};
+pub use boot::open;
 pub use arena::Arena;
 pub use device::{Buffer, Context, Handles, Pipelines};
 pub use encode::Sink;
 pub use error::{Fault, Result};
+pub use experts::{GroupResidency, Plan as ResidencyPlan};
 #[cfg(target_vendor = "apple")]
 pub use icb::{Icb, Rebound};
 pub use inputs::Inputs;
-pub use program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
+pub use program::{Fired, Launched, Plane as ProgramPlane, Session as ProgramSession};
 pub use record::{Arg, Point, Recording, Slot, Tape};
 pub use run::{
     CacheGeometry, CachePool, CacheTable, FireBindings, FireTables, Run, SlotTable, StructSlot,
     WeightRow, WeightTable,
 };
-pub use serve::{Boot, Lane, Seated, Shell};
+pub use scores::ScoreSeat;
+pub use scratch::Scratch;
+pub use serve::{
+    Attached, Boot, Enqueued, FireCost, Landed, Lane, Prepared, Seated, Shell, StepView,
+};
+pub use settle::{Airborne, Arms, Done};
 pub use store::Pools;
-pub use weights::Weights;
-pub use window::{Cursor, Window, Windows};
+pub use weights::{AdapterPlane, Weights};
+pub use window::{Copies, Cursor, Gathered, GatheredSpace, Window, Windows};

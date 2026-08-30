@@ -38,7 +38,7 @@
 
 use std::ops::Range;
 
-use model_ir::{ClassSet, ClassTable, ValueId};
+use model_ir::{ClassSet, ClassTable, RowAxis, ValueId};
 
 use crate::arena::{ArenaMap, Concurrency};
 use crate::pq::PqTree;
@@ -80,10 +80,19 @@ pub struct CompiledModel {
     /// classes and belong to the same phase. Program order, and the record
     /// script walks them front to back.
     pub regions: Vec<Region>,
-    /// P4's output: the global class order, as the whole feasible set.
+    /// P4's output on the TOKEN axis: the global class order, as the whole
+    /// feasible set.
+    ///
+    /// **ONE ORDER PER AXIS, AND THIS IS THE FIRST ONE'S** (multimodal §5.1 —
+    /// "P7's one row order" reads "one per axis"). It keeps the design's
+    /// spelling because the token rectangle is the axis every plan has and
+    /// every pre-campaign caller means; [`patches`](CompiledModel::patches)
+    /// carries the second, and [`order_for`](CompiledModel::order_for) is how
+    /// a caller that knows about axes asks without knowing which field.
     pub order: ClassOrder,
-    /// P4's other output: what the consumers that order could not seat do
-    /// instead, per bucket range.
+    /// P4's other output on the token axis: what the consumers that order
+    /// could not seat do instead, per bucket range — ranges into
+    /// `Budget::buckets`.
     pub fallback: FallbackTable,
     /// P7's output: one slot per plan value, static offsets, rows symbolic in
     /// the bucket.
@@ -101,6 +110,79 @@ pub struct CompiledModel {
     /// with nothing to overlap, and for every plan when the profile's
     /// `side_streams` is 0.
     pub streams: StreamPlan,
+    /// The capture units, in exec order — one row axis each (multimodal §1).
+    ///
+    /// `[RowAxis::Tokens]` for every plan that states one row space, which is
+    /// every pre-campaign SKU and the M1 invariant a test pins. A plan with a
+    /// vision tower carries two, the tower's first, and the fire launches one
+    /// exec per entry chained on one stream: `prepare(all) → capture(tower) →
+    /// capture(trunk)`, the embed handoff riding stream order with no host in
+    /// it (Article 2).
+    ///
+    /// LADDERS ARE ONE-DIMENSIONAL PER UNIT. Six token rungs and six patch
+    /// rungs are twelve graphs, not thirty-six — see
+    /// [`fold_refused`](CompiledModel::fold_refused) for what that property
+    /// currently costs.
+    pub units: Vec<RowAxis>,
+    /// Which capture unit each region is recorded into — an index into
+    /// [`units`](CompiledModel::units), parallel to
+    /// [`regions`](CompiledModel::regions) (multimodal §1).
+    ///
+    /// **DERIVED FROM THE ROW AXIS OF THE ROWS A REGION WRITES**, never
+    /// declared — see [`crate::unit`] for the derivation and for what it
+    /// refuses. All zero on every plan that states one row space, which is
+    /// every pre-campaign SKU.
+    ///
+    /// PARALLEL RATHER THAN A FIELD ON [`Region`], for the reason
+    /// `ClassTable::node_mask` is parallel to `Trace::nodes`: the answer is a
+    /// whole-script one — which unit a region lands in depends on where every
+    /// other region stands — so it is produced by one pass over the table and
+    /// read by index, and `Region` keeps describing only what a run of nodes
+    /// is. [`unit_of`](CompiledModel::unit_of) is the read.
+    pub units_of: Vec<u32>,
+    /// P4's answers on the PATCH axis, or `None` for a plan that states no
+    /// patch row.
+    ///
+    /// **A SECOND SERIATION AND NOT AN EXTENSION OF THE FIRST**, because the
+    /// invariant the first is composed under does not reach here: `compose`'s
+    /// merged prefix sum has rows and lanes breaking at the same places, and a
+    /// lane of a class may carry zero images or three. So the patch axis gets
+    /// its own class order over its own lane space — IMAGES — and its own
+    /// fallback rows, indexed into `PatchLadder::buckets` rather than into
+    /// `Budget::buckets`.
+    pub patches: Option<AxisPlan>,
+    /// **THE FOLD STANDS DOWN, BY NAME** (multimodal §5.3).
+    ///
+    /// `true` exactly when this artifact has more than one capture unit. The
+    /// graph-fold plane is structurally one graph per bucket per key, so a
+    /// fire launching two execs has two bucket numbers and no single graph to
+    /// arm; there is no correct fold to build, and the engine serves the KEYED
+    /// path for the life of the load rather than folding something that would
+    /// be wrong. Said out loud rather than discovered: "6 + 6, not 6 × 6" is a
+    /// property OF per-unit keys, so deferring the fold defers the property,
+    /// and a fire-level key carrying both bucket numbers would be the product.
+    pub fold_refused: bool,
+}
+
+/// One row axis's baked answers — the pair P4 produces, per axis.
+///
+/// The token axis's pair is spelled out on [`CompiledModel`] itself
+/// ([`order`](CompiledModel::order), [`fallback`](CompiledModel::fallback)),
+/// because it is the axis every plan has and moving it into a table would
+/// rename a field every caller in the tree reads. This is what a SECOND axis
+/// arrives as, and [`CompiledModel::order_for`] is the spelling that does not
+/// care which of the two it is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AxisPlan {
+    /// Which row space these answers are about.
+    pub axis: RowAxis,
+    /// The class order a fire seriates this axis's rows by.
+    pub order: ClassOrder,
+    /// What the consumers that order could not seat do instead. The bucket
+    /// ranges index THIS AXIS'S ladder — `PatchLadder::buckets` for
+    /// [`RowAxis::Patches`] — which is the per-unit table multimodal §5.5
+    /// asks for in place of an untagged index into one vector.
+    pub fallback: FallbackTable,
 }
 
 impl CompiledModel {
@@ -126,6 +208,57 @@ impl CompiledModel {
     #[must_use]
     pub fn template(&self) -> &[Region] {
         &self.regions
+    }
+
+    /// Which capture unit this region is recorded into. `0` for a region index
+    /// past the table, which is the one-unit answer and the only honest one
+    /// for a region that is not there.
+    #[must_use]
+    pub fn unit_of(&self, region: usize) -> u32 {
+        self.units_of.get(region).copied().unwrap_or(0)
+    }
+
+    /// The class order this axis's rows are seriated by, or `None` for an axis
+    /// this plan does not state.
+    #[must_use]
+    pub fn order_for(&self, axis: RowAxis) -> Option<&ClassOrder> {
+        match axis {
+            RowAxis::Tokens => Some(&self.order),
+            RowAxis::Patches => self.patches.as_ref().map(|plan| &plan.order),
+        }
+    }
+
+    /// The fallback answers on this axis, or `None` for an axis this plan does
+    /// not state. The rows' bucket ranges index the axis's OWN ladder.
+    #[must_use]
+    pub fn fallback_for(&self, axis: RowAxis) -> Option<&FallbackTable> {
+        match axis {
+            RowAxis::Tokens => Some(&self.fallback),
+            RowAxis::Patches => self.patches.as_ref().map(|plan| &plan.fallback),
+        }
+    }
+
+    /// The capture regions of one unit, as the half-open range of the record
+    /// script an exec is recorded from.
+    ///
+    /// ONE RANGE AND NOT A LIST, which is exactly what [`crate::unit`]'s
+    /// refusal buys: a unit whose regions were scattered down the script would
+    /// have no such range, and the plan that produced one is refused at the
+    /// bake rather than recorded as several execs of one name.
+    #[must_use]
+    pub fn unit_script(&self, unit: u32) -> Option<core::ops::Range<u32>> {
+        let mut span: Option<core::ops::Range<u32>> = None;
+        for (r, region) in self.regions.iter().enumerate() {
+            if region.phase != Phase::Capture || self.unit_of(r) != unit {
+                continue;
+            }
+            let r = r as u32;
+            span = Some(match span {
+                None => r..r + 1,
+                Some(held) => held.start..r + 1,
+            });
+        }
+        span
     }
 }
 

@@ -46,7 +46,7 @@
 
 use std::path::{Path, PathBuf};
 
-use engine::engine_api::fire::RsReset;
+use engine::fire::RsReset;
 use engine_cuda::{Boot, Lane, Seated, Shell};
 use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
@@ -137,6 +137,7 @@ fn ready(what: &str) -> Option<Shell> {
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(4, 256),
+        patches: None,
         profile: None,
         page_size: PAGE,
         context: CONTEXT,

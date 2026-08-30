@@ -26,7 +26,7 @@
 //!
 //! 1. **The corpus fixture serves, as committed.** `naive-baseline` is the
 //!    shape every algorithm inferlet in `tests/inferlets` is written to — one
-//!    chunked prefill, then a `ptir::run_ahead` decode loop whose epilogue
+//!    chunked prefill, then a `eta::run_ahead` decode loop whose epilogue
 //!    writes the sampled token back into the `embed` channel and its own next
 //!    position, extent, write slot and page CSR beside it — and against a
 //!    shell answering `PortMask::NONE` every one of them died on the first

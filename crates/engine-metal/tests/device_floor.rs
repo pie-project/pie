@@ -195,19 +195,61 @@ fn a_second_sighting_of_a_point_compiles_nothing() {
 }
 
 #[test]
-fn a_jit_stamp_is_refused_by_name() {
+fn a_jit_stamp_mints_the_entrypoint_the_shipped_source_does_not_hold() {
+    let _serial = serialized();
+    let Some(device) = device_or_skip("the stamp path") else {
+        return;
+    };
+    let pipelines = Pipelines::new();
+    // One affine qmm point, composed the way `linear::quant` composes the one
+    // it selects. The shipped source declares `PIE_STAMP_qmm_t` and
+    // instantiates nothing with it, so the entrypoint exists only because the
+    // driver appended the stamp.
+    let point = kernels_metal::linear::quant::qmm_point(
+        "quant.qmm_t",
+        "",
+        "PIE_STAMP_qmm_t",
+        64,
+        4,
+        32,
+        32,
+    )
+    .expect("an axis point");
+    let stamped = Fire::at("linear/quant_qmm_t.metal", point.entry).stamp(point.stamp);
+    assert!(
+        !pipelines
+            .entrypoints(&device, "linear/quant_qmm_t.metal")
+            .expect("the source compiles")
+            .iter()
+            .any(|name| name == point.entry),
+        "`{}` is instantiated in source, and this test is about the one that is not",
+        point.entry
+    );
+    pipelines
+        .warm(&device, stamped)
+        .expect("the stamp mints it");
+}
+
+#[test]
+fn a_stamp_that_mints_no_such_entrypoint_is_refused_by_name() {
     let _serial = serialized();
     let Some(device) = device_or_skip("the stamp refusal") else {
         return;
     };
     let pipelines = Pipelines::new();
-    let stamped = Fire::at("layout/embed.metal", "embed_bfloat16").stamp("<bfloat16, 32, 4>");
+    // A well-formed invocation of the file's own macro, minting a symbol
+    // nobody asked for — so the source compiles and the LOOKUP is what fails.
+    let stamped = Fire::at(
+        "linear/quant_qmm_t.metal",
+        "affine_qmm_t_bfloat16_gs_64_b_4_bm_32_bn_32",
+    )
+    .stamp("PIE_STAMP_qmm_t(\"somebody_elses_symbol\", 64, 4, 32, 32, 32)");
     let fault = pipelines
         .warm(&device, stamped)
-        .expect_err("a stamp this shell has no specialization path for");
+        .expect_err("the stamp mints a name the fire does not ask for");
     let said = fault.to_string();
     assert!(
-        said.contains("jit stamp") && said.contains("<bfloat16, 32, 4>"),
+        said.contains("somebody_elses_symbol"),
         "the refusal names the stamp: {said}"
     );
 }

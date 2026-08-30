@@ -107,6 +107,7 @@ fn owes(trace: &Trace) -> Option<BTreeSet<u32>> {
 }
 
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn no_catalog_text_changes_what_it_owes_when_its_facts_are_renumbered() {
     let mut moved: Vec<String> = Vec::new();
     let (mut compiled, mut with_rows) = (0usize, 0usize);

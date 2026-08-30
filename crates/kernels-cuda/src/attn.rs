@@ -46,8 +46,8 @@ pub mod sched_sm90;
 
 pub mod ssm;
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::attn::fa2_abi::{Buffers, make_decode_params, make_prefill_params};
 use crate::attn::plan::{DecodePlan, PrefillPlan, PrefillPlanSm90};
@@ -86,7 +86,7 @@ const fn per_head_elementwise(rows: u32, heads: u32, head_dim: u32) -> Launch {
 }
 
 /// The head count a row's width spells at a stated head width.
-fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, KernelError> {
+fn row_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the head width this attention states", head_dim)?;
     if width == 0 || width % head_dim != 0 {
         return Err(refuse(
@@ -142,7 +142,7 @@ fn fa2_decode(
     sm_scale: f32,
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     dtype_dispatch!(op, q.dtype, { Bf16 => () });
     attention_lands(op, q, o);
     let window_left = plan::window_left(op, window)?;
@@ -201,7 +201,7 @@ fn fa2_prefill(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
     mask: Option<(Tensor, Tensor)>,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
@@ -214,11 +214,23 @@ fn fa2_prefill(
         stated(op, head_dim)?,
     );
 
-    debug_assert_eq!(
-        q.indptr.rows,
-        plan.shape.num_requests + 1,
-        "the fire's indptr spells the batch this schedule was planned at"
-    );
+    // The fire's indptr spells the batch this schedule was planned at, and
+    // BOTH SIDES ARE DRIVER-BOUND — the ragged boundary vector is one the rule
+    // names, the plan's shape is the engine's, and no op names either — so a
+    // disagreement is refused rather than asserted (the boundary rule at
+    // `refuse`). Asserted, a release build reads `num_requests + 1`
+    // boundaries off a shorter indptr and takes the kv pool's spans from
+    // whatever follows it.
+    if q.indptr.rows.checked_sub(1) != Some(plan.shape.num_requests) {
+        return Err(refuse(
+            op,
+            format!(
+                "the fire's indptr spells {} requests and this schedule was planned at {}",
+                q.indptr.rows.saturating_sub(1),
+                plan.shape.num_requests
+            ),
+        ));
+    }
     let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
     bufs.qo_indptr = q.indptr.ptr;
     if let Some(lse) = &lse {
@@ -264,7 +276,7 @@ pub fn decode(
     head_dim: u32,
     sm_scale: f32,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.decode";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None)
@@ -281,7 +293,7 @@ pub fn decode_lse(
     sm_scale: f32,
     o: &mut Tensor,
     lse: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.decode_lse";
     plan.accepts(OP, head_dim, window)?;
     fa2_decode(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, Some(lse))
@@ -300,7 +312,7 @@ pub fn prefill(
     kv_heads: u32,
     sm_scale: f32,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.prefill";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(ctx, OP, q, plan, pool, window, head_dim, sm_scale, o, None, None)
@@ -318,7 +330,7 @@ pub fn prefill_lse(
     sm_scale: f32,
     o: &mut Tensor,
     lse: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.prefill_lse";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     fa2_prefill(
@@ -375,7 +387,7 @@ pub fn masked(
     head_dim: u32,
     sm_scale: f32,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.masked";
     debug_assert_eq!(mask.dtype, Dtype::U8, "`{OP}` reads packed u8 mask bits");
     // The op states no kv head count; the window must be the one the schedule
@@ -419,8 +431,8 @@ pub fn prefill_sm90(
     _kv_heads: u32,
     _sm_scale: f32,
     _o: &mut Tensor,
-) -> Result<(), KernelError> {
-    Err(KernelError::Unsupported {
+) -> Result<(), Error> {
+    Err(Error::Unsupported {
         op: "attention.prefill_sm90",
     })
 }
@@ -433,7 +445,7 @@ pub fn sink(
     lse: Tensor,
     sink: Tensor,
     head_dim: u32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.sink";
     let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let heads = row_heads(OP, o.width, head_dim)?;
@@ -469,7 +481,7 @@ pub fn merge_lse(
     head_dim: u32,
     o: &mut Tensor,
     lse: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.merge_lse";
 
     const COMBINE_BLOCK_MIN: u32 = 32;
@@ -514,7 +526,7 @@ pub fn merge_lse(
 }
 
 /// `x = cap * tanh(x / cap)`, in place on `x`.
-pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), KernelError> {
+pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
     const OP: &str = "attention.logit_softcap";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     if cap.is_nan() || cap <= 0.0 {
@@ -553,7 +565,7 @@ pub fn kv_append(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.kv_append";
     dtype_dispatch!(OP, k.data.dtype, { Bf16 => () });
     debug_assert!(
@@ -570,7 +582,7 @@ pub fn kv_append_shared(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.kv_append_shared";
     dtype_dispatch!(OP, plane.data.dtype, { Bf16 => () });
     kv::write_kv_to_pages(
@@ -600,7 +612,7 @@ pub fn res_blend(
     eps: f32,
     proj: Tensor,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.res_blend";
 
     /// The device text's `kMaxBlocks`: the softmax scratch bound.

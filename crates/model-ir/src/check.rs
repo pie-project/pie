@@ -368,6 +368,10 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::Decode { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE)],
             Attention::Prefill { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE)],
             Attention::Masked { .. } => &[(In(1), PREFILL_PLAN), (In(3), CACHE)],
+            // The tower's attention pins its indptr and nothing else: q, k, v
+            // and o ride the activation dtype, and `segments` is the patch
+            // axis's own bounds vector, i32 like every other indptr here.
+            Attention::Dense { .. } => &[(In(3), I32)],
             Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
             Attention::Sink { .. } => &[(In(1), F32)],
@@ -444,6 +448,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MlpSwigluClamp { .. }
             | Linear::MlpSwigluClampAlpha { .. }
             | Linear::MlpGegluTanh { .. }
+            | Linear::MlpGeluTanh { .. }
             | Linear::MlpGegluTanhPacked { .. }
             | Linear::MlpSitu { .. }
             | Linear::MoeSigmoidGateAdd { .. } => &[],
@@ -451,6 +456,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
         Operation::Elementwise(op) => match op {
             Elementwise::RopeFull { .. }
             | Elementwise::RopePartial { .. }
+            | Elementwise::RopeMrope { .. }
             | Elementwise::RopeYarn { .. } => &[(In(2), I32)],
             Elementwise::RopePartialQ { .. } | Elementwise::RopePartialLast { .. } => {
                 &[(In(1), I32)]
@@ -465,6 +471,9 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::RmsnormPlusOne { .. }
             | Elementwise::RmsnormPerHeadPlusOne { .. }
             | Elementwise::RmsnormNoScale { .. }
+            | Elementwise::LayernormNoScale { .. }
+            | Elementwise::Clamp { .. }
+            | Elementwise::ClampLearned { .. }
             | Elementwise::RmsnormGated { .. }
             | Elementwise::RmsnormGatedBy { .. }
             | Elementwise::ResidualAdd { .. }
@@ -478,10 +487,28 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
         },
         Operation::Layout(op) => match op {
             Layout::Embed { .. } => &[(In(0), I32)],
+            // The interpolating gather pins BOTH its geometry ports: the taps
+            // are i32 like every index vector here, and the weights are f32
+            // because they are the preprocessor's arithmetic and not the
+            // activation's — a weight quantised to the model element would
+            // move the resample by more than the gather it feeds.
+            Layout::EmbedWeighted { .. } => &[(In(0), I32), (In(1), F32)],
+            // The scatter's route vector, at In(1) behind the tower rows it
+            // places: one destination TOKEN row per source row, i32 like
+            // every other index vector this IR names.
+            // The dropping twin pins the same port for the same reason;
+            // what differs is which VALUES it admits, which is a host-side
+            // check and not a dtype (multimodal §8.6).
+            Layout::ScatterRows { .. } | Layout::ScatterLiveRows { .. } => &[(In(1), I32)],
+            // The pool pins nothing: it folds rows of the activation dtype
+            // into fewer rows of the same one, and its `side` is a stated
+            // number rather than an operand.
             Layout::SplitQkv { .. }
             | Layout::SplitQGate { .. }
             | Layout::SplitRows { .. }
-            | Layout::Select { .. } => &[],
+            | Layout::Select { .. }
+            | Layout::PoolRows { .. }
+            | Layout::MergeRows { .. } => &[],
         },
         Operation::CustomCuda(op) => match op {
             CustomCuda::QkvFusedQknormRopeVnormWrite { .. } => {
@@ -523,7 +550,11 @@ impl Display for N {
             Dtype::Bf16 => "bf16", Dtype::F16 => "f16", Dtype::F32 => "f32",
             Dtype::I32 => "i32", Dtype::U32 => "u32", Dtype::U8 => "u8",
             Dtype::I8 => "i8", Dtype::Fp8E4m3 => "fp8e4m3", Dtype::Fp4 => "fp4",
-            Dtype::Mxfp4 => "mxfp4", Dtype::E8m0 => "e8m0",
+            Dtype::Mxfp4 => "mxfp4", Dtype::MlxU4 => "mlxu4",
+            Dtype::MlxU8 => "mlxu8",
+            Dtype::E8m0 => "e8m0",
+            Dtype::Fp8E5m2 => "fp8e5m2", Dtype::I64 => "i64", Dtype::I16 => "i16",
+            Dtype::U64 => "u64", Dtype::U16 => "u16", Dtype::Bool => "bool",
         })
     }
 }
@@ -557,6 +588,9 @@ impl Display for D {
             Dim::TokensTimes(k) => write!(f, "tokens*{k}"),
             Dim::Lanes => f.write_str("lanes"),
             Dim::LanesPlus(k) => write!(f, "lanes+{k}"),
+            Dim::Patches => f.write_str("patches"),
+            Dim::Images => f.write_str("images"),
+            Dim::ImagesPlus(k) => write!(f, "images+{k}"),
         }
     }
 }

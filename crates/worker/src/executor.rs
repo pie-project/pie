@@ -8,7 +8,7 @@
 //! blob-fetch budget, an inline KV push that `cudaMemcpy`'d pages out of the
 //! local pool, a NIXL registration path, and a FIFO engine actor that
 //! translated `RemoteLaunch` back into a `FrameSubmission`. Every message
-//! type it named lived in `engine_api::remote`, and the palo contract rewrite
+//! type it named lived in `engine::remote`, and the palo contract rewrite
 //! deleted that module whole (design §7, decision 19):
 //!
 //! > Remote is a property, not an encoding: every noun serde, trait
@@ -24,14 +24,14 @@
 //!
 //! * **the hello** — a wire version (on the transport, not on the contract),
 //!   the peer's [`ModelIdentity`], its
-//!   [`Capabilities`](engine_api::Capabilities), its
-//!   [`KvLayout`](engine_api::KvLayout), and the scratch grant (base page +
+//!   [`Capabilities`](engine::Capabilities), its
+//!   [`KvLayout`](engine::KvLayout), and the scratch grant (base page +
 //!   count) the caller may address inside the peer's pool.
 //! * **the verbs** — `register_program`, `register_channel`, `bind_instance`,
 //!   `fire`, `copy_kv`, `encode`, `close_*`. All seven take serde nouns now,
 //!   so the message set is the trait; what the envelope adds is id mapping
 //!   (the peer mints program/channel/instance ids), a frame-size ceiling, and
-//!   an asynchronous [`FireTicket`](engine_api::FireTicket) path.
+//!   an asynchronous [`FireTicket`](engine::FireTicket) path.
 //! * **the transfer** — inline bytes or an RDMA handle, and a way to say
 //!   which was used.
 //!
@@ -49,9 +49,9 @@ use crate::translate::ModelEngines;
 
 /// Which half of a model a load carries.
 ///
-/// **WORKER VOCABULARY NOW.** It was `engine_api::ModelComponent`, and the
+/// **WORKER VOCABULARY NOW.** It was `engine::ModelComponent`, and the
 /// contract dropped it because it says WHICH GRAPH to load by enum, and that
-/// is now which `Trace` you hand over (`engine-api::load`'s header: "the
+/// is now which `Trace` you hand over (`engine::load`'s header: "the
 /// encoder is a traced plan like any other"). What it still means here is
 /// which of a deployment's two loads a worker is: a decode worker's full
 /// model, or an encode partner's encoder.
@@ -131,7 +131,7 @@ impl ExecutorServer {
         let _ = (engines, model, max_clients, transfer);
         Err(anyhow!(
             "this build cannot serve the executor role at {addr}: the remote \
-             envelope `engine_api::remote` carried was deleted by the palo \
+             envelope `engine::remote` carried was deleted by the palo \
              contract rewrite and its successor is palo B-remote. Boot this \
              worker in the standalone role."
         ))

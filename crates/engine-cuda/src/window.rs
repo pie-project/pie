@@ -97,7 +97,7 @@
 //! schedule is carved for one window, and a consumer standing over the union
 //! of two runs must read a schedule carved over that union — so the prepare
 //! region that builds it is copied whenever its readers are, even though P4
-//! owes it no row of its own (`engine::fire::fallback::copies` argues why the
+//! owes it no row of its own (`model_exec::fire::fallback::copies` argues why the
 //! question is asked of the MASK). The two masks being equal is checked at
 //! load, by name, in [`no_schedule_straddles_its_readers`].
 //!
@@ -136,10 +136,10 @@
 use std::cell::Cell;
 
 use crate::device::graph::Event;
-use engine::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
-use engine::store::check::{self, rebase};
 use kernels_cuda::Tensor;
 use model_compiler::{CompiledModel, Lowering, Phase, Region};
+use model_exec::fire::{EventId, MaskSpan, Sink, WindowTable, fallback};
+use model_exec::store::check::{self, rebase};
 use model_ir::{Def, Dim, Dtype, GeomKind, Operands, Operation, RuntimeInput, Trace, Ty};
 
 use crate::error::{Fault, Result};
@@ -188,7 +188,7 @@ pub struct Window {
     /// `Tensor::new(0, 0, 0, ..)` for a window with no segments.
     pub segments: Tensor,
     /// The artifact's load-time bound on the segment count
-    /// (`engine::fire::max_runs`), carried here because it is what sizes the
+    /// (`model_exec::fire::max_runs`), carried here because it is what sizes the
     /// grid's segment axis and the fire is not allowed to size it
     /// (decision #15).
     pub segment_cap: u32,
@@ -196,6 +196,18 @@ pub struct Window {
     /// — the runs it compacts, and everything a consumer needs to read them
     /// as one.
     pub gathered: Option<Gathered>,
+    /// **THE SAME MASK'S INTERVAL ON THE SECOND ROW AXIS** — patch rows where
+    /// [`span`](Window::span) has token rows, and IMAGES where it has lanes
+    /// (multimodal §5.1).
+    ///
+    /// A REGION HAS BOTH, AND WHICH ONE A VALUE IS CUT AT IS READ OFF ITS
+    /// LEADING `Dim`. A tower region's `span` IS this — its rows are the row
+    /// count its kernels launch over — but the embed merge is a TOKEN region
+    /// that reads a patch rectangle, so a shell that carried only one pair
+    /// would have to hand that node the token interval of a patch column.
+    /// Zero for every fire of every artifact with no patch axis, which is the
+    /// same zero window a class no lane is in has.
+    pub patch: MaskSpan,
 }
 
 
@@ -363,7 +375,7 @@ pub struct Windows {
 /// Struct operands are exempt by construction: a plan payload is host state
 /// resolved through `Run::slot`, and its own window is the region that BUILT
 /// it — which is copied whenever this one is, for the reason
-/// `engine::fire::fallback::copies` states.
+/// `model_exec::fire::fallback::copies` states.
 fn copyable(trace: &Trace, region: &Region) -> bool {
     let mut operands: Vec<model_ir::ValueId> = Vec::new();
     for node in region.nodes.clone() {
@@ -435,6 +447,16 @@ fn copyable(trace: &Trace, region: &Region) -> bool {
                     // Window-free: handed over whole, gathered or not.
                     Some(Dim::Const(_)) | None => true,
                     Some(Dim::Lanes | Dim::LanesPlus(_)) => false,
+                    // The second row axis, excluded for `TokensTimes`' reason
+                    // and not for a weaker one: `Gathered::rows_host` is a map
+                    // of TOKEN rows, and a patch column's rows are a different
+                    // row space entirely (multimodal §5.1 — patches and tokens
+                    // do not break at the same places). Copying one under a
+                    // token map would move the wrong bytes, so a region that
+                    // reads a patch rectangle does not copy. A patch-axis
+                    // fallback needs a gather map of its own, which is what
+                    // the second seriation brings.
+                    Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
                 },
             },
         }
@@ -458,6 +480,7 @@ impl Windows {
         trace: &Trace,
         compiled: &CompiledModel,
         classes: &WindowTable,
+        patches: &WindowTable,
         indptr_host: &[i32],
         copies: Copies<'_>,
     ) -> Result<Windows> {
@@ -471,9 +494,49 @@ impl Windows {
         let segment_cap = fallback::max_runs(compiled);
 
         for (at, region) in compiled.template().iter().enumerate() {
-            classes.spans_into(&region.mask, &mut spans);
+            // **WHICH TABLE THIS REGION'S OWN ROWS COME OUT OF** is its
+            // capture unit's axis, exactly as the walk reads it — the two
+            // have to agree about the run count or the walk's launch loop and
+            // this table's window list are cut at different places.
+            let axis = compiled
+                .units
+                .get(compiled.unit_of(at) as usize)
+                .copied()
+                .unwrap_or(model_ir::RowAxis::PRIMARY);
+            match axis {
+                model_ir::RowAxis::Tokens => classes.spans_into(&region.mask, &mut spans),
+                model_ir::RowAxis::Patches => patches.spans_into(&region.mask, &mut spans),
+            }
+            // And the OTHER axis's interval, which a token region needs
+            // because the embed merge reads a patch rectangle from inside
+            // one. A patch window this fire found in pieces has no single
+            // rectangle for such a node to read, and that is refused here
+            // rather than resolved to the first piece.
+            let patch = match patches.span(&region.mask) {
+                Ok(span) => span.unwrap_or_default(),
+                Err(runs) => {
+                    return Err(Fault::Fragmented {
+                        region: at as u32,
+                        runs,
+                        promised: None,
+                    });
+                }
+            };
             let mut segments_host: Vec<i32> = Vec::new();
-            if spans.len() > 1 {
+            // **P4'S MENU IS THE TOKEN AXIS'S MENU, AND IT IS NOT CONSULTED
+            // OVER HERE.** `fallback::promised`, `::grouped` and `::copies`
+            // all read `CompiledModel::fallback`, which is the row order of
+            // the TOKEN seriation; the patch axis carries its own table
+            // (`fallback_for(RowAxis::Patches)`), indexed into its own ladder.
+            // Asking the token table about a patch region would be judging
+            // one seriation's promise against the other's answers. So a patch
+            // window this fire finds in pieces takes the plain split — one
+            // window per interval, which is what the walk's launch loop turns
+            // for either axis — and neither the grouped arm nor the copy arm
+            // is offered, because the shell has no patch-axis gather map and
+            // says so by name in `copyable`.
+            let menu = axis == model_ir::RowAxis::Tokens;
+            if menu && spans.len() > 1 {
                 // The two integrity questions, asked of the artifact
                 // rather than of the fire. Did P4 PROMISE this window
                 // consecutive — a capture region it seated and wrote no
@@ -496,7 +559,7 @@ impl Windows {
                 // `r` intervals, carrying the intervals themselves so the
                 // kernel can skip the foreign rows between them. The walk
                 // reads the same row of the same table
-                // (`engine::fire::fallback::grouped`) and turns its launch
+                // (`model_exec::fire::fallback::grouped`) and turns its launch
                 // loop once, so the two cannot disagree about how many runs
                 // this region has — which is what `at`'s panic would
                 // otherwise be for.
@@ -523,12 +586,14 @@ impl Windows {
             // copy, whose operands the copy can re-point, becomes ONE window
             // over the compacted rectangle — and the region then costs one
             // launch, which is the whole point.
-            if spans.len() > 1
+            if menu
+                && spans.len() > 1
                 && copies.enabled
                 && fallback::copies(compiled, &region.mask, copies.bucket)
                 && copyable(trace, region)
             {
-                let gathered = gather_of(&spans, indptr_host, copies.spaces);
+                let mut gathered = gather_of(&spans, indptr_host, copies.spaces);
+                gathered.patch = patch;
                 of_region.push((runs.len() as u32, 1));
                 runs.push(seat(&mut windows, gathered));
                 continue;
@@ -538,12 +603,26 @@ impl Windows {
             for &span in &spans {
                 let window = Window {
                     span,
-                    indptr_host: rebase(indptr_host, span),
+                    // **A PATCH REGION HAS NO REBASED QO BOUNDARIES**, and
+                    // that is a statement rather than an omission: this vector
+                    // is the TOKEN rectangle's per-lane bounds, and `span` for
+                    // a tower region indexes images. Slicing one by the other
+                    // would produce a vector that is the right shape and about
+                    // the wrong thing. The patch axis's bounds vector is
+                    // `RuntimeInput::PatchSegments` — it arrives in the
+                    // submission, cut at this window by `Run::cut`, and no op
+                    // on that axis asks a window for one.
+                    indptr_host: if menu {
+                        rebase(indptr_host, span)
+                    } else {
+                        Vec::new()
+                    },
                     indptr: Tensor::new(0, 0, 1, Dtype::I32),
                     gathered: None,
                     segments_host: segments_host.clone(),
                     segments: Tensor::new(0, 0, 2, Dtype::I32),
                     segment_cap,
+                    patch,
                 };
                 runs.push(seat(&mut windows, window));
             }
@@ -628,7 +707,7 @@ impl Windows {
     /// How many launches a region costs in this fire — `1` for a window P4
     /// seated, `r` for one it could not, and `1` for an empty window.
     ///
-    /// THE SAME NUMBER `engine::fire::walk` LOOPS ON, and it is the same
+    /// THE SAME NUMBER `model_exec::fire::walk` LOOPS ON, and it is the same
     /// number because both read it off the same class table: the walk asks
     /// `WindowTable::spans_into` and this asked it once per region when the
     /// table was built. A disagreement would show up as
@@ -641,7 +720,7 @@ impl Windows {
     /// How many launches this fire's walk makes over the whole template.
     ///
     /// **THE NUMBER A COPY EXISTS TO LOWER, AND THE ONLY ONE A CALLER CAN SEE
-    /// FROM OUTSIDE.** `engine::fire::walk` loops `Windows::runs(region)`
+    /// FROM OUTSIDE.** `model_exec::fire::walk` loops `Windows::runs(region)`
     /// times per region — the same table, read the same way — so this is that
     /// loop's total, known before a single kernel is enqueued. A fire whose
     /// windows P4 all seated answers one per region; a split adds `r - 1` per
@@ -711,7 +790,7 @@ impl Windows {
 /// be built over more classes than the node consuming it runs in.
 ///
 /// The whole argument, and the walk that carries it out, is
-/// [`engine::store::check::no_schedule_straddles_its_readers`] — neutral IR
+/// [`model_exec::store::check::no_schedule_straddles_its_readers`] — neutral IR
 /// reasoning over a `Trace` and a `CompiledModel`, which is what it always
 /// was, written once now instead of twice. This is the shell's door onto it:
 /// same signature, this shell's [`Fault`].
@@ -728,7 +807,7 @@ pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel
 ///
 /// The sibling of [`no_schedule_straddles_its_readers`], and it guards the one
 /// asymmetry between this shell's two ways out of a split. `Fallback::Copy` is
-/// resolved per MASK (`engine::fire::fallback::copies`) precisely so a prepare
+/// resolved per MASK (`model_exec::fire::fallback::copies`) precisely so a prepare
 /// builder inherits its readers' answer: P4 offers only capture regions to its
 /// C1P instance, so a builder standing over the same window is owed no row of
 /// its own, and one that split while its reader gathered would hand the single
@@ -899,6 +978,10 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], spaces: &[Geometry]) -> Win
             rows_host,
             spaces: gathered_spaces,
         }),
+        // The caller fills this from the patch table: `gather_of` compacts a
+        // TOKEN rectangle and knows nothing about the second axis (a patch
+        // column is not copyable at all — `copyable` says so by name).
+        patch: MaskSpan::default(),
     }
 }
 
@@ -953,6 +1036,45 @@ pub struct Lanes<'a> {
     pub at: &'a Cell<u32>,
 }
 
+/// **THE SENTINEL `Lanes::at` CARRIES WHILE A CONDITIONAL BODY IS OPEN.**
+///
+/// A stream index, like every other value in that cell, and deliberately one
+/// no artifact can name: `model_compiler::stream` numbers streams from zero
+/// upward and a plan that asked for four billion of them would have been
+/// refused at load. What reads it is [`Run::ctx`](crate::run::Run) — the same
+/// lookup that picks a side stream — so a body's launches land on the stream
+/// its capture was begun on without a second mechanism.
+pub const BODY: u32 = u32::MAX;
+
+/// What a [`Cursor`] needs to put a conditional node in the graph it is
+/// recording (palo design §4).
+///
+/// **HANDED IN, NEVER OWNED**, exactly as [`Lanes`] is: the streams and the
+/// context are the load's, the windows are this fire's, and the cell is the
+/// one the [`Run`](crate::run::Run) already reads. A cursor without this
+/// bundle is a cursor that still refuses a conditional by name — which is what
+/// a shell whose artifact holds none never has to build.
+#[derive(Clone, Copy)]
+pub struct Conditionals<'a> {
+    /// The stream the parent capture is on: where the handle is minted, the
+    /// setter is launched and the node is placed.
+    pub main: *mut core::ffi::c_void,
+    /// The stream a body is captured on — opened at load by
+    /// `Context::open_conditional`, and never enqueued on outside a
+    /// `cuStreamBeginCaptureToGraph`.
+    pub body: *mut core::ffi::c_void,
+    /// The kernel context on [`main`](Conditionals::main), which is where the
+    /// device-side setter's one launch goes.
+    pub setter: &'a kernels_cuda::Ctx,
+    /// This fire's windows: the setter reads a region's row count out of the
+    /// staged boundary vector this table addresses.
+    pub windows: &'a Windows,
+    /// Which stream the walk is on — the same cell [`Lanes::at`] carries, so
+    /// that a load with side streams and a load without one both have exactly
+    /// one of them.
+    pub at: &'a Cell<u32>,
+}
+
 /// This shell's [`Sink`]: the region counter a [`Run`](crate::run::Run) reads
 /// its window out of, and — when the artifact forked — the stream switch and
 /// the event points.
@@ -967,19 +1089,18 @@ pub struct Lanes<'a> {
 /// **[`Cursor::across`] IS THE RECORDING ONE, AND IT IS THE ONLY PLACE A
 /// STREAM SWITCH HAPPENS.** A cursor built with [`Cursor::new`] leaves the
 /// stream cell at zero forever, which is what makes the eager pass the
-/// SERIALIZATION of P6's DAG (`engine::fire::EagerSink`'s doc argues why that
+/// SERIALIZATION of P6's DAG (`model_exec::fire::EagerSink`'s doc argues why that
 /// is correct rather than merely safe). A cursor built with `across` writes
 /// each region's stream into the cell, waits the events the region waits on
 /// and records the ones it records — the fork/join pattern
 /// `.wiki/tart/evidence/green_contexts.md` Finding 3 measured, in the order
-/// `engine::fire::walk` emits it.
+/// `model_exec::fire::walk` emits it.
 ///
 /// A device call inside a `Sink` method has nowhere to return an error to, so
 /// the first one is kept and [`Cursor::settle`] is where the caller asks. That
 /// is not a swallowed error: a failed `cudaEventRecord` leaves the capture in
 /// a state the caller must not instantiate, and the caller is the code that
 /// knows it.
-#[derive(Debug)]
 pub struct Cursor<'a> {
     at: u32,
     place: &'a At,
@@ -994,7 +1115,30 @@ pub struct Cursor<'a> {
     /// modes is the difference between ignoring a conditional (correct) and
     /// recording its body unconditionally (silently wrong).
     recording: bool,
+    /// The conditional machinery, when this load opened any — see
+    /// [`Conditionals`]. `None` is a cursor that refuses a conditional region
+    /// by name, which is what every load whose artifact holds none gets.
+    cond: Option<Conditionals<'a>>,
+    /// The bracket currently open, and the stream to put the walk back on when
+    /// it closes. `Some` only between [`cond_begin`](Sink::cond_begin) and
+    /// [`cond_end`](Sink::cond_end).
+    open: Option<(crate::device::conditional::Conditional, u32)>,
     fault: Option<Fault>,
+}
+
+/// **BY HAND BECAUSE ONE FIELD IS A KERNEL CONTEXT**, which is a stream and
+/// three opaque handles and derives nothing. What a reader wants from a cursor
+/// is where it stands and what it is doing, and that is all four of these.
+impl core::fmt::Debug for Cursor<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Cursor")
+            .field("at", &self.at)
+            .field("recording", &self.recording)
+            .field("conditionals", &self.cond.is_some())
+            .field("open", &self.open.is_some())
+            .field("fault", &self.fault)
+            .finish()
+    }
 }
 
 impl<'a> Cursor<'a> {
@@ -1008,6 +1152,8 @@ impl<'a> Cursor<'a> {
             place,
             lanes: None,
             recording: false,
+            cond: None,
+            open: None,
             fault: None,
         }
     }
@@ -1036,7 +1182,26 @@ impl<'a> Cursor<'a> {
             place,
             lanes: Some(lanes),
             recording: false,
+            cond: None,
+            open: None,
             fault: None,
+        }
+    }
+
+    /// The same cursor, told where to put a conditional node.
+    ///
+    /// **ADDITIVE, AND ONLY A RECORDING WALK IS GIVEN IT.** An eager pass
+    /// ignores the bracket and is right to (design §4 — the walk's zero-row
+    /// rule decides what the conditional decides, at the same instant), so
+    /// handing it this bundle would be minting a graph handle on a stream that
+    /// is not capturing. A recording walk that is NOT given it is the shell
+    /// this campaign started with, and it still answers
+    /// [`Fault::Unlowered`].
+    #[must_use]
+    pub fn conditionals(self, cond: Conditionals<'a>) -> Cursor<'a> {
+        Cursor {
+            cond: Some(cond),
+            ..self
         }
     }
 
@@ -1048,7 +1213,13 @@ impl<'a> Cursor<'a> {
     /// or [`Fault::Unbound`] for a template naming a stream or an event this
     /// load never opened — which is a `CompiledModel` and a `Context` that were not
     /// set up from each other.
-    pub fn settle(self) -> Result<()> {
+    pub fn settle(mut self) -> Result<()> {
+        // **A BRACKET LEFT OPEN IS CLOSED HERE AND NOT LEFT TO THE DROP.** The
+        // walk returns early on a plan that names a node the trace lacks, and
+        // that path runs no `cond_end`; a body stream left mid-capture answers
+        // every later call with `cudaErrorStreamCaptureUnjoined` for the rest
+        // of the process, which would turn one bad artifact into a dead shell.
+        self.cond_end();
         match self.fault {
             Some(fault) => Err(fault),
             None => Ok(()),
@@ -1115,8 +1286,16 @@ impl Sink for Cursor<'_> {
         // The stream switch, and it is the whole of it: everything the `Run`
         // resolves afterwards fires on whatever this names, until the next
         // region says otherwise.
+        //
+        // **THE SAME CELL UNDER BOTH BUNDLES, AND ONLY ONE WRITE.** A load
+        // that opened side streams carries it on [`Lanes`] and one that only
+        // opened a conditional body carries it on [`Conditionals`]; they are
+        // the same `Cell` when both are present, so writing through whichever
+        // is there writes the one the `Run` reads.
         if let Some(lanes) = self.lanes {
             lanes.at.set(region.stream);
+        } else if let Some(cond) = self.cond {
+            cond.at.set(region.stream);
         }
     }
     fn region_end(&mut self, _region: &Region) {}
@@ -1131,32 +1310,143 @@ impl Sink for Cursor<'_> {
         self.place.run.set(run);
     }
 
-    /// **THE EAGER CURSOR IGNORES IT AND THE RECORDING ONE REFUSES IT.**
+    /// **THE EAGER CURSOR IGNORES IT AND THE RECORDING ONE RECORDS A NODE.**
     ///
     /// Ignoring is correct for an eager pass and it is not a shortcut: the
     /// walk's zero-row rule decides exactly what a conditional decides, at the
     /// same instant, so a fire that walks a conditional region eagerly runs
     /// the same nodes over the same rows (design §4 — conditionals are the
     /// optimization, zero-row always-launch is the semantics). That is what
-    /// `engine::fire::EagerSink` says too, and why the two agree.
+    /// `model_exec::fire::EagerSink` says too, and why the two agree.
     ///
     /// A CAPTURE CANNOT IGNORE IT. The graph outlives the fire that recorded
     /// it, so a body recorded outside its conditional node is a body that runs
     /// under every composition the exec is replayed for — and it would
-    /// compute. So the recording cursor answers [`Fault::Unlowered`], which
-    /// names the region and says what is missing; see that variant for the two
-    /// things this shell would need, neither of which is the cudarc binding.
+    /// compute. So the recording cursor places a real
+    /// `CU_GRAPH_NODE_TYPE_CONDITIONAL` node and captures the region's
+    /// launches into its child graph
+    /// ([`crate::device::conditional`] holds the four driver calls), with the
+    /// predicate stored by a KERNEL reading this region's row count off the
+    /// device — `kernels_cuda::graph::set_conditional`, which is design §5's
+    /// "the kernel reads the count" and the reason the decision is inside the
+    /// graph rather than beside it.
+    ///
+    /// # What a region in PIECES gets, and why it is the safe direction
+    ///
+    /// A region P4 could not seat runs once per interval of its class set, so
+    /// there is no single row count to read and one node stands over all of
+    /// them. Such a region takes its body unconditionally — a null table with
+    /// `absent` set, which the setter stores as 1 — and that is the
+    /// conservative half of decision #3: always-launch is the correctness
+    /// mechanism, and a conditional that declines to decide has given up an
+    /// optimization and nothing else. The per-run zero-row skips inside the
+    /// body are untouched.
+    ///
+    /// # A shell with no conditional machinery still refuses by name
+    ///
+    /// A load whose artifact holds no conditional never opens a body stream,
+    /// so a cursor here with no [`Conditionals`] is a shell being asked for
+    /// something it was not set up for — and [`Fault::Unlowered`] is still the
+    /// answer, now naming a load rather than a toolkit.
     fn cond_begin(&mut self, lowering: &Lowering) {
         if !self.recording || self.fault.is_some() {
             return;
         }
-        self.fault = Some(Fault::Unlowered {
-            region: self.at.saturating_sub(1),
-            lowering: format!("{lowering:?}"),
-        });
+        let region = self.at.saturating_sub(1);
+        let unlowered = |why: &Lowering| Fault::Unlowered {
+            region,
+            lowering: format!("{why:?}"),
+        };
+        // **SWITCH IS NOT BUILT AND SAYS SO.** An `IF` is one body behind one
+        // handle; a SWITCH is `arms` bodies behind one, and the arms are
+        // separate REGIONS the walk announces one after another — so the
+        // bracket would have to stay open across `region_begin`, which is a
+        // second piece of state this sink does not carry. P3 only ever groups
+        // one when `max_lanes == 1`, and no row of the catalog is baked at a
+        // one-lane budget.
+        if !matches!(lowering, Lowering::If) {
+            self.fault = Some(unlowered(lowering));
+            return;
+        }
+        let Some(cond) = self.cond else {
+            self.fault = Some(unlowered(lowering));
+            return;
+        };
+        let outcome = (|| {
+            let handle = crate::device::conditional::handle(cond.main)?;
+            // The predicate, and the one launch of this whole sequence. A
+            // region with exactly one run hands its staged boundary vector and
+            // the setter reads `indptr[lanes]`; anything else hands nothing and
+            // states that an absent table means "take it".
+            let (indptr, lanes, absent) = match cond.windows.runs(region) {
+                // **AND THE VECTOR HAS TO BE THERE, NOT JUST THE WINDOW.** A
+                // region on the PATCH axis carries no rebased qo boundaries at
+                // all — `indptr_host` is empty by construction, because that
+                // vector is the token rectangle's per-lane bounds and a tower
+                // region's span indexes images — and its staged `Tensor` is a
+                // zero-length seat whose address is the NEXT window's first
+                // int. Reading a count out of it would be reading somebody
+                // else's, so an empty vector is a table this region does not
+                // have and takes the `absent` arm with the pointer nulled.
+                1 if !cond.windows.at(region, 0).indptr_host.is_empty() => {
+                    let window = cond.windows.at(region, 0);
+                    let lanes = window.indptr_host.len().saturating_sub(1) as u32;
+                    (window.indptr.ptr, lanes, false)
+                }
+                _ => (0, 0, true),
+            };
+            kernels_cuda::graph::set_conditional(
+                cond.setter,
+                handle,
+                indptr,
+                lanes,
+                absent,
+                kernels_cuda::graph::Arm::Set,
+            )
+            .map_err(|why| Fault::Unbound {
+                what: format!("the conditional setter for region {region}, which answered {why}"),
+            })?;
+            let open = crate::device::conditional::open(cond.main, handle)?;
+            crate::device::conditional::begin_body(cond.body, open.body)?;
+            Ok(open)
+        })();
+        match outcome {
+            Ok(open) => {
+                self.open = Some((open, cond.at.get()));
+                cond.at.set(BODY);
+            }
+            Err(fault) => self.fault = Some(fault),
+        }
     }
+
+    /// One arm of a SWITCH — never reached, because
+    /// [`cond_begin`](Sink::cond_begin) refuses the lowering that produces
+    /// them before the walk gets here.
     fn cond_arm(&mut self, _arm: u8) {}
-    fn cond_end(&mut self) {}
+
+    /// Close the body and put the walk back on the stream the region named.
+    ///
+    /// **THE BODY IS CLOSED EVEN WHEN THE WALK FAULTED INSIDE IT**, for the
+    /// reason `Graph::capture` ends the parent capture on every path: a stream
+    /// left mid-capture answers every later call with
+    /// `cudaErrorStreamCaptureUnjoined` for the rest of the process. The first
+    /// fault still wins — a close that also fails is a second sentence about
+    /// the same failure.
+    fn cond_end(&mut self) {
+        let Some((_, was)) = self.open.take() else {
+            return;
+        };
+        let Some(cond) = self.cond else {
+            return;
+        };
+        let closed = crate::device::conditional::end_body(cond.body);
+        cond.at.set(was);
+        if let Err(fault) = closed {
+            if self.fault.is_none() {
+                self.fault = Some(fault);
+            }
+        }
+    }
     fn fork(&mut self, event: EventId) {
         self.event(event, true);
     }
@@ -1168,7 +1458,7 @@ impl Sink for Cursor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::fire::{ClassWindow, WindowTable};
+    use model_exec::fire::{ClassWindow, WindowTable};
     use model_ir::ClassSet;
 
     /// The design's own diagram: 10 prefill rows over 2 lanes, then 3 decode
@@ -1207,8 +1497,13 @@ mod tests {
         }
     }
 
+    /// A recording cursor with no [`Conditionals`] is a load whose context
+    /// opened no body stream — which is every artifact P3 declined — and it
+    /// still refuses by name rather than recording the body bare. The arm that
+    /// RECORDS needs a capturing stream and a device, so it lives in
+    /// `tests/conditional_nodes.rs` and `tests/conditional_lowering.rs`.
     #[test]
-    fn an_eager_cursor_ignores_a_conditional_and_a_recording_one_refuses_it() {
+    fn a_recording_cursor_with_nowhere_to_put_a_conditional_still_refuses_it() {
         let cell = At::new();
         let mut eager = Cursor::new(&cell);
         let region = conditional();
@@ -1229,7 +1524,7 @@ mod tests {
             .settle()
             .expect_err("a capture may not record a body outside its node");
         assert!(matches!(fault, Fault::Unlowered { region: 0, .. }), "{fault}");
-        assert!(fault.to_string().contains("conditional nodes"));
+        assert!(fault.to_string().contains("nowhere"), "{fault}");
     }
 
     #[test]

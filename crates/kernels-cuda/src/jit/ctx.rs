@@ -5,7 +5,7 @@
 
 use core::ffi::c_void;
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::jit::{ArgValue, refuse};
 
@@ -126,7 +126,7 @@ pub struct Slabs(u32);
 
 impl Slabs {
     /// **THE ARENA A BARE [`Ctx::on`] FIRES AGAINST.** Shared by everything
-    /// that never asked for one of its own — the model-loader's transform
+    /// that never asked for one of its own — the checkpoint's transform
     /// executor, benches, a test that wants a stream and nothing else — and
     /// still per stream inside, so sharing it is not sharing a slab.
     pub const PROCESS: Slabs = Slabs(0);
@@ -266,7 +266,7 @@ impl Ctx {
         self.stream
     }
 
-    pub fn cublas(&self, op: &'static str) -> Result<*mut c_void, KernelError> {
+    pub fn cublas(&self, op: &'static str) -> Result<*mut c_void, Error> {
         if self.cublas.is_null() {
             return Err(refuse(op, "this context carries no cuBLAS handle"));
         }
@@ -276,7 +276,7 @@ impl Ctx {
     /// The NCCL communicator a tensor-parallel run carries. Absent on a
     /// single-rank context — a collective fired there is a typed refusal,
     /// not a hang.
-    pub fn comm(&self, op: &'static str) -> Result<*mut c_void, KernelError> {
+    pub fn comm(&self, op: &'static str) -> Result<*mut c_void, Error> {
         if self.comm.is_null() {
             return Err(refuse(op, "this context carries no communicator"));
         }
@@ -302,7 +302,7 @@ impl Ctx {
     /// been told about. This plane's side: the cheap runtime guard in
     /// `device::take` — if this context's stream is mid-capture
     /// (`cudaStreamIsCapturing`) and the slab would have to grow, the fire
-    /// comes back as a [`KernelError::Backend`] refusal naming the
+    /// comes back as a [`Error::Backend`] refusal naming the
     /// un-warmed slab instead of corrupting the capture.
     ///
     /// **AND WHAT NEITHER SIDE CAN PROMISE**: that no LATER fire grows a name
@@ -317,7 +317,7 @@ impl Ctx {
         op: &'static str,
         name: &'static str,
         bytes: usize,
-    ) -> Result<*mut c_void, KernelError> {
+    ) -> Result<*mut c_void, Error> {
         #[cfg(feature = "_cuda")]
         {
             crate::jit::device::take(self.slabs.0, self.stream, name, bytes)
@@ -467,7 +467,7 @@ impl Ctx {
 
     /// Enqueue one launch. `Ok` means the launch is on the stream, not that
     /// it ran; every failure comes back attributed to `op`.
-    pub fn fire(&self, op: &'static str, fire: Fire, args: &[ArgValue]) -> Result<(), KernelError> {
+    pub fn fire(&self, op: &'static str, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         let Some(root) = crate::jit::Root::of(fire.file) else {
             return Err(refuse(
                 op,
@@ -488,7 +488,7 @@ impl Ctx {
         instantiation: &'static str,
         launch: Launch,
         args: &[ArgValue],
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), Error> {
         let resolved = match crate::jit::cache::resolve(root, instantiation) {
             Ok(resolved) => resolved,
             Err(why) => return Err(said(root.name, instantiation, why).at(op)),
@@ -514,7 +514,7 @@ impl Ctx {
         _instantiation: &'static str,
         _launch: Launch,
         _args: &[ArgValue],
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), Error> {
         Err(crate::jit::runtimeless(op))
     }
 }

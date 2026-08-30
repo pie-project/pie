@@ -19,8 +19,8 @@
 
 use std::path::Path;
 
-use model_loader::checkpoint::zt::{parse_checkpoint, verify_checkpoint};
-use model_loader::types::{DType, Encoding};
+use checkpoint::file::zt;
+use checkpoint::types::{DType, Encoding};
 
 /// A dense llama-shaped snapshot: `config.json` plus one real safetensors
 /// file of zeroed `dtype` weights.
@@ -150,6 +150,7 @@ fn import_streams_a_fully_decoded_model_through_the_spool() {
 
     pie::ops::model::import::run(pie::ops::model::import::ImportArgs {
         source: staging.path().to_string_lossy().into_owned(),
+        aux: None,
         out: Some(artifact.clone()),
         dry_run: false,
         force: false,
@@ -160,11 +161,11 @@ fn import_streams_a_fully_decoded_model_through_the_spool() {
     })
     .expect("import failed");
 
-    let parsed = parse_checkpoint(&artifact).expect("parse artifact");
+    let parsed = zt::parse(&artifact).expect("parse artifact");
     for tensor in parsed.weights() {
         assert_eq!(
             tensor.encoding,
-            Encoding::Raw(DType::BF16),
+            Encoding::Raw(DType::Bf16),
             "{} was not normalized to BF16",
             tensor.name
         );
@@ -174,6 +175,6 @@ fn import_streams_a_fully_decoded_model_through_the_spool() {
         !store.path().join("converted.spool.tmp").exists(),
         "the spool was not cleaned up"
     );
-    let verified = verify_checkpoint(&artifact).expect("digests verify");
+    let verified = zt::verify(&artifact).expect("digests verify");
     assert_eq!(verified as usize, parsed.tensors.len());
 }

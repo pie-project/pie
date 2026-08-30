@@ -2,8 +2,8 @@
 //! paged and plan arms plus the absorbed `mla`, `ssm`, `index`, and `pool`
 //! groups, in the order the merged enum lists them.
 
-use kernels::{DispatchAttention, KernelError};
 use kernels_metal::attn;
+use model_exec::{DispatchAttention, KernelError};
 use model_ir::{Attention, StructKind};
 
 use crate::run::{Run, StructSlot};
@@ -18,6 +18,86 @@ const NO_MLA_PLAN: &attn::mla::MlaPlan = &attn::mla::MlaPlan;
 
 impl DispatchAttention for Run<'_> {
     fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
+        self.attention(op).map_err(crate::error::kernel)
+    }
+}
+
+impl Run<'_> {
+    /// How many requests the window's rows belong to.
+    ///
+    /// The one fact the sdpa arbitration turns on and no operand carries: a
+    /// prefill and a fleet of decodes can present the SAME row count, and
+    /// what separates them is how many key spans those rows sit over. The
+    /// window's qo boundaries are one entry per request plus a terminator,
+    /// so the count is already here and nothing has to be recomputed from
+    /// the composition.
+    fn requests(&self) -> u32 {
+        u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
+    }
+
+    /// **THE CAPTURE ARM'S OBSERVATION** — one launch, or none at all
+    /// (`.wiki/alto/attn-score.md` §4).
+    ///
+    /// Returns `Ok(())` without touching an encoder in every case that is not
+    /// an observation: a load with no slab, a fire no lane captured, and a
+    /// `prefill_lse` node the plan's `attn.scores` seam does not name. That
+    /// last one matters — a text may write a log-sum-exp for its own reasons,
+    /// and a node the seam did not declare owns no plane.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`kernels_metal::attn::score::capture`] refuses: a sliding
+    /// window (the row would not be the softmax the eviction papers define), a
+    /// quantized key plane, a head this kernel is not stamped for.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_scores(
+        &mut self,
+        q: model_ir::ValueId,
+        plan: model_ir::ValueId,
+        cache: model_ir::ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        lse: model_ir::ValueId,
+    ) -> Result<(), kernels_metal::Error> {
+        let Some(seat) = self.bindings().scores.clone() else {
+            return Ok(());
+        };
+        let Some(plane) = seat.plane_of(lse) else {
+            return Ok(());
+        };
+        // `lane_offset` is what turns this window's request number into a fire
+        // lane, which is the slab's row space; a window in two pieces
+        // therefore lands each piece on its own lanes with no lane map
+        // anywhere.
+        let lane_offset = self.window().span.lane_offset;
+        let requests = self.requests();
+        attn::score::capture(
+            self.ctx(),
+            self.ragged(q),
+            self.prefill_plan(plan),
+            self.pool(cache),
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            seat.observe,
+            lane_offset,
+            seat.plane_stride,
+            plane,
+            crate::scores::KV_MAX,
+            requests,
+            seat.slab,
+        )
+    }
+
+    /// The arms themselves, in `kernels-metal`'s error vocabulary and not
+    /// the contract's — which is what keeps each one a plain tail call with
+    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
+    /// above that lifts the family, and says why it is a call and not a
+    /// `From` impl.
+    fn attention(&mut self, op: &Attention) -> Result<(), kernels_metal::Error> {
         match op {
             // MENLO-SEAM (engine side): the op names kv geometry the metal
             // builder never reads — kv_indptr/kv_indices/last_page_len stay
@@ -127,6 +207,14 @@ impl DispatchAttention for Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
+            // **THE OP NAMES THE SHAPE, NOT THE KERNEL.** A `Prefill` is a
+            // statement that these rows have keys behind them, and the tiled
+            // shader is only the right answer when the rows SHARE those keys:
+            // a fleet of thirty-two one-row lanes has a prefill's row count
+            // and a decode's dataflow, and measures 370 tok/s tiled against
+            // 728 per-row. So the arbitration is here, off the window's own
+            // request count, and `kernels_metal::attn::arbiter` holds the
+            // rule. See its header.
             Attention::Prefill {
                 q,
                 plan,
@@ -136,7 +224,7 @@ impl DispatchAttention for Run<'_> {
                 kv_heads,
                 sm_scale,
                 o,
-            } => attn::prefill(
+            } => attn::arbiter::prefill(
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
@@ -144,6 +232,30 @@ impl DispatchAttention for Run<'_> {
                 *window,
                 *head_dim,
                 *kv_heads,
+                *sm_scale,
+                self.tensor(*o),
+                self.requests(),
+                &kernels_metal::tuning::current(),
+            ),
+            // THE TOWER'S ATTENTION. A real arm and not a refusal: this
+            // plane's `attn::dense` is a written shader, so the family's rule
+            // holds — the arm forwards, and if the entry declines it declines
+            // by its own name.
+            Attention::Dense {
+                q,
+                k,
+                v,
+                segments,
+                head_dim,
+                sm_scale,
+                o,
+            } => attn::dense::bidirectional(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*v),
+                self.tensor(*segments),
+                *head_dim,
                 *sm_scale,
                 self.tensor(*o),
             ),
@@ -156,16 +268,31 @@ impl DispatchAttention for Run<'_> {
                 head_dim,
                 sm_scale,
                 o,
-            } => attn::masked(
+            } => attn::arbiter::masked(
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
-                self.tensor(*mask),
+                // THE OP-NAMED MASK IS CUT LIKE THE PLAN-CARRIED ONE, AND
+                // THAT IS WHAT MAKES THE SEAM'S CLAIM TRUE.
+                // `kernels_metal::attn::masked`'s MENLO-SEAM note says the
+                // op's `mask` and `plan.mask` are "one buffer wearing two
+                // names"; the plan's was built from `cut_rows` and this one
+                // resolves WHOLE (`Run::cut` excludes `RuntimeInput::Mask`,
+                // because a row offset is not a byte offset for a slab the IR
+                // spells in bits). `cut_rows` is what knows the stride, so
+                // applying it here is what makes the two names name the same
+                // rows — rather than leaving them equal only while the masked
+                // window happens to start at fire row zero, which today's
+                // split order (`[masked, captures_scores, qo_one, rest]`)
+                // makes true and no rule requires.
+                self.cut_rows(self.tensor(*mask)),
                 self.pool(*cache),
                 *window,
                 *head_dim,
                 *sm_scale,
                 self.tensor(*o),
+                self.requests(),
+                &kernels_metal::tuning::current(),
             ),
             Attention::DecodeLse {
                 q,
@@ -197,18 +324,42 @@ impl DispatchAttention for Run<'_> {
                 sm_scale,
                 o,
                 lse,
-            } => attn::prefill_lse(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                self.pool(*cache),
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                self.tensor(*o),
-                self.tensor(*lse),
-            ),
+            } => {
+                attn::arbiter::prefill_lse(
+                    self.ctx(),
+                    self.ragged(*q),
+                    self.prefill_plan(*plan),
+                    self.pool(*cache),
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    self.tensor(*o),
+                    self.tensor(*lse),
+                    self.requests(),
+                    &kernels_metal::tuning::current(),
+                )?;
+                // ── **THE OBSERVATION, BESIDE THE ARM THAT ALREADY RAN**
+                //    (`.wiki/alto/attn-score.md` §4: "the graph writes; the
+                //    epilogue reads").
+                //
+                //    MENLO-SEAM (engine side): the op names `o` and `lse` and
+                //    nothing else, because the per-key rectangle is not a
+                //    value another node consumes — it is what this layer paid
+                //    attention to, written into a slab the shell owns and the
+                //    epilogue binds. So the arm asks fire state for it, the
+                //    way the masked arm asks for its span table, and a load
+                //    that seats no slab launches nothing at all.
+                //
+                //    **THE NODE IS ASKED, NOT THE OP.** Which plane this layer
+                //    owns comes from the VALUE it writes, matched against the
+                //    plan's `attn.scores` exports — the only reading that
+                //    cannot be fooled by a text reusing `prefill_lse` somewhere
+                //    the seam does not name.
+                self.capture_scores(
+                    *q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse,
+                )
+            }
             Attention::Sink {
                 o,
                 lse,

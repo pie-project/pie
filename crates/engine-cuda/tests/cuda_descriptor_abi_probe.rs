@@ -98,6 +98,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(4, 512),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 1024,

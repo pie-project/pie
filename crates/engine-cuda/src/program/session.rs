@@ -107,7 +107,7 @@
 //! So the shell's gate is gone and this one is no longer an admission
 //! decision. What is left of it is the STANDALONE fire's semantics: a program
 //! fired on its own through `Shell::fire_program` answers [`Fired::Blocked`]
-//! for the same channel [`engine::step`] blocks on, which is what the parity
+//! for the same channel [`eta_exec::step`] blocks on, which is what the parity
 //! test compares. At a model fire's BOUNDARY a block is not an answer at all —
 //! an epilogue runs after the forward has written the lane's KV, so there is
 //! nothing to replay — and `serve::committed_or` turns it into a [`Fault`]
@@ -128,10 +128,10 @@
 
 use std::sync::Arc;
 
-use engine::tensor_ir::registry::GeometryClass;
-use engine::tensor_ir::container::HostRole;
-use engine::tensor_ir::validate::Direction;
-use engine::{ExecPlan, Extents};
+use eta_exec::{ExecPlan, Extents};
+use eta_ir::container::HostRole;
+use eta_ir::registry::GeometryClass;
+use eta_ir::validate::Direction;
 use kernels_cuda::channel::{self, PublishLane, PullLane, SettleLane, Ticket};
 
 use crate::device::Pinned;
@@ -145,7 +145,7 @@ use super::ports::{self, Envelope};
 
 /// What one fire produced.
 ///
-/// Deliberately the shape of [`engine::StepOutcome`], because the parity test
+/// Deliberately the shape of [`eta_exec::StepOutcome`], because the parity test
 /// compares the two directly: a device fire that blocks must block on the same
 /// channel the host interpreter blocks on, and neither half may quietly turn a
 /// refusal into a commit.
@@ -154,14 +154,14 @@ pub enum Fired {
     /// Every stage ran and the cursors advanced.
     Committed,
     /// Nothing launched: this channel did not meet the program's declared
-    /// requirement. The counterpart of [`engine::StepOutcome::Blocked`].
+    /// requirement. The counterpart of [`eta_exec::StepOutcome::Blocked`].
     Blocked(u32),
     /// A stage's kernel cleared its commit slot — a stale table ABI, a fault
     /// it raised, or a check it made itself. The cursors are left where they
     /// were, so the next fire sees the same inputs.
     Declined,
     /// The instance is unusable and stays so. The counterpart of
-    /// [`engine::StepOutcome::Faulted`].
+    /// [`eta_exec::StepOutcome::Faulted`].
     Faulted(String),
 }
 
@@ -189,7 +189,7 @@ pub enum Launched {
 /// is per lane and the lane is not known until the boundary flies.
 #[derive(Clone, Copy, Debug)]
 struct Intrinsic {
-    id: engine::tensor_ir::op::IntrinsicId,
+    id: eta_ir::op::IntrinsicId,
     base: u64,
     storage: u32,
     width: u32,
@@ -200,7 +200,7 @@ struct Intrinsic {
 /// One bound instance's device state.
 ///
 /// The cursors are `u64` sequence numbers that never wrap, exactly as the host
-/// half's [`ChannelState`](engine::ChannelState) keeps them; a ring position
+/// half's [`ChannelState`](eta_exec::ChannelState) keeps them; a ring position
 /// is the residue. Keeping the same spelling is what makes a slot-for-slot
 /// diff of the two halves mean anything.
 #[derive(Debug)]
@@ -218,7 +218,7 @@ pub struct Session {
     /// and never again.
     ///
     /// Half of the key its [`Prepared`] batch is cut against — the program is
-    /// the other half — because [`engine::layout`]'s `offsets` are shared by
+    /// the other half — because [`eta_exec::layout`]'s `offsets` are shared by
     /// every lane of a launch and `describe` resolves a value's size against
     /// these. Two attachments of one program that agree here ride one launch;
     /// two that disagree are two launches, which is one more kernel and no
@@ -303,7 +303,7 @@ impl Session {
     /// then seed the channels the program declares seeds for.
     ///
     /// `seeds` are WIRE cells, one per `(channel, bytes)` pair — the same
-    /// encoding [`engine::Registry::bind_instance`] takes, so an instance that
+    /// encoding [`eta_exec::Registry::bind_instance`] takes, so an instance that
     /// already exists on the host half is adopted by handing over what its
     /// rings hold (see [`seeds_of`]) rather than by a second seeding rule.
     ///
@@ -557,7 +557,7 @@ impl Session {
     /// Push one wire cell into channel `channel`, answering `false` when the
     /// ring has no room — back-pressure, not a drop.
     ///
-    /// The host-side counterpart of [`engine::host_put`], and the only door a
+    /// The host-side counterpart of [`eta_exec::host_put`], and the only door a
     /// caller's bytes enter this plane through.
     ///
     /// # Errors
@@ -611,7 +611,7 @@ impl Session {
     /// Take channel `channel`'s committed cell as wire bytes, advancing its
     /// head; `None` when the ring is empty.
     ///
-    /// The counterpart of [`engine::host_take`].
+    /// The counterpart of [`eta_exec::host_take`].
     ///
     /// # Errors
     ///
@@ -650,7 +650,7 @@ impl Session {
     /// [`Prepared::stage_lane`] publishes to the emitted kernel as
     /// `committed_cell` — so the shell's read and the guest's take are one
     /// value. Nothing is consumed: the pass's own commit advances `head` for
-    /// every port [`Port::consumes`](engine::tensor_ir::registry::Port::consumes)
+    /// every port [`Port::consumes`](eta_ir::registry::Port::consumes)
     /// names, and draining here as well would spend two cells per fire.
     ///
     /// # Errors
@@ -687,7 +687,7 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
-        intrinsic: engine::tensor_ir::op::IntrinsicId,
+        intrinsic: eta_ir::op::IntrinsicId,
         base: u64,
         storage: u32,
         width: u32,
@@ -794,7 +794,7 @@ impl Session {
         // process — every later call on every later shell answers 700. So the
         // one thing the host can check before the launch, it checks.
         if plan.needs_logits
-            && self.bound & (1u64 << (engine::tensor_ir::op::IntrinsicId::Logits as u32)) == 0
+            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::Logits as u32)) == 0
         {
             return Err(Fault::program(
                 "program::session",
@@ -810,7 +810,7 @@ impl Session {
         // so a program that reads drafts against a headless model would take
         // the same address-zero dereference the line above exists to prevent.
         if plan.needs_mtp_logits
-            && self.bound & (1u64 << (engine::tensor_ir::op::IntrinsicId::MtpLogits as u32)) == 0
+            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpLogits as u32)) == 0
         {
             return Err(Fault::program(
                 "program::session",
@@ -820,10 +820,30 @@ impl Session {
             ));
         }
 
+        // AND THE SCORE RECTANGLE GETS THE THIRD GUARD, FOR THE SECOND
+        // ONE'S REASON (attn-score §4). A program reads `attn_score` only
+        // when the shell bound this lane's block of the observability slab,
+        // and the shell binds it only for a lane that CAPTURED. A capturing
+        // ask that reached a plain lane would take the address-zero
+        // dereference the two lines above exist to prevent — and the axis's
+        // own refusal (`Fault::ScoreWord`) fires earlier, on the model side,
+        // for the same disagreement stated in the model's vocabulary. This is
+        // the guest-plane half of it.
+        if plan.needs_attn_scores
+            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::AttnScore as u32)) == 0
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `attn_score` intrinsic and no buffer has been \
+                 bound to it; a lane that did not ask to capture its attention has no \
+                 block of the observability slab for it to point at",
+            ));
+        }
+
         // ── THE STANDALONE FIRE'S OWN VERB (the module header's "Article 4
         //    bridge, crossed"). The program's declared per-channel
         //    requirement, in channel order, answering with the FIRST channel
-        //    that fails — because `engine::step` does exactly that and the
+        //    that fails — because `eta_exec::step` does exactly that and the
         //    parity test compares the two answers channel for channel.
         //
         //    **IT IS NOT AN ADMISSION CHECK ANY MORE.** Static admission is
@@ -972,7 +992,7 @@ impl Session {
     /// the device's durable state for every channel alike.
     ///
     /// The prediction advances here, and the arithmetic is the one
-    /// `engine::program::step` commits with, transcribed:
+    /// `eta_exec::step` commits with, transcribed:
     ///
     /// * a take advances the head, but only when the ring held something;
     /// * a put advances the tail, and overflows the ring rather than wrapping
@@ -1139,7 +1159,7 @@ impl Session {
             // was opened at the NATIVE width and its mirror is a shadow of the
             // slab, so packing one bit per lane on the way out would write a
             // cell an eighth the width the readers expect.
-            if shape.dtype == engine::tensor_ir::DType::Bool
+            if shape.dtype == eta_ir::Dtype::Bool
                 && endpoint.role() != HostRole::None
             {
                 flags |= Ticket::PACKED_BOOL;
@@ -1420,14 +1440,14 @@ impl Session {
 /// Cells are returned oldest first, so republishing them reproduces the ring's
 /// order. A channel whose ring is empty contributes nothing.
 #[must_use]
-pub fn seeds_of(interp: &engine::InterpInstance, plan: &ExecPlan) -> Vec<(u32, Vec<u8>)> {
+pub fn seeds_of(interp: &eta_exec::InterpInstance, plan: &ExecPlan) -> Vec<(u32, Vec<u8>)> {
     let mut seeds = Vec::new();
     for (channel, ring) in interp.channels.iter().enumerate() {
         let declared = match plan.package.channels.get(channel) {
             Some(declared) => declared,
             None => continue,
         };
-        let dtype = engine::concrete_dtype(declared.dtype);
+        let dtype = eta_exec::concrete_dtype(declared.dtype);
         let numel = declared
             .shape
             .iter()
@@ -1435,8 +1455,8 @@ pub fn seeds_of(interp: &engine::InterpInstance, plan: &ExecPlan) -> Vec<(u32, V
             .product::<usize>()
             .max(1);
         for sequence in ring.head()..ring.tail() {
-            let mut wire = vec![0u8; engine::wire_cell_bytes(dtype, numel)];
-            engine::encode_wire(&ring.decode_sequence(sequence), &mut wire);
+            let mut wire = vec![0u8; eta_exec::wire_cell_bytes(dtype, numel)];
+            eta_exec::encode_wire(&ring.decode_sequence(sequence), &mut wire);
             seeds.push((channel as u32, wire));
         }
     }

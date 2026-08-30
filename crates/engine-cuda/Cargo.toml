@@ -12,6 +12,13 @@ name = "engine_cuda"
 path = "src/lib.rs"
 
 [dependencies]
+# The boot document's format, for `boot.rs` — this shell's own `[model]`,
+# `[engine]` and `[cache]` keys, read into its own `DeviceBoot`. The reader
+# used to live in `runtime`, which is where this line used to be; it moved with
+# the code, because the crate that parses into a type should be the crate that
+# declares it. The FORMAT is still the runtime's (see `boot.rs`'s header): this
+# manifest names a parser, not a schema.
+toml = "1.1"
 # The vocabulary the resolver routes on: `ValueDecl`, `Def`, `RuntimeInput`,
 # `StructKind` — and the 15 family enums the dispatch arms destructure.
 # `statvfs`, for the one question the standard library cannot answer:
@@ -25,10 +32,12 @@ libc = "0.2"
 # serializer the plan already derives for.
 serde_json = "1"
 model-ir = { path = "../model-ir" }
-# The contract implemented — the 15 `Dispatch*` traits and `KernelError`.
-# Contract only: the walk written over it lives in the engine substrate
-# (`engine::fire::walk`) and is driven over this crate's `Run` from there.
-kernels = { path = "../kernels" }
+# `kernels` STOOD HERE for the contract this crate implements — the six
+# `Dispatch*` traits and `KernelError` — and the crate is gone. Both halves
+# went to `model-exec`, which is already below (the walk written over the
+# contract has always lived there and is driven over this crate's `Run` from
+# there), so this line was subtracted rather than replaced: the same names
+# arrive over an edge this manifest already declared.
 # The entries called and the handles resolved to: `Tensor`, `RaggedTensor`,
 # `KvPool`, `RecurrentPool`, the four plan structs and their pure builders.
 # No `cuda-12`/`cuda-13` feature is named here on purpose: picking the
@@ -37,10 +46,29 @@ kernels = { path = "../kernels" }
 # a fire without a runtime answers with a typed refusal.
 kernels-cuda = { path = "../kernels-cuda" }
 
+# The runtime↔engine contract: `trait Engine` and every noun its verbs take.
+# This shell IMPLEMENTS it; nothing here is re-exported onward.
+engine = { path = "../engine" }
+
 # The shared fire substrate: `compose`, `FireDescriptor`, `walk`, `EagerSink`
 # (palo design §6). The shell supplies the two traits and calls the walk; it
 # never re-implements one.
-engine = { path = "../engine" }
+model-exec = { path = "../model-exec" }
+
+# The ETA host half: launch-package adoption, the channel ring, the reference
+# pass. It was one crate with `model-exec` until the two were measured apart,
+# and this shell is the reason there is no umbrella left to depend on instead:
+# it uses BOTH halves, so a re-exporting parent would only have hidden which.
+eta-exec = { path = "../eta-exec" }
+
+# NAMED DIRECTLY, AND THEY USED TO ARRIVE FOUR HOPS AWAY. `eta_ir::registry`'s
+# ports and `eta_compiler::codegen::launch`'s stage plans were reached by
+# spelling the substrate crate, then the contract crate it re-exported, then
+# the IR the contract re-exported, and only then the item: a leaf enum took
+# four crate names. The substrate's re-exports are gone; the edges they hid
+# are these two lines, which is what they always were.
+eta-ir = { path = "../eta-ir" }
+eta-compiler = { path = "../eta-compiler" }
 # `CompiledModel` — the artifact this shell records and replays: the region template,
 # the class table a descriptor's counts index, and the arena's static offsets.
 model-compiler = { path = "../model-compiler" }
@@ -48,7 +76,16 @@ model-compiler = { path = "../model-compiler" }
 # shell is handed a contract, never a model family), `plan::compile` and the
 # `Execution` that runs it against the checkpoint. No family name crosses
 # this edge; `model` is a dev-dependency of the smoke and nothing more.
-model-loader = { path = "../model-loader" }
+#
+# AND THE PLAN VOCABULARY THE DEVICE ARENA SPEAKS: `executor::arena`'s
+# `ArenaBacking`/`TileMapOp` and `plan::passes::tile`'s four `CUDA_*` kernel
+# words, which `src/weights/arena.rs` implements against. The arrow runs this
+# way on purpose — the loader says *what* transform a plan calls for and
+# compiles that claim on a machine with no CUDA; this crate is where the claim
+# is cashed. It used to run both ways, through an optional `cuda` feature on
+# the loader that pulled `kernels-cuda` back across; nothing but the loader's
+# own test ever turned it on.
+checkpoint = { path = "../checkpoint" }
 
 # The CUDA runtime, for the bytes this crate owns that no kernel entry
 # allocates: the arena, the weight store, the pool pages, the resident fire
@@ -59,6 +96,17 @@ model-loader = { path = "../model-loader" }
 # ABI is the BINARY's choice, and Cargo unifies features across the graph, so
 # a `cudarc` version selected here and a different one selected in
 # `kernels-cuda` would silently become one.
+#
+# THAT IS NOT HYPOTHETICAL, and the episode is worth carrying because of how
+# it surfaced. `checkpoint` used to hold a `cuda` feature of its own that
+# pinned `cudarc/cuda-12080` while this crate selected `cuda-13000`; the two
+# unified, cudarc's cublas `sys` module declared every enum twice, and the
+# build failed in `cargo test --doc` — nowhere near anything that named a
+# version. The rule the episode leaves behind is that a version is selected in
+# ONE place and inherited everywhere, which is what `cuda-12`/`cuda-13` below
+# do. There are two crates voting now rather than three: the loader's arm is
+# gone (its device half is `src/weights/arena.rs` in this crate), so the vote
+# is this manifest's and `kernels-cuda`'s, cast by the same two lines.
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",
     "driver",
@@ -74,7 +122,7 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
 # a machine with no GPU in it.
 default = ["probe"]
 
-# **THE GATE-ONLY HOOKS**, on the `model-loader/testkit` pattern: on by default
+# **THE GATE-ONLY HOOKS**, on the `checkpoint/testkit` pattern: on by default
 # so this crate's own gates build with a plain `cargo test`, and dropped by a
 # serving binary with `default-features = false` (which `runtime` does), so
 # nothing a serving path could call is compiled into one.
@@ -107,14 +155,7 @@ model-dsl = { path = "../model-dsl" }
 tokenizer = { path = "../tokenizer" }
 # The checkpoint container the import contract is checked against, and the
 # projection that lets a stock safetensors snapshot BE one — the same pair
-# `model-loader` uses, and for the same reason its manifest gives: `ztensor`
+# `checkpoint` uses, and for the same reason its manifest gives: `ztensor`
 # owns the container format, `ztensor-compat` owns the foreign projections.
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-# The guest-program half's producer: a golden trace in, a `LaunchPackage` and
-# an emitted CUDA kernel table out. A DEV edge — `program/` is handed the two
-# by its caller and never plans anything itself (the same arrow `engine`'s own
-# manifest argues for its `plan` import).
-tensor-compiler = { path = "../tensor-compiler" }
-# The container the goldens are stored as, and the profile they bind against.
-tensor-ir = { path = "../tensor-ir" }

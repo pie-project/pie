@@ -28,7 +28,7 @@ only through its last `window_size` keys.
 The important distinction is that the rule is positional, not score-based. There
 is no attempt to keep whichever old tokens look important to the current query;
 anything outside the window is hidden uniformly. That makes the mechanism simple
-enough to express as PTIR geometry and a dense boolean attention mask.
+enough to express as ETA geometry and a dense boolean attention mask.
 
 ## The rule
 
@@ -50,7 +50,7 @@ token  = argmax(logits)
 ## Implementation notes
 
 Like `attention-sink`, this inferlet is possible because it selects KV by
-**position**, which PTIR's geometry exposes. KV policies that select by attention
+**position**, which ETA's geometry exposes. KV policies that select by attention
 score are outside the current surface area: `IntrinsicId` exposes logits,
 embeddings and geometry, but no attention weights.
 

@@ -47,7 +47,7 @@ export type Pipeline = import('./pie-inferlet-pipeline.js').Pipeline;
  * Attention geometry. Every input is an individual channel; the record
  * exists so the whole group can be handled as a unit (and, in
  * `forward-hybrid`, made optional as a unit). `none` on `mask` omits the
- * PTIR AttnMask port; `some(mask)` binds that channel to it.
+ * ETA AttnMask port; `some(mask)` binds that channel to it.
  * 
  * Declared separately per interface ON PURPOSE (D8/D3).
  */
@@ -193,7 +193,7 @@ export class ForwardPass {
   */
   readout(indices: Channel): void;
   /**
-  * Attach canonical PTIR bytes and channel handles in dense declaration
+  * Attach canonical ETA bytes and channel handles in dense declaration
   * order. Validation uses the engine-owned ModelProfile, and now also
   * rejects any stage this interface does not admit -- see the per-file
   * note on which stages are legal.

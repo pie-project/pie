@@ -63,8 +63,8 @@ impl Cluster {
     }
 
     /// Register a worker (fields extracted from its wire `WorkerInfo` by the
-    /// service; `capability` is not used by the trivial planner). Mints a
-    /// [`WorkerId`].
+    /// service — all of them, now that the engine capability record the trivial
+    /// planner never read is gone from the contract). Mints a [`WorkerId`].
     pub fn insert_worker(
         &mut self,
         role: Role,

@@ -3,8 +3,8 @@
 //! forms are the prefill path: they take the fire's ragged view and launch
 //! one scan per request instead of one per token.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
@@ -24,7 +24,7 @@ const fn recurrence_grid(heads: u32, rows: u32) -> Grid {
     Grid::of([SCAN_WIDTH, heads, rows], [SCAN_WIDTH, 1, 1])
 }
 
-fn head_width(op: &'static str, width: u32, what: &'static str) -> Result<(), KernelError> {
+fn head_width(op: &'static str, width: u32, what: &'static str) -> Result<(), Error> {
     if width > SCAN_HEAD_MAX {
         return Err(refuse(
             op,
@@ -38,7 +38,7 @@ fn head_width(op: &'static str, width: u32, what: &'static str) -> Result<(), Ke
 /// boundary vector is driver-assembled, not an operand the validator sees,
 /// so a wrong dtype is refused, not asserted (the boundary rule at
 /// [`refuse`]).
-fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, KernelError> {
+fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
     if x.indptr.dtype != Dtype::I32 {
         return Err(refuse(
             op,
@@ -75,7 +75,7 @@ impl Delta {
         v_heads: u32,
         k_dim: u32,
         v_dim: u32,
-    ) -> Result<Self, KernelError> {
+    ) -> Result<Self, Error> {
         nonzero(op, "the key heads this statement states", k_heads)?;
         nonzero(op, "the value heads this statement states", v_heads)?;
         nonzero(op, "the key head width this statement states", k_dim)?;
@@ -125,7 +125,7 @@ impl Kda {
         y: Tensor,
         heads: u32,
         head_dim: u32,
-    ) -> Result<Self, KernelError> {
+    ) -> Result<Self, Error> {
         nonzero(op, "the KDA heads this statement states", heads)?;
         nonzero(op, "the KDA head width this statement states", head_dim)?;
         head_width(op, head_dim, "the KDA head width")?;
@@ -158,7 +158,7 @@ pub fn causal_conv1d(
     state: &RecurrentPool,
     conv_width: u32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "causal_conv1d_bfloat16" });
     let channels = nonzero(OP, "the conv's channel count", x.width)?;
@@ -192,7 +192,7 @@ pub fn causal_conv1d_chunked(
     state: &RecurrentPool,
     conv_width: u32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d_chunked";
     let entry = dtype_dispatch!(OP, x.data.dtype, { Bf16 => "causal_conv1d_chunked_bfloat16" });
     let channels = nonzero(OP, "the conv's channel count", x.data.width)?;
@@ -226,7 +226,7 @@ pub fn gdn_prep(
     dt_bias: Tensor,
     a_log: Tensor,
     gates: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gdn_prep";
     let entry = dtype_dispatch!(OP, ba.dtype, { Bf16 => "qwen_gdn_ba_gates_bfloat16" });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
@@ -274,7 +274,7 @@ pub fn gated_delta(
     k_dim: u32,
     v_dim: u32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta";
     let _ = z;
     let entry = dtype_dispatch!(OP, qkv.dtype, { Bf16 => "gated_delta_bfloat16" });
@@ -311,7 +311,7 @@ pub fn gated_delta_chunked(
     k_dim: u32,
     v_dim: u32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta_chunked";
     let _ = z;
     let entry = dtype_dispatch!(OP, qkv.data.dtype, { Bf16 => "gated_delta_chunked_bfloat16" });
@@ -349,7 +349,7 @@ pub fn kda_step(
     head_dim: u32,
     norm_eps: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_step";
     let entry = dtype_dispatch!(OP, mixed.dtype, { Bf16 => "kda_step_bfloat16" });
     debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");
@@ -389,7 +389,7 @@ pub fn kda_chunked(
     head_dim: u32,
     norm_eps: f32,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_chunked";
     let entry = dtype_dispatch!(OP, mixed.data.dtype, { Bf16 => "kda_chunked_bfloat16" });
     debug_assert_eq!(dt_bias.dtype, Dtype::F32, "`{OP}` reads an f32 decay bias");

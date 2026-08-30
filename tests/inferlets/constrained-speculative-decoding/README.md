@@ -35,7 +35,7 @@ rollback has to be emulated by resetting and replaying the entire accepted
 prefix on every rejection, which costs more than speculation saves. That is why
 these two features are usually offered but not offered *together*.
 
-PTIR's matcher resource therefore exposes two extra operations, added for this
+ETA's matcher resource therefore exposes two extra operations, added for this
 composition (`interface/inferlet/grammar.wit`):
 
 | Operation | Role here |

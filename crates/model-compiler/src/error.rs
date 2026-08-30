@@ -174,6 +174,48 @@ pub enum Error {
         /// The capture node that produces it.
         produced_by: u32,
     },
+    /// A plan that states a row axis the budgets size no ceiling for.
+    ///
+    /// **EVERY SYMBOLIC DIM IS SIZED IN THE BUDGET AND NOWHERE ELSE**, so a
+    /// `Dim::Patches` against a `Budget` with no `PatchLadder` is a rectangle
+    /// with no height. The alternative is worse than a refusal and quieter: a
+    /// carve at zero rows places every tower rectangle at the same offset,
+    /// nothing clashes because nothing is live, and the graph computes over
+    /// somebody else's bytes. So it is named at the door, with the field the
+    /// deployment has to fill in.
+    #[error(
+        "the plan states {} rows and the budgets size no {} ceiling —          a deployment that serves this model declares the axis's ladder",
+        .axis.name(),
+        .axis.name()
+    )]
+    Unsized {
+        /// The row axis the plan states.
+        axis: model_ir::RowAxis,
+    },
+    /// Capture units that alternate down the record script.
+    ///
+    /// **A CAPTURE UNIT IS AN EXEC, AND AN EXEC IS ONE CONTIGUOUS STRETCH.**
+    /// The fire launches one exec per unit, chained on one stream; a unit
+    /// whose regions resume after another unit's have run is not one exec but
+    /// several, and picking an order that would make it one is a scheduling
+    /// decision this compiler has no dependence graph to make (the same reason
+    /// `coalesce` keeps program order). The shape that works is the shape a
+    /// declared tower already has: the tower stated before the trunk that
+    /// reads its output.
+    #[error(
+        "the {} capture unit (unit {unit}) resumes at nodes {}..{} after another          unit has run. A unit is one exec and an exec is one contiguous stretch          of the script; the model text states the tower before the trunk that          reads it",
+        .axis.name(),
+        .nodes.start,
+        .nodes.end
+    )]
+    UnitsInterleave {
+        /// The axis whose unit resumes.
+        axis: model_ir::RowAxis,
+        /// Its index into `CompiledModel::units`.
+        unit: u32,
+        /// The node range of the region that resumes it.
+        nodes: core::ops::Range<u32>,
+    },
 }
 
 /// Which of the IR's two column-sharing rules a [`Error::Mismatch`] is

@@ -69,13 +69,10 @@ worker-api = { path = "../worker-api" }
 # The runtime <-> engine vocabulary. A direct dep because this crate names
 # those types, not (as it once did) so its build script could receive a C
 # header directory through a `links` handoff.
-engine-api = { path = "../engine-api" }
-# **THE RUN-AHEAD FORMULA, READ RATHER THAN TRANSCRIBED** (alto design §9,
-# article 8). This file's `[runtime]` knobs bound what the engine's staging
-# ring can be carved from, and the one place that arithmetic lives is
-# `engine::runahead`. The edge exists so that `UPLOAD_STAGING_DEPTH = 13` — a
-# literal copied out of a C++ header this tree deleted — does not have to.
 engine = { path = "../engine" }
+# `Platform`, to say which shell a boot is for. One enum, from the crate that
+# owns it — this used to arrive through `engine`'s re-export of the whole IR.
+model-ir = { path = "../model-ir" }
 transport = { path = "../transport", optional = true }
 # Shared id atoms (WorkerId / NodeId / ReqId / SessionId) and the client wire
 # vocabulary (ClientMessage / ServerMessage) the gateway data plane carries.
@@ -118,7 +115,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # `default-features = false` drops the loader's testkit (oracle, contract
 # fixture builder, CPU executor). Nothing under `ffi/` reaches them, and this is
 # what keeps that true.
-model-loader = { path = "../model-loader", default-features = false }
+checkpoint = { path = "../checkpoint", default-features = false }
 # `model-compiler` STOOD HERE, with the note "no Rust in this process calls the
 # forward toolchain — the engines reach it over its C ABI — so the dependency
 # exists to put the rlib in the link and to order the build-script include
@@ -169,8 +166,8 @@ tempfile = "3"
 # there is no log. Finding one such fault meant patching an `eprintln!` into
 # another crate; this is that, once.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-# `tensor-ir` STOOD HERE and no test in this crate ever named it: the single
-# occurrence was `cuda_canaries.rs` quoting `tensor_ir::validate`'s refusal
+# `eta-ir` STOOD HERE and no test in this crate ever named it: the single
+# occurrence was `cuda_canaries.rs` quoting `eta_ir::validate`'s refusal
 # TEXT in a `//!` census, which is prose about another crate's message and
 # needs no edge. `[build-dependencies]` stood below it with no entries, which
 # is a section header for a `build.rs` this crate does not have.

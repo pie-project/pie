@@ -1,0 +1,369 @@
+# oracle dump: pie::metal::pipeline::emit_grouped_readiness_msl
+# source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
+# emitter_version: 33
+# @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
+# @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
+# cases: 4
+# re-blessed: the C++ oracle (crates/engine-metal/csrc/src/pipeline/m1_codegen.cpp) is
+#   deleted, so these bytes can no longer be re-derived from it. Three cases
+#   below were re-blessed from Rust in the change that made the emitted corpus
+#   compile: `crates/engine-metal/csrc/tests/msl_compile_test.cpp` put every kernel here
+#   through Apple's shader compiler for the first time and found two rejections
+#   the byte comparison could never see, because the oracle had them too.
+#     * readiness/commit `wide_30` emitted `[[buffer(31)]]`, one past Metal's
+#       highest buffer index; `METAL_M1_MAX_CHANNELS` now rejects it by name.
+#     * three grouped fused regions passed the `const device bfloat*` logits
+#       pointer into `ptir_m1_execute`'s `const device uchar*` parameter, which
+#       MSL will not convert. They now cast.
+#   Nothing else in this directory moved, and `msl_compile_test` is the standing
+#   check that took over from the oracle for the question it could not answer.
+#   re-blessed again (emitter 27): `m1_reduce_argmax` no longer materializes one
+#   16-byte candidate per element into device `temporary` and tree-reduces it in
+#   passes -- `m1_argmax_combine` is a strict total order, so a fold gives the
+#   same answer -- and the bf16 logits intrinsic copies unrolled. Both loops run
+#   on the single thread that owns a lane, so at a 248320 vocab they were ~250ms
+#   per decode step against a ~4ms model forward. Only @runtime bytes moved.
+#   re-blessed again (emitter 29): a generated region now gets a threadgroup per
+#   lane instead of a thread, and the three things that walked a vocabulary-wide
+#   row -- the logits gather, argmax, and the typed copy behind a reshape -- are
+#   split across it. m1_copy_typed also moved from one device access per BYTE to
+#   one per word. Between them a decode step's GPU time went 89ms -> 6.5ms.
+#   re-blessed again (emitter 31): a same-footprint reshape is a view, so the
+#   grouped emitter elides its copy and points the consumers at the source
+#   value's offset. The runtime executed it as a byte-for-byte copy of the whole
+#   value, which in the sampler's graph was a vocabulary-wide round trip through
+#   device memory for nothing.
+# REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
+#   reason: METAL_M1_EMITTER_VERSION 37 -> 38 for the attention-score door: the M2 slot table gives IntrinsicId::AttnScore an argument index (28) and the M1 runtime's 0xA0 arm gathers float rather than bfloat for it, so a score-reading region's emitted MSL is new and a library cached under 37 would be built from a source that binds nothing there. The version is spelled into the grouped readiness/commit entry names, so only those names move here; not one byte of either kernel's body did.
+=== ptir_m3_generic_ready_v38
+function_name: ptir_m3_generic_ready_v38
+ok: true
+source: bytes=2977 prefix=none tail_bytes=2977
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+
+struct M3LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M3LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M3LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+struct M3ChannelMeta {
+  ulong words;
+  uint capacity;
+  uint flags;
+};
+struct M3GroupLayout {
+  uint lane_count;
+  uint value_count;
+  uint scratch_stride;
+  uint temporary_offset;
+  uint vocab;
+  uint reserved0;
+  uint reserved1;
+  uint reserved2;
+};
+struct M3RowMeta {
+  uint offset;
+  uint count;
+  uint mtp_offset;
+  uint reserved;
+};
+kernel void ptir_m3_generic_ready_v38(const device uchar* lane_bytes [[buffer(0)]], const device M3ChannelMeta* meta [[buffer(1)]], uint lane_index [[thread_position_in_grid]]) {
+  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
+  if (lane_index >= header->lane_count) return;
+  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
+  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
+  const M3LaneRecord lane = lanes[lane_index];
+  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
+  status->state = 0; status->fault = 0;
+  for (uint channel = 0; channel < header->channel_count; ++channel) {
+    const M3ChannelMeta m = meta[lane.channel_slot_offset + channel];
+    if ((m.flags & 1u) == 0u) continue;
+    const device ulong* words = reinterpret_cast<const device ulong*>(m.words);
+    const ulong head = words[0], tail = words[1];
+    const M3LaneChannelSlot slot = slots[lane.channel_slot_offset + channel];
+    if (words[2] != 0ul || words[3] != 0ul || tail < head) { status->state = 3; status->fault = 0x700u + channel; return; }
+    bool retry = slot.expected_head != ~0ul && head != slot.expected_head;
+    retry = retry || (((m.flags & 2u) != 0u) && tail <= head);
+    retry = retry || (((m.flags & 4u) != 0u) && tail - head >= ulong(m.capacity));
+    if ((m.flags & 16u) != 0u) {
+      const ulong credit = ((m.flags & 10u) == 10u) ? 1ul : 0ul;
+      retry = retry || slot.expected_tail == ~0ul || tail != slot.expected_tail || tail - head >= ulong(m.capacity) + credit;
+    }
+    if (retry) { status->state = (m.flags & 32u) != 0u ? 3u : 2u; status->fault = 0x780u + channel; return; }
+  }
+  status->state = 1;
+}
+=== end
+=== ptir_m3_generic_commit_v38
+function_name: ptir_m3_generic_commit_v38
+ok: true
+source: bytes=2978 prefix=none tail_bytes=2978
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+
+struct M3LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M3LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M3LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+struct M3ChannelMeta {
+  ulong words;
+  uint capacity;
+  uint flags;
+};
+struct M3GroupLayout {
+  uint lane_count;
+  uint value_count;
+  uint scratch_stride;
+  uint temporary_offset;
+  uint vocab;
+  uint reserved0;
+  uint reserved1;
+  uint reserved2;
+};
+struct M3RowMeta {
+  uint offset;
+  uint count;
+  uint mtp_offset;
+  uint reserved;
+};
+kernel void ptir_m3_generic_commit_v38(const device uchar* lane_bytes [[buffer(0)]], const device M3ChannelMeta* meta [[buffer(1)]], uint lane_index [[thread_position_in_grid]]) {
+  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
+  if (lane_index >= header->lane_count) return;
+  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
+  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
+  const M3LaneRecord lane = lanes[lane_index];
+  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
+  status->state = 0; status->fault = 0;
+  for (uint channel = 0; channel < header->channel_count; ++channel) {
+    const M3ChannelMeta m = meta[lane.channel_slot_offset + channel];
+    if ((m.flags & 1u) == 0u) continue;
+    const device ulong* words = reinterpret_cast<const device ulong*>(m.words);
+    const ulong head = words[0], tail = words[1];
+    const M3LaneChannelSlot slot = slots[lane.channel_slot_offset + channel];
+    if (words[2] != 0ul || words[3] != 0ul || tail < head) { status->state = 3; status->fault = 0x700u + channel; return; }
+    bool retry = slot.expected_head != ~0ul && head != slot.expected_head;
+    retry = retry || (((m.flags & 2u) != 0u) && tail <= head);
+    retry = retry || (((m.flags & 4u) != 0u) && tail - head >= ulong(m.capacity));
+    if ((m.flags & 16u) != 0u) {
+      const ulong credit = ((m.flags & 10u) == 10u) ? 1ul : 0ul;
+      retry = retry || slot.expected_tail == ~0ul || tail != slot.expected_tail || tail - head >= ulong(m.capacity) + credit;
+    }
+    if (retry) { status->state = (m.flags & 32u) != 0u ? 3u : 2u; status->fault = 0x780u + channel; return; }
+  }
+  status->state = 1;
+}
+=== end
+=== k
+function_name: k
+ok: true
+source: bytes=2953 prefix=none tail_bytes=2953
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+
+struct M3LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M3LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M3LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+struct M3ChannelMeta {
+  ulong words;
+  uint capacity;
+  uint flags;
+};
+struct M3GroupLayout {
+  uint lane_count;
+  uint value_count;
+  uint scratch_stride;
+  uint temporary_offset;
+  uint vocab;
+  uint reserved0;
+  uint reserved1;
+  uint reserved2;
+};
+struct M3RowMeta {
+  uint offset;
+  uint count;
+  uint mtp_offset;
+  uint reserved;
+};
+kernel void k(const device uchar* lane_bytes [[buffer(0)]], const device M3ChannelMeta* meta [[buffer(1)]], uint lane_index [[thread_position_in_grid]]) {
+  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
+  if (lane_index >= header->lane_count) return;
+  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
+  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
+  const M3LaneRecord lane = lanes[lane_index];
+  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
+  status->state = 0; status->fault = 0;
+  for (uint channel = 0; channel < header->channel_count; ++channel) {
+    const M3ChannelMeta m = meta[lane.channel_slot_offset + channel];
+    if ((m.flags & 1u) == 0u) continue;
+    const device ulong* words = reinterpret_cast<const device ulong*>(m.words);
+    const ulong head = words[0], tail = words[1];
+    const M3LaneChannelSlot slot = slots[lane.channel_slot_offset + channel];
+    if (words[2] != 0ul || words[3] != 0ul || tail < head) { status->state = 3; status->fault = 0x700u + channel; return; }
+    bool retry = slot.expected_head != ~0ul && head != slot.expected_head;
+    retry = retry || (((m.flags & 2u) != 0u) && tail <= head);
+    retry = retry || (((m.flags & 4u) != 0u) && tail - head >= ulong(m.capacity));
+    if ((m.flags & 16u) != 0u) {
+      const ulong credit = ((m.flags & 10u) == 10u) ? 1ul : 0ul;
+      retry = retry || slot.expected_tail == ~0ul || tail != slot.expected_tail || tail - head >= ulong(m.capacity) + credit;
+    }
+    if (retry) { status->state = (m.flags & 32u) != 0u ? 3u : 2u; status->fault = 0x780u + channel; return; }
+  }
+  status->state = 1;
+}
+=== end
+=== ptir_m3_0123456789abcdef_effects
+function_name: ptir_m3_0123456789abcdef_effects
+ok: true
+source: bytes=2984 prefix=none tail_bytes=2984
+#include <metal_stdlib>
+using namespace metal;
+struct M1Status { uint state; uint fault; uint reserved0; uint reserved1; };
+
+struct M3LaneHeader { uint abi_version; uint lane_count; uint channel_count; uint flags; };
+struct M3LaneRecord {
+  ulong logits_base;
+  uint logits_row_offset;
+  uint logits_row_count;
+  uint kv_len;
+  uint page_count;
+  uint row_count;
+  uint token_count;
+  uint sampled_rows;
+  uint query_len;
+  uint key_len;
+  uint channel_slot_offset;
+  ulong rng_state;
+  ulong commit_slot;
+  ulong active_row_mask;
+  ulong sample_output_channel_mask;
+  ulong row_valid;
+  uint row_valid_offset;
+  uint reserved0;
+};
+struct M3LaneChannelSlot {
+  ulong committed_cell;
+  ulong pending_cell;
+  ulong expected_head;
+  ulong expected_tail;
+};
+struct M3ChannelMeta {
+  ulong words;
+  uint capacity;
+  uint flags;
+};
+struct M3GroupLayout {
+  uint lane_count;
+  uint value_count;
+  uint scratch_stride;
+  uint temporary_offset;
+  uint vocab;
+  uint reserved0;
+  uint reserved1;
+  uint reserved2;
+};
+struct M3RowMeta {
+  uint offset;
+  uint count;
+  uint mtp_offset;
+  uint reserved;
+};
+kernel void ptir_m3_0123456789abcdef_effects(const device uchar* lane_bytes [[buffer(0)]], const device M3ChannelMeta* meta [[buffer(1)]], uint lane_index [[thread_position_in_grid]]) {
+  const device M3LaneHeader* header = reinterpret_cast<const device M3LaneHeader*>(lane_bytes);
+  if (lane_index >= header->lane_count) return;
+  const device M3LaneRecord* lanes = reinterpret_cast<const device M3LaneRecord*>(lane_bytes + sizeof(M3LaneHeader));
+  const device M3LaneChannelSlot* slots = reinterpret_cast<const device M3LaneChannelSlot*>(lane_bytes + sizeof(M3LaneHeader) + header->lane_count * sizeof(M3LaneRecord));
+  const M3LaneRecord lane = lanes[lane_index];
+  device M1Status* status = reinterpret_cast<device M1Status*>(lane.commit_slot);
+  status->state = 0; status->fault = 0;
+  for (uint channel = 0; channel < header->channel_count; ++channel) {
+    const M3ChannelMeta m = meta[lane.channel_slot_offset + channel];
+    if ((m.flags & 1u) == 0u) continue;
+    const device ulong* words = reinterpret_cast<const device ulong*>(m.words);
+    const ulong head = words[0], tail = words[1];
+    const M3LaneChannelSlot slot = slots[lane.channel_slot_offset + channel];
+    if (words[2] != 0ul || words[3] != 0ul || tail < head) { status->state = 3; status->fault = 0x700u + channel; return; }
+    bool retry = slot.expected_head != ~0ul && head != slot.expected_head;
+    retry = retry || (((m.flags & 2u) != 0u) && tail <= head);
+    retry = retry || (((m.flags & 4u) != 0u) && tail - head >= ulong(m.capacity));
+    if ((m.flags & 16u) != 0u) {
+      const ulong credit = ((m.flags & 10u) == 10u) ? 1ul : 0ul;
+      retry = retry || slot.expected_tail == ~0ul || tail != slot.expected_tail || tail - head >= ulong(m.capacity) + credit;
+    }
+    if (retry) { status->state = (m.flags & 32u) != 0u ? 3u : 2u; status->fault = 0x780u + channel; return; }
+  }
+  status->state = 1;
+}
+=== end

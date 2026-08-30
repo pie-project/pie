@@ -110,30 +110,18 @@ impl Weight {
             .unwrap_or_else(|| panic!("`{}` is {:?} and has no axis {i}", self.name, self.shape))
     }
 
-    /// The dtype activations see through this weight. Mxfp4 banks store codes
-    /// and compute in bf16; the rest of `Dtype` names kv-cache schemes, index
-    /// layouts, and the e8m0 scales plane a bank interns beside itself — never
-    /// a weight an author declares.
+    /// The dtype activations see through this weight. Mxfp4 and MlxU4 banks
+    /// store codes and compute in bf16; the rest of `Dtype` names kv-cache
+    /// schemes, index layouts, and the companion planes a bank interns beside
+    /// itself — never a weight an author declares.
     #[must_use]
     pub fn compute_dtype(&self) -> Dtype {
-        match self.dtype {
-            Dtype::Bf16 => Dtype::Bf16,
-            Dtype::F16 => Dtype::F16,
-            Dtype::F32 => Dtype::F32,
-            Dtype::Mxfp4 => Dtype::Bf16,
-            Dtype::I32
-            | Dtype::U32
-            | Dtype::U8
-            | Dtype::I8
-            | Dtype::Fp8E4m3
-            | Dtype::Fp4
-            | Dtype::E8m0 => {
-                panic!(
-                    "`{}`: not a weight representation an author declares",
-                    self.name
-                )
-            }
-        }
+        compute_dtype(self.dtype).unwrap_or_else(|| {
+            panic!(
+                "`{}`: not a weight representation an author declares",
+                self.name
+            )
+        })
     }
 
     /// The stored planes behind one logical weight. Every dtype stores itself
@@ -141,6 +129,55 @@ impl Weight {
     /// and interns an e8m0 scale-per-block companion under `.scales`.
     pub(crate) fn planes(&self) -> Vec<BankPlane> {
         match self.dtype {
+            // MLX's affine U4: the codes keep the logical shape and change
+            // only their width — four bits an element, which is exactly the
+            // eight-codes-to-a-u32-word the checkpoint ships — and TWO
+            // companions of one group count each, a scale and an offset,
+            // because `code * scale + bias` needs both to be read at all.
+            // Publishing the scales and withholding the biases would land a
+            // bank that dequantizes to the right spread around the wrong
+            // centre, silently.
+            // **BOTH AFFINE WIDTHS TAKE THIS ARM, AND THE WIDTH IS THE ONLY
+            // THING THAT DIFFERS.** `MlxU8` is `MlxU4`'s scheme at eight bits
+            // a code — `mlx_lm`'s `quant_predicate` raises a MoE router gate
+            // to it while the stack around it stays at four (see
+            // `dtype::Dtype::MlxU8`) — and everything below is a fact about
+            // the SCHEME rather than the width: the codes keep the logical
+            // shape, the group is sixty-four codes wide at either width, and
+            // both companions are one bf16 per group. So the plane carries
+            // `self.dtype` and the arm is shared; a width-specific arm here
+            // would be two copies of one paragraph.
+            Dtype::MlxU4 | Dtype::MlxU8 => {
+                let (&k, lead) = self
+                    .shape
+                    .split_last()
+                    .expect("an affine bank's logical shape ends in its contracted axis");
+                assert!(
+                    k % 64 == 0,
+                    "`{}` is an affine bank contracting over {k}, which is not a whole \
+                     number of 64-code groups",
+                    self.name,
+                );
+                let mut factors = lead.to_vec();
+                factors.push(k / 64);
+                vec![
+                    BankPlane {
+                        suffix: "",
+                        shape: self.shape.clone(),
+                        dtype: self.dtype,
+                    },
+                    BankPlane {
+                        suffix: SCALES,
+                        shape: factors.clone(),
+                        dtype: Dtype::Bf16,
+                    },
+                    BankPlane {
+                        suffix: BIASES,
+                        shape: factors,
+                        dtype: Dtype::Bf16,
+                    },
+                ]
+            }
             Dtype::Mxfp4 => {
                 let (&k, lead) = self
                     .shape
@@ -179,7 +216,13 @@ impl Weight {
             | Dtype::I8
             | Dtype::Fp8E4m3
             | Dtype::Fp4
-            | Dtype::E8m0 => vec![BankPlane {
+            | Dtype::E8m0
+            | Dtype::Fp8E5m2
+            | Dtype::I64
+            | Dtype::I16
+            | Dtype::U64
+            | Dtype::U16
+            | Dtype::Bool => vec![BankPlane {
                 suffix: "",
                 shape: self.shape.clone(),
                 dtype: self.dtype,
@@ -207,7 +250,50 @@ pub(crate) struct BankPlane {
 /// they all say it here.
 const SCALES: &str = ".scales";
 
+/// What an affine bank's zero-point plane is called. Same argument as
+/// [`SCALES`], and the same four writers: an offset nothing can find is an
+/// offset nothing subtracts, and a bank read without its offsets is not a
+/// worse bank but a wrong one.
+const BIASES: &str = ".biases";
+
 #[must_use]
 pub fn scales_name(of: &str) -> String {
     format!("{of}{SCALES}")
+}
+
+#[must_use]
+pub fn biases_name(of: &str) -> String {
+    format!("{of}{BIASES}")
+}
+
+/// The dtype a weight of this representation is MULTIPLIED as, or `None` for a
+/// dtype no weight is declared in.
+///
+/// Asked of the dtype rather than of the weight so a model text can state a
+/// bank's neighbours without owning a bank: a norm beside an MlxU4 projection
+/// is bf16 BECAUSE the projection computes in bf16, and saying so here is what
+/// keeps a quantized SKU from being a second family text whose norms happen to
+/// have been remembered. [`Weight::compute_dtype`] is this function plus the
+/// weight's name in the panic.
+#[must_use]
+pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
+    match dtype {
+        Dtype::Bf16 => Some(Dtype::Bf16),
+        Dtype::F16 => Some(Dtype::F16),
+        Dtype::F32 => Some(Dtype::F32),
+        Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 => Some(Dtype::Bf16),
+        Dtype::I32
+        | Dtype::U32
+        | Dtype::U8
+        | Dtype::I8
+        | Dtype::Fp8E4m3
+        | Dtype::Fp4
+        | Dtype::E8m0
+        | Dtype::Fp8E5m2
+        | Dtype::I64
+        | Dtype::I16
+        | Dtype::U64
+        | Dtype::U16
+        | Dtype::Bool => None,
+    }
 }

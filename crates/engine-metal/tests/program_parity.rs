@@ -2,9 +2,9 @@
 //! the Metal side.
 //!
 //! **THIS IS THE POINT OF STEP 7.** Every other test in this crate can pass
-//! while a PTIR fire computes the wrong thing: the launch succeeded, the
+//! while an ETA fire computes the wrong thing: the launch succeeded, the
 //! commit slot survived, a channel holds *a* value. What cannot be faked is
-//! agreement with `engine::program` — a complete interpreter of the same
+//! agreement with `eta_exec` — a complete interpreter of the same
 //! launch package, written against the same op table, that never touches a
 //! device. So both halves are handed the same programs, the same seeds and the
 //! same per-fire inputs, and after every fire the test compares:
@@ -23,7 +23,7 @@
 //! — and why "close enough" is not an option anywhere below.
 //!
 //! **THE SUBJECTS ARE REAL GOLDEN TRACES**, not fixtures written here: the
-//! `tensor-compiler` corpus under `tests/golden/`, decoded from the
+//! `eta-compiler` corpus under `tests/golden/`, decoded from the
 //! `container:` line, bound against the profile each was authored for, planned
 //! by `compile_bound`, and emitted for Metal by `emit_program`. That is
 //! exactly the path a registration takes in production, so what this test
@@ -40,7 +40,7 @@
 //! heights — `Logits [K+1, V]` and `MtpLogits [K, V]` — each argmaxed and
 //! published on its own channel, which is the shape a draft-reading guest
 //! has. It is unreachable on this plane. The Metal M2 emitter
-//! (`tensor_compiler::codegen::metal::fused::emit_fused_region`) writes ONE
+//! (`eta_compiler::codegen::metal::fused::emit_fused_region`) writes ONE
 //! intrinsic parameter into the kernel signature —
 //! `const device uchar* logits [[buffer(6)]]` — and sets it as the first
 //! argument of EVERY `INTRINSIC_VAL` op it lowers. So the two intrinsics do
@@ -90,20 +90,21 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use engine::engine_api::program::{LaunchChannel, LaunchPackage, ProgramRegistration, ValueSource};
-use engine::tensor_ir::DType;
-use engine::tensor_ir::container::HostRole;
-use engine::engine_api::program::KernelKind;
-use engine::tensor_ir::op::IntrinsicId;
-use engine::{
+use engine::program::ProgramRegistration;
+use engine_metal::device::{Buffer, Context, present};
+use engine_metal::program::{Fired, Plane};
+use eta_compiler::codegen::launch::{LaunchChannel, LaunchPackage, ValueOrigin};
+use eta_compiler::codegen::program::KernelKind;
+use eta_exec::{
     ExecPlan, Extents, HostOp, InterpInstance, PassInputs, StepOutcome, Value,
     adopt_launch_package, concrete_dtype, encode_wire, host_put, host_take, make_host_instance,
     step, wire_cell_bytes,
 };
-use engine_metal::device::{Buffer, Context, present};
-use engine_metal::program::{Fired, Plane};
-use tensor_ir::container::TraceContainer;
-use tensor_ir::registry::{GeometryClass, KernelInfo, ModelProfile};
+use eta_ir::Dtype;
+use eta_ir::container::HostRole;
+use eta_ir::container::TraceContainer;
+use eta_ir::op::IntrinsicId;
+use eta_ir::registry::{GeometryClass, KernelInfo, ModelProfile};
 
 /// **ONE PLANE AT A TIME, PER PROCESS — AND NOT FOR THE CUDA SIBLING'S
 /// REASON.** That file serializes because `kernels-cuda`'s scratch slabs are
@@ -223,7 +224,7 @@ const HOLD_THE_DRAIN: usize = 2;
 fn golden_dir() -> PathBuf {
     PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../tensor-compiler/tests/golden"
+        "/../eta-compiler/tests/golden"
     ))
 }
 
@@ -234,7 +235,7 @@ fn unhex(text: &str) -> Vec<u8> {
 }
 
 /// The bind-time profile each golden was authored against, transcribed from
-/// `tensor-compiler`'s own corpus helper. The goldens do not carry it, and
+/// `eta-compiler`'s own corpus helper. The goldens do not carry it, and
 /// binding one at the wrong vocabulary refuses rather than misbehaves — which
 /// is why this is a copy and not a guess.
 fn golden_profile(name: &str) -> ModelProfile {
@@ -270,35 +271,25 @@ fn container_of(name: &str) -> TraceContainer {
         .lines()
         .find_map(|line| line.strip_prefix("container: "))
         .unwrap_or_else(|| panic!("{name} has no container line"));
-    tensor_ir::container::decode(&unhex(line))
+    eta_ir::container::decode(&unhex(line))
         .unwrap_or_else(|why| panic!("{name} does not decode: {why:?}"))
 }
 
 /// One trace, all the way to what `register_program` takes.
 fn registration(name: &str) -> ProgramRegistration {
     let container = container_of(name);
-    let bound = tensor_ir::validate::bind(container, golden_profile(name))
+    let bound = eta_ir::validate::bind(container, golden_profile(name))
         .unwrap_or_else(|why| panic!("{name} does not bind: {why:?}"));
-    let stages = tensor_compiler::plan::compile_bound(&bound);
-    let launch = tensor_compiler::codegen::launch::build(&bound, &stages);
-    let backend = tensor_compiler::codegen::program::Backend::Metal;
-    let emitted = tensor_compiler::codegen::program::emit_program(backend, &stages, &bound);
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    let launch = eta_compiler::codegen::launch::build(&bound, &stages);
+    let backend = eta_compiler::codegen::program::Backend::Metal;
+    let emitted = eta_compiler::codegen::program::emit_program(backend, &stages, &bound);
 
     ProgramRegistration {
         // The bound trace's own hash, which is what the host uses: two
         // registrations of one program have to be recognised as one.
         program_hash: bound.hash,
-        emitted_kernels: emitted
-            .into_iter()
-            .map(|kernel| engine::engine_api::program::EmittedKernel {
-                kind: kernel.kind,
-                stage_index: kernel.stage_index,
-                region_index: kernel.region_index,
-                entry_name: kernel.entry_name,
-                source: kernel.source,
-                error: kernel.error,
-            })
-            .collect(),
+        emitted_kernels: emitted,
         emitter_version: backend.emitter_version(),
         region_analysis: Vec::new(),
         launch,
@@ -338,7 +329,7 @@ fn host_reads(declared: &LaunchChannel) -> bool {
 /// alone. The values are small so that a u32 sum over a decode loop stays
 /// nowhere near a wrap, and non-constant across rounds so a program that
 /// ignores its input cannot pass by accident.
-fn cell(dtype: DType, lanes: usize, channel: u32, round: usize) -> Value {
+fn cell(dtype: Dtype, lanes: usize, channel: u32, round: usize) -> Value {
     let mut state = 0x9e37_79b9_u32
         .wrapping_mul(channel.wrapping_add(1))
         .wrapping_add(round as u32 * 0x0851_1e19);
@@ -349,16 +340,25 @@ fn cell(dtype: DType, lanes: usize, channel: u32, round: usize) -> Value {
         state
     };
     match dtype {
-        DType::U32 => Value::U32((0..lanes).map(|_| next() % 7).collect()),
-        DType::I32 => Value::I32((0..lanes).map(|_| (next() % 7) as i32).collect()),
-        DType::Bool => Value::Bool((0..lanes).map(|_| u8::from(next() % 2 == 1)).collect()),
+        Dtype::U32 => Value::U32((0..lanes).map(|_| next() % 7).collect()),
+        Dtype::I32 => Value::I32((0..lanes).map(|_| (next() % 7) as i32).collect()),
+        Dtype::Bool => Value::Bool((0..lanes).map(|_| u8::from(next() % 2 == 1)).collect()),
         // Small exact binary fractions: representable to the bit, so an f32
         // channel would still be comparable byte for byte.
-        DType::F32 => Value::F32((0..lanes).map(|_| (next() % 16) as f32 / 8.0).collect()),
+        Dtype::F32 => Value::F32((0..lanes).map(|_| (next() % 16) as f32 / 8.0).collect()),
+        // A channel carries one of the four dtypes ETA computes in —
+        // `eta_exec::Value`'s own arms, and no more — so anything else names
+        // no lane on either half of this diff and there is no cell to hand
+        // them. Stated as a refusal rather than as a zero: a subject whose
+        // channel is a dtype the interpreter cannot hold would otherwise be
+        // compared against a fabrication.
+        other => panic!(
+            "{other:?} is not a dtype a channel carries, so this diff has no cell for it"
+        ),
     }
 }
 
-fn wire(value: &Value, dtype: DType, lanes: usize) -> Vec<u8> {
+fn wire(value: &Value, dtype: Dtype, lanes: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; wire_cell_bytes(dtype, lanes)];
     encode_wire(value, &mut bytes);
     bytes
@@ -492,7 +492,7 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
     // a plan's shapes are symbolic and a package's are not, and the number
     // that reconciles them cannot be guessed.
     for value in &package.values {
-        if value.source != ValueSource::Intrinsic {
+        if value.source != ValueOrigin::Intrinsic {
             continue;
         }
         assert_ne!(
@@ -552,14 +552,15 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
             .write(0, &bytes)
             .unwrap_or_else(|error| panic!("{name}: staging the readout: {error}"));
         // A BUFFER AND A BYTE OFFSET, WHERE THE CUDA TWIN TAKES AN ADDRESS AND
-        // FIVE WORDS. Metal binds an object: the row width and the row offset
-        // the CUDA side writes into side tables are, here, the op record the
-        // region was planned with (`logits + imm2 * imm`) and the encoder's own
-        // `setBuffer:offset:atIndex:`. The rows begin at the base, so the
-        // offset is zero and there is no storage word to state — the runtime
-        // reads `bfloat` and only `bfloat`.
+        // FIVE WORDS. Metal binds an object: the row offset the CUDA side
+        // writes into a side table is the encoder's own
+        // `setBuffer:offset:atIndex:`, and the rows begin at the base, so it
+        // is zero. The width and the dtype travel because the slot table
+        // ARGUES with them — `Prepared::bind_intrinsic` holds them against the
+        // row width the program's own shapes resolved to — and this staging
+        // is `VOCAB`-wide `bfloat`, which is what those shapes say.
         plane
-            .bind_intrinsic(instance, IntrinsicId::Logits, &buffer, 0)
+            .bind_intrinsic(instance, IntrinsicId::Logits, &buffer, 0, VOCAB, Dtype::Bf16)
             .unwrap_or_else(|error| panic!("{name}: binding the readout: {error}"));
         Some(buffer)
     };
@@ -575,6 +576,13 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
             rows,
             vocab: VOCAB,
             mtp_draft_row: None,
+            // No score rectangle either, and for the same reason one buffer
+            // deep: the score plane is not logits-shaped, so it would need a
+            // second rectangle this plane has no index for, and
+            // `program::session` refuses `needs_attn_scores` outright. A
+            // subject that observed attention could not be seated here at
+            // all, so this is unreachable rather than untested.
+            attn_score: None,
         }
     };
 
@@ -862,7 +870,7 @@ fn a_source_metal_refuses_is_a_named_deterministic_refusal_and_nothing_else() {
     assert!(
         matches!(
             refusal,
-            engine_metal::Fault::Compile(engine::Failure::Deterministic { .. })
+            engine_metal::Fault::Compile(eta_exec::Failure::Deterministic { .. })
         ),
         "a source the Metal compiler rejects is rejected forever, so it must be \
          Deterministic: {text}"

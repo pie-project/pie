@@ -192,6 +192,7 @@ fn same_mass(left: &[Vec<LayerScores>], right: &[Vec<LayerScores>], what: &str) 
 /// composition, and P4's table must answer `Copy` for it at this fire's
 /// bucket. NO DEVICE — it is a statement about the bake.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_composition_fragments_a_window_and_the_table_asks_for_a_copy() {
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let compiled = compile(&trace, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
@@ -199,11 +200,11 @@ fn the_composition_fragments_a_window_and_the_table_asks_for_a_copy() {
     // The three lanes of `fire_it`, as words: a capturing decode, a capturing
     // prefill and a plain prefill.
     let lanes = [
-        engine::fire::Lane::new(word(1, true), 1),
-        engine::fire::Lane::new(word(5, true), 5),
-        engine::fire::Lane::new(word(4, false), 4),
+        model_exec::fire::Lane::new(word(1, true), 1),
+        model_exec::fire::Lane::new(word(5, true), 5),
+        model_exec::fire::Lane::new(word(4, false), 4),
     ];
-    let fire = engine::fire::compose(&compiled, &BUDGETS, &lanes).expect("the fire composes");
+    let fire = model_exec::fire::compose(&compiled, &BUDGETS, &lanes).expect("the fire composes");
     // An empty lattice is one implicit bucket, at index 0 — which is what the
     // shell computes too, and the number the table is read at.
     let bucket = 0u32;
@@ -215,7 +216,7 @@ fn the_composition_fragments_a_window_and_the_table_asks_for_a_copy() {
             continue;
         }
         fragmented += 1;
-        if engine::fire::fallback::copies(&compiled, &region.mask, bucket) {
+        if model_exec::fire::fallback::copies(&compiled, &region.mask, bucket) {
             copied += 1;
         }
     }
@@ -245,6 +246,7 @@ fn the_composition_fragments_a_window_and_the_table_asks_for_a_copy() {
 /// cold first fire and a warm second one are two tactic ladders and the
 /// identity would be between different arithmetic.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_same_fragmented_fire_split_and_copied_is_the_same_bytes_in_fewer_launches() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the copy/split diff") else {
@@ -330,11 +332,11 @@ fn predicted() -> (u32, u32) {
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let compiled = compile(&trace, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
     let lanes = [
-        engine::fire::Lane::new(word(1, true), 1),
-        engine::fire::Lane::new(word(5, true), 5),
-        engine::fire::Lane::new(word(4, false), 4),
+        model_exec::fire::Lane::new(word(1, true), 1),
+        model_exec::fire::Lane::new(word(5, true), 5),
+        model_exec::fire::Lane::new(word(4, false), 4),
     ];
-    let fire = engine::fire::compose(&compiled, &BUDGETS, &lanes).expect("the fire composes");
+    let fire = model_exec::fire::compose(&compiled, &BUDGETS, &lanes).expect("the fire composes");
     let mut fragmented = 0u32;
     let mut extra = 0u32;
     for region in compiled.template() {
@@ -372,6 +374,7 @@ fn predicted() -> (u32, u32) {
 /// and copied is the same bytes, and the copied region costs one launch where
 /// the split cost three.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_window_in_three_pieces_becomes_one_launch_and_still_the_same_bytes() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready_wide("the three-run copy") else {
@@ -490,13 +493,13 @@ fn predicted_wide() -> (u32, u32) {
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let compiled = compile(&trace, &WIDE, &DeviceProfile::default()).expect("the SKU bakes");
     let lanes = [
-        engine::fire::Lane::new(wide_word(5, true, false), 5),
-        engine::fire::Lane::new(wide_word(3, false, false), 3),
-        engine::fire::Lane::new(wide_word(4, true, true), 4),
-        engine::fire::Lane::new(wide_word(1, false, false), 1),
-        engine::fire::Lane::new(wide_word(1, true, false), 1),
+        model_exec::fire::Lane::new(wide_word(5, true, false), 5),
+        model_exec::fire::Lane::new(wide_word(3, false, false), 3),
+        model_exec::fire::Lane::new(wide_word(4, true, true), 4),
+        model_exec::fire::Lane::new(wide_word(1, false, false), 1),
+        model_exec::fire::Lane::new(wide_word(1, true, false), 1),
     ];
-    let fire = engine::fire::compose(&compiled, &WIDE, &lanes).expect("the five lanes compose");
+    let fire = model_exec::fire::compose(&compiled, &WIDE, &lanes).expect("the five lanes compose");
     let mut fragmented = 0u32;
     let mut extra = 0u32;
     for region in compiled.template() {
@@ -572,6 +575,7 @@ fn bf16_bits(value: f32) -> u16 {
 /// Both runs are interleaved (split, copy, split, copy) so a device that
 /// drifts under thermal load drifts through both.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn what_a_copy_and_a_split_cost_on_this_device() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the copy/split timing") else {
@@ -648,6 +652,7 @@ fn what_a_copy_and_a_split_cost_on_this_device() {
 /// The composition is repeated so it reaches a capture and then a replay,
 /// which is `export_axes`'s own recipe for the split.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_copied_window_replays_out_of_a_recorded_graph_identically() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the recorded copy") else {
@@ -775,6 +780,7 @@ fn load(what: &str, budget: Budget, slots: u32) -> Option<(Shell, tokenizer::Tok
         contract: &contract,
         checkpoint: &checkpoint,
         budget,
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,

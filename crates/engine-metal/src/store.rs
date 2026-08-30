@@ -5,7 +5,7 @@
 //! token lands in is [`kv`]'s arithmetic, backend-neutral and host-tested;
 //! this module owns only what that arithmetic cannot: the reservation, and
 //! the [`KvPool`]/[`RecurrentPool`] rows the dispatch arms resolve a cache id
-//! to. The split is design §6's `engine::store` / shell `store/` line, drawn
+//! to. The split is design §6's `model_exec::store` / shell `store/` line, drawn
 //! here ahead of the module that will hold the first half — and [`kv`] itself
 //! is the same file on both shells, which is the cheapest possible proof that
 //! the line is in the right place.
@@ -26,6 +26,22 @@
 //! [`Pools::clear`] synchronous and streamless, and it makes the ORDER — the
 //! clear before the command buffer that reads the slot is committed — a
 //! property of the call site rather than of a stream token.
+//!
+//! **AND UNDER RUN-AHEAD THAT ORDER IS NOT FREE.** A `memset` is not ordered
+//! against a command buffer already on the queue, so a fire path with steps in
+//! flight has to DRAIN before it clears a slot one of them may be reading.
+//! [`Pools::has_state`] is what keeps that from being a tax on every prefill:
+//! only a plan with a `CacheRow::State` has anything here to zero, and every
+//! attention-only artifact this shell serves answers no.
+//!
+//! # And the other half of design §8: admission
+//!
+//! This module implements [`engine::frame::Supply`]. The reservation is fixed
+//! — carved at the deployment's ceiling at load, never grown — so `commit` is
+//! a ceiling check at the RIGHT INSTANT rather than a physical mapping, and
+//! `trim` moves a watermark rather than unmapping a page. Both readings
+//! satisfy the contract, and the difference is visible as
+//! `PoolFacts::elastic_page_bytes`, which this plane answers zero.
 //!
 //! # Sizes come off the plan, not off a config
 //!
@@ -77,20 +93,20 @@ use crate::store::kv::{Facts, Paging};
 
 /// The neutral store's refusals, in this shell's vocabulary.
 ///
-/// **THE CONDITION IS SHARED AND THE SENTENCE IS NOT.** `engine::store` owns
+/// **THE CONDITION IS SHARED AND THE SENTENCE IS NOT.** `model_exec::store` owns
 /// the arithmetic that decides a lane overran its block or a value's width is
 /// symbolic; each shell owns how that reads to somebody holding a stack trace
 /// ("the load reserved" here, "the shell reserved" on the CUDA plane). This
 /// is the one place the two meet, and it is a variant-for-variant map because
 /// both shells already carried these three under these names.
-impl From<engine::store::Fault> for Fault {
-    fn from(fault: engine::store::Fault) -> Fault {
+impl From<model_exec::store::Fault> for Fault {
+    fn from(fault: model_exec::store::Fault) -> Fault {
         match fault {
-            engine::store::Fault::Ceiling { what, need, have } => {
+            model_exec::store::Fault::Ceiling { what, need, have } => {
                 Fault::Ceiling { what, need, have }
             }
-            engine::store::Fault::Unbound { what } => Fault::Unbound { what },
-            engine::store::Fault::Straddled {
+            model_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
+            model_exec::store::Fault::Straddled {
                 value,
                 node,
                 planned,
@@ -211,6 +227,15 @@ pub struct Pools {
     slabs: Vec<Buffer>,
     shapes: Vec<Shape>,
     paging: Paging,
+    /// **The highest demand any admitted frame has stated**, per arena.
+    ///
+    /// Not a physical commitment — this plane reserves at the load's ceiling
+    /// and never grows (see the [`Supply`](engine::frame::Supply) impl) — so
+    /// this is the OBSERVABLE that says admission is doing arithmetic rather
+    /// than nodding: `pool_high_water_bytes` is read off it, and a load that
+    /// never rose above a fraction of its reservation can be seen to have
+    /// been carved too large.
+    watermark: engine::frame::Demand,
 }
 
 impl Pools {
@@ -285,7 +310,31 @@ impl Pools {
             slabs,
             shapes,
             paging,
+            watermark: engine::frame::Demand::ZERO,
         })
+    }
+
+    /// **Does any cache row carry recurrent state?**
+    ///
+    /// Asked by the fire path for one reason and it is an ordering one: a
+    /// sequence beginning in a slot another sequence used has to have that
+    /// slot's banks zeroed, [`Pools::clear`] does it with a host `memset`
+    /// through the shared mapping, and a `memset` is not ordered against a
+    /// command buffer the device is still reading. A plan with no `State`
+    /// row has nothing to clear and therefore nothing to order, which is
+    /// every attention-only artifact this shell serves — so the run-ahead
+    /// never pays for the exception it does not have.
+    #[must_use]
+    pub fn has_state(&self) -> bool {
+        self.shapes
+            .iter()
+            .any(|shape| matches!(shape, Shape::State { .. }))
+    }
+
+    /// The highest demand admission has committed. See the field.
+    #[must_use]
+    pub fn watermark(&self) -> engine::frame::Demand {
+        self.watermark
     }
 
     /// How the pages are handed out.
@@ -429,6 +478,96 @@ impl Pools {
             slab.zero_span(u64::from(slot) * bytes, bytes)?;
         }
         Ok(())
+    }
+}
+
+/// **The engine's half of memory, on a plane whose reservation is fixed**
+/// (alto design §8; article 8: the runtime owns policy, the engine owns
+/// supply).
+///
+/// [`Pools::reserve`] carves every cache row at the deployment's ceiling at
+/// LOAD, so there is no physical growth for admission to drive and
+/// `PoolFacts::elastic_page_bytes` answers zero. The contract says both
+/// readings satisfy it — *"a shell that has not been converted still carves
+/// fixed pools at load, and for it `commit` is the ceiling check it already
+/// had and `trim` has nothing to give back"* — and this is that shell.
+///
+/// **THE POINT OF ASKING ANYWAY IS THE INSTANT, NOT THE BYTES** (article 4).
+/// The two refusals below are the ones `kv::geometry_with` already raises, to
+/// the variant and to the `what` string; what admission buys is that they are
+/// raised BEFORE any command buffer is opened, on a value the frame's steps
+/// have taken the union of, so an `Impossible` frame leaves nothing behind to
+/// undo. Past this call the fire is success-only.
+///
+/// The day this plane grows an `MTLHeap` under the pools, `commit` is where
+/// the growth goes and nothing above it changes — which is the whole reason
+/// the question is asked here rather than in the page arithmetic.
+impl engine::frame::Supply for Pools {
+    type Error = Fault;
+
+    fn commit(&mut self, demand: engine::frame::Demand) -> Result<()> {
+        // Only the slots this shell PAGES are its supply. A lane that brought
+        // its own page table brought its own addressing with it (article 8:
+        // engine page ids are the runtime's, the shell's paging is sizing) —
+        // but a page id is still a page id, and the demand this is handed is
+        // the highest one the frame will address plus one, whoever minted it.
+        if demand.state_slots > self.paging.slots {
+            return Err(Fault::Ceiling {
+                what: "recurrent slots",
+                need: u64::from(demand.state_slots),
+                have: u64::from(self.paging.slots),
+            });
+        }
+        let pages = self.paging.pages();
+        if u64::from(demand.kv_pages) > pages {
+            return Err(Fault::Ceiling {
+                what: "kv pages",
+                need: u64::from(demand.kv_pages),
+                have: pages,
+            });
+        }
+        // **THE THIRD ARENA IS EMPTY AND IS STILL ASKED ABOUT.** This plane
+        // grants no per-fire workspace — `kernels-metal`'s plan builders are
+        // pure carriers with no schedule and no split-kv partials to hold
+        // (`inputs.rs`'s opening note) — so every `Prepared` here states zero
+        // and this arm never fires. It is written rather than ignored because
+        // a `Demand` arriving with bytes in it would mean a builder had grown
+        // one, and the honest answer to that is a named ceiling rather than
+        // silence.
+        if demand.workspace > 0 {
+            return Err(Fault::Ceiling {
+                what: "pool workspace bytes",
+                need: demand.workspace,
+                have: 0,
+            });
+        }
+        // Past the refusals, and only past them: nothing above this line
+        // wrote anything, which is article 4's zero side effects.
+        self.watermark = self.watermark.union(demand);
+        Ok(())
+    }
+
+    /// **Nothing is unmapped, and the hint is still recorded.**
+    ///
+    /// A fixed reservation has no tail to give back — the bytes were taken
+    /// from the device at load and are held until the load ends — so this
+    /// method cannot do the thing its name promises on the elastic plane.
+    /// What it can do is stop the watermark from being a ratchet: a caller
+    /// that states a residency below what has been committed is telling this
+    /// pool that the high water it is reporting is stale, and reporting a
+    /// stale one would make a load look tighter than it is.
+    ///
+    /// **THE HINT IS A RESIDENCY STATEMENT AND ITS TRUTH IS THE CALLER'S**
+    /// (the trait's own note). Nothing here invents a watermark of its own,
+    /// and nothing here refuses one either: the cost of being wrong on this
+    /// plane is one wrong number in a footprint line, not a page somebody's
+    /// prefix was living in.
+    fn trim(&mut self, hint: engine::frame::Demand) {
+        self.watermark = engine::frame::Demand {
+            kv_pages: self.watermark.kv_pages.min(hint.kv_pages),
+            state_slots: self.watermark.state_slots.min(hint.state_slots),
+            workspace: self.watermark.workspace.min(hint.workspace),
+        };
     }
 }
 

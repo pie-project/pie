@@ -708,6 +708,9 @@ instantiate_sdpa_tiled_impl("sdpa_paged_tiled_sink", bfloat16, bfloat, 64, 64, t
       device float*, uint3, uint3, uint, uint);
 
 instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 64, 64, true)
+instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 128, 128, true)
+instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 256, 256, false)
+instantiate_sdpa_tiled_lse("sdpa_paged_tiled_lse", bfloat16, bfloat, 512, 512, false)
 
 #define instantiate_sdpa_paged_impl(fn, name, itype, d, v, sink)           \
   template [[host_name(fn "_" #name "_d_" #d)]]                            \
@@ -744,6 +747,9 @@ instantiate_sdpa_paged_sink(bfloat16, bfloat, 64, 64)
       uint3, uint3, uint, uint);
 
 instantiate_sdpa_paged_lse(bfloat16, bfloat, 64, 64)
+instantiate_sdpa_paged_lse(bfloat16, bfloat, 128, 128)
+instantiate_sdpa_paged_lse(bfloat16, bfloat, 256, 256)
+instantiate_sdpa_paged_lse(bfloat16, bfloat, 512, 512)
 
 #define instantiate_sdpa_paged_p32(name, itype, d, v)                       \
   template [[host_name("sdpa_paged_decode_" #name "_d_" #d "_p32")]]        \

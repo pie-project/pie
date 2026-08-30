@@ -74,7 +74,7 @@
 use core::ffi::c_void;
 use core::fmt;
 
-use engine::law::Refuse;
+use model_exec::law::Refuse;
 
 use crate::device::graph::Graph;
 use crate::device::nodes::{self, Node, Param, Walked};
@@ -103,7 +103,7 @@ use crate::error::Result;
 /// WHAT the number is. A two-capture diff observes rather than solves, so the
 /// law is always a [`Law::Const`] of the value the new capture wants — which
 /// is exactly the claim `cudaGraphExecKernelNodeSetParams` is handed.
-pub use engine::law::{At, Component, Law};
+pub use model_exec::law::{At, Component, Law};
 
 // ─────────────────────────────────────────────────────────────────────────
 // The fingerprint

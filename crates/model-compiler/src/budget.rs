@@ -16,6 +16,14 @@
 ///
 /// A BUDGET IS NOT AN ADMISSION CAP (decision #17). Exceeding one is a load
 /// that is refused at compile time, not a request that is queued at run time.
+///
+/// ONE ROW AXIS, AND SINCE M1 THAT IS SAID OUT LOUD. This is the TOKEN
+/// rectangle's ceilings; a deployment that also serves patch rows states
+/// theirs beside it in [`Budgets`], which is the same doctrine over two row
+/// spaces rather than a second place a dim is sized. Nothing here moved, and
+/// an artifact baked through [`compile`](crate::compile) against this alone is
+/// byte for byte the one this compiler produced before the second axis
+/// existed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Budget {
     /// The most requests one fire may carry. `Dim::Lanes` is this number.
@@ -39,6 +47,167 @@ pub struct Budget {
     /// than there is room for is a refusal with a number in it.
     pub max_adapters: u32,
 }
+
+/// The ceilings a fire is baked against, ONE ROW AXIS AT A TIME.
+///
+/// **EVERY SYMBOLIC DIM IS STILL SIZED IN THE BUDGETS AND NOWHERE ELSE** —
+/// there are simply two row spaces to size now (multimodal §5.1). [`Budget`]
+/// above is the token rectangle's, whole and unchanged; [`patches`](Budgets::
+/// patches) is the second axis's, and a third (the per-key attention-score
+/// extent, attn-score §6.1) lands here as one more field rather than as a
+/// parallel invention.
+///
+/// WHY A CONTAINER AND NOT TWO MORE FIELDS ON `Budget`. Because the token
+/// axis's ceilings are exactly what every caller in the tree already holds and
+/// exactly what a text-only deployment has to say, and growing the struct
+/// would make every one of them state a second axis they do not serve.
+/// [`compile`](crate::compile) is the one-axis door and stays the signature it
+/// was; [`compile_axes`](crate::compile_axes) is the same pass told about a
+/// second axis. `Budgets::from(budget)` is the conversion, and it is the
+/// identity as far as any pre-campaign artifact is concerned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Budgets {
+    /// The token rectangle's ceilings — `Dim::Tokens`, `Dim::Lanes` and their
+    /// kin.
+    pub tokens: Budget,
+    /// **THE SECOND ROW AXIS'S SEAT** (multimodal §5.5), or `None` for a
+    /// deployment that admits no patch rows.
+    ///
+    /// `None` IS NOT `max_patches: 0`, AND THE DIFFERENCE IS A REFUSAL. Zero
+    /// patch rows would be a ceiling every rectangle is empty under — the
+    /// same thing [`Budget::max_tokens`] is refused for — so a plan that
+    /// states `Dim::Patches` against `None` is a load that does not happen,
+    /// named at the door, rather than a tower carved at nothing. A plan that
+    /// states NO patch row is exempt, which is what makes this field free for
+    /// every pre-campaign SKU: the artifact it bakes is bit-identical whether
+    /// the deployment declared a patch ladder or not.
+    ///
+    /// A SEAT AND NOT A VECTOR. §5.5's finding is that the ladder splits per
+    /// axis and so does everything indexed by it: the patch ladder is its own
+    /// ascending list, [`FallbackTable`](crate::FallbackTable) rows on the
+    /// patch axis index THIS vector, and `LATTICE_FLOOR = 8`'s justification
+    /// does not travel (see [`PATCH_LATTICE_FLOOR`]).
+    pub patches: Option<PatchLadder>,
+}
+
+impl Budgets {
+    /// The token axis alone — what every pre-campaign deployment admits, and
+    /// what [`compile`](crate::compile) passes.
+    #[must_use]
+    pub fn of(tokens: Budget) -> Budgets {
+        Budgets {
+            tokens,
+            patches: None,
+        }
+    }
+
+    /// The same, with a patch axis admitted — what a deployment serving a
+    /// vision tower passes.
+    #[must_use]
+    pub fn with_patches(mut self, patches: PatchLadder) -> Budgets {
+        self.patches = Some(patches);
+        self
+    }
+
+    /// The ceiling `Dim::Patches` is sized at, and `0` for a deployment that
+    /// declared no patch axis — which is the number that makes a patch
+    /// rectangle empty, and therefore the number the bake refuses a
+    /// patch-stating plan against rather than carving.
+    #[must_use]
+    pub fn max_patches(&self) -> u32 {
+        self.patches.as_ref().map_or(0, |ladder| ladder.max_patches)
+    }
+
+    /// The ceiling `Dim::Images` is sized at, and `0` for a deployment that
+    /// declared no patch axis — the patch rectangle's lane count, on the same
+    /// terms [`max_patches`](Budgets::max_patches) is its row count.
+    #[must_use]
+    pub fn max_images(&self) -> u32 {
+        self.patches.as_ref().map_or(0, |ladder| ladder.max_images)
+    }
+}
+
+impl From<Budget> for Budgets {
+    fn from(tokens: Budget) -> Budgets {
+        Budgets::of(tokens)
+    }
+}
+
+impl From<&Budget> for Budgets {
+    fn from(tokens: &Budget) -> Budgets {
+        Budgets::of(tokens.clone())
+    }
+}
+
+/// What a fire is allowed to be on the PATCH axis: a ceiling and a ladder of
+/// its own.
+///
+/// **ITS OWN, BECAUSE THE TOKEN AXIS'S NUMBERS ARE ABOUT TOKENS.** The token
+/// lattice is doubling from 8 to `max_tokens` because that is where a decode
+/// gemv arm stops beating a gemm; patches-per-image is fixed by the image
+/// resize policy, so the patch ladder is a handful of rungs at multiples of
+/// that number and a fire either has an image or does not. Sizing one off the
+/// other would be a number carrying somebody else's argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchLadder {
+    /// The most patch rows one fire may carry, across every image of every
+    /// lane in it. `Dim::Patches` is this number.
+    pub max_patches: u32,
+    /// The shape lattice a fire's PATCH count is rounded up to — one
+    /// immutable graph per entry, in the tower's own capture unit. Ascending,
+    /// each entry at most [`max_patches`](PatchLadder::max_patches).
+    ///
+    /// **"6 + 6, NOT 6 × 6" IS A PROPERTY OF THIS BEING A SECOND VECTOR**
+    /// (multimodal §5.3). One ladder per axis is one exec per axis per fire;
+    /// a single ladder carrying both numbers would be the product.
+    pub buckets: Vec<u32>,
+    /// The most IMAGES one fire may carry, over every lane in it.
+    /// `Dim::Images` is this number and `Dim::ImagesPlus(k)` is `this + k`.
+    ///
+    /// **THE PATCH AXIS'S `max_lanes`, AND NOT DERIVED FROM EITHER OF THE
+    /// NUMBERS THAT LOOK LIKE IT.** It is not `Budget::max_lanes`: a lane may
+    /// submit three images or none, so the two counts are two numbers in any
+    /// mixed fire. And it is not [`max_patches`](PatchLadder::max_patches)
+    /// either, even though an image contributes at least one patch row —
+    /// reading it off that would reserve the `images + 1` indptr at the patch
+    /// ceiling, which is a column sized by an argument that is not about it.
+    /// A deployment states it, the way it states every other ceiling here,
+    /// and the resize policy that fixes patches-per-image is what makes it a
+    /// small number.
+    pub max_images: u32,
+}
+
+impl PatchLadder {
+    /// A ceiling with no ladder — one implicit rung at the ceiling, which is
+    /// what the token axis means by an empty `buckets` too.
+    #[must_use]
+    pub fn new(max_patches: u32, max_images: u32) -> PatchLadder {
+        PatchLadder {
+            max_patches,
+            buckets: Vec::new(),
+            max_images,
+        }
+    }
+}
+
+/// The smallest rung a PATCH ladder should state, and the argument is the
+/// tower's rather than the trunk's.
+///
+/// **`LATTICE_FLOOR = 8` DOES NOT TRAVEL** (multimodal §5.5). The token
+/// lattice floors at 8 because below it a decode's gemv arm beats the gemm
+/// and the rungs stop buying anything — a claim about ONE-ROW-PER-LANE
+/// decode, which the patch axis has no analogue of. A tower fire is a prefill
+/// every time: the smallest thing it can carry is ONE IMAGE, and one image is
+/// `(resize / patch)²` rows before the spatial merge divides it — 256 patches
+/// at 224/14, 64 after a 2×2 merge. So the floor is the smallest whole image
+/// a resize policy admits, and 64 is that number for the catalog's
+/// patch-16 / merge-2 towers. A rung below it would round up to a fire that
+/// cannot exist.
+///
+/// STATED HERE AND CHOSEN BY THE DEPLOYMENT. Like every other number in this
+/// module it is a statute: a shell whose resize policy fixes a different
+/// grid states its own rungs, and this is the argument it has to beat.
+pub const PATCH_LATTICE_FLOOR: u32 = 64;
 
 impl Budget {
     /// The ceilings, with no bucket lattice and no adapter pool — what a test

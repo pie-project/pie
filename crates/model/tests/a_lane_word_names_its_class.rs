@@ -104,7 +104,7 @@ fn a_one_token_lane_lands_in_the_decode_class() {
 /// Every word every SKU's classifier can produce names a class of that SKU's
 /// own plan.
 ///
-/// A word with no class is the refusal `engine_api::fire::Lane` describes —
+/// A word with no class is the refusal `engine::fire::Lane` describes —
 /// "the runtime and the shell disagree about what is loaded" — and it is a fact
 /// about a build, not about a deployment, so it is settled here rather than at
 /// the first fire.

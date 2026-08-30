@@ -2,8 +2,8 @@
 //! per IR variant; every arm rotates halves, so the interleaved layouts that
 //! reach a shader do so as a stated flag, never as a different loop.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, head_group, nonzero, refuse, stated};
 use crate::tensor::Tensor;
@@ -19,7 +19,7 @@ fn rope_grid(
     width: u32,
     head_dim: u32,
     rows: u32,
-) -> Result<[u32; 3], KernelError> {
+) -> Result<[u32; 3], Error> {
     nonzero(op, "the rotated width", rotary)?;
     nonzero(op, "the head width this rotation states", head_dim)?;
     nonzero(op, "rows", rows)?;
@@ -58,7 +58,7 @@ fn rotate_geometric(
     base: f32,
     head_dim: u32,
     rotary: u32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "neox_mb_bfloat16" });
     positions_stream(op, positions, x);
     let lanes = rope_grid(op, rotary, x.width, head_dim, x.rows)?;
@@ -86,7 +86,7 @@ fn rotate_proportional(
     base: f32,
     head_dim: u32,
     rotary: u32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "neox_prop_mb_bfloat16" });
     positions_stream(op, positions, x);
     let lanes = rope_grid(op, rotary, x.width, head_dim, x.rows)?;
@@ -113,7 +113,7 @@ fn rotate_tail(
     head_dim: u32,
     rotary: u32,
     interleaved: bool,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "neox_last_mb_bfloat16" });
     positions_stream(op, positions, x);
     let lanes = rope_grid(op, rotary, x.width, head_dim, x.rows)?;
@@ -173,7 +173,7 @@ fn rotate_ramped(
     head_dim: u32,
     ramp: Ramp,
     interleaved: bool,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let entry = dtype_dispatch!(op, x.dtype, { Bf16 => "neox_yarn_mb_bfloat16" });
     positions_stream(op, positions, x);
     let lanes = rope_grid(op, head_dim, x.width, head_dim, x.rows)?;
@@ -201,7 +201,7 @@ pub fn full(
     head_dim: u32,
     theta: f32,
     interleaved: bool,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_full";
     if interleaved {
         return Err(refuse(
@@ -223,7 +223,7 @@ pub fn partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
@@ -238,7 +238,7 @@ pub fn partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     rotate_proportional(
         ctx,
         "elementwise.rope_partial_q",
@@ -260,7 +260,7 @@ pub fn partial_last(
     head_dim: u32,
     theta: f32,
     interleaved: bool,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial_last";
     if rotary_dim > head_dim {
         return Err(refuse(
@@ -297,7 +297,7 @@ pub fn yarn(
     attention_factor: f32,
     original_max_position: u32,
     interleaved: bool,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_yarn";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let max_position = stated(

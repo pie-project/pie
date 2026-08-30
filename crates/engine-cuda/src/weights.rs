@@ -61,26 +61,45 @@
 //! alignment and the tile budget — but the arena handed to the executor is a
 //! `Vec<u8>`, so `ArenaBacking::runs_named_kernels` is false and every cast
 //! runs host-side. For the SKUs this shell serves today that is a handful of
-//! bf16→f32 widenings on norm scales; the device path
-//! (`model_loader::executor::cuda`) is a load-time optimisation, and it does
-//! not build against the current `kernels-cuda` (its imports name a `quant`
-//! module and `In`/`Out` marks that the menlo rewrite retired). Landing the
-//! bytes correctly first, quickly second, is the right order.
+//! bf16→f32 widenings on norm scales; the device path is a load-time
+//! optimisation. Landing the bytes correctly first, quickly second, is the
+//! right order.
+//!
+//! The device path is `arena::CudaArena`, beside this module, behind
+//! `feature = "_cuda"`. It moved here from the loader, which had carried it
+//! behind an optional `cuda` feature that no engine's `src/` ever turned on —
+//! see that module's header for why the seam is an `ArenaBacking` the
+//! consumer supplies rather than a second executor. Binding it is one line
+//! here (hand `Execution::arena` a `CudaArena` over the store's allocation
+//! instead of a `Vec<u8>`) and is not taken yet; `tests/gpu_transform_parity.rs`
+//! is what holds the device answer bit-identical to the host one until it is.
+
+/// The device load arena and its four transforms — the other answer to "why
+/// the transforms run on the host" above, gated on a chosen runtime because
+/// it is the only part of this crate's load path that calls one.
+#[cfg(feature = "_cuda")]
+pub mod arena;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
+// The two readers. `zt` comes in by module because its door is spelled
+// `parse` — the module path is what says what is parsed, and a bare `parse`
+// beside `parse_metadata` would say nothing about which of the two doors
+// this line opened.
+use checkpoint::file::read::parse_metadata;
+use checkpoint::file::zt;
+use checkpoint::contract::ModelContract;
+use checkpoint::error::Error as LoadError;
+use checkpoint::executor::{Execution, sink::TensorSink};
+use checkpoint::plan::{LoadPlan, StorageTarget, compile};
+use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_cuda::Tensor;
 use model_ir::{Dtype, ParamSource, Trace};
-use model_loader::checkpoint;
-use model_loader::contract::ModelContract;
-use model_loader::error::Error as LoadError;
-use model_loader::executor::{Execution, sink::TensorSink};
-use model_loader::plan::{StorageTarget, compile};
-use model_loader::types::BackendKind;
 
 use crate::device::Buffer;
 use crate::error::{Fault, Result};
+use crate::experts::Attachments;
 use crate::run::{WeightRow, WeightTable};
 
 /// What a matrix operand wants under cuBLAS, and what `cudaMalloc` itself
@@ -148,6 +167,42 @@ struct Bank {
     adapters: u32,
     /// One adapter's bytes in this bank.
     slot: u64,
+    /// **ONE SLOT'S RECTANGLE**, which is the param's shape past the leading
+    /// adapters axis — `[rank, in]` for an `A` and `[out, rank]` for a `B`.
+    ///
+    /// Recorded because the SHARED-BLOB resolver needs it and nothing else
+    /// does: a file declares which way it was written (alto adapter §6.3's
+    /// out-major statute) and the only thing that can contradict the file is
+    /// the bank's own shape. `register_adapter` still checks bytes and only
+    /// bytes — a plane is one slot — so this adds no arm to the verb.
+    rows: u64,
+    /// The trailing half of that rectangle.
+    cols: u64,
+    /// One element of this bank's declared dtype, in bytes.
+    elem: u64,
+}
+
+/// **ONE BANK, AS THE SHARED-ADAPTER RESOLVER READS IT** (alto adapter §6.3).
+///
+/// Everything [`crate::blob`] needs to slice a `[layers, ...]` file into one
+/// full-capacity plane per bank: the name it registers under, the capacity,
+/// the slot's bytes, and the rectangle those bytes are. A flattened
+/// [`Bank`] — the resolver lives in another module and a private field is
+/// not a contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankSeat {
+    /// The param's own name, which is what a registration names.
+    pub name: String,
+    /// How many adapters it seats.
+    pub adapters: u32,
+    /// One adapter's bytes.
+    pub slot: u64,
+    /// The leading axis of one slot.
+    pub rows: u64,
+    /// The trailing axes of one slot, multiplied out.
+    pub cols: u64,
+    /// One element in bytes.
+    pub elem: u64,
 }
 
 /// The banks a plan declares, read off `ParamSource::Registered`.
@@ -171,12 +226,20 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
             } else {
                 place.bytes / u64::from(adapters)
             };
+            // The slot's own rectangle: the param's shape with the adapters
+            // axis cut off. `[adapters, rank, in]` is a `[rank, in]` slot and
+            // `[adapters, out, rank]` is an `[out, rank]` one — the same
+            // `rectangle` split the store's layout uses, one axis in.
+            let (rows, cols) = rectangle(param.shape.get(1..).unwrap_or(&[]));
             (
                 param.name.clone(),
                 Bank {
                     offset: place.offset,
                     adapters,
                     slot,
+                    rows,
+                    cols,
+                    elem: model_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
                 },
             )
         })
@@ -189,7 +252,7 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
 /// The same arithmetic [`Weights::resident`] does — every param's rows times
 /// width times element, each rounded up to the handle alignment — read off the
 /// PLAN alone. A pure function of the trace, so a load that a
-/// [`Residency`](engine::engine_api::load::Residency) budget cannot admit is
+/// [`Residency`](engine::load::Residency) budget cannot admit is
 /// refused before the device is touched rather than after the store is full.
 ///
 /// # Errors
@@ -210,23 +273,280 @@ pub fn device_demand(trace: &Trace) -> Result<u64> {
 /// computed a bank's size differently from the store that reserves it would
 /// be a plan about a different table.
 ///
+/// **THE TWO PACKED PLANES ARE DECLARED IN TWO DIFFERENT UNITS, AND
+/// `elem_bytes` CAN ANSWER FOR NEITHER.** `model_dsl::Weight::planes` gives an
+/// mxfp4 bank the rectangle it OCCUPIES — each 32-code block folded into a
+/// trailing axis of sixteen, which is the block's bytes — and gives an MLX
+/// affine bank its LOGICAL rectangle, four bits an element, because that is
+/// the shape its points index it by. So neither is `elements x element size`,
+/// and taking `elem_bytes`'s honest `None` for the four-bit code as a refusal
+/// is what refused every quantized SKU at its first param — which is the
+/// `no element size` this shell answered a gpt-oss load with until wave W-5.
+///
+/// The refusal STAYS for a storage element that genuinely has no byte size
+/// (`Dtype::Fp4`, a nibble with no declared packing): a plane whose length
+/// cannot be computed is not a plane a store can reserve, and it is said by
+/// name rather than guessed at.
+///
 /// # Errors
 ///
-/// [`Fault::Param`] for a param whose dtype the arena has no element size for.
+/// [`Fault::Param`] for a param declared in a storage element that has no
+/// byte size.
 pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
     trace
         .params
         .iter()
         .map(|param| {
-            let element =
-                model_compiler::arena::elem_bytes(param.dtype).ok_or_else(|| Fault::Param {
-                    name: param.name.clone(),
-                    why: "is declared in a packed storage element that has no element size",
-                })?;
             let (rows, width) = rectangle(&param.shape);
-            Ok(rows.saturating_mul(width).saturating_mul(element))
+            Ok(match param.dtype {
+                // The shape already folds a 32-code block into sixteen bytes,
+                // so the rectangle IS the byte count.
+                Dtype::Mxfp4 => rows.saturating_mul(width),
+                // The shape is logical and the element is a nibble: two codes
+                // to a byte, and an odd row rounds up rather than overlapping
+                // the next one.
+                Dtype::MlxU4 => rows.saturating_mul(width).div_ceil(2),
+                // The same bank at eight bits: one whole byte a code, so the
+                // logical rectangle IS the byte count and nothing rounds.
+                Dtype::MlxU8 => rows.saturating_mul(width),
+                other => {
+                    let element =
+                        model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
+                            name: param.name.clone(),
+                            why: "is declared in a packed storage element that has no \
+                                  element size",
+                        })?;
+                    rows.saturating_mul(width).saturating_mul(element)
+                }
+            })
         })
         .collect()
+}
+
+/// **EVERYTHING A LOAD CAN BE PLANNED AGAINST BEFORE A BYTE OF IT IS READ.**
+///
+/// Two facts, one plan compile — because both come off the same `LoadPlan` and
+/// compiling it twice to learn them separately would be paying twice for one
+/// answer.
+#[derive(Debug, Clone)]
+pub struct Prospect {
+    /// The split-plane pairings: which other params move when a packed bank
+    /// moves. What [`experts::Plan::of`] budgets groups with.
+    ///
+    /// [`experts::Plan::of`]: crate::experts::Plan::of
+    pub planes: Attachments,
+    /// **The warm-artifact key a FULLY RESIDENT load of this deployment
+    /// forms** — the name of the T2 source, and the reason a CAPPED load can
+    /// find one at all.
+    ///
+    /// A load's own key is a function of the layout it chose, so a capped load
+    /// and an uncapped load of one deployment key differently and neither can
+    /// find the other's file. The fix is not a second key format: it is that
+    /// the RESIDENT layout is a pure function of the trace
+    /// (`places(trace, &Plan::default())`), so any load can compute the key
+    /// the resident one would have used. That is this number, and it is what
+    /// makes "boot once uncapped, then serve capped out of the artifact" a
+    /// sentence an operator can act on.
+    pub resident_key: u64,
+}
+
+/// **A ROUTED BANK'S OTHER DEVICE PLANES AND THE T2 SOURCE'S NAME, OFF THE
+/// LOAD PLAN** — what [`experts::Plan::of`] and
+/// [`Residency::admit_tiers`](engine::load::Residency::admit_tiers) need
+/// before a byte is landed, and the reason they can be asked for without one.
+///
+/// A quantized bank is codes plus factors, and both are indexed by the number
+/// the routing vector carries — so a residency decision that moved the codes
+/// alone would leave the factors reading somebody else's expert
+/// (`crate::experts`'s header states it whole). The pairing is the LOAD
+/// PLAN's, read exactly as [`pairings`] reads it and never off a name; this
+/// door exists so that the decision can be made BEFORE [`Weights::resident`]
+/// reserves the store, which is what puts admission in front of the landing
+/// rather than behind it.
+///
+/// Costs one metadata parse and one plan compile, and reads no tensor bytes.
+///
+/// # Errors
+///
+/// [`Fault::Load`] for a checkpoint the contract does not fit,
+/// [`Fault::Param`] for an attachment this plan cannot resolve.
+///
+/// [`experts::Plan::of`]: crate::experts::Plan::of
+pub fn prospect(trace: &Trace, contract: &ModelContract, path: &Path) -> Result<Prospect> {
+    let metadata = if path.is_dir() {
+        parse_metadata(path)?
+    } else {
+        zt::parse(path)?
+    };
+    let landing = compile(
+        &metadata,
+        contract,
+        StorageTarget::for_backend(BackendKind::Cuda, 0, 1),
+    )?;
+    let index: BTreeMap<&str, usize> = trace
+        .params
+        .iter()
+        .enumerate()
+        .map(|(at, param)| (param.name.as_str(), at))
+        .collect();
+    let mut planes = Attachments::new();
+    for (name, pairing) in pairings(&landing, &index)? {
+        let Some(&at) = index.get(name) else {
+            continue;
+        };
+        planes.insert(at, vec![pairing.scales]);
+    }
+    Ok(Prospect {
+        planes,
+        resident_key: resident_key(trace, &landing, path)?,
+    })
+}
+
+/// **The key a FULLY RESIDENT load of this deployment forms** — see
+/// [`Prospect::resident_key`].
+///
+/// A pure function of the trace, the recipe and the checkpoint: the layout it
+/// hashes is `places(trace, &Plan::default())`, which is what an uncapped load
+/// lays out, whatever THIS load's budgets are. So a capped load computes the
+/// uncapped load's key exactly and names the file it wrote.
+///
+/// # Errors
+///
+/// [`Fault::Param`] for a param whose plane cannot be sized.
+fn resident_key(trace: &Trace, landing: &LoadPlan, path: &Path) -> Result<u64> {
+    let resident = places(trace, &crate::experts::Plan::default())?;
+    let layout: Vec<(u64, u64, u64)> = resident
+        .iter()
+        .map(|place| (place.offset, place.bytes, place.reserved))
+        .collect();
+    let total = resident.last().map_or(0, |p| p.offset + p.reserved);
+    // A plan that will not serialize is not a fault — it is a key this load
+    // cannot form, and a load with no key neither reads nor writes the cache.
+    // `0` is that answer, and no artifact is ever written under it because the
+    // writer takes the same `None` path.
+    let Ok(plan_json) = serde_json::to_vec(landing) else {
+        return Ok(0);
+    };
+    Ok(crate::weight_cache::Identity {
+        checkpoint: path,
+        trace_name: &trace.name,
+        plan_json: &plan_json,
+        layout: &layout,
+        total,
+    }
+    .key())
+}
+
+/// **Open the T2 source for this load, or answer why there is none.**
+///
+/// The artifact a FULLY RESIDENT load of this deployment wrote, under
+/// [`Prospect::resident_key`]. `None` for every load that was offered no cache
+/// directory, and for one whose deployment has not booted uncapped yet — which
+/// is not an error here: it becomes
+/// [`Residency::admit_tiers`](engine::load::Residency::admit_tiers)'s refusal,
+/// with the sentence that says what to do about it.
+///
+/// **THE KEY IS CHECKED AGAINST THE FILE'S OWN.** `Artifact::open` validates
+/// the format, the index and the lengths, and the key lives in the FILENAME —
+/// so a file moved or renamed under a key it does not carry would open and
+/// serve another deployment's weights. The header states its key; it is read
+/// back and compared here.
+#[must_use]
+pub fn spill_source(cache_dir: Option<&Path>, key: u64) -> Option<crate::weight_cache::Artifact> {
+    if key == 0 {
+        return None;
+    }
+    let dir = cache_dir?;
+    let artifact = crate::weight_cache::Artifact::open(&crate::weight_cache::artifact_path(dir, key))
+        .ok()?;
+    (artifact.key() == key).then_some(artifact)
+}
+
+/// One quantized weight's other plane, as a row of [`places`].
+#[derive(Debug, Clone, Copy)]
+struct Pairing {
+    scales: usize,
+}
+
+/// **THE SPLIT-PLANE PAIRINGS THIS LOAD PLAN STATES**, by the code plane's own
+/// name.
+///
+/// Every entry is recorded by whoever declared the scale tensor, at the point
+/// of declaring it (`QuantAttachment`) — a contract that shipped its own
+/// scales says so with `TensorContract::scaling`, and an encode the loader
+/// performs records the id itself. So the pair is READ here and never
+/// reconstructed: a `.scales` suffix matched against a param name is how a
+/// scale tensor gets read as the wrong bank's, silently, in a model that
+/// computes.
+///
+/// **ONE BANK FORM ON THIS PLANE.** The cuda shell stamps exactly one
+/// quantized routed point — mxfp4, e2m1 codes under raw e8m0 exponents
+/// (`linear::moe::matmul_select_bias` and its bias-free twin) — so an affine
+/// codec's `Bf16AffineFactors`, whose bank is `code * scale + zero`, is
+/// refused by name rather than seated without the half that centres it.
+///
+/// # Errors
+///
+/// [`Fault::Param`] for an attachment naming a plane this trace does not
+/// declare, or a scale form this shell has no point for.
+fn pairings<'a>(
+    landing: &'a LoadPlan,
+    index: &BTreeMap<&str, usize>,
+) -> Result<BTreeMap<&'a str, Pairing>> {
+    // Keyed by the id's own number: `TensorId` is `Hash` and `Eq` and not
+    // `Ord`, and a derive on the loader's type is not this shell's to add.
+    let named: BTreeMap<u32, &str> = landing
+        .tensors
+        .iter()
+        .map(|decl| (decl.id.0, decl.name.as_str()))
+        .collect();
+    let mut out = BTreeMap::new();
+    for attachment in &landing.attachments {
+        let Some(name) = named.get(&attachment.tensor.0) else {
+            continue;
+        };
+        // Only a plane the trace declares becomes a weight row; a contract may
+        // compute internal tensors, and an attachment on one of those is a
+        // pairing about bytes no `Def::Weight` names.
+        if !index.contains_key(name) {
+            continue;
+        }
+        let row = |id: TensorId, what: &'static str| -> Result<usize> {
+            named
+                .get(&id.0)
+                .and_then(|plane| index.get(plane))
+                .copied()
+                .ok_or_else(|| Fault::Param {
+                    name: (*name).to_string(),
+                    why: what,
+                })
+        };
+        match attachment.scale_form {
+            ScaleForm::RawE8M0 => {}
+            ScaleForm::Bf16AffineFactors | ScaleForm::F32Factors => {
+                return Err(Fault::Param {
+                    name: (*name).to_string(),
+                    why: "carries a scale form no point this shell stamps reads. The \
+                          cuda plane has one split-plane bank: mxfp4 e2m1 codes under \
+                          raw e8m0 exponents. An affine bank is `code * scale + zero` \
+                          and seating it without its zero points is the right spread \
+                          around the wrong centre — a model that computes and is wrong \
+                          — so it is refused here instead",
+                });
+            }
+        }
+        out.insert(
+            *name,
+            Pairing {
+                scales: row(
+                    attachment.scale_tensor,
+                    "is a quantized weight whose scales this plan does not publish as a \
+                     param of their own",
+                )?,
+            },
+        );
+    }
+    Ok(out)
 }
 
 impl Weights {
@@ -266,12 +586,9 @@ impl Weights {
         stream: *mut core::ffi::c_void,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
-            (checkpoint::read::parse_checkpoint_metadata(path)?, path)
+            (parse_metadata(path)?, path)
         } else {
-            (
-                checkpoint::zt::parse_checkpoint(path)?,
-                path.parent().unwrap_or(Path::new(".")),
-            )
+            (zt::parse(path)?, path.parent().unwrap_or(Path::new(".")))
         };
 
         // tp=1: the plan's `Shard::Cut` segments still describe the whole
@@ -289,8 +606,17 @@ impl Weights {
         // PINNED tier, whole, and the slab takes a copy of its first
         // `resident` slots afterwards. `None` for the degenerate plan, and
         // then nothing below this line is different from what it was.
+        // ── THE T2 SOURCE, OPENED BEFORE THE TIER THAT POINTS INTO IT.
+        //    The artifact a fully-resident load of this deployment wrote, found
+        //    under the key that load would have formed — `resident_key`'s doc
+        //    says why a capped load can name it. `None` for a plan that spills
+        //    nothing, which is every plan whose host budget held its groups.
+        let source = match plan.spill_demand() > 0 {
+            true => spill_source(cache_dir, resident_key(trace, &landing, path)?),
+            false => None,
+        };
         let mut experts = match plan.streams() {
-            true => Some(crate::experts::Tier::open(plan.clone())?),
+            true => Some(crate::experts::Tier::open(plan.clone(), source)?),
             false => None,
         };
 
@@ -340,6 +666,17 @@ impl Weights {
             None => false,
         };
 
+        // The plan's own name -> row map. Read by the landing sink to place an
+        // arriving tensor and by the pairing below to resolve an attachment's
+        // planes onto rows, so it is stated once above both rather than inside
+        // the branch that used to be its only reader.
+        let index: BTreeMap<&str, usize> = trace
+            .params
+            .iter()
+            .enumerate()
+            .map(|(at, param)| (param.name.as_str(), at))
+            .collect();
+
         let landed = if from_cache {
             // EVERY PARAM IS LANDED, because the blob is the whole table —
             // the layout is part of the key, so a restore that matched wrote
@@ -353,12 +690,6 @@ impl Weights {
             let mut scratch = vec![0u8; usize::try_from(landing.memory.arena_bytes()).unwrap_or(0)];
             let mut backing: &mut [u8] = &mut scratch;
 
-            let index: BTreeMap<&str, usize> = trace
-                .params
-                .iter()
-                .enumerate()
-                .map(|(at, param)| (param.name.as_str(), at))
-                .collect();
             let mut sink = Landing {
                 store: &mut store,
                 experts: experts.as_ref(),
@@ -380,10 +711,39 @@ impl Weights {
             // direction: a declined write is a counted line, not a failed
             // load.
             if let Some(key) = key {
-                crate::weight_cache::store(cache_dir, key, &store);
+                // **WITH THE PLANE-GROUP INDEX**, which is what turns the
+                // artifact from a boot accelerator into a serving-time T2
+                // source (alto streaming §0, build order item 2). One entry
+                // per param at plane zero: a split-plane bank is already two
+                // `Trace::params` rows on this plane, so each is its own
+                // group and the index's `plane` axis stays at zero — it is
+                // for a shell that puts both planes under one id, which this
+                // one does not.
+                //
+                // This runs on the RESIDENT path only (`key` is `None` for a
+                // streamed load), so the index it writes describes the whole
+                // table — which is exactly the file a later capped load maps.
+                let groups: Vec<crate::weight_cache::Group> = places
+                    .iter()
+                    .enumerate()
+                    .map(|(at, place)| crate::weight_cache::Group {
+                        id: u32::try_from(at).unwrap_or(u32::MAX),
+                        plane: 0,
+                        offset: place.offset,
+                        bytes: place.bytes,
+                        reserved: place.reserved,
+                    })
+                    .collect();
+                crate::weight_cache::store_indexed(cache_dir, key, &groups, &store);
             }
             landed
         };
+
+        // The pairings this landing states, read once. Empty for every SKU
+        // whose weights are all dense, which is every catalog row but
+        // gpt-oss's — and an empty map costs one walk of a vector nobody has
+        // pushed to.
+        let pairings = pairings(&landing, &index)?;
 
         let mut table = Vec::with_capacity(places.len());
         for (at, place) in places.iter().enumerate() {
@@ -400,30 +760,53 @@ impl Weights {
                     why: "is a plan param the load contract never published",
                 });
             }
-            // Every row of this catalog is one dense handle. A split-plane
-            // bank (`WeightRow::Planes`) arrives the day a SKU with mxfp4
-            // banks does, through the load plan's `attachments` — the
-            // pairing is stated there rather than guessed from a `.scales`
-            // suffix, which is how a scale tensor gets read as the wrong
-            // one's.
-            // **A STREAMED BANK IS STILL ONE DENSE HANDLE**, and it has to be:
-            // `Run::tensor` is the one resolution path and a second kind of
-            // weight row would be a second one. What the handle names is the
-            // SLAB — `resident` slots at the store's own address — and the
-            // table that says which expert is in which of them rides beside
-            // it in the row, as two device addresses the select kernel reads
-            // (alto design §7, wave D2). `rows` is the slot count rather than
-            // the expert count, which is honest: the numbers on a weight
+            // **A SPLIT-PLANE BANK IS TWO HANDLES UNDER ONE `Def::Weight`**
+            // (alto streaming §3 item 6, wave W-5). The pairing is the load
+            // plan's — stated by whoever declared the scale tensor rather than
+            // guessed from a `.scales` suffix, which is how a scale tensor
+            // gets read as the wrong bank's — and `Run::planes` is the one
+            // resolution that answers with both.
+            //
+            // **BOTH PLANES ARE BOUND AS `U8`.** The mxfp4 select reads them
+            // as `const u8*` and does its own block arithmetic
+            // (`quant.cuh`); the handle's dtype is what a `{:?}` prints, and
+            // naming an element the launch never indexes by would be a number
+            // nothing means. `rows x width` is the BYTE rectangle for both,
+            // because `plane_bytes` sizes an mxfp4 code plane at exactly its
+            // declared rectangle and an e8m0 exponent plane at one byte an
+            // entry.
+            //
+            // **A STREAMED DENSE BANK IS STILL ONE DENSE HANDLE**, and it has
+            // to be: `Run::tensor` is the one resolution path for it and a
+            // second kind of weight row would be a second one. What the handle
+            // names is the SLAB — `resident` slots at the store's own address
+            // — and the table that says which expert is in which of them rides
+            // beside it in the row, as two device addresses the select kernel
+            // reads (alto design §7, wave D2). `rows` is the slot count rather
+            // than the expert count, which is honest: the numbers on a weight
             // handle are what a `{:?}` prints, and no entry reads a bank's
             // rows back as a promise (see `rectangle`).
-            let handle = Tensor::new(store.at(place.offset)?, place.rows, place.width, place.dtype);
-            let row = match experts.as_ref().and_then(|tier| tier.handles(at)) {
-                None => WeightRow::Dense(handle),
-                Some(handles) => WeightRow::Streamed {
-                    slab: handle,
-                    table: handles.table,
-                    counts: handles.counts,
+            let row = match pairings.get(trace.params[at].name.as_str()) {
+                Some(pairing) => WeightRow::Planes {
+                    codes: packed(experts.as_ref(), &store, &places, at)?,
+                    scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
                 },
+                None => {
+                    let handle = Tensor::new(
+                        address(experts.as_ref(), &store, place.offset, at)?,
+                        place.rows,
+                        place.width,
+                        place.dtype,
+                    );
+                    match experts.as_ref().and_then(|tier| tier.handles(at)) {
+                        None => WeightRow::Dense(handle),
+                        Some(handles) => WeightRow::Streamed {
+                            slab: handle,
+                            table: handles.table,
+                            counts: handles.counts,
+                        },
+                    }
+                }
             };
             table.push(Some(row));
         }
@@ -465,7 +848,7 @@ impl Weights {
     }
 
     /// **Is the whole weight table on the device?** What
-    /// [`LoadFacts::weights_resident`](engine::engine_api::load::LoadFacts)
+    /// [`LoadFacts::weights_resident`](engine::load::LoadFacts)
     /// reports, answered rather than assumed.
     #[must_use]
     pub fn all_resident(&self) -> bool {
@@ -476,7 +859,7 @@ impl Weights {
     ///
     /// `true` says the host-side transform pipeline did not run for this
     /// load. What a caller reports as
-    /// [`LoadFacts::weights_from_cache`](engine::engine_api::load::LoadFacts).
+    /// [`LoadFacts::weights_from_cache`](engine::load::LoadFacts).
     #[must_use]
     pub fn from_cache(&self) -> bool {
         self.from_cache
@@ -571,6 +954,50 @@ impl Weights {
             .collect()
     }
 
+    /// **THE BANKS, AS THE SHARED-ADAPTER RESOLVER READS THEM** — name,
+    /// capacity, slot bytes, the slot's rectangle and its element size.
+    ///
+    /// [`Weights::banks`]'s longer twin, and a second method rather than a
+    /// widened one because the two have different readers: a caller sizing a
+    /// plane by hand wants three numbers, and [`crate::blob`] slicing a
+    /// `[layers, ...]` file needs the shape to check the out-major statute
+    /// against (alto adapter §6.3).
+    #[must_use]
+    pub fn seats(&self) -> Vec<BankSeat> {
+        self.banks
+            .iter()
+            .map(|(name, bank)| BankSeat {
+                name: name.clone(),
+                adapters: bank.adapters,
+                slot: bank.slot,
+                rows: bank.rows,
+                cols: bank.cols,
+                elem: bank.elem,
+            })
+            .collect()
+    }
+
+    /// **HOW MANY ADAPTERS THIS LOAD CAN HOLD RESIDENT AT ONCE** — the
+    /// smallest capacity any declared bank states, and zero for a plan that
+    /// declares none.
+    ///
+    /// The SMALLEST, because an adapter occupies one slot of every bank it
+    /// fills: a load whose `A` seats eight and whose `B` seats four holds
+    /// four adapters, and a fifth would have nowhere to put its `B`. Model
+    /// texts declare the two alike today and this is the honest reading of a
+    /// text that does not.
+    ///
+    /// This is `slots` in the sense alto adapter §3.3 fixes it: CONCURRENT
+    /// RESIDENCY, not a catalog. A hundred adapters may exist as files.
+    #[must_use]
+    pub fn adapter_seats(&self) -> u32 {
+        self.banks
+            .values()
+            .map(|bank| bank.adapters)
+            .min()
+            .unwrap_or(0)
+    }
+
     /// The table a fire resolves `Def::Weight(i)` through.
     #[must_use]
     pub fn table(&self) -> &WeightTable {
@@ -582,6 +1009,47 @@ impl Weights {
     pub fn bytes(&self) -> u64 {
         self.store.bytes() as u64
     }
+}
+
+/// **Where a param's bytes actually are** — the device store, or the pinned
+/// tier for a plane of a packed group the store does not hold.
+///
+/// One place asks the question, because a handle built off `store.at(offset)`
+/// for a plane that reserved nothing there would name the NEXT param's bytes:
+/// right-looking, resident, and wrong. `Tier::offloaded_at` answers the pinned
+/// tier's address for a T1 group, the mapping's for a T2 one, and `None` for
+/// everything the store does hold — which is every plane of every load that
+/// does not stream a packed bank.
+fn address(
+    tier: Option<&crate::experts::Tier>,
+    store: &Buffer,
+    offset: u64,
+    param: usize,
+) -> Result<u64> {
+    match tier.and_then(|tier| tier.offloaded_at(param)) {
+        Some(elsewhere) => Ok(elsewhere),
+        None => store.at(offset),
+    }
+}
+
+/// One plane of a split-plane bank, as the mxfp4 select reads it: raw bytes.
+///
+/// The dtype is `U8` and the rectangle is the BYTE rectangle — see the seating
+/// comment in [`Weights::resident`] for why both are the honest numbers and
+/// not a widening.
+fn packed(
+    tier: Option<&crate::experts::Tier>,
+    store: &Buffer,
+    places: &[Place],
+    param: usize,
+) -> Result<Tensor> {
+    let place = places[param];
+    Ok(Tensor::new(
+        address(tier, store, place.offset, param)?,
+        place.rows,
+        place.width,
+        Dtype::U8,
+    ))
 }
 
 /// Where one param's plane sits in the store.
@@ -626,9 +1094,20 @@ fn places(trace: &Trace, plan: &crate::experts::Plan) -> Result<Vec<Place>> {
         // the indirection table points into. For every other param, and for
         // every param of an uncapped load, the two are the same number and
         // this line is the line that was here before.
-        let held = match plan.resident(index) {
-            Some(resident) if rows > 0 => plane / rows * u64::from(resident),
-            _ => plane,
+        // **A PACKED GROUP THE STORE DOES NOT HOLD RESERVES NOTHING HERE.**
+        // Its planes are not a slab over a source; they ARE the source — read
+        // over UVA out of the pinned tier, or over HMM out of the mapped
+        // artifact — so the store gives them no bytes at all and the plane
+        // that follows them starts where they would have. `bytes` still says
+        // what the checkpoint publishes, which is what the landing sink checks
+        // an arriving tensor against.
+        let held = if plan.streamed_whole(index) {
+            0
+        } else {
+            match plan.resident(index) {
+                Some(resident) if rows > 0 => plane / rows * u64::from(resident),
+                _ => plane,
+            }
         };
         out.push(Place {
             offset: at,
@@ -693,7 +1172,26 @@ impl TensorSink for Landing<'_> {
         // a span past the allocation, which cannot happen — the tier was
         // opened from the same plan this offset came from — and is turned
         // into a sentence rather than swallowed.
-        match self.plan.resident(at).and(self.experts) {
+        // **A MAPPED GROUP'S BYTES GO NOWHERE.** They are already on disk in
+        // the artifact this load maps, in exactly the form the executor just
+        // computed — that is what the key asserts, and it is streaming §0's
+        // precondition read from the landing side. Writing them into the store
+        // is impossible (it reserved nothing for them) and writing them into
+        // the pinned tier is the tier the host budget just refused. So the
+        // plane is COUNTED AS LANDED and dropped, which is honest: the load
+        // did produce it, and the copy it would have made is the one T2 exists
+        // to avoid.
+        //
+        // (The transform still RAN, which is a cost this wave pays and names:
+        // landing the resident planes straight out of the artifact — the
+        // executor never running at all — is the next step and is written up
+        // in this module's header.)
+        if self.plan.mapped(at) {
+            self.landed[at] = true;
+            return Ok(());
+        }
+        let streamed = self.plan.resident(at).is_some() || self.plan.pinned(at);
+        match self.experts.filter(|_| streamed) {
             Some(tier) => {
                 let host_at = tier.host_offset(at).ok_or_else(|| {
                     LoadError::Internal(format!(

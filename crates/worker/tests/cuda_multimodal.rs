@@ -60,7 +60,7 @@
 //! `token-count`, `grid`, `prefix-tokens`. But NO interface consumes one:
 //! `forward.wit`, `forward-hybrid.wit` and `forward-recurrent.wit` do not
 //! contain the word "image" between them. The `pass.input_image(...) ->
-//! execute()` path this header used to name did not survive the PTIR forward
+//! execute()` path this header used to name did not survive the ETA forward
 //! rewrite. The SDK's `media` module re-exports the raw bindings and nothing
 //! else -- there is no `Context` helper -- and `MULTIMODAL.md`, which every one
 //! of these comments pointed at, is no longer in the tree.

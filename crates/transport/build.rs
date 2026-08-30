@@ -1,7 +1,7 @@
 //! Build script — only does work under `--features nixl`.
 //!
 //! Under the `nixl` feature it generates the NIXL C-API bindings from the
-//! vendored `engines/nixl/wrapper.h` and links the wheel's precompiled
+//! vendored `backends/nixl/wrapper.h` and links the wheel's precompiled
 //! `libnixl_capi.so` from `$NIXL_PREFIX/lib`. The header is the single file
 //! taken from NIXL source (Apache-2.0); everything else comes from the
 //! `pip download nixl-cu12` wheel assembled into `$NIXL_PREFIX` (see the crate
@@ -18,7 +18,7 @@ mod nixl {
     use std::path::PathBuf;
 
     pub fn generate() {
-        println!("cargo:rerun-if-changed=src/engines/nixl/wrapper.h");
+        println!("cargo:rerun-if-changed=src/backends/nixl/wrapper.h");
         println!("cargo:rerun-if-env-changed=NIXL_PREFIX");
 
         let prefix = std::env::var("NIXL_PREFIX").expect(
@@ -34,7 +34,7 @@ mod nixl {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{prefix}/lib");
 
         let bindings = bindgen::Builder::default()
-            .header("src/engines/nixl/wrapper.h")
+            .header("src/backends/nixl/wrapper.h")
             .allowlist_item("nixl_capi.*")
             .generate()
             .expect("failed to generate NIXL bindings from wrapper.h");

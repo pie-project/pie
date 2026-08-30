@@ -1,5 +1,20 @@
 //! The resident fire inputs: one allocation, carved once, overwritten every
-//! fire and never moved.
+//! fire and never moved — **and one of them per in-flight step.**
+//!
+//! # Why there is more than one, and it is the whole run-ahead
+//!
+//! A `Shell` holds a `Vec<Inputs>`, one per arm, and a step writes only into
+//! its own. That is not a convenience: this store is `StorageModeShared`, so
+//! [`Inputs::write`] is a `memcpy` into the very bytes a shader will read, and
+//! a second frame staging into the same plane would rewrite the first frame's
+//! tokens under a running dispatch with nothing anywhere to fault on. One
+//! plane is what made frames-in-flight structurally one however deep a
+//! deployment asked to run.
+//!
+//! Everything below this paragraph is about ONE plane, and every word of it
+//! still holds: the ceiling reservation, the absent stream, the mint per
+//! staged vector. What the duplication adds is the seat, and the seat is
+//! `serve.rs`'s.
 //!
 //! **RESERVED AT THE CEILING, AND ON THIS PLANE THE REASON IS NOT CAPTURE.**
 //! The CUDA sibling reserves because its step 5 records device ADDRESSES into
@@ -283,6 +298,7 @@ impl Inputs {
         paging: Paging,
         spaces: usize,
         classes: usize,
+        gathered: usize,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
@@ -293,7 +309,27 @@ impl Inputs {
         // measured, because this carve is made once at load and a fire that
         // grew it would move bytes an encoder has already bound (the note at
         // the top of this file).
-        let window_ints = (classes * (classes + 1) / 2 + 1) as u64 * (lanes + 1);
+        //
+        // **AND A GATHERED WINDOW IS BIGGER THAN A BOUNDARY VECTOR.** A
+        // `Fallback::Copy` window (`crate::window::Gathered`) writes its row
+        // map, the two ambient row tables re-laid under it, and — per kv
+        // space — a fresh page-bounds prefix sum, the compacted page-id list
+        // and the two per-lane vectors. Every one of those is HOST-written,
+        // which is precisely why they belong in this plane and not in
+        // `crate::scratch`: that plane rests on nothing there ever being
+        // touched by the host, and these are computed on it.
+        //
+        // `gathered` is how many DISTINCT windows this artifact can ever
+        // gather — the masks P4 wrote a `Fallback::Copy` row for, counted at
+        // load off the bake, and `0` for an artifact that owes no row at all.
+        // Counted rather than bounded by the window count above, because the
+        // per-window cost here is `3 * max_tokens` plus a page list and a
+        // reservation at the whole triangle would be tens of MiB for a path
+        // one or two masks can take.
+        let per_gathered =
+            3 * rows + spaces as u64 * (2 * lanes + (lanes + 1) + pages);
+        let window_ints =
+            (classes * (classes + 1) / 2 + 1) as u64 * (lanes + 1) + gathered as u64 * per_gathered;
 
         let mut at = 0u64;
         let mut take = |bytes: u64| {
@@ -511,8 +547,8 @@ impl Inputs {
                 )?,
                 last_page_len: i32s(handles, &self.store, at.last_page_len, lanes)?,
                 kv_len: i32s(handles, &self.store, at.kv_len, lanes)?,
-                write_page: i32s(handles, &self.store, at.write_page, rows)?,
-                write_offset: i32s(handles, &self.store, at.write_offset, rows)?,
+                write_page: u32s(handles, &self.store, at.write_page, rows)?,
+                write_offset: u32s(handles, &self.store, at.write_offset, rows)?,
             });
         }
 
@@ -617,6 +653,29 @@ fn i32s(
 ) -> Result<Tensor> {
     let buf = handles.bind(store, at, u64::from(rows) * 4)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::I32))
+}
+
+/// The same column, wearing `u32` — for the two seats whose shader says so.
+///
+/// **THE HOST STAGES THESE AS `i32` AND THE SHADER READS THEM AS `uint`, AND
+/// BOTH ARE RIGHT.** `store::kv::Geometry` carries every vector as `Vec<i32>`
+/// because that is the one integer the geometry arithmetic is written in, but
+/// a write page and an in-page offset are counts — never negative, derived
+/// from a `u32` page table — so `attn/kv_write.metal` declares them
+/// `const device uint*` and `kernels_metal::attn::append_paged` refuses a
+/// write table that is not `U32`. Four bytes either way and the same
+/// little-endian bits, so the relabel copies nothing; what it does is let the
+/// seat state what the kernel it is bound to actually reads. The other
+/// seats — indptr, indices, the two lengths — stay `i32` because their
+/// shaders do.
+fn u32s(
+    handles: &crate::device::Handles,
+    store: &Buffer,
+    at: u64,
+    rows: u32,
+) -> Result<Tensor> {
+    let buf = handles.bind(store, at, u64::from(rows) * 4)?;
+    Ok(Tensor::new(buf, rows, 1, Dtype::U32))
 }
 
 /// A vector of `i32` as the bytes a copy takes.

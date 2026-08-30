@@ -1,13 +1,19 @@
 //! What the shell refuses, and whose fault it is.
 //!
 //! THREE ERROR VOCABULARIES MEET HERE AND NONE OF THEM ABSORBS ANOTHER.
-//! [`kernels::KernelError`] is about the backend and never about the plan;
-//! [`engine::Error`] is about a fire the artifact cannot describe; and this
+//! [`KernelError`] is about the backend and never about the plan;
+//! [`model_exec::Error`] is about a fire the artifact cannot describe; and this
 //! type is about everything that happens *around* a fire — binding a device,
 //! landing a checkpoint, carving bytes. Folding any of the three into another
 //! would send an operator hunting for a missing kernel when what actually
 //! failed was a `cudaMalloc`, which is the failure mode the split exists to
 //! prevent.
+//!
+//! A FOURTH NOW ARRIVES FROM BELOW and is translated rather than carried:
+//! `kernels_cuda::Error`, which the kernel library kept when the crate the two
+//! shared was taken apart. [`kernel`] at the foot of this file is that seam,
+//! and its doc says why it is a function where a `From` impl would read
+//! better.
 //!
 //! An integrity break — a weight row the shell never bound, a cache id in a
 //! tensor seat — is NOT here: [`Run`](crate::run::Run) panics with a sentence
@@ -16,6 +22,8 @@
 //! did, or something the machine did.
 
 use std::fmt;
+
+use model_exec::KernelError;
 
 /// The shell's result.
 pub type Result<T> = std::result::Result<T, Fault>;
@@ -43,11 +51,21 @@ pub enum Fault {
     Bake(model_compiler::Error),
 
     /// The loader refused to land this checkpoint.
-    Load(model_loader::error::Error),
+    Load(checkpoint::error::Error),
 
     /// The fire substrate refused this batch, or the backend refused a
     /// dispatch inside it.
-    Fire(engine::Error),
+    ///
+    /// **IT USED TO CARRY A THIRD THING AND SHOULD NOT HAVE.** The substrate
+    /// was one crate with one `Error` enum, and its `Program { message }`
+    /// variant — a launch program the ETA interpreter could not read — arrived
+    /// here as a `Fire` like any other. `fault()` sorts `Fire` to
+    /// `Error::Invalid` and the guest-program refusals to `Error::Program`, so
+    /// every interpreter refusal crossed the contract wearing the wrong noun,
+    /// and a holder of this variant had to match an inner enum to find out
+    /// which. The substrate is two crates now and so is this: what is left
+    /// here is a batch the artifact cannot describe, and nothing else.
+    Fire(model_exec::Error),
 
     /// A region whose classes this fire's order does not make consecutive, and
     /// which the artifact owes no answer for.
@@ -58,7 +76,7 @@ pub enum Fault {
     /// windowed kernel take a pointer and an extent. When it cannot seat a
     /// consumer it says so, in
     /// [`FallbackTable`](model_compiler::FallbackTable) — and THAT is a slow
-    /// path, not this: `engine::fire::walk` dispatches such a region once per
+    /// path, not this: `model_exec::fire::walk` dispatches such a region once per
     /// interval and `crate::window::Windows` cuts it a window per launch. The
     /// catalog does bake rows (the four qwen texts owe 12–84 apiece, all of
     /// them the `captures_scores` window), so an empty table is not the
@@ -104,6 +122,24 @@ pub enum Fault {
     Residency(String),
 
     /// A count past a ceiling the shell reserved bytes for.
+    /// A media submission whose patch payload does not match the geometry
+    /// beside it.
+    ///
+    /// **REFUSAL (i) OF MULTIMODAL M-1e, IN BYTES.** `Media::rows` says how
+    /// many patch rows each image contributes and `Media::patches` carries
+    /// them; the plan states one row's width. Three numbers that must agree,
+    /// and a submission where they do not has a caller who packed one image's
+    /// grid and described another's — which does not fault on the device, it
+    /// reads whatever the next image's rows are.
+    PatchPayload {
+        /// Which lane of the submission.
+        lane: u32,
+        /// What its geometry adds up to, in bytes.
+        need: u64,
+        /// What its payload carries.
+        have: u64,
+    },
+
     Ceiling {
         /// What overflowed.
         what: &'static str,
@@ -349,6 +385,35 @@ pub enum Fault {
         why: String,
     },
 
+    /// A shared adapter the mount cannot serve (alto adapter §3.3, §5).
+    ///
+    /// **FILES ARE THE TRUTH, SO THE REFUSALS ARE ABOUT FILES.** An
+    /// unmounted shell, a name that leaves the mount, a directory with no
+    /// `adapter.toml`, a manifest naming a plane that is not there, a source
+    /// whose orientation is not the bank's (§6.3's out-major statute), a
+    /// length that is not `layers x rank x hidden`: each is a mount and a
+    /// model text that were not written from each other, each names the
+    /// adapter, and none of them falls back to anything.
+    Blob {
+        /// The adapter, as the bind spelled it.
+        path: String,
+        /// What is wrong with it.
+        why: String,
+    },
+
+    /// Every adapter slot pinned by a live bind when a load wanted one.
+    ///
+    /// **THE ONE PRESSURE THIS AXIS ANSWERS WITH A REFUSAL** (alto adapter
+    /// §3.3, §5). Residency is reclaimed LRU from slots NO bind holds; a
+    /// table in which every slot is held has nothing reclaimable in it, and
+    /// the alternative to refusing is moving an adapter some fire in flight
+    /// routes to. `slots` bounds concurrent residency and not the catalog, so
+    /// the fix is fewer live binds or a wider bank — never a retry that hopes.
+    AdapterSlots {
+        /// How many slots the banks seat.
+        seats: u32,
+    },
+
     /// A plan struct built over more rows than the node consuming it runs.
     ///
     /// **P4's PROMISE AT THE OTHER END** — [`Fault::Fragmented`] catches a
@@ -377,17 +442,17 @@ pub enum Fault {
         consumed: String,
     },
 
-    /// A guest program (PTIR) that does not compile on this device.
+    /// A guest program (ETA) that does not compile on this device.
     ///
     /// **THE TAXONOMY IS THE POINT, NOT THE TEXT.**
-    /// [`Deterministic`](engine::Failure::Deterministic) means the source is
+    /// [`Deterministic`](eta_exec::Failure::Deterministic) means the source is
     /// wrong and will be wrong next time — the compile plane remembers it and
     /// answers the next registration from memory. `Retryable` means the
     /// machine could not, this time (no NVRTC, out of memory, a cubin that
     /// would not load), and remembering it would strand a program on one bad
     /// minute. Folding the two into one string is what makes an engine either
     /// retry a syntax error forever or give up on a transient.
-    Compile(engine::Failure),
+    Compile(eta_exec::Failure),
 
     // A `Blocked { instance, channel }` variant stood here: an attached
     // instance whose ring was not ready, typed so `fault()` could answer
@@ -414,6 +479,21 @@ pub enum Fault {
         why: String,
     },
 
+    /// The ETA substrate refused a launch program, in its own words.
+    ///
+    /// [`Fault::Program`] above is THIS crate's refusals about the guest-
+    /// program plane — a door here, spelled the way the rest of this enum
+    /// spells one. This is the substrate's, forwarded whole: a package whose
+    /// values do not resolve, an op the interpreter does not know, a channel
+    /// the plan does not declare. It is a separate variant because it is a
+    /// separate author, and it carries the error rather than a string because
+    /// the type is the only thing that says which author it was.
+    ///
+    /// Both sort to `Error::Program` at the contract, which is the point: the
+    /// crossing this replaces sorted to `Error::Invalid`, by riding inside
+    /// [`Fault::Fire`].
+    Interpret(eta_exec::Error),
+
     /// A plan naming something this shell has no binding for.
     ///
     /// A refusal rather than a panic because it is a statement about the
@@ -424,40 +504,52 @@ pub enum Fault {
         what: String,
     },
 
-    /// A region the compiler put behind a conditional node, reaching a
-    /// RECORDING walk this shell has no conditional-node mechanism for.
+    /// A conditional bracket reaching a RECORDING walk that has nowhere to put
+    /// it — a lowering this shell does not build, or a load that opened no
+    /// conditional machinery.
     ///
-    /// **REFUSED BY NAME RATHER THAN RECORDED UNCONDITIONALLY**, and the
-    /// distinction is the whole reason this variant exists. An EAGER walk may
-    /// ignore a conditional and be right — the zero-row rule decides the same
-    /// thing at the same instant (design §4), which is why
-    /// `engine::fire::EagerSink` no-ops the bracket and why the eager cursor
-    /// beside it does too. A CAPTURE may not: a graph outlives the fire that
-    /// recorded it, so a body recorded outside its conditional node is a body
-    /// that runs in every composition, over rows some later fire does not
-    /// have. It would compute, and that is the failure mode that has no
-    /// observable.
+    /// **THE FIRST HALF OF THIS VARIANT IS RETIRED** (graphs wave). An `IF` on
+    /// a load whose context opened a body stream is now RECORDED: a real
+    /// `CU_GRAPH_NODE_TYPE_CONDITIONAL` node at the capture's frontier, its
+    /// body captured into the child graph the driver mints for it, and the
+    /// predicate stored by a kernel — `kernels_cuda::graph::set_conditional`,
+    /// reading the region's row count off the device. See
+    /// [`crate::device::conditional`] for the sequence and
+    /// `crate::window::Cursor::cond_begin` for where it is driven from.
     ///
-    /// **WHAT IS MISSING IS NOT THE API.** `cudarc` 0.19.8 binds the whole
-    /// host half — `cudaGraphConditionalHandleCreate`, `cudaGraphAddNode` with
-    /// `cudaGraphNodeTypeConditional`, `cudaStreamGetCaptureInfo`,
-    /// `cudaStreamUpdateCaptureDependencies`, `cudaStreamBeginCaptureToGraph`
-    /// — and CUDA 13 on this tree's L40S has all of them. Two things are
-    /// missing and both are named in build log 27:
+    /// **AND THE LINK STAGE THIS VARIANT USED TO NAME DOES NOT EXIST.** It
+    /// said `cudaGraphSetConditional` needed relocatable device code and
+    /// `libcudadevrt.a`. It needs neither: the symbol is declared
+    /// `extern __device__ __cudart_builtin__` and DEFINED nowhere — not in a
+    /// toolkit header, not in that archive (which was extracted and searched,
+    /// `.wiki/driver/new-horizon.md` §62.3) — so the driver resolves it at
+    /// module load whichever frontend emitted the call. The unit compiles
+    /// whole-program through the same NVRTC path as every other one.
     ///
-    /// 1. `cudaGraphSetConditional` is DEVICE-side only, so the predicate is a
-    ///    kernel compiled with relocatable device code and linked against
-    ///    `libcudadevrt.a`. This shell's JIT (`program::compile`) is a
-    ///    whole-program NVRTC→cubin path with no `cuLink` stage and no
-    ///    cudadevrt discovery.
-    /// 2. **The deeper one**: a captured launch's EXTENT is frozen in its node
-    ///    parameters (build log 10 — rebinding needs a node→argument map the
-    ///    shell never sees), so an exec already serves exactly one composition
-    ///    and one size, and the walk skips an empty window at RECORD time. A
-    ///    conditional body would guard a launch whose extents belong to the
-    ///    fire that recorded it. Conditionals become worth building the day a
-    ///    kernel reads its extent from the descriptor, which is design §5's
-    ///    "the kernel reads `desc.count[region]`" and is unbuilt.
+    /// # What still answers here, and it is two things
+    ///
+    /// 1. **A `SWITCH`.** `IF` is one body behind one handle; a SWITCH is
+    ///    `arms` bodies behind one, and its arms are separate REGIONS the walk
+    ///    announces one after another — so the bracket would have to survive a
+    ///    `region_begin`, which is a second piece of state the sink does not
+    ///    carry. P3 only groups one at `max_lanes == 1` and no catalog row is
+    ///    baked at a one-lane budget, so nothing reaches it today.
+    /// 2. **A load with no body stream.** `Context::open_conditional` is
+    ///    called at load only for an artifact P3 stamped a lowering on; a
+    ///    cursor reaching a bracket without it is a shell being asked for
+    ///    something its load did not set up.
+    ///
+    /// # The frozen extent, which is a bound on the SAVING and not on the node
+    ///
+    /// A captured launch's extent is fixed in its node parameters (build log
+    /// 10), and the exec key is the per-class `(rows, lanes)` vector — so on
+    /// the keyed path an exec already serves one composition and the walk
+    /// skipped its empty windows at RECORD time. The predicate is therefore
+    /// constant across the replays of any one keyed exec, and what the node
+    /// buys there is nothing. It is not decoration: the decision is IN the
+    /// graph, so an exec replayed under a composition its recording fire never
+    /// saw — the fold's axis, and what a padded lattice would do — skips the
+    /// body correctly instead of computing over rows it does not have.
     Unlowered {
         /// Which region of the template.
         region: u32,
@@ -502,6 +594,11 @@ impl fmt::Display for Fault {
                 ),
             },
             Self::Param { name, why } => write!(f, "`{name}` {why}"),
+            Self::PatchPayload { lane, need, have } => write!(
+                f,
+                "lane {lane} describes {need} bytes of patch rows and submitted {have} — \
+                 its geometry and its payload disagree"
+            ),
             Self::Ceiling { what, need, have } => write!(
                 f,
                 "this fire wants {need} {what} and the shell reserved {have}"
@@ -641,6 +738,16 @@ impl fmt::Display for Fault {
             Self::Adapter { bank, why } => {
                 write!(f, "the adapter bank `{bank}` {why}")
             }
+            Self::Blob { path, why } => {
+                write!(f, "the shared adapter `{path}` {why}")
+            }
+            Self::AdapterSlots { seats } => write!(
+                f,
+                "every one of this load's {seats} adapter slots is pinned by a live \
+                 bind, and the only slot left to take would be one some fire in flight \
+                 routes to — `slots` bounds concurrent residency, not the catalog, so \
+                 the fix is fewer live binds or a bank that seats more"
+            ),
             Self::Straddled {
                 value,
                 node,
@@ -667,15 +774,16 @@ impl fmt::Display for Fault {
                 failure.reason()
             ),
             Self::Program { at, why } => write!(f, "{at}: {why}"),
+            Self::Interpret(error) => write!(f, "{error}"),
             Self::Unlowered { region, lowering } => write!(
                 f,
-                "region {region} is baked as {lowering} and this shell records no \
-                 conditional nodes: the host half of the CUDA API is reachable, the \
-                 device-side `cudaGraphSetConditional` needs an rdc + cudadevrt link \
-                 stage this crate has no seat for, and a captured launch's extent is \
-                 frozen anyway (build log 10), so a body behind a conditional would \
-                 hold the recording fire's rows. Bake with `fat_region_us: INFINITY` \
-                 — every region always-launch, which is the correctness mechanism"
+                "region {region} is baked as {lowering} and this capture has nowhere \
+                 to put it: an `If` records as a real conditional node on a load whose \
+                 context opened a body stream, but a `Switch` is unbuilt (its arms are \
+                 separate regions and the bracket would have to survive a region \
+                 boundary) and a load whose artifact declared no conditional opened no \
+                 stream to capture a body on. Bake with `fat_region_us: INFINITY` — \
+                 every region always-launch, which is the correctness mechanism"
             ),
             Self::Unbound { what } => write!(
                 f,
@@ -693,14 +801,14 @@ impl From<model_compiler::Error> for Fault {
     }
 }
 
-impl From<model_loader::error::Error> for Fault {
-    fn from(error: model_loader::error::Error) -> Fault {
+impl From<checkpoint::error::Error> for Fault {
+    fn from(error: checkpoint::error::Error) -> Fault {
         Fault::Load(error)
     }
 }
 
-impl From<engine::Error> for Fault {
-    fn from(error: engine::Error) -> Fault {
+impl From<model_exec::Error> for Fault {
+    fn from(error: model_exec::Error) -> Fault {
         Fault::Fire(error)
     }
 }
@@ -719,14 +827,75 @@ impl Fault {
     }
 }
 
-impl From<engine::Failure> for Fault {
-    fn from(failure: engine::Failure) -> Fault {
+impl From<eta_exec::Failure> for Fault {
+    fn from(failure: eta_exec::Failure) -> Fault {
         Fault::Compile(failure)
     }
 }
 
-impl From<kernels::KernelError> for Fault {
-    fn from(error: kernels::KernelError) -> Fault {
-        Fault::Fire(engine::Error::Kernel(error))
+impl From<eta_exec::Error> for Fault {
+    fn from(error: eta_exec::Error) -> Fault {
+        Fault::Interpret(error)
+    }
+}
+
+impl From<model_exec::KernelError> for Fault {
+    fn from(error: model_exec::KernelError) -> Fault {
+        Fault::Fire(model_exec::Error::Kernel(error))
+    }
+}
+
+/// A kernel entry's refusal, reaching a shell path that answers [`Fault`].
+///
+/// **NOT EVERY CALL INTO `kernels-cuda` IS A DISPATCH ARM.** Weight staging,
+/// the wave's control launches and the fire's own scratch work all call
+/// entries there and answer `Fault`, not the contract; before the shared
+/// error crate came apart this was `From<KernelError>` and `?` did the work.
+/// It still can, because `Fault` is this crate's own type and the orphan rule
+/// only bites when NEITHER side is — which is the whole difference between
+/// this impl and [`kernel`] below.
+impl From<kernels_cuda::Error> for Fault {
+    fn from(error: kernels_cuda::Error) -> Self {
+        Fault::from(kernel(error))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the seam: this backend's refusal, said in the contract's words
+// ---------------------------------------------------------------------------
+
+/// Say a [`kernels_cuda::Error`] in the dispatch contract's words.
+///
+/// **THIS IS A FUNCTION AND NOT A `From` IMPL, AND THAT IS NOT A STYLE
+/// CHOICE.** Both types are foreign to this crate — one is the kernel
+/// library's, the other the contract's — and Rust's orphan rule (E0117)
+/// forbids a third crate from implementing `From` between two types it owns
+/// neither of. No arrangement of these three crates gets `?` to convert here
+/// without one of them naming a crate it must not: the kernel library would
+/// have to depend on `model-exec`, and so on `model-compiler` and `model-ir`,
+/// which is the whole edge deleting `crates/kernels` bought — or the two
+/// enums would have to be one type again in a shared leaf. So the conversion
+/// is called instead, once per `Dispatch*` impl, and each family's arms live
+/// in an inherent method that answers [`kernels_cuda::Error`] so their own
+/// `?` still converts.
+///
+/// **The match is total on purpose.** The two enums are variant for variant
+/// identical today; they were one type until `crates/kernels` came apart, and
+/// `model_exec::KernelError`'s own doc says plainly that three copies is a
+/// prediction rather than a fact, with the falsifier written out. What makes
+/// the prediction safe to hold is this function: the day `kernels-cuda`
+/// grows the NVRTC compile-failure variant it is expected to, this stops
+/// compiling, at the one line that has to decide what the new refusal means
+/// to a caller who can make nothing of an NVRTC log. Nothing has to watch the
+/// copy — and a copy that needs watching is the one
+/// `crates/eta-exec/Cargo.toml` rules out: "a copy that is only safe because
+/// something watches it is a copy that costs the watch".
+pub fn kernel(error: kernels_cuda::Error) -> KernelError {
+    match error {
+        kernels_cuda::Error::Unsupported { op } => KernelError::Unsupported { op },
+        kernels_cuda::Error::DtypeUnsupported { op, dtype } => {
+            KernelError::DtypeUnsupported { op, dtype }
+        }
+        kernels_cuda::Error::Backend { op, detail } => KernelError::Backend { op, detail },
     }
 }

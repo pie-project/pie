@@ -27,7 +27,7 @@
 //! The entropy has to be reduced over the full 151936-token logit row and then
 //! fed *back into the same step's* temperature before sampling. On a black-box
 //! server that is a host round-trip per token: read logits out, reduce, decide,
-//! push back. Here it is four PTIR ops inside the forward pass, and the decode
+//! push back. Here it is four ETA ops inside the forward pass, and the decode
 //! loop keeps running ahead.
 //!
 //! Pie already had both halves of this. `entropycheck` measures entropy and
@@ -55,7 +55,7 @@
 //! Faithfulness: **Exact**. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]

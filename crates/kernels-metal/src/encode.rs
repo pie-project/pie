@@ -9,7 +9,7 @@
 //! Where the old plane monomorphized `<T: Scalar>`, entries here match on
 //! the handle's runtime dtype with [`dtype_dispatch!`] (design item E4).
 
-use kernels::KernelError;
+use crate::error::Error;
 
 /// One marshalled shader argument. Buffers travel as driver-scoped `u32`
 /// handles; `Buffer` vs `BufferMut` is where read/write intent is recorded.
@@ -71,11 +71,11 @@ impl Arg for u64 {
 pub trait Encode {
     /// Encode one shader dispatch. Enqueue only — a returned `Ok` means the
     /// launch is in the command buffer, not that it ran.
-    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), KernelError>;
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error>;
 
     /// The plane's stand-in for an optional buffer an op does not carry (a
     /// null binding). The attn/moe entries hold the optional slots.
-    fn absent(&self) -> Result<ArgValue, KernelError>;
+    fn absent(&self) -> Result<ArgValue, Error>;
 }
 
 /// The context every kernel entry takes: any encode sink, behind `dyn` so
@@ -173,7 +173,7 @@ impl Geometry for Grid {
 }
 
 /// One thread per element, flattened: `[width * rows, 1, 1]`.
-pub fn elementwise(op: &'static str, width: u32, rows: u32) -> Result<[u32; 3], KernelError> {
+pub fn elementwise(op: &'static str, width: u32, rows: u32) -> Result<[u32; 3], Error> {
     nonzero(op, "width", width)?;
     nonzero(op, "rows", rows)?;
     let n = u64::from(width) * u64::from(rows);
@@ -183,7 +183,7 @@ pub fn elementwise(op: &'static str, width: u32, rows: u32) -> Result<[u32; 3], 
 }
 
 /// One thread per element, rows kept on their own axis: `[width, rows, 1]`.
-pub fn elementwise_rows(op: &'static str, width: u32, rows: u32) -> Result<[u32; 3], KernelError> {
+pub fn elementwise_rows(op: &'static str, width: u32, rows: u32) -> Result<[u32; 3], Error> {
     nonzero(op, "width", width)?;
     nonzero(op, "rows", rows)?;
     Ok([width, rows, 1])
@@ -196,7 +196,7 @@ pub fn head_grid(
     head_dim: u32,
     heads: u32,
     depth: u32,
-) -> Result<[u32; 3], KernelError> {
+) -> Result<[u32; 3], Error> {
     Ok([
         nonzero(op, "the head width", head_dim)?,
         nonzero(op, "heads", heads)?,
@@ -219,14 +219,14 @@ pub const fn head_group(grid: [u32; 3]) -> [u32; 3] {
 /// upstream vouches for it. Cross-operand *shape agreement* between values
 /// the ops do name is never reported this way — that is the validator's
 /// guarantee, restated as `debug_assert!` at the entries.
-pub(crate) fn refuse(op: &'static str, detail: impl Into<String>) -> KernelError {
-    KernelError::Backend {
+pub(crate) fn refuse(op: &'static str, detail: impl Into<String>) -> Error {
+    Error::Backend {
         op,
         detail: detail.into(),
     }
 }
 
-pub(crate) fn nonzero(op: &'static str, axis: &'static str, v: u32) -> Result<u32, KernelError> {
+pub(crate) fn nonzero(op: &'static str, axis: &'static str, v: u32) -> Result<u32, Error> {
     if v == 0 {
         return Err(refuse(op, format!("`{axis}` is zero")));
     }
@@ -234,19 +234,19 @@ pub(crate) fn nonzero(op: &'static str, axis: &'static str, v: u32) -> Result<u3
 }
 
 /// An extent stated to a shader that reads it as `int`.
-pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, KernelError> {
+pub(crate) fn stated(op: &'static str, v: u32) -> Result<i32, Error> {
     i32::try_from(v).map_err(|_| refuse(op, format!("{v} does not fit the shader's int")))
 }
 
 /// The runtime successor of `<T: Scalar>` monomorphization: name the dtypes
 /// this entry is stamped for and get the named arm's value; any other dtype
-/// **returns** [`KernelError::DtypeUnsupported`] from the enclosing function.
+/// **returns** [`Error::DtypeUnsupported`] from the enclosing function.
 macro_rules! dtype_dispatch {
     ($op:expr, $dtype:expr, { $($stamped:ident => $arm:expr),+ $(,)? }) => {
         match $dtype {
-            $(::model_ir::Dtype::$stamped => $arm,)+
+            $(::dtype::Dtype::$stamped => $arm,)+
             other => {
-                return Err(::kernels::KernelError::DtypeUnsupported {
+                return Err(crate::error::Error::DtypeUnsupported {
                     op: $op,
                     dtype: other,
                 });

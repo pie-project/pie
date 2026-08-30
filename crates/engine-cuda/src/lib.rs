@@ -9,7 +9,7 @@
 //! as the fabric is rewired.
 //!
 //! **Prepare/capture.** The split itself is the model compiler's and the
-//! walk over it the engine substrate's (`engine::fire::walk`, design
+//! walk over it the engine substrate's (`model_exec::fire::walk`, design
 //! decisions #11–#12); graph capture policy — whether to capture at all,
 //! rows-bucketing vs graph-update, when a bucket is re-captured — stays the
 //! shell's; this crate only makes the split *executable*. The prepare-phase
@@ -62,10 +62,10 @@
 //!            kernel entry allocates, because an entry that allocated per
 //!            fire could not be captured
 //! weights.rs a `ModelContract` and a checkpoint in, a resident
-//!            `WeightTable` out — through model-loader, with no model family
+//!            `WeightTable` out — through checkpoint, with no model family
 //!            named on this side
 //! store/     the pools: `kv.rs` is backend-neutral page arithmetic marked
-//!            for `engine::store`, the rest is bytes
+//!            for `model_exec::store`, the rest is bytes
 //! arena.rs   one allocation at the compiler's `ArenaMap::bytes`, and the
 //!            per-fire `SlotTable` that is `base + offset` and nothing else
 //! inputs.rs  the pointer-stable resident fire inputs and the plan grants
@@ -85,7 +85,7 @@
 //! is the runtime's step and is deliberately not wired here — see
 //! [`program`]'s module docs for the seam.
 //!
-//! **The walk is not here.** `engine::fire::walk` is written once, over
+//! **The walk is not here.** `model_exec::fire::walk` is written once, over
 //! `Dispatch` and `Sink`, and this shell hands it a [`Run`] and its
 //! [`Cursor`] (decision #11). [`record`] is the second mode of the SAME walk:
 //! it runs the prepare regions on the open stream and the capture regions
@@ -99,8 +99,21 @@
 //! entries accept the op's `write_page`/`write_offset` and mark where the
 //! device text still re-derives the cells.
 
+/// **THE LORA SINK'S RESOLVER** (alto adapter §6.1, §6.4): reading the
+/// `lora` sink off a launch package, and turning the f32 cell a guest seeded
+/// into the bank's own bytes. Pure host arithmetic — the half of the wave
+/// that needs no device to be judged.
+pub mod adapter;
 pub mod api;
 pub mod arena;
+/// **The shared-adapter store** (alto adapter §3.3, promoted to wave 1 by
+/// §6.1): a read-only mount whose files are the truth, a single-flight
+/// refcounted host cache over them, and the bank slots keyed by blob
+/// identity — which is what makes N instances of one adapter one device copy.
+/// Nothing in it is reachable from the fire path.
+pub mod blob;
+/// Reading a boot document — this crate's half of it, in this crate.
+pub mod boot;
 pub mod device;
 mod dispatch;
 mod error;
@@ -117,9 +130,15 @@ pub mod mask;
 pub mod program;
 pub mod record;
 pub mod run;
+pub mod scores;
 pub mod serve;
 /// Who is airborne, and where the settlement callbacks ride (survey §7, I7).
 pub mod settle;
+/// **The pinned double-buffered H2D pump** (alto streaming §1 and build-order
+/// item 1), ported from `origin/dev`'s `loader/staged_h2d.hpp`. The one path
+/// bulk weight bytes take: four lanes, each overlapping a host memcpy with the
+/// DMA already in flight, because one lane already outruns NVMe by 1.6×.
+pub mod staged_h2d;
 pub mod store;
 pub mod weight_cache;
 pub mod weights;
@@ -187,12 +206,14 @@ pub use run::{
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
 pub use api::{ContractFor, Cuda, DeviceBoot};
-pub use serve::{Boot, FireCost, Graphs, Knobs, Lane, Seated, Shell};
+pub use boot::open;
+pub use serve::{Boot, FireCost, Graphs, Knobs, Lane, Media, Seated, Shell};
 
 /// What a capturing lane's fire hands back, one entry per exported attention
 /// layer — the contract's own type, re-exported so a caller of
 /// [`Shell::fire_captured`] need not reach two crates deep for the noun its
 /// own signature is written in (design §9, palo C4b).
-pub use engine::engine_api::fire::LayerScores;
-pub use weights::AdapterPlane;
+pub use engine::fire::LayerScores;
+pub use blob::{Adapters, Binding, Source as AdapterSource, layer_of, role_of};
+pub use weights::{AdapterPlane, BankSeat};
 pub use window::{Cursor, Window, Windows};

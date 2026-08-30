@@ -13,10 +13,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
 use controller_api::Role;
-// **THE RUN-AHEAD DEPTHS COME FROM THE ENGINE'S OWN MODULE** (alto design §9,
-// article 8). This crate used to hold `UPLOAD_STAGING_DEPTH = 13`, a literal
-// transcribed out of a deleted C++ header, and bound the deployment's depths
-// against it. The formula lives in one place now and this file reads it.
+// **THE RUN-AHEAD DEPTHS COME FROM THE ENGINE CONTRACT'S OWN MODULE** (alto
+// design §9, article 8). This crate used to hold `UPLOAD_STAGING_DEPTH = 13`,
+// a literal transcribed out of a deleted C++ header, and bound the
+// deployment's depths against it. The formula lives in one place now and this
+// file reads it.
 pub use engine::runahead::Runahead;
 use serde::{Deserialize, Serialize};
 
@@ -692,6 +693,67 @@ pub struct ModelConfig {
     /// `[engine]`.
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
+    /// **How many weight bytes this load may keep on the DEVICE**, written
+    /// with its unit (`"18GiB"`). Omit for uncapped, which lands the whole
+    /// weight table on the device and is what this deployment did before the
+    /// key existed.
+    ///
+    /// **NOT `[engine] gpu_mem_utilization`, which is the OTHER budget.**
+    /// That one is the fraction of the card pie's elastic physical pool -- KV
+    /// pages and scratch -- may commit; this one is the ceiling on the
+    /// model's own weight table (tier T0). One says how much of the model
+    /// stays on the card, the other how much of the card is pie's. Alto
+    /// design §7's unified accounting is where the two meet; until it lands
+    /// they are stated separately and neither derives the other.
+    ///
+    /// A `[model]` key rather than an engine option because it is portable:
+    /// the budget is a fact about the load, and every shell that streams
+    /// weights reads the same two numbers. WHICH planes a shell can hold
+    /// fewer of is the shell's own property, so a budget it cannot meet by
+    /// holding less refuses the load by name with both numbers rather than
+    /// silently holding more (`engine::Residency`).
+    #[serde(default)]
+    pub device_weight_budget: Option<ByteSize>,
+    /// **How many weight bytes this load may keep in the PINNED HOST cache**
+    /// (tier T1), written with its unit (`"64GiB"`). Omit for uncapped.
+    ///
+    /// T1 is the tier a device miss reads over UVA instead of stalling on the
+    /// checkpoint. An engine that holds everything on the device keeps zero
+    /// host-resident weight bytes and every host budget admits it; one that
+    /// streams routed experts pins EVERY expert of every streamed bank -- the
+    /// pinned copy is authoritative and the device slab is a cache over it --
+    /// so its host demand is those banks whole, and a budget under that
+    /// refuses like any other.
+    #[serde(default)]
+    pub host_weight_budget: Option<ByteSize>,
+    /// **THE SECOND ROW AXIS'S CEILING** (alto multimodal §5.5): the most
+    /// patch rows one fire may carry, over every image of every lane in it.
+    ///
+    /// **OMIT IT.** A vision SKU serves with zero configuration: the shell
+    /// reads the loaded TEXT, and a plan that states a patch axis gets rungs
+    /// at whole images from the patch lattice's floor up to a ceiling argued
+    /// from the token rectangle. A plan that states none gets no ladder at
+    /// all, which is what every text-only SKU has always had.
+    ///
+    /// **A PLAIN INTEGER AND NOT A [`ByteSize`]**, unlike the two weight
+    /// budgets above it: those are byte counts an operator writes with a unit,
+    /// this is a ROW COUNT like `max_forward_tokens` beside it, and giving it
+    /// a unit would invite `"4KiB"` for a number that is not bytes.
+    ///
+    /// A `[model]` key rather than `[model.engine.options]` because it is
+    /// portable — every shell that serves a tower states its ceilings the same
+    /// way, which is debt 6's rule and the one `max_adapters` already follows.
+    #[serde(default)]
+    pub max_patches: Option<u32>,
+    /// **THE PATCH AXIS'S LANE CEILING** (alto multimodal §5.5): the most
+    /// IMAGES one fire may carry.
+    ///
+    /// Omit it, as above. Not the same number as `max_patches` and not derived
+    /// from it by the engine's own doctrine — a lane may submit three images
+    /// or none — but the DEFAULT is argued from it: as many images as the
+    /// patch ceiling holds if every one of them is the smallest whole image.
+    #[serde(default)]
+    pub max_images: Option<u32>,
     /// **The correction class's two operator decisions** (alto design §8):
     /// how many adapter seats this deployment intends to use, and which
     /// adapters to write into them at boot.
@@ -736,7 +798,7 @@ pub struct AdapterConfig {
     /// The adapters to write into those seats at boot, in the order given.
     ///
     /// Registration is a control-plane residency verb — once per adapter,
-    /// never on the fire path (`engine_api::adapter`) — so boot is exactly
+    /// never on the fire path (`engine::adapter`) — so boot is exactly
     /// where it belongs.
     #[serde(default)]
     pub registered: Vec<RegisteredAdapter>,
@@ -745,13 +807,13 @@ pub struct AdapterConfig {
 /// One adapter, as an operator names it.
 ///
 /// **THE PLANES ARE RAW BYTES AND THE PADDING IS THE CALLER'S**, which is the
-/// contract's own rule (`engine_api::adapter`): an adapter trained at rank 4
+/// contract's own rule (`engine::adapter`): an adapter trained at rank 4
 /// in a bank declared at rank 16 is submitted zero-padded, because `A`'s
 /// unused ranks are trailing ROWS and `B`'s are a stride inside every row, and
 /// a shell that padded a short plane's prefix would be right for one and wrong
 /// for the other. So a file here is one bank's slot, exactly, in the bank's
 /// declared dtype and layout — the same bytes
-/// [`AdapterPlane::bytes`](engine_api::AdapterPlane) carries. A file of the
+/// [`AdapterPlane::bytes`](engine::AdapterPlane) carries. A file of the
 /// wrong length is refused by the engine, by name, with both numbers.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -821,6 +883,38 @@ impl AdapterConfig {
 }
 
 impl ModelConfig {
+    /// **The two weight budgets, in the form the engine's load contract
+    /// states them** (alto design §7) -- what `[model] device_weight_budget`
+    /// and `[model] host_weight_budget` are for.
+    ///
+    /// Both absent is [`engine::Residency::uncapped`], which is exactly the
+    /// behaviour this worker had before the keys existed: the whole weight
+    /// table lands on the device at load and never moves. There is no mode
+    /// enum on either side of this seam -- residency is two numbers, and two
+    /// numbers name every tier mix including the ones nobody has built yet.
+    #[must_use]
+    pub fn residency(&self) -> engine::Residency {
+        engine::Residency {
+            device_weight_budget: self.device_weight_budget.map(|b| b.as_bytes()),
+            host_weight_budget: self.host_weight_budget.map(|b| b.as_bytes()),
+        }
+    }
+
+    /// **The second row axis's two ceilings, in the form the engine's load
+    /// contract states them** (alto multimodal §5.5) — what `[model]
+    /// max_patches` and `[model] max_images` are for.
+    ///
+    /// Both absent is the honest default and the common case: the shell reads
+    /// the loaded text and derives a ladder when the plan states a patch axis,
+    /// so a vision SKU serves with zero configuration and a text-only one
+    /// keeps the literal `None` it has always had. There is no mode enum on
+    /// either side of this seam — a ladder is two numbers and a floor, and the
+    /// floor is the compiler's statute.
+    #[must_use]
+    pub fn patch_ceilings(&self) -> (Option<u32>, Option<u32>) {
+        (self.max_patches, self.max_images)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.name.is_empty(),
@@ -841,6 +935,38 @@ impl ModelConfig {
              leave it empty for $PIE_HOME/cache/weights",
             self.weight_cache_dir
         );
+        // A ceiling of zero bytes admits no plan at all, so it is a typo
+        // rather than a policy -- and it is refused HERE, by the key's own
+        // name, instead of reaching the engine as an `Impossible` naming
+        // plane byte counts the operator never wrote down.
+        // **A CEILING OF ZERO ROWS ADMITS NO IMAGE**, so it is a typo rather
+        // than a policy — and it is refused here, by the key's own name,
+        // rather than reaching the compiler as a `Budget` refusal about a
+        // rectangle the operator never wrote down. Omitting the key is how a
+        // deployment says "derive one"; writing `0` is how it says nothing at
+        // all, and the two must not be the same sentence.
+        for (key, rows) in [
+            ("max_patches", self.max_patches),
+            ("max_images", self.max_images),
+        ] {
+            ensure!(
+                rows != Some(0),
+                "model.{key} = 0 admits no image at all; omit the key to let the engine \
+                 derive a ladder from the model text, or state a positive count"
+            );
+        }
+        for (key, budget) in [
+            ("device_weight_budget", self.device_weight_budget),
+            ("host_weight_budget", self.host_weight_budget),
+        ] {
+            if let Some(budget) = budget {
+                ensure!(
+                    budget.as_bytes() > 0,
+                    "model.{key} is zero, and no load can hold zero weight bytes; \
+                     state a real ceiling or omit the key for uncapped"
+                );
+            }
+        }
         self.adapters.validate()?;
         Ok(())
     }
@@ -2537,5 +2663,170 @@ mxfp4_moe = "mystery"
         let cfg: Config = toml::from_str(cuda).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("mxfp4_moe"), "got: {err}");
+    }
+
+    // -------------------------------------------------------------------------
+    // [model] max_patches / max_images  (alto multimodal §5.5, the second axis)
+    // -------------------------------------------------------------------------
+
+    /// **THE COMMON CASE IS SAYING NOTHING**, and it has to parse to "derive".
+    /// A vision SKU serves with zero configuration; the engine reads the
+    /// loaded text and a plan that states no patch axis gets no ladder at all.
+    #[test]
+    fn a_deployment_that_states_no_patch_ceilings_asks_the_engine_to_derive_them() {
+        let cuda = r#"
+[model]
+name = "default"
+model = "Qwen/Qwen3.5-0.8B"
+
+[model.engine]
+type = "cuda_native"
+device = ["cuda:0"]
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        cfg.validate().expect("a config that states nothing is valid");
+        assert_eq!(cfg.model.patch_ceilings(), (None, None));
+    }
+
+    /// And an operator who has measured their traffic states two plain
+    /// integers — row counts, not byte sizes, so no unit and no `ByteSize`.
+    #[test]
+    fn a_stated_patch_ceiling_is_two_plain_integers() {
+        let cuda = r#"
+[model]
+name = "default"
+model = "Qwen/Qwen3.5-0.8B"
+max_patches = 2304
+max_images = 4
+
+[model.engine]
+type = "cuda_native"
+device = ["cuda:0"]
+"#;
+        let cfg: Config = toml::from_str(cuda).unwrap();
+        cfg.validate().expect("stated ceilings are valid");
+        assert_eq!(cfg.model.patch_ceilings(), (Some(2304), Some(4)));
+    }
+
+    /// **ZERO IS A TYPO, NOT A POLICY**, and it is refused by the key's own
+    /// name rather than reaching the compiler as a refusal about a rectangle
+    /// the operator never wrote down. Omitting the key is how a deployment
+    /// says "derive one"; the two sentences must not be the same.
+    #[test]
+    fn a_patch_ceiling_of_zero_is_refused_by_its_own_name() {
+        for key in ["max_patches", "max_images"] {
+            let cuda = format!(
+                r#"
+[model]
+name = "default"
+model = "Qwen/Qwen3.5-0.8B"
+{key} = 0
+
+[model.engine]
+type = "cuda_native"
+device = ["cuda:0"]
+"#
+            );
+            let cfg: Config = toml::from_str(&cuda).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(key), "got: {err}");
+            assert!(err.contains("omit the key"), "got: {err}");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // [model] device_weight_budget / host_weight_budget  (alto streaming, W-3)
+    // -------------------------------------------------------------------------
+
+    /// `MINIMAL_METAL` with extra `[model]` keys, written INSIDE the one
+    /// `[model]` table -- pie serves exactly one model, so a second `[model]`
+    /// header is a duplicate-key refusal before any of this is reached.
+    fn metal_with_model_keys(extra: &str) -> String {
+        format!(
+            "[model]\nname = \"default\"\nmodel = \"Qwen/Qwen3-0.6B\"\n{extra}\n\
+             [model.engine]\ntype = \"metal\"\ndevice = [\"cpu\"]\n"
+        )
+    }
+
+    #[test]
+    fn both_weight_budgets_reach_residency_as_bytes() {
+        // The keys carry a unit like every other size in this file, and the
+        // engine's load contract takes plain bytes -- so the conversion
+        // happens once, here, and `Residency` never sees a string.
+        let toml = metal_with_model_keys(
+            "device_weight_budget = \"18GiB\"\nhost_weight_budget = \"64GiB\"",
+        );
+        let cfg = Config::parse(&toml).expect("both budgets parse");
+        let residency = cfg.model.residency();
+        assert_eq!(residency.device_weight_budget, Some(18 << 30));
+        assert_eq!(residency.host_weight_budget, Some(64 << 30));
+    }
+
+    #[test]
+    fn absent_weight_budgets_are_uncapped() {
+        // The whole point of the pair being optional: a config written before
+        // these keys existed reaches the engine as the engine it had.
+        let cfg = Config::parse(MINIMAL_METAL).expect("the minimal config parses");
+        assert_eq!(cfg.model.device_weight_budget, None);
+        assert_eq!(cfg.model.host_weight_budget, None);
+        assert_eq!(cfg.model.residency(), engine::Residency::uncapped());
+    }
+
+    #[test]
+    fn one_weight_budget_may_be_stated_without_the_other() {
+        // Two budgets, not a mode: capping the device tier alone is a
+        // deployment shape, not a half-written config.
+        let device_only = metal_with_model_keys("device_weight_budget = \"512MiB\"");
+        let cfg = Config::parse(&device_only).expect("device budget alone parses");
+        assert_eq!(
+            cfg.model.residency(),
+            engine::Residency {
+                device_weight_budget: Some(512 << 20),
+                host_weight_budget: None,
+            }
+        );
+
+        let host_only = metal_with_model_keys("host_weight_budget = \"2GiB\"");
+        let cfg = Config::parse(&host_only).expect("host budget alone parses");
+        assert_eq!(
+            cfg.model.residency(),
+            engine::Residency {
+                device_weight_budget: None,
+                host_weight_budget: Some(2 << 30),
+            }
+        );
+    }
+
+    #[test]
+    fn a_weight_budget_refuses_at_boot_by_the_keys_name() {
+        // A nonsense budget is a boot-time refusal naming the key the
+        // operator wrote, not a panic somewhere downstream of the load.
+        for (key, nonsense, needle) in [
+            ("device_weight_budget", "\"35\"", "has no unit"),
+            ("host_weight_budget", "\"35GB\"", "binary units only"),
+            ("device_weight_budget", "18", "invalid type"),
+        ] {
+            let toml = metal_with_model_keys(&format!("{key} = {nonsense}"));
+            let err = Config::parse(&toml)
+                .expect_err("a nonsense budget must refuse")
+                .to_string();
+            assert!(err.contains(key), "refusal does not name {key}: {err}");
+            assert!(err.contains(needle), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn a_zero_weight_budget_refuses_by_the_keys_name() {
+        // Parseable and still nonsense: no load holds zero weight bytes. The
+        // engine would refuse it too, but naming plane byte counts the
+        // operator never wrote; this one names the key.
+        for key in ["device_weight_budget", "host_weight_budget"] {
+            let toml = metal_with_model_keys(&format!("{key} = \"0B\""));
+            let err = Config::parse(&toml)
+                .expect_err("a zero budget must refuse")
+                .to_string();
+            assert!(err.contains(&format!("model.{key}")), "got: {err}");
+            assert!(err.contains("zero weight bytes"), "got: {err}");
+        }
     }
 }

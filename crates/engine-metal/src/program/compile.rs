@@ -5,7 +5,7 @@
 //! DELIBERATE.** [`Pipelines`](crate::device::Pipelines) compiles the
 //! SHIPPED shaders and is keyed by `(&'static str file, &'static str
 //! entrypoint)` off `kernels_metal::SOURCES`; a guest program's MSL is an
-//! owned `String` produced this second by `tensor-compiler`, with no file
+//! owned `String` produced this second by `eta-compiler`, with no file
 //! and no static name. Sharing that cache would mean either leaking every
 //! guest entry name to `'static` or keying it by something it is not. So
 //! this module compiles its own, and the two share only the framework — the
@@ -14,7 +14,7 @@
 //!
 //! # The emitted source is not complete until this module completes it
 //!
-//! Every M2 kernel `tensor_compiler::codegen::metal` emits begins with
+//! Every M2 kernel `eta_compiler::codegen::metal` emits begins with
 //! `RUNTIME_TEMPLATE`, and the template's second line is
 //! `#include "ptir_rng.generated.metal"`. `newLibraryWithSource:` has no
 //! header search path, so the compile fails with `fatal error:
@@ -56,13 +56,15 @@
 
 use std::sync::Arc;
 
-use engine::engine_api::program::{KernelKind, LaunchStagePlan, LibraryOp, RegionKind};
-use engine::tensor_ir::registry::Stage as Attach;
-use engine::{
+use eta_compiler::codegen::launch::LaunchStagePlan;
+use eta_compiler::codegen::program::KernelKind;
+use eta_compiler::plan::{LibraryOp, RegionKind};
+use eta_exec::{
     Backend, Bounded, CacheStats, Emitted, EmittedKernel, ExecPlan, Failure, Lookup,
     MAX_NEGATIVE_ENTRIES, MAX_PROGRAM_ENTRIES, MAX_STAGE_ENTRIES, Slot, Stages, Versions,
     cache_identity, combined_signature,
 };
+use eta_ir::registry::Stage as Attach;
 
 use crate::device::Context;
 use crate::error::Result;
@@ -454,7 +456,7 @@ impl Cache {
             combined_signature(&plan.package.plans),
             versions,
         );
-        let program_key = engine::tensor_ir::fnv1a64(program_identity.as_bytes());
+        let program_key = eta_ir::fnv1a64(program_identity.as_bytes());
         if let Some(reason) = self.negative.get(&program_key) {
             self.stats.negative_hits += 1;
             return Err(Failure::Deterministic {
@@ -516,7 +518,7 @@ impl Cache {
             // **NOTHING IS FOLDED IN BESIDE THE IDENTITY**, where the CUDA
             // twin folds NVRTC's version: `cache_identity` already carries
             // the device, and on this plane the device IS the toolchain.
-            let key = engine::tensor_ir::fnv1a64(identity.as_bytes());
+            let key = eta_ir::fnv1a64(identity.as_bytes());
             let (lookup, hit) = self.stages.lookup(key, stage_plan.identity);
             match lookup {
                 Lookup::Hit => {
@@ -694,7 +696,7 @@ mod tests {
     /// different translation units and must never share a key.
     #[test]
     fn the_two_emitters_never_share_a_cache_identity() {
-        use tensor_compiler::codegen::program::Backend as Emitter;
+        use eta_compiler::codegen::program::Backend as Emitter;
 
         assert_ne!(
             Emitter::Metal.emitter_version(),

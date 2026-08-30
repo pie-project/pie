@@ -1,7 +1,7 @@
 // $name — TypeScript inferlet.
 //
 // HEADS UP: this scaffold does not generate text, because the JavaScript SDK
-// cannot yet. The guest forward-pass surface now ships PTIR container bytes,
+// cannot yet. The guest forward-pass surface now ships ETA container bytes,
 // and the encoder that produces them exists only in the Rust SDK, so
 // `@pie-project/inferlet` currently exposes the non-forward interfaces only.
 // `scripts/check-sdk-interfaces.sh` in the pie repo fails on exactly that and

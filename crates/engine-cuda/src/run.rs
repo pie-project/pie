@@ -8,12 +8,12 @@
 //! with it.
 //!
 //! Everything here answers to one rule: a [`KernelError`] is about the
-//! backend, never about the plan (`kernels::error`). A hole in a table,
+//! backend, never about the plan (`model_exec::error`). A hole in a table,
 //! a cache id in a tensor seat, a plan consumed before its plan op — those
 //! are integrity failures of the shell or the compiler, and they panic with
 //! a sentence instead of dressing up as a backend refusal.
 //!
-//! [`KernelError`]: kernels::KernelError
+//! [`KernelError`]: model_exec::KernelError
 
 use std::cell::Cell;
 
@@ -287,7 +287,7 @@ pub struct FireTables {
 }
 
 /// **What one lane's recurrent state does with the buffer this fire**
-/// (`engine_api::RsVerb`, resolved to addressing).
+/// (`engine::RsVerb`, resolved to addressing).
 ///
 /// The verb minus everything the shell already decided. `Fold` is the absence
 /// of a move — the plain path, and the only shape that graph-replays — so it
@@ -483,6 +483,65 @@ pub struct FireBindings {
     /// launches, because its window is empty and the walk skips it.
     pub adapter_routes: Option<Tensor>,
 
+    /// **THE SECOND ROW AXIS'S THREE SEATS** (multimodal §2, §5.4), and all
+    /// three `None` for a fire no lane submitted an image into.
+    ///
+    /// `patches` is `RuntimeInput::Patches` — the pre-unfolded patch rows,
+    /// `[patch_rows, C·T·P²]`; `patch_segments` is the patch axis's own
+    /// indptr, `i32`, `images + 1` entries; `patch_routes` says which token
+    /// row each tower row scatters into, `i32`, one per patch row.
+    ///
+    /// **NONE OF THE THREE RIDES THE PINNED STAGING RING.** The ring is
+    /// depth-multiplied and its layout is fixed at load, so reserving a patch
+    /// rectangle in it would make every text-only load pay `12 MiB × depth`
+    /// of pinned memory for a vector it never fills — the §5.4 finding, and
+    /// the reason gate (a) is an arithmetic property here rather than a
+    /// measurement. These are written inside `enqueue` from pageable memory
+    /// (which makes `cudaMemcpyAsync` synchronous in the SOURCE, so the
+    /// `Vec` may be dropped immediately) and consumed by kernels the same
+    /// `enqueue` launched behind them on the same stream. It is the argument
+    /// `Inputs`' schedule grants already make, one axis over.
+    ///
+    /// The absence is load-bearing exactly as `adapter_routes`' is: nothing
+    /// staged, no seat bound, and the tower's window is empty so the walk
+    /// never reaches a launch that would read one.
+    pub patches: Option<Tensor>,
+    /// The patch axis's indptr — see [`patches`](FireBindings::patches).
+    pub patch_segments: Option<Tensor>,
+    /// The embed merge's destination rows — see
+    /// [`patches`](FireBindings::patches). Checked against this fire's token
+    /// row count BEFORE the launch (`Fault::PatchRoute`), because
+    /// `layout.scatter_rows` cannot check it and an out-of-range entry is an
+    /// out-of-bounds device write.
+    pub patch_routes: Option<Tensor>,
+    /// **THE TOWER'S ROTATION STREAM** (multimodal §6.3):
+    /// `RuntimeInput::PatchPositions`, `i32`, `[patch rows, 3]` — one
+    /// `(t, h, w)` per patch row, each patch's own `(h, w)` in its image's
+    /// grid. Cut from the same submission as the three above and staged in
+    /// the same `enqueue`; `None` on the same terms.
+    pub patch_positions: Option<Tensor>,
+    /// **THE LEARNED POSITION TABLE'S GATHER INDICES** (multimodal §9.2):
+    /// `RuntimeInput::PatchEmbedRows`, `i32`, `[patch rows, taps]` — 1 tap on
+    /// the native grid, 4 for bilinear, 16 for bicubic. `None` for a plan that
+    /// declares no learned position table.
+    pub patch_embed_rows: Option<Tensor>,
+    /// **AND HOW MUCH OF EACH TAP**: `RuntimeInput::PatchEmbedWeights`, `f32`,
+    /// `[patch rows, taps]`. `None` for a NATIVE-grid plan, which reads one
+    /// table row per patch through the plain `layout.embed` and weights it by
+    /// nothing — the cheap path being the absence of this seat rather than a
+    /// rectangle of ones.
+    pub patch_embed_weights: Option<Tensor>,
+    /// **THE TRUNK'S ROTATION STREAM** (multimodal §6.3):
+    /// `RuntimeInput::MropePositions`, `i32`, `[token rows, 3]`.
+    ///
+    /// On the FIRST axis and not the second, which is why it stands apart
+    /// from the four above: the trunk is one region over the whole token
+    /// rectangle, so every row of an mrope-declaring fire carries a triple —
+    /// a lane with no image carries `(p, p, p)`, which is scalar rope to the
+    /// last bit. `None` for a plan that does not declare the stream, which is
+    /// every text this engine served before the towers.
+    pub mrope_positions: Option<Tensor>,
+
     /// Per cache space, aligned with `Trace::caches`:
     /// `RuntimeInput::Geometry { space, kind }` routes to that space, and
     /// the plan-building arms route to row `cache`'s planning twin.
@@ -506,6 +565,22 @@ pub struct FireBindings {
 
     /// The seam extras the arms bind beside the ops' named operands.
     pub tables: FireTables,
+
+    /// **THE OBSERVABILITY SEAT** (`.wiki/alto/attn-score.md` §4), `None` for
+    /// a load whose plan declares no `attn.scores` export and for every fire
+    /// of a load whose lanes all asked for nothing.
+    ///
+    /// A `MENLO-SEAM` in the strict sense — no `Operands` impl mentions the
+    /// slab, and no `Operands` impl should: the score write is not a value
+    /// the graph computes for another node, it is an OBSERVATION the graph
+    /// makes on its way past. What the IR names is the capture arm, and the
+    /// capture arm is `attention.prefill_lse`, which the plan already
+    /// carried.
+    ///
+    /// It stands beside [`tables`](FireBindings::tables) rather than on it
+    /// because the seat carries a list (which value is which plane) and
+    /// [`FireTables`] is `Copy`.
+    pub scores: Option<crate::scores::ScoreSeat>,
 
     /// The device facts every builder takes — pre-probed by the shell
     /// (`Device::probe` once at boot, or a stated fallback); the builders
@@ -550,7 +625,7 @@ pub enum StructSlot {
 /// One fire's dispatch state: the stream context, the resolution tables,
 /// the fire bindings, and the plan payloads this fire builds. The shell
 /// constructs one per fire and drives the substrate's walk
-/// (`engine::fire::walk`) over it — prepare phase first (outside any
+/// (`model_exec::fire::walk`) over it — prepare phase first (outside any
 /// capture), so every plan payload exists and is staged before its
 /// consumers enqueue.
 pub struct Run<'c> {
@@ -634,6 +709,17 @@ pub struct Run<'c> {
     /// [`place`](Run::place), at the same instant and for the same reason.
     stream: &'c Cell<u32>,
 
+    /// **THE CONTEXT A CONDITIONAL BODY'S LAUNCHES LAND ON**, when this load
+    /// opened one (`Context::open_conditional`).
+    ///
+    /// Not a member of [`side`](Run::side) even though it is built exactly
+    /// like one, because it is not a stream ASSIGNMENT: no region names it and
+    /// `model_compiler::stream` cannot reach it. The cursor writes
+    /// [`window::BODY`](crate::window::BODY) into the cell for exactly the
+    /// span between a conditional's `cond_begin` and its `cond_end`, which is
+    /// the span whose launches belong in the child graph.
+    body: Option<&'c Ctx>,
+
     /// The `Fallback::Copy` currently in force: which rectangles the region
     /// the walk is inside compacted, and where in the scratch slab each one
     /// landed.
@@ -695,6 +781,7 @@ impl<'c> Run<'c> {
             place,
             side: &[],
             stream: &place.region,
+            body: None,
             copy: CopyPlan::default(),
             pad: Pad::default(),
         }
@@ -746,7 +833,7 @@ impl<'c> Run<'c> {
         op: &'static str,
         id: ValueId,
         rows: Tensor,
-    ) -> Result<(), kernels::KernelError> {
+    ) -> Result<(), kernels_cuda::Error> {
         let Some(seat) = self.rs.as_ref() else {
             return Ok(());
         };
@@ -755,13 +842,15 @@ impl<'c> Run<'c> {
         };
         let span = self.window().span;
         let bounds = self.qo_indptr_host();
-        // The shell's fault becomes the dispatch plane's, because that is the
-        // channel this arm answers on: the walk turns a `KernelError` back
-        // into a `Fault` one frame up (`Fault::from`), so nothing is lost but
-        // the variant, and the sentence — which is what a caller reads — is
-        // carried whole.
+        // The shell's fault becomes the KERNEL plane's, because that is the
+        // channel this arm answers on: the dispatch arm that calls this is
+        // typed `Result<(), kernels_cuda::Error>` like every entry beside it,
+        // `error::kernel` lifts the whole arm into the contract, and the walk
+        // turns the contract's `KernelError` back into a `Fault` one frame up
+        // (`Fault::from`). Nothing is lost across the three but the variant,
+        // and the sentence — which is what a caller reads — is carried whole.
         seat.run(self.ctx.stream(), plane, span.lane_offset, bounds, rows)
-            .map_err(|fault| kernels::KernelError::Backend {
+            .map_err(|fault| kernels_cuda::Error::Backend {
                 op,
                 detail: fault.to_string(),
             })
@@ -807,6 +896,22 @@ impl<'c> Run<'c> {
         self
     }
 
+    /// The same `Run`, told which context a conditional body's launches go on.
+    ///
+    /// **IT SEATS THE STREAM CELL TOO, AND THAT IS NOT A CONVENIENCE.**
+    /// `Run::new` parks the region cell in the stream field so the type has
+    /// something to hold, and [`Run::ctx`] reads the stream field only when
+    /// somebody has since replaced it — reading a region index as a stream
+    /// index is the bug that guard exists to make impossible. A `Run` given a
+    /// body context is one whose cursor writes stream numbers into `stream`,
+    /// so the two arrive together or neither does.
+    #[must_use]
+    pub fn conditional(mut self, body: &'c Ctx, stream: &'c Cell<u32>) -> Self {
+        self.body = Some(body);
+        self.stream = stream;
+        self
+    }
+
     /// The stream context the node being dispatched fires on, for the arms.
     ///
     /// **THE ONE PLACE A SIDE STREAM ENTERS THE DISPATCH PLANE**, and it is a
@@ -822,13 +927,21 @@ impl<'c> Run<'c> {
         // and `new` seats the region cell there so the type has something to
         // hold. Reading a region index as a stream index is exactly the bug
         // this line exists to make impossible.
-        let ctx = if self.side.is_empty() {
-            self.ctx
-        } else {
-            match self.stream.get() {
+        let ctx = match self.body {
+            // **THE CONDITIONAL BODY IS ASKED FIRST**, because it is the one
+            // reading that is not a stream ASSIGNMENT: the sentinel is written
+            // for the span between a `cond_begin` and its `cond_end` and says
+            // "this launch belongs in the child graph", which outranks
+            // whatever stream the region was baked onto. A conditional region
+            // is never forked anyway (`model_compiler::stream::forkable` has
+            // read `lowering == AlwaysLaunch` since D1), so the two can never
+            // both have something to say.
+            Some(body) if self.stream.get() == crate::window::BODY => body,
+            _ if self.side.is_empty() => self.ctx,
+            _ => match self.stream.get() {
                 0 => self.ctx,
                 n => self.side.get(n as usize - 1).copied().unwrap_or(self.ctx),
-            }
+            },
         };
         // **AND THE SECOND THING THIS LOOKUP ANSWERS: MAY THIS REGION PAD?**
         // (`.wiki/palo/cuda-abi.md` §3's boundary.) Every dispatch arm reaches
@@ -1027,13 +1140,26 @@ impl<'c> Run<'c> {
         let Ty::Tensor { shape, .. } = &self.values[at].ty else {
             return handle;
         };
-        let window = self.window().span;
+        let seated = self.window();
+        let window = seated.span;
+        let patch = seated.patch;
         let (skip, keep) = match shape.first() {
             Some(Dim::Tokens) => (window.row_offset, window.rows),
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
             Some(Dim::Const(_)) | None => return handle,
+            // **THE SECOND ROW AXIS, CUT AT ITS OWN WINDOW** (multimodal
+            // §5.1). `Window::patch` is this region's mask read against the
+            // PATCH table — patch rows where `span` has token rows and IMAGES
+            // where it has lanes — so a tower rectangle is cut by the
+            // seriation that placed it and never by the token one. The two
+            // pairs are carried separately rather than chosen between,
+            // because the embed merge is a TOKEN region that reads a patch
+            // column and needs both in the same resolution.
+            Some(Dim::Patches) => (patch.row_offset, patch.rows),
+            Some(Dim::Images) => (patch.lane_offset, patch.lanes),
+            Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
         };
         if skip == 0 && keep >= handle.rows {
             return handle;
@@ -1096,7 +1222,7 @@ impl<'c> Run<'c> {
                     self.copy.region,
                     self.place.region.get(),
                     "value {at} is being resolved inside a copied region whose gather \
-                     has not run; `engine::fire::walk` brackets a copied region's \
+                     has not run; `model_exec::fire::walk` brackets a copied region's \
                      nodes and this is what says the bracket was lost",
                 );
                 self.copy.tight(handle.ptr).unwrap_or_else(|| {
@@ -1152,6 +1278,71 @@ impl<'c> Run<'c> {
                 self.fire.adapter_routes.unwrap_or_else(|| {
                     panic!(
                         "value {at} reads this fire's adapter ids, which no lane of it                          carried"
+                    )
+                })
+            }
+            // **THE SECOND ROW AXIS'S THREE RUNTIME INPUTS** (multimodal
+            // §2), bound from what `enqueue` wrote — outside the staging ring,
+            // for the reason [`FireBindings::patches`] states at length.
+            //
+            // The panic is the `AdapterRoutes` statement one arm up, on the
+            // other axis: a fire whose lanes submitted no image binds no patch
+            // seat, and a plan that reads one has a class whose window is
+            // empty, so the walk never dispatches the node that would ask.
+            // `compose_axes` is what makes that true rather than hoped for —
+            // a lane carrying images against an artifact with no patch axis is
+            // `Fault::Towerless`, refused before a byte is staged.
+            Def::Input(RuntimeInput::Patches) => self.fire.patches.unwrap_or_else(|| {
+                panic!(
+                    "value {at} reads this fire's patch rows, which no lane of it                      submitted"
+                )
+            }),
+            Def::Input(RuntimeInput::PatchSegments) => {
+                self.fire.patch_segments.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's image boundaries, which no lane of                          it submitted"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::PatchRoutes) => {
+                self.fire.patch_routes.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads where this fire's tower rows land, and no lane                          of it submitted an image"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::PatchEmbedRows) => {
+                self.fire.patch_embed_rows.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads which position-table rows this fire's patches gather,                          and no lane of it submitted an image"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::PatchEmbedWeights) => {
+                self.fire.patch_embed_weights.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's interpolation weights, which a                          native-grid plan declares none of"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::PatchPositions) => {
+                self.fire.patch_positions.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads where this fire's patches sit in their grids,                          and no lane of it submitted an image"
+                    )
+                })
+            }
+            // **THE TRUNK'S TRIPLE, ON THE TOKEN AXIS.** Unlike the four
+            // above it this is not gated on a lane carrying an image: the
+            // trunk's region covers the whole rectangle, so a plan that
+            // declares the stream reads it in every fire, and a text lane's
+            // rows carry `(p, p, p)`. Reaching the panic therefore means the
+            // load reserved no stream for a plan that names one, which
+            // `Inputs::reserve` decides from the trace itself.
+            Def::Input(RuntimeInput::MropePositions) => {
+                self.fire.mrope_positions.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's (t, h, w) token positions, which this                          load reserved no stream for"
                     )
                 })
             }

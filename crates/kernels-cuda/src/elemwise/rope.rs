@@ -5,8 +5,8 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
@@ -74,7 +74,7 @@ pub fn ramp_bounds(
     (low_dim, high_dim)
 }
 
-fn heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, KernelError> {
+fn heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the head width this rotation states", head_dim)?;
     if width % head_dim != 0 {
         return Err(refuse(
@@ -85,7 +85,7 @@ fn heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, KernelError
     Ok(width / head_dim)
 }
 
-fn q_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, KernelError> {
+fn q_heads(op: &'static str, width: u32, head_dim: u32) -> Result<u32, Error> {
     nonzero(op, "the q region's width", width)?;
     heads(op, width, head_dim)
 }
@@ -110,7 +110,7 @@ pub fn full(
     head_dim: u32,
     theta: f32,
     interleaved: bool,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_full";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
@@ -167,7 +167,7 @@ pub fn partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
@@ -182,7 +182,7 @@ pub fn partial_q(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial_q";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     positions_stream(OP, positions, q);
@@ -200,7 +200,7 @@ pub fn partial_last(
     head_dim: u32,
     theta: f32,
     interleaved: bool,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_partial_last";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     positions_stream(OP, positions, q);
@@ -249,7 +249,7 @@ pub fn yarn(
     attention_factor: f32,
     original_max_position: u32,
     interleaved: bool,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rope_yarn";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
@@ -310,7 +310,7 @@ fn rope_partial(
     rotary_dim: u32,
     head_dim: u32,
     theta: f32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let num_q_heads = q_heads(op, q.width, head_dim)?;
     let num_kv_heads = heads(op, k.width, head_dim)?;
     ctx.fire(

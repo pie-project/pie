@@ -1,12 +1,12 @@
 //! `Gate`: `x *= sigmoid(gate)`, in place on `x`. One point, and the old
 //! plane claimed it.
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, stated};
 use crate::tensor::Tensor;
 
-pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), KernelError> {
+pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.gate_sigmoid_mul";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "gate_bfloat16" });
     debug_assert!(

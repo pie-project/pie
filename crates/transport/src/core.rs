@@ -1,16 +1,16 @@
 //! Backend-agnostic transport core.
 //!
-//! Defines the uniform interface every engine implements and the
-//! register → transfer → complete lifecycle vocabulary. Engines (`local`,
-//! `nixl`) plug in behind the [`Engine`] trait; the [`crate::registry`] binds a
+//! Defines the uniform interface every backend implements and the
+//! register → transfer → complete lifecycle vocabulary. Backends (`local`,
+//! `nixl`) plug in behind the [`Backend`] trait; the [`crate::registry`] binds an
 //! engine-exported handle to one and dispatches.
 //!
 //! The KV handle the data plane consumes lives on the schema floor
-//! ([`engine_api::KvHandle`]) — transport never owns or interprets the
+//! ([`engine::KvHandle`]) — transport never owns or interprets the
 //! bytes, it only moves pages between workers.
 
 use crate::error::Result;
-use engine_api::KvHandle;
+use engine::KvHandle;
 
 /// Worker identity on the data plane — re-exported from the interface leaf.
 ///
@@ -44,7 +44,7 @@ impl PageSet {
     }
 }
 
-/// Opaque token for an in-flight transfer. Poll it via the registry/engine for
+/// Opaque token for an in-flight transfer. Poll it via the registry/backend for
 /// completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransferId(pub u64);
@@ -62,29 +62,29 @@ pub enum Completion {
     Failed(String),
 }
 
-/// Which engine backs a registered handle or transfer.
+/// Which backend backs a registered handle or transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineKind {
+pub enum BackendKind {
     /// Same-node device-to-device copy (co-located prefill+decode).
     Local,
     /// Cross-node RDMA/NIXL path (deferred behind `feature = "nixl"`).
     Nixl,
 }
 
-/// An engine-exported handle bound to a transfer engine — the output of
-/// [`Engine::register`]. Carries the engine tag and owning worker so the
+/// An engine-exported handle bound to a transfer backend — the output of
+/// [`Backend::register`]. Carries the backend tag and owning worker so the
 /// registry can route subsequent `send`/`recv`/`poll` calls.
 #[derive(Debug, Clone)]
 pub struct RegisteredHandle {
-    pub(crate) engine: EngineKind,
+    pub(crate) backend: BackendKind,
     pub(crate) owner: WorkerId,
     pub(crate) handle: KvHandle,
 }
 
 impl RegisteredHandle {
-    /// The engine this handle is bound to.
-    pub fn engine(&self) -> EngineKind {
-        self.engine
+    /// The backend this handle is bound to.
+    pub fn backend(&self) -> BackendKind {
+        self.backend
     }
 
     /// The worker that owns the underlying KV cache.
@@ -101,7 +101,7 @@ impl RegisteredHandle {
 /// A paired peer's connection info, handed over by the controller's pairing
 /// decision. Transport *executes* against this — it never computes it.
 ///
-/// Bundles everything a cross-node engine needs to target the peer: the peer's
+/// Bundles everything a cross-node backend needs to target the peer: the peer's
 /// id, its exported [`KvHandle`] (where its pages physically live, for building
 /// the remote descriptor list), and the opaque connect-metadata creds (for
 /// NIXL, the peer agent's `get_local_md` blob). serde because it crosses the
@@ -119,18 +119,18 @@ pub struct PeerConn {
 /// The uniform, backend-agnostic data-plane interface.
 ///
 /// `local` and `nixl` implement it; the registry dispatches to the right one.
-/// Object-safe so the registry can hold engines behind a trait object.
+/// Object-safe so the registry can hold backends behind a trait object.
 ///
-/// Lifecycle: [`register`](Engine::register) →
-/// [`send`](Engine::send)/[`recv`](Engine::recv) → [`poll`](Engine::poll).
+/// Lifecycle: [`register`](Backend::register) →
+/// [`send`](Backend::send)/[`recv`](Backend::recv) → [`poll`](Backend::poll).
 /// Transfers are async — the start calls return a [`TransferId`] and completion
 /// is observed via `poll`.
-pub trait Engine {
-    /// The engine kind this implementation provides.
-    fn kind(&self) -> EngineKind;
+pub trait Backend {
+    /// The backend kind this implementation provides.
+    fn kind(&self) -> BackendKind;
 
     /// Register an engine-exported handle owned by `owner` so this transfer
-    /// engine can move its pages.
+    /// backend can move its pages.
     fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle>;
 
     /// Start sending `pages` of `handle` to worker `dst`. Async — returns a
@@ -172,14 +172,14 @@ pub trait Engine {
     /// Register a remote peer's connection info — the [`PeerConn`] the
     /// controller's pairing handoff carries (peer id, its exported handle, and
     /// for NIXL the peer agent's `get_local_md` blob). Subsequent
-    /// [`send`](Engine::send)/[`recv`](Engine::recv) to that peer target it.
+    /// [`send`](Backend::send)/[`recv`](Backend::recv) to that peer target it.
     ///
-    /// The local engine has no remote peers (co-located handles are known via
-    /// [`register`](Engine::register)), so its implementation is a no-op.
+    /// The local backend has no remote peers (co-located handles are known via
+    /// [`register`](Backend::register)), so its implementation is a no-op.
     fn connect(&self, peer: &PeerConn) -> Result<()>;
 
-    /// This engine's own connect metadata, to advertise to peers via the
-    /// controller. Empty for the local engine; for NIXL, the agent's local
+    /// This backend's own connect metadata, to advertise to peers via the
+    /// controller. Empty for the local backend; for NIXL, the agent's local
     /// metadata blob (valid once memory is registered).
     fn local_metadata(&self) -> Result<Vec<u8>>;
 }

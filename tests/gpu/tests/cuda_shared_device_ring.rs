@@ -49,15 +49,15 @@
 
 mod common;
 
-use engine_api::model_ir::Platform;
-use engine_api::tensor_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use engine_api::tensor_ir::op::Op;
-use engine_api::tensor_ir::registry::{GeometryClass, ModelProfile, Stage};
-use engine_api::tensor_ir::types::{DType, Shape};
-use engine_api::{
+use engine::{
     Attachment, BindExtents, Boundary, Budgets, ChannelRegistration, FrameSubmission,
     InstanceBinding, KvDelta, Lane, Readout, RsReset, RsVerb, Step,
 };
+use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+use eta_ir::op::Op;
+use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::types::{Dtype, Shape};
+use model_ir::Platform;
 use runtime::engine::backend::open;
 
 /// The catalog row this gate serves, spelled as the catalog spells it.
@@ -91,7 +91,7 @@ fn putter() -> TraceContainer {
             // wait for the host to publish.
             ChannelDecl {
                 shape: Shape::vector(1),
-                dtype: ChanDType::Concrete(DType::I32),
+                dtype: ChanDType::Concrete(Dtype::I32),
                 capacity: 1,
                 host_role: HostRole::Writer,
                 seeded: false,
@@ -100,7 +100,7 @@ fn putter() -> TraceContainer {
             // leaves the device between here and the taker.
             ChannelDecl {
                 shape: Shape::vector(1),
-                dtype: ChanDType::Concrete(DType::I32),
+                dtype: ChanDType::Concrete(Dtype::I32),
                 capacity: 1,
                 host_role: HostRole::None,
                 seeded: false,
@@ -126,7 +126,7 @@ fn taker() -> TraceContainer {
             // 0: THE SHARED RING, at a different dense slot than the putter's.
             ChannelDecl {
                 shape: Shape::vector(1),
-                dtype: ChanDType::Concrete(DType::I32),
+                dtype: ChanDType::Concrete(Dtype::I32),
                 capacity: 1,
                 host_role: HostRole::None,
                 seeded: false,
@@ -134,7 +134,7 @@ fn taker() -> TraceContainer {
             // 1: where the host reads what crossed.
             ChannelDecl {
                 shape: Shape::vector(1),
-                dtype: ChanDType::Concrete(DType::I32),
+                dtype: ChanDType::Concrete(Dtype::I32),
                 capacity: 1,
                 host_role: HostRole::Reader,
                 seeded: false,
@@ -159,7 +159,7 @@ fn loop_carried() -> TraceContainer {
         externs: Vec::new(),
         channels: vec![ChannelDecl {
             shape: Shape::vector(1),
-            dtype: ChanDType::Concrete(DType::I32),
+            dtype: ChanDType::Concrete(Dtype::I32),
             capacity: 1,
             host_role: HostRole::None,
             seeded: false,
@@ -179,29 +179,19 @@ fn loop_carried() -> TraceContainer {
 fn registration(
     container: TraceContainer,
     profile: &ModelProfile,
-) -> engine_api::ProgramRegistration {
-    let bound = engine_api::tensor_ir::validate::bind(container, profile.clone())
+) -> engine::ProgramRegistration {
+    let bound = eta_ir::validate::bind(container, profile.clone())
         .unwrap_or_else(|why| panic!("the gate's program does not bind: {why:?}"));
-    let stages = tensor_compiler::plan::compile_bound(&bound);
-    let launch = tensor_compiler::codegen::launch::build(&bound, &stages);
-    let backend = tensor_compiler::codegen::program::Backend::Cuda;
-    let emitted = tensor_compiler::codegen::program::emit_program(backend, &stages, &bound);
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    let launch = eta_compiler::codegen::launch::build(&bound, &stages);
+    let backend = eta_compiler::codegen::program::Backend::Cuda;
+    let emitted = eta_compiler::codegen::program::emit_program(backend, &stages, &bound);
     for kernel in &emitted {
         assert!(kernel.error.is_empty(), "did not emit: {}", kernel.error);
     }
-    engine_api::ProgramRegistration {
+    engine::ProgramRegistration {
         program_hash: bound.hash,
-        emitted_kernels: emitted
-            .into_iter()
-            .map(|kernel| engine_api::EmittedKernel {
-                kind: kernel.kind,
-                stage_index: kernel.stage_index,
-                region_index: kernel.region_index,
-                entry_name: kernel.entry_name,
-                source: kernel.source,
-                error: kernel.error,
-            })
-            .collect(),
+        emitted_kernels: emitted,
         emitter_version: backend.emitter_version(),
         region_analysis: Vec::new(),
         launch,
@@ -220,7 +210,7 @@ fn device_only(id: u64) -> ChannelRegistration {
     ChannelRegistration {
         id,
         shape: vec![1],
-        dtype: ChanDType::Concrete(DType::I32),
+        dtype: ChanDType::Concrete(Dtype::I32),
         host_role: HostRole::None,
         seeded: false,
         extern_dir: None,
@@ -266,7 +256,7 @@ fn fire(tokens: &[u32], attachment: Attachment) -> FrameSubmission {
 
 #[test]
 fn a_device_only_ring_carries_a_cell_from_one_instance_to_another() {
-    use engine_api::Engine;
+    use engine::Engine;
 
     if !engine_cuda::device::present() {
         eprintln!("skipping the shared-ring gate: no CUDA device on this machine");
@@ -294,7 +284,7 @@ fn a_device_only_ring_carries_a_cell_from_one_instance_to_another() {
         &checkpoint,
         Platform::Cuda,
         budgets,
-        engine_api::Residency::uncapped(),
+        engine::Residency::uncapped(),
         0,
         1,
     )

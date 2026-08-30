@@ -8,7 +8,7 @@
 //! two more `match`es (`kind`, `device_domain`) that answered an engine's own
 //! properties on the engine's behalf.
 //!
-//! All of it is [`engine_api::Engine`] now, and `EngineBox` is a
+//! All of it is [`engine::Engine`] now, and `EngineBox` is a
 //! `Box<dyn Engine>`. What that deleted, besides the arms:
 //!
 //! * **The size tuning.** Two variants were `Box`ed with `size_of`
@@ -31,13 +31,39 @@
 //!
 //! Selecting a backend is `open`'s: one function per device, each answering
 //! the same `Box<dyn Engine>`.
+//!
+//! # What this module stopped KNOWING
+//!
+//! It also held both shells' boot-config readers — `backend/cuda.rs` (347
+//! lines) and `backend/metal.rs` (72) — which parsed the boot TOML into
+//! `engine_cuda::{DeviceBoot, Graphs, Knobs}` and `engine_metal::DeviceBoot`.
+//! They lived here because that is where the call happened to be made, and the
+//! price was that this crate named five of a shell's types and adding a
+//! backend meant editing a crate that is not the backend.
+//!
+//! They are `engine_cuda::boot` and `engine_metal::boot` now. What is left is
+//! three lines per entry point, and the whole of what a new shell costs THIS
+//! crate is:
+//!
+//! ```text
+//!   Cargo.toml   one optional path dependency + its feature line
+//!   backend.rs   one `#[cfg]`-gated `pub fn` in `open`, three lines long
+//! ```
+//!
+//! and nothing else in `crates/runtime/src/`. No `trait EngineKind`, no
+//! registry, no `register()` list: which shells exist in a binary is a
+//! COMPILE-TIME fact — CUDA needs `cudarc`, Metal needs `objc2` and
+//! `target_vendor = "apple"` — so a runtime table over `#[cfg]`-gated
+//! implementations would be a table populated under the same `#[cfg]`s. That
+//! trades a `match` for a `register()` and leaves the arrow pointing the same
+//! wrong way.
 
 use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
-use engine_api::transfer::MemoryDomain;
-use engine_api::Engine;
-use tensor_ir::registry::PortMask;
+use engine::transfer::MemoryDomain;
+use engine::Engine;
+use eta_ir::registry::PortMask;
 
 /// One execution device, behind the contract.
 ///
@@ -62,7 +88,7 @@ pub struct EngineSpec {
     /// Which descriptor ports this engine resolves on the device.
     ///
     /// Was a private thirteen-bit `u32` numbering that disagreed with the
-    /// port registry's own; it is `tensor_ir::registry`'s mask now
+    /// port registry's own; it is `eta_ir::registry`'s mask now
     /// (decision 19), so the two cannot drift.
     pub device_geometry_port_mask: PortMask,
     /// Which memory a KV page of this engine's lives in.
@@ -90,15 +116,38 @@ impl EngineSpec {
 
 /// Opening a device: one function per backend, all answering the contract.
 ///
+/// Each hands the boot bytes it is given to the shell that owns the types
+/// they parse into, and boxes what comes back.
+///
+/// **"THE BOOT TOML IS THE RUNTIME'S FORMAT ON PURPOSE"** STOOD HERE, on the
+/// argument that *"an engine that parsed it would be the second thing entitled
+/// to an opinion about the file's shape, and the two would drift."* The half
+/// about the FORMAT is still true and is still enforced — the worker writes
+/// the document and [`crate::config`] rules on what a key may say — but the
+/// conclusion drawn from it was wrong, and it cost 419 lines. Every one of
+/// those lines parsed into a SHELL's type (`engine_cuda::{DeviceBoot, Graphs,
+/// Knobs}`, `engine_metal::DeviceBoot`), so this crate named five structs it
+/// could not otherwise have heard of, and a backend could not be added without
+/// editing a crate that is not the backend.
+///
+/// The reader is `engine_cuda::boot` and `engine_metal::boot` now, one per
+/// shell, each reading only the keys it parses into its own type. There is
+/// still exactly one reader per key, which is all the drift argument ever
+/// asked for; what changed is which crate it is in.
+///
 /// Free functions rather than `EngineBox::*_create` constructors, because
 /// `EngineBox` is an alias for `Box<dyn Engine>` and has no inherent impl to
 /// hang them off any more — and because what they have in common is the
-/// ANSWER, not the receiver.
+/// ANSWER, not the receiver. The shell answers its own concrete type and the
+/// boxing happens here, for the same reason: `EngineBox` is this crate's
+/// alias, and a shell that returned one would know the name of the crate that
+/// opens it.
 ///
-/// Each takes the boot bytes it is given and reads what it needs. The boot
-/// TOML is the runtime's format on purpose: an engine that parsed it would be
-/// the second thing entitled to an opinion about the file's shape, and the
-/// two would drift.
+/// **THE ONE THING THAT STILL CROSSES INWARD** is
+/// [`crate::engine::load::contract_for`], passed as a `fn` pointer. A shell
+/// cannot depend on `runtime` — that is the cycle — so the load door is a
+/// parameter of every `open` below, exactly as it has always been a parameter
+/// of `Cuda::new`.
 pub mod open {
     // Every function below is gated on an engine feature, so with none
     // selected -- which is how the workspace clippy gate builds this crate --
@@ -113,10 +162,15 @@ pub mod open {
     ///
     /// # Errors
     ///
-    /// No device, or a boot config this engine refuses.
+    /// No device, or a boot config that shell refuses. The sentence is the
+    /// shell's; this crate only gives it an `anyhow` skin, because the two
+    /// sides of this seam have different error vocabularies and neither
+    /// should have to name the other's.
     #[cfg(feature = "_engine-cuda")]
     pub fn cuda(config_bytes: &[u8]) -> Result<EngineBox> {
-        Ok(Box::new(super::cuda::open(config_bytes)?))
+        engine_cuda::open(config_bytes, crate::engine::load::contract_for)
+            .map(|engine| Box::new(engine) as EngineBox)
+            .map_err(::anyhow::Error::msg)
     }
 
     /// Open one CUDA device per rank, as one engine.
@@ -126,7 +180,7 @@ pub mod open {
     /// `Engine`, fanning a `Vec<ModelLoadDesc>` across a thread scope and
     /// cross-checking that the ranks agreed about the model. None of that
     /// shape survives: a rank is not a load
-    /// ([`LoadRequest`](engine_api::LoadRequest) is one plan, `Shard::Cut` is
+    /// ([`LoadRequest`](engine::LoadRequest) is one plan, `Shard::Cut` is
     /// in the plan), the shell states tp=1 in `weights.rs` — `StorageTarget::
     /// for_backend(Cuda, 0, 1)` — and no collective ever fires in v1
     /// (`serve.rs`'s "what v1 does not do"). A multi-rank launch is refused
@@ -136,6 +190,21 @@ pub mod open {
     /// `StorageTarget`, an `Engine` that owns N shells and drives their
     /// streams in lockstep, and NCCL ordering — decision 5, "collectives
     /// never elided; descriptor rank-replicated".
+    ///
+    /// **THE REFUSAL IS THIS CRATE'S AND STAYED WHEN THE READER LEFT.** Every
+    /// other line of the CUDA door moved to `engine_cuda::boot`, and this one
+    /// did not, because what it refuses is not a device fact. `engine_cuda::
+    /// open` takes ONE document and answers ONE `Cuda`; it is never handed a
+    /// list and has no way to learn that a launcher held three. The fan-out
+    /// being refused is a shape of this crate's registry — N boot documents
+    /// collapsing into one `EngineId` — so the arity policy belongs to the
+    /// party that owns the registry. The shell's half of the same claim is
+    /// already stated, and stated better, by `open`'s signature: it takes
+    /// `&[u8]`, singular.
+    ///
+    /// It is also why a third shell does not owe the workspace a `*_group`.
+    /// This exists because `worker`'s CUDA launch path fans a `Vec<Vec<u8>>`,
+    /// not because opening a device needs it.
     ///
     /// # Errors
     ///
@@ -165,12 +234,14 @@ pub mod open {
     /// # Errors
     ///
     /// A boot document that is not TOML. Binding the device happens at
-    /// [`Engine::load`](engine_api::Engine::load), not here — `Shell::load`
+    /// [`Engine::load`](engine::Engine::load), not here — `Shell::load`
     /// is one call that binds, bakes and lands, and there is nothing to bind
     /// before a plan says what to bake.
     #[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
     pub fn metal(config_bytes: &[u8]) -> Result<EngineBox> {
-        Ok(Box::new(super::metal::open(config_bytes)?))
+        engine_metal::open(config_bytes, crate::engine::load::contract_for)
+            .map(|engine| Box::new(engine) as EngineBox)
+            .map_err(::anyhow::Error::msg)
     }
 }
 
@@ -183,41 +254,74 @@ pub mod open {
 // done when they return, so the completion the runtime hands its waiters is
 // one that is already settled. There is no half of it left to forget.
 
-#[cfg(feature = "_engine-cuda")]
-mod cuda;
-// TARGET-GATED as well as feature-gated, and now for the plainest reason
-// there is: there is a shell behind this door and it binds an `MTLDevice`.
-// `engine-metal` itself still builds and host-tests on any OS — its device
-// half is `cfg(target_vendor = "apple")` and its refusing twin answers
-// `Fault::Deviceless` elsewhere — but an `Engine` impl that cannot bind
-// anything is not one this registry should hand a scheduler, and `worker`'s
-// `EngineOptions::Metal` arm is Apple-gated on the same reading.
-#[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
-mod metal;
+// `mod cuda;` AND `mod metal;` STOOD HERE, and both files are gone: the boot
+// readers are `engine_cuda::boot` and `engine_metal::boot` now, in the crates
+// that declare the types they parse into. What was on those two lines is what
+// survives, and it survives on the two `open` functions above.
+//
+// The metal one was TARGET-gated as well as feature-gated, for the plainest
+// reason there is: there is a shell behind that door and it binds an
+// `MTLDevice`. `engine-metal` itself still builds and host-tests on any OS —
+// its device half is `cfg(target_vendor = "apple")` and its refusing twin
+// answers `Fault::Deviceless` elsewhere — but an `Engine` impl that cannot
+// bind anything is not one this registry should hand a scheduler, and
+// `worker`'s `EngineOptions::Metal` arm is Apple-gated on the same reading.
+// That gate is unchanged; it is spelled on `open::metal`.
 mod remote;
 
 // `pub use cuda::CudaEngine` STOOD HERE. There is no such type: the `Engine`
 // impl is `engine_cuda::Cuda`, in the crate that owns the device, and this
-// module's CUDA arm is a boot-config reader that answers one
-// (`backend::cuda::open`). Re-exporting the shell's own type through here
-// would be this crate claiming an engine it does not implement.
+// module's CUDA arm was a boot-config reader that answered one. Re-exporting
+// the shell's own type through here would be this crate claiming an engine it
+// does not implement. The reader has since gone the same way for the same
+// reason — `engine_cuda::boot` — and what is left is `open::cuda`.
 // `pub use metal::MetalEngine` STOOD HERE, and it is gone for the reason the
 // CUDA line above it never existed: the `Engine` impl is `engine_metal::Metal`,
-// in the crate that owns the device, and this module's metal arm is a
-// boot-config reader that answers one (`backend::metal::open`). What stood
-// here was a REFUSING engine this crate defined itself, back when there was
-// no shell to open — every verb `Error::Unsupported`. There is a shell.
+// in the crate that owns the device. What stood here was a REFUSING engine
+// this crate defined itself, back when there was no shell to open — every verb
+// `Error::Unsupported`. There is a shell.
 pub use remote::{RemoteDisconnectHandle, RemoteEngine};
 
-// One function DOES come through, and it is not an engine: `palo B3`'s
-// envelope counter, which is the only observable of a negative (the token
-// that did not travel to the host). See `cuda::envelopes_resolved`.
+/// How many descriptor-port envelopes the CUDA shell has resolved off guest
+/// device rings in this process (`palo B3`).
+///
+/// **THE ONE OBSERVABLE OF A NEGATIVE.** Device-carried decode's whole claim
+/// is that a chained fire's token did not travel to the host, and a round trip
+/// that does not happen leaves no trace. What DOES happen is one envelope
+/// resolved per attached device-carried lane per fire, so a serving gate
+/// asserts on this: zero says every decode serialized through the host plane,
+/// `>= decodes` says the shell read the token off the ring the epilogue wrote.
+///
+/// **THIS IS THE ONE PLACE THIS CRATE STILL SPELLS `engine_cuda`, AND IT IS
+/// NOT THE BOOT PATH.** Re-exported here rather than reached for directly
+/// because `engine-cuda` is a private link of this crate — `_engine-cuda` is
+/// what gates it — and a test that named the shell crate would be a test that
+/// could not build without a GPU feature it does not select. That is an
+/// observability argument, not a layering one: nothing about opening or
+/// serving an engine passes through here.
 #[cfg(feature = "_engine-cuda")]
-pub use cuda::envelopes_resolved;
-// And its palo-E sibling: the fold's motion mirror, which is how a
-// runtime-level gate sees the next-fire hint land (`cuda::fold_observed`).
+#[must_use]
+pub fn envelopes_resolved() -> u64 {
+    engine_cuda::Shell::envelopes_resolved()
+}
+
+/// The CUDA fold's motion counters —
+/// `(folds, rebinds, rebind_us, swaps, prebinds, prebind_us, twins)` —
+/// re-exported on [`envelopes_resolved`]'s argument exactly: the shell is a
+/// private link of this crate, the instance lives behind `Box<dyn Engine>` on
+/// a scheduler lane thread, and what a runtime-level fold gate diffs is this
+/// process-global mirror before and after a serving loop. `prebinds` moving is
+/// the one observable that the runtime's own next-fire hint
+/// (`Engine::expect_fire`, stated from `scheduler::worker::fire_frame`)
+/// reached the shell — nothing else in the runtime can say so, because a hint
+/// that lands leaves no trace in any completion. The two micros columns split
+/// the same binding work into its on-critical-path and hidden halves, which is
+/// the number the `PIE_CUDA_PIPELINE` A/B moves.
 #[cfg(feature = "_engine-cuda")]
-pub use cuda::fold_observed;
+#[must_use]
+pub fn fold_observed() -> (u64, u64, u64, u64, u64, u64, u64) {
+    engine_cuda::Shell::fold_observed()
+}
 
 struct EngineRegistration {
     spec: EngineSpec,

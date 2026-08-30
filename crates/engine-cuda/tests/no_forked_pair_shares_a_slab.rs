@@ -127,6 +127,7 @@ fn forked(compiled: &model_compiler::CompiledModel) -> usize {
 /// that stops being vacuous the moment somebody puts a name back on it —
 /// which is exactly when the property matters.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn no_two_regions_that_claim_a_slab_are_ever_scheduled_together() {
     let profile = profile();
     let mut wrong: Vec<String> = Vec::new();
@@ -169,6 +170,7 @@ fn no_two_regions_that_claim_a_slab_are_ever_scheduled_together() {
 ///    must be unmoved — if one moved, the two profiles differ for a reason
 ///    that has nothing to do with slabs and the reading below is wrong.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_per_stream_slab_gives_back_the_arms_the_name_key_silenced() {
     let now = profile();
     let was = as_it_was();
@@ -266,6 +268,7 @@ fn the_per_stream_slab_gives_back_the_arms_the_name_key_silenced() {
 /// P, article 9); what this asserts is the property it exists to produce,
 /// which is the one a measurement's off arm depends on.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_off_arm_is_the_artifact_and_not_a_flag() {
     let off = DeviceProfile {
         side_streams: 0,

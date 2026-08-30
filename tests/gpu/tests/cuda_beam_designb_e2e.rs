@@ -7,7 +7,7 @@
 //! free flat pool position (`WSlot`/`WOff`), and the KV write goes through B2's
 //! explicit-KV-write path (`launch_write_kv_explicit_bf16`). Pages/PageIndptr
 //! are constant (pool fixed between compactions). Submitted through the
-//! `inferlet::ptir` bridge (`forward-pass.new` / `pipeline.submit`) end to end:
+//! `inferlet::eta` bridge (`forward-pass.new` / `pipeline.submit`) end to end:
 //!
 //!   guest mask-out beam program
 //!     → runtime device-geometry submit (PageLease grants, run-ahead FIFO)

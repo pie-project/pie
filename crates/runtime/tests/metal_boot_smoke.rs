@@ -46,8 +46,8 @@
 
 use std::path::{Path, PathBuf};
 
-use engine_api::model_ir::Platform;
-use engine_api::{Budgets, Step, Lane, Readout};
+use engine::{Budgets, Step, Lane, Readout};
+use model_ir::Platform;
 use runtime::engine::backend::open;
 
 /// The catalog row this smoke serves, spelled as the catalog spells it.
@@ -154,7 +154,7 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
             budgets.clone(),
             // Uncapped: every load in this workspace is fully resident
             // (alto design §7 — the tiers are D2's).
-            engine_api::Residency::uncapped(),
+            engine::Residency::uncapped(),
             0,
             1,
         )
@@ -187,14 +187,18 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
         "the profile is carried, not reconstructed: {:?}",
         caps.profile
     );
-    // **THIS PLANE RESOLVES NO PORTS ON THE DEVICE**, so it admits the HOST
-    // geometry class and nothing wider. The CUDA shell answers
-    // `DecodeEnvelope` too because `program::ports` reads the next token off
-    // an attached instance's own ring; this one has no such read and says
-    // so, through the contract's own negotiation rather than through a fire
-    // that discovers it.
-    assert!(caps.admits(tensor_ir::registry::GeometryClass::Host));
-    assert!(!caps.admits(tensor_ir::registry::GeometryClass::DeviceGeometry));
+    // **THIS PLANE RESOLVES THE DECODE ENVELOPE ON THE DEVICE**, so it
+    // admits that class and the HOST class beneath it, and nothing wider.
+    // `serve::stage` reads `embed_tokens`, `positions` and `kv_len` off an
+    // attached instance's own ring at step 0b — the same read the CUDA shell
+    // has always made — so a decode loop's sampled token never leaves the
+    // device. What stays refused is `DeviceGeometry`: its other four ports
+    // describe a page table this shell owns and derives from the seat, and
+    // the refusal arrives through the contract's own negotiation at
+    // `bind_instance` rather than through a fire that discovers it.
+    assert!(caps.admits(eta_ir::registry::GeometryClass::Host));
+    assert!(caps.admits(eta_ir::registry::GeometryClass::DecodeEnvelope));
+    assert!(!caps.admits(eta_ir::registry::GeometryClass::DeviceGeometry));
 
     // 4. THE FIRE. One lane, the prompt, the shell's own page table.
     let prompt = tokenizer.encode(PROMPT);
@@ -205,13 +209,13 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
             word: word(prompt.len() as u32),
             tokens: prompt.clone(),
             positions: Vec::new(),
-            kv: engine_api::KvDelta::default(),
+            kv: engine::KvDelta::default(),
             mask: None,
             adapter: None,
             drafts: false,
             captures_scores: false,
-            rs: engine_api::RsVerb::Fold,
-            rs_reset: engine_api::RsReset::Inferred,
+            rs: engine::RsVerb::Fold,
+            rs_reset: engine::RsReset::Inferred,
             channels: Vec::new(),
             readout: Readout::Last,
         }],
@@ -223,7 +227,7 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
     // ONE STEP IS A FRAME OF ONE, and that is the whole of what `fire`
     // became: the contract's forward verb is `submit(FrameSubmission)`, and
     // the fire this smoke test has always run is the degenerate case.
-    let frame = engine_api::FrameSubmission::of(submission);
+    let frame = engine::FrameSubmission::of(submission);
     frame
         .validate()
         .expect("and the frame it is the one step of");

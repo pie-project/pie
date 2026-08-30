@@ -24,7 +24,7 @@ use crate::error::{Fault, Result};
 /// built `fallback-dynamic-loading`, so a missing `libcudart` PANICS from
 /// inside the shim rather than returning a code) and a library with no device
 /// behind it. This is the door a GPU test knocks on before it asks for
-/// anything; the idiom is `model-loader`'s `device_or_skip`, kept whole
+/// anything; the idiom is `checkpoint`'s `device_or_skip`, kept whole
 /// because its comment is the reason it is written this way.
 #[must_use]
 pub fn present() -> bool {
@@ -107,6 +107,17 @@ pub struct Context {
     /// [`Context::open_lanes`] is told how many the artifact asked for, and
     /// empty forever for an artifact that forked nothing.
     side: Vec<Side>,
+    /// **THE STREAM A CONDITIONAL BODY IS CAPTURED ON**, opened by
+    /// [`Context::open_conditional`] and `None` for the artifacts P3 declined
+    /// — which is every SKU in the catalog but the drafting ones.
+    ///
+    /// Not one of [`side`](Context::side), even though it is built exactly
+    /// like one, because it is not a STREAM ASSIGNMENT: no region names it,
+    /// `model_compiler::stream` cannot reach it, and nothing is ever enqueued
+    /// on it outside a `cuStreamBeginCaptureToGraph`. It exists because
+    /// beginning a capture needs a stream that is not already capturing, and
+    /// the parent capture is on the main one.
+    conditional: Option<Side>,
     /// One `cudaEvent_t` per `model_compiler::EventId`, created once at load.
     events: Vec<crate::device::graph::Event>,
     /// **THIS SHELL'S SCRATCH SLABS, AND NOBODY ELSE'S.**
@@ -208,6 +219,7 @@ impl Context {
                     ctx,
                     slabs,
                     side: Vec::new(),
+                    conditional: None,
                     events: Vec::new(),
                     device,
                     toggles: Toggles::from_env(),
@@ -355,46 +367,8 @@ impl Context {
     pub fn open_lanes(&mut self, side: u32, events: u32) -> Result<()> {
         #[cfg(feature = "_cuda")]
         {
-            use cudarc::cublas::sys as blas;
-            use cudarc::runtime::sys as rt;
-
             while self.side.len() < side as usize {
-                // SAFETY: every call takes a live local out-parameter, and the
-                // handles below are the ones the calls before them produced.
-                // This thread bound the device.
-                let opened = unsafe {
-                    let mut stream: rt::cudaStream_t = core::ptr::null_mut();
-                    check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
-                    let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
-                    let status = blas::cublasCreate_v2(&raw mut handle);
-                    if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                        rt::cudaStreamDestroy(stream);
-                        return Err(Fault::Device {
-                            call: "cublasCreate_v2",
-                            code: status as i32,
-                        });
-                    }
-                    let status = blas::cublasSetStream_v2(handle, stream.cast());
-                    if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                        blas::cublasDestroy_v2(handle);
-                        rt::cudaStreamDestroy(stream);
-                        return Err(Fault::Device {
-                            call: "cublasSetStream_v2",
-                            code: status as i32,
-                        });
-                    }
-                    let stream: *mut c_void = stream.cast();
-                    let cublas: *mut c_void = handle.cast();
-                    // Attached at LOAD, before the first fire, because the
-                    // warm pass runs eagerly on the main stream and its
-                    // growth has to reach this one — see `Slabs::attach`.
-                    self.slabs.attach(stream);
-                    Side {
-                        stream,
-                        cublas,
-                        ctx: Ctx::on(stream).with_cublas(cublas).with_slabs(self.slabs),
-                    }
-                };
+                let opened = self.open_side()?;
                 self.side.push(opened);
             }
             while self.events.len() < events as usize {
@@ -410,6 +384,99 @@ impl Context {
             let _ = (side, events);
             Err(Fault::Runtimeless)
         }
+    }
+
+    /// One more stream, its cuBLAS handle, and its seat in the scratch arena
+    /// — the shape every companion stream this context opens has.
+    #[cfg(feature = "_cuda")]
+    fn open_side(&mut self) -> Result<Side> {
+        use cudarc::cublas::sys as blas;
+        use cudarc::runtime::sys as rt;
+
+        // SAFETY: every call takes a live local out-parameter, and the
+        // handles below are the ones the calls before them produced.
+        // This thread bound the device.
+        unsafe {
+            let mut stream: rt::cudaStream_t = core::ptr::null_mut();
+            check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
+            let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
+            let status = blas::cublasCreate_v2(&raw mut handle);
+            if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                rt::cudaStreamDestroy(stream);
+                return Err(Fault::Device {
+                    call: "cublasCreate_v2",
+                    code: status as i32,
+                });
+            }
+            let status = blas::cublasSetStream_v2(handle, stream.cast());
+            if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                blas::cublasDestroy_v2(handle);
+                rt::cudaStreamDestroy(stream);
+                return Err(Fault::Device {
+                    call: "cublasSetStream_v2",
+                    code: status as i32,
+                });
+            }
+            let stream: *mut c_void = stream.cast();
+            let cublas: *mut c_void = handle.cast();
+            // Attached at LOAD, before the first fire, because the warm pass
+            // runs eagerly on the main stream and its growth has to reach
+            // this one — see `Slabs::attach`.
+            self.slabs.attach(stream);
+            Ok(Side {
+                stream,
+                cublas,
+                ctx: Ctx::on(stream).with_cublas(cublas).with_slabs(self.slabs),
+            })
+        }
+    }
+
+    /// **OPEN THE STREAM A CONDITIONAL BODY IS RECORDED ON**, or do nothing
+    /// when one is already open.
+    ///
+    /// Asked once at load, and only of an artifact P3 stamped a
+    /// `Lowering::If` or `Lowering::Switch` on — which is the drafting SKUs
+    /// and nothing else in today's catalog. The stream costs what a side
+    /// stream costs and carries what one carries (a cuBLAS handle, a seat in
+    /// the scratch arena), because a conditional body may hold a projection
+    /// and a body's launches must be the launches they would have been.
+    ///
+    /// **AT LOAD AND NEVER ON THE FIRE PATH**, for the reason
+    /// [`open_lanes`](Context::open_lanes) is: a `cudaStreamCreate` between
+    /// two launches is host work, and inside a capture it is what the
+    /// thread-local mode refuses by name.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`]
+    /// for a stream or a handle the runtime refused.
+    pub fn open_conditional(&mut self) -> Result<()> {
+        #[cfg(feature = "_cuda")]
+        {
+            if self.conditional.is_none() {
+                self.conditional = Some(self.open_side()?);
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            Err(Fault::Runtimeless)
+        }
+    }
+
+    /// The conditional-body stream, or a null handle for a load that opened
+    /// none — which is a load whose artifact holds no conditional region.
+    #[must_use]
+    pub fn conditional_stream(&self) -> *mut c_void {
+        self.conditional
+            .as_ref()
+            .map_or(core::ptr::null_mut(), |side| side.stream)
+    }
+
+    /// The kernel context on that stream, for the launches a body holds.
+    #[must_use]
+    pub fn conditional_ctx(&self) -> Option<&Ctx> {
+        self.conditional.as_ref().map(|side| &side.ctx)
     }
 
     /// The side streams' handles, in stream order — `streams()[0]` is stream
@@ -531,7 +598,7 @@ impl Drop for Context {
                 // freeing is what makes a SECOND shell in this process cost
                 // what the first one did.
                 self.slabs.release();
-                for side in self.side.drain(..) {
+                for side in self.side.drain(..).chain(self.conditional.take()) {
                     if !side.cublas.is_null() {
                         let _ = cudarc::cublas::sys::cublasDestroy_v2(side.cublas.cast());
                     }

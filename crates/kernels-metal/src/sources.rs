@@ -30,8 +30,11 @@ macro_rules! source_root {
 /// `#include` lines resolve to.
 pub const SOURCES: &[(&str, &str)] = &[
     ("attn/attn_sink.metal", include_str!(concat!(source_root!(), "/attn/attn_sink.metal"))),
+    ("attn/dense.metal", include_str!(concat!(source_root!(), "/attn/dense.metal"))),
     ("attn/kv_write.metal", include_str!(concat!(source_root!(), "/attn/kv_write.metal"))),
     ("attn/logit_softcap.metal", include_str!(concat!(source_root!(), "/attn/logit_softcap.metal"))),
+    ("attn/merge_lse.metal", include_str!(concat!(source_root!(), "/attn/merge_lse.metal"))),
+    ("attn/score.metal", include_str!(concat!(source_root!(), "/attn/score.metal"))),
     ("attn/sdpa_paged.metal", include_str!(concat!(source_root!(), "/attn/sdpa_paged.metal"))),
     ("attn/sdpa_paged_mma.metal", include_str!(concat!(source_root!(), "/attn/sdpa_paged_mma.metal"))),
     ("attn/sdpa_sliding.metal", include_str!(concat!(source_root!(), "/attn/sdpa_sliding.metal"))),
@@ -49,6 +52,7 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("elemwise/norm_residual_add.metal", include_str!(concat!(source_root!(), "/elemwise/norm_residual_add.metal"))),
     ("elemwise/norm_rms.metal", include_str!(concat!(source_root!(), "/elemwise/norm_rms.metal"))),
     ("elemwise/norm_vector.metal", include_str!(concat!(source_root!(), "/elemwise/norm_vector.metal"))),
+    ("elemwise/rope_mrope.metal", include_str!(concat!(source_root!(), "/elemwise/rope_mrope.metal"))),
     ("elemwise/rope_neox.metal", include_str!(concat!(source_root!(), "/elemwise/rope_neox.metal"))),
     ("icb/rebind.metal", include_str!(concat!(source_root!(), "/icb/rebind.metal"))),
     ("layout/blit.metal", include_str!(concat!(source_root!(), "/layout/blit.metal"))),
@@ -58,6 +62,7 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("layout/ple_combine.metal", include_str!(concat!(source_root!(), "/layout/ple_combine.metal"))),
     ("layout/row_gather.metal", include_str!(concat!(source_root!(), "/layout/row_gather.metal"))),
     ("linear/gemm_dense.metal", include_str!(concat!(source_root!(), "/linear/gemm_dense.metal"))),
+    ("linear/lora.metal", include_str!(concat!(source_root!(), "/linear/lora.metal"))),
     ("linear/mlp_gated.metal", include_str!(concat!(source_root!(), "/linear/mlp_gated.metal"))),
     ("linear/mlp_packed.metal", include_str!(concat!(source_root!(), "/linear/mlp_packed.metal"))),
     ("linear/moe_route.metal", include_str!(concat!(source_root!(), "/linear/moe_route.metal"))),

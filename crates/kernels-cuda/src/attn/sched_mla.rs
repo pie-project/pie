@@ -5,7 +5,7 @@
 //! and deterministic, not byte-identical to the C++ reference (see
 //! [`sched`](crate::attn::sched)).
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::attn::plan::{Built, Device, MlaPlanInfo};
 use crate::attn::sched::{
@@ -86,11 +86,7 @@ pub fn kv_len_limit_step(x: u64) -> u64 {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn schedule(
-    op: &'static str,
-    req: &Request<'_>,
-    device: &Device,
-) -> Result<Schedule, KernelError> {
+pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     let batch = req.batch_size as usize;
     if batch == 0 {
         return Err(refuse(op, "the batch is empty"));
@@ -311,7 +307,7 @@ pub fn plan(
     device: &Device,
     int_bytes: usize,
     float_bytes: usize,
-) -> Result<Built<MlaPlanInfo>, KernelError> {
+) -> Result<Built<MlaPlanInfo>, Error> {
     let sched = schedule(op, req, device)?;
     let mut info = MlaPlanInfo {
         num_blks_x: i64::from(sched.cluster_size),

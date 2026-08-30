@@ -54,7 +54,7 @@
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// Keeps `h * 31 + token` far below `u32::MAX` so the device arithmetic is

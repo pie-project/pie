@@ -8,7 +8,7 @@
 //! and there was no gate that walked the whole of it through the CONTRACT.
 //! `engine-cuda/tests/adapter_banks.rs` walks it through `Shell`, which is the
 //! shell's own surface; what nothing asserted is that
-//! `engine_api::AdapterRegistration` reaches a bank, that
+//! `engine::AdapterRegistration` reaches a bank, that
 //! `Lane::adapter` reaches the kernel, and that the two agree.
 //!
 //! Three claims, in the order they can fail:
@@ -34,8 +34,8 @@
 
 use std::path::{Path, PathBuf};
 
-use engine_api::model_ir::Platform;
-use engine_api::{Budgets, Lane, Readout, Step};
+use engine::{Budgets, Lane, Readout, Step};
+use model_ir::Platform;
 use runtime::engine::backend::open;
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -65,7 +65,7 @@ fn an_adapter_registered_through_the_contract_corrects_the_lane_that_names_it() 
     let base = run(&checkpoint, &prompt, Graphs::Captured, Routing::Base);
 
     // ── 2. CORRECTED, captured. One adapter registered through
-    //    `engine_api::AdapterRegistration`, one lane routed to it.
+    //    `engine::AdapterRegistration`, one lane routed to it.
     let corrected = run(&checkpoint, &prompt, Graphs::Captured, Routing::Adapter(0));
     assert_eq!(
         corrected.len(),
@@ -161,9 +161,13 @@ fn run(checkpoint: &Path, prompt: &[u32], graphs: Graphs, routing: Routing) -> V
             page_size: 16,
             max_context: 128,
             slots: 2,
+            // The second row axis: derive, which for a text-only plan is no
+            // ladder at all (alto multimodal §5.5).
+            max_patches: None,
+            max_images: None,
         },
         // Uncapped: this shell has one weight tier (alto design §7).
-        engine_api::Residency::uncapped(),
+        engine::Residency::uncapped(),
         0,
         1,
     )
@@ -192,11 +196,11 @@ fn run(checkpoint: &Path, prompt: &[u32], graphs: Graphs, routing: Routing) -> V
     //    — the same call `worker::embedded_engine` makes for every adapter an
     //    operator declares in `[model.adapters]`.
     if let Routing::Adapter(id) = routing {
-        let registration = engine_api::AdapterRegistration {
+        let registration = engine::AdapterRegistration {
             id,
             planes: banks
                 .iter()
-                .map(|bank| engine_api::AdapterPlane {
+                .map(|bank| engine::AdapterPlane {
                     bank: bank.name.clone(),
                     bytes: loud_plane(&bank.name, bank.slot_bytes),
                 })
@@ -220,20 +224,20 @@ fn run(checkpoint: &Path, prompt: &[u32], graphs: Graphs, routing: Routing) -> V
             word: word(prompt.len() as u32, adapter.is_some()),
             tokens: prompt.to_vec(),
             positions: Vec::new(),
-            kv: engine_api::KvDelta::default(),
+            kv: engine::KvDelta::default(),
             mask: None,
             adapter,
             drafts: false,
             captures_scores: false,
-            rs: engine_api::RsVerb::Fold,
-            rs_reset: engine_api::RsReset::Inferred,
+            rs: engine::RsVerb::Fold,
+            rs_reset: engine::RsReset::Inferred,
             channels: Vec::new(),
             readout: Readout::Last,
         }],
         attachments: Vec::new(),
     };
     step.validate().expect("the submission is one the contract describes");
-    let frame = engine_api::FrameSubmission::of(step);
+    let frame = engine::FrameSubmission::of(step);
     let mut ticket = engine.submit(&frame).expect("the fire is admitted");
     engine
         .settle_frame(&mut ticket)
@@ -261,17 +265,17 @@ struct Bank {
     slot_bytes: usize,
 }
 
-fn banks_of(trace: &engine_api::model_ir::Trace) -> Vec<Bank> {
+fn banks_of(trace: &model_ir::Trace) -> Vec<Bank> {
     trace
         .params
         .iter()
-        .filter(|param| param.source == engine_api::model_ir::ParamSource::Registered)
+        .filter(|param| param.source == model_ir::ParamSource::Registered)
         .map(|param| {
             let seats = param.shape.first().copied().unwrap_or(0);
             let elements: u64 = param.shape.iter().skip(1).product();
             assert_eq!(
                 param.dtype,
-                engine_api::model_ir::Dtype::Bf16,
+                model_ir::Dtype::Bf16,
                 "this gate builds bf16 planes; {} declares {:?}",
                 param.name,
                 param.dtype
@@ -286,7 +290,7 @@ fn banks_of(trace: &engine_api::model_ir::Trace) -> Vec<Bank> {
 }
 
 /// **FULL CAPACITY, NOT THE ADAPTER'S OWN RANK, AND THE PADDING IS OURS.**
-/// The contract says so (`engine_api::adapter`): a plane is one whole slot in
+/// The contract says so (`engine::adapter`): a plane is one whole slot in
 /// the bank's declared dtype and layout, because `A`'s unused ranks are
 /// trailing rows and `B`'s are a stride inside every row, and a shell that
 /// padded a short plane's prefix would be right for one and wrong for the

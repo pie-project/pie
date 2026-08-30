@@ -7,7 +7,7 @@
 //! port reads, and the host never sees it. Everything else those epilogues
 //! carry — the position, the readable extent, the write slot and offset, the
 //! page CSR — is pure arithmetic over the KV length, which the runtime's host
-//! shadow (`tensor_compiler::eval::pareval`) folds per fire. So the gap
+//! shadow (`eta_compiler::eval::pareval`) folds per fire. So the gap
 //! between a servable decode loop and an unservable one is exactly one line
 //! of guest source (`tok_in.put(&token)`), and exactly one port:
 //! [`Port::EmbedTokens`].
@@ -92,15 +92,16 @@
 //! into per-lane runs. A member that binds no such port is one lane, which is
 //! every decode-envelope guest and is why nothing about them changes.
 //!
-//! [`Port::consumes`]: engine::tensor_ir::registry::Port::consumes
-//! [`PortMask::DECODE_ENVELOPE`]: engine::tensor_ir::registry::PortMask::DECODE_ENVELOPE
-//! [`PortMask::DEVICE_GEOMETRY`]: engine::tensor_ir::registry::PortMask::DEVICE_GEOMETRY
+//! [`Port::consumes`]: eta_ir::registry::Port::consumes
+//! [`PortMask::DECODE_ENVELOPE`]: eta_ir::registry::PortMask::DECODE_ENVELOPE
+//! [`PortMask::DEVICE_GEOMETRY`]: eta_ir::registry::PortMask::DEVICE_GEOMETRY
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use engine::tensor_ir::DType;
-use engine::tensor_ir::registry::{GeometryClass, Port};
-use engine::{ExecPlan, Value};
+use eta_exec::{ExecPlan, Value};
+use eta_ir::Dtype;
+use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::types::name_or_unknown;
 
 use crate::error::{Fault, Result};
 
@@ -180,8 +181,12 @@ pub struct Envelope {
 
 impl Envelope {
     /// True when nothing was bound — the shape an attached program with no
-    /// descriptor port at all resolves to, and the one
-    /// `crates/runtime/tests/cuda_program_epilogue.rs` authors on purpose.
+    /// descriptor port at all resolves to.
+    ///
+    /// It USED to name the test that authored this shape on purpose, and that
+    /// test (runtime/tests/cuda_program_epilogue.rs) is gone — deleted as
+    /// misplaced, not superseded. So this shape is currently exercised by
+    /// nothing, which is worth knowing before trusting it.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.qo_indptr.is_none()
@@ -815,14 +820,14 @@ fn read_cell(
             ),
         ));
     };
-    if !matches!(shape.dtype, DType::I32 | DType::U32) {
+    if !matches!(shape.dtype, Dtype::I32 | Dtype::U32) {
         return Err(Fault::program(
             "program::ports",
             format!(
                 "port {}'s channel {channel} holds {}, and a geometry index is not an \
                  activation",
                 port.name(),
-                shape.dtype.name()
+                name_or_unknown(shape.dtype)
             ),
         ));
     }
@@ -863,14 +868,14 @@ fn read_bool_cell(
             ),
         ));
     };
-    if shape.dtype != DType::Bool {
+    if shape.dtype != Dtype::Bool {
         return Err(Fault::program(
             "program::ports",
             format!(
                 "port {}'s channel {channel} holds {}, and an attention mask is a \
                  rectangle of KEPT/DROPPED and not a rectangle of numbers",
                 port.name(),
-                shape.dtype.name()
+                name_or_unknown(shape.dtype)
             ),
         ));
     }
@@ -891,7 +896,7 @@ fn as_u32(port: Port, value: &Value) -> Result<Vec<u32>> {
                 "the folded constant for port {} is {}, and a geometry index is not an \
                  activation",
                 port.name(),
-                other.dtype().name()
+                name_or_unknown(other.dtype())
             ),
         )),
     }
@@ -900,7 +905,7 @@ fn as_u32(port: Port, value: &Value) -> Result<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::Envelope;
-    use engine::tensor_ir::registry::Port;
+    use eta_ir::registry::Port;
 
     /// The check is an EQUALITY against the seat, and the sentence names both
     /// numbers — a refusal that named only one would leave the reader
@@ -1031,7 +1036,7 @@ mod tests {
     /// went from 0/24 degenerate runs to 8/24.
     #[test]
     fn a_decode_envelope_resolves_its_three_ports_and_not_the_page_family() {
-        use engine::tensor_ir::registry::GeometryClass;
+        use eta_ir::registry::GeometryClass;
         for port in [Port::EmbedTokens, Port::Positions, Port::KvLen] {
             assert!(
                 super::resolves(GeometryClass::DecodeEnvelope, port),

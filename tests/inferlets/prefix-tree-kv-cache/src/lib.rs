@@ -5,7 +5,7 @@
 //! Generation then continues independently from all four shared-prefix leaves.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 
 #[derive(Deserialize)]

@@ -29,7 +29,7 @@
 //! One allocation for the whole pool, pointer-stable for the load's lifetime
 //! (article 7), cut by arithmetic: a page slot holds `page_tokens` rows of
 //! every plane, and a layer holds `slots` page slots. A lane's buffer is a RUN
-//! of page slots stated by the verb ([`engine_api::PageRange`]), page-major
+//! of page slots stated by the verb ([`engine::PageRange`]), page-major
 //! from buffer token zero — so buffer token `i` lives in page slot
 //! `run.page_index + i / page_tokens` at in-page row `i % page_tokens`, which
 //! is the addressing both the scatter and the gather do and the only thing the

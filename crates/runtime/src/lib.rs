@@ -11,8 +11,8 @@
 // and eight more. `as _` because there is nothing to call.
 // THE CUTOVER, and it is one line because it has to be: the Rust shell
 // exports the same thirteen `pie_cuda_*` symbols, so which crate supplies
-// them is a link question. `backend/cuda.rs` never learns which one it
-// reached.
+// them is a link question. The boot reader (`engine_cuda::boot`, and
+// `backend/cuda.rs` when this was written) never learns which one it reached.
 #[cfg(feature = "_engine-cuda")]
 extern crate engine_cuda as _;
 

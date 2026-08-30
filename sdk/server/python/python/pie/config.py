@@ -55,7 +55,6 @@ class TelemetryConfig:
 @dataclass
 class RuntimeConfig:
     request_timeout_secs: Optional[int] = None
-    speculation_depth: Optional[int] = None
     # Frame geometry. Absent means the engine's own defaults, which is what
     # every ordinary run wants; these exist so a measurement can hold the
     # geometry fixed while something else varies. `pie config tune` moves the

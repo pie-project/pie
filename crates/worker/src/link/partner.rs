@@ -23,9 +23,9 @@ use crate::executor;
 pub(crate) struct PartnerBootstrap {
     pub full_identity: ModelIdentity,
     pub encode_identity: ModelIdentity,
-    pub kv_layout: engine_api::KvLayout,
+    pub kv_layout: engine::KvLayout,
     #[cfg_attr(not(feature = "nixl"), allow(dead_code))]
-    pub home_kv_handle: engine_api::KvHandle,
+    pub home_kv_handle: engine::KvHandle,
     pub transfer: crate::config::OffloadTransfer,
     pub model_idx: usize,
     pub page_size: u32,
@@ -35,7 +35,7 @@ pub(crate) struct PartnerBootstrap {
 
 #[cfg(feature = "nixl")]
 struct ClientNixl {
-    _engine: std::sync::Arc<transport::NixlEngine>,
+    _backend: std::sync::Arc<transport::NixlBackend>,
     metadata: Vec<u8>,
 }
 
@@ -167,7 +167,7 @@ impl PartnerLinkManager {
     /// `HelloResponse` whose scratch grant was range-checked against the
     /// peer's advertised pool; then `register_remote_store`,
     /// `register_engine_backend` with a `RemoteEngine` over the client, and
-    /// `spawn_engine`. Every noun in it lived in `engine_api::remote`.
+    /// `spawn_engine`. Every noun in it lived in `engine::remote`.
     ///
     /// It refuses at the top rather than part way through, because a
     /// half-dialled partner is a registered `EngineId` with no transport
@@ -259,24 +259,24 @@ fn finish_cleanup(worker_id: WorkerId, link: PartnerLink, model_idx: usize) {
 
 #[cfg(feature = "nixl")]
 fn build_client_nixl(worker_id: WorkerId, config: &PartnerBootstrap) -> Result<Option<ClientNixl>> {
-    use transport::Engine;
+    use transport::Backend;
 
     if config.transfer == crate::config::OffloadTransfer::Inline {
         return Ok(None);
     }
     let result = (|| {
-        let engine = std::sync::Arc::new(transport::NixlEngine::new(&format!(
+        let backend = std::sync::Arc::new(transport::NixlBackend::new(&format!(
             "pie-decode-{}-{}",
             worker_id.0,
             std::process::id()
         ))?);
-        let _registered = engine.register(
+        let _registered = backend.register(
             transport::WorkerId(worker_id.0),
             config.home_kv_handle.clone(),
         )?;
-        let metadata = engine.local_metadata()?;
+        let metadata = backend.local_metadata()?;
         Ok::<_, transport::TransportError>(ClientNixl {
-            _engine: engine,
+            _backend: backend,
             metadata,
         })
     })();

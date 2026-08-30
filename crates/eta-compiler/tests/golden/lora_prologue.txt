@@ -1,0 +1,17 @@
+name: lora_prologue
+hash: 0xf5d993811f6ccff9
+container: 45544100010000000100000002000000000000000100000004006c6f72610003020000000100000002000000010000000001000302000000020000000100000001000000000100040000009100000000910100000081020b000000a2000003000000000100000002000000
+verdict: OK
+plan: stage=prologue signature=0x26849b68dee54237 source_ops=4 normalized_ops=4 singleton_regions=4 fused_regions=2 library_regions=1 static_scratch_bytes=36 direct_sink_bytes=0
+readiness: chan=0 phase=0x00 dir=NeedsFull
+readiness: chan=1 phase=0x00 dir=NeedsFull
+class: chan=0 FullRing
+class: chan=1 FullRing
+seed chan=0 = F32([0.5, -0.5, 1.0, -1.0])
+seed chan=1 = F32([2.0, 0.25, -2.0, -0.25])
+inputs 0: PassInputs { logits: None, mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
+step 0: committed=true missed=None sinks=1
+sink lora: stage=Prologue layer=0 args=[F32([0.5, -0.5, 1.0, -1.0]), F32([2.0, 0.25, -2.0, -0.25]), U32([11])]
+inputs 1: PassInputs { logits: None, mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
+step 1: committed=true missed=None sinks=1
+sink lora: stage=Prologue layer=0 args=[F32([0.5, -0.5, 1.0, -1.0]), F32([2.0, 0.25, -2.0, -0.25]), U32([11])]

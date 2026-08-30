@@ -89,7 +89,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         .expect("the import contract fits its own checkpoint");
     drop(source);
     let shell = Shell::load(Boot {
-        plan,
+        trace,
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(8, 256),
@@ -97,6 +97,16 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         page_size: 16,
         context: 512,
         slots: 8,
+        // F1's depth: one step in flight, one A/B seat set. Stated rather
+        // than defaulted because these are goldens — the eager shell is what
+        // a byte-identity arm compares against — and because a second seat
+        // set is a second whole `Inputs` reservation on a machine this test
+        // is already sized carefully for.
+        runahead: engine::runahead::Runahead::F1,
+        // Full residency: the whole weight table on the device, no
+        // wired-slab tier, no segment cuts — the load every gate in
+        // this directory measures.
+        residency: engine_metal::ResidencyPlan::default(),
     })
     .expect("the shell loads");
     Some((shell, tokenizer))

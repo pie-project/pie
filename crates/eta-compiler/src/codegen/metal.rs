@@ -1,0 +1,87 @@
+//! # Metal (MSL) region emitters
+//!
+//! The only producer of Pie's generated MSL. Emission is a pure function of the
+//! plan — no device-architecture inputs — so the same stage emits the same bytes
+//! every time and `compiler/tests/golden-msl/` pins them. Those goldens are the
+//! contract itself: nothing can re-derive them, so a diff is a decision to be
+//! justified rather than a comparison to be re-run.
+//!
+//! Most emitters return `Result<String, EmitError>` and refuse rather than emit
+//! a kernel they cannot justify; the three taking no plan return a bare `String`
+//! because their inputs are a name and a closed-enum tag. For the same reason
+//! there is no out-of-range extent-role, dtype or op-tag refusal — a refusal the
+//! types make unrepresentable is dead code that reads like a live guard.
+
+pub mod effects;
+pub mod fused;
+pub mod intrinsics;
+pub mod nucleus;
+pub mod preamble;
+pub mod singleton;
+pub mod topk;
+pub mod validate;
+
+pub use crate::codegen::op_view::OpView;
+pub use effects::{
+    channel_effects, emit_commit, emit_grouped_commit, emit_grouped_readiness, emit_readiness,
+};
+pub use fused::{emit_fused_region, emit_grouped_fused_region};
+pub use intrinsics::{
+    M2_INTRINSIC_TOP_BUFFER, M2_LOGITS_BUFFER, fused_channel_ceiling, m2_intrinsic_buffer,
+    m2_intrinsic_element_bytes, m3_intrinsic_bindable,
+};
+pub use nucleus::emit_grouped_nucleus;
+pub use preamble::RUNTIME_TEMPLATE;
+pub use singleton::emit_singleton_region;
+pub use topk::emit_grouped_topk;
+pub use validate::validate_singleton_plan;
+
+/// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes; the engine's pipeline cache keys on it.
+pub const METAL_M1_EMITTER_VERSION: u16 = 38;
+
+/// `kMetalM1MaxChannels` — the single-lane readiness/commit kernels bind one
+/// `words_N` buffer per channel starting at buffer 2, and Metal's highest
+/// buffer index is 30. Enforced by `emit_readiness` / `emit_commit`; it used to
+/// be a comment, and a program with one channel more emitted `[[buffer(31)]]`.
+pub const METAL_M1_MAX_CHANNELS: usize = 29;
+
+/// `kMetalM2MaxFusedChannels` — a fused region binds committed/pending pairs
+/// from buffer 7, which caps the direct-binding form at 12 channels.
+///
+/// **THE CEILING FOR A REGION THAT ALSO READS A SECOND INTRINSIC RECTANGLE IS
+/// LOWER**, because those bind down from index 30 while the channels bind up
+/// from 7. [`intrinsics::fused_channel_ceiling`] is the one that knows which
+/// of the two applies; this is the ceiling when nothing but the trunk's
+/// `logits` is read, which is every stage the corpus had before the slot
+/// table existed.
+pub const METAL_M2_MAX_FUSED_CHANNELS: usize = 12;
+
+/// `M1ChannelEffect` — what one channel needs before a lane may run, and what
+/// the lane does to it on commit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct M1ChannelEffect {
+    /// The lane may run only when this channel's ring is non-empty — a
+    /// `take`/`read` precondition.
+    pub requires_full: bool,
+    /// The lane may run only when this channel's ring has room — a `put`
+    /// precondition.
+    pub requires_empty: bool,
+    /// On commit the lane pops one committed cell from this channel.
+    pub take: bool,
+    /// On commit the lane pushes one value to this channel.
+    pub put: bool,
+    /// The channel ring's capacity — its bound on committed cells.
+    pub capacity: u32,
+}
+
+/// `M1OpMeta` — one accepted singleton op: where it sits in the stage, the SSA
+/// id its first result defines, and the `COp` view the engine dispatches on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct M1OpMeta {
+    /// The op's position in the stage op list.
+    pub node: u32,
+    /// The SSA id this op's first result defines.
+    pub result_base: u32,
+    /// The decoded [`OpView`] the engine dispatches on.
+    pub op: OpView,
+}

@@ -53,7 +53,7 @@ pick         = argmax score(x) over plausible tokens
 The amateur and expert use separate KV working sets. The amateur attends only a
 sliding `amateur_window`; the expert attends the complete context. The amateur
 logits are passed through a host `Writer` channel into the expert epilogue, where
-the contrastive argmax runs in PTIR.
+the contrastive argmax runs in ETA.
 
 This loop is structurally depth-1, as noted in
 `inference-time-algorithms/10-implementation-faithfulness-audit.md`:

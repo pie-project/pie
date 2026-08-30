@@ -255,7 +255,7 @@ fn solo(
 /// 1.00x — the axis must be free when nobody uses it. The mechanism is design
 /// §0's, not a special case: the correction is guarded on `has_adapter`, a
 /// fire no lane routed has zero rows in that class, and
-/// `engine::fire::walk` skips a zero-row region before it dispatches a node.
+/// `model_exec::fire::walk` skips a zero-row region before it dispatches a node.
 /// So the launch sequence of a plain fire is the launch sequence of a plain
 /// fire on a plan with no bank at all.
 ///
@@ -264,6 +264,7 @@ fn solo(
 /// MILLISECONDS pin the launches, against the shell's own measurement of the
 /// same loop rather than against a number written down last week.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_fire_no_lane_routed_costs_the_axis_nothing() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the zero-adapter floor") else {
@@ -336,6 +337,7 @@ fn a_fire_no_lane_routed_costs_the_axis_nothing() {
 /// fire's rectangle instead of the region's: every one of them shows up here
 /// as a logit that moved.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_zero_adapter_is_the_identity_bit_for_bit() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the zero adapter") else {
@@ -383,6 +385,7 @@ fn a_zero_adapter_is_the_identity_bit_for_bit() {
 /// proportionality is not what the model computes. Monotone in the scale is,
 /// and it is what a wrong bank read breaks.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_displacement_vanishes_with_the_adapter() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the scaled family") else {
@@ -444,6 +447,7 @@ fn the_displacement_vanishes_with_the_adapter() {
 /// [`a_correction_reaches_no_row_outside_its_window`], where the fire's shape
 /// is held fixed and only the bank's contents change.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn three_lanes_two_adapters_and_a_base_lane_agree_with_their_solo_runs() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the three-lane adapter golden") else {
@@ -559,6 +563,7 @@ fn three_lanes_two_adapters_and_a_base_lane_agree_with_their_solo_runs() {
 /// nowhere — must read bit for bit the same in both, and any difference is a
 /// correction that wrote a row its window does not cover.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_correction_reaches_no_row_outside_its_window() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the exact leak gate") else {
@@ -653,6 +658,7 @@ fn a_correction_reaches_no_row_outside_its_window() {
 /// exercised at all: a run in which nothing ever captured would pass a
 /// no-recapture assertion vacuously.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn registering_another_adapter_captures_nothing() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the no-recapture counter") else {
@@ -725,6 +731,7 @@ fn registering_another_adapter_captures_nothing() {
 /// IT** — the budget is a shape, so a caller that overran one is told which
 /// one and by how much, at the door, before a byte is written.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_registration_the_banks_cannot_seat_is_refused_by_name() {
     let _serial = serialized();
     let Some((mut shell, _)) = ready("the registration refusals") else {
@@ -788,6 +795,7 @@ fn a_registration_the_banks_cannot_seat_is_refused_by_name() {
 /// cap to avoid. A lane inside the window that named no adapter would send the
 /// arm at a routes vector this fire never staged.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn an_adapter_and_a_word_that_disagree_are_refused() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the word/adapter agreement") else {
@@ -911,6 +919,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
             max_adapters: u32::try_from(seats).expect("a capacity fits a u32"),
             ..Budget::new(4, 256)
         },
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,

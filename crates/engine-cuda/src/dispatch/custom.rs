@@ -1,7 +1,7 @@
 //! `CustomCuda`: the cuda-plane escape hatch's fused points.
 
-use kernels::{DispatchCustomCuda, KernelError};
 use kernels_cuda::custom;
+use model_exec::{DispatchCustomCuda, KernelError};
 use model_ir::CustomCuda;
 
 use crate::run::Run;
@@ -12,6 +12,17 @@ impl DispatchCustomCuda for Run<'_> {
     /// write side lands by the op's own `write_page`/`write_offset`
     /// descriptors; `positions` stays the rope input.
     fn dispatch(&mut self, op: &CustomCuda) -> Result<(), KernelError> {
+        self.custom_cuda(op).map_err(crate::error::kernel)
+    }
+}
+
+impl Run<'_> {
+    /// The arms themselves, in `kernels-cuda`'s error vocabulary and not
+    /// the contract's — which is what keeps each one a plain tail call with
+    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
+    /// above that lifts the family, and says why it is a call and not a
+    /// `From` impl.
+    fn custom_cuda(&mut self, op: &CustomCuda) -> Result<(), kernels_cuda::Error> {
         match op {
             CustomCuda::QkvFusedQknormRopeVnormWrite {
                 packed,

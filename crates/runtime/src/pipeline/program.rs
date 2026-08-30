@@ -1,7 +1,7 @@
 //! Program registry (thrust-3 P2.2/P2.3) — the host-side "register a traced
 //! pass once, cache by identity" counterpart to the inferlet program cache.
 //!
-//! The wire artifact is the **canonical container bytes** (the `tensor_ir`
+//! The wire artifact is the **canonical container bytes** (the `eta_ir`
 //! IR's `container`); the guest cannot bind (bind needs the backend
 //! [`ModelProfile`]). Registration:
 //!
@@ -30,18 +30,16 @@ use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
-use ::engine_api::program::{DirectArgmax, RegionAnalysis};
 use lru::LruCache;
-use tensor_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
-use tensor_compiler::plan::CompiledStage;
-use tensor_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
-use tensor_ir::container_hash;
-use tensor_compiler::codegen::cuda::region_analysis::{
-    REGION_GENERATED_VALID, REGION_SECOND_PARTY_SUPPORTED,
-};
-use tensor_ir::op::{IntrinsicId, Op};
-use tensor_ir::registry::{ModelProfile, Port};
-use tensor_ir::validate::{BoundTrace, ValidateError, bind};
+use eta_compiler::codegen::cuda::region_analysis::RegionAnalysis;
+use eta_compiler::codegen::launch::LaunchPackage;
+use eta_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
+use eta_compiler::plan::CompiledStage;
+use eta_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
+use eta_ir::container_hash;
+use eta_ir::op::Op;
+use eta_ir::registry::{ModelProfile, Port};
+use eta_ir::validate::{BoundTrace, ValidateError, bind};
 
 /// Registration-time pricing (thrust-3 P2.3): per-instance costs computed once
 /// per program and attached to its identity (feeds thrust-2's capacity
@@ -63,7 +61,7 @@ pub struct Pricing {
     pub rows: u32,
 }
 
-/// The interned, immutable artifact for one distinct registered PTIR program.
+/// The interned, immutable artifact for one distinct registered ETA program.
 #[derive(Debug)]
 pub struct RegisteredProgram {
     /// Canonical container bytes (the host→engine wire artifact).
@@ -83,20 +81,36 @@ pub struct RegisteredProgram {
     emitted: Mutex<HashMap<Backend, Arc<EmittedProgram>>>,
     /// Dense-channel `(consume, publish)` mask, derived once from immutable IR.
     pub channel_accesses: Vec<(bool, bool)>,
+    /// **THE ASK IS THE READ** (`.wiki/alto/attn-score.md` §4). True when any
+    /// stage of this program materializes `IntrinsicId::AttnScore`, which is
+    /// the whole of how a lane becomes a CAPTURING lane.
+    ///
+    /// No port, no request field, no client-facing flag: the observability
+    /// contract says the graph writes and the epilogue reads, so a program
+    /// that reads the scores IS a program that asked for them, and a program
+    /// that does not costs its fire nothing. That closes the gap
+    /// `fire::geometry`'s lane builder named — "the ETA port vocabulary this
+    /// fire path is assembled from names no capture port" — without adding
+    /// one, because this axis never needed a port: the intrinsic is the ask.
+    ///
+    /// Derived once at registration, beside [`channel_accesses`](Self::channel_accesses),
+    /// and for the same reason: it is a function of immutable IR and a
+    /// program is registered once but instantiated many times.
+    pub reads_attn_score: bool,
     /// This program in the shape an engine executes it, built on first use.
     /// See [`Self::launch`].
-    launch: std::sync::OnceLock<::engine_api::program::LaunchPackage>,
+    launch: std::sync::OnceLock<LaunchPackage>,
     /// Static geometry-derivability taint, and the per-pass shadow fold
     /// schedule derived from it. Both are functions of `bound` alone, and a
     /// program is registered once but instantiated many times — at a cohort
     /// boundary a whole herd instantiates at once, so re-deriving a
     /// whole-trace taint fixpoint per instance lands squarely on the
     /// critical path.
-    geometry_taint: std::sync::OnceLock<tensor_compiler::eval::pareval::GeometryTaint>,
+    geometry_taint: std::sync::OnceLock<eta_compiler::eval::pareval::GeometryTaint>,
     shadow_plan: std::sync::OnceLock<Arc<crate::pipeline::fire::shadow::ShadowPlan>>,
     /// Registration-time pricing. [`Pricing::rows`] is read at bind — it is
     /// the readout row count an instance's stage buffers are carved at
-    /// (`engine_api::BindExtents::sampled_rows`), and the same number
+    /// (`engine::BindExtents::sampled_rows`), and the same number
     /// registration already derived is the one the bind states rather than a
     /// second derivation of it. The other two feed thrust-2 capacity
     /// accounting, which is still unwired.
@@ -115,19 +129,19 @@ impl RegisteredProgram {
     /// **The launch package** — this program in the shape an engine executes it.
     ///
     /// This is what replaced the container bytes and the PTIB sidecar. An engine
-    /// receives typed records instead of PTIR, so it has no wire format to parse and no
+    /// receives typed records instead of ETA, so it has no wire format to parse and no
     /// plan to re-derive (`ptir-refactor.md` §2.3).
-    pub fn launch(&self) -> &::engine_api::program::LaunchPackage {
+    pub fn launch(&self) -> &LaunchPackage {
         self.launch.get_or_init(|| {
-            tensor_compiler::codegen::launch::build(&self.bound, &self.compiled_stages)
+            eta_compiler::codegen::launch::build(&self.bound, &self.compiled_stages)
         })
     }
 
     /// Whether the host can derive this program's submission geometry, and
     /// which channels the device decides. Derived once — see the field.
-    pub fn geometry_taint(&self) -> &tensor_compiler::eval::pareval::GeometryTaint {
+    pub fn geometry_taint(&self) -> &eta_compiler::eval::pareval::GeometryTaint {
         self.geometry_taint
-            .get_or_init(|| tensor_compiler::eval::pareval::geometry_taint(&self.bound))
+            .get_or_init(|| eta_compiler::eval::pareval::geometry_taint(&self.bound))
     }
 
     /// The per-pass fold schedule every instance's [`HostShadow`] runs.
@@ -149,39 +163,14 @@ impl RegisteredProgram {
     /// question the emitter had to answer to build the kernel, which is exactly
     /// why it must not be answered twice. Shipped on the same terms as
     /// `stage_identities` — the engine compares while both exist.
+    /// NOTHING IS RE-SHAPED ON THE WAY OUT. This was a twenty-line
+    /// field-for-field rebuild of the analysis into a second `RegionAnalysis`
+    /// the contract crate declared, unpacking two `REGION_*` bits into two
+    /// booleans and typing a `u16` intrinsic id — because the contract could
+    /// not name the emitter's record. It names it now; the analysis ships as
+    /// itself.
     pub fn region_analysis(&self) -> Vec<RegionAnalysis> {
-        tensor_compiler::codegen::cuda::region_analysis::analyze_program(&self.compiled_stages)
-            .into_iter()
-            .map(|region| RegionAnalysis {
-                stage_index: region.stage_index,
-                region_index: region.region_index,
-                // TWO NAMED BOOLEANS, out of two bits of a `u32` the emitter
-                // and the engine each had a `REGION_*` constant for. The
-                // contract's `program` module purified every such tag; this is
-                // the one place the emitter's numbering is read.
-                second_party_supported: region.flags & REGION_SECOND_PARTY_SUPPORTED != 0,
-                generated_valid: region.flags & REGION_GENERATED_VALID != 0,
-                direct_argmax: region
-                    .direct_argmax
-                    .into_iter()
-                    .filter_map(|record| {
-                        Some(DirectArgmax {
-                            node: record.node,
-                            source_value: record.source_value,
-                            // A `u16` in the emitter's record, and PTIR's own
-                            // enum in the contract. An id no intrinsic claims
-                            // is dropped rather than shipped: the fast path it
-                            // describes is an optimisation, and an engine that
-                            // took an unnameable intrinsic would read a buffer
-                            // by a number nobody bound.
-                            intrinsic: IntrinsicId::from_u16(record.intrinsic)?,
-                            requires_single_row: record.requires_single_row != 0,
-                        })
-                    })
-                    .collect(),
-                skipped: region.skipped,
-            })
-            .collect()
+        eta_compiler::codegen::cuda::region_analysis::analyze_program(&self.compiled_stages)
     }
 
     /// Backend source for this program, generated on first ask and cached.
@@ -229,7 +218,7 @@ impl std::error::Error for RegisterError {}
 /// limit. Traces are small; this is generous.
 pub const DEFAULT_CAPACITY: usize = 256;
 
-/// A bounded LRU of registered PTIR programs, keyed by `container_hash`.
+/// A bounded LRU of registered ETA programs, keyed by `container_hash`.
 pub struct Registry {
     inner: LruCache<u64, Arc<RegisteredProgram>>,
 }
@@ -259,8 +248,9 @@ impl Registry {
         let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
         let pricing = price(&decoded);
         let channel_accesses = Self::channel_accesses(&decoded);
+        let reads_attn_score = Self::reads_attn_score(&decoded);
         let bound = bind(decoded, profile.clone()).map_err(RegisterError::Bind)?;
-        let compiled_stages = tensor_compiler::plan::compile_bound(&bound);
+        let compiled_stages = eta_compiler::plan::compile_bound(&bound);
         let launch = std::sync::OnceLock::new();
         let entry = Arc::new(RegisteredProgram {
             bytes,
@@ -268,6 +258,7 @@ impl Registry {
             bound,
             compiled_stages,
             channel_accesses,
+            reads_attn_score,
             launch,
             geometry_taint: std::sync::OnceLock::new(),
             shadow_plan: std::sync::OnceLock::new(),
@@ -276,6 +267,21 @@ impl Registry {
         });
         self.inner.put(hash, entry.clone());
         Ok(entry)
+    }
+
+    /// Whether any stage materializes the attention-score rectangle.
+    fn reads_attn_score(container: &TraceContainer) -> bool {
+        container.stages.iter().any(|stage| {
+            stage.ops.iter().any(|op| {
+                matches!(
+                    op,
+                    Op::IntrinsicVal {
+                        intr: eta_ir::op::IntrinsicId::AttnScore,
+                        ..
+                    }
+                )
+            })
+        })
     }
 
     fn channel_accesses(container: &TraceContainer) -> Vec<(bool, bool)> {
@@ -329,7 +335,7 @@ fn price(c: &TraceContainer) -> Pricing {
     // STATED.** This number is bound as `BindExtents::sampled_rows`, which the
     // contract defines as "how many readout rows the epilogue reads"; the
     // compiler agrees and says so structurally —
-    // `tensor_compiler::plan::compile::symbolic` lifts `Port::Readout`'s first
+    // `eta_compiler::plan::compile::symbolic` lifts `Port::Readout`'s first
     // dim AND `IntrinsicId::Logits`'s first dim to the same
     // `SymbolicExtent::SampledRows`, and gives `Port::EmbedIndptr` a different
     // extent entirely (`RowCount`).
@@ -340,7 +346,7 @@ fn price(c: &TraceContainer) -> Pricing {
     // rows, and a `sampled_rows` of 1 carved the epilogue's logits value at one
     // row — so `reduce_argmax(logits())` answered one token and the guest read
     // `k - 1` cells of zeroes after it, which is token 0 at every rejected
-    // position. `engine_api::BindExtents`'s own doc names that failure mode:
+    // position. `engine::BindExtents`'s own doc names that failure mode:
     // "a buffer carved for one row when the fire hands it four leaves three
     // rows of zeroes that no launch faults on".
     //
@@ -359,11 +365,11 @@ fn price(c: &TraceContainer) -> Pricing {
                     .map(|decl| decl.shape.numel() as u32),
             })
     };
-    let rows = port_len(tensor_ir::registry::Port::Readout)
+    let rows = port_len(eta_ir::registry::Port::Readout)
         .map(|readout| readout.max(1))
         .or_else(|| {
             // A CSR of `lanes + 1` bounds, so the lane count is one less.
-            port_len(tensor_ir::registry::Port::EmbedIndptr)
+            port_len(eta_ir::registry::Port::EmbedIndptr)
                 .map(|indptr| indptr.saturating_sub(1).max(1))
         })
         .unwrap_or(1);
@@ -427,9 +433,9 @@ pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
 /// registration on an engine that generates its own kernels or needs none.
 #[must_use]
 pub fn with_host_codegen<'a>(
-    plan: &'a ::engine_api::ProgramRegistration,
+    plan: &'a ::engine::ProgramRegistration,
     engine_backend: Option<&str>,
-) -> std::borrow::Cow<'a, ::engine_api::ProgramRegistration> {
+) -> std::borrow::Cow<'a, ::engine::ProgramRegistration> {
     // THE ENGINE'S ANSWER, not one derived from its name. Deriving it from
     // `Engine::kind()` reads almost right and is wrong for Metal: `"metal"`
     // parses as a codegen backend, so a Metal engine would be handed
@@ -468,18 +474,9 @@ pub fn with_host_codegen<'a>(
     let mut next = plan.clone();
     if let Some(emitted) = emitted {
         next.emitter_version = emitted.emitter_version;
-        next.emitted_kernels = emitted
-            .kernels
-            .iter()
-            .map(|kernel| ::engine_api::EmittedKernel {
-                kind: kernel.kind,
-                stage_index: kernel.stage_index,
-                region_index: kernel.region_index,
-                entry_name: kernel.entry_name.clone(),
-                source: kernel.source.clone(),
-                error: kernel.error.clone(),
-            })
-            .collect();
+        // A clone, not a copy field by field: `EmittedKernel` is the
+        // compiler's own record and `ProgramRegistration` carries exactly it.
+        next.emitted_kernels = emitted.kernels.clone();
     }
     if !region_analysis.is_empty() {
         next.region_analysis = region_analysis;
@@ -496,7 +493,7 @@ pub fn model_profile() -> ModelProfile {
         m.vocab_size(),
         crate::store::registry::get(0, 0).kv_page_size,
         m.num_layers(),
-        m.ptir_caps(),
+        m.eta_caps(),
     )
 }
 
@@ -506,24 +503,24 @@ fn profile_from(
     vocab: u32,
     page_size: u32,
     num_layers: u32,
-    ptir: crate::model::PtirCaps,
+    eta: crate::model::EtaCaps,
 ) -> ModelProfile {
     ModelProfile {
         vocab,
         page_size,
         num_layers,
-        activation: tensor_ir::types::DType::F32,
-        has_lora: ptir.has_lora,
-        has_mtp_logits: ptir.has_mtp_logits,
-        has_mtp_drafts: ptir.has_mtp_drafts,
-        has_value_head: ptir.has_value_head,
-        has_attn_score: ptir.has_attn_score,
-        has_attn_page_mask: ptir.has_attn_page_mask,
+        activation: eta_ir::types::Dtype::F32,
+        has_lora: eta.has_lora,
+        has_mtp_logits: eta.has_mtp_logits,
+        has_mtp_drafts: eta.has_mtp_drafts,
+        has_value_head: eta.has_value_head,
+        has_attn_score: eta.has_attn_score,
+        has_attn_page_mask: eta.has_attn_page_mask,
         // Second-party kernels the backend advertises. `envelope_dot` is
         // replayable (a pure function of the query and the page envelopes) and
         // has no sink scope: it produces a value, it does not consume one.
-        kernels: if ptir.has_kv_envelopes {
-            vec![tensor_ir::registry::KernelInfo {
+        kernels: if eta.has_kv_envelopes {
+            vec![eta_ir::registry::KernelInfo {
                 name: "envelope_dot".into(),
                 sink_scope: None,
                 replayable: true,
@@ -537,16 +534,16 @@ fn profile_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tensor_ir::container::{
+    use eta_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram,
     };
-    use tensor_ir::op::{IntrinsicId, Op};
-    use tensor_ir::registry::{Port, Stage};
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::op::{IntrinsicId, Op};
+    use eta_ir::registry::{Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
 
     const VOCAB: u32 = 32;
 
-    fn chan(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
+    fn chan(shape: Shape, dtype: Dtype, role: HostRole, seeded: bool) -> ChannelDecl {
         ChannelDecl {
             shape,
             dtype: ChanDType::Concrete(dtype),
@@ -560,7 +557,7 @@ mod tests {
         PortBinding {
             port,
             source: PortSource::Const {
-                dtype: DType::U32,
+                dtype: Dtype::U32,
                 shape,
                 data: values
                     .iter()
@@ -577,7 +574,7 @@ mod tests {
             Op::IntrinsicVal {
                 intr: IntrinsicId::Logits,
                 shape: Shape::matrix(1, vocab),
-                dtype: DType::F32,
+                dtype: Dtype::F32,
             },
             Op::Reshape {
                 value: 0,
@@ -594,8 +591,8 @@ mod tests {
             names: vec![],
             externs: vec![],
             channels: vec![
-                chan(Shape::vector(1), DType::I32, HostRole::None, true), // 0 tok
-                chan(Shape::vector(1), DType::I32, HostRole::Reader, false), // 1 out
+                chan(Shape::vector(1), Dtype::I32, HostRole::None, true), // 0 tok
+                chan(Shape::vector(1), Dtype::I32, HostRole::Reader, false), // 1 out
             ],
             ports: vec![
                 PortBinding {
@@ -605,7 +602,7 @@ mod tests {
                 PortBinding {
                     port: Port::EmbedIndptr,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(2),
                         data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
                     },
@@ -616,7 +613,7 @@ mod tests {
                 PortBinding {
                     port: Port::KvLen,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(1),
                         data: 1u32.to_le_bytes().to_vec(),
                     },
@@ -641,7 +638,7 @@ mod tests {
         container.names = vec!["envelope_dot".to_string()];
         container.channels.push(chan(
             Shape::vector(pages),
-            DType::F32,
+            Dtype::F32,
             HostRole::Reader,
             false,
         ));
@@ -653,13 +650,13 @@ mod tests {
                     Op::IntrinsicVal {
                         intr: IntrinsicId::Query,
                         shape: Shape::vector(pages),
-                        dtype: DType::F32,
+                        dtype: Dtype::F32,
                     },
                     Op::KernelCall {
                         name: 0,
                         args: vec![0],
                         shape: Shape::vector(pages),
-                        dtype: DType::F32,
+                        dtype: Dtype::F32,
                     },
                     Op::ChanPut { chan: 2, value: 1 },
                 ],
@@ -670,7 +667,7 @@ mod tests {
 
     #[test]
     fn quest_tap_binds_only_against_a_backend_with_kv_envelopes() {
-        let caps = |has: bool| crate::model::PtirCaps {
+        let caps = |has: bool| crate::model::EtaCaps {
             has_lora: false,
             has_mtp_logits: false,
             has_mtp_drafts: false,
@@ -767,7 +764,7 @@ mod tests {
 
     #[test]
     fn kv_envelope_capability_gates_the_envelope_dot_kernel() {
-        let caps = |has: bool| crate::model::PtirCaps {
+        let caps = |has: bool| crate::model::EtaCaps {
             has_lora: false,
             has_mtp_logits: false,
             has_mtp_drafts: false,
@@ -801,7 +798,7 @@ mod tests {
         let mut container = greedy(VOCAB);
         container
             .channels
-            .push(chan(Shape::vector(3), DType::U32, HostRole::None, true));
+            .push(chan(Shape::vector(3), Dtype::U32, HostRole::None, true));
         container
             .ports
             .iter_mut()
@@ -824,7 +821,7 @@ mod tests {
         // verifier's `embed_indptr` is and what used to price this at 1.
         container
             .channels
-            .push(chan(Shape::vector(2), DType::U32, HostRole::None, true));
+            .push(chan(Shape::vector(2), Dtype::U32, HostRole::None, true));
         container
             .ports
             .iter_mut()
@@ -840,7 +837,7 @@ mod tests {
         // The same container, now stating the four rows it reads back.
         container
             .channels
-            .push(chan(Shape::vector(4), DType::U32, HostRole::None, true));
+            .push(chan(Shape::vector(4), Dtype::U32, HostRole::None, true));
         container.ports.push(container::PortBinding {
             port: Port::Readout,
             source: PortSource::Channel(3),
@@ -875,6 +872,7 @@ mod tests {
                 bound: program.bound.clone(),
                 compiled_stages: program.compiled_stages.clone(),
                 channel_accesses: program.channel_accesses.clone(),
+                reads_attn_score: program.reads_attn_score,
                 launch: program.launch.clone(),
                 geometry_taint: program.geometry_taint.clone(),
                 shadow_plan: program.shadow_plan.clone(),
@@ -909,7 +907,7 @@ mod tests {
             Op::IntrinsicVal {
                 intr: IntrinsicId::Logits,
                 shape: Shape::matrix(1, VOCAB),
-                dtype: DType::F32,
+                dtype: Dtype::F32,
             },
             Op::Reshape {
                 value: 0,

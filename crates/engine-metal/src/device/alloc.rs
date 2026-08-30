@@ -140,7 +140,7 @@ impl Buffer {
     /// The `MTLBuffer` itself, for a caller that binds it directly rather
     /// than through a handle.
     ///
-    /// The guest-program plane is the one such caller: an emitted PTIR
+    /// The guest-program plane is the one such caller: an emitted ETA
     /// kernel names its buffers by `[[buffer(n)]]` index rather than through
     /// a `kernels_metal::Tensor`, so there is no handle to resolve and the
     /// binding is this reservation at an offset the plane computed.

@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use checkpoint::contract::{Expr, ModelContract, TensorContract, Visibility};
 use model::contract::ModelError;
 use model_dsl::{Dtype, Param, ParamSource, Platform, Shard};
-use model_loader::contract::{Expr, ModelContract, TensorContract, Visibility};
 
 const GROUP: u64 = 32;
 
@@ -84,6 +84,29 @@ fn skus() -> Vec<Sku> {
         sku("qwen35-d0.8b-bf16-kv-bf16", |src| {
             model::qwen_3::model::Model::d0_8b(Dtype::Bf16, Dtype::Bf16, 1).load(src)
         }),
+        // The M-1 and M-2 rows: the same trunks reading the vision towers
+        // their own checkpoints ship. The bijection here covers `visual.*` —
+        // a hundred and forty-eight planes for the twelve-block one and three
+        // hundred and twenty-eight for the twenty-seven-block one — and it is
+        // one-to-one at every entry but the patch embed, whose `Conv3d` kernel
+        // the plan reads as the matmul bank it already is.
+        sku("qwen35-d0.8b-vision-bf16-kv-bf16", |src| {
+            model::qwen_3::model::Model::d0_8b_vision(Dtype::Bf16, Dtype::Bf16, 1).load(src)
+        }),
+        sku("qwen35-d0.8b-vision-eagle-bf16-kv-bf16", |src| {
+            model::qwen_3::model::Model::d0_8b_vision_eagle(Dtype::Bf16, Dtype::Bf16, 1).load(src)
+        }),
+        sku("qwen36-27b-vision-bf16-kv-bf16", |src| {
+            model::qwen_3::model::Model::d27b_vision(Dtype::Bf16, Dtype::Bf16, 1).load(src)
+        }),
+        // The M-4 row: the same trunk with an EAGLE head overlaid, so the one
+        // SKU whose bijection covers `aux.*`. Eleven declared planes against
+        // twelve stored tensors, and the difference is the same regrouping the
+        // 27B's row makes in the other direction -- `aux.fc` is one bank cut
+        // into two and `gate_proj`/`up_proj` are two fused into one.
+        sku("qwen35-d0.8b-eagle-bf16-kv-bf16", |src| {
+            model::qwen_3::model::Model::d0_8b_eagle(Dtype::Bf16, Dtype::Bf16, 1).load(src)
+        }),
         sku("qwen35-a3b-bf16-kv-bf16-tp2", |src| {
             model::qwen_3::model::Model::a3b(Dtype::Bf16, Dtype::Bf16, 2).load(src)
         }),
@@ -133,6 +156,28 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
             "`{}` is declared fp4, which names a kv-page scheme and no stored plane",
             param.name
         ),
+        // The catalog's 4-bit rows (`*-mlxu4-kv-bf16`) are read through
+        // `Model::import`, off an MLX checkpoint that ships the triplet, and
+        // not through the `load` this fixture exercises. None of the SKUs
+        // above reaches this arm, and stating an affine bank here would mean
+        // inventing a canonical layout for the codes plus a `.scales` and a
+        // `.biases` — a claim about bytes no load in this file reads.
+        Dtype::MlxU4 | Dtype::MlxU8 => panic!(
+            "`{}` is declared {:?}, which this fixture does not state; the \
+             affine rows are exercised through `Model::import`, not `load`",
+            param.name,
+            param.dtype
+        ),
+        // The checkpoint vocabulary the merged dtype enum brought with it. No
+        // SKU in the catalog declares a weight in one, so this fixture has
+        // never had to state one, and inventing a layout here would be a
+        // claim about a plane no model ships.
+        Dtype::Fp8E5m2 | Dtype::I64 | Dtype::I16 | Dtype::U64 | Dtype::U16 | Dtype::Bool => {
+            panic!(
+                "`{}` is declared {:?}, which no SKU in the catalog stores",
+                param.name, param.dtype
+            )
+        }
     }
 }
 
@@ -254,12 +299,25 @@ fn nodes(expr: &Expr, wanted: &dyn Fn(&Expr) -> bool) -> usize {
     found
 }
 
+/// **AND THE 4-BIT ROWS ARE EXEMPT, BY THE FIXTURE'S OWN ARGUMENT.**
+///
+/// `state`'s `MlxU4` arm refuses to write a plane: an affine bank would mean
+/// inventing a canonical layout for the codes plus a `.scales` and a
+/// `.biases`, which is a claim about bytes no load in this file reads. The
+/// `*-mlxu4-kv-bf16` rows are landed through `Model::import` off a real MLX
+/// checkpoint, and `the_checkpoints_state_what_the_texts_read` is where that
+/// is asked. So they are named here as exempt rather than left to read as an
+/// omission — a row that ships untested and a row tested somewhere else are
+/// different sentences, and this test only makes the first one.
+const NOT_BY_LOAD: &str = "-mlxu4-";
+
 #[test]
 fn every_catalog_row_states_how_it_lands() {
     let asked: BTreeSet<&str> = skus().iter().map(|sku| sku.name).collect();
     let shipped: BTreeSet<&str> = model::catalog()
         .into_iter()
         .map(|(name, ..)| name)
+        .filter(|name| !name.contains(NOT_BY_LOAD))
         .collect();
 
     let mut faults = Vec::new();
@@ -455,7 +513,7 @@ fn an_identity_load_states_no_cast() {
 /// file's other tests exist to forbid.
 ///
 /// The loader's half is proved where it lives, on the bytes:
-/// `model-loader`'s `executor::walk::tests`
+/// `checkpoint`'s `executor::walk::tests`
 /// `an_expert_bank_encodes_to_the_same_bytes_as_the_rows_it_stacks` compiles a
 /// rank-3 bank's `Cast`, runs it, and reads the published `experts.scales`
 /// back. This half is the claim on the model side of that seam, and the two
@@ -495,6 +553,16 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
 
         let supply = published(&contract);
         for param in &trace.params {
+            // **A REGISTERED PLANE IS NOT THE CHECKPOINT'S**, and the argument
+            // is the one `one_entry_per_plan_param_under_the_plans_own_names`
+            // makes next door: an adapter bank is a `Param` because the shell
+            // reserves it and the routed op indexes it, and its bytes arrive
+            // through `register_adapter` rather than out of a `.zt`. Demanding
+            // it here would be demanding that an unquantized checkpoint ship
+            // somebody's LoRA.
+            if param.source != ParamSource::Checkpoint {
+                continue;
+            }
             let Some(stem) = param.name.strip_suffix(".scales") else {
                 // Every other plane is declared under its own name.
                 if !supply.contains_key(param.name.as_str()) {
@@ -528,7 +596,7 @@ fn a_bank_the_checkpoint_ships_unquantized_is_cast_on_the_way_in() {
                 matches!(
                     expr,
                     Expr::Cast {
-                        to: model_loader::types::Encoding::Quant(_),
+                        to: checkpoint::types::Encoding::Quant(_),
                         ..
                     }
                 )

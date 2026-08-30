@@ -219,6 +219,77 @@ pub struct Handles {
     pub mask_indptr: Option<Tensor>,
 }
 
+/// How many numbers a multimodal position is: `(t, h, w)`. The one place this
+/// shell states it, on both axes — `RuntimeInput::PatchPositions` and
+/// `RuntimeInput::MropePositions` are the same triple over two rectangles.
+const AXES: u64 = 3;
+
+/// **WHAT THE SECOND ROW AXIS RESERVES** (multimodal §5.4), or nothing at
+/// all for a load whose plan states no patch row.
+///
+/// The three numbers are the ladder's and the plan's together: the ceilings
+/// come from `PatchLadder` (a deployment statute) and the row width from the
+/// plan's own `RuntimeInput::Patches` declaration, because `C·T·P²` is a
+/// property of the resize policy a model text bakes against and not of the
+/// deployment.
+#[derive(Debug, Clone, Copy)]
+pub struct PatchSeat {
+    /// `PatchLadder::max_patches` — the most patch rows one fire may carry.
+    pub rows: u64,
+    /// One patch row's width in bytes: `C·T·P²` elements of the plan's
+    /// activation dtype.
+    pub row_bytes: u64,
+    /// `PatchLadder::max_images` — the most images one fire may carry.
+    pub images: u64,
+    /// The element the patch rows are written in — the plan's own.
+    pub dtype: Dtype,
+    /// **HOW WIDE THE POSITION GATHER IS** (multimodal §9.2): the `taps` of
+    /// the plan's `RuntimeInput::PatchEmbedRows` declaration — 1 on the native
+    /// grid, 4 for bilinear, 16 for bicubic — or 0 for a plan that declares no
+    /// position gather at all, which reserves nothing.
+    pub embed_taps: u64,
+    /// Whether the plan also declares `RuntimeInput::PatchEmbedWeights`. A
+    /// native-grid tower does not, and then the weight stream costs it not one
+    /// byte: the cheap path is the ABSENCE of the stream rather than a vector
+    /// of ones.
+    pub embed_weights: bool,
+}
+
+/// Where the patch vectors sit in the device store.
+#[derive(Debug, Clone, Copy)]
+struct PatchAt {
+    payload: u64,
+    segments: u64,
+    routes: u64,
+    positions: u64,
+    embed_rows: u64,
+    embed_weights: u64,
+    seat: PatchSeat,
+}
+
+/// The three seats one fire's images resolve to.
+#[derive(Debug, Clone, Copy)]
+pub struct PatchHandles {
+    /// `RuntimeInput::Patches`: `[patch rows, C·T·P²]`, the plan's element.
+    pub patches: Tensor,
+    /// `RuntimeInput::PatchSegments`: `i32`, `[images + 1]`.
+    pub segments: Tensor,
+    /// `RuntimeInput::PatchRoutes`: `i32`, one destination token row per
+    /// patch row.
+    pub routes: Tensor,
+    /// `RuntimeInput::PatchPositions`: `i32`, `[patch rows, 3]` — one
+    /// `(t, h, w)` per patch row, the grid coordinates the tower rotates by.
+    pub positions: Tensor,
+    /// `RuntimeInput::PatchEmbedRows`: `i32`, `[patch rows, taps]` — which
+    /// rows of the learned position table each patch reads. `None` for a plan
+    /// that declares no position gather.
+    pub embed_rows: Option<Tensor>,
+    /// `RuntimeInput::PatchEmbedWeights`: `f32`, `[patch rows, taps]`. `None`
+    /// for a native-grid plan, which reads one table row per patch and weights
+    /// it by nothing.
+    pub embed_weights: Option<Tensor>,
+}
+
 /// One kv space's device seats.
 #[derive(Debug, Clone, Copy)]
 pub struct SpaceHandles {
@@ -402,6 +473,32 @@ pub struct Inputs {
     mask_bits: u64,
     mask_bytes: u64,
     mask_indptr: u64,
+    /// **THE SECOND ROW AXIS'S THREE REGIONS, CARVED PAST THE STAGED
+    /// PREFIX** (multimodal §5.4) — device bytes and no pinned mirror.
+    ///
+    /// The ring is depth-multiplied, so a patch rectangle inside it would be
+    /// paid `staging_depth` times by every load, including the text-only ones
+    /// that never fill it. These sit BELOW `stage_bytes`, exactly where the
+    /// schedule grants sit and for exactly the schedule grants' reason: their
+    /// source is a `Vec` one `enqueue` makes and drops (pageable, so
+    /// `cudaMemcpyAsync` is synchronous in the source) and their destination
+    /// is read by kernels that same `enqueue` launched behind them on the
+    /// same stream. `None` for a plan that states no patch row, which is
+    /// where the whole cost of the axis goes to zero.
+    patch: Option<PatchAt>,
+    /// **WHERE THE TRUNK'S TRIPLE-WIDE POSITION STREAM SITS**
+    /// (`RuntimeInput::MropePositions`, multimodal §6.3), or `None` for the
+    /// texts that rotate by a scalar — which is every text this engine served
+    /// before the towers.
+    ///
+    /// Below the staged prefix and on no ring, for [`Inputs::patch`]'s reason
+    /// exactly: the source is a `Vec` one `enqueue` makes and drops, and the
+    /// destination is read by the rotation that same `enqueue` launched behind
+    /// it on the same stream.
+    mrope: Option<u64>,
+    /// How many bytes [`Inputs::mrope`] holds — the row ceiling tripled, or
+    /// zero.
+    mrope_bytes: u64,
     spaces: Vec<SpaceAt>,
     /// One grant per (RUN, PLAN VALUE), flat at `run * plan_values + value`.
     /// Grants are disjoint carvings of the shell's bounded pool because every
@@ -490,6 +587,8 @@ impl Inputs {
         gathered: usize,
         sms: u32,
         runahead: engine::runahead::Runahead,
+        patch: Option<PatchSeat>,
+        mrope: bool,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
         let lanes = u64::from(budget.max_lanes);
@@ -508,7 +607,7 @@ impl Inputs {
         //
         // - `2 * runs` for the SEGMENT LIST a `Fallback::Grouped` window
         //   carries (`Windows::packed` stages both in the one copy). `runs` is
-        //   `engine::fire::max_runs`, the artifact's own bound on how many
+        //   `model_exec::fire::max_runs`, the artifact's own bound on how many
         //   intervals any mask breaks into, so the ceiling holds for every
         //   fire this load can be handed; an artifact P4 seated whole answers
         //   `1` and pays two ints per slot for a list it never fills.
@@ -516,7 +615,7 @@ impl Inputs {
         //   (`window::Gathered`, `Fallback::Copy`): the row map the gather and
         //   the scatter read, and per kv space the page bounds, the compacted
         //   page-id list and the two per-lane vectors. `gathered` is
-        //   `engine::fire::fragmentable` — how many distinct masks this
+        //   `model_exec::fire::fragmentable` — how many distinct masks this
         //   artifact can ever find in pieces, which is 0 for every artifact P4
         //   seated whole and 1 for today's qwen texts.
         let per_gathered = rows + spaces as u64 * (3 * lanes + 1 + pages);
@@ -569,6 +668,36 @@ impl Inputs {
         // is the size one host ring slot mirrors — a `take(0)` because the
         // closure owns the cursor and this is how it is read without moving.
         let stage_bytes = take(0);
+        // **THE PATCH REGIONS, BELOW THE LINE** — device bytes with no pinned
+        // mirror, which is the whole of multimodal §5.4. Nothing above this
+        // line moved, so a text-only load's carve is byte-for-byte the one it
+        // always was and `PatchSeat`'s `None` costs it not even an offset.
+        let patch = patch.map(|seat| PatchAt {
+            payload: take(seat.rows * seat.row_bytes),
+            segments: take((seat.images + 1) * 4),
+            routes: take(seat.rows * 4),
+            // The tower's own rotation stream, `[patch rows, 3]` i32 — cut
+            // from the same submission, carved beside the three it arrives
+            // with, and staged in the same `enqueue`.
+            positions: take(seat.rows * AXES * 4),
+            // **THE POSITION GATHER'S TWO STREAMS** (multimodal §9.2), sized
+            // by the plan's own tap count and by nothing else: `0` taps is a
+            // plan with no learned position table and carves nothing, and a
+            // native-grid plan carves the ids at one tap and no weights at all.
+            embed_rows: take(seat.rows * seat.embed_taps * 4),
+            embed_weights: if seat.embed_weights {
+                take(seat.rows * seat.embed_taps * 4)
+            } else {
+                0
+            },
+            seat,
+        });
+        // **THE TRUNK'S TRIPLE-WIDE TOKEN STREAM** (multimodal §6.3), below
+        // the line for the patch regions' reason and reserved only when the
+        // plan names it. `[max_tokens, 3]` i32 is 96 KiB at the row ceiling
+        // this shell serves — paid once, not `staging_depth` times, and not
+        // at all by a text that rotates by a scalar.
+        let mrope = mrope.then(|| take(rows * AXES * 4));
         // One grant per plan value. The float side is the requirement of the
         // builder that will actually run, or the flat floor, whichever is
         // larger — computed rather than guessed, because a short grant here
@@ -581,7 +710,7 @@ impl Inputs {
         // ONE INT GRANT PER RUN, ONE FLOAT GRANT PER VALUE — see
         // [`Inputs::plans`] for which half of a schedule needs which, and why
         // multiplying the float side would be the expensive way to be wrong
-        // about it. `runs` is `engine::fire::max_runs`, which is `1` for every
+        // about it. `runs` is `model_exec::fire::max_runs`, which is `1` for every
         // artifact P4 seated whole, and the carve below is then byte-for-byte
         // the one this shell has always made.
         let runs = runs.max(1);
@@ -641,6 +770,9 @@ impl Inputs {
             mask_bits,
             mask_bytes,
             mask_indptr,
+            patch,
+            mrope,
+            mrope_bytes: if mrope.is_some() { rows * AXES * 4 } else { 0 },
             spaces,
             plan_values: grants.len(),
             plans: (0..runs as usize)
@@ -665,7 +797,7 @@ impl Inputs {
     /// A run past the ones this load reserved answers `None`, which the caller
     /// reads as "no grant" and refuses on — the same answer a value that is
     /// not a plan struct gives. It cannot happen to a load and a fire built
-    /// from one artifact: `engine::fire::max_runs` bounds every fire's split
+    /// from one artifact: `model_exec::fire::max_runs` bounds every fire's split
     /// and is what `reserve` was handed.
     #[must_use]
     pub fn grant(&self, plan: u32, run: u32) -> Option<Workspace> {
@@ -854,6 +986,174 @@ impl Inputs {
     /// # Errors
     ///
     /// [`Fault::Device`](crate::Fault::Device) for a copy.
+    /// **THE SECOND ROW AXIS'S H2D, INSIDE THE ENQUEUE AND OUTSIDE THE
+    /// RING** (multimodal §5.4).
+    ///
+    /// Three `cudaMemcpyAsync`s from PAGEABLE host memory onto the fire's own
+    /// compute stream, in front of the launches that read them. Pageable is
+    /// what makes this safe without a slot: the driver copies the source into
+    /// its own staging buffer before the call returns, so the caller's `Vec`
+    /// may be dropped the instant this returns — which is the argument
+    /// [`Inputs::plans`] already makes for the schedule grants, and the reason
+    /// neither needs a pinned mirror or a depth.
+    ///
+    /// `None` for a load whose plan states no patch row, which is a refusal
+    /// the caller should never reach: `compose_axes` answers `Fault::Towerless`
+    /// for an image against a text with no patch axis, so a fire that gets
+    /// here with patch bytes has an artifact that reserved room for them.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`](crate::Fault::Ceiling) for a fire past the reserved
+    /// patch rectangle, and [`Fault::Device`](crate::Fault::Device) for the
+    /// copies.
+    pub fn stage_patches(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        payload: &[u8],
+        segments: &[i32],
+        routes: &[i32],
+        positions: &[i32],
+        embed_rows: &[i32],
+        embed_weights: &[f32],
+    ) -> Result<PatchHandles> {
+        let Some(at) = self.patch else {
+            return Err(crate::error::Fault::Ceiling {
+                what: "the patch rectangle, which this load reserved none of",
+                need: payload.len() as u64,
+                have: 0,
+            });
+        };
+        let owed = [
+            (payload.len() as u64, at.seat.rows * at.seat.row_bytes),
+            (segments.len() as u64 * 4, (at.seat.images + 1) * 4),
+            (routes.len() as u64 * 4, at.seat.rows * 4),
+            (positions.len() as u64 * 4, at.seat.rows * AXES * 4),
+            (
+                embed_rows.len() as u64 * 4,
+                at.seat.rows * at.seat.embed_taps * 4,
+            ),
+            (
+                embed_weights.len() as u64 * 4,
+                if at.seat.embed_weights {
+                    at.seat.rows * at.seat.embed_taps * 4
+                } else {
+                    0
+                },
+            ),
+        ];
+        for (need, have) in owed {
+            if need > have {
+                return Err(crate::error::Fault::Ceiling {
+                    what: "bytes of the patch rectangle this load reserved",
+                    need,
+                    have,
+                });
+            }
+        }
+        let base = self.store.ptr();
+        self.store.stage(stream, at.payload, payload)?;
+        self.store.stage(stream, at.segments, bytes_of(segments))?;
+        self.store.stage(stream, at.routes, bytes_of(routes))?;
+        self.store.stage(stream, at.positions, bytes_of(positions))?;
+        if !embed_rows.is_empty() {
+            self.store.stage(stream, at.embed_rows, bytes_of(embed_rows))?;
+        }
+        if !embed_weights.is_empty() {
+            self.store
+                .stage(stream, at.embed_weights, f32_bytes_of(embed_weights))?;
+        }
+        let rows = if at.seat.row_bytes == 0 {
+            0
+        } else {
+            (payload.len() as u64 / at.seat.row_bytes) as u32
+        };
+        let width = model_compiler::arena::elem_bytes(at.seat.dtype)
+            .filter(|element| *element > 0)
+            .map_or(0, |element| (at.seat.row_bytes / element) as u32);
+        Ok(PatchHandles {
+            patches: Tensor::new(base + at.payload, rows, width, at.seat.dtype),
+            segments: i32s(base + at.segments, segments.len() as u32),
+            routes: i32s(base + at.routes, routes.len() as u32),
+            // `[patch rows, 3]` and not a flat vector: `rope_mrope` reads a
+            // rectangle and refuses anything that is not three wide, which is
+            // the check that would otherwise be nobody's.
+            positions: Tensor::new(
+                base + at.positions,
+                (positions.len() / AXES as usize) as u32,
+                AXES as u32,
+                Dtype::I32,
+            ),
+            // `[patch rows, taps]` and not a flat vector: `embed_weighted`
+            // reads the tap count off the operand's width, so the rectangle is
+            // where that number lives.
+            embed_rows: (!embed_rows.is_empty()).then(|| {
+                let taps = at.seat.embed_taps.max(1) as u32;
+                Tensor::new(
+                    base + at.embed_rows,
+                    embed_rows.len() as u32 / taps,
+                    taps,
+                    Dtype::I32,
+                )
+            }),
+            embed_weights: (!embed_weights.is_empty()).then(|| {
+                let taps = at.seat.embed_taps.max(1) as u32;
+                Tensor::new(
+                    base + at.embed_weights,
+                    embed_weights.len() as u32 / taps,
+                    taps,
+                    Dtype::F32,
+                )
+            }),
+        })
+    }
+
+    /// **THE TRUNK'S TRIPLE-WIDE POSITION STREAM, STAGED WHERE THE PATCH
+    /// VECTORS ARE** (multimodal §6.3).
+    ///
+    /// One `cudaMemcpyAsync` from pageable host memory onto the fire's compute
+    /// stream, in front of the rotation that reads it; no ring slot, no pinned
+    /// reservation, for the reason [`Inputs::stage_patches`] states at length.
+    /// `[rows, 3]` `i32`, one `(t, h, w)` per TOKEN row — every row of the
+    /// fire, because the trunk is one region over the whole rectangle and a
+    /// text lane's `(p, p, p)` is scalar rope rather than an absence.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`](crate::Fault::Ceiling) for a fire past the reserved
+    /// stream (which is the row ceiling's, tripled) or for a plan that
+    /// reserved none, and [`Fault::Device`](crate::Fault::Device) for the copy.
+    pub fn stage_mrope_positions(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        positions: &[i32],
+    ) -> Result<Tensor> {
+        let Some(at) = self.mrope else {
+            return Err(crate::error::Fault::Ceiling {
+                what: "the triple-wide position stream, which this load reserved none of",
+                need: positions.len() as u64 * 4,
+                have: 0,
+            });
+        };
+        let have = self.mrope_bytes;
+        let need = positions.len() as u64 * 4;
+        if need > have {
+            return Err(crate::error::Fault::Ceiling {
+                what: "bytes of the triple-wide position stream this load reserved",
+                need,
+                have,
+            });
+        }
+        let base = self.store.ptr();
+        self.store.stage(stream, at, bytes_of(positions))?;
+        Ok(Tensor::new(
+            base + at,
+            (positions.len() / AXES as usize) as u32,
+            AXES as u32,
+            Dtype::I32,
+        ))
+    }
+
     pub fn commit(
         &mut self,
         stream: *mut core::ffi::c_void,
@@ -987,6 +1287,20 @@ fn bytes_of(values: &[i32]) -> &[u8] {
     // SAFETY: `i32` is `Copy`, has no padding and no niche, so all `4 * len`
     // of its bytes are initialized and readable as `u8`. The result borrows
     // the input and is read, never written, for the length of one enqueue.
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
+    }
+}
+
+/// [`bytes_of`] for the one geometry stream that is not an index: the
+/// interpolation weights (multimodal §9.2), which are `f32` because they are
+/// the preprocessor's arithmetic.
+///
+/// A second function rather than a generic one, because the two callers are
+/// the two element types this staging path will ever have and a `T: Pod` bound
+/// would be a wider promise than the module keeps.
+fn f32_bytes_of(values: &[f32]) -> &[u8] {
+    // SAFETY: as [`bytes_of`] — `f32` is `Copy`, has no padding and no niche.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     }

@@ -54,7 +54,7 @@
 use inferlet::chat;
 use inferlet::grammar::{Grammar, Matcher};
 use inferlet::mask::unpack_mask;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

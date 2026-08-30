@@ -24,11 +24,16 @@ use serde::{Deserialize, Serialize};
 // consumers can still reach them as `controller_api::{WorkerId, …}`.
 pub use ids::{GatewayId, NodeId, WorkerId};
 
-// The engine contract owns the capability record (`engine_api::caps`);
-// `WorkerInfo.capability` carries it. It was `DriverCapabilities`, a 30-field
-// flat struct mixing device, load and model facts; `Capabilities` is the same
-// answer with those three separated.
-use engine_api::caps::Capabilities;
+// `WorkerInfo` used to carry the engine's whole capability record
+// (`engine::caps::Capabilities`, itself the successor to the 30-field flat
+// `DriverCapabilities`). It was write-only: serialized by the worker, shipped,
+// and dropped again at `controller::actor::register_worker`. The engine keeps
+// that record behind `Engine::load`, which is where anything that needs it
+// reads it. If capability-aware placement is ever wanted, the controller takes
+// the specific low-cardinality numbers it needs as fields of its own — the rule
+// `WorkerStatus` already follows — instead of republishing the engine's
+// record whole, which is what cost this crate a dependency on the engine
+// contract.
 
 // ──────────────────────────── role / health ───────────────────────────
 
@@ -99,9 +104,6 @@ pub struct WorkerInfo {
     /// Where peers reach this worker's control/data endpoint
     /// (e.g. `"10.0.0.4:7000"`).
     pub addr: String,
-    /// What the worker's engine can do (page geometry, forward limits, arch,
-    /// …) — the existing engine-handshake capability descriptor.
-    pub capability: Capabilities,
 }
 
 /// Static identity a gateway declares when it joins.

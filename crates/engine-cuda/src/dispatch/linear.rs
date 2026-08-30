@@ -1,14 +1,25 @@
 //! `Linear`: the gemm anchor, the mlp activations, the moe router, bank and
 //! combine arms, and the LoRA correction over a routed adapter bank.
 
-use kernels::{DispatchLinear, KernelError};
 use kernels_cuda::linear;
+use model_exec::{DispatchLinear, KernelError};
 use model_ir::Linear;
 
 use crate::run::Run;
 
 impl DispatchLinear for Run<'_> {
     fn dispatch(&mut self, op: &Linear) -> Result<(), KernelError> {
+        self.linear(op).map_err(crate::error::kernel)
+    }
+}
+
+impl Run<'_> {
+    /// The arms themselves, in `kernels-cuda`'s error vocabulary and not
+    /// the contract's — which is what keeps each one a plain tail call with
+    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
+    /// above that lifts the family, and says why it is a call and not a
+    /// `From` impl.
+    fn linear(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
         match op {
             // ---- gemm (anchor) ----
             Linear::Matmul { act, w, y } => linear::gemm::matmul(
@@ -66,6 +77,11 @@ impl DispatchLinear for Run<'_> {
                 self.tensor(*up),
                 &mut self.tensor(*y),
             ),
+            // **THE UNGATED GELU** (multimodal §6.2) — the towers' MLP and
+            // merger, which are `fc2(act(fc1(x)))` with nothing to multiply.
+            Linear::MlpGeluTanh { x, y } => {
+                linear::mlp::gelu_tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*y))
+            }
             Linear::MlpGegluTanhPacked {
                 packed,
                 intermediate,

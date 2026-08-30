@@ -11,29 +11,109 @@
 //! generation. Its premise is that the last few prompt tokens are the best
 //! available proxy for what the not-yet-generated continuation will want.
 //!
-//! That premise makes SnapKV the only member of Track B that needs a **prefill**
-//! score capture. `attn_score` at `on_attn` during a decode fire yields one query
-//! row; during a prefill fire it yields the mean over the last `window` query
-//! rows (32 by default, `PIE_ATTN_SCORE_WINDOW`). Design doc §12.
+//! That premise makes SnapKV the only member of Track B that reads the score
+//! rectangle at a **prefill** epilogue rather than a decode one.
 //!
-//! So this program is the end-to-end test of a path nothing else exercises: the
-//! FlashInfer prefill variant, the causal-aware normalisation (the prefill hook
-//! sees dot products at positions the softmax later discards, because
-//! `LogitsMask` runs after `LogitsTransform`), and the head+row fold.
+//! ## The observation window is the BACKEND's, and SnapKV no longer carries one
+//!
+//! The capture arm folds the last `min(32, qo_len)` query rows of each request
+//! into the row it publishes — 32 is the backend's statute, and it is SnapKV's
+//! own width (`PIE_ATTN_SCORE_WINDOW` in the C++ lineage). So the row this
+//! program reads at the prefill epilogue ALREADY IS the end-of-prompt
+//! observation: there is no window channel to declare, no window fold to write,
+//! and nothing for a guest to get wrong about which rows were averaged. TOVA
+//! and H2O run 1-row decode fires, where that same statute degenerates to a
+//! window of one — the current query's distribution, which is what those two
+//! papers define. One backend rule serves all three.
+//!
+//! This program is still the end-to-end test of a path nothing else exercises:
+//! a multi-row capture, its causal-aware normalisation (a prefill row must not
+//! be scaled by query rows the causal mask discarded), and the layer/head fold
+//! over a rectangle whose live prefix is the whole prompt rather than one
+//! decode step's cache.
 //!
 //! ## What it enforces, and how the budget is spent
 //!
-//! One selection, made after prefill, then fixed. Two groups of pages are kept:
+//! One selection, made after prefill, then fixed. Two groups of positions are
+//! kept:
 //!
-//!  1. The top `page_budget` **prompt** pages by observed attention mass.
-//!  2. **Every page written after prefill**, unconditionally.
+//!  1. Every position in the top `page_budget` **prompt** pages by observed
+//!     attention mass.
+//!  2. **Every position written after prefill**, unconditionally.
 //!
 //! (2) is not a hedge, it is SnapKV: the paper compresses the prompt and then
 //! lets the cache grow normally from there. Evicting freshly generated tokens
-//! would be a different (and worse) algorithm. It is expressed by giving those
-//! slots a mass far above anything a prompt page can reach and widening the
-//! rank predicate by the same count, so the selection among prompt pages is
-//! still exactly `page_budget` wide.
+//! would be a different (and worse) algorithm.
+//!
+//! ## The door the eviction goes through, and why it is the mask
+//!
+//! `.wiki/alto/attn-score.md` §4 already answered this, and the answer is the
+//! first of the two honest deltas it records against the papers: **"evict"
+//! executes as CUSTOM MASK updates (the masked arm), with a page drop only
+//! when a page's tokens are all dead.** So the decode fire binds an `AttnMask`
+//! — the descriptor port `snapkv-eviction` and `sliding-window-attention`
+//! already ride — and the keep-set is a row of bits ANDed into the causal row.
+//! Nothing here is a second-party intrinsic; nothing here is engine surface
+//! this program invented.
+//!
+//! **AND THE MASK IS THE DOOR FOR A REASON, NOT FOR CONVENIENCE.** The other
+//! route — naming fewer pages in the page list — makes the KV cache shorter
+//! without making the SEQUENCE shorter, and from that instant the cache index
+//! and the true position are two different numbers. A kept key carries the
+//! RoPE it was written with, at its true position, so the query must carry its
+//! true position too or every relative distance in the attention is wrong by
+//! however much was evicted. The cuda shell derives a lane's positions as
+//! `held .. held + rows` and refuses an explicit list by name (`Unsupported`,
+//! verb `explicit lane positions`), and `WorkingSet::discard` says outright
+//! that "suffix indexes shift down" — so a page-list cut would have to
+//! re-index the query, which is StreamingLLM's technique and NOT SnapKV's.
+//!
+//! Under the mask the geometry does not move at all: the same page list, the
+//! same `kv_len`, the same positions, and the only thing that changes is which
+//! keys the softmax is allowed to see. Quality semantics exact; memory savings
+//! quantized to page granularity and taken later, which is precisely the delta
+//! §4 wrote down.
+//!
+//! **A masked lane keeps no scores**, and that costs this program nothing:
+//! SnapKV observes at the PREFILL epilogue (unmasked, capturing) and enforces
+//! over the decode (masked, not capturing), so the two never want the same
+//! fire. That is the structural reason SnapKV is the member of Track B that
+//! rides this door without a compromise — see `trackb-h2o` for the one that
+//! does not.
+//!
+//! ## What the backend does under `intrinsics::attn_score`
+//!
+//! **The graph wrote it; the epilogue reads it** (`.wiki/alto/attn-score.md`
+//! §4). The attention capture arm accumulates per-key mass into an arena
+//! rectangle as it runs, and the epilogue is handed the whole thing at once as
+//! a device tensor:
+//!
+//! ```text
+//! intrinsics::attn_score(planes) -> [planes, intrinsics::attn_score_kv_max()]
+//! ```
+//!
+//! one row per (exported attention layer, query head), **layer-major,
+//! head-minor** (`layer * heads + head`), so a program that declares fewer
+//! planes than the load exports reads a prefix of the layers rather than a
+//! stripe of the heads. There is no per-layer stage and no host in the loop;
+//! `Stage::OnAttn` no longer admits the intrinsic at all. Model-gated on
+//! `has_attn_score`.
+//!
+//! Both folds SnapKV needs are ONE in-graph reduction at the epilogue, on the
+//! device (§4: "reduction stays on device — only decisions cross to the host"):
+//!
+//! ```text
+//! folded = reduce_sum(transpose(rect)) / heads
+//! ```
+//!
+//! `transpose` puts the planes on the last axis so `reduce_sum` — which
+//! reduces the LAST axis — sums down them; `/ heads` turns that plane-sum into
+//! (mean over heads, then sum over layers), because
+//! `Σ_l (1/H) Σ_h row = (1/H) Σ_planes row`. The result is a row of mass
+//! exactly `layers`, which is what `score_mass` checks. **The layer count is
+//! declared, not counted**: the per-layer accumulator and the device layer
+//! counter both existed to fold a per-layer tap across the layer loop, and
+//! there is no layer loop left. `layers_observed` is `planes / heads`.
 //!
 //! ## Deviations from the paper, as built
 //!
@@ -46,25 +126,29 @@
 //!    at a time, so a sub-page keep-set cannot free anything. The clustering
 //!    effect SnapKV's pooling exists to produce is what page granularity gives
 //!    for free.
-//! 2. **Heads are folded by the backend.** SnapKV selects per head; one page
-//!    list per request means a per-head keep-set has no representable consumer,
-//!    so the backend returns the mean over query heads. `quest-attention`,
+//! 2. **Heads are folded by the PROGRAM.** SnapKV selects per head; one page
+//!    list per request means a per-head keep-set has no representable consumer.
+//!    The rectangle is per-head because observability wants it that way (§4),
+//!    so this program takes the mean itself, in-graph. `quest-attention`,
 //!    `tova-attention` and `trackb-h2o` document the identical collapse.
 //! 3. **Layers are folded by the program.** Same reason. Summing layers is
-//!    monotone-equivalent to averaging, so the ranking does not depend on a
-//!    layer count the program cannot observe.
+//!    monotone-equivalent to averaging, so the ranking does not depend on how
+//!    many layers were declared.
 //!
 //! ## Why the page mass takes a host round trip
 //!
 //! The selection is made in the prefill program and enforced in the decode
-//! program, and those are two separately submitted PTIR programs. The
+//! program, and those are two separately submitted ETA programs. The
 //! established idiom for carrying a value between them is a host drain and a
 //! fresh channel — `attention-sink` carries its first token that way. The
-//! *ranking* still happens on device, inside `on_attn_proj`, from a device
-//! tensor; only the one-time hand-off is on the host, which is also what makes
-//! the selection independently checkable in `Output`.
+//! *fold* still happens on device, at the prefill epilogue, from a device
+//! tensor; only the one-time hand-off and the rank are on the host, which is
+//! also what makes the selection independently checkable in `Output`. §4 asks
+//! that "only decisions cross to the host"; a `[p_max]` row crossing once per
+//! request, never per step, is the smallest hand-off this two-program shape
+//! admits, and `snapkv-eviction` makes the same trade for the same reason.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -77,18 +161,37 @@ struct Input {
     max_tokens: usize,
     #[serde(default = "default_seed")]
     seed: u32,
-    /// Prompt KV pages SnapKV keeps. Pages written after prefill are kept on
-    /// top of this, as is the request's last page (the backend force-keeps it).
+    /// Prompt KV pages SnapKV keeps. Positions written after prefill are kept
+    /// on top of this, unconditionally — including the tail of the last prompt
+    /// page, which is where the decode writes.
     #[serde(default = "default_page_budget")]
     page_budget: u32,
     /// Pins the reserved page count so it does not move with `max_tokens`.
-    /// `p_max` sets the width of the score row folded and ranked every layer,
-    /// so a benchmark that differences two `max_tokens` would otherwise be
-    /// comparing two different per-step workloads and would charge the policy
-    /// for the difference. Setting this to the larger of the two endpoints
+    /// `p_max` sets the width of the score row folded at the prefill epilogue
+    /// and the width of the keep row every decode fire carries, so a benchmark
+    /// that differences two `max_tokens` would otherwise be comparing two
+    /// different per-step workloads and would charge the policy for the
+    /// difference. Setting this to the larger of the two endpoints
     /// makes the per-step cost identical. Defaults to `max_tokens`.
     #[serde(default)]
     reserve_tokens: Option<usize>,
+    /// Attention layers the load EXPORTS a score plane for. Declared, not
+    /// derived: the plane count is not in the model profile and the SDK has no
+    /// host call for it, so the program states it and the backend refuses a
+    /// claim larger than the load exports (the `hidden(width)` deviation —
+    /// a declared ceiling, checked by name).
+    ///
+    /// The default is `Qwen/Qwen3.5-0.8B`: `Model::d0_8b` in
+    /// `crates/model/src/qwen_3/model.rs` is `layers: 24, attn_every: 4`, and
+    /// the SKU is hybrid — `attn_at(l) = l % attn_every == attn_every - 1`
+    /// puts an attention mixer on 6 of the 24 layers and a GDN mixer on the
+    /// other 18. Only the attention layers export a plane.
+    #[serde(default = "default_layers")]
+    layers: u32,
+    /// Query heads per exported attention layer. `Model::d0_8b`'s
+    /// `q_heads: 8`, at `tp == 1`.
+    #[serde(default = "default_heads")]
+    heads: u32,
     /// Prefill chunk width, clamped to the engine's `max_embed_length()`.
     /// Defaults to that limit, i.e. the fewest chunks the engine allows.
     /// Forcing it down runs the multi-chunk path on a short prompt, which is
@@ -112,12 +215,14 @@ fn default_seed() -> u32 {
 fn default_page_budget() -> u32 {
     4
 }
-
-/// The mass handed to pages that did not exist at prefill time, so they sort
-/// above every prompt page. One page cannot exceed `layers` in observed mass
-/// (each layer contributes one distribution, summing to 1 over the prefix), and
-/// no model in range has 1e6 layers.
-const ALWAYS_KEEP_MASS: f32 = 1.0e6;
+/// qwen35-d0.8b: 24 layers, `attn_every: 4` → 6 exported attention layers.
+fn default_layers() -> u32 {
+    6
+}
+/// qwen35-d0.8b: `q_heads: 8` at `tp == 1`.
+fn default_heads() -> u32 {
+    8
+}
 
 /// Largest entry of the tie-break ramp given to prompt pages before anything has
 /// been observed. Only reachable if the capture returns an all-zero row, which
@@ -131,7 +236,12 @@ struct Output {
     sampler: &'static str,
     text: String,
     count: usize,
-    /// The static ceiling the program declared for the score row.
+    /// The program's own KV window into the published score row: the exact
+    /// page geometry it reserved, `max_pages * page_size`. The ROW's width is
+    /// not the program's to declare any more — it is the published constant
+    /// `intrinsics::attn_score_kv_max()` — so this is the prefix of that row
+    /// the program reads, and the program refuses up front if its geometry
+    /// would outgrow the published one.
     kv_max: u32,
     /// Prompt length in tokens, i.e. the KV length the observed fire had.
     prompt_len: u32,
@@ -139,19 +249,22 @@ struct Output {
     /// Pages the prompt occupies. Only these compete for the budget.
     prompt_pages: u32,
     /// How many fires the prefill was split into, and how many tokens the
-    /// FINAL (observed) one carried. Reported because the observation window
-    /// is the last `window` rows *of that chunk*: if `prefill_final` drops
-    /// below the engine's window the observation is silently truncated, and a
-    /// truncated window still produces a plausible-looking ranking. With even
-    /// chunking `prefill_final == prompt_len / prefill_chunks`, the largest a
-    /// last chunk can be.
+    /// FINAL (observed) one carried. Reported because the backend's window is
+    /// the last `min(32, qo_len)` rows *of that fire*: if `prefill_final` drops
+    /// below 32 the observation narrows with it, and a narrow window still
+    /// produces a plausible-looking ranking. With even chunking
+    /// `prefill_final == prompt_len / prefill_chunks`, the largest a last chunk
+    /// can be.
     prefill_chunks: u32,
     prefill_final: u32,
-    /// KV page size, reported so a consumer can convert the engine's
-    /// observation window (a token count) into the page span it covers.
+    /// KV page size, reported so a consumer can convert the backend's
+    /// observation window (a token count, `min(32, qo_len)`) into the page span
+    /// it covers.
     page_size: u32,
-    /// Layers that reported a score row during the single prefill fire. This is
-    /// the model's layer count, and it is what `score_mass` must equal.
+    /// Attention layers folded into the observed row. DERIVED FROM THE
+    /// DECLARED SHAPE (`planes / heads`), not counted by a device channel:
+    /// there is no per-layer tap left to count, and the rectangle arrives
+    /// whole. It is what `score_mass` must equal.
     layers_observed: u32,
     /// Slots inside the prompt that carry a finite, non-negative score.
     live_scored: usize,
@@ -165,16 +278,27 @@ struct Output {
     /// than the program thinks it does.
     observed_live: usize,
     scores_nan: usize,
-    /// `Σ score` over the prompt. Each layer contributes one distribution over
-    /// the prefix -- the fold averages over heads and window rows but not over
-    /// layers -- so this must come out at `layers_observed`.
+    /// `Σ score` over the prompt. The mean over heads is one distribution per
+    /// layer -- the backend already averaged the observation window's rows, and
+    /// nothing averages over layers -- so the layer-sum must come out at
+    /// `layers_observed`.
     score_mass: f32,
     /// SnapKV's keep-set among the PROMPT pages: the `page_budget` highest-mass
-    /// ones. Recomputed on the host from the drained row, so it is an
-    /// independent second opinion on the device's selection.
+    /// ones, ranked off the device's own page fold. This is the set the served
+    /// mask was built from, not a second opinion about it.
     kept_pages: Vec<u32>,
     /// The prompt page SnapKV would drop first (lowest mass).
     evicted_first: Option<u32>,
+    /// Pages the prompt occupies that the served mask lets through. The
+    /// all-keep arm reports this equal to `prompt_pages`; **this is the shrink**
+    /// and it is a property of the row that flew, not of the policy that
+    /// planned it.
+    served_pages: u32,
+    /// Prompt KV positions the served mask admits, against the number an
+    /// unmasked decode attends over. THE MASK IS THE MEASUREMENT: a count of
+    /// set bits in the row the fire actually carried.
+    served_kv: u32,
+    full_kv: u32,
     /// Per-page mass over the prompt.
     page_mass: Vec<String>,
     /// The mass of the page holding the END of the prompt, as a fraction of the
@@ -202,6 +326,18 @@ async fn main(input: Input) -> Result<Output> {
     if input.page_budget == 0 {
         return Err("page_budget must be at least 1".into());
     }
+    if input.layers == 0 || input.heads == 0 {
+        return Err("layers and heads must both be at least 1".into());
+    }
+    // The declared rectangle. `planes = exported attention layers * query
+    // heads`, layer-major; the backend refuses a claim larger than the load
+    // exports, by name.
+    let layers = input.layers;
+    let heads = input.heads;
+    let Some(planes) = layers.checked_mul(heads) else {
+        return Err("layers * heads overflows the plane count".into());
+    };
+    let heads_f = heads as f32;
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let ws = WorkingSet::new();
@@ -223,6 +359,19 @@ async fn main(input: Input) -> Result<Output> {
     // outgrows it. Sized off `max_pages` so it is an exact multiple of the page
     // geometry the engine derives its own length from.
     let kv_max = max_pages * page_size;
+    // The score row's width is the backend's, not the program's: a slab pitch
+    // cannot be a per-program number, so `attn_score_kv_max()` publishes the
+    // one that was carved and the program reads a prefix of it. Refusing here
+    // is the honest failure — a truncated read would produce a plausible
+    // ranking over positions that are not the ones it names.
+    if kv_max > intrinsics::attn_score_kv_max() {
+        return Err(format!(
+            "prompt + reserve needs {kv_max} KV slots, past the published \
+             attn_score ceiling of {}",
+            intrinsics::attn_score_kv_max()
+        )
+        .into());
+    }
     let p_max = max_pages;
     let prompt_pages = n.div_ceil(page_size).min(p_max);
     let page_budget = input.page_budget.min(prompt_pages);
@@ -237,13 +386,16 @@ async fn main(input: Input) -> Result<Output> {
     // fire that is observed at all -- which is exactly what makes chunking it
     // delicate, and why the tap is attached where it is.
     //
-    // The capture records the last `window` query rows OF THE FIRE. For a
-    // one-shot prefill that is the last `window` tokens of the prompt, which is
-    // SnapKV's definition. Under chunking only the FINAL chunk's window is the
-    // prompt's tail; an earlier chunk's window is a well-defined observation of
-    // an earlier position, but it is not the quantity SnapKV selects on. So the
-    // tap goes on the final chunk alone, and the earlier chunks run the plain
-    // prefill -- which also means they do not pay the capture variant's cost.
+    // The capture folds the last `min(32, qo_len)` query rows OF THE FIRE into
+    // the row it publishes. For a one-shot prefill that is the last 32 tokens
+    // of the prompt, which is SnapKV's definition -- so the program declares no
+    // window of its own and does no window fold: the published row already IS
+    // the end-of-prompt observation. Under chunking only the FINAL chunk's
+    // window is the prompt's tail; an earlier chunk's window is a well-defined
+    // observation of an earlier position, but it is not the quantity SnapKV
+    // selects on. So the tap goes on the final chunk alone, and the earlier
+    // chunks run the plain prefill -- which also means they do not pay the
+    // capture variant's cost.
     //
     // The split is `prefill_chunks`, whose docs explain why it spreads the
     // remainder over the FIRST chunks: a "C tokens at a time until the
@@ -323,19 +475,13 @@ async fn main(input: Input) -> Result<Output> {
     let rng_p = Channel::from([input.seed ^ 0x5bd1, 0]).named("rng_p");
     let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
 
-    // The observation accumulator. `on_attn` fires once per layer and the
-    // inferlet cannot ask the model how many layers there are, so the layer
-    // loop folds into a device-carried channel.
-    //
-    // Contract #1: a loop-carried channel must be `take`n before it is `put`,
-    // or the dummy run that infers the geometry sees a port written but never
-    // read. The seed is zeros -- unlike H2O's ramp -- because this accumulator
-    // lives for exactly one fire and every slot it will be ranked on is written
-    // by that fire's capture.
-    let acc = Channel::from(vec![0.0f32; kv_max as usize]).named("snapkv_acc");
-    let layer_ct = Channel::from([0u32]).named("snapkv_layers");
+    // NO ACCUMULATOR, AND NO LAYER COUNTER. Both were device-carried channels
+    // that existed only to fold a per-layer tap across the layer loop, and
+    // there is no layer loop: the epilogue is handed every exported layer's
+    // rows at once, and SnapKV observes exactly one fire anyway. The layer
+    // count that used to ride `snapkv_layers` back to the host is
+    // `planes / heads`, a number the program declared.
     let scores_out = Channel::new([kv_max], dtype::f32).named("snapkv_scores");
-    let layers_out = Channel::new([1], dtype::u32).named("snapkv_layer_count");
     // The device's own fold, drained alongside the position row so the host can
     // check the two against each other rather than trusting either.
     let page_mass_out = Channel::new([p_max], dtype::f32).named("snapkv_page_mass");
@@ -357,17 +503,6 @@ async fn main(input: Input) -> Result<Output> {
         },
     )?;
 
-    // ── THE TAP. Fires once per layer, AFTER that layer's attention. During a
-    //    prefill fire the row is the mean over the observation window's query
-    //    rows, which is precisely the quantity SnapKV selects on. ──
-    fwd_p.on_attn(move || {
-        let prev = acc.take();
-        let ct = layer_ct.take();
-        let scores = intrinsics::attn_score(kv_max);
-        acc.put(&(&prev + &scores));
-        layer_ct.put(&(&ct + 1u32));
-    });
-
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::logits();
@@ -375,18 +510,32 @@ async fn main(input: Input) -> Result<Output> {
         tok_out_p.put(&token);
         rng_p.put(&(&r + iota(2)));
 
+        // ── THE TAP. Once, at this prefill fire's epilogue, over the whole
+        //    rectangle: `[planes, attn_score_kv_max()]`, layer-major. Because
+        //    this is a prefill fire the backend folded the last
+        //    `min(32, prefill_final)` query rows into every row of it, so what
+        //    arrives here is already SnapKV's end-of-prompt observation.
+        //
+        //    `transpose` puts the planes on the last axis so `reduce_sum` --
+        //    which reduces the LAST axis -- sums down them; `/ heads` turns
+        //    that plane-sum into (mean over heads, then sum over layers), since
+        //    `Σ_l (1/H) Σ_h row = (1/H) Σ_planes row`. The result is a row of
+        //    mass exactly `layers`.
+        //
+        //    The `gather` narrows the published width to the program's own page
+        //    geometry -- `kv_max = max_pages * page_size` -- so the drained row
+        //    and the page fold describe the prefix this program reserved and
+        //    nothing past it.
+        let rect = intrinsics::attn_score(planes);
+        let folded = gather(&(&reduce_sum(&transpose(&rect)) / heads_f), iota(kv_max));
+        scores_out.put(&folded);
+
         // Fold positions into pages. `reduce_sum` reduces the last axis per row
         // and `kv_max = p_max * page_size` exactly (it was derived from the page
         // geometry), so the reshape is a reinterpretation rather than a resize.
         // Summing is the right collapse for a probability mass: a page's share
         // of the attention is the sum of its positions' shares.
-        let folded = acc.take();
-        let layers = layer_ct.take();
-        scores_out.put(&folded);
-        layers_out.put(&layers);
         page_mass_out.put(&reduce_sum(&reshape(&folded, [p_max, page_size])));
-        acc.put(&folded);
-        layer_ct.put(&layers);
     });
 
     fwd_p
@@ -397,8 +546,55 @@ async fn main(input: Input) -> Result<Output> {
     generated.push(g0 as u32);
 
     let prefill_scores = scores_out.take_host::<Vec<f32>>().await?;
-    let layers_observed = layers_out.take_host::<u32>().await?;
+    // Declared, not counted: `planes / heads`.
+    let layers_observed = layers;
     let device_page_mass = page_mass_out.take_host::<Vec<f32>>().await?;
+
+    // ── THE CUT, CHOSEN ONCE, AT THE PREFILL EPILOGUE. ──
+    //
+    // SnapKV selects when prefill ends and holds the selection for the whole
+    // generation, so this runs here and never again. It is host arithmetic
+    // over the DEVICE's own page fold -- the fold stayed on device (§4), and
+    // the only thing that crossed is the decision.
+    //
+    // The ramp is the tie-break and nothing else: two pages at equal observed
+    // mass go to the earlier one, which is the StreamingLLM prior, and it sits
+    // four orders of magnitude below the mass a single layer contributes.
+    let ranked = |p: u32| -> f32 {
+        device_page_mass.get(p as usize).copied().unwrap_or(0.0)
+            + SEED_SCALE * (prompt_pages - p) as f32 / prompt_pages.max(1) as f32
+    };
+    let mut order: Vec<u32> = (0..prompt_pages).collect();
+    order.sort_by(|&a, &b| {
+        ranked(b)
+            .partial_cmp(&ranked(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let evicted_first = order.last().copied();
+    let mut kept: Vec<u32> = order.into_iter().take(page_budget as usize).collect();
+    kept.sort_unstable();
+
+    // ── THE KEEP ROW: one bit per KV slot the pool can address, `true` where
+    //    the softmax may look.
+    //
+    //    Positions inside a kept prompt page survive; positions inside a
+    //    dropped one do not; **every position at or past the prompt is kept
+    //    unconditionally**, and that is SnapKV rather than a hedge -- the paper
+    //    compresses the PROMPT and then lets the cache grow normally from
+    //    there. Evicting freshly generated tokens would be a different (and
+    //    worse) algorithm. It used to be spelled as a mass far above anything a
+    //    prompt page could reach plus a widened rank predicate; a row of bits
+    //    says it directly.
+    let keep_set: std::collections::BTreeSet<u32> = kept.iter().copied().collect();
+    let keep_row: Vec<bool> = (0..kv_max)
+        .map(|j| j >= n || keep_set.contains(&(j / page_size)))
+        .collect();
+    // What the served row admits OF THE PROMPT, counted from the bits the fire
+    // actually carries rather than multiplied out of the page count -- so the
+    // number in `Output` is a measurement of the mask, not a restatement of the
+    // policy that built it.
+    let served_kv = keep_row[..n as usize].iter().filter(|k| **k).count() as u32;
 
     // ── DECODE LOOP (1-wide, run-ahead), enforcing the fixed keep-set. ──
     if generated.len() < max_tokens {
@@ -410,28 +606,43 @@ async fn main(input: Input) -> Result<Output> {
         let lane1 = Channel::from([0u32, 1u32]).named("embed_indptr");
         let positions = Channel::from([n]).named("positions");
         let pages = Channel::from_iter(0..max_pages).named("pages");
+        // **THE PAGE LIST IS RE-PUT EVERY FIRE, AND THAT IS THE MASK'S DOING.**
+        // A channel-bound dense `AttnMask` declines the decode-envelope class
+        // and lands the trace in the pool-owned device-geometry class
+        // (`lease::detect_pooled_device_geometry`), which requires EVERY
+        // geometry port's channel to be republished by a stage -- `pages`
+        // included, though its value never changes. It is sourced from a
+        // second channel rather than taken from `pages` itself for the reason
+        // `sliding-window-attention` does the same: `pages` is a port channel
+        // whose committed cell the fire reads, and this one only ever writes
+        // it.
+        let pages_src = Channel::from_iter(0..max_pages).named("pages_src");
         let page_indptr = Channel::from([0u32, (n + 1).div_ceil(page_size)]).named("page_indptr");
         let w_slot = Channel::from([n / page_size]).named("w_slot");
         let w_off = Channel::from([n % page_size]).named("w_off");
         let kv_len = Channel::from([n + 1]).named("kv_len");
 
-        // The frozen selection. Prompt pages carry the observed mass (with the
-        // tie-break ramp folded in far below it); everything past the prompt
-        // carries `ALWAYS_KEEP_MASS`, so the rank predicate below spends exactly
-        // `page_budget` of its width on prompt pages and the rest on pages that
-        // did not exist when the selection was made.
-        let mask_row: Vec<f32> = (0..p_max)
-            .map(|p| {
-                if p >= prompt_pages {
-                    ALWAYS_KEEP_MASS
-                } else {
-                    device_page_mass.get(p as usize).copied().unwrap_or(0.0)
-                        + SEED_SCALE * (prompt_pages - p) as f32 / prompt_pages as f32
-                }
-            })
-            .collect();
-        let page_mass = Channel::from(mask_row).named("snapkv_mask_row");
-        let effective_budget = page_budget + (p_max - prompt_pages);
+        // ── THE ENFORCEMENT, AS TWO CHANNELS. `keep` is the frozen keep-set,
+        //    loop-carried and never rewritten -- SnapKV selects once. `mask` is
+        //    what the fire actually carries: the keep-set ANDed with THIS
+        //    step's causal row, rebuilt on the device every step because the
+        //    causal half moves and the keep half does not.
+        //
+        //    **ANDed, not substituted.** A bound mask REPLACES the derived
+        //    causal bound (`Port::AttnMask`'s own doc), so a row that carried
+        //    only the keep-set would let the query attend to slots that do not
+        //    exist yet. `sliding-window-attention` evolves its row for the same
+        //    reason and by the same means.
+        let keep = Channel::from_shaped([1, kv_max], keep_row.clone()).named("snapkv_keep");
+        let mask = Channel::from_shaped(
+            [1, kv_max],
+            keep_row
+                .iter()
+                .enumerate()
+                .map(|(j, k)| *k && (j as u32) <= n)
+                .collect::<Vec<bool>>(),
+        )
+        .named("snapkv_mask");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
@@ -446,23 +657,9 @@ async fn main(input: Input) -> Result<Output> {
                 w_slot: &w_slot,
                 w_off: &w_off,
                 positions: &positions,
-                mask: None,
+                mask: Some(&mask),
             },
         )?;
-
-        // ── THE ENFORCEMENT. Fires once per layer, BEFORE that layer's
-        //    attention, which is the only point at which the page list can
-        //    still be narrowed. The row never changes: SnapKV selects once.
-        //
-        //    `pivot_threshold(.., rank_le(k))` is the top-k keep predicate in
-        //    one op; `top_k` would need a second reduce and is a library region
-        //    (a fusion barrier). The backend force-keeps the request's last page
-        //    whatever this says -- it holds the token this fire is writing. ──
-        fwd.on_attn_proj(move || {
-            let mass = page_mass.take();
-            intrinsics::kernel::attn_page_mask(&pivot_threshold(&mass, rank_le(effective_budget)));
-            page_mass.put(&mass);
-        });
 
         fwd.epilogue(move || {
             let length = kv_len.take();
@@ -481,6 +678,21 @@ async fn main(input: Input) -> Result<Output> {
             page_indptr.put(indptr(1, &page_count));
             tok_out.put(&token);
             rng.put(&(&r + iota(2)));
+
+            // The next fire's served row. `length` is that fire's own query
+            // position (it is what `positions` was just given), so
+            // `causal_mask` cuts exactly the slots that exist for it, and the
+            // frozen keep-set cuts the ones SnapKV dropped.
+            //
+            // Contract #1: `keep` is `take`n before it is `put`, or the dummy
+            // run that infers the geometry sees a port written but never read.
+            let k = keep.take();
+            mask.put(&and(&causal_mask(&length, kv_max), &k));
+            keep.put(&k);
+
+            let ids = pages_src.take();
+            pages.put(&ids);
+            pages_src.put(&ids);
         });
 
         let budget_n = max_tokens - 1;
@@ -512,17 +724,6 @@ async fn main(input: Input) -> Result<Output> {
             }
         })
         .collect();
-    let mut order: Vec<u32> = (0..prompt_pages).collect();
-    order.sort_by(|&a, &b| {
-        masses[b as usize]
-            .partial_cmp(&masses[a as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.cmp(&a))
-    });
-    let evicted_first = order.last().copied();
-    let mut kept: Vec<u32> = order.into_iter().take(page_budget as usize).collect();
-    kept.sort_unstable();
-
     let total_mass: f32 = masses.iter().sum();
     let tail_page_share = if total_mass > 0.0 && prompt_pages > 0 {
         masses[(prompt_pages - 1) as usize] / total_mass
@@ -553,6 +754,9 @@ async fn main(input: Input) -> Result<Output> {
             .map_or(0, |i| i + 1),
         scores_nan: prefill_scores.iter().filter(|s| s.is_nan()).count(),
         score_mass: prefill_scores[..live].iter().sum(),
+        served_pages: kept.len() as u32,
+        served_kv,
+        full_kv: n,
         kept_pages: kept,
         evicted_first,
         page_mass: masses.iter().map(|m| format!("{m:.5}")).collect(),

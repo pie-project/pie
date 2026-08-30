@@ -1,12 +1,12 @@
 //! A4 mask-migration DEVICE e2e — real engine. First end-to-end exercise
-//! of the token-at-a-time, B=1 explicit-write PTIR geometry that the A4 mask
+//! of the token-at-a-time, B=1 explicit-write ETA geometry that the A4 mask
 //! inferlets migrated onto (superseding the classic `forward-pass` +
 //! `attention_mask(list<brle>)` surface). The `sliding-window-attention` inferlet
 //! drives a single-sequence masked decode: one token per pass, the input token
 //! host-fed (prompt tokens during prefill, then the sampled token), and ALL
 //! geometry — position, KV length, WSlot/WOff write descriptor, and the
 //! sliding-window `attn_mask` — evolved in-graph in the epilogue, submitted
-//! through the `inferlet::ptir` bridge (`forward-pass.new` / `pipeline.submit`):
+//! through the `inferlet::eta` bridge (`forward-pass.new` / `pipeline.submit`):
 //!
 //!   guest sliding-window decode program
 //!     → runtime device-geometry submit (PageLease grants, run-ahead FIFO)
@@ -40,7 +40,7 @@
 //!
 //! That sentence is about the symptom, and it names the wrong port because
 //! `EmbedTokens` is the first one the fire path reaches. The claim behind it
-//! is `crates/tensor-ir/src/registry.rs`, where an engine's served set is one
+//! is `crates/eta-ir/src/registry.rs`, where an engine's served set is one
 //! of two constants and neither holds the port this file is about:
 //!
 //! > `DECODE_ENVELOPE`: the three ports a decode envelope resolves -- the

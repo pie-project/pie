@@ -2,8 +2,8 @@
 //! One entry per IR variant. The embed gather picks its vectorised
 //! instantiation from alignment alone; that choice never leaves this file.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{
     Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
@@ -43,7 +43,7 @@ pub fn embed(
     table: Tensor,
     vocab: u32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "layout.embed";
     dtype_dispatch!(OP, table.dtype, { Bf16 => () });
     debug_assert_eq!(ids.dtype, Dtype::I32, "`{OP}` gathers by i32 token ids");
@@ -88,7 +88,7 @@ pub fn split_qkv(
     q: &mut Tensor,
     k: &mut Tensor,
     v: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "layout.split_qkv";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     debug_assert_eq!(q.width, q_width, "the q half is the width this cut states");
@@ -126,7 +126,7 @@ pub fn split_q_gate(
     head_dim: u32,
     q: &mut Tensor,
     gate: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "layout.split_q_gate";
     dtype_dispatch!(OP, packed.dtype, { Bf16 => () });
     nonzero(OP, "the head width this cut walks", head_dim)?;
@@ -163,7 +163,7 @@ pub fn split_rows(
     width: u32,
     left: &mut Tensor,
     right: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "layout.split_rows";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(
@@ -198,7 +198,7 @@ pub fn select(
     layer: u32,
     width: u32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "layout.select";
     let t = dtype_dispatch!(OP, table.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "the slice width this select states", width)?;
@@ -260,12 +260,12 @@ fn unit(bytes: u64, a: u64, b: u64) -> (&'static str, u64) {
 }
 
 /// How wide one row of this handle is, in bytes.
-fn row_bytes(op: &'static str, handle: Tensor) -> Result<u64, KernelError> {
+fn row_bytes(op: &'static str, handle: Tensor) -> Result<u64, Error> {
     let elem = match handle.dtype {
         Dtype::Bf16 | Dtype::F16 => 2,
         Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
         Dtype::U8 | Dtype::I8 | Dtype::Fp8E4m3 | Dtype::E8m0 => 1,
-        other => return Err(KernelError::DtypeUnsupported { op, dtype: other }),
+        other => return Err(Error::DtypeUnsupported { op, dtype: other }),
     };
     Ok(u64::from(handle.width) * elem)
 }
@@ -273,6 +273,11 @@ fn row_bytes(op: &'static str, handle: Tensor) -> Result<u64, KernelError> {
 /// The two halves of one `Fallback::Copy`, which differ only in which way the
 /// index is read — so they are one body, and the pair cannot drift apart into
 /// a gather and a scatter that disagree about what the map means.
+///
+/// The row map is a fire table the shell assembles (`engine_cuda`'s window
+/// machinery); no op names it, so the trace-time validator never sees it and
+/// its dtype is refused on the same footing as its length — the boundary rule
+/// at [`refuse`].
 fn move_rows(
     ctx: &Ctx,
     op: &'static str,
@@ -281,8 +286,16 @@ fn move_rows(
     tight: Tensor,
     index: Tensor,
     args: [Tensor; 3],
-) -> Result<(), KernelError> {
-    debug_assert_eq!(index.dtype, Dtype::I32, "`{op}` reads i32 fire rows");
+) -> Result<(), Error> {
+    if index.dtype != Dtype::I32 {
+        return Err(refuse(
+            op,
+            format!(
+                "the fire rows this copy is handed are {:?}, and it reads an i32 row map",
+                index.dtype
+            ),
+        ));
+    }
     if index.rows != tight.rows {
         return Err(refuse(
             op,
@@ -332,7 +345,7 @@ fn move_rows(
 ///
 /// # Errors
 ///
-/// [`KernelError::DtypeUnsupported`] for a packed element with no byte size,
+/// [`Error::DtypeUnsupported`] for a packed element with no byte size,
 /// and a refusal for an index vector or a rectangle that does not match the
 /// one beside it.
 pub fn gather_rows(
@@ -340,7 +353,7 @@ pub fn gather_rows(
     wide: Tensor,
     index: Tensor,
     tight: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "layout.gather_rows";
     move_rows(
         ctx,
@@ -368,7 +381,7 @@ pub fn scatter_rows(
     tight: Tensor,
     index: Tensor,
     wide: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "layout.scatter_rows";
     move_rows(
         ctx,

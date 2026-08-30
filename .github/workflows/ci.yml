@@ -105,7 +105,7 @@ jobs:
           cargo test -p pie --lib
           cargo test -p client --lib
 
-      # `tensor-ir` and `tensor-compiler` declare `#![no_std]` behind `not(feature =
+      # `eta-ir` and `eta-compiler` declare `#![no_std]` behind `not(feature =
       # "std")` and the wasm SDK depends on them that way, but nothing ever
       # built that configuration -- the `std` prelude was covering a missing
       # `alloc::string::String` import, so `--no-default-features` had been
@@ -113,8 +113,8 @@ jobs:
       # compiled is not a `no_std` crate.
       - name: cargo check (compiler IR core, no_std)
         run: |
-          cargo check -p tensor-ir --no-default-features
-          cargo check -p tensor-compiler --no-default-features
+          cargo check -p eta-ir --no-default-features
+          cargo check -p eta-compiler --no-default-features
 
       # Same defect, one crate over. `model` gates code on a feature, and a
       # gate is a claim about what links WITHOUT the rest -- true only if
@@ -164,7 +164,7 @@ jobs:
       # there. `model-compiler`, `waker` and `transport` were between one and
       # twelve findings away.
       #
-      # The list named `tensor-compiler` four times until now. Six crates were
+      # The list named `eta-compiler` four times until now. Six crates were
       # merged into three by a rename (`pie-ir`/`pie-plan`/`pie-eval`/
       # `pie-codegen`/`pie-dsl`/`pie-compiler-tests`), and the rename rewrote
       # each `-p` in place, so the repeats were the merge's shadow rather than
@@ -260,13 +260,14 @@ jobs:
       - name: cargo clippy (deny warnings)
         run: |
           cargo clippy --no-deps --all-targets \
-            -p tensor-ir -p tensor-compiler -p tensor-dsl \
-            -p model-loader -p model-compiler \
+            -p eta-ir -p eta-compiler -p eta-dsl \
+            -p checkpoint -p model-compiler \
             -p worker-api -p client-api -p controller-api \
             -p ids -p waker -p transport \
-            -p bootstrap -p client -p controller -p engine -p engine-api \
+            -p bootstrap -p client -p controller -p engine \
+            -p model-exec -p eta-exec \
             -p runtime -p gateway -p grammar -p inferlet \
-            -p inferlet-macros -p kernels -p pie -p tokenizer -p worker \
+            -p inferlet-macros -p pie -p tokenizer -p worker \
             -p kernels-wgpu \
             -p kernels-metal -p kernels-vulkan -p kernels-cuda \
             -p kernels-macros -p points-dispatch \
@@ -298,7 +299,7 @@ jobs:
       # Same scope, same reason: these crates are rustfmt-clean, the rest of
       # the workspace is not.
       #
-      # `model-loader` joined the list because it is what a formatter gate is
+      # `checkpoint` joined the list because it is what a formatter gate is
       # FOR. Four doc comments in `executor/host.rs` had come apart — one
       # function's documentation sitting on another, a `///    ///` doubled
       # prefix, a body on its signature line — and each was one `cargo fmt`
@@ -351,14 +352,15 @@ jobs:
       - name: cargo fmt (compiler crates)
         run: |
           cargo fmt --check \
-            -p tensor-ir -p tensor-compiler -p tensor-dsl \
-            -p model-loader -p model -p model-compiler \
+            -p eta-ir -p eta-compiler -p eta-dsl \
+            -p checkpoint -p model -p model-compiler \
             -p worker-api -p client-api -p controller-api \
             -p ids -p waker -p transport \
             -p runtime -p worker \
-            -p bootstrap -p client -p controller -p engine -p engine-api \
+            -p bootstrap -p client -p controller -p engine \
+            -p model-exec -p eta-exec \
             -p gateway -p grammar -p inferlet \
-            -p inferlet-macros -p kernels -p kernels-metal -p kernels-vulkan \
+            -p inferlet-macros -p kernels-metal -p kernels-vulkan \
             -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer \
             -p kernels-wgpu \
             -p kernels-macros -p points-dispatch -p engine-metal -p engine-wgpu \
@@ -500,6 +502,24 @@ jobs:
           cargo test --workspace \
             --exclude pie-server-py --exclude worker --exclude engine-cuda
           cargo test -p worker --lib
+
+      # THE CATALOG SWEEPS, which the step above no longer runs.
+      #
+      # Sixteen `model-compiler` tests bake every SKU on every platform, and
+      # one of them re-bakes each text once per permutation of its fact bits.
+      # They are minutes rather than seconds — `renumbering_the_facts_does_not_
+      # move_the_cost` alone outran a ten-minute wall — and together they were
+      # most of what remained of a developer's `cargo test` after the CUDA
+      # suites moved behind `#[ignore]`.
+      #
+      # They are NOT cheap property tests to sample down. The renumbering gate
+      # is exhaustive on purpose: its header records that `captures_scores`
+      # paid a 2.65x cost for being `fact(3)` rather than `fact(1)`, with
+      # nothing anywhere saying so, and it is exhaustiveness that caught it.
+      # So they run here, where minutes are affordable, rather than being made
+      # weaker to fit somewhere they are not.
+      - name: cargo test (model-compiler catalog sweeps)
+        run: cargo test -p model-compiler -- --ignored
 
       # A file no `mod` declares is INVISIBLE, not dead. rustc never reads
       # it, so clippy does not lint it, no test covers it, and nothing
@@ -759,7 +779,7 @@ jobs:
       # roots, 6 aggregates, 40 assertions -- and was confirmed to bite by
       # planting a wrong field offset.
 
-      # The test that fires a REAL PTIR program: register bytecode, publish a
+      # The test that fires a REAL ETA program: register bytecode, publish a
       # seed into a channel, read the program's own answer back out. It is the
       # only thing in the tree that covers that path -- `engine-cuda`'s
       # `serve.rs` registers `ProgramRegistration { program_hash, ..Default }`,
@@ -771,7 +791,7 @@ jobs:
       # This step used to read `cargo test -p runtime --features
       # engine-cuda-13 --test ptir_shell`, and that command had stopped
       # COMPILING. The C ABI it was written against -- `pie_cuda_create`,
-      # `pie_cuda_register_program`, the `engine_api::local::Pie*` descriptors
+      # `pie_cuda_register_program`, the `engine::local::Pie*` descriptors
       # -- was deleted when the engine became a Rust `Shell`; the sibling
       # `engine-cuda/tests/serve.rs` was ported with it and this file was not.
       # Eighteen errors. Nothing caught it because this branch has never run
@@ -779,12 +799,12 @@ jobs:
       #
       # It now lives beside the engine, which is also where the reason it did
       # not went: it sat in `runtime` because building a registerable program
-      # needs `tensor_compiler`'s bind/compile/emit chain and "a dev-dependency
+      # needs `eta_compiler`'s bind/compile/emit chain and "a dev-dependency
       # the other way would be a cycle". `engine-cuda` already has
-      # `tensor-compiler` and `tensor-ir` as dev-dependencies and two of its
+      # `eta-compiler` and `eta-ir` as dev-dependencies and two of its
       # tests already drive that exact chain.
       #
-      # `abi` is not optional in the spelling: `Shell` and `engine_api::local`
+      # `abi` is not optional in the spelling: `Shell` and `engine::local`
       # are behind it, which is why the engine-cuda steps above -- which do not
       # pass it -- do not build this target.
       #
@@ -793,7 +813,7 @@ jobs:
       # is what this step is for. Where a card exists it takes 15 s and it
       # earns them: it caught a `Shell::drop` that released two of its three
       # attention workspaces and debug-asserted on the third.
-      - name: cargo test (the PTIR program path, through the engine shell)
+      - name: cargo test (the ETA program path, through the engine shell)
         run: cargo test -p engine-cuda --features cuda-13,abi --test gpu_ptir_shell
 
       # LAST IN THE JOB, AND THAT IS THE ONLY THING THAT CHANGED ABOUT IT.
@@ -1096,8 +1116,8 @@ jobs:
       # while the two either side of them were green, and nothing said so —
       # `--features cuda-13` failed with 58 errors in `fire/launch.rs` and
       # `--features cuda-13,bridge` failed on `weights/`, both for the same
-      # reason: `abi` is the only spelling that brings `engine_api` and
-      # `model-loader`, so a module reaching for either compiles under
+      # reason: `abi` is the only spelling that brings `engine` and
+      # `checkpoint`, so a module reaching for either compiles under
       # `cuda-13,abi` and under nothing else.
       #
       # Here rather than in the no-toolkit job because `bridge` compiles the
@@ -1128,21 +1148,45 @@ jobs:
           # and naming a feature that does not exist is a hard cargo error,
           # so this line had to go in the same commit as the manifest.
           #
-          # `abi` is what covers it: `abi = ["bridge", …]` until this commit
+          # `abi` is what covered it: `abi = ["bridge", …]` until that commit
           # and `["_cuda", …]` after, so the configuration this step actually
-          # built under both spellings is the one below. The spelling that
-          # went was a strict subset, not a distinct configuration.
-          cargo test -p engine-cuda --features cuda-13,abi --no-run --all-targets
+          # built under both spellings was one configuration. The spelling
+          # that went was a strict subset, not a distinct one.
+          #
+          # AND `abi` HAS SINCE GONE THE SAME WAY — it is not in
+          # `engine-cuda/Cargo.toml` any more, and the same hard cargo error
+          # applies to naming it here. `cuda-13` alone is what all three
+          # spellings reduced to.
+          cargo test -p engine-cuda --features cuda-13 --no-run --all-targets
 
-          # `model-loader`'s CUDA half is the same hole from the other side.
-          # Its `executor::cuda` is `feature = "cuda"`, and its lib TEST is
-          # where the four tile-map symbols are resolved against
-          # `kernels_cuda::routine` — the check that a plan cannot name a
-          # kernel this build has no host program for. Nothing built it: the
-          # workspace sweeps take the crate without the feature, and the
-          # feature was only ever reached transitively through `engine-cuda`,
-          # which does not compile a dependency's tests.
-          cargo test -p model-loader --features cuda-13 --no-run --all-targets
+          # `checkpoint --features cuda-13` STOOD HERE, and it was the same
+          # hole from the other side: the loader's `executor::cuda` was behind
+          # a `cuda` feature nothing in any engine's `src/` turned on, so the
+          # workspace sweeps took the crate without it and the feature was
+          # only ever reached transitively — and cargo does not compile a
+          # dependency's tests. The device half is `engine-cuda`'s
+          # `weights::arena` now and its parity gate is
+          # `engine-cuda/tests/gpu_transform_parity.rs`, so the line above
+          # builds both. The loader has no CUDA configuration left to miss.
+
+      # AND NOW IT RUNS THEM, which the step above never did.
+      #
+      # Thirteen `engine-cuda` test binaries need a CUDA device and a local
+      # model snapshot, and they used to skip at RUN time rather than carry
+      # `#[ignore]` — several of their headers argue for that explicitly, on
+      # the reading that "an ignored test on the one box that could run it is
+      # a gate nobody runs". The reading was right about the risk and wrong
+      # about where the box was: this job, the one box in the fleet with a
+      # GPU, only ever built them (`--no-run`). What actually ran them was a
+      # developer's `cargo test`, at a cost of 1580 s out of 1864 s — so the
+      # sweep every developer runs before pushing was 31 minutes, and the
+      # answer to that is to stop running it, which is worse than an ignore.
+      #
+      # So they are `#[ignore]`d and this step is where they run. The gate did
+      # not weaken; it moved to the hardware, and a step that names it can be
+      # seen to be red.
+      - name: cargo test (engine-cuda, the real-hardware gates)
+        run: cargo test -p engine-cuda --features cuda-13 -- --ignored
 
       - name: cargo build (engine-cuda)
         run: |

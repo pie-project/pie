@@ -167,8 +167,8 @@ pub struct EngineConfig {
     ///
     /// Was `kv_copy_domain_mask: u32` over four `KV_COPY_*` bit constants;
     /// four named booleans is what four bits with four names are, and a
-    /// caller reads the one it is about (`engine-api::caps`).
-    pub kv_copy: ::engine_api::caps::KvCopyDomains,
+    /// caller reads the one it is about (`engine::caps`).
+    pub kv_copy: ::engine::caps::KvCopyDomains,
     pub backend_kind: String,
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
@@ -189,7 +189,7 @@ pub struct EngineConfig {
     pub has_lora: bool,
     /// Which descriptor ports it resolves on the device, in the port
     /// registry's own numbering (decision 19).
-    pub device_geometry_port_mask: tensor_ir::registry::PortMask,
+    pub device_geometry_port_mask: eta_ir::registry::PortMask,
     pub limits: crate::engine::SchedulerLimits,
     pub engine_backend: crate::engine::EngineBox,
 }
@@ -398,7 +398,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             fold_granularity: 1, // token-causal; 0-RS models never read it
         }
     };
-    let ptir_caps = model::PtirCaps {
+    let eta_caps = model::EtaCaps {
         // tart: the span-grouped adapter capability, re-threaded onto
         // the 0.3 handshake (engine context.cpp reports it; the worker
         // translate carries it; every engine must honour the sink for
@@ -422,7 +422,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &model_id,
         kv_page_size as u32,
         rs_caps,
-        ptir_caps,
+        eta_caps,
         tokenizer_path.clone(),
         &metadata,
     )?;
@@ -444,7 +444,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 engine::EngineSpec {
                     // Overwritten by `register_engine_backend` from the
                     // backend itself; see `EngineSpec::device_domain`.
-                    device_domain: ::engine_api::MemoryDomain::HostPinned,
+                    device_domain: ::engine::MemoryDomain::HostPinned,
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
@@ -456,7 +456,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
 
     // Register this model's per-engine typed stores (KvStore/RsStore) in the
     // standalone registry. Capacities are read straight from `cfg.engines[]`.
-    // The registry is where the WIT working-set resources and the PTIR fire
+    // The registry is where the WIT working-set resources and the ETA fire
     // path lock `store::registry::get(...)`.
     let _ = engine_count;
     let arena_model_idx = crate::store::registry::register_model_with_swap(

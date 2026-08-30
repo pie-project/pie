@@ -52,7 +52,7 @@ Only `m + 1` tokens advance the loop-carried KV length.
 
 The inferlet depends on `intrinsics::mtp_logits(k)`. It cannot be exercised with
 ordinary next-token-only checkpoints; on the available `Qwen/Qwen3-0.6B` model it
-is therefore **untested end-to-end**. Treat the current code as a PTIR expression
+is therefore **untested end-to-end**. Treat the current code as an ETA expression
 of the algorithm and a wiring test for an MTP-capable model, not as a measured
 green path.
 

@@ -65,7 +65,7 @@
 //!   lattice step, so that a batch of 3 and a batch of 5 share one exec — is
 //!   the natural extension and is NOT built here. It is not a capture
 //!   question: padding means minting lanes that carry no request, which is a
-//!   change to `engine::fire::compose` (a shared-crate rewrite, not an
+//!   change to `model_exec::fire::compose` (a shared-crate rewrite, not an
 //!   additive helper) and to every per-lane vector the shell stages. The
 //!   lattice seat already exists (`Budget::buckets`,
 //!   `Composition::bucket`); what is missing is the dummy lane, and
@@ -135,12 +135,14 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use engine::fire::{EventId, FireDescriptor, Phases, Sink, WindowTable, walk_phases};
 use model_compiler::{CompiledModel, Lowering, Region};
+use model_exec::fire::{
+    EventId, FireDescriptor, Phases, Sink, Units, WindowTable, walk_phases, walk_units,
+};
 use model_ir::Trace;
 
 use crate::device::graph::{self, Graph, GraphExec};
-use engine::law::{Refusal, Refuse};
+use model_exec::law::{Refusal, Refuse};
 
 use crate::device::map::{self, Patch};
 use crate::device::nodes::{self, Node};
@@ -296,7 +298,17 @@ pub struct Stats {
 
 /// One cached exec and the schedule shape it was captured against.
 struct Entry {
-    exec: GraphExec,
+    /// **ONE EXEC PER CAPTURE UNIT, IN EXEC ORDER** (multimodal §1) — the
+    /// tower's, then the trunk's, launched back to back on ONE stream with no
+    /// host between them, which is what makes the embed handoff ride stream
+    /// order (Article 2).
+    ///
+    /// ONE ENTRY FOR EVERY PLAN THAT STATES ONE ROW SPACE, which is every
+    /// pre-campaign SKU: `CompiledModel::units` is `[RowAxis::Tokens]` there,
+    /// so this is a one-element `Vec` and the launch below is the single
+    /// `exec.launch` this cache has always done. The G4 invariant is what
+    /// makes that not a coincidence.
+    execs: Vec<GraphExec>,
     shape: u64,
     /// **The step sequence this exec was last launched at**, and
     /// [`Airborne::NEVER`](crate::settle::Airborne::NEVER) for one that never
@@ -330,10 +342,22 @@ pub struct Fire<'a> {
     /// Outside one it is a real cross-stream synchronization bought on a walk
     /// whose numbers are the golden the replay is diffed against. So the eager
     /// pass below runs on the main stream from end to end (see
-    /// `engine::fire::EagerSink`'s doc: that is the serialization of the same
+    /// `model_exec::fire::EagerSink`'s doc: that is the serialization of the same
     /// DAG, which is why the two agree token for token) and the capture pass
     /// records the forks.
     pub lanes: Option<Lanes<'a>>,
+    /// **WHERE A CONDITIONAL NODE GOES**, when this load's artifact holds a
+    /// region P3 stamped one on and the context opened a body stream for it
+    /// (`Context::open_conditional`).
+    ///
+    /// `None` is every SKU in today's catalog but the drafting ones, and it is
+    /// not a degradation: a walk with no conditional region never reaches
+    /// `cond_begin`, and one that does with nothing here still answers
+    /// `Fault::Unlowered` by name. **ONLY THE CAPTURING WALK IS GIVEN IT**,
+    /// for the reason [`lanes`](Fire::lanes) is — an eager pass ignores the
+    /// bracket and is right to, and minting a graph handle on a stream that is
+    /// not capturing is not a thing to do for nothing.
+    pub conditionals: Option<crate::window::Conditionals<'a>>,
     /// Which exec this fire's shape asks for.
     pub key: Key,
     /// The lattice point this fire's rows round up to
@@ -516,7 +540,13 @@ impl Graphs {
                     key: at.key.to_string(),
                 });
             }
-            entry.exec.launch(at.stream)?;
+            // **THE CHAIN**: every unit's exec, in exec order, enqueued
+            // back to back on the one stream. No host read, no synchronize
+            // and no event stands between them, so the inter-exec gap is a
+            // launch's own latency and nothing else (M-3's nsys gate).
+            for exec in &entry.execs {
+                exec.launch(at.stream)?;
+            }
             // The stamp eviction reads: this exec may be on the device from
             // here until the settled count passes `at_seq`.
             entry.launched_at = at_seq;
@@ -568,17 +598,35 @@ impl Graphs {
         //    which is a second schedule beside the template; a failed capture
         //    is a failed load either way.
         let began = Instant::now();
-        let graph = Graph::capture(at.stream, || walk_capture(at, run, place, Streams::Forked))?;
-        let exec = graph.instantiate(at.stream)?;
-        self.stats.nodes = exec.nodes();
-        self.stats.edges = graph.edges();
+        // **ONE CAPTURE PER UNIT, AND ONE FOR EVERY PLAN THAT STATES ONE ROW
+        // SPACE.** `Units::One(u)` filters the DISPATCH and not the script —
+        // every region is still announced, so a region's number means the
+        // same thing in both passes — and `walk_units` reads each region's
+        // interval off its own axis's window table. A tower fire records the
+        // tower's launches into one graph and the trunk's into another;
+        // a text-only fire records the one graph this cache has always held.
+        let units = at.compiled.units.len().max(1) as u32;
+        let mut execs = Vec::with_capacity(units as usize);
+        let mut nodes = 0;
+        let mut edges = 0;
+        for unit in 0..units {
+            let graph = Graph::capture(at.stream, || {
+                walk_capture_unit(at, run, place, Streams::Forked, unit)
+            })?;
+            let exec = graph.instantiate(at.stream)?;
+            nodes += exec.nodes();
+            edges += graph.edges();
+            execs.push(exec);
+            if self.keep {
+                self.kept.push((at.key.clone(), graph));
+            }
+        }
+        self.stats.nodes = nodes;
+        self.stats.edges = edges;
         self.stats.capture_millis += began.elapsed().as_secs_f64() * 1000.0;
         self.stats.captures += 1;
-        if self.keep {
-            self.kept.push((at.key.clone(), graph));
-        }
         self.insert(at.key.clone(), Entry {
-            exec,
+            execs,
             shape,
             // Nothing has launched it yet; the replay arm above stamps it.
             launched_at: crate::settle::Airborne::NEVER,
@@ -1216,6 +1264,19 @@ impl Sink for Tapped<'_, '_> {
 /// [`Streams::Serial`] remains the THROWAWAY captures' mode — a binding
 /// wants argument values, not topology, and the serial placement's chain
 /// argument is the stronger check where it holds.
+///
+/// **AND IT IS NOT GIVEN THE CONDITIONAL BUNDLE, SO THE FOLD DECLINES A
+/// CONDITIONALIZED ARTIFACT BY NAME.** That is a decision and not an
+/// oversight. [`Tapped`]'s census places nodes by their position in the
+/// PARENT graph's chain, read off the capture frontier at each region
+/// boundary; a conditional's launches are nodes of a CHILD graph and appear
+/// in no such position, so a fold that recorded one would build a binding map
+/// with a hole in it and then restate arguments into the wrong nodes. The
+/// cursor here is `writing()` with no [`Conditionals`](crate::window::Conditionals),
+/// which is exactly the shape `Fault::Unlowered` still answers for — a typed
+/// refusal at the arm rather than a wrong graph at the replay. The keyed path
+/// serves these artifacts today; teaching the census to descend into a child
+/// graph is what would lift it.
 fn walk_capture_tapped(
     at: &Fire<'_>,
     run: &mut Run<'_>,
@@ -2009,6 +2070,27 @@ impl Graphs {
     /// against, and [`Fault::Device`] for a launch.
     pub fn fire_folded(&mut self, at: &Fire<'_>, run: &mut Run<'_>, place: &At) -> Result<Mode> {
         let key = FoldKey::of(at);
+        // **THE FOLD STANDS DOWN FOR A MULTI-UNIT ARTIFACT, BY NAME**
+        // (multimodal §5.3). `Armed` is structurally ONE graph per bucket per
+        // key; a fire that launches two execs has two bucket numbers — a
+        // token one and a patch one — and there is no single graph to arm, so
+        // there is no correct fold to build. The honest answer is the keyed
+        // path for the life of the load, which costs nothing structural and
+        // defers the "6 + 6, not 6 × 6" property (that property is OF
+        // per-unit keys, and a fire-level key carrying both numbers would be
+        // exactly the product §1 refuses).
+        //
+        // Refused rather than folded-wrong, and tallied rather than silent:
+        // the sentence lands in `FoldStats::refusals` where an operator asking
+        // "why is this load not folding" reads it.
+        if at.compiled.fold_refused && !self.fold_refused.contains(&key) {
+            self.fold_refuse_as(
+                key,
+                Refuse::Unstructured,
+                "the artifact records more than one capture unit, and a fold arms one \
+                 graph per bucket — the keyed path serves it",
+            );
+        }
         if self.fold_refused.contains(&key) || self.fold_unaligned.contains(&at.key) {
             return self.fire(at, run, place);
         }
@@ -2602,6 +2684,16 @@ impl<'a> Fire<'a> {
         if let Some(lanes) = self.lanes {
             lanes.at.set(0);
         }
+        // The same reset for a load that carries the cell on the conditional
+        // bundle instead — an artifact with a baked `If` and no fork group has
+        // one and no `Lanes`. Belt and braces: the cell is minted at zero once
+        // per fire and every bracket restores what it found, so nothing has
+        // been seen to leave `BODY` behind. A serial walk launching into a
+        // stream that is not capturing would be silent, though, and this line
+        // is one comparison.
+        if let Some(cond) = self.conditionals {
+            cond.at.set(0);
+        }
         Cursor::new(place)
     }
 }
@@ -2615,6 +2707,33 @@ fn walk_capture(
     place: &At,
     streams: Streams,
 ) -> Result<()> {
+    walk_capture_units(at, run, place, streams, Units::All)
+}
+
+/// The same capture, restricted to ONE capture unit's regions — one exec's
+/// worth of the record script (multimodal §1).
+///
+/// `Units::One(u)` filters the dispatch and never the structure, so the
+/// cursor sees every region in both passes and a region's number means one
+/// thing. For a plan that states one row space this is `walk_capture` with a
+/// comparison in front of it.
+fn walk_capture_unit(
+    at: &Fire<'_>,
+    run: &mut Run<'_>,
+    place: &At,
+    streams: Streams,
+    unit: u32,
+) -> Result<()> {
+    walk_capture_units(at, run, place, streams, Units::One(unit))
+}
+
+fn walk_capture_units(
+    at: &Fire<'_>,
+    run: &mut Run<'_>,
+    place: &At,
+    streams: Streams,
+    units: Units,
+) -> Result<()> {
     let mut cursor = match (streams, at.lanes) {
         (Streams::Forked, Some(lanes)) => Cursor::across(place, lanes),
         _ => at.serial(place),
@@ -2626,20 +2745,32 @@ fn walk_capture(
     // an eager pass and silently wrong in a recorded one.
     if streams == Streams::Forked {
         cursor = cursor.writing();
+        if let Some(cond) = at.conditionals {
+            cursor = cursor.conditionals(cond);
+        }
     }
-    walk_phases(
+    let walked = walk_units(
         at.trace,
         at.compiled,
         at.descriptor,
         run,
         &mut cursor,
         Phases::Capture,
-    )?;
+        units,
+    );
     // A `Sink` method has nowhere to return to, so the cursor kept whatever
     // the device refused and this is where it is asked — INSIDE the capture
     // body, so that `Graph::capture` ends the capture on the way out and the
     // stream is usable afterwards.
-    cursor.settle()?;
+    //
+    // **AND IT IS ASKED EVEN WHEN THE WALK ITSELF REFUSED**, because `settle`
+    // is also what closes a conditional body the walk returned early out of. A
+    // body stream left mid-capture poisons every later call on it for the rest
+    // of the process, which would turn one refused fire into a dead shell; the
+    // walk's own refusal is still the one that propagates.
+    let settled = cursor.settle();
+    walked?;
+    settled?;
     Ok(())
 }
 
@@ -2655,7 +2786,7 @@ impl core::fmt::Debug for Graphs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::fire::ClassWindow;
+    use model_exec::fire::ClassWindow;
 
     fn table(classes: &[(u32, u32)]) -> WindowTable {
         let mut at = (0, 0);

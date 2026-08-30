@@ -207,7 +207,7 @@ fn the_qwen36_import_covers_its_plan_over_the_real_census() {
     let supply: BTreeSet<&str> = contract
         .tensors
         .iter()
-        .filter(|t| t.visibility == model_loader::contract::Visibility::Public)
+        .filter(|t| t.visibility == checkpoint::contract::Visibility::Public)
         .map(|t| t.name.as_str())
         .collect();
 
@@ -219,13 +219,16 @@ fn the_qwen36_import_covers_its_plan_over_the_real_census() {
         ));
     }
 
-    // And the identification is unambiguous: this file is the 27B and no
-    // earlier qwen row may claim it.
+    // And the identification is unambiguous: this file is the 27B, no earlier
+    // qwen row may claim it, and the row it lands on is the VISION one —
+    // because the checkpoint ships a `model.visual.*` tower and the strictly
+    // more demanding row goes first (`qwen_3::IMPORTS`' own note).
     match model::identify(&src) {
         Ok("qwen36-27b-bf16-kv-bf16") => {}
         Ok(other) => faults.push(format!(
-            "a Qwen3.6-27B census identifies as `{other}`; the IMPORTS order \
-             lets a smaller row claim a bigger artifact"
+            "a Qwen3.6-27B census identifies as `{other}`; this checkpoint ships \
+             a vision tower and a draft head, so the row that reads both is the \
+             row it must land on"
         )),
         Err(why) => faults.push(format!("a Qwen3.6-27B census matches no SKU: {why}")),
     }
@@ -233,6 +236,115 @@ fn the_qwen36_import_covers_its_plan_over_the_real_census() {
     drop(src);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
+}
+
+/// **THE TOWERS, HELD AGAINST THE CHECKPOINTS THAT SHIP THEM** (campaign
+/// M-1/M-2).
+///
+/// The same bijection as the row above, over `model.visual.*` — which is a
+/// hundred and fifty planes for the twelve-block tower and three hundred and
+/// twenty-eight for the twenty-seven-block one, all of them names somebody
+/// else chose. A text that mapped one of them wrong would not fail loudly: the
+/// contract would simply not build, `identify` would fall through to the
+/// text-only row beside it, and the model would serve with its tower silently
+/// gone. So the identification is asserted here too, and it is the half that
+/// catches that.
+#[test]
+fn the_vision_imports_cover_their_plans_over_the_real_census() {
+    const ROWS: [(&str, &str); 2] = [
+        ("models--Qwen--Qwen3.5-0.8B", "qwen35-d0.8b-vision-bf16-kv-bf16"),
+        ("models--Qwen--Qwen3.6-27B", "qwen36-27b-vision-bf16-kv-bf16"),
+    ];
+    let mut faults = Vec::new();
+    let mut asked = 0usize;
+
+    for (repo, sku) in ROWS {
+        let Some(census) = census(repo) else {
+            eprintln!("not asked: no {repo} checkpoint index on this machine");
+            continue;
+        };
+        asked += 1;
+        let dir = scratch();
+        let path = dir.join("vision-census.zt");
+        state_the_census(&path, &census);
+        let src =
+            ztensor::Source::open(&path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
+
+        let import = model::import_of(sku).expect("this build ships the row");
+        match import(&src) {
+            Ok(contract) => {
+                let trace = model::trace_of(sku).expect("and its trace");
+                let trace = trace(Platform::Cuda);
+                let demand: BTreeSet<&str> = trace
+                    .params
+                    .iter()
+                    .filter(|p| p.source == ParamSource::Checkpoint)
+                    .map(|p| p.name.as_str())
+                    .collect();
+                let supply: BTreeSet<&str> = contract
+                    .tensors
+                    .iter()
+                    .filter(|t| t.visibility == checkpoint::contract::Visibility::Public)
+                    .map(|t| t.name.as_str())
+                    .collect();
+                for name in demand.symmetric_difference(&supply) {
+                    faults.push(format!(
+                        "`{sku}`: `{name}` is in one of the plan and its import \
+                         contract and not the other"
+                    ));
+                }
+            }
+            Err(why) => faults.push(format!(
+                "`{sku}` refuses the census of the checkpoint it was written for: {why}"
+            )),
+        }
+
+        // **THE ORDERING, ASKED AT THE LEVEL A NAME CENSUS CAN ANSWER.**
+        // `model::identify` returns the first row whose contract BUILDS, and a
+        // contract is a name mapping — so a 0.8B census matches `qwen35-d3b`'s
+        // names as happily as its own, and only the shape check the RUNTIME's
+        // `identify` runs (`checkpoint::plan::compile`) tells the two apart.
+        // Asserting a SKU here would be asserting something the fixture cannot
+        // know.
+        //
+        // What it can answer is the property the ordering is for: among the
+        // rows that build over this census, the vision one comes before the
+        // text-only sibling it towers over. That is the whole of what the flip
+        // did, and a row order that let the sibling win would fail here
+        // whatever the shapes said.
+        let builds: Vec<&str> = model::imports()
+            .into_iter()
+            .filter(|(_, import)| import(&src).is_ok())
+            .map(|(name, _)| name)
+            .collect();
+        let plain = sku.replace("-vision", "");
+        match (
+            builds.iter().position(|name| *name == sku),
+            builds.iter().position(|name| *name == plain),
+        ) {
+            (Some(tower), Some(text)) if text < tower => {}
+            (Some(tower), Some(text)) => faults.push(format!(
+                "over a {repo} census `{plain}` builds at {text} and `{sku}` at \
+                 {tower}; the text-only row would claim a checkpoint that ships \
+                 a tower and serve it with the tower silently gone"
+            )),
+            (None, _) => faults.push(format!(
+                "`{sku}` does not build over a {repo} census at all"
+            )),
+            (_, None) => faults.push(format!(
+                "`{plain}` does not build over a {repo} census, so this file is \
+                 not asking the ordering question it thinks it is"
+            )),
+        }
+
+        drop(src);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
+    if asked == 0 {
+        eprintln!("not asked: no qwen checkpoint index on this machine");
+    }
 }
 
 /// **THE GEMMA VERDICT, AS A TEST AND NOT AS A PARAGRAPH.**

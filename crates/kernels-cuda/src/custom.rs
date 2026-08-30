@@ -4,8 +4,8 @@
 //! v, and append k/v to the cache in one pass. Emitting it is a model-source
 //! decision (design §10); this file only launches it.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
@@ -36,7 +36,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     head_dim: u32,
     theta: f32,
     q: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "custom_cuda.qkv_fused_qknorm_rope_vnorm_write";
 
     const WARP_BLOCK: u32 = 256;

@@ -9,8 +9,8 @@
 //! registers and shared arrays, which is why [`MAX_HC_MULT`] is a hard
 //! refusal and not a shape check.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
@@ -26,7 +26,7 @@ const MAX_HC_MULT: u32 = 8;
 /// The stream fan `M`: how many `hidden`-wide streams the wide row holds.
 /// The variants that state a count beside their rows assert agreement at
 /// their own entries; `fold` states none.
-fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, KernelError> {
+fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, Error> {
     nonzero(op, "the hidden width", hidden)?;
     if wide == 0 || wide % hidden != 0 {
         return Err(refuse(
@@ -53,7 +53,7 @@ fn stream_fan(op: &'static str, wide: u32, hidden: u32) -> Result<u32, KernelErr
 /// One thread per INPUT element — these kernels' grids cover the `[N, H]`
 /// side and each thread writes its `M` outputs (the old `ElementwiseIn`
 /// rule). Refused rather than clamped past a 32-bit launch.
-fn elementwise_in(op: &'static str, rows: u32, width: u32) -> Result<Launch, KernelError> {
+fn elementwise_in(op: &'static str, rows: u32, width: u32) -> Result<Launch, Error> {
     nonzero(op, "rows", rows)?;
     nonzero(op, "width", width)?;
     let n = u64::from(rows) * u64::from(width);
@@ -67,7 +67,7 @@ fn elementwise_in(op: &'static str, rows: u32, width: u32) -> Result<Launch, Ker
 }
 
 /// Tiles `x` across `streams` residual streams.
-pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), KernelError> {
+pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_expand";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(y.rows, x.rows, "the expansion lands one wide row per row");
@@ -92,12 +92,7 @@ pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), 
 
 /// RMS-normalises the wide stream row and widens it to f32 — the mix
 /// coefficients derived downstream are too sensitive for a bf16 round-trip.
-pub fn rmsnorm_f32(
-    ctx: &Ctx,
-    streams: Tensor,
-    eps: f32,
-    y: &mut Tensor,
-) -> Result<(), KernelError> {
+pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_rmsnorm_f32";
     dtype_dispatch!(OP, streams.dtype, { Bf16 => () });
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` widens to f32");
@@ -136,7 +131,7 @@ pub fn gates(
     x: &mut Tensor,
     post_mix: &mut Tensor,
     comb_mix: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_gates";
     let t = dtype_dispatch!(OP, streams.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert_eq!(normed.dtype, Dtype::F32, "`{OP}` reads an f32 mix row");
@@ -190,7 +185,7 @@ pub fn fold(
     post_mix: Tensor,
     comb_mix: Tensor,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.hc_fold";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     debug_assert!(

@@ -11,9 +11,10 @@
 //! two arithmetic flags), that `copy_kv`/`resize_pool` refused "before
 //! load_model" with a pool-shaped message, and that `load_model` took exactly
 //! one descriptor. All three were about `engine_metal::serve::Shell`, which
-//! went with the string-plan stack — see `runtime::engine::backend::metal`'s
-//! header. What is left to check is the shape of the refusal, which is the
-//! part a caller depends on.
+//! went with the string-plan stack — see `engine_metal::boot`'s header, which
+//! is where that history now lives along with the reader itself. What is left
+//! to check is the shape of the refusal, which is the part a caller depends
+//! on.
 
 #![cfg(all(feature = "engine-metal", target_vendor = "apple"))]
 
@@ -46,7 +47,7 @@ fn the_metal_seam_opens_and_refuses_every_verb_by_name() {
             .encode(&mut Default::default())
             .expect_err("there is no encoder"),
     ] {
-        let engine_api::Error::Unsupported { verb, engine } = &error else {
+        let engine::Error::Unsupported { verb, engine } = &error else {
             panic!("a seam with no shell refuses as `Unsupported`, not as {error}");
         };
         assert_eq!(*engine, "metal", "a refusal names the engine that made it");

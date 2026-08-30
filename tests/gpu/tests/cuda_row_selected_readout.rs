@@ -69,16 +69,15 @@
 
 mod common;
 
-use engine_api::model_ir::Platform;
-use engine_api::tensor_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
-use engine_api::tensor_ir::container::HostRole;
-use engine_api::tensor_ir::op::{IntrinsicId, Op};
-use engine_api::tensor_ir::registry::{GeometryClass, ModelProfile, Stage};
-use engine_api::tensor_ir::types::{DType, Shape};
-use engine_api::{
+use engine::{
     Attachment, BindExtents, Boundary, Budgets, FrameSubmission, InstanceBinding, KvDelta, Lane,
     LaneReadout, Readout, RsReset, RsVerb, Step,
 };
+use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
+use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::types::{Dtype, Shape};
+use model_ir::Platform;
 use runtime::engine::backend::open;
 
 /// The guest's one channel: the token it chose per readout row.
@@ -100,17 +99,18 @@ const OUT: u32 = 0;
 /// `[k]` i32, one token per row, so the guest's list is directly comparable
 /// with the host mirror's rows one for one.
 ///
-/// Authored here rather than taken from the corpus for the reason
-/// `runtime/tests/cuda_program_epilogue.rs` gives about its own: a trace's
-/// `logits` intrinsic carries a CONCRETE shape, so a golden authored at the
-/// dummy profile's vocabulary cannot bind at this checkpoint's.
+/// Authored here rather than taken from the corpus, for a reason that is
+/// worth stating rather than citing now that the test which stated it is
+/// gone: a trace's `logits` intrinsic carries a CONCRETE shape, so a golden
+/// authored at the dummy profile's vocabulary cannot bind at this
+/// checkpoint's.
 fn program(rows: u32, vocab: u32) -> TraceContainer {
     TraceContainer {
         names: Vec::new(),
         externs: Vec::new(),
         channels: vec![ChannelDecl {
             shape: Shape::vector(rows),
-            dtype: ChanDType::Concrete(DType::I32),
+            dtype: ChanDType::Concrete(Dtype::I32),
             capacity: 1,
             host_role: HostRole::Reader,
             seeded: false,
@@ -122,7 +122,7 @@ fn program(rows: u32, vocab: u32) -> TraceContainer {
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Logits,
                     shape: Shape::matrix(rows, vocab),
-                    dtype: DType::F32,
+                    dtype: Dtype::F32,
                 },
                 Op::ReduceArgmax(0),
                 Op::ChanPut {
@@ -139,13 +139,13 @@ fn program(rows: u32, vocab: u32) -> TraceContainer {
 /// The emitted kernels are attached HERE rather than by the scheduler lane's
 /// splice, because this gate holds the engine directly and so plays that part
 /// too.
-fn registration(rows: u32, profile: &ModelProfile) -> engine_api::ProgramRegistration {
-    let bound = engine_api::tensor_ir::validate::bind(program(rows, profile.vocab), profile.clone())
+fn registration(rows: u32, profile: &ModelProfile) -> engine::ProgramRegistration {
+    let bound = eta_ir::validate::bind(program(rows, profile.vocab), profile.clone())
         .unwrap_or_else(|why| panic!("the gate's program does not bind: {why:?}"));
-    let stages = tensor_compiler::plan::compile_bound(&bound);
-    let launch = tensor_compiler::codegen::launch::build(&bound, &stages);
-    let backend = tensor_compiler::codegen::program::Backend::Cuda;
-    let emitted = tensor_compiler::codegen::program::emit_program(backend, &stages, &bound);
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    let launch = eta_compiler::codegen::launch::build(&bound, &stages);
+    let backend = eta_compiler::codegen::program::Backend::Cuda;
+    let emitted = eta_compiler::codegen::program::emit_program(backend, &stages, &bound);
     for kernel in &emitted {
         assert!(
             kernel.error.is_empty(),
@@ -153,19 +153,9 @@ fn registration(rows: u32, profile: &ModelProfile) -> engine_api::ProgramRegistr
             kernel.error
         );
     }
-    engine_api::ProgramRegistration {
+    engine::ProgramRegistration {
         program_hash: bound.hash,
-        emitted_kernels: emitted
-            .into_iter()
-            .map(|kernel| engine_api::EmittedKernel {
-                kind: kernel.kind,
-                stage_index: kernel.stage_index,
-                region_index: kernel.region_index,
-                entry_name: kernel.entry_name,
-                source: kernel.source,
-                error: kernel.error,
-            })
-            .collect(),
+        emitted_kernels: emitted,
         emitter_version: backend.emitter_version(),
         region_analysis: Vec::new(),
         launch,
@@ -280,7 +270,7 @@ fn a_lane_reads_back_the_interior_rows_it_names_in_the_order_it_names_them() {
         &checkpoint,
         Platform::Cuda,
         budgets,
-        engine_api::Residency::uncapped(),
+        engine::Residency::uncapped(),
         0,
         1,
     )
@@ -303,7 +293,7 @@ fn a_lane_reads_back_the_interior_rows_it_names_in_the_order_it_names_them() {
     let overrun = prefill(&tokens, Readout::Rows(vec![n]));
     let refusal = overrun.validate();
     assert!(
-        matches!(refusal, Err(engine_api::Error::Invalid(_))),
+        matches!(refusal, Err(engine::Error::Invalid(_))),
         "row {n} of a lane that carries {n} rows is refused, not gathered: {refusal:?}"
     );
 

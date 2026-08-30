@@ -1,6 +1,6 @@
 //! NVRTC: one self-contained translation unit in, one launchable region out.
 //!
-//! **NO INCLUDE PATH.** `tensor-compiler`'s CUDA emitter splices every runtime
+//! **NO INCLUDE PATH.** `eta-compiler`'s CUDA emitter splices every runtime
 //! header into the string it hands over (`runtime/cuda/*.cuh` plus the
 //! generated RNG preamble), so an `#include` in an emitted source is an
 //! emitter bug rather than a search-path problem, and `libnvrtc` is
@@ -14,9 +14,9 @@
 //! `(entry, specialization, arch)`, and answers with a `CUfunction` it owns
 //! for the life of the process. Everything in that sentence is wrong here.
 //! A guest program's source is not in any crate — it arrives per registration
-//! from a host that ran `tensor-compiler` — so there is no template to name;
-//! the cache key that makes a PTIR cubin reusable is
-//! [`engine::cache_identity`] (backend × device × stage signature × four
+//! from a host that ran `eta-compiler` — so there is no template to name;
+//! the cache key that makes an ETA cubin reusable is
+//! [`eta_exec::cache_identity`] (backend × device × stage signature × four
 //! version numbers) plus a fingerprint of the emitted bytes, not a
 //! specialization struct; and a program is CLOSED, which has to unload its
 //! modules, where a kernel template never is. So this is a second NVRTC
@@ -41,18 +41,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use engine::engine_api::program::LaunchStagePlan;
-use engine::{
+use eta_compiler::codegen::launch::LaunchStagePlan;
+use eta_compiler::codegen::program::KernelKind;
+use eta_exec::{
     Backend, Bounded, CacheStats, Emitted, EmittedKernel, ExecPlan, Failure, Lookup,
     MAX_NEGATIVE_ENTRIES, MAX_PROGRAM_ENTRIES, MAX_STAGE_ENTRIES, Slot, Stages, Versions,
     cache_identity, combined_signature,
 };
 
 use crate::error::{Fault, Result};
-use engine::engine_api::program::{KernelKind, LibraryOp, RegionKind};
-// `Stage` is this module's own struct (one compiled stage), so PTIR's
+// `Stage` is this module's own struct (one compiled stage), so ETA's
 // attachment-point enum is reached by path rather than imported.
-use engine::tensor_ir::registry::Stage as Attach;
+use eta_ir::registry::Stage as Attach;
 
 /// The only kind the CUDA emitter produces, named from the contract rather
 /// than written as `1`, so a renumbering is a build break and not an empty
@@ -87,7 +87,7 @@ pub struct Target {
     pub device: u64,
     /// NVRTC's own `(major, minor)`. Two NVRTC versions compile one source to
     /// different machine code, so a cubin must not outlive a toolkit upgrade —
-    /// and [`engine::cache_identity`] has no seat for it (it is shared with
+    /// and [`eta_exec::cache_identity`] has no seat for it (it is shared with
     /// backends that never call NVRTC), so it is folded into the memory key
     /// here and into the disk key through the source fingerprint's sibling.
     pub nvrtc: (i32, i32),
@@ -627,7 +627,7 @@ impl Disk {
         let directory = self.directory.as_ref()?;
         Some(directory.join(format!(
             "{:016x}-{region_index}.cubin",
-            engine::tensor_ir::fnv1a64(key.as_bytes())
+            eta_ir::fnv1a64(key.as_bytes())
         )))
     }
 }
@@ -635,13 +635,13 @@ impl Disk {
 /// The identity string plus an eight-byte fingerprint of the source, appended
 /// rather than folded in so the identity stays readable inside a key.
 ///
-/// **THE FINGERPRINT IS WHY THIS FUNCTION EXISTS.** Editing `tensor-compiler`'s
+/// **THE FINGERPRINT IS WHY THIS FUNCTION EXISTS.** Editing `eta-compiler`'s
 /// device templates bumps no version number, so without the source in the key
 /// a stale cubin matches today's identity and every kernel edit silently does
 /// nothing.
 #[must_use]
 pub fn disk_key(identity: &str, source: &str) -> String {
-    let hash = engine::tensor_ir::fnv1a64(source.as_bytes());
+    let hash = eta_ir::fnv1a64(source.as_bytes());
     let mut key = String::with_capacity(identity.len() + 16);
     key.push_str(identity);
     for byte in hash.to_le_bytes() {
@@ -832,7 +832,7 @@ impl Cache {
             combined_signature(&plan.package.plans),
             versions,
         );
-        let program_key = engine::tensor_ir::fnv1a64(program_identity.as_bytes());
+        let program_key = eta_ir::fnv1a64(program_identity.as_bytes());
         if let Some(reason) = self.negative.get(&program_key) {
             self.stats.negative_hits += 1;
             return Err(Failure::Deterministic {
@@ -954,9 +954,17 @@ impl Cache {
             // can actually run. It is the LIBRARY tag that says so — an
             // emitter that declined a genuinely generated region still has to
             // be a failure, which is what the arms below are for.
-            if plan.fused.get(region_index as usize).is_some_and(|region| {
-                region.kind == RegionKind::Library(LibraryOp::SecondParty)
-            }) {
+            //
+            // `shell_launches` IS that tag, asked as a question, and it is the
+            // launch half's too: the same predicate decides which values a
+            // fire has to carry scratch for (alto adapter §6.1). Skipping here
+            // under one spelling and budgeting there under another is what put
+            // an adapter's weights in per-lane scratch in the first place.
+            if plan
+                .fused
+                .get(region_index as usize)
+                .is_some_and(|region| !super::launch::shell_launches(region))
+            {
                 continue;
             }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
@@ -1185,7 +1193,7 @@ mod tests {
         assert_eq!(fnv1a64_with(b"", &[]), 0xcbf2_9ce4_8422_2325);
         assert_eq!(
             fnv1a64_with(b"ptir", &[]),
-            engine::tensor_ir::fnv1a64(b"ptir")
+            eta_ir::fnv1a64(b"ptir")
         );
         let joined = fnv1a64_with(b"identity\x0c\x00\x00\x00\x00\x00\x00\x00", &[]);
         let split = fnv1a64_with(b"identity", &[&12u32.to_le_bytes(), &0u32.to_le_bytes()]);

@@ -98,6 +98,35 @@ __global__ void mlp_geglu_tanh(
     y[idx] = Elem<T>::from_f32(gelu * u);
 }
 
+/// **THE UNGATED GELU** (`.wiki/alto/multimodal.md` §6.2).
+///
+/// `y = gelu_tanh(x)`, one thread per element, no `up` half to multiply.
+/// `Qwen3_5VisionMLP` is `linear_fc2(act(linear_fc1(x)))` with
+/// `hidden_act: gelu_pytorch_tanh` and the merger is the same shape — NOT
+/// gated, which every other gelu arm on this plane assumes.
+///
+/// **WHAT NOT HAVING THIS COSTS, said so the arm's existence is a number.**
+/// It is bakeable without a kernel: declare `gate_up` at `[2*inter, hidden]`
+/// with the `up` half zero and the `up` half of the bias one, and
+/// `mlp_geglu_tanh_packed` computes `gelu_tanh(fc1(x)) * 1`. That pays the
+/// GEMM and the bank twice over — on qwen36's 27 blocks at 1152 -> 4304 it is
+/// 268 M parameters, 0.5 GiB of bf16, written and multiplied to produce ones.
+/// The tanh polynomial here is `mlp_geglu_tanh`'s, transcribed, so the two
+/// spellings answer the same number.
+template <class T>
+__global__ void mlp_gelu_tanh(
+    const T* __restrict__ x,
+    T* __restrict__ y,
+    i32 n)
+{
+    const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    constexpr float c = 0.7978845608028654f;
+    const float g = Elem<T>::to_f32(x[idx]);
+    y[idx] = Elem<T>::from_f32(
+        0.5f * g * (1.f + tanhf(c * (g + 0.044715f * g * g * g))));
+}
+
 template <class T>
 __global__ void relu2(
     const T* __restrict__ x,

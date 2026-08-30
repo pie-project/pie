@@ -1,9 +1,9 @@
 //! The guest-program plane, host half against device half, byte for byte.
 //!
 //! **THIS IS THE POINT OF STEP 7.** Every other test in this crate can pass
-//! while a PTIR fire computes the wrong thing: the launch succeeded, the
+//! while an ETA fire computes the wrong thing: the launch succeeded, the
 //! commit slot survived, a channel holds *a* value. What cannot be faked is
-//! agreement with `engine::program` — a complete interpreter of the same
+//! agreement with `eta_exec` — a complete interpreter of the same
 //! launch package, written against the same op table, that never touches a
 //! device. So both halves are handed the same programs, the same seeds and the
 //! same per-fire inputs, and after every fire the test compares:
@@ -20,7 +20,7 @@
 //! --prec-sqrt=true` and why "close enough" is not an option anywhere below.
 //!
 //! **THE SUBJECTS ARE REAL GOLDEN TRACES**, not fixtures written here: the
-//! `tensor-compiler` corpus under `tests/golden/`, decoded from the `container:`
+//! `eta-compiler` corpus under `tests/golden/`, decoded from the `container:`
 //! line, bound against the profile each was authored for, planned by
 //! `compile_bound`, and emitted for CUDA by `emit_program`. That is exactly the
 //! path a registration takes in production, so what this test exercises is the
@@ -40,24 +40,23 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use engine::engine_api::program::{
-    LaunchChannel, LaunchPackage, ProgramRegistration, ValueSource,
-};
-use engine::tensor_ir::container::HostRole;
-use tensor_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
-use tensor_ir::op::Op;
-use tensor_ir::registry::Stage;
-use tensor_ir::types::{Literal, Shape};
-use engine::tensor_ir::DType;
-use engine::tensor_ir::op::IntrinsicId;
-use engine::{
+use engine::program::ProgramRegistration;
+use engine_cuda::device::{Buffer, Context, present};
+use engine_cuda::program::{Disk, Fired, Plane};
+use eta_compiler::codegen::launch::{LaunchChannel, LaunchPackage, ValueOrigin};
+use eta_exec::{
     Boundaries, ExecPlan, Extents, HostOp, InterpInstance, PassInputs, StepOutcome, Value,
     adopt_launch_package_with, concrete_dtype, encode_wire, host_put, host_take,
     make_host_instance, step, wire_cell_bytes,
 };
-use engine_cuda::device::{Buffer, Context, present};
-use engine_cuda::program::{Disk, Fired, Plane};
-use tensor_ir::registry::{GeometryClass, KernelInfo, ModelProfile};
+use eta_ir::Dtype;
+use eta_ir::container::HostRole;
+use eta_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
+use eta_ir::op::IntrinsicId;
+use eta_ir::op::Op;
+use eta_ir::registry::Stage;
+use eta_ir::registry::{GeometryClass, KernelInfo, ModelProfile};
+use eta_ir::types::{Literal, Shape};
 
 /// One shell per process — `kernels-cuda`'s scratch slabs are process-global
 /// and this crate's other GPU suites say the same. The guest-program plane
@@ -166,7 +165,7 @@ const SUBJECTS: &[Subject] = &[
     // decline any region carrying a scan boundary (`region contains a
     // non-generated boundary (scan)`), which is why the subject was built here
     // from the two ops the gate is actually about. That gap is closed —
-    // `tensor_compiler::codegen::cuda::scan` emits the region, and the
+    // `eta_compiler::codegen::cuda::scan` emits the region, and the
     // `scan_prefix` subject below is what proves the fold — so adopting the
     // corpus program is now a choice about this axis rather than a codegen
     // blocker. It stays synthetic because the argument for it never was the
@@ -189,11 +188,11 @@ const SUBJECTS: &[Subject] = &[
     },
     // **THE `Order` LIBRARY REGIONS** — `top_k` and `sort_desc`, neither a
     // fused body nor a second-party name but a generated kernel of their own
-    // (`tensor_compiler::codegen::cuda::order`, one emitter for both because
+    // (`eta_compiler::codegen::cuda::order`, one emitter for both because
     // `sort_desc` IS `top_k` at `k = n`). Eight of them in one stage over two
     // rows of a thousand, so what is compared is the ORDER: descending by
     // value, ties to the lower index, values and indices agreeing element for
-    // element with `engine::program`'s own `sort_desc_order`.
+    // element with `eta_exec`'s own `sort_desc_order`.
     //
     // The two rows are chosen to fail differently. The taken channel holds
     // sixteen distinct eighths over a thousand lanes — sixty-odd ties per
@@ -214,7 +213,7 @@ const SUBJECTS: &[Subject] = &[
         why: "top_k at k in {1,3,8} and sort_desc, over ties and negatives",
     },
     // **THE SCAN LIBRARY REGION** — `cumsum`/`cumprod`
-    // (`tensor_compiler::codegen::cuda::scan`), and the one whose kernel is
+    // (`eta_compiler::codegen::cuda::scan`), and the one whose kernel is
     // deliberately NOT parallel within a row. The reference is a left-to-right
     // f32 fold and this suite compares bytes, so any reassociation is a
     // failure; what the kernel parallelises is rows, and the subject carries
@@ -301,7 +300,7 @@ fn mtp_two_columns() -> TraceContainer {
     let (k, v) = (3u32, 8u32);
     let out = |len: u32| ChannelDecl {
         shape: Shape::vector(len),
-        dtype: ChanDType::Concrete(DType::I32),
+        dtype: ChanDType::Concrete(Dtype::I32),
         capacity: 1,
         host_role: HostRole::Reader,
         seeded: false,
@@ -317,14 +316,14 @@ fn mtp_two_columns() -> TraceContainer {
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Logits,
                     shape: Shape::matrix(k + 1, v),
-                    dtype: DType::F32,
+                    dtype: Dtype::F32,
                 },
                 // 1: the draft head's, `[K, V]` — a different height, so a
                 // binding that confused the two cannot even be shape-correct.
                 Op::IntrinsicVal {
                     intr: IntrinsicId::MtpLogits,
                     shape: Shape::matrix(k, v),
-                    dtype: DType::F32,
+                    dtype: Dtype::F32,
                 },
                 Op::ReduceArgmax(0),
                 Op::ReduceArgmax(1),
@@ -337,7 +336,7 @@ fn mtp_two_columns() -> TraceContainer {
 }
 
 /// A reader channel of `shape`, at capacity one so an undrained round fills it.
-fn reader(shape: Shape, dtype: DType) -> ChannelDecl {
+fn reader(shape: Shape, dtype: Dtype) -> ChannelDecl {
     ChannelDecl {
         shape,
         dtype: ChanDType::Concrete(dtype),
@@ -352,7 +351,7 @@ fn reader(shape: Shape, dtype: DType) -> ChannelDecl {
 fn taken_row() -> ChannelDecl {
     ChannelDecl {
         shape: Shape::vector(ORDER_ROW),
-        dtype: ChanDType::Concrete(DType::F32),
+        dtype: ChanDType::Concrete(Dtype::F32),
         capacity: 1,
         host_role: HostRole::Writer,
         seeded: true,
@@ -371,14 +370,14 @@ fn order_ranks() -> TraceContainer {
     let mut channels = vec![taken_row()];
     for k in ORDER_KS {
         for _ in 0..2 {
-            channels.push(reader(Shape::vector(k), DType::F32));
-            channels.push(reader(Shape::vector(k), DType::U32));
+            channels.push(reader(Shape::vector(k), Dtype::F32));
+            channels.push(reader(Shape::vector(k), Dtype::U32));
         }
     }
     // The `sort_desc` pair, one per row: the whole order, full width.
     for _ in 0..2 {
-        channels.push(reader(Shape::vector(ORDER_ROW), DType::F32));
-        channels.push(reader(Shape::vector(ORDER_ROW), DType::U32));
+        channels.push(reader(Shape::vector(ORDER_ROW), Dtype::F32));
+        channels.push(reader(Shape::vector(ORDER_ROW), Dtype::U32));
     }
 
     // 0: the taken row. 1..3: `iota` cast to f32 and subtracted from it.
@@ -387,7 +386,7 @@ fn order_ranks() -> TraceContainer {
         Op::Iota { len: ORDER_ROW },
         Op::Cast {
             value: 1,
-            dtype: DType::F32,
+            dtype: Dtype::F32,
         },
         Op::Sub(0, 2),
     ];
@@ -442,9 +441,9 @@ fn scan_prefix() -> TraceContainer {
     let matrix = || Shape::matrix(SCAN_ROWS, SCAN_COLUMNS);
     let channels = vec![
         taken_row(),
-        reader(Shape::vector(ORDER_ROW), DType::F32),
-        reader(matrix(), DType::F32),
-        reader(matrix(), DType::F32),
+        reader(Shape::vector(ORDER_ROW), Dtype::F32),
+        reader(matrix(), Dtype::F32),
+        reader(matrix(), Dtype::F32),
     ];
     let ops = vec![
         // 0: the taken row, multiples of an eighth.
@@ -515,7 +514,7 @@ const HOLD_THE_DRAIN: usize = 2;
 fn golden_dir() -> PathBuf {
     PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../tensor-compiler/tests/golden"
+        "/../eta-compiler/tests/golden"
     ))
 }
 
@@ -526,7 +525,7 @@ fn unhex(text: &str) -> Vec<u8> {
 }
 
 /// The bind-time profile each golden was authored against, transcribed from
-/// `tensor-compiler`'s own corpus helper. The goldens do not carry it, and
+/// `eta-compiler`'s own corpus helper. The goldens do not carry it, and
 /// binding one at the wrong vocabulary refuses rather than misbehaves — which
 /// is why this is a copy and not a guess.
 fn golden_profile(name: &str) -> ModelProfile {
@@ -567,35 +566,25 @@ fn container_of(name: &str) -> TraceContainer {
         .lines()
         .find_map(|line| line.strip_prefix("container: "))
         .unwrap_or_else(|| panic!("{name} has no container line"));
-    tensor_ir::container::decode(&unhex(line))
+    eta_ir::container::decode(&unhex(line))
         .unwrap_or_else(|why| panic!("{name} does not decode: {why:?}"))
 }
 
 /// One trace, all the way to what `register_program` takes.
 fn registration(name: &str) -> ProgramRegistration {
     let container = container_of(name);
-    let bound = tensor_ir::validate::bind(container, golden_profile(name))
+    let bound = eta_ir::validate::bind(container, golden_profile(name))
         .unwrap_or_else(|why| panic!("{name} does not bind: {why:?}"));
-    let stages = tensor_compiler::plan::compile_bound(&bound);
-    let launch = tensor_compiler::codegen::launch::build(&bound, &stages);
-    let backend = tensor_compiler::codegen::program::Backend::Cuda;
-    let emitted = tensor_compiler::codegen::program::emit_program(backend, &stages, &bound);
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    let launch = eta_compiler::codegen::launch::build(&bound, &stages);
+    let backend = eta_compiler::codegen::program::Backend::Cuda;
+    let emitted = eta_compiler::codegen::program::emit_program(backend, &stages, &bound);
 
     ProgramRegistration {
         // The bound trace's own hash, which is what the host uses: two
         // registrations of one program have to be recognised as one.
         program_hash: bound.hash,
-        emitted_kernels: emitted
-            .into_iter()
-            .map(|kernel| engine::engine_api::program::EmittedKernel {
-                kind: kernel.kind,
-                stage_index: kernel.stage_index,
-                region_index: kernel.region_index,
-                entry_name: kernel.entry_name,
-                source: kernel.source,
-                error: kernel.error,
-            })
-            .collect(),
+        emitted_kernels: emitted,
         emitter_version: backend.emitter_version(),
         region_analysis: Vec::new(),
         launch,
@@ -635,7 +624,7 @@ fn host_reads(declared: &LaunchChannel) -> bool {
 /// alone. The values are small so that a u32 sum over a decode loop stays
 /// nowhere near a wrap, and non-constant across rounds so a program that
 /// ignores its input cannot pass by accident.
-fn cell(dtype: DType, lanes: usize, channel: u32, round: usize) -> Value {
+fn cell(dtype: Dtype, lanes: usize, channel: u32, round: usize) -> Value {
     let mut state = 0x9e37_79b9_u32
         .wrapping_mul(channel.wrapping_add(1))
         .wrapping_add(round as u32 * 0x0851_1e19);
@@ -646,16 +635,17 @@ fn cell(dtype: DType, lanes: usize, channel: u32, round: usize) -> Value {
         state
     };
     match dtype {
-        DType::U32 => Value::U32((0..lanes).map(|_| next() % 7).collect()),
-        DType::I32 => Value::I32((0..lanes).map(|_| (next() % 7) as i32).collect()),
-        DType::Bool => Value::Bool((0..lanes).map(|_| u8::from(next() % 2 == 1)).collect()),
+        Dtype::U32 => Value::U32((0..lanes).map(|_| next() % 7).collect()),
+        Dtype::I32 => Value::I32((0..lanes).map(|_| (next() % 7) as i32).collect()),
+        Dtype::Bool => Value::Bool((0..lanes).map(|_| u8::from(next() % 2 == 1)).collect()),
         // Small exact binary fractions: representable to the bit, so an f32
         // channel would still be comparable byte for byte.
-        DType::F32 => Value::F32((0..lanes).map(|_| (next() % 16) as f32 / 8.0).collect()),
+        Dtype::F32 => Value::F32((0..lanes).map(|_| (next() % 16) as f32 / 8.0).collect()),
+        other => panic!("{other:?} is not a dtype an ETA channel can hold"),
     }
 }
 
-fn wire(value: &Value, dtype: DType, lanes: usize) -> Vec<u8> {
+fn wire(value: &Value, dtype: Dtype, lanes: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; wire_cell_bytes(dtype, lanes)];
     encode_wire(value, &mut bytes);
     bytes
@@ -754,7 +744,7 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
     // `[K, V]` of drafts — so a single check against `rows` would have to be
     // wrong about one of them.
     for value in &package.values {
-        if value.source != ValueSource::Intrinsic {
+        if value.source != ValueOrigin::Intrinsic {
             continue;
         }
         let (want, which) = match value.intrinsic {
@@ -848,6 +838,10 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
             rows,
             vocab: VOCAB,
             mtp_draft_row: None,
+            // The parity corpus reads logits and drafts; no program in it
+            // observes attention, so the score rectangle is honestly absent
+            // and a program that read it would fault rather than see zeros.
+            attn_score: None,
         }
     };
 
@@ -1108,7 +1102,7 @@ fn a_source_nvrtc_refuses_is_a_named_deterministic_refusal_and_nothing_else() {
     assert!(
         matches!(
             refusal,
-            engine_cuda::Fault::Compile(engine::Failure::Deterministic { .. })
+            engine_cuda::Fault::Compile(eta_exec::Failure::Deterministic { .. })
         ),
         "a source NVRTC rejects is rejected forever, so it must be Deterministic: {text}"
     );

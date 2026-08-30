@@ -3,7 +3,7 @@
 //! **THIS FILE HAS NO LOGIC AND THAT IS THE DESIGN** (§6: shells are thin
 //! call-order crates). Every decision it looks like it makes was made
 //! somewhere else and is being read back here: which windows run is
-//! `engine::fire::walk`'s, where a rectangle lives is the compiler's carve,
+//! `model_exec::fire::walk`'s, where a rectangle lives is the compiler's carve,
 //! which kernel answers an op is the dispatch arm's, which page a token lands
 //! in is [`store::kv`](crate::store::kv)'s arithmetic. What is left — and
 //! what a reader should be able to follow top to bottom — is the ORDER.
@@ -129,7 +129,7 @@
 //! fire's shape is still its key, because two fires can share a bucket and
 //! differ in the per-class split, and the captured windowed extents would then
 //! be the other fire's (`record.rs` argues the mechanism; the cuda-abi note's
-//! own CORRECTION argues why D4 alone collapses nothing). The PTIR prologue
+//! own CORRECTION argues why D4 alone collapses nothing). The ETA prologue
 //! and epilogue are wired ([`Shell::fire_attached`]); what is not is a guest
 //! program INSIDE the graph, which design §9 rules out rather than defers.
 
@@ -142,7 +142,8 @@ mod stats;
 use std::cell::Cell;
 use std::path::Path;
 
-use engine::fire::{Composition, FireDescriptor, Lane as FireLane, compose, walk};
+use checkpoint::contract::ModelContract;
+use model_exec::fire::{Composition, FireDescriptor, Lane as FireLane, compose_axes, walk};
 // THE THREE-PHASE SEAM, FROM THE NEUTRAL CRATE (alto design §3). Renamed at
 // the import because this crate already has a `Shell` (the loaded model) and a
 // `Prepared`/`Enqueued` of its own — which is the point: the traits are what
@@ -151,15 +152,14 @@ use engine::frame::{
     Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Shell as FrameShell, Supply,
 };
 use kernels_cuda::attn::plan::Shape;
-use model_compiler::{CompiledModel, Budget, DeviceProfile, compile};
+use model_compiler::{Budget, Budgets, CompiledModel, DeviceProfile};
 use model_ir::{Dtype, Trace};
-use model_loader::contract::ModelContract;
 
 use crate::arena::Arena;
 use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
-use engine::engine_api::fire::{
+use engine::fire::{
     Boundary, FoldLen, LayerScores, Mask, Masking, Readout, RsReset, RsVerb,
 };
 
@@ -394,8 +394,24 @@ pub struct Boot<'a> {
     pub contract: &'a ModelContract,
     /// A snapshot directory, or one container file.
     pub checkpoint: &'a Path,
-    /// The ceilings every fire is baked against.
+    /// The ceilings every fire is baked against, ON THE TOKEN AXIS.
     pub budget: Budget,
+    /// **THE SECOND ROW AXIS'S CEILINGS** (multimodal §5.5), or `None` for a
+    /// deployment that admits no image.
+    ///
+    /// A SEPARATE FIELD AND NOT A WIDENED [`Budget`], for the reason
+    /// `model_compiler::Budgets` is a container: the token rectangle's
+    /// ceilings are what every text-only deployment has to say and what every
+    /// caller in the tree already holds, and growing the struct would make
+    /// all of them state an axis they do not serve. `None` here is exactly
+    /// `model_compiler::compile`; `Some` is `compile_axes`, and the artifact
+    /// a TEXT-ONLY plan bakes is bit-identical either way (the G4 invariant,
+    /// which is a property of the plan and not of the ladder).
+    ///
+    /// A plan that states `Dim::Patches` against `None` is a load that does
+    /// not happen — `model_compiler::Error::Unsized`, named at the door —
+    /// rather than a tower carved at zero rows.
+    pub patches: Option<model_compiler::PatchLadder>,
     /// What the device charges. `None` takes the defaults with this device's
     /// measured SM count in them — costs are input, not knowledge, and an
     /// unmeasured deployment should still bake something that runs.
@@ -427,7 +443,7 @@ pub struct Boot<'a> {
     /// unless the disk has no room, in which case it declines and says so.
     pub weight_cache_dir: Option<&'a Path>,
     /// **Where the guest-program plane keeps its compiled cubins** — the
-    /// PTIR cache, typed from the boot document's `[cache] dir` rather than
+    /// ETA cache, typed from the boot document's `[cache] dir` rather than
     /// discovered from `$PIE_HOME`/`$XDG_CACHE_HOME`/`$HOME` inside the shell
     /// (article 9: shells read no environment).
     ///
@@ -483,7 +499,7 @@ pub struct Lane<'a> {
 /// cache, pages that move between sequences — because then the page table is
 /// the CALLER's and a block formula names somebody else's pages.
 ///
-/// So the contract's [`KvDelta`](engine_api::KvDelta) states both, and this is
+/// So the contract's [`KvDelta`](engine::KvDelta) states both, and this is
 /// its shell-side shape: `pages` empty means the shell owns the table (and
 /// `held` is the shell's own count), non-empty means the caller does.
 #[derive(Debug, Clone)]
@@ -506,7 +522,7 @@ pub struct Seated<'a> {
     /// [`Seated::pages`] beside it is the OTHER space — pool ids, translated
     /// by the runtime before it submitted.
     ///
-    /// [`KvDelta::translation`]: engine::engine_api::KvDelta::translation
+    /// [`KvDelta::translation`]: engine::KvDelta::translation
     pub translation: &'a [u32],
     /// An explicit attention mask over the lane's readable extent, replacing
     /// the causal bound `attention.prefill` derives — `Some` is what makes
@@ -697,7 +713,7 @@ impl<'a> Seated<'a> {
 /// One guest program attached to a fire's boundary (design §9).
 ///
 /// The shell's spelling of the contract's
-/// [`Attachment`](engine::engine_api::fire::Attachment), and the same rule:
+/// [`Attachment`](engine::fire::Attachment), and the same rule:
 /// one attachment per instance per fire, because a program's stages are ONE
 /// pass with one readiness gate and one commit. [`Attached::at`] says which
 /// side of the immutable graph that pass runs on.
@@ -710,6 +726,151 @@ pub struct Attached {
     pub instance: u64,
     /// Which side of the graph.
     pub at: Boundary,
+}
+
+/// How many numbers a multimodal position is: `(t, h, w)`. Stated once here
+/// and read by both axes' streams, which are the same triple over two
+/// rectangles.
+const AXES: usize = 3;
+
+/// **HOW WIDE A RUNTIME INPUT THE PLAN DECLARES IS** — the product of every
+/// dim past the leading row one, or `0` when no value of the trace names it.
+///
+/// The `patch_seat` scan already reads `C·T·P²` off `RuntimeInput::Patches`
+/// this way; the position gather's tap count is the same question about
+/// another row (multimodal §9.2). Stated once here so the three readings
+/// cannot drift, and so "the plan does not declare it" and "the plan declares
+/// it zero wide" are one answer rather than two.
+fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64 {
+    trace.values.iter().find_map(|decl| {
+        let (model_ir::Def::Input(named), model_ir::Ty::Tensor { shape, .. }) =
+            (&decl.def, &decl.ty)
+        else {
+            return None;
+        };
+        if *named != which {
+            return None;
+        }
+        Some(
+            shape
+                .iter()
+                .skip(1)
+                .map(|dim| match dim {
+                    model_ir::Dim::Const(n) => *n,
+                    _ => 1,
+                })
+                .product(),
+        )
+    })
+    .unwrap_or(0)
+}
+
+/// **"THIS TOWER ROW HAS NO DESTINATION"** (multimodal §8.6) — what a
+/// compacting fold's tail writes into `RuntimeInput::PatchRoutes`.
+///
+/// `-1` because that is what `RuntimeInput::AdapterRoutes` already spells "no
+/// bank" with, and one sentinel per axis is one too many already. Admitted
+/// only for a plan that declares `layout.scatter_live_rows`; the plain
+/// scatter would read it as an address.
+const PATCH_ROUTE_DROP: i32 = -1;
+
+/// **ONE LANE'S IMAGES, AS THE SUBMISSION CARRIES THEM** (multimodal §2).
+///
+/// **A PARALLEL SLICE KEYED BY LANE, WHICH IS [`Attached`]'S PRECEDENT AND
+/// NOT A NEW IDEA.** A guest attachment is a property of one lane that most
+/// lanes do not have, so it rides beside the lanes rather than as a field on
+/// every `Seated`; images are exactly the same shape of fact. What that buys
+/// is the thing gate (a) is about — a text-only submission constructs no
+/// `Media`, assembles no vector, stages no byte, and its `Seated` is the
+/// struct it always was.
+///
+/// **PRE-UNFOLDED, AND THAT IS A CONTRACT DECISION** (multimodal §2, §4's
+/// named risk). `patches` is patch VECTORS and not pixels — `[rows, C·T·P²]`
+/// in the plan's activation element, merge-block-major so the spatial merge
+/// is a view — so the patch embed is the matmul the IR already has and v1's
+/// decode and resize happen host-side under the rung policy that fixes
+/// patches-per-image. Raw-image decode inside the engine is out of scope.
+#[derive(Debug, Clone, Copy)]
+pub struct Media<'a> {
+    /// Which lane of the submission these images belong to.
+    pub lane: u32,
+    /// How many patch rows each image contributes, in submission order.
+    /// Its length is the lane's image count; its sum is its patch row count,
+    /// and a disagreement with `patches` is refused by name
+    /// (`Fault::PatchPayload`).
+    pub rows: &'a [u32],
+    /// The patch rows themselves, concatenated over this lane's images:
+    /// `rows.iter().sum()` rows of the plan's declared patch width, in the
+    /// plan's activation element, little-endian.
+    pub patches: &'a [u8],
+    /// Where each patch row's tower output lands in the TOKEN rectangle —
+    /// one entry per patch row, as an offset into THIS LANE's token rows.
+    ///
+    /// **LANE-RELATIVE, AND REBASED HERE.** The submission cannot know the
+    /// seriated fire it will land in — that is what `compose` decides, after
+    /// the caller has written this — so a route says "my seventh token row"
+    /// and the shell adds the lane's own `row_offset`. An entry past the
+    /// lane's row count is refused by name (`Fault::PatchRoute`) BEFORE
+    /// anything launches, because `layout.scatter_rows` is a copy with an
+    /// index and no arithmetic: it cannot see the bound, and the arena does
+    /// not fault on an address that stays inside one `cudaMalloc`.
+    pub routes: &'a [i32],
+    /// **THE TOWER'S ROTATION STREAM** (multimodal §6.3): three `i32` per
+    /// patch row — `(t, h, w)`, each patch's own coordinate in its image's
+    /// grid — concatenated over this lane's images in the same order
+    /// [`patches`](Media::patches) is.
+    ///
+    /// **NOT REBASED, AND THAT IS THE DIFFERENCE FROM `routes`.** A route
+    /// names a TOKEN row, which only the seriated fire knows the number of; a
+    /// grid coordinate is a property of the image and means the same thing in
+    /// every fire it lands in. So this rides through verbatim and `routes`
+    /// does not.
+    ///
+    /// `3 · rows.iter().sum()` long; a disagreement is `Fault::PatchPayload`.
+    pub positions: &'a [i32],
+    /// **WHICH ROWS OF THE LEARNED POSITION TABLE EACH PATCH GATHERS**
+    /// (multimodal §9.2): `taps` `i32` per patch row, concatenated over this
+    /// lane's images in `patches`' own order.
+    ///
+    /// `taps` is the plan's, not the submission's — 1 on the native grid, 4
+    /// for bilinear, 16 for bicubic — and the shell reads it off the text's
+    /// `RuntimeInput::PatchEmbedRows` declaration. So the length owed is
+    /// `taps · rows.iter().sum()`, and a plan that declares no position table
+    /// owes an EMPTY slice; either disagreement is `Fault::PatchPayload`.
+    ///
+    /// Not rebased, for [`positions`](Media::positions)' reason: a table row
+    /// is a property of the image's grid and means the same thing in every
+    /// fire it lands in.
+    pub embed_rows: &'a [i32],
+    /// **HOW MUCH OF EACH TAP** (multimodal §9.2): `taps` `f32` per patch row,
+    /// beside [`embed_rows`](Media::embed_rows).
+    ///
+    /// `get_vision_interpolation_indices_and_weights` is what computes both,
+    /// host-side, because the resize policy that fixed the grid already owns
+    /// the resample arithmetic.
+    ///
+    /// **EMPTY ON THE NATIVE GRID, AND THAT IS THE CHEAP PATH.** A text whose
+    /// image grid is the stored grid declares no weight stream and writes the
+    /// plain `layout.embed`; nothing is reserved and nothing is staged. Empty
+    /// is owed exactly when the plan declares none, and any other length is
+    /// `Fault::PatchPayload`.
+    pub embed_weights: &'a [f32],
+    /// **THE TRUNK'S ROTATION STREAM FOR THIS LANE** (multimodal §6.3): three
+    /// `i32` per TOKEN row of the lane — `(t, h, w)`.
+    ///
+    /// On the FIRST axis, which is why it sits on `Media` and is about tokens:
+    /// a lane carrying an image is exactly the lane whose trunk positions stop
+    /// being a scalar, and `get_rope_index` is what computes them host-side
+    /// (image-placeholder rows take their patch's grid coordinate, text rows
+    /// take `(p, p, p)`).
+    ///
+    /// **EMPTY IS LEGAL AND MEANS `(p, p, p)`.** A lane that submits images
+    /// but states no token triples is read as scalar-rope over its own
+    /// positions, which is what the shell fills for every lane that submitted
+    /// nothing at all — so the stream is complete in every fire without every
+    /// caller having to write the boring part of it. Otherwise `3 · rows`
+    /// long, and a disagreement is `Fault::PatchPayload`.
+    pub token_positions: &'a [i32],
 }
 
 /// One loaded model, serving.
@@ -734,6 +895,31 @@ pub struct Shell {
     trace: Trace,
     compiled: CompiledModel,
     budget: Budget,
+    /// **HOW MANY BYTES ONE PATCH ROW IS**, or `None` for a load whose plan
+    /// states no patch row. Read off the plan's `RuntimeInput::Patches`
+    /// declaration at load, because `C·T·P²` is the model text's number and
+    /// not the deployment's.
+    patch_seat: Option<crate::inputs::PatchSeat>,
+    /// **WHETHER THIS PLAN ROTATES BY A TRIPLE** — whether its trace declares
+    /// `RuntimeInput::MropePositions` (multimodal §6.3). Read off the trace at
+    /// load, like `patch_seat`'s row width is, because it is the model text's
+    /// fact and not the deployment's; `false` for every text served before the
+    /// towers, and then the stream is neither reserved nor assembled.
+    mrope_seat: bool,
+    /// **WHETHER THIS PLAN HONOURS A DROPPED PATCH ROW** — whether its trace
+    /// declares `layout.scatter_live_rows` (multimodal §8.6). Read off the
+    /// trace at load beside `mrope_seat`, and `false` for every text served
+    /// before the folds, whose `PatchRoutes` must therefore still name a row
+    /// in every entry.
+    drops_patch_rows: bool,
+    /// **THE SAME CEILINGS, PLUS THE SECOND ROW AXIS'S** (multimodal §5.5).
+    ///
+    /// [`budget`](Shell::budget) above is the token rectangle's and is what
+    /// every pre-campaign reader of this shell means; this is the pair, and
+    /// it is what `compose_axes` is handed each fire. The two are one object
+    /// held twice rather than two facts: `budgets.tokens == budget` by
+    /// construction at load, so a reader cannot pick the wrong one.
+    budgets: Budgets,
     weights: Weights,
     arena: Arena,
     pools: Pools,
@@ -768,6 +954,39 @@ pub struct Shell {
     /// window. Empty for an artifact that declares no correction at all, and
     /// then an adapter has nowhere to go.
     corrected: model_ir::ClassSet,
+    /// **WHICH BIT OF A FACT WORD PUTS A LANE IN THE CORRECTION'S WINDOW**
+    /// (alto adapter §6.4), or `None` for a bake where no single bit does.
+    ///
+    /// **THE ENGINE ANSWERS `WHICH`, SO THE ENGINE HAS TO ANSWER IT IN THE
+    /// MODEL'S OWN VOCABULARY.** §6.4 splits the axis: `needs.lora` is a bool
+    /// and cannot name a slot, so the slot is the engine's bind-time answer
+    /// and `Lane::adapter` is stamped from the instance. But a lane's word and
+    /// its adapter are ONE READING (`Fault::AdapterWord` exists to say so), so
+    /// a shell that derives the adapter must derive the word with it — and a
+    /// word is the model text's bitfield, which this shell has never had a
+    /// name for.
+    ///
+    /// It has this instead, and it is DERIVED rather than declared: the bit is
+    /// the one whose value decides, across every class of the bake, whether
+    /// that class runs the `linear.lora_correct` arm. For every catalog text
+    /// today that is `Facts::has_adapter` — `Predicate::fact(1)` in qwen_3 —
+    /// and nothing here knows the number. A bake where no bit decides it, or
+    /// where two do, answers `None`: the correction window is then not a
+    /// single fact and this shell will not guess which one to set, so an
+    /// adapter bind against it refuses by name rather than firing a lane into
+    /// the wrong class.
+    adapter_fact: Option<u32>,
+    /// **THE SHARED-ADAPTER STORE** (alto adapter §3.3, §6.1): the mount, the
+    /// single-flight host byte cache, and the bank slots keyed by blob
+    /// identity.
+    ///
+    /// **IT SITS BESIDE THE FIRE PATH AND NOT ON IT.** Every one of its verbs
+    /// runs between fires, on the host, the way `register_adapter` does —
+    /// which is the whole of §6.1's ruling: the channel that names an adapter
+    /// is never READ at fire time, because the bytes landed once at bind. A
+    /// load whose model text declares no bank seats zero slots and every bind
+    /// against it refuses by name; nothing about that costs a fire anything.
+    adapters: crate::blob::Adapters,
     /// Per slot: how many kv tokens it holds.
     held: Vec<u32>,
     /// **The row-pointer tables a non-consecutive readout binds through**
@@ -791,6 +1010,15 @@ pub struct Shell {
     /// This load's declared exports (design §9): the trunk's readout, the
     /// draft readout when the model text states one, and the capture columns.
     exports: Exports,
+    /// **THE OBSERVABILITY SLAB** (`.wiki/alto/attn-score.md` §4), or `None`
+    /// for a plan that declares no `attn.scores` export — in which case this
+    /// axis costs the load exactly one `Option` that is never `Some`.
+    ///
+    /// Reserved at load beside the arena and never again: a slab address is
+    /// baked into a capture the same way an arena address is
+    /// ([`crate::arena`]'s "one allocation for the model's whole load"), so
+    /// it may not move once a graph has recorded a launch that writes it.
+    scores: Option<crate::scores::Scores>,
     graphs: Graphs,
     /// Does this shell serve `Fallback::Copy` where P4's table asks for one?
     ///
@@ -970,12 +1198,59 @@ impl Shell {
         } else {
             Vec::new()
         };
-        let compiled = compile(&boot.trace, &boot.budget, &profile)?;
+        // **ONE BAKE, TOLD ABOUT EVERY AXIS THE DEPLOYMENT ADMITS.**
+        // `compile_axes` at a `None` patch ladder IS `compile` — the same
+        // pass, the same artifact, byte for byte — so a text-only load is
+        // unmoved and a deployment that states a patch ladder for a text-only
+        // plan is unmoved too (the G4 invariant, and `unit`'s own test).
+        let budgets = Budgets {
+            tokens: boot.budget.clone(),
+            patches: boot.patches.clone(),
+        };
+        let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
         // The streams and the events the artifact asked for, opened once,
         // here: a `cudaStreamCreate` on the fire path would be host work
         // between two launches, and inside a capture it is what
         // `Graph::capture`'s thread-local mode refuses by name.
         device.open_lanes(compiled.streams.streams.saturating_sub(1), compiled.streams.events)?;
+        // **AND THE CONDITIONAL BODY'S STREAM, FOR AN ARTIFACT THAT BAKED
+        // ONE** (palo design §4). P3 stamps a `Lowering` other than
+        // always-launch on exactly the regions worth guarding — one region in
+        // one SKU at the default profile, the MTP head — and a load whose
+        // artifact holds none opens nothing and pays nothing. Two things
+        // happen here and both belong at load rather than on the fire path:
+        //
+        // 1. The STREAM. A conditional body is recorded with
+        //    `cuStreamBeginCaptureToGraph`, which needs a stream that is not
+        //    already capturing, and the parent capture is on the main one.
+        // 2. The SETTER'S MODULE. `cudaGraphSetConditional` is device-side, so
+        //    the predicate is a kernel — and a kernel is compiled and its
+        //    module loaded on FIRST LAUNCH, which is host work. Inside
+        //    `cudaStreamBeginCapture` that is exactly what the thread-local
+        //    mode refuses. So the setter is fired once here, eagerly, on its
+        //    warm arm: it returns before it reaches the handle and leaves the
+        //    module resident for every capture that follows.
+        if compiled
+            .regions
+            .iter()
+            .any(|region| region.lowering != model_compiler::Lowering::AlwaysLaunch)
+        {
+            device.open_conditional()?;
+            kernels_cuda::graph::set_conditional(
+                device.ctx(),
+                0,
+                0,
+                0,
+                false,
+                kernels_cuda::graph::Arm::Warm,
+            )
+            .map_err(|why| Fault::Unbound {
+                what: format!(
+                    "the conditional setter this artifact's baked conditional needs,                      which answered {why}"
+                ),
+            })?;
+            crate::device::ctx::sync(device.stream())?;
+        }
 
         // Heads, head widths and windows are on the ops, not on
         // `CacheRow::Kv`, so they are read off the plan rather than off a
@@ -1028,14 +1303,75 @@ impl Shell {
             })
             .max()
             .unwrap_or(0);
+        // **WHAT THE SECOND ROW AXIS RESERVES, READ OFF BOTH HALVES.** The
+        // ceilings are the deployment's (`PatchLadder`); the row WIDTH is the
+        // plan's own — `C·T·P²` is a property of the resize policy the model
+        // text baked against, so it is read off the `RuntimeInput::Patches`
+        // declaration rather than stated twice. `None` on either side is no
+        // reservation at all: a deployment that admits no image, or a text
+        // that states no patch row, pays not one byte.
+        let patch_seat = boot.patches.as_ref().and_then(|ladder| {
+            boot.trace.values.iter().find_map(|decl| {
+                let (model_ir::Def::Input(model_ir::RuntimeInput::Patches), model_ir::Ty::Tensor { shape, dtype }) =
+                    (&decl.def, &decl.ty)
+                else {
+                    return None;
+                };
+                let width: u64 = shape
+                    .iter()
+                    .skip(1)
+                    .map(|dim| match dim {
+                        model_ir::Dim::Const(n) => *n,
+                        _ => 1,
+                    })
+                    .product();
+                let element = model_compiler::arena::elem_bytes(*dtype).unwrap_or(0);
+                Some(crate::inputs::PatchSeat {
+                    rows: u64::from(ladder.max_patches),
+                    row_bytes: width * element,
+                    images: u64::from(ladder.max_images),
+                    dtype: *dtype,
+                    // **THE POSITION GATHER'S WIDTH, OFF THE PLAN'S OWN
+                    // DECLARATION** (multimodal §9.2) — the same trace scan
+                    // the patch width comes from, one row over. `0` for a text
+                    // that states no learned position table; `1` for the
+                    // native grid; 4 or 16 for a resampled one, and then the
+                    // weights are declared beside the ids.
+                    embed_taps: declared_width(&boot.trace, model_ir::RuntimeInput::PatchEmbedRows),
+                    embed_weights: declared_width(
+                        &boot.trace,
+                        model_ir::RuntimeInput::PatchEmbedWeights,
+                    ) > 0,
+                })
+            })
+        });
+        // **AND WHETHER THE TRUNK ROTATES BY A TRIPLE** (multimodal §6.3),
+        // read off the same trace scan one thought later: the stream is the
+        // plan's declaration and nothing else, so a text that never names it
+        // reserves no bytes and assembles no vector.
+        let mrope_seat = boot.trace.values.iter().any(|decl| {
+            matches!(decl.def, model_ir::Def::Input(model_ir::RuntimeInput::MropePositions))
+        });
+        // **AND WHETHER A TOWER ROW MAY SAY IT LANDS NOWHERE** (multimodal
+        // §8.6), read off the NODES rather than the values because it is an op
+        // that honours the sentinel and not an input that carries it. A plan
+        // that folds its patch rows declares `layout.scatter_live_rows`; one
+        // that does not keeps `layout.scatter_rows`' contract, under which a
+        // negative route is a write below the base of the token rectangle.
+        let drops_patch_rows = boot.trace.nodes.iter().any(|node| {
+            matches!(
+                node.op,
+                model_ir::Operation::Layout(model_ir::Layout::ScatterLiveRows { .. })
+            )
+        });
         let inputs = Inputs::reserve(
             &boot.budget,
             paging,
             spaces,
             &facts,
             compiled.classes.classes.len(),
-            engine::fire::max_runs(&compiled),
-            engine::fire::fragmentable(&compiled),
+            model_exec::fire::max_runs(&compiled),
+            model_exec::fire::fragmentable(&compiled),
             device.device().num_sm,
             // THE ONE NUMBER, FROM THE ONE MODULE (article 8), and `Boot` is
             // now where it arrives: the deployment states
@@ -1043,9 +1379,35 @@ impl Shell {
             // `LoadRequest::frames_in_flight`, and every pool sized for
             // run-ahead derives from it here and nowhere else.
             boot.runahead,
+            patch_seat,
+            mrope_seat,
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
+
+        // ── **THE SCORE SLAB, CARVED OFF THE SEAM THE TEXT ALREADY WROTE**
+        //    (attn-score §4). Its planes are the `attn.scores` exports and
+        //    its width is each column's own — the capture column is
+        //    `[fire rows, heads]`, so the head count is read off the declared
+        //    type rather than guessed, and a text that exports nothing gets
+        //    no slab and no bytes. Nothing in the artifact moves for this:
+        //    the compiler never hears about it, which is what keeps a
+        //    pre-campaign SKU's bake byte-identical (G4, S-3).
+        let score_heads = exports
+            .scores
+            .first()
+            .and_then(|export| match &boot.trace.values[export.value.0 as usize].ty {
+                model_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
+                    model_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
+                    _ => None,
+                }),
+                model_ir::Ty::Struct(_) => None,
+            })
+            .unwrap_or(0);
+        let score_values: Vec<model_ir::ValueId> =
+            exports.scores.iter().map(|export| export.value).collect();
+        let scores =
+            crate::scores::Scores::reserve(&score_values, score_heads, boot.budget.max_lanes)?;
 
         // The run-ahead counters, made before the cache so the cache can be
         // handed a clone: `record::Graphs` asks them the one question the
@@ -1068,11 +1430,21 @@ impl Shell {
                 .saturating_mul(boot.budget.max_tokens as usize)
                 .saturating_mul(size_of::<u64>()),
         )?;
+        // Read before the struct takes the table: how many adapters can be
+        // resident at once is the smallest capacity any bank declared.
+        let adapter_seats = weights.adapter_seats();
+        // The same instant and the same reason: the correction window's bit is
+        // read off the class table before the struct takes it.
+        let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         Ok(Shell {
             device,
             trace: boot.trace,
             compiled,
-            budget: boot.budget,
+            budget: budgets.tokens.clone(),
+            budgets,
+            patch_seat,
+            mrope_seat,
+            drops_patch_rows,
             weights,
             arena,
             pools,
@@ -1082,7 +1454,16 @@ impl Shell {
             facts,
             spaces,
             masked,
+            adapter_fact,
             corrected,
+            // **SEATED OFF THE BANKS AND MOUNTED NOWHERE.** How many adapters
+            // can be resident at once is the model text's declaration (alto
+            // adapter §3.3: `slots` is residency, not a catalog); WHERE the
+            // shared ones live is the deployment's, and it arrives on
+            // `Shell::mount_adapters` rather than out of the environment
+            // (article 9).
+            adapters: crate::blob::Adapters::new(adapter_seats),
+            scores,
             held: vec![0; boot.slots as usize],
             readout_rows,
             exports,
@@ -1206,6 +1587,134 @@ impl Shell {
         self.weights.register_adapter(id, planes)
     }
 
+    /// **STATE WHERE THE SHARED ADAPTERS LIVE** (alto adapter §3.3).
+    ///
+    /// A read-only directory whose subdirectories are adapters. `None` is the
+    /// feature off: every shared bind refuses by name, and a byte-seeded one
+    /// is unaffected.
+    ///
+    /// **TYPED, NOT `getenv`** (design article 9), and a VERB rather than a
+    /// [`Boot`] field because the mount is a deployment fact that outlives any
+    /// one load and §3.3's hot-add is a file drop: a LoRA appearing in the
+    /// directory while the box serves needs no restart, no re-mount and no
+    /// registration verb.
+    pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
+        self.adapters.mount(root);
+    }
+
+    /// **BIND ONE INSTANCE TO ONE ADAPTER; ANSWER THE SLOT ITS LANES ROUTE
+    /// TO** (alto adapter §6.1 and §6.4).
+    ///
+    /// This is the wave's whole sentence. A shared source is keyed by BLOB
+    /// IDENTITY, so N instances naming one adapter land on one slot and the
+    /// device sees one copy; a byte-seeded one takes a slot of its own. The
+    /// bytes cross exactly once, here, between fires — `Shell::fire` never
+    /// reads a channel for a weight, which is what makes the adapter axis
+    /// cost a fire with no adapter lane nothing at all.
+    ///
+    /// The answer is [`Binding::slot`]: §6.4's "the plan says WHETHER, the
+    /// bind says WHICH". `needs.lora` is a bool and cannot name a slot; this
+    /// can, and the runtime stamps it onto `Lane::adapter`.
+    ///
+    /// **A BIND IS A REFERENCE AND HAS TO BE GIVEN BACK.**
+    /// [`Shell::release_adapter`] is what makes a slot reclaimable; a slot
+    /// nobody released is pinned forever and its bank fills up, which is the
+    /// refusal below rather than a leak that gets slow.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Blob`] for a mount, a manifest or a shape that disagrees with
+    /// this load's banks; [`Fault::AdapterSlots`] when every slot is pinned;
+    /// [`Fault::Adapter`] and [`Fault::Device`] from the landing itself.
+    pub fn bind_adapter(&mut self, source: crate::blob::Source<'_>) -> Result<crate::blob::Binding> {
+        let seats = self.weights.seats();
+        // Two disjoint fields, borrowed apart: the residency table decides
+        // WHICH slot on the host and the weight store writes it on the
+        // device, and keeping the decision testable without a GPU is the
+        // reason the landing arrives as a closure.
+        let weights = &mut self.weights;
+        self.adapters
+            .bind(source, &seats, |slot, planes| {
+                weights.register_adapter(slot, planes)
+            })
+    }
+
+    /// Give a bind back.
+    ///
+    /// The slot KEEPS its contents (§3.3: "eviction is LRU under pressure,
+    /// not eager"), so an adapter with intermittent traffic does not re-pay
+    /// its H2D each time somebody comes back to it. What the release changes
+    /// is only that the slot is now reclaimable if some other identity wants
+    /// a seat.
+    pub fn release_adapter(&mut self, binding: crate::blob::Binding) {
+        self.adapters.release(binding);
+    }
+
+    /// **THE BANKS, AS THE RESOLVER READS THEM** — name, capacity, slot
+    /// bytes, the slot's rectangle and its element size.
+    ///
+    /// [`Shell::banks`]'s longer twin, and the value
+    /// [`crate::adapter::planes_of`] slices a `[layers, ...]` seed against.
+    #[must_use]
+    pub fn bank_seats(&self) -> Vec<crate::weights::BankSeat> {
+        self.weights.seats()
+    }
+
+    /// **THE `lora` SINK ONE REGISTERED PROGRAM DECLARES** (alto adapter
+    /// §6.4: the plan says WHETHER).
+    ///
+    /// `Ok(None)` for a program that carries no adapter, which is nearly all
+    /// of them and costs nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for a program this shell never registered, and
+    /// [`Fault::Adapter`] for a sink this shell cannot serve — see
+    /// [`crate::adapter::sink_of`].
+    pub fn program_adapter_sink(&self, program_id: u64) -> Result<Option<crate::adapter::Sink>> {
+        let program = self.programs.program(program_id).ok_or_else(|| {
+            Fault::program(
+                "serve::shell",
+                format!("no program {program_id} to read an adapter sink off"),
+            )
+        })?;
+        crate::adapter::sink_of(&program.plan.package)
+    }
+
+    /// **THE SAME LANE, IN THE CORRECTION'S WINDOW** (alto adapter §6.4).
+    ///
+    /// A fact word and the adapter beside it are ONE READING of one lane —
+    /// `Fault::AdapterWord` refuses a fire where they disagree — so a shell
+    /// that answers WHICH slot a lane routes to has to answer the word with
+    /// it. This is that answer: `word` with the correction window's own bit
+    /// set, checked to land in a class this bake really corrects.
+    ///
+    /// `None` says this bake cannot carry the lane: it declares no
+    /// correction, no single fact decides the window
+    /// ([`Shell::adapter_fact`](Shell::adapter_fact)'s note), or the adapted
+    /// word names no class at all. A caller turns that into a refusal rather
+    /// than firing the lane uncorrected, because a lane that asked for an
+    /// adapter and silently got the base model is the one wrong answer this
+    /// axis must never give.
+    #[must_use]
+    pub fn adapted_word(&self, word: u64) -> Option<u64> {
+        let bit = self.adapter_fact?;
+        let adapted = word | (1u64 << bit);
+        let class = self
+            .compiled
+            .classes
+            .class_of(adapted & self.compiled.classes.mask)?;
+        self.corrected.contains(class).then_some(adapted)
+    }
+
+    /// The shared-adapter store, for a caller that wants to read the
+    /// residency — which slot holds which identity, how many binds hold it,
+    /// and how many file reads the store has actually performed.
+    #[must_use]
+    pub fn adapters(&self) -> &crate::blob::Adapters {
+        &self.adapters
+    }
+
     /// Open a slot for a fresh sequence.
     ///
     /// The kv pages need no clearing — `kv_len` says nothing before the
@@ -1272,7 +1781,7 @@ impl Shell {
             .iter()
             .map(|lane| FireLane::new(lane.word, lane.tokens.len() as u32))
             .collect();
-        let hint = compose(&self.compiled, &self.budget, &submitted)
+        let hint = compose_axes(&self.compiled, &self.budgets, &submitted)
             .ok()
             .map(|composition| {
                 (
@@ -1305,7 +1814,7 @@ impl Shell {
     /// for a region NVRTC refuses.
     pub fn register_program(
         &mut self,
-        registration: &engine::engine_api::program::ProgramRegistration,
+        registration: &engine::program::ProgramRegistration,
     ) -> Result<u64> {
         self.programs.register(&self.device, registration)
     }
@@ -1320,7 +1829,7 @@ impl Shell {
     /// three rows of zeroes that no launch faults on. A program attached to a
     /// model fire is handed that fire's readout shape; a standalone one
     /// resolves entirely from static dims and never reads these at all, which
-    /// is what [`engine::Extents::default`] — every extent one — says.
+    /// is what [`eta_exec::Extents::default`] — every extent one — says.
     ///
     /// # Errors
     ///
@@ -1329,8 +1838,8 @@ impl Shell {
         &mut self,
         program_id: u64,
         seeds: &[(u32, Vec<u8>)],
-        extents: engine::Extents,
-        geometry: engine::tensor_ir::registry::GeometryClass,
+        extents: eta_exec::Extents,
+        geometry: eta_ir::registry::GeometryClass,
         adopted: &[Option<std::sync::Arc<crate::program::Endpoint>>],
         ids: &[u64],
     ) -> Result<u64> {
@@ -1344,7 +1853,7 @@ impl Shell {
     pub fn program_ticket_disagreement(
         &self,
         instance_id: u64,
-        tickets: &[engine::engine_api::Ticket],
+        tickets: &[engine::Ticket],
     ) -> Option<String> {
         self.programs.disagreeing_ticket(instance_id, tickets)
     }
@@ -1569,11 +2078,21 @@ impl Shell {
     /// NAMES rather than dodges, so the day a workload warms every class the
     /// full template is what arms.
     fn maybe_arm_fold(&mut self, lanes: &[Seated<'_>]) {
+        // **A MULTI-UNIT ARTIFACT IS NEVER ARMED** (multimodal §5.3). The
+        // fold plane arms one graph per bucket per key and a fire that
+        // launches two execs has two bucket numbers, so `fire_folded` refuses
+        // this artifact by name anyway — arming it first would pay a capture
+        // and an instantiation for a graph nothing will ever replay. The
+        // refusal is stated in one place and read in two, which is why this
+        // is the flag and not a second predicate.
+        if self.compiled.fold_refused {
+            return;
+        }
         let submitted: Vec<FireLane> = lanes
             .iter()
             .map(|seated| FireLane::new(seated.lane.word, seated.lane.tokens.len() as u32))
             .collect();
-        let Ok(composition) = compose(&self.compiled, &self.budget, &submitted) else {
+        let Ok(composition) = compose_axes(&self.compiled, &self.budgets, &submitted) else {
             // A batch the artifact cannot describe: the fire itself is about
             // to say so properly.
             return;
@@ -1798,7 +2317,7 @@ impl Shell {
     /// arena rectangle the carve holds open past the last node, and this
     /// copies the capturing lane's rows out of it where they lie. No pool, no
     /// second buffer, no verb of its own — the argument for that choice is on
-    /// [`LaneReadout::scores`](engine::engine_api::fire::LaneReadout::scores).
+    /// [`LaneReadout::scores`](engine::fire::LaneReadout::scores).
     ///
     /// # Errors
     ///
@@ -1809,6 +2328,32 @@ impl Shell {
         &mut self,
         lanes: &[Seated<'_>],
         attachments: &[Attached],
+        scores: &mut Vec<Vec<LayerScores>>,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.fire_media(lanes, attachments, &[], scores)
+    }
+
+    /// **THE SAME FIRE, WITH IMAGES** (multimodal §2) — the door a vision
+    /// submission comes through.
+    ///
+    /// `media` is keyed by lane and is empty for every text-only fire, which
+    /// is what makes [`fire_captured`](Shell::fire_captured) exactly this call
+    /// and not a second path: the four doors above it are one body, and a fire
+    /// with no image walks it having assembled nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`fire_captured`](Shell::fire_captured), plus the three multimodal
+    /// refusals — `Fault::Towerless` for an image against a text with no patch
+    /// axis, `Fault::PatchPayload` / `Fault::PatchRoute` for a submission
+    /// whose geometry disagrees with its payload, and `Fault::TooManyPatches`
+    /// / `Fault::TooManyImages` / `Fault::NoPatchBucket` for a fire past the
+    /// patch ladder.
+    pub fn fire_media(
+        &mut self,
+        lanes: &[Seated<'_>],
+        attachments: &[Attached],
+        media: &[Media<'_>],
         scores: &mut Vec<Vec<LayerScores>>,
     ) -> Result<Vec<Vec<f32>>> {
         // ── THE FOLD'S ARMING INSTANT (`PIE_CUDA_FOLD`). Before ANY of this
@@ -1830,7 +2375,8 @@ impl Shell {
         //    interleaves is `prepare` of the next step with `enqueue` of this
         //    one. Neither is possible while the three are one function, and
         //    both are a call-site edit now that they are not.
-        let prepared = FrameShell::prepare(self, StepView { lanes, attachments }, None)?;
+        let prepared =
+            FrameShell::prepare(self, StepView { lanes, attachments, media }, None)?;
         let enqueued = FrameShell::enqueue(self, prepared)?;
         let mut settled = FrameShell::settle(self, enqueued)?;
         // **AND THEN THE NUMBERS DOOR**, because this verb's whole contract is
@@ -1859,6 +2405,9 @@ pub struct StepView<'a> {
     pub lanes: &'a [Seated<'a>],
     /// The guest programs attached at this step's boundaries.
     pub attachments: &'a [Attached],
+    /// The images this step's lanes submitted — empty for every text-only
+    /// fire, which is every fire this shell fired before M3.
+    pub media: &'a [Media<'a>],
 }
 
 /// **Every host decision one step needs, made — and not one stream touched**
@@ -1907,6 +2456,31 @@ pub struct Prepared<'a> {
     composition: Composition,
     /// What the walk reads to know which nodes have rows.
     descriptor: FireDescriptor,
+    /// **THE SECOND ROW AXIS'S THREE HOST VECTORS, IN FIRE ORDER** — the
+    /// patch payload, the images' indptr and the rebased routes. All three
+    /// empty for a fire no lane submitted an image into, which is what makes
+    /// the axis cost such a fire nothing: `enqueue` stages no bytes and the
+    /// tower's window has no rows for the walk to dispatch.
+    ///
+    /// Host `Vec`s and PAGEABLE on purpose — see `Inputs::stage_patches` for
+    /// why that is what lets them ride no staging ring (multimodal §5.4).
+    patch_payload: Vec<u8>,
+    patch_segments: Vec<i32>,
+    patch_routes: Vec<i32>,
+    /// The tower's rotation stream, `[patch rows, 3]` flattened — each
+    /// patch's `(t, h, w)` in its own image's grid. Empty on the same terms
+    /// as the three above.
+    patch_positions: Vec<i32>,
+    /// The learned position table's gather indices, `[patch rows, taps]`
+    /// flattened, and its interpolation weights beside them (multimodal §9.2).
+    /// Both empty on the terms their `Media` fields are.
+    patch_embed_rows: Vec<i32>,
+    patch_embed_weights: Vec<f32>,
+    /// **THE TRUNK'S ROTATION STREAM** (multimodal §6.3), `[token rows, 3]`
+    /// flattened — and empty for a load whose plan does not declare it, which
+    /// is the ONLY thing that empties it. An mrope-declaring plan fills this
+    /// in every fire, image or none: a text lane's triple is `(p, p, p)`.
+    mrope_positions: Vec<i32>,
     /// Every region's rows and lanes, resolved against this composition's
     /// class table — bound to a device address only in `enqueue`.
     windows: Windows,
@@ -2109,7 +2683,11 @@ impl FrameShell for Shell {
         // shell's `prepare` a breaking change at exactly the wave that can
         // least afford one.
         let _ = prev;
-        let StepView { lanes, attachments } = step;
+        let StepView {
+            lanes,
+            attachments,
+            media,
+        } = step;
         let arming = self.arming;
         let copies = self.copies;
 
@@ -2206,7 +2784,7 @@ impl FrameShell for Shell {
             && attachments.iter().any(|attached| {
                 self.programs
                     .geometry_of(attached.instance)
-                    .is_some_and(|class| class != engine::tensor_ir::registry::GeometryClass::Host)
+                    .is_some_and(|class| class != eta_ir::registry::GeometryClass::Host)
             })
         {
             self.reap_guests()?;
@@ -2381,14 +2959,163 @@ impl FrameShell for Shell {
             }
         }
 
+        // ── **THE SECOND ROW AXIS'S SUBMISSION, JUDGED BEFORE IT IS
+        //    COUNTED** (multimodal M-1e, refusal (i)). Nothing has launched,
+        //    so every disagreement between a lane's declared geometry and the
+        //    payload beside it is free to refuse here — and this is the only
+        //    instant at which the ROUTE vector is checkable at all, because
+        //    `layout.scatter_rows` is a copy with an index and no arithmetic:
+        //    an entry past the rectangle is an out-of-bounds device write the
+        //    kernel cannot see and the arena does not fault on.
+        //
+        //    Keyed by lane like [`Attached`] is, so a text-only submission
+        //    passes an empty slice, allocates this `Vec` of `None` and does
+        //    nothing else at all.
+        let row_bytes = self.patch_seat.map_or(0, |seat| seat.row_bytes);
+        // The position gather's width, from the LOAD and not from the
+        // submission (multimodal §9.2): `0` when the text states no learned
+        // position table, and `0` weights when it states a native grid.
+        let embed_taps = self.patch_seat.map_or(0, |seat| seat.embed_taps);
+        let embed_weight_taps = self
+            .patch_seat
+            .map_or(0, |seat| if seat.embed_weights { seat.embed_taps } else { 0 });
+        let mut media_of: Vec<Option<&Media<'_>>> = vec![None; lanes.len()];
+        for shot in media {
+            let at = shot.lane as usize;
+            if at >= lanes.len() {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "images were submitted for lane {at} and this fire carries {}",
+                        lanes.len()
+                    ),
+                ));
+            }
+            if media_of[at].is_some() {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "lane {at} was handed two media rows, and a lane's images are one \
+                         concatenation with one patch order"
+                    ),
+                ));
+            }
+            let patch_rows: u64 = shot.rows.iter().map(|&rows| u64::from(rows)).sum();
+            // The payload's bytes, the geometry's rows and the plan's width:
+            // three numbers that have to agree.
+            let need = patch_rows * row_bytes;
+            if need != shot.patches.len() as u64 || patch_rows != shot.routes.len() as u64 {
+                return Err(Fault::PatchPayload {
+                    lane: shot.lane,
+                    need,
+                    have: shot.patches.len() as u64,
+                });
+            }
+            // **THE TWO ROTATION STREAMS, AGAINST THE TWO ROW COUNTS**
+            // (multimodal §6.3). The patch one is three numbers per PATCH row
+            // and is owed whole; the token one is three per TOKEN row and may
+            // be empty, which reads as `(p, p, p)` — the scalar rope a lane
+            // gets when it says nothing.
+            if shot.positions.len() as u64 != patch_rows * AXES as u64 {
+                return Err(Fault::PatchPayload {
+                    lane: shot.lane,
+                    need: patch_rows * AXES as u64,
+                    have: shot.positions.len() as u64,
+                });
+            }
+            if !shot.token_positions.is_empty()
+                && shot.token_positions.len() as u64 != u64::from(lane_rows[at]) * AXES as u64
+            {
+                return Err(Fault::PatchPayload {
+                    lane: shot.lane,
+                    need: u64::from(lane_rows[at]) * AXES as u64,
+                    have: shot.token_positions.len() as u64,
+                });
+            }
+            // **AND THE POSITION GATHER'S TWO STREAMS** (multimodal §9.2),
+            // against the tap count THE PLAN declares. `0` taps is a text with
+            // no learned position table and owes an empty slice; a native-grid
+            // text declares 1 tap of ids and no weights, so the weight stream
+            // is owed empty there too. Both are exact rather than
+            // empty-or-exact, because unlike `token_positions` there is no
+            // value the shell could synthesize: it does not know the grid.
+            for (what, have, owed) in [
+                (
+                    "the position table's gather rows",
+                    shot.embed_rows.len() as u64,
+                    patch_rows * embed_taps,
+                ),
+                (
+                    "the position table's interpolation weights",
+                    shot.embed_weights.len() as u64,
+                    patch_rows * embed_weight_taps,
+                ),
+            ] {
+                let _ = what;
+                if have != owed {
+                    return Err(Fault::PatchPayload {
+                        lane: shot.lane,
+                        need: owed,
+                        have,
+                    });
+                }
+            }
+            // The routes, against THIS LANE's token rows — the bound the
+            // rebase below preserves, because a lane's rows are one interval
+            // of the fire's.
+            //
+            // **AND THE DROP SENTINEL, ADMITTED BY THE PLAN AND NOT BY THIS
+            // LOOP** (multimodal §8.6). A compacting fold — `layout.pool_rows`,
+            // `layout.merge_rows` — answers `rows / side²` rows and leaves the
+            // rest of the patch rectangle as the arena left it, and
+            // `PatchRoutes` has an entry per row of the FULL rectangle, so the
+            // tail needs a value meaning "nowhere". `-1` is it, the spelling
+            // `AdapterRoutes` already uses for "no bank".
+            //
+            // It is legal exactly when the plan declares an op that HONOURS
+            // it. `layout.scatter_rows` reads a negative route as a device
+            // write below the base of the token rectangle, so admitting the
+            // sentinel for every plan would turn this refusal into that write;
+            // `self.drops_patch_rows` is read off the trace at load, and a
+            // text that folds declares `layout.scatter_live_rows` and gets the
+            // leniency with it. `-1` ALONE and not every negative: a `-2` is
+            // still a submission that meant something this shell does not
+            // serve.
+            let rows = lane_rows[at];
+            let drop = self.drops_patch_rows;
+            if let Some((j, &route)) = shot.routes.iter().enumerate().find(|&(_, &route)| {
+                !(drop && route == PATCH_ROUTE_DROP) && (route < 0 || route as u32 >= rows)
+            }) {
+                return Err(Fault::from(model_exec::Error::Fire(
+                    model_exec::fire::Fault::PatchRoute {
+                        at: j as u32,
+                        route,
+                        rows,
+                    },
+                )));
+            }
+            media_of[at] = Some(shot);
+        }
+
         // 1. Lane words in. `compose` is arithmetic over a `Vec` of them:
         //    words to classes, classes to an order, counts to prefix sums.
+        //    A lane that submitted images states them here, and `compose_axes`
+        //    seriates the second axis beside the first.
         let submitted: Vec<FireLane> = lanes
             .iter()
             .zip(&lane_rows)
-            .map(|(seated, &rows)| FireLane::new(seated.lane.word, rows))
+            .enumerate()
+            .map(|(at, (seated, &rows))| match media_of[at] {
+                None => FireLane::new(seated.lane.word, rows),
+                Some(shot) => FireLane::with_images(
+                    seated.lane.word,
+                    rows,
+                    shot.rows.len() as u32,
+                    shot.rows.iter().sum(),
+                ),
+            })
             .collect();
-        let composition = compose(&self.compiled, &self.budget, &submitted)?;
+        let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
         // The fold's traffic memory: which classes real fires have exercised
         // is what the arming ladder's second rung captures, and a synthetic
         // pass must not count as traffic.
@@ -2398,6 +3125,97 @@ impl FrameShell for Shell {
             }
         }
         let descriptor = FireDescriptor::of(&composition);
+
+        // ── **THE SECOND SERIATION, CASHED INTO THREE VECTORS.** The
+        //    composition placed every lane's images: `patch_offset` is where
+        //    its rows begin in the fire's patch rectangle and `image_offset`
+        //    where its images begin in the indptr — and neither is derivable
+        //    from the token order, which is the whole of multimodal §5.1. So
+        //    the assembly PLACES rather than appends, and the patch order may
+        //    differ from the order this loop walks in without any of the
+        //    three vectors noticing.
+        //
+        //    The routes are rebased here and nowhere else: a submission says
+        //    "my seventh token row" because it was written before the fire it
+        //    lands in existed, and `row.row_offset` is the fire's answer to
+        //    that. The bound checked lane-relatively above survives the shift
+        //    because a lane's rows are one interval of the fire's.
+        let (
+            patch_payload,
+            patch_segments,
+            patch_routes,
+            patch_positions,
+            patch_embed_rows,
+            patch_embed_weights,
+        ) = if composition.patch_rows() == 0 {
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            let stride = row_bytes as usize;
+            let mut payload = vec![0u8; composition.patch_rows() as usize * stride];
+            let mut routes = vec![0i32; composition.patch_rows() as usize];
+            // **THE TOWER'S ROTATION STREAM, PLACED THE WAY THE PAYLOAD IS.**
+            // A patch's `(t, h, w)` is its own image's grid coordinate, so it
+            // is the submission's number verbatim — no rebasing, unlike the
+            // routes, which name a TOKEN row and therefore have to follow the
+            // seriation.
+            let mut positions = vec![0i32; composition.patch_rows() as usize * AXES];
+            // **THE POSITION GATHER, PLACED THE WAY THE PAYLOAD IS** — the
+            // taps and their weights are a property of the image's grid, so
+            // they ride through verbatim like the rotation stream and unlike
+            // the routes. Zero-length when the plan declares no table, and
+            // then the loop below copies nothing into them.
+            let taps = embed_taps as usize;
+            let weight_taps = embed_weight_taps as usize;
+            let mut embed_rows = vec![0i32; composition.patch_rows() as usize * taps];
+            let mut embed_weights = vec![0f32; composition.patch_rows() as usize * weight_taps];
+            let mut per_image = vec![0u32; composition.images() as usize];
+            for row in composition.lanes() {
+                let Some(shot) = media_of[row.source as usize] else {
+                    continue;
+                };
+                let at = row.patch_offset as usize * stride;
+                payload[at..at + shot.patches.len()].copy_from_slice(shot.patches);
+                for (j, &route) in shot.routes.iter().enumerate() {
+                    routes[row.patch_offset as usize + j] = route + row.row_offset as i32;
+                }
+                let triples = row.patch_offset as usize * AXES;
+                positions[triples..triples + shot.positions.len()]
+                    .copy_from_slice(shot.positions);
+                let at_ids = row.patch_offset as usize * taps;
+                embed_rows[at_ids..at_ids + shot.embed_rows.len()]
+                    .copy_from_slice(shot.embed_rows);
+                let at_w = row.patch_offset as usize * weight_taps;
+                embed_weights[at_w..at_w + shot.embed_weights.len()]
+                    .copy_from_slice(shot.embed_weights);
+                for (i, &rows) in shot.rows.iter().enumerate() {
+                    per_image[row.image_offset as usize + i] = rows;
+                }
+            }
+            // The indptr the tower's attention reads: `images + 1` entries,
+            // image `i` owning `[segments[i], segments[i + 1])`.
+            let mut segments = Vec::with_capacity(per_image.len() + 1);
+            let mut at = 0i32;
+            segments.push(at);
+            for rows in per_image {
+                at += rows as i32;
+                segments.push(at);
+            }
+            (
+                payload,
+                segments,
+                routes,
+                positions,
+                embed_rows,
+                embed_weights,
+            )
+        };
         let rows = composition.rows();
 
         // 2. The fire's own vectors, in fire order — which is the seriated
@@ -2820,6 +3638,42 @@ impl FrameShell for Shell {
             }
         }
 
+        // ── **THE TRUNK'S TRIPLE-WIDE POSITION STREAM, ASSEMBLED FROM THE
+        //    SCALAR ONE** (multimodal §6.3). Empty unless the plan declares
+        //    it, which is what makes this cost every text served before the
+        //    towers exactly nothing — not a branch inside a loop, a vector
+        //    that is never built.
+        //
+        //    THE DEFAULT IS `(p, p, p)` AND THAT IS NOT A PLACEHOLDER: a
+        //    triple whose three entries agree is scalar rope to the last bit
+        //    the two expressions can share, which is why a text lane in an
+        //    image-carrying fire needs no submission of its own and why a
+        //    text-only fire of an mrope SKU answers what it always did. A
+        //    lane that DOES state triples (`get_rope_index`'s output, where
+        //    image-placeholder rows take their patch's grid coordinate)
+        //    overwrites its own interval, and a lane's rows are one interval
+        //    of the fire's — the same fact the route rebase leans on.
+        let mrope_positions = if !self.mrope_seat {
+            Vec::new()
+        } else {
+            let mut triples = Vec::with_capacity(positions.len() * AXES);
+            for &at in &positions {
+                triples.extend_from_slice(&[at, at, at]);
+            }
+            for row in composition.lanes() {
+                let Some(shot) = media_of[row.source as usize] else {
+                    continue;
+                };
+                if shot.token_positions.is_empty() {
+                    continue;
+                }
+                let at = row.row_offset as usize * AXES;
+                triples[at..at + shot.token_positions.len()]
+                    .copy_from_slice(shot.token_positions);
+            }
+            triples
+        };
+
         // ── 2b. ADMISSION (article 4). The union demand of this step,
         //    committed atomically before any of it runs.
         //
@@ -2956,6 +3810,7 @@ impl FrameShell for Shell {
             &self.trace,
             &self.compiled,
             composition.classes(),
+            composition.patch_classes(),
             &indptr_host,
             crate::window::Copies {
                 bucket,
@@ -3034,6 +3889,13 @@ impl FrameShell for Shell {
             attachments,
             composition,
             descriptor,
+            patch_payload,
+            patch_segments,
+            patch_routes,
+            patch_positions,
+            patch_embed_rows,
+            patch_embed_weights,
+            mrope_positions,
             windows,
             seats,
             tables,
@@ -3232,6 +4094,11 @@ impl Shell {
             owed,
             guest_landed,
             airborne,
+            // NAMED FOR THE FIFTH TIME AND FOR THE SAME REASON: the score
+            // slab is touched at exactly two instants — the seat handed to
+            // the walk, and the epilogue binding that points a guest at it —
+            // and both of them are in this function.
+            scores,
             ..
         } = self;
         let graphs = *graphs;
@@ -3368,10 +4235,54 @@ impl Shell {
         let handles = inputs.commit(device.stream(), slot, &p.lengths)?;
         p.windows.bind(handles.windows);
 
+        // ── **THE PATCH BYTES, WRITTEN INSIDE THE ENQUEUE** (multimodal
+        //    §5.4). Three copies onto the same compute stream, in front of
+        //    the launches that read them, from pageable `Vec`s the prepare
+        //    pass made — which is what lets them ride no staging ring and
+        //    cost a text-only load nothing. `None` for a fire no lane
+        //    submitted an image into, and then not one of the three copies
+        //    happens.
+        let patches = if p.patch_payload.is_empty() {
+            None
+        } else {
+            Some(inputs.stage_patches(
+                device.stream(),
+                &p.patch_payload,
+                &p.patch_segments,
+                &p.patch_routes,
+                &p.patch_positions,
+                &p.patch_embed_rows,
+                &p.patch_embed_weights,
+            )?)
+        };
+
+        // ── **AND THE TRUNK'S ROTATION STREAM, ONE COPY BESIDE THEM.** Same
+        //    stream, same instant, same argument for riding no ring; empty
+        //    for a plan that does not declare it, and then no copy at all.
+        let mrope = if p.mrope_positions.is_empty() {
+            None
+        } else {
+            Some(inputs.stage_mrope_positions(device.stream(), &p.mrope_positions)?)
+        };
+
         // 6. The three tables a `Run` resolves through: the arena's
         //    rectangles at this fire's rows, the pools' storage under this
         //    fire's page tables, and the loader's weights, which never move.
-        let slots = arena.slots(&compiled.arena, u64::from(rows), u64::from(lane_count));
+        // **BOTH AXES' COUNTS** (multimodal §5.1): a tower rectangle is
+        // `Dim::Patches`-rowed and resolves through this same table, so a call
+        // that stated only the token pair would size every one of them at zero
+        // — which does not fault, it computes, and the failure arrives inside
+        // a GEMM whose destination has no rows. The composition holds both
+        // pairs because it seriated both axes.
+        let slots = arena.slots(
+            &compiled.arena,
+            model_compiler::FireRows {
+                tokens: u64::from(rows),
+                lanes: u64::from(lane_count),
+                patches: u64::from(p.composition.patch_rows()),
+                images: u64::from(p.composition.images()),
+            },
+        );
         let caches = pools.table(
             &inputs
                 .seats(&handles, p.pages, rows, lane_count)
@@ -3487,6 +4398,13 @@ impl Shell {
             tokens: handles.tokens,
             positions: handles.positions,
             adapter_routes: handles.adapter_routes,
+            patches: patches.as_ref().map(|seats| seats.patches),
+            patch_segments: patches.as_ref().map(|seats| seats.segments),
+            patch_routes: patches.as_ref().map(|seats| seats.routes),
+            patch_positions: patches.as_ref().map(|seats| seats.positions),
+            patch_embed_rows: patches.as_ref().and_then(|seats| seats.embed_rows),
+            patch_embed_weights: patches.as_ref().and_then(|seats| seats.embed_weights),
+            mrope_positions: mrope,
             geometry,
             schedules,
             plan_values: facts.plans.len(),
@@ -3498,6 +4416,17 @@ impl Shell {
                 mask_indptr: handles.mask_indptr,
                 pool_state: None,
             },
+            // **A SEAT ONLY WHEN SOMEBODY ASKED** (attn-score §4's
+            // zero-cost-when-off, gate S-3). `None` is what makes the capture
+            // arm's observation cost a non-capturing fire nothing at all —
+            // not a disabled node, not an empty launch, not a predicated
+            // store: `Run::capture_scores` returns before it reaches a
+            // stream, so the fire this shell fires is the fire it always
+            // fired, launch for launch.
+            scores: scores
+                .as_ref()
+                .filter(|_| p.lanes.iter().any(|seated| seated.captures_scores))
+                .map(crate::scores::Scores::seat),
             device: device.device(),
             toggles: device.toggles(),
             // The shell's policy word going in: under a mode that records,
@@ -3525,6 +4454,24 @@ impl Shell {
             events: device.events(),
             at: &stream,
         });
+        // **THE CONDITIONAL BUNDLE, AND IT IS `Some` ONLY FOR AN ARTIFACT
+        // THAT ASKED** (palo design §4). `Context::open_conditional` is called
+        // at load and only when P3 stamped a `Lowering` on some region, so
+        // this reads `None` for every SKU in the catalog but the drafting
+        // ones — and a walk that never meets a conditional never looks at it.
+        //
+        // It carries the SAME stream cell `forked` does, which is what lets a
+        // load with a conditional and no side streams write a stream number
+        // the `Run` reads: there is one cell per fire, not one per bundle.
+        let conditionals = device
+            .conditional_ctx()
+            .map(|_| crate::window::Conditionals {
+                main: device.stream(),
+                body: device.conditional_stream(),
+                setter: device.ctx(),
+                windows: &p.windows,
+                at: &stream,
+            });
         // **D4: THE BUCKET REACHES THE ENTRIES, AND NOTHING ELSE MOVES**
         // (`.wiki/palo/cuda-abi.md` §3, refined form). `Composition::bucket`
         // has been computed on every fire since compose was written and read
@@ -3572,6 +4519,12 @@ impl Shell {
         )
         .across(&side_ctx, &stream)
         .quantized(armed);
+        // The other half of the bundle above: where a conditional body's
+        // launches land. The cursor writes `window::BODY` into the cell for
+        // exactly the span between a `cond_begin` and its `cond_end`.
+        if let Some(body) = device.conditional_ctx() {
+            run = run.conditional(body, &stream);
+        }
         // **THE BUFFERED PLANE, SEATED ONLY WHEN A LANE MOVES BYTES.** A fire
         // whose every lane folds hands the walk nothing, so the two dispatch
         // arms that could scatter or gather test one `Option` and return.
@@ -3605,6 +4558,7 @@ impl Shell {
                 descriptor: &p.descriptor,
                 stream: device.stream(),
                 lanes: forked,
+                conditionals,
                 key: record::Key::of(p.composition.classes(), copies),
                 bucket: p.composition.bucket(),
             };
@@ -3695,7 +4649,7 @@ impl Shell {
             let lane_count = p.lanes.len();
             let mut last_row = vec![0u32; lane_count];
             // And which rows it OWNS, first and count — the draft readout is
-            // indexed by the first (`engine::program`'s `mtp_draft_row`) and
+            // indexed by the first (`eta_exec`'s `mtp_draft_row`) and
             // the capture readout copies the whole run, so both come off the
             // same reading of the same composition.
             let mut first_row = vec![0u32; lane_count];
@@ -3851,7 +4805,7 @@ impl Shell {
                 if consecutive {
                     programs.bind_intrinsic(
                         attached.instance,
-                        engine::tensor_ir::op::IntrinsicId::Logits,
+                        eta_ir::op::IntrinsicId::Logits,
                         logits.ptr,
                         INTRINSIC_STORAGE_RAW_BF16,
                         vocab,
@@ -3876,7 +4830,7 @@ impl Shell {
                     readout_rows.stage(device.stream(), at, &table)?;
                     programs.bind_intrinsic(
                         attached.instance,
-                        engine::tensor_ir::op::IntrinsicId::Logits,
+                        eta_ir::op::IntrinsicId::Logits,
                         readout_rows.ptr() + at,
                         crate::program::launch::INTRINSIC_STORAGE_ROW_POINTERS,
                         vocab,
@@ -3887,12 +4841,67 @@ impl Shell {
                 if let Some(column) = draft {
                     programs.bind_intrinsic(
                         attached.instance,
-                        engine::tensor_ir::op::IntrinsicId::MtpLogits,
+                        eta_ir::op::IntrinsicId::MtpLogits,
                         column.ptr,
                         INTRINSIC_STORAGE_RAW_BF16,
                         column.width,
                         column.width,
                         first_row[attached.lane as usize],
+                    )?;
+                }
+                // ── **THE OBSERVABILITY DOOR** (`.wiki/alto/attn-score.md`
+                //    §4). The capture arm wrote this lane's block of planes
+                //    as the graph ran; this points the epilogue at it and
+                //    nothing is copied anywhere. Bound at F32 and not at
+                //    `INTRINSIC_STORAGE_RAW_BF16`, because a probability that
+                //    a policy divides by is not a bf16 quantity — the slab is
+                //    the one place in this shell where the four bytes are
+                //    what they say.
+                //
+                //    **THE STRIDE IS THE SLAB'S AND THE ROWS ARE THE
+                //    PROGRAM'S**, which is the whole contract
+                //    (`eta_ir::registry::ATTN_SCORE_KV_MAX`): a guest states
+                //    how many planes it means to read and reads a prefix of
+                //    the layers, while the pitch between them is a number it
+                //    could not have been told and must not guess.
+                if let Some(slab) = scores.as_ref().filter(|_| {
+                    p.lanes
+                        .get(attached.lane as usize)
+                        .is_some_and(|seated| seated.captures_scores)
+                }) {
+                    if attached.lane >= slab.lanes() {
+                        return Err(Fault::Ceiling {
+                            what: "fire lanes the score slab seats",
+                            need: u64::from(attached.lane) + 1,
+                            have: u64::from(slab.lanes()),
+                        });
+                    }
+                    // **AND THE DECLARED CEILING IS REFUSED, NOT TRUNCATED.**
+                    // The rows are the program's own claim and the pitch is
+                    // the slab's, so a program claiming more planes than this
+                    // load exports would read straight on into the NEXT
+                    // lane's mass — silently, deterministically, and wrong.
+                    // The type rule in `eta_ir::validate` can only check the
+                    // width (the plane count is not in the profile), so this
+                    // is where the other half of that contract is kept.
+                    let declared = programs.declared_score_planes(attached.instance);
+                    if let Some(declared) = declared
+                        && declared > slab.planes()
+                    {
+                        return Err(Fault::Ceiling {
+                            what: "attention-score planes this load exports",
+                            need: u64::from(declared),
+                            have: u64::from(slab.planes()),
+                        });
+                    }
+                    programs.bind_intrinsic(
+                        attached.instance,
+                        eta_ir::op::IntrinsicId::AttnScore,
+                        slab.lane_base(attached.lane),
+                        crate::program::launch::INTRINSIC_STORAGE_F32,
+                        crate::scores::KV_MAX,
+                        crate::scores::KV_MAX,
+                        0,
                     )?;
                 }
                 if let Some(fired) =
@@ -3976,9 +4985,9 @@ impl Shell {
 /// is waiting.
 pub struct Done {
     /// Which step of which frame this is.
-    pub at: engine::engine_api::StepDone,
+    pub at: engine::StepDone,
     /// Where to say so.
-    pub sink: engine::engine_api::CompletionSink,
+    pub sink: engine::CompletionSink,
 }
 
 impl Shell {
@@ -4085,7 +5094,7 @@ impl Shell {
             recycler.give(at);
             airborne.leave();
             if let Some(done) = done {
-                (done.sink)(done.at, engine::engine_api::StepOutcome::Committed);
+                (done.sink)(done.at, engine::StepOutcome::Committed);
             }
         }));
         if let Err(fault) = posted {
@@ -4168,7 +5177,7 @@ impl Shell {
     ///
     /// As [`Shell::read_out`], plus [`Fault::Ceiling`] for a stated row past
     /// the rows its lane owns. The contract refuses that one first
-    /// ([`Lane::validate_for`](engine::engine_api::fire::Lane)), so reaching
+    /// ([`Lane::validate_for`](engine::fire::Lane)), so reaching
     /// it here means a caller that skipped its own validation — and reading
     /// somebody else's lane's logits under this lane's name is not a failure
     /// mode worth saving a bounds check over.
@@ -4399,6 +5408,54 @@ struct RsFire<'a> {
 /// Refusing zero is what makes it dispatchable: a speculative commit folds at
 /// least the bonus token it is guaranteed to accept, and a zero-length fold
 /// is a launch that would compute nothing while claiming to have committed.
+/// **WHICH BIT OF A FACT WORD DECIDES THE CORRECTION WINDOW** (alto adapter
+/// §6.4), or `None` when no single bit does.
+///
+/// # Why this is derived and not declared
+///
+/// The window is the model text's — qwen_3 writes it `Predicate::fact(1)` and
+/// calls the fact `has_adapter` — and nothing crosses into this shell that
+/// names the bit. What DOES cross is the class table (every fact word, grouped
+/// by behaviour) and [`corrected_classes`]'s answer (which of those classes
+/// run a `linear.lora_correct` arm). Between them the bit is a fact rather
+/// than a guess: it is the one whose value agrees with membership of the
+/// correction window on EVERY word of EVERY class.
+///
+/// `None` on either failure, and both are the same refusal from the caller's
+/// side:
+///
+/// * **no bit qualifies** — the window is not a single fact of this bake, so
+///   there is no word to move a lane to;
+/// * **two bits qualify** — the bake is degenerate (two facts that are never
+///   observed apart), and picking one of them would be picking at random.
+///
+/// A bake with no correction at all answers `None` from the first line, which
+/// is the same sentence [`Fault::Adapterless`] already says.
+fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) -> Option<u32> {
+    if corrected.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for bit in 0..u64::BITS {
+        if classes.mask & (1u64 << bit) == 0 {
+            continue;
+        }
+        let decides = classes.classes.iter().enumerate().all(|(at, class)| {
+            let runs = corrected.contains(at);
+            class.words.iter().all(|word| ((word >> bit) & 1 == 1) == runs)
+        });
+        if decides {
+            if found.is_some() {
+                // Two facts that no class tells apart. Answering either would
+                // be answering by coin toss, so this answers neither.
+                return None;
+            }
+            found = Some(bit);
+        }
+    }
+    found
+}
+
 fn resolve_fold_len(
     len: FoldLen,
     bound: u32,
@@ -4806,8 +5863,8 @@ mod tests {
     /// The port a device-resident fold length would be read from. Any
     /// consuming geometry port serves: what the resolver takes is the CELL,
     /// and the port name only ever reaches a refusal's sentence.
-    const PORT: engine::tensor_ir::registry::Port =
-        engine::tensor_ir::registry::Port::RsFoldLen;
+    const PORT: eta_ir::registry::Port =
+        eta_ir::registry::Port::RsFoldLen;
 
     /// **THE CLAMP IS WHAT MAKES A DEVICE-RESIDENT FOLD LENGTH SAFE** (alto
     /// design §6; dev `batch_compose.hpp:726-768`).

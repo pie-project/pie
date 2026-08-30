@@ -11,34 +11,31 @@ use crate::guard::Guard;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ValueId(pub u32);
 
-/// Element type as data, not a generic: monomorphization's guarantee moved to
-/// the trace-time validator plus a launch-site match. The one such enum in the
-/// stack — it names storage representations as well as compute elements, so a
-/// weight plane, a kv page and a tensor all say what they hold in one spelling.
+/// Element type as data — [`dtype::Dtype`], re-exported at the path the IR has
+/// always spelled it.
 ///
-/// `Mxfp4` is a weight plane's 32-code block packed to 16 bytes; the companion
-/// `.scales` plane beside it is `E8m0`, which is only ever that companion and
-/// never something an author declares. `Fp8E4m3`, `I8` and `Fp4` name kv-page
-/// quant schemes. What a scheme's granularity is (per-tensor vs per-token-head)
-/// and how wide an fp4 block runs are not facts about the element — they are
-/// sibling fields of the cache row that chose the scheme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Dtype {
-    Bf16,
-    F16,
-    F32,
-    I32,
-    U32,
-    U8,
-    I8,
-    Fp8E4m3,
-    Fp4,
-    Mxfp4,
-    E8m0,
-}
+/// The enum ITSELF stood here, and it was one of two: the loader's
+/// `checkpoint::types::DType` named the same thing over a wider vocabulary
+/// (the wide ints, `Bool`) and a narrower one (no `Fp4`, no `Mxfp4`), so every
+/// edge between the IR and a checkpoint was a hand-written table. There is one
+/// enum now, in a leaf crate that deps nothing, and `model_ir::Dtype` is a name
+/// for it rather than a second one.
+pub use dtype::Dtype;
 
 /// The whole surviving shape algebra. Symbolic dims are sized by runtime
-/// budgets (`Tokens` → max_tokens, `Lanes` → max_lanes) when the arena is cut.
+/// budgets (`Tokens` → max_tokens, `Lanes` → max_lanes, `Patches` →
+/// max_patches) when the arena is cut.
+///
+/// **A VARIANT IS A ROW SPACE, AND THAT IS WHAT MAKES THE AXIS A SYMBOL**
+/// (multimodal §5.1). `Tokens` and `Lanes` are two spellings of ONE rectangle
+/// — a lane is a request of the token rectangle, an indptr closes over it —
+/// so every value they size is windowed by the same seriation and carried by
+/// the same descriptor row count. `Patches` is not: a lane may carry zero
+/// images or three, so patch rows and token rows do not break at the same
+/// places, and nothing about the token window can be read off a patch one.
+/// Which axis a value lives on is therefore READ OFF ITS TYPE
+/// ([`Dim::axis`]) rather than declared beside it, and the capture-unit
+/// partition is derived from that and never from a flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Dim {
     Const(u64),
@@ -50,6 +47,93 @@ pub enum Dim {
     Lanes,
     /// Indptr-shaped: lanes + 1.
     LanesPlus(u32),
+    /// **THE SECOND ROW AXIS.** This fire's patch count — the rows of the
+    /// vision tower's window, concatenated over every image every lane
+    /// submitted.
+    ///
+    /// NOT A SUBSET OF THE TOKEN RECTANGLE, which is the whole of why it is a
+    /// variant rather than a `TokensTimes`. The tower's "lanes" are IMAGES:
+    /// one request contributes as many patch runs as it submitted images, and
+    /// a text-only request contributes none. So the merged-prefix-sum
+    /// invariant the token axis is composed under — rows and lanes break at
+    /// the same places — does not hold here, and the patch axis gets its own
+    /// seriation, its own bucket ladder and its own capture unit.
+    Patches,
+    /// **THE PATCH AXIS'S LANE SPACE: IMAGES.** How many images this fire
+    /// carries, over every lane in it.
+    ///
+    /// M1 promised this variant in as many words — "the patch axis has its
+    /// own lane space — images — and when it needs a bounds vector it will
+    /// name one, in its own variant, for the same reason this one does" — and
+    /// the bounds vector arrived with the tower's one real kernel:
+    /// `attention.dense` is block-diagonal PER IMAGE and reads an indptr of
+    /// `images + 1` entries to know where one image's patch run ends and the
+    /// next begins.
+    ///
+    /// `Images` is to [`Patches`](Dim::Patches) exactly what [`Lanes`](Dim::Lanes)
+    /// is to [`Tokens`](Dim::Tokens) — a count of the requests of a row
+    /// rectangle, cut by the same window pair its rows are — and it is a
+    /// SEPARATE variant from `Lanes` for the reason the row spaces are
+    /// separate: a lane carrying no image contributes a lane and no image, so
+    /// the two counts are two numbers in any mixed fire.
+    Images,
+    /// Indptr-shaped on the patch axis: `images + 1`.
+    ImagesPlus(u32),
+}
+
+/// Which row space a symbolic dim sizes — the discriminator every per-axis
+/// table is keyed by.
+///
+/// **DERIVED, NEVER DECLARED.** There is no axis field on a value, a node or
+/// a region: [`Dim::axis`] reads it off the type a model text already wrote,
+/// which is what keeps a second row axis from being a second vocabulary a
+/// text could get wrong. A third instance is already spoken for — the
+/// per-key attention-score extent (attn-score §6.1) — and it lands as one
+/// more variant here plus one more ceiling, not as a parallel invention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RowAxis {
+    /// The token rectangle: `Tokens`, `TokensTimes(k)`, `Lanes`, `LanesPlus(k)`.
+    Tokens,
+    /// The patch rectangle: `Patches`, `Images`, `ImagesPlus(k)`.
+    Patches,
+}
+
+impl RowAxis {
+    /// The axis every plan has, and the one a plan that names no other is
+    /// entirely made of.
+    pub const PRIMARY: RowAxis = RowAxis::Tokens;
+
+    /// The name a refusal or a ledger line spells this axis with.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            RowAxis::Tokens => "tokens",
+            RowAxis::Patches => "patches",
+        }
+    }
+}
+
+impl Dim {
+    /// The row space this dim sizes, or `None` for a [`Const`](Dim::Const) —
+    /// a fixed block is not fire-aligned and so belongs to no axis.
+    ///
+    /// **`Lanes` IS THE TOKEN AXIS AND `Images` IS THE PATCH ONE.** A lane is
+    /// a request of the token rectangle and an indptr is that rectangle's
+    /// bounds vector; both are cut by the same window pair the token rows
+    /// are. [`Images`](Dim::Images) and [`ImagesPlus`](Dim::ImagesPlus) say
+    /// the same two sentences about the patch rectangle, and answer
+    /// [`RowAxis::Patches`] for the same reason — which is what makes the
+    /// second seriation's window pair the one that cuts them.
+    #[must_use]
+    pub fn axis(self) -> Option<RowAxis> {
+        match self {
+            Dim::Const(_) => None,
+            Dim::Tokens | Dim::TokensTimes(_) | Dim::Lanes | Dim::LanesPlus(_) => {
+                Some(RowAxis::Tokens)
+            }
+            Dim::Patches | Dim::Images | Dim::ImagesPlus(_) => Some(RowAxis::Patches),
+        }
+    }
 }
 
 /// The kinds of host-owned plan objects an op may define. The payload is
@@ -92,6 +176,30 @@ pub enum GeomKind {
 pub enum RuntimeInput {
     Tokens,
     Positions,
+    /// **THE TRUNK'S TRIPLE-WIDE POSITION STREAM**: `[Dim::Tokens, 3]` `i32`,
+    /// one `(t, h, w)` per TOKEN row (multimodal §6.3).
+    ///
+    /// [`Positions`](RuntimeInput::Positions) is one scalar per token row and
+    /// `elementwise.rope_mrope` reads a `[rows, 3]` rectangle, so before this
+    /// row existed THE MROPE OP WAS UNREACHABLE FROM ANY TEXT — it had no
+    /// feeder at all. Both qwen SKUs' `text_config.rope_parameters` state
+    /// `mrope_interleaved: true` with `mrope_section: [11, 11, 10]` (summing
+    /// to 32 = `rotary_dim/2`, which is what identifies it as the TRUNK's
+    /// rotation and not the tower's), and every lane carrying an image needs
+    /// it.
+    ///
+    /// **A SECOND STREAM AND NOT A WIDENED FIRST ONE.** A text lane's triple
+    /// is `(p, p, p)`, which is scalar rope to the last bit — so widening
+    /// `Positions` would have cost every fire of every SKU three times the
+    /// staging for a rectangle whose two extra columns repeat the first. It is
+    /// declared by the texts that rotate this way and by no others, and a load
+    /// whose plan does not name it reserves not one byte.
+    ///
+    /// **AND IT RIDES NO STAGING RING**, for [`Patches`](RuntimeInput::Patches)'
+    /// reason (multimodal §5.4): device bytes below the staged prefix, written
+    /// inside `enqueue` from a pageable vector and consumed by the rotation
+    /// launched behind it on the same stream.
+    MropePositions,
     /// Custom attention mask bits for a kv space; read by `attention.masked`.
     Mask { space: u32 },
     /// One geometry vector of a cache space; `space` matches the group the
@@ -112,6 +220,123 @@ pub enum RuntimeInput {
     /// zero-adapter fire's cost exactly zero: nothing is staged when no lane
     /// carries one.
     AdapterRoutes,
+    /// The fire's patch rows, pre-unfolded: `[Dim::Patches, C·T·P²]`, one row
+    /// per patch, every image of every lane concatenated in the fire's patch
+    /// order.
+    ///
+    /// **BARE, FOR `AdapterRoutes`' REASON, AND ON THE OTHER AXIS.** There is
+    /// one patch rectangle per fire the way there is one token rectangle, so
+    /// there is nothing to key it by; what makes it the second row axis is its
+    /// `Dim::Patches` leading dim and nothing else it carries.
+    ///
+    /// **PRE-UNFOLDED IS A CONTRACT DECISION, NOT AN OMISSION** (multimodal
+    /// §2). The submission ships patch vectors rather than pixels, so the
+    /// patch embed is the matmul+bias this IR already has and no convolution
+    /// op is owed; v1's decode and resize happen host-side under the rung
+    /// policy that fixes patches-per-image.
+    ///
+    /// **AND IT RIDES NO STAGING RING** (multimodal §5.4). A store layout may
+    /// not depend on the plan, so a depth-multiplied pinned reservation for a
+    /// vector a text-only load never fills would be paid by every load; patch
+    /// bytes are written inside the enqueue and consumed by kernels behind
+    /// them on the same stream. The same is true of the two vectors below,
+    /// which are cut from the same submission at the same instant.
+    Patches,
+    /// The patch axis's own indptr: `[Dim::ImagesPlus(1)]` `i32`, where image
+    /// `i`'s patch rows are `[segments[i], segments[i + 1])` of the fire's
+    /// patch rectangle. Read by `attention.dense`.
+    ///
+    /// **THE BOUNDS VECTOR THE SECOND AXIS OWES ITSELF.** `GeomKind::Indptr`
+    /// is the token rectangle's, keyed by a cache SPACE because a page table
+    /// is a property of an extent; this one is keyed by nothing for
+    /// [`AdapterRoutes`]'s reason — there is one patch rectangle per fire and
+    /// therefore one way to cut it into images, and a second spelling would
+    /// be the same vector interned twice and free to disagree with itself.
+    ///
+    /// [`AdapterRoutes`]: RuntimeInput::AdapterRoutes
+    PatchSegments,
+    /// Where each row of the tower's output lands in the TOKEN rectangle:
+    /// `i32`, one destination token row per tower row, read by
+    /// `layout.scatter_rows` as the embed merge.
+    ///
+    /// **THE ONE VECTOR THAT CROSSES THE TWO AXES, AND THE ONLY UNCHECKABLE
+    /// ONE.** `scatter_rows` is a copy with an index and no arithmetic: an
+    /// entry past the token rectangle is an out-of-bounds DEVICE WRITE that
+    /// the kernel cannot see and the arena does not fault on. So the fire path
+    /// validates this vector against the composition's row count before the
+    /// launch — refusal (i) of multimodal M-1e — which is a check the plan
+    /// cannot state and the kernel cannot make.
+    PatchRoutes,
+    /// **THE TOWER'S OWN POSITION STREAM**: `[Dim::Patches, 3]` `i32`, one
+    /// `(t, h, w)` per PATCH row (multimodal §6.3).
+    ///
+    /// `Qwen3_5VisionAttention.forward` rotates, and what it rotates by is
+    /// each patch's `(h, w)` in its own image's grid —
+    /// `get_vision_position_ids` over `Qwen3_5VisionRotaryEmbedding`. That is
+    /// the patch axis's fact and nothing on the token axis carries it: two
+    /// patches of two images may share a `(h, w)` and sit in different lanes,
+    /// and a lane's token positions say nothing about either.
+    ///
+    /// **BARE, LIKE ITS TWO NEIGHBOURS, AND CUT FROM THE SAME SUBMISSION.**
+    /// One patch rectangle per fire means one position stream over it; it is
+    /// staged beside [`Patches`](RuntimeInput::Patches),
+    /// [`PatchSegments`](RuntimeInput::PatchSegments) and
+    /// [`PatchRoutes`](RuntimeInput::PatchRoutes), in the same `enqueue`, on
+    /// no ring.
+    ///
+    /// The third column is the time axis, and the towers this campaign serves
+    /// leave it zero: an image is one frame, so `sections[0] == 0` in the
+    /// tower's [`MropeForm::Blocked`](crate::MropeForm::Blocked) rotation and
+    /// nothing reads the column. It is carried anyway because the rotation
+    /// reads `[rows, 3]` on both axes, and a two-wide patch stream would be a
+    /// second shape for one op to know about — the video case (`temporal_
+    /// patch_size`, out of scope by §4) is where the column starts moving.
+    PatchPositions,
+    /// **WHICH ROW OF THE LEARNED POSITION TABLE EACH PATCH READS**:
+    /// `[Dim::Patches]` `i32` on the native grid, `[Dim::Patches, taps]` when
+    /// the table is resampled (multimodal §9.2, text-wave III).
+    ///
+    /// §6.4 proposed baking the position embedding into the patch-embed GEMM
+    /// by widening the patch vector with a one-hot of the patch's index. That
+    /// does not survive its own arithmetic — the one-hot is
+    /// `num_position_embeddings` wide, so an image of 2304 patches would ship
+    /// 10.6 MiB of bf16 zeros to address a 3.4 MiB table, which is §5.4's own
+    /// objection word for word — and it could not express the resample at all,
+    /// because an import places bytes and does not compute them.
+    ///
+    /// **SO THE POSITION EMBED IS A GATHER, AND THE GATHER ALREADY EXISTS.**
+    /// `layout.embed` reads a table by an id vector and now types its output
+    /// off THAT VECTOR'S row space, so the same op serves both axes and the
+    /// exact-grid case costs one node:
+    /// `residual_add(layout::embed(ids, pos_embed, vocab), y)`.
+    ///
+    /// `taps` is the interpolation's width — 1 on the native grid, 4 for
+    /// bilinear, 16 for bicubic — and the text's own declaration states it, so
+    /// the shell reserves what the plan asks for and a native-grid tower pays
+    /// one i32 per patch row.
+    ///
+    /// Cut from the same submission as the four patch vectors beside it, and
+    /// staged on no ring for their reason.
+    PatchEmbedRows,
+    /// **HOW MUCH OF EACH TAP** — `[Dim::Patches, taps]` `f32`, read by
+    /// `layout.embed_weighted` (multimodal §9.2).
+    ///
+    /// The bilinear resample of the learned grid is four table rows summed
+    /// under four weights; `_interpolation_axis_taps_weights` computes both
+    /// per axis and the 2-D case is their outer product. The weights are the
+    /// PREPROCESSOR'S arithmetic — the resize policy already owns the grid —
+    /// so they arrive with the ids rather than being derived on the device.
+    ///
+    /// **A TEXT ON THE NATIVE GRID NEVER DECLARES THIS**, and then nothing is
+    /// reserved, nothing staged, and the plan reads
+    /// [`PatchEmbedRows`](RuntimeInput::PatchEmbedRows) through the plain
+    /// `layout.embed`. That is the cheap path, and it is cheap because it is
+    /// the absence of this row rather than a degenerate value of it.
+    ///
+    /// `f32` and not the activation element: these are geometry, the same way
+    /// a position is, and a weight quantised to bf16 would move the resample
+    /// by more than the gather it feeds.
+    PatchEmbedWeights,
 }
 
 /// Raggedness is not a `Ty` — a leading symbolic `Dim` means the value is

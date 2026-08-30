@@ -12,22 +12,51 @@ name = "engine_metal"
 path = "src/lib.rs"
 
 [dependencies]
+# The boot document's format, for `boot.rs` — this shell's own `[…]` tables,
+# read into its own `DeviceBoot`. The reader used to live in `runtime`, which
+# is where this line used to be; it moved with the code, because a crate that
+# parses into a type should be the crate that declares it.
+toml = "1.1"
 # The vocabulary the resolver routes on: `ValueDecl`, `Def`, `RuntimeInput`,
 # `ValueId` — and the six family enums the dispatch arms destructure.
 model-ir = { path = "../model-ir" }
-# The contract implemented — the six `Dispatch*` traits and `KernelError`.
-# Contract only: the walk written over it lives in the engine substrate
-# (`engine::fire::walk`) and is driven over this crate's `Run` from there.
-kernels = { path = "../kernels" }
+# `kernels` STOOD HERE for the contract this crate implements — the six
+# `Dispatch*` traits and `KernelError` — and the crate is gone. Both halves
+# went to `model-exec`, which is already below (the walk written over the
+# contract has always lived there and is driven over this crate's `Run` from
+# there), so this line was subtracted rather than replaced: the same names
+# arrive over an edge this manifest already declared.
 # The entries called and the handles resolved to: `Tensor`, `RaggedTensor`,
 # `KvPool`, `RecurrentPool`, the plan payloads, and the `dyn Encode` sink
 # that keeps this crate OS-portable.
 kernels-metal = { path = "../kernels-metal" }
 
+# The runtime↔engine contract: `trait Engine` and every noun its verbs take.
+# This shell IMPLEMENTS it; nothing here is re-exported onward.
+engine = { path = "../engine" }
+
 # The shared fire substrate: `compose`, `FireDescriptor`, `walk`, `EagerSink`
 # (palo design §6). The shell supplies the two traits and calls the walk; it
 # never re-implements one.
-engine = { path = "../engine" }
+model-exec = { path = "../model-exec" }
+
+# The ETA host half: launch-package adoption, the channel ring, the reference
+# pass. It was one crate with `model-exec` until the two were measured apart,
+# and this shell is the reason there is no umbrella left to depend on instead:
+# it uses BOTH halves, so a re-exporting parent would only have hidden which.
+eta-exec = { path = "../eta-exec" }
+
+# THE DEV EDGE THAT WAS ALSO A PRODUCTION EDGE ALL ALONG. Both crates sat
+# under `[dev-dependencies]` below with a note explaining that `program/` is
+# handed a `LaunchPackage` and never plans one — true, and not what the edge
+# was for. Production code here reads `eta_compiler::codegen::launch::
+# LaunchStagePlan` and `eta_ir::registry::Port`, and it reached them by
+# spelling the substrate crate, then the contract crate it re-exported, then
+# the IR: a re-export chain four crate names long whose only effect was to keep
+# this manifest looking cleaner than the code. The chain is gone, so the lines
+# are here.
+eta-compiler = { path = "../eta-compiler" }
+eta-ir = { path = "../eta-ir" }
 # `CompiledModel` — the artifact this shell walks: the region template, the class
 # table a descriptor's counts index, and the arena's static offsets. Metal
 # records nothing (design §6: "no record.rs"), so `CompiledModel` is read as a
@@ -35,7 +64,7 @@ engine = { path = "../engine" }
 model-compiler = { path = "../model-compiler" }
 # The residency half: `ModelContract` (the caller's, per decision #18),
 # `plan::compile` and the `Execution` that runs it against the checkpoint.
-model-loader = { path = "../model-loader" }
+checkpoint = { path = "../checkpoint" }
 
 # Metal itself, and the two crates it is spoken through. TARGET-gated rather
 # than feature-gated, which is the one place this manifest diverges from
@@ -49,6 +78,12 @@ model-loader = { path = "../model-loader" }
 # the walk included, is still type-checked by a plain workspace sweep.
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6"
+# The completion handler a committed command buffer is settled through
+# (`device::ctx::Frame::commit_async`). `addCompletedHandler:` takes an
+# Objective-C block and there is no other spelling of it: a shell that polled
+# `status` instead would need somebody to poll, and the whole point of the
+# asynchronous wave is that nobody is standing there.
+block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSString",
@@ -68,6 +103,8 @@ objc2-metal = { version = "0.3", default-features = false, features = [
     "MTLLibrary",
     "MTLBlitCommandEncoder",
     "MTLTypes",
+    # `MTLCommandBufferHandler` — the block `addCompletedHandler:` takes.
+    "block2",
     # The indirect command buffer plane (`crate::icb`): the buffer, the
     # per-slot compute command, and the `MTLAllocation` supertrait a resource
     # is declared resident through.
@@ -91,9 +128,3 @@ tokenizer = { path = "../tokenizer" }
 # projection that lets a stock safetensors snapshot BE one.
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-# The guest-program half's producer: a golden trace in, a `LaunchPackage` and
-# an emitted Metal kernel table out. A DEV edge — `program/` is handed the two
-# by its caller and never plans anything itself.
-tensor-compiler = { path = "../tensor-compiler" }
-# The container the goldens are stored as, and the profile they bind against.
-tensor-ir = { path = "../tensor-ir" }

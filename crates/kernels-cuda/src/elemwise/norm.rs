@@ -2,8 +2,8 @@
 //! IR variant. Selection (which unit, which element stamp) lives here, so
 //! the engine's dispatch arm stays destructure → resolve → call.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
@@ -22,12 +22,7 @@ const OFFSET_BANK: &str = "rmsnorm_plus_one";
 
 /// One block per normed span: whole rows when `head_dim` is zero, else one
 /// per head.
-fn rows_per_head(
-    op: &'static str,
-    rows: u32,
-    width: u32,
-    head_dim: u32,
-) -> Result<Launch, KernelError> {
+fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Result<Launch, Error> {
     nonzero(op, "rows", rows)?;
     if head_dim == 0 {
         return Ok(Launch::per_row(rows, BLOCK));
@@ -53,7 +48,7 @@ fn rows_per_head(
 /// One thread per element, flattened — refused rather than truncated when
 /// the extent outgrows a 32-bit launch, because a clamped grid would leave
 /// the tail unwritten.
-fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), KernelError> {
+fn elementwise(op: &'static str, t: Tensor) -> Result<(Launch, u64), Error> {
     let n = t.elements();
     let lanes = u32::try_from(n).map_err(|_| {
         refuse(
@@ -88,7 +83,7 @@ fn rms_row(
     y: &mut Tensor,
     per_head_dim: u32,
     eps: f32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let hidden = stated(
         op,
@@ -130,7 +125,7 @@ pub fn rmsnorm(
     weight: Tensor,
     eps: f32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     rms_row(
         ctx,
         "elementwise.rmsnorm",
@@ -150,7 +145,7 @@ pub fn rmsnorm_per_head(
     head_dim: u32,
     eps: f32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     rms_row(
         ctx,
         "elementwise.rmsnorm_per_head",
@@ -169,7 +164,7 @@ pub fn rmsnorm_plus_one(
     weight: Tensor,
     eps: f32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     rms_row(
         ctx,
         "elementwise.rmsnorm_plus_one",
@@ -189,7 +184,7 @@ pub fn rmsnorm_per_head_plus_one(
     head_dim: u32,
     eps: f32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     rms_row(
         ctx,
         "elementwise.rmsnorm_per_head_plus_one",
@@ -208,7 +203,7 @@ pub fn rmsnorm_no_scale(
     head_dim: u32,
     eps: f32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_no_scale";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let hidden = stated(
@@ -241,7 +236,7 @@ pub fn rmsnorm_gated(
     head_dim: u32,
     eps: f32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_gated";
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
@@ -283,7 +278,7 @@ pub fn rmsnorm_gated_by(
     heads: u32,
     eps: f32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_gated_by";
 
     const KDA_BLOCK_MIN: u32 = WARP;
@@ -328,7 +323,7 @@ pub fn rmsnorm_gated_by(
 }
 
 /// `y += x`, in place on `y` (the IR aliases `y_out` onto `y`).
-pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), KernelError> {
+pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.residual_add";
     let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, n) = elementwise(OP, *y)?;
@@ -340,7 +335,7 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), KernelEr
 }
 
 /// `out += bias` per row, in place on `out`.
-pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), KernelError> {
+pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.add_bias";
     let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     nonzero(OP, "rows", out.rows)?;
@@ -354,7 +349,7 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), KernelE
 }
 
 /// `x *= s` for a plan-stated scalar, in place on `x`.
-pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), KernelError> {
+pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.mul_scalar";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, n) = elementwise(OP, *x)?;
@@ -366,7 +361,7 @@ pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), KernelError> 
 }
 
 /// `x *= s` for a device-held scalar, in place on `x`.
-pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), KernelError> {
+pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.scale";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let (launch, n) = elementwise(OP, *x)?;
@@ -389,6 +384,6 @@ pub fn res_blend(
     eps: f32,
     proj: Tensor,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     crate::attn::res_blend(ctx, prefix, blocks, weight, eps, proj, y)
 }

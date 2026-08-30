@@ -8,6 +8,7 @@ use super::model::{Attn, AttnBanks, Model, Reading};
 pub struct Facts {
     pub qo_one: bool,
     pub masked: bool,
+    pub has_adapter: bool,
 }
 
 impl Facts {
@@ -18,6 +19,28 @@ impl Facts {
     pub fn masked() -> Predicate {
         Predicate::fact(1)
     }
+
+    /// **THE ADAPTER WINDOW** (palo design §8, §0; campaign A-6).
+    ///
+    /// A lane that routed its rows to a registered adapter. §8 puts the
+    /// correction "over the adapter window", and §0 defines a window as the
+    /// rows of the lanes whose word satisfies the guard — so the axis needs a
+    /// bit, and the bit is what makes it FREE when nobody uses it: a fire no
+    /// lane routed has zero rows in this class, `engine::fire::walk` skips a
+    /// zero-row region before it dispatches anything, and the correction costs
+    /// that fire no launch, no empty grid and no instruction. A `Guard::Always`
+    /// correction would instead launch two kernels per layer over every row of
+    /// every fire to add zero to them, which is 1.0x nothing.
+    ///
+    /// **BIT TWO, AND THE POSITION IS DELIBERATE.** The masked window was
+    /// declared at bit one before this axis existed, and a word is what the
+    /// runtime hands the shell — renumbering it would move every masked lane's
+    /// class for no reason but tidiness. The correction is orthogonal to the
+    /// attention split anyway: it reads no plan and takes no arm of the merge,
+    /// so where its bit sits changes nothing but the arithmetic of the word.
+    pub fn has_adapter() -> Predicate {
+        Predicate::fact(2)
+    }
 }
 
 impl Classify for Facts {
@@ -25,11 +48,14 @@ impl Classify for Facts {
         Facts {
             qo_one: r.query_len() == 1,
             masked: r.has_custom_mask(),
+            has_adapter: r.has_adapter(),
         }
     }
 
     fn word(&self) -> u64 {
-        self.qo_one as u64 | (self.masked as u64) << 1
+        u64::from(self.qo_one)
+            | (u64::from(self.masked) << 1)
+            | (u64::from(self.has_adapter) << 2)
     }
 }
 
@@ -147,6 +173,7 @@ impl ForwardHybrid for Model {
             )
         });
 
+        let routes = inputs.adapter_routes();
         for (l, w) in inputs.walk_layers(&m.layers) {
             let normed = ops::elemwise::rmsnorm(&y, &w.attn_norm, w.attn_norm_eps);
             let at = &w.attn;
@@ -256,6 +283,20 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
+            // **THE CORRECTION, OVER ITS WINDOW** (design §8, campaign A-6).
+            // One statement: the sublayer's output, plus this row's adapter's
+            // `B·(A·x)`, in place. No merge and no arm — the op writes THROUGH
+            // `o`'s arena column, so a class outside the window never runs the
+            // node and reads the uncorrected value at the same address, which
+            // is the identity for free.
+            //
+            // After the reduce and before `post_attn_norm`; `Layer::lora_a`'s
+            // own note argues both.
+            let o = {
+                let (adapted, _) = o.split(&Facts::has_adapter());
+                let (px, _) = normed.split(&Facts::has_adapter());
+                ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
+            };
 
             y = ops::elemwise::residual_add(
                 &ops::elemwise::rmsnorm(&o, &w.post_attn_norm, w.post_attn_norm_eps),
@@ -289,6 +330,16 @@ impl ForwardHybrid for Model {
                 let out = ops::elemwise::rmsnorm(&out, &lp.norm, lp.norm_eps);
 
                 y = ops::elemwise::scale(&lp.scalar, &ops::elemwise::residual_add(&out, &y));
+            }
+
+            // **THE PER-LAYER SCALAR, AFTER EVERYTHING THE LAYER DID.**
+            // `gemma4_text`'s decoder ends `h = h * self.layer_scalar`, after
+            // the PLE relay's own addition and not before it — so this is the
+            // same statement as the one closing the branch above, at the one
+            // site the branch does not run. See `model::Layer::scalar` for why
+            // exactly one of the two fires.
+            if let Some(scalar) = &w.scalar {
+                y = ops::elemwise::scale(scalar, &y);
             }
         }
 

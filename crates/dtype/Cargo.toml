@@ -1,0 +1,33 @@
+[package]
+name = "dtype"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The one element-type enum: what a weight plane, a kv page, a checkpoint tensor and a compute value all say when asked what they hold. A leaf crate — the enum, its width in bits, plain serde, no internal deps."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "dtype"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+# On by default, so every host consumer that named this crate before the
+# feature existed sees exactly what it saw. It is a feature at all for one
+# consumer: `eta-ir`, the crate a wasm guest imports, which is `no_std` with
+# its own `serde` off by default and takes this one with
+# `default-features = false`. `default-features = false` + `alloc` keeps the
+# `no_std` promise in the lib.rs header true even when the feature is on.
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = [
+    "alloc",
+    "derive",
+], optional = true }
+
+[dev-dependencies]
+serde_json = "1.0"

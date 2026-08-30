@@ -2,8 +2,8 @@
 //! queries to select which pages the main attention will read. One entry
 //! per IR variant, transcribed from the old INDEX claims.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::attn::kv;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
@@ -20,7 +20,7 @@ fn q_rope_block(n_heads: i32) -> u32 {
 
 /// The index pool stores whole key rows contiguously; its strides must
 /// spell exactly that, and an HND pool cannot.
-fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), KernelError> {
+fn pool_pitch(op: &'static str, pool: &KvPool, row: i32) -> Result<(), Error> {
     if pool.layout != 0 {
         return Err(refuse(
             op,
@@ -54,7 +54,7 @@ pub fn layernorm_rope(
     eps: f32,
     rope_dim: u32,
     theta: f32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.index_layernorm_rope";
     dtype_dispatch!(OP, k.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
@@ -86,7 +86,7 @@ pub fn rope(
     head_dim: u32,
     rope_dim: u32,
     theta: f32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.index_rope";
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     debug_assert_eq!(positions.dtype, Dtype::I32, "`{OP}` reads i32 positions");
@@ -121,7 +121,7 @@ pub fn kv_append(
     keys: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.index_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, k.data.dtype, { Bf16 => () });
@@ -152,7 +152,7 @@ pub fn topk(
     head_dim: u32,
     top_k: u32,
     selection: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.index_topk";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 page ids");

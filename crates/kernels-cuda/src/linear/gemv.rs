@@ -3,7 +3,7 @@
 //! architecture probe — Blackwell prefers shallow unrolls with more warps in
 //! flight.
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, refuse};
 
@@ -14,7 +14,7 @@ pub(crate) fn gemv_bf16(
     out: u64,
     n: i32,
     k: i32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     if n <= 0 || k <= 0 || k % 8 != 0 {
         return Err(refuse(
             "linear.gemv",

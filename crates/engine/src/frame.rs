@@ -231,7 +231,7 @@ impl Demand {
 pub trait Supply {
     /// What a refusal is spelled as. The shells speak their own fault type and
     /// the contract layer above them turns it into `Exhausted`/`Impossible`;
-    /// putting `engine_api::Error` here would push that translation down into
+    /// putting this crate's `Error` here would push that translation down into
     /// the arena code, which is the one place that genuinely knows only about
     /// bytes.
     type Error;

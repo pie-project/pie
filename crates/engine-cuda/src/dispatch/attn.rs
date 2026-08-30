@@ -2,14 +2,77 @@
 //! ssm, index, and pool arms, plus the plan-building prepare phase those
 //! launches ride on.
 
-use kernels::{DispatchAttention, KernelError};
 use kernels_cuda::attn::{self, fa2, index, mla, plan, pool};
+use kernels_cuda::attn_dense;
+use model_exec::{DispatchAttention, KernelError};
 use model_ir::{Attention, StructKind};
 
 use crate::run::{Run, StructSlot};
 
 impl DispatchAttention for Run<'_> {
     fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
+        self.attention(op).map_err(crate::error::kernel)
+    }
+}
+
+impl Run<'_> {
+    /// **THE CAPTURE ARM'S OBSERVATION** — one launch, or none at all.
+    ///
+    /// Returns `Ok(())` without touching a stream in every case that is not
+    /// an observation: a load with no slab, a fire no lane captured, and a
+    /// `prefill_lse` node the plan's `attn.scores` seam does not name. That
+    /// last one matters — a text may write a log-sum-exp for its own reasons,
+    /// and a node the seam did not declare owns no plane.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`kernels_cuda::attn_score::capture`] refuses: a sliding
+    /// window (the row would not be the softmax the eviction papers define),
+    /// a quantized key plane, a head this kernel is not stamped for.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_scores(
+        &mut self,
+        q: model_ir::ValueId,
+        plan: model_ir::ValueId,
+        cache: model_ir::ValueId,
+        window: Option<u32>,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        lse: model_ir::ValueId,
+    ) -> Result<(), kernels_cuda::Error> {
+        let Some(seat) = self.bindings().scores.clone() else {
+            return Ok(());
+        };
+        let Some(plane) = seat.plane_of(lse) else {
+            return Ok(());
+        };
+        let lane_offset = self.window().span.lane_offset;
+        let mut slab = seat.slab;
+        kernels_cuda::attn_score::capture(
+            self.ctx(),
+            self.ragged(q),
+            self.prefill_plan(plan),
+            &self.pool(cache),
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            seat.observe,
+            lane_offset,
+            seat.plane_stride,
+            plane,
+            crate::scores::KV_MAX,
+            &mut slab,
+        )
+    }
+
+    /// The arms themselves, in `kernels-cuda`'s error vocabulary and not
+    /// the contract's — which is what keeps each one a plain tail call with
+    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
+    /// above that lifts the family, and says why it is a call and not a
+    /// `From` impl.
+    fn attention(&mut self, op: &Attention) -> Result<(), kernels_cuda::Error> {
         match op {
             // ---- attention (anchor) ----
             // MENLO-SEAM (engine side): the op names its kv geometry as
@@ -204,6 +267,29 @@ impl DispatchAttention for Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
+            // THE TOWER'S ATTENTION, AND IT TAKES NOTHING THIS FAMILY'S
+            // OTHER ARMS TAKE: no pool, no plan slot, no window. `segments` is
+            // the patch axis's own indptr and `self.tensor` cuts it at the
+            // PATCH window, which is what makes one fire's images the ones
+            // this launch sees.
+            Attention::Dense {
+                q,
+                k,
+                v,
+                segments,
+                head_dim,
+                sm_scale,
+                o,
+            } => attn_dense::bidirectional(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*v),
+                self.tensor(*segments),
+                *head_dim,
+                *sm_scale,
+                &mut self.tensor(*o),
+            ),
             Attention::DecodeLse {
                 q,
                 plan,
@@ -234,18 +320,45 @@ impl DispatchAttention for Run<'_> {
                 sm_scale,
                 o,
                 lse,
-            } => attn::prefill_lse(
-                self.ctx(),
-                self.ragged(*q),
-                self.prefill_plan(*plan),
-                &self.pool(*cache),
-                *window,
-                *head_dim,
-                *kv_heads,
-                *sm_scale,
-                &mut self.tensor(*o),
-                &mut self.tensor(*lse),
-            ),
+            } => {
+                attn::prefill_lse(
+                    self.ctx(),
+                    self.ragged(*q),
+                    self.prefill_plan(*plan),
+                    &self.pool(*cache),
+                    *window,
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    &mut self.tensor(*o),
+                    &mut self.tensor(*lse),
+                )?;
+                // ── **THE OBSERVATION, BESIDE THE ARM THAT ALREADY RAN**
+                //    (`.wiki/alto/attn-score.md` §4: "the graph writes; the
+                //    epilogue reads").
+                //
+                //    MENLO-SEAM (engine side): the op names `o` and `lse` and
+                //    nothing else, because the per-key rectangle is not a
+                //    value another node consumes — it is what this layer paid
+                //    attention to, written into a slab the shell owns and the
+                //    epilogue binds. So the arm asks fire state for it, the
+                //    way the masked arm asks for its span table, and a load
+                //    that seats no slab launches nothing at all.
+                //
+                //    **THE NODE IS ASKED, NOT THE OP.** Which plane this
+                //    layer owns comes from the VALUE it writes, matched
+                //    against the plan's `attn.scores` exports — the same
+                //    reading `exports::writer_classes` takes, and the only
+                //    one that cannot be fooled by a text reusing
+                //    `prefill_lse` somewhere the seam does not name.
+                //
+                //    `lane_offset` is what turns this window's request number
+                //    into a fire lane, which is the slab's row space; a
+                //    window in two pieces (P4's split, the capturing-prefill-
+                //    beside-capturing-decode fire) therefore lands each piece
+                //    on its own lanes with no lane map anywhere.
+                self.capture_scores(*q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse)
+            }
             Attention::Sink {
                 o,
                 lse,

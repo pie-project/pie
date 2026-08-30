@@ -65,6 +65,20 @@
 //! As `serve_smoke.rs`: skipped at run time when the machine, the checkpoint
 //! or the tokenizer is missing, rather than `#[ignore]`d.
 //!
+//! **AND `#[ignore]` IS ON THEM NOW, WHICH REVERSES THAT.** The reading above
+//! was right about the risk and wrong about which box it meant. The one box in
+//! the fleet with a GPU is CI's self-hosted `pie-worker (engine-cuda)` job, and
+//! that job only ever BUILT these (`--no-run`) — so "the box that could run it"
+//! was a developer's machine, and what ran them was a plain `cargo test`. That
+//! cost 1580 s of a 1864 s workspace sweep across thirteen binaries, which is
+//! how a pre-push sweep becomes 31 minutes and then becomes a sweep nobody
+//! runs. Trading one gate for the whole suite is the worse bargain.
+//!
+//! The run-time skip stays — it is still what a developer sees when the
+//! snapshot is missing. What is added is that the sweep no longer waits for a
+//! model to load, and that the CUDA job now runs `-- --ignored` rather than
+//! only compiling. The gate did not weaken; it moved to the hardware.
+//!
 //! ```text
 //! RUSTFLAGS="--force-warn missing_docs" \
 //!   cargo test -p engine-cuda --features cuda-13 --test fold_gate -- --nocapture
@@ -173,6 +187,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(4, 256),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,
@@ -241,6 +256,7 @@ fn warm(millis: &[f64]) -> f64 {
 /// the disabled-library-node case — an all-decode fire through the folded
 /// exec against the keyed all-decode graph, byte for byte.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_folded_fire_says_token_for_token_what_a_keyed_fire_says() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the fold A/B") else {
@@ -354,6 +370,7 @@ fn alternating(
 /// token-identical to the keyed path's same fires, and once both are bound,
 /// revisiting captures nothing — the counters say rebind, not throwaway.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn an_absent_window_is_an_enable_bit_and_a_revisit_is_not_a_capture() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the fold's enable machinery") else {
@@ -477,6 +494,7 @@ fn steady_mixed(
 /// disabled — the attribution instrument for the all-decode column's gap,
 /// and one more identity surface while it is at it.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_steady_mixed_fire_folds_token_for_token_and_prices_the_zero_disabled_launch() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the fold's mixed steady state") else {
@@ -526,6 +544,7 @@ fn a_steady_mixed_fire_folds_token_for_token_and_prices_the_zero_disabled_launch
 /// column is where swaps replace rebinds), and whatever disable policy is
 /// the shipped default.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn one_load_three_modes_three_workloads_agree_and_the_table_says_what_each_costs() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the step-5 nine-cell gate") else {
@@ -591,6 +610,7 @@ fn one_load_three_modes_three_workloads_agree_and_the_table_says_what_each_costs
 /// bought. Tokens byte-identical across the arms, because the same bindings
 /// land on an exec either way.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_pipeline_takes_the_rebind_off_the_critical_path() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the pipelined revisit gate") else {
@@ -647,6 +667,7 @@ fn the_pipeline_takes_the_rebind_off_the_critical_path() {
 /// execution. `prebinds` moves, critical-path `rebinds` stops, tokens match
 /// the unhinted arm exactly.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_stated_next_fire_is_bound_under_the_running_one() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the prebind gate") else {
@@ -764,6 +785,7 @@ fn a_stated_next_fire_is_bound_under_the_running_one() {
 /// empty computes garbage, and the token diff is where that surfaces), and
 /// prints the numbers the shipped default stands on.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_disable_policy_is_a_measurement_and_both_arms_say_the_same_tokens() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the disable-policy measurement") else {

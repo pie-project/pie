@@ -36,7 +36,7 @@
 //! F2b built the ring, so the default is **2** — article 1's floor, *at least
 //! two frames in flight* — and the number now arrives from the deployment:
 //! `[runtime] frame_dispatch_depth` crosses the load boundary once
-//! ([`engine_api::LoadRequest::frames_in_flight`]) and every pool downstream
+//! ([`crate::LoadRequest::frames_in_flight`]) and every pool downstream
 //! derives from it rather than re-declaring a depth of its own.
 
 /// **How far ahead of the device the host is allowed to be**, and every depth

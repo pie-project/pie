@@ -23,10 +23,10 @@
 //! NO DEVICE. `Windows::of` is arithmetic over a class table and a boundary
 //! vector; nothing here opens a context, allocates, or launches.
 
-use engine::fire::{Lane, MaskSpan, WindowTable, compose, fallback};
 use engine_cuda::window::Windows;
 use model_compiler::{CompiledModel, Budget, DeviceProfile, compile};
 use model_dsl::Platform;
+use model_exec::fire::{Lane, MaskSpan, WindowTable, compose, fallback};
 use model_ir::Trace;
 
 /// The SKU whose `captures_scores` window P4 withdraws, and the one the
@@ -96,6 +96,7 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
         &plan,
         &compiled,
         fire.classes(),
+        fire.patch_classes(),
         &boundaries,
         engine_cuda::window::Copies::off(),
     )
@@ -175,7 +176,7 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
     let count = compiled.classes.classes.len();
     let ascending = WindowTable::new(
         (0..count)
-            .map(|at| engine::fire::ClassWindow {
+            .map(|at| model_exec::fire::ClassWindow {
                 row_offset: at as u32,
                 rows: 1,
                 lane_offset: at as u32,
@@ -201,6 +202,7 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
         &plan,
         &compiled,
         &ascending,
+        &WindowTable::default(),
         &indptr(&vec![1; count]),
         engine_cuda::window::Copies::off(),
     )

@@ -88,7 +88,6 @@ def build_config(args: argparse.Namespace, port: int):
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
-        "speculation_depth": args.speculation_depth,
         # Admission is scheduling, so the cap rides with the batching knobs.
         "max_concurrent_processes": max_concurrent,
     }
@@ -291,8 +290,6 @@ def main() -> None:
                         help="Scheduler token-admission limit (match pie_bench).")
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0,
                         help="Scheduler admission oversubscription (match pie_bench).")
-        sp.add_argument("--speculation-depth", type=int, default=None,
-                        help="Pass-level chain-firing depth (hides guest<->host per-step round-trip).")
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--dump-first-text", action="store_true",
                         help="Decode + print the first request's output (spot-check).")

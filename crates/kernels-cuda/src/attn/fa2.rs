@@ -6,7 +6,7 @@
 //! fired at cannot drift apart. Selection lives here, below the entries
 //! (decision #13) — a dispatch arm never sees a lattice point.
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::attn::fa2_abi::{DecodeParams, Partials, PrefillPagedParams};
 use crate::attn::plan::Device;
@@ -44,7 +44,7 @@ pub enum PrefillArm {
 /// One fa2 head width outside the stamped lattice, refused before NVRTC
 /// ever sees a name for it. The geometry derivations bound most shapes on
 /// their own; this is the belt over those braces.
-fn instantiated(op: &'static str, head_dim: u32) -> Result<(), KernelError> {
+fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     if crate::attn::plan::head_dim_instantiated(head_dim) {
         return Ok(());
     }
@@ -66,7 +66,7 @@ fn decode_symbol(
     op: &'static str,
     g: &DecodeGeometry,
     arm: DecodeArm,
-) -> Result<&'static str, KernelError> {
+) -> Result<&'static str, Error> {
     instantiated(op, g.head_dim)?;
     let (variant, params) = match arm {
         DecodeArm::Full => ("VariantFull", "DecodeParams"),
@@ -95,7 +95,7 @@ fn prefill_symbol(
     op: &'static str,
     g: &PrefillGeometry,
     arm: PrefillArm,
-) -> Result<&'static str, KernelError> {
+) -> Result<&'static str, Error> {
     instantiated(op, g.head_dim)?;
     let (mask, variant, params) = match arm {
         PrefillArm::CausalFullSoftcap => ("kCausal", "VariantFullSoftcap", "PrefillParams"),
@@ -159,7 +159,7 @@ pub(crate) fn decode(
     op: &'static str,
     at: DecodePoint,
     params: &DecodeParams,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let geometry =
         DecodeGeometry::derive(op, at.head_dim, at.group_size, KvWidth::BF16, &at.device)?;
 
@@ -181,7 +181,7 @@ pub(crate) fn prefill(
     op: &'static str,
     at: PrefillPoint,
     params: &PrefillPagedParams,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let geometry = PrefillGeometry::derive(
         op,
         at.head_dim,
@@ -281,7 +281,7 @@ fn merge_varlen_inst(head_dim: u32) -> Option<&'static str> {
     )))
 }
 
-fn no_merge_row(op: &'static str) -> KernelError {
+fn no_merge_row(op: &'static str) -> Error {
     refuse(
         op,
         "no cascade merge is stamped at this head width -- 64, 128, 256 and 512 are here",
@@ -330,7 +330,7 @@ fn merge_blocks_per_sm(_instantiation: &'static str, _smem: u32) -> u32 {
 /// Folds a split schedule's partial planes into the final output. `Ok` on a
 /// non-split plan is a bug in the caller, not here — the entries call this
 /// only under `info.split_kv`.
-pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), KernelError> {
+pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), Error> {
     let head_dim = split.head_dim;
     let (_, bdx, bdy) = merge_geometry(head_dim).ok_or_else(|| no_merge_row(op))?;
     let smem = merge_smem_bytes(head_dim).ok_or_else(|| no_merge_row(op))?;
@@ -484,7 +484,7 @@ impl DecodeGeometry {
         group_size: u32,
         kv: KvWidth,
         dev: &Device,
-    ) -> Result<Self, KernelError> {
+    ) -> Result<Self, Error> {
         if head_dim == 0 {
             return Err(refuse(op, "fa2 decode head_dim is zero (decode.cuh:762)"));
         }
@@ -600,7 +600,7 @@ impl PrefillGeometry {
         kv: KvWidth,
         use_fp16_qk_reduction: bool,
         dev: &Device,
-    ) -> Result<Self, KernelError> {
+    ) -> Result<Self, Error> {
         if !matches!(cta_tile_q, 16 | 32 | 64 | 128) {
             return Err(refuse(
                 op,

@@ -30,8 +30,8 @@
 
 /// tart (0.3 re-port step 1): whether the bound container carries
 /// attention-stage programs — the fire planner's hook divergence fact.
-fn container_has_attention_stages(container: &tensor_ir::container::TraceContainer) -> bool {
-    use tensor_ir::registry::Stage;
+fn container_has_attention_stages(container: &eta_ir::container::TraceContainer) -> bool {
+    use eta_ir::registry::Stage;
     container
         .stages
         .iter()
@@ -46,7 +46,7 @@ fn container_has_attention_stages(container: &tensor_ir::container::TraceContain
 // appears in engine-metal only as a capability bit it answers `false` to), so
 // the question has no asker. Deleted with the rule (alto E).
 
-fn container_has_lora_sink(container: &tensor_ir::container::TraceContainer) -> bool {
+fn container_has_lora_sink(container: &eta_ir::container::TraceContainer) -> bool {
     container
         .stages
         .iter()
@@ -54,7 +54,7 @@ fn container_has_lora_sink(container: &tensor_ir::container::TraceContainer) -> 
         .any(|op| {
             matches!(
                 op,
-                tensor_ir::op::Op::SinkCall { name, .. }
+                eta_ir::op::Op::SinkCall { name, .. }
                     if container.names.get(*name as usize).map(String::as_str) == Some("lora")
             )
         })
@@ -74,14 +74,14 @@ use wasmtime::component::Resource;
 
 pub use context::FireContext;
 
-use tensor_ir::registry::{GeometryClass, Port, PortMask};
+use eta_ir::registry::{GeometryClass, Port, PortMask};
 
 use crate::pipeline::Pipeline;
 use crate::pipeline::channel::{BoundCells, Channel, ChannelError};
 use crate::pipeline::instance::ForwardPass;
 use crate::store::kv::working_set::{KvFireLease, KvWorkingSet};
 use crate::store::rs::working_set::RsWorkingSet;
-use tensor_ir::container::HostRole;
+use eta_ir::container::HostRole;
 
 /// A pass's in-flight fires, submit order. The queue mutex is never held across
 /// an await; the async finalizer gate serializes pop-through-finalize instead.
@@ -1330,7 +1330,7 @@ impl TicketReservation {
             return;
         }
         let mut adopted = true;
-        let tickets: Vec<engine_api::Ticket> = self
+        let tickets: Vec<engine::Ticket> = self
             .cells
             .iter()
             .zip(&self.heads)
@@ -1340,7 +1340,7 @@ impl TicketReservation {
                 adopted &= cell
                     .endpoint()
                     .is_some_and(|endpoint| endpoint.registered().adopted());
-                engine_api::Ticket {
+                engine::Ticket {
                     channel: cell.global_id,
                     expected_head: head,
                     expected_tail: tail,
@@ -1480,6 +1480,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             attn_mask,
             accesses,
             decode_envelope,
+            p_reads_attn_score,
         ) = {
             let p = ctx.resources().get_mut(&fwd)?;
             if let Some(e) = &p.failed {
@@ -1549,6 +1550,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             };
             crate::probe_fire_record!(submit_probe.geometry_us, geometry_clock.elapsed());
             let accesses = p.instance.program.channel_accesses.clone();
+            let reads_attn_score = p.instance.program.reads_attn_score;
             (
                 geometry,
                 p.cells.clone(),
@@ -1563,6 +1565,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 attn_mask,
                 accesses,
                 p.decode_envelope.clone(),
+                reads_attn_score,
             )
         };
         let mut req = crate::engine::FireRequest::default();
@@ -1578,6 +1581,26 @@ pub async fn submit_pass_stamped<C: FireContext>(
         // lowering under test) leave the flag false and submit exactly the
         // fire they always did.
         req.boundary_program = true;
+        // **AND A PROGRAM THAT READS THE SCORES IS A CAPTURING LANE**
+        // (`.wiki/alto/attn-score.md` §4, wave S1). The capture bit was
+        // hard-`false` on every path in this crate under a note saying the
+        // port vocabulary named no capture port — and the note was right and
+        // the port was never the answer. The observability contract is that
+        // the graph writes and the EPILOGUE reads, so the ask and the read
+        // are one act: an attached program that materializes
+        // `IntrinsicId::AttnScore` is asking, and one that does not is not.
+        //
+        // Stamped on every lane of the member, because a member firing three
+        // row groups is one bound instance running one pass and its epilogue
+        // is pointed at the first lane's block — but the capture arm writes
+        // whichever lanes the fire seats, and `Fault::ScoreWord` refuses a
+        // lane whose word and whose ask disagree, so the two readings have to
+        // be the same reading.
+        if p_reads_attn_score {
+            for lane in &mut req.lanes {
+                lane.captures_scores = true;
+            }
+        }
         // A CLASS AND NOT A BOOL, and the bool beside it is gone (alto E).
         // `device_resolved_geometry` said the same fact with two values where
         // there are three ways to read a fire's geometry; its only readers
@@ -3021,8 +3044,8 @@ async fn fire_device_geometry<C: FireContext>(
         let p = ctx.resources().get(&fwd)?;
         let bound = &p.instance.program.bound;
         let channel_bound_mask = bound.container.ports.iter().any(|binding| {
-            binding.port == tensor_ir::registry::Port::AttnMask
-                && matches!(binding.source, tensor_ir::container::PortSource::Channel(_))
+            binding.port == eta_ir::registry::Port::AttnMask
+                && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
         });
         if channel_bound_mask {
             Ok(geometry::FireAttnMask::Device)
@@ -3430,15 +3453,15 @@ mod lifecycle_tests {
 mod static_admission_tests {
     use super::*;
     use crate::pipeline::channel::ChannelCell;
-    use tensor_ir::container::ChannelDecl;
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::container::ChannelDecl;
+    use eta_ir::types::{Dtype, Shape};
 
     /// One bound channel: a cell with a role, a capacity and a seeded flag.
     fn channel(role: HostRole, capacity: u32, seeded: bool) -> Arc<Mutex<ChannelCell>> {
-        let mut cell = ChannelCell::new(vec![1], DType::U32, capacity);
+        let mut cell = ChannelCell::new(vec![1], Dtype::U32, capacity);
         cell.bind(&ChannelDecl {
             shape: Shape::new(&[1]).expect("a one-element cell"),
-            dtype: tensor_ir::container::ChanDType::Concrete(DType::U32),
+            dtype: eta_ir::container::ChanDType::Concrete(Dtype::U32),
             capacity,
             host_role: role,
             seeded,

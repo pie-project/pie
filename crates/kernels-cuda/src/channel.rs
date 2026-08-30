@@ -71,7 +71,7 @@
 //! structure that disagrees with the kernel reading it fails as a wrong ring
 //! index, not as a crash.
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::jit::{ArgValue, Ctx, Fire, Launch};
 
@@ -464,7 +464,7 @@ pub fn pull_validate(
     tickets: DevicePtr,
     lanes: DevicePtr,
     lane_count: u32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "channel.pull_validate";
     // A wave with no host-visible endpoint has no admission decision to make.
     // Nothing to enqueue is not a refusal (dev: `if (lanes.empty()) return`).
@@ -495,7 +495,7 @@ pub fn pull_validate(
 /// Enqueue this AFTER the kernels that wrote the cells, on the same stream:
 /// the launch boundary between them is what orders payload before tail, and it
 /// is the only thing that does (see the module header).
-pub fn commit_bump(ctx: &Ctx, lanes: DevicePtr, lane_count: u32) -> Result<(), KernelError> {
+pub fn commit_bump(ctx: &Ctx, lanes: DevicePtr, lane_count: u32) -> Result<(), Error> {
     const OP: &str = "channel.commit_bump";
     if lane_count == 0 {
         return Ok(());
@@ -534,7 +534,7 @@ pub fn scatter_publish(
     tickets: DevicePtr,
     lanes: DevicePtr,
     lane_count: u32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "channel.scatter_publish";
     // A wave with nothing outward-bound has nothing to publish, and that is
     // not a refusal — the same reading `pull_validate` gives an empty wave.
@@ -584,7 +584,7 @@ pub fn settle(
     tickets: DevicePtr,
     lanes: DevicePtr,
     lane_count: u32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "channel.settle";
     // A wave with no host-visible endpoint has no counter to advance, and
     // that is not a refusal — the same reading every other kernel here gives
@@ -626,7 +626,7 @@ pub fn mask_from_commit(
     indptr: DevicePtr,
     mask: DevicePtr,
     lane_count: u32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "channel.mask_from_commit";
     if lane_count == 0 {
         return Ok(());

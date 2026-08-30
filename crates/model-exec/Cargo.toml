@@ -1,0 +1,83 @@
+[package]
+name = "model-exec"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The model forward substrate, in Rust: lane composition, the fire descriptor, the artifact walk, the paged kv geometry and the seat law. Device-free — the CUDA and Metal shells both read it."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "model_exec"
+path = "src/lib.rs"
+
+# This crate can afford the workspace lints in full, and that is the point of
+# it being a crate. `engine-metal` and `engine-cuda` both opt OUT of
+# `[lints] workspace = true` because `unsafe_code = "forbid"` is violated by
+# construction — every objc2 message send, every `cudarc::*::sys` call. Nothing
+# here sends a message or calls a driver: the whole layer is arithmetic over
+# `#[repr(C)]` records and `Vec`s. So the forbid is free, and it is worth
+# having, because it is the mechanical proof of the claim this crate makes:
+# that the model forward path needs no device.
+[lints]
+workspace = true
+
+[dependencies]
+# THE ARTIFACT THE FIRE WALKS, and the arrow points this way on purpose.
+# `compile(plan, budgets, profile) -> CompiledModel` is pure and knows nothing about a
+# engine; `model_exec::fire::walk` iterates what it produced. Every shell then
+# holds the two together — the `Plan` for its nodes, the `CompiledModel` for the
+# regions over them — which is the arrangement `model_compiler::baked`'s own
+# docs describe, and the reason `walk` takes both.
+model-compiler = { path = "../model-compiler" }
+
+# The vocabulary both ends of that walk are written in: `Plan`, `Node`,
+# `ClassSet`, `Operation`. It arrives through model-compiler's public types
+# anyway -- a `Region::mask` IS a `model_ir::ClassSet` -- so naming it directly
+# is what lets this crate spell the types it is already handed, rather than
+# reaching for them one re-export deep.
+model-ir = { path = "../model-ir" }
+
+# `kernels` STOOD HERE, and the line is gone because the crate is. It held the
+# dispatch contract and ONLY the contract -- six `Dispatch*` traits, the
+# aggregate `exec`, and `KernelError` -- 141 lines over three files, and it was
+# two unrelated things sharing a manifest. `dispatch.rs` needed `model-ir` and
+# had exactly one caller in the workspace, `fire::walk` in this crate;
+# `error.rs` needed a `Dtype` and was named by the two kernel libraries and by
+# nothing else. Nothing connected them but the manifest.
+#
+# So each half went to the crate its consumers already point at. The contract
+# is `src/dispatch.rs` here, beside its one call site, and `KernelError` is in
+# `src/error.rs` beside the `Error::Kernel` that has always carried it. The
+# kernel libraries kept an `Error` of their own and lost their last edge to
+# anything above them.
+#
+# **The old comment's argument survives and is not what moved.** It said a
+# contract crate that knew what a compiler is would invert the layering every
+# backend depends on (palo decisions #11 and #12), which is why the WALK could
+# not live in `kernels`: it reads `CompiledModel`'s regions. That is still
+# true, and it is still why the walk is here. What the decisions never ruled on
+# is where the trait's file sits once the walk is already in that crate --
+# `src/dispatch.rs`'s header states the difference, and the measurement behind
+# it is that no crate gained an edge in the move. Five lost one.
+
+# WHAT IS NOT HERE, AND USED TO BE. The crate this one was carved out of held
+# `eta-ir`, `eta-compiler` and the engine contract as well, because the guest-
+# program plane was subletting inside it. That plane is `eta-exec` now. The
+# cross-references between the two halves were zero on the day they parted, so
+# nothing above replaces an edge below — the three lines simply left with the
+# code that named them, and this crate's floor is the model toolchain alone.
+
+[dev-dependencies]
+# THE REAL CATALOG, for the same reason `model-compiler` takes it: every unit
+# test in `src/fire/` builds its plan by hand, which checks this crate against
+# this crate's own idea of what a fire looks like. The catalog adds the one
+# thing a fixture cannot -- six model texts somebody else wrote, four platforms,
+# sixty layers of nested split and merge -- and `tests/every_sku_walks_its_
+# classes.rs` walks all of them with a mock `Dispatch` and no GPU in the room.
+#
+# A DEV EDGE ONLY, AND IT DOES NOT CYCLE: `model` reads `model-dsl`,
+# `checkpoint` and `tokenizer`, and none of the three names this crate.
+model = { path = "../model" }
+model-dsl = { path = "../model-dsl" }

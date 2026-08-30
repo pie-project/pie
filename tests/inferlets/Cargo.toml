@@ -33,6 +33,7 @@ members = [
     "context-aware-decoding",
     "sampling-primitives",
     "sliding-window-attention",
+    "snapkv-eviction",
     "tail-free-sampling",
     "text-completion",
     "text-completion-bench",

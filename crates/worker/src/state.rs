@@ -28,7 +28,7 @@ use std::path::PathBuf;
 ///
 /// Named here — the one filename this module spells out — because it is the
 /// only thing under `cache/` that a boot does **not** re-derive. Every sibling
-/// (compiled PTIR, GEMM autotuning) is rebuilt on the next cold start; this
+/// (compiled ETA, GEMM autotuning) is rebuilt on the next cold start; this
 /// file is written *only* by a boot that was explicitly asked to calibrate,
 /// which is stage one of `pie config tune` and costs a dedicated bootstrap
 /// that serves nothing. Clearing it with the rest would look like reclaiming a
@@ -126,7 +126,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
             // below, because it is the one thing here a cold boot does not
             // rebuild. The claim "deleting costs one cold rebuild" is true of
             // what is left, and was false while it covered the profile.
-            what: "Engine-side disk caches: compiled PTIR modules, GEMM \
+            what: "Engine-side disk caches: compiled ETA modules, GEMM \
                    autotuning results. All keyed and self-invalidating; \
                    deleting costs one cold rebuild.",
             reclaim: Reclaim::Safe,

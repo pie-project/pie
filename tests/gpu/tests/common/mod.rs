@@ -357,7 +357,10 @@ pub fn mtp_draft_tokens(default_k: u32) -> u32 {
 // `cuda_grammar_op`, `cuda_grammar_late`) went with the engine-baked sampler
 // plane it was written for, and what asks that question now is
 // `engine-cuda/tests/program_parity` (the emitted guest kernels diffed against
-// the host interpreter, ring for ring) and `runtime/tests/cuda_program_epilogue`.
+// the host interpreter, ring for ring). It was two: runtime/tests/cuda_program_
+// epilogue asked the same question through the serving stack, and was deleted
+// as misplaced -- it drove `Engine::submit` directly with no runtime above it,
+// so it lived in a crate it did not test.
 //
 // The gates that still submit a guest build it themselves against
 // `tests/inferlets`, one package each, which is what lets a harness name the

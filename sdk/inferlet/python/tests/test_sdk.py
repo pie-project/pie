@@ -5,7 +5,7 @@ SCOPE NOTE: these cover the non-forward interfaces only. That is not an
 omission -- it is the SDK's entire surface right now. The forward-pass
 interfaces (`forward` / `forward-recurrent` / `forward-hybrid` plus `channel`,
 `working-set`, `pipeline`) have no Python counterpart, because the guest now
-ships PTIR container bytes and the encoder that produces them exists only in
+ships ETA container bytes and the encoder that produces them exists only in
 Rust. `scripts/check-sdk-interfaces.sh` fails on exactly that, deliberately,
 and blocks publishing until it is fixed.
 

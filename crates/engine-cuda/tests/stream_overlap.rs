@@ -65,6 +65,7 @@ struct Block {
 }
 
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_three_class_fire_says_the_same_thing_with_the_streams_on_and_here_is_the_cost() {
     let _serial = gemma::serialized();
     if gemma::ready_or_skip("the stream overlap gate").is_none() {
@@ -194,6 +195,7 @@ fn the_three_class_fire_says_the_same_thing_with_the_streams_on_and_here_is_the_
 /// "this SKU has almost nothing to overlap" is as much a result as the one
 /// that says otherwise.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_qwen_decode_beside_a_prefill_says_the_same_thing_with_the_streams_on() {
     let _serial = gemma::serialized();
     if qwen::ready_or_skip("the qwen stream gate").is_none() {
@@ -272,7 +274,7 @@ mod gemma {
     use std::sync::{Mutex, MutexGuard, PoisonError};
     use std::time::Instant;
 
-    use engine::engine_api::fire::{Mask, Masking};
+    use engine::fire::{Mask, Masking};
     use engine_cuda::{Boot, Seated, Shell};
     use model_compiler::{Budget, DeviceProfile};
     use model_dsl::{Classify, Platform, Request};
@@ -376,6 +378,7 @@ mod gemma {
             contract: &contract,
             checkpoint: &checkpoint,
             budget: Budget::new(4, 768),
+            patches: None,
             profile: Some(DeviceProfile {
                 sms: 142,
                 side_streams,
@@ -387,7 +390,7 @@ mod gemma {
             ordinal: 0,
             // **RECORDED, BECAUSE A FORK ONLY EXISTS IN A GRAPH.** The eager
             // walk is the serialization of the same DAG by construction
-            // (`engine::fire::EagerSink`), so an eager arm would measure
+            // (`model_exec::fire::EagerSink`), so an eager arm would measure
             // nothing and prove nothing.
             graphs: engine_cuda::Graphs::On,
             knobs: engine_cuda::Knobs::default(),
@@ -592,6 +595,7 @@ mod qwen {
             contract: &contract,
             checkpoint: &checkpoint,
             budget: Budget::new(4, 256),
+            patches: None,
             profile: Some(DeviceProfile {
                 sms: 142,
                 side_streams,

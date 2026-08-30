@@ -11,8 +11,8 @@
 //! the scan reads the planes. Both launches ride the same stream, so the
 //! staging is ordered like everything else and nothing synchronises.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
@@ -41,7 +41,7 @@ const fn kda_shmem(d: u32) -> u32 {
 /// boundary vector is driver-assembled, not an operand the validator sees,
 /// so a wrong dtype is refused, not asserted (the boundary rule at
 /// [`refuse`]).
-fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, KernelError> {
+fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, Error> {
     if x.indptr.dtype != Dtype::I32 {
         return Err(refuse(
             op,
@@ -58,7 +58,7 @@ fn requests(op: &'static str, x: RaggedTensor) -> Result<u32, KernelError> {
 }
 
 /// A named f32 scratch plane, returned as the address the launch binds.
-fn plane(ctx: &Ctx, op: &'static str, name: &'static str, elems: u64) -> Result<u64, KernelError> {
+fn plane(ctx: &Ctx, op: &'static str, name: &'static str, elems: u64) -> Result<u64, Error> {
     let bytes = elems.checked_mul(u64::from(FLOAT)).ok_or_else(|| {
         refuse(
             op,
@@ -92,7 +92,7 @@ fn seated(
     mask: bool,
     commit: bool,
     begin: bool,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     if !mask && !state.write_state_mask.is_absent() {
         return Err(refuse(
             op,
@@ -135,7 +135,7 @@ fn conv_extents(
     x: Tensor,
     y: &Tensor,
     conv_width: u32,
-) -> Result<(u32, i32, i32), KernelError> {
+) -> Result<(u32, i32, i32), Error> {
     let channels = nonzero(op, "the conv's channel count", x.width)?;
     debug_assert!(
         y.rows == x.rows && y.width == x.width,
@@ -158,7 +158,7 @@ pub fn causal_conv1d(
     state: &RecurrentPool,
     conv_width: u32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let (channels, c, k) = conv_extents(OP, x, y, conv_width)?;
@@ -200,7 +200,7 @@ pub fn causal_conv1d_chunked(
     state: &RecurrentPool,
     conv_width: u32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d_chunked";
 
     const CHANNEL_TILE_FROM: u32 = 8;
@@ -265,7 +265,7 @@ pub fn gdn_prep(
     dt_bias: Tensor,
     a_log: Tensor,
     gates: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gdn_prep";
     dtype_dispatch!(OP, ba.dtype, { Bf16 => () });
     debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
@@ -335,7 +335,7 @@ impl Delta {
         v_heads: u32,
         k_dim: u32,
         v_dim: u32,
-    ) -> Result<Self, KernelError> {
+    ) -> Result<Self, Error> {
         nonzero(op, "the key heads this statement states", k_heads)?;
         nonzero(op, "the value heads this statement states", v_heads)?;
         nonzero(op, "the key head width this statement states", k_dim)?;
@@ -384,7 +384,7 @@ impl Delta {
         op: &'static str,
         qkv: Tensor,
         gates: Tensor,
-    ) -> Result<DeltaStaged, KernelError> {
+    ) -> Result<DeltaStaged, Error> {
         let key = self.elems(self.k_heads, self.k_dim);
         let val = self.elems(self.v_heads, self.v_dim);
         let decay = self.elems(self.v_heads, 1);
@@ -454,7 +454,7 @@ pub fn gated_delta(
     k_dim: u32,
     v_dim: u32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta";
 
     /// Both head widths at exactly this hit the shared-memory arm.
@@ -524,7 +524,7 @@ pub fn gated_delta_chunked(
     k_dim: u32,
     v_dim: u32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_gated_delta_chunked";
 
     const BK_MAX_FLA: u32 = 128;
@@ -705,7 +705,7 @@ impl Kda {
         y: &Tensor,
         heads: u32,
         head_dim: u32,
-    ) -> Result<Self, KernelError> {
+    ) -> Result<Self, Error> {
         nonzero(op, "the KDA heads this statement states", heads)?;
         nonzero(op, "the KDA head width this statement states", head_dim)?;
         let width = heads.checked_mul(head_dim).ok_or_else(|| {
@@ -752,7 +752,7 @@ impl Kda {
         dt_bias: Tensor,
         a_log: Tensor,
         norm_eps: f32,
-    ) -> Result<KdaStaged, KernelError> {
+    ) -> Result<KdaStaged, Error> {
         /// q, k, v — the prep's grid-y axis.
         const PLANES: u32 = 3;
 
@@ -818,7 +818,7 @@ pub fn kda_step(
     head_dim: u32,
     norm_eps: f32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_step";
 
     const STEP_BLOCK: u32 = 256;
@@ -866,7 +866,7 @@ pub fn kda_chunked(
     head_dim: u32,
     norm_eps: f32,
     y: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_chunked";
 
     /// The widest block the prefill scan spans, in warps.

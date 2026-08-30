@@ -3,7 +3,7 @@
 //!
 //! # `palo B-remote`: what this module lost, and why it kept its shape
 //!
-//! Every verb that moved bytes lived on `engine_api::remote` —
+//! Every verb that moved bytes lived on `engine::remote` —
 //! `ExecutorRpcClient`, `ExecutorRequest`/`ExecutorResponse`, `PushKv`,
 //! `InlineKvPayload`, `RemoteEncode`, `RemoteEmbeddings`, `RemoteMediaBlob`,
 //! `ScratchGrant`, `REMOTE_WIRE_VERSION` — and the palo contract rewrite
@@ -25,7 +25,7 @@
 //!
 //! A registered peer is an `EngineId` like any other, and the engine behind it
 //! is `crate::engine::backend::remote::RemoteEngine`, which answers
-//! [`Error::Unsupported`](engine_api::Error::Unsupported) to
+//! [`Error::Unsupported`](engine::Error::Unsupported) to
 //! every verb with the peer named. That is the shape the rewrite asks for: a
 //! remote engine is *a `dyn Engine` whose envelope is the transport's*, and
 //! until the transport exists the runtime can see the peer, refuse to use it,
@@ -54,7 +54,7 @@ pub enum PartnerRole {
 /// How a peer's bytes are meant to reach this node.
 ///
 /// **A RUNTIME TYPE NOW, NOT A CONTRACT ONE.** It was
-/// `engine_api::RemoteTransferKind`, sitting in the contract beside the tarpc
+/// `engine::RemoteTransferKind`, sitting in the contract beside the tarpc
 /// service it selected a codec for. Which wire a deployment runs on is a
 /// deployment's decision and a transport's implementation; the runtime holds
 /// it because the runtime is what an operator configures.
@@ -167,7 +167,7 @@ impl Partner {
     /// serves, either the page BYTES (the old `InlineKvPayload`: a page-stride
     /// count, the destination page ids echoed back, and one flat buffer the
     /// caller splits per region) or an RDMA registration
-    /// ([`KvHandle`](engine_api::KvHandle) is serde and already says where a
+    /// ([`KvHandle`](engine::KvHandle) is serde and already says where a
     /// pool's regions are). It must also answer which one it used, because
     /// the caller's next act differs: an inline reply is imported region by
     /// region on the host; an RDMA push is already done when the reply
@@ -183,13 +183,13 @@ impl Partner {
     ///
     /// Always, until the envelope exists.
     ///
-    /// **`palo B-remote`**: [`MediaEncode`](engine_api::MediaEncode) is serde
+    /// **`palo B-remote`**: [`MediaEncode`](engine::MediaEncode) is serde
     /// and carries its own bytes, so the message is that type and the answer
     /// is the same value with `output_rows` filled. What the envelope must
     /// add is a SIZE policy — an encode is megabytes, the old code stood up a
     /// TCP blob server above four of them, and a frame limit is the
     /// transport's business rather than the contract's.
-    pub async fn encode(&self, plan: engine_api::MediaEncode) -> Result<engine_api::MediaEncode> {
+    pub async fn encode(&self, plan: engine::MediaEncode) -> Result<engine::MediaEncode> {
         let _ = plan;
         Err(self.no_transport("encode"))
     }
@@ -198,7 +198,7 @@ impl Partner {
         COUNTERS.remote_failure.fetch_add(1, Ordering::Relaxed);
         anyhow!(
             "partner {} cannot serve `{verb}`: the remote envelope \
-             `engine_api::remote` carried was deleted by the palo contract \
+             `engine::remote` carried was deleted by the palo contract \
              rewrite and its successor is palo B-remote",
             self.worker_id
         )
@@ -391,7 +391,7 @@ static SETTINGS: LazyLock<RwLock<OffloadSettings>> = LazyLock::new(|| {
 });
 static OFFLOAD_ENABLED: AtomicBool = AtomicBool::new(false);
 static ENCODE_INJECTION_ENABLED: AtomicBool = AtomicBool::new(false);
-static HOME_KV_HANDLE: LazyLock<RwLock<Option<engine_api::KvHandle>>> =
+static HOME_KV_HANDLE: LazyLock<RwLock<Option<engine::KvHandle>>> =
     LazyLock::new(|| RwLock::new(None));
 
 /// Turn prefill offload on, and say how long a suffix has to be to qualify.
@@ -413,15 +413,15 @@ pub fn configure_encode_injection(enabled: bool, hidden_size: u32) {
 /// Publish this node's own KV pool address, so a peer can be told where to
 /// write.
 ///
-/// Still meaningful with no transport: [`KvHandle`](engine_api::KvHandle) is
+/// Still meaningful with no transport: [`KvHandle`](engine::KvHandle) is
 /// a fact about this node's pool, and it is what a future envelope's hello
 /// hands over.
-pub fn set_home_kv_handle(handle: engine_api::KvHandle) {
+pub fn set_home_kv_handle(handle: engine::KvHandle) {
     *HOME_KV_HANDLE.write().unwrap() = Some(handle);
 }
 
 /// This node's own KV pool address, if an engine exported one.
-pub fn home_kv_handle() -> Option<engine_api::KvHandle> {
+pub fn home_kv_handle() -> Option<engine::KvHandle> {
     HOME_KV_HANDLE.read().unwrap().clone()
 }
 
@@ -525,7 +525,7 @@ pub(crate) async fn try_encode(request: &mut crate::engine::FireRequest) -> bool
     };
     if let Err(error) = guard
         .partner()
-        .encode(engine_api::MediaEncode::default())
+        .encode(engine::MediaEncode::default())
         .await
     {
         tracing::warn!(%error, "encode offload declined");
@@ -617,7 +617,7 @@ mod tests {
             "the refusal names the wave that owes the envelope: {error}"
         );
         let error = partner
-            .encode(engine_api::MediaEncode::default())
+            .encode(engine::MediaEncode::default())
             .await
             .expect_err("there is no transport");
         assert!(format!("{error}").contains("palo B-remote"), "{error}");

@@ -1,5 +1,5 @@
 //! THE forward path: guest-programmed pipelines. The wire format (the IR
-//! itself) lives in `tensor_ir`; this module is the runtime domain that
+//! itself) lives in `eta_ir`; this module is the runtime domain that
 //! binds/instantiates/fires it.
 //!
 //! - [`program`]: container bytes -> bind -> price -> cache; absorbs
@@ -15,7 +15,7 @@
 //!   `geometry`/`kv`/`rs`/`lease`.
 //!
 //! Layering: this module imports only `scheduler`/`store`/`engine` plus the
-//! `tensor_ir` IR crate and external leaf crates — never `inferlet`/`server`.
+//! `eta_ir` IR crate and external leaf crates — never `inferlet`/`server`.
 //! The WIT resource *types* live here because they hold domain state;
 //! `inferlet::host` owns only the thin `Host*` trait impls that push/get/
 //! delete them from the WASM component resource table.

@@ -19,9 +19,9 @@
 //! # The contract the wrapper cannot state, and how it is supplied
 //!
 //! [`LoadRequest`] carries `{ trace, checkpoint, budgets, ordinal }` and NOT a
-//! `ModelContract` — deliberately, because `engine-api`'s dependency floor is
-//! `model-ir`, `tensor-ir`, `serde`, `thiserror` (its own header), and a
-//! contract type in it would put `model-loader` in the graph of everyone who
+//! `ModelContract` — deliberately, because `engine`'s dependency floor is
+//! `model-ir`, `eta-ir`, `serde`, `thiserror` (its own header), and a
+//! contract type in it would put `checkpoint` in the graph of everyone who
 //! reads a `KvHandle`. But [`Weights::resident`](crate::weights::Weights)
 //! needs one: how a checkpoint's tensors become this plan's params is the
 //! MODEL's declaration, and the shell must not grow an arm per family to
@@ -39,35 +39,107 @@
 //! One pointer, resolved by the party that already links the catalog, and no
 //! model name anywhere in this crate outside its own dev-dependencies.
 //!
+//! # The settlement protocol, stated once
+//!
+//! This engine used to settle inside `submit`: every step committed a command
+//! buffer and blocked on it, `settles_asynchronously` was `false`, and the
+//! receipts came back with their readouts already filled. It answers two
+//! shapes now and the deployment's `frames_in_flight` chooses between them.
+//!
+//! ```text
+//! depth 1 (the eager shell, `Runahead::F1`)
+//!   submit  -> prepare/enqueue/settle each step, then `settle_frame` itself
+//!           -> returns with every readout filled; `settles_asynchronously`
+//!              is false and the runtime settles its own cells on the spot
+//!
+//! depth >= 2 (article 1's floor, and the default)
+//!   submit  -> prepare/enqueue/settle each step and RETURN, device running
+//!           -> receipts carry ids and EMPTY readouts
+//!   device  -> each command buffer's completion handler, on Metal's own
+//!              thread, publishes `StepOutcome` to `Engine::on_complete`'s
+//!              sink; that is what retires the frame for the runtime
+//!   numbers -> `Engine::settle_frame`, for a caller that came for them —
+//!              it waits for whatever the host has not caught up with and
+//!              reads the rows out of the arm's readout seat
+//! ```
+//!
+//! **A FRAME'S NUMBERS LIVE UNTIL THE FRAMES BEHIND IT TAKE ITS SEATS.** There
+//! are as many readout seats as there are arms, so `settle_frame` refuses a
+//! frame a later `submit` has displaced, by name — the bytes in that seat
+//! afterwards are a real logits row belonging to somebody else's step, and
+//! nothing about them looks wrong.
+//!
 //! # What this engine does not serve, and says so by name
 //!
 //! **EVERY ABSENCE BELOW IS A REFUSAL, NOT A SILENT DROP.** The metal
 //! [`Shell`] is genuinely smaller than the CUDA one — `Seated` is
-//! `{ lane, pages, held, mask }` and `Shell::fire_seated(&[Seated])` is the
-//! whole fire door — so this wrapper is handed submission fields that have
-//! nowhere on this plane to go. Dropping one would make an adapter-routed
-//! lane, a draft ask or a score capture *appear* to have been honoured and
-//! then answer the plain continuation, which is the failure mode the
-//! contract's "refusal is a value" section exists to prevent.
+//! `{ lane, pages, held, mask, adapter, positions }` and
+//! `Shell::fire_seated(&[Seated])` is the whole fire door — so this wrapper
+//! is handed submission fields that have nowhere on this plane to go.
+//! Dropping one would make a draft ask or a score capture *appear* to have
+//! been honoured and then answer the plain continuation, which is the failure
+//! mode the contract's "refusal is a value" section exists to prevent.
 //!
-//! * `register_adapter` — design §8's banks. The RESIDENCY exists:
-//!   `weights.rs` reserves and zeroes a bank for any plan that declares one,
-//!   and [`Weights::register_adapter`](crate::weights::Weights) writes planes
-//!   into it. What does not exist is anything that READS one — `kernels-metal`
-//!   stubs `linear.lora_correct` (`serve.rs`'s own "what this plane refuses")
-//!   — and, consequently, no [`Shell`] door onto that write. §8's standing
-//!   open item.
-//! * A lane's `adapter`, `drafts` and `captures_scores` — the three declared
-//!   export axes. The metal `Seated` carries none of them, for the reason one
-//!   line up: the dispatch layer stubs the ops they would run in.
-//! * `attachments` — a guest program at a fire BOUNDARY. The guest-program
-//!   plane is fully served (register, bind, publish, take, fire, stats), but
-//!   it fires BESIDE a model fire and never inside one: there is no
-//!   `fire_attached` here, because attaching means binding
-//!   `IntrinsicId::Logits` at the arena's out-seam rectangle and this fire
-//!   path reads that rectangle back to the host instead. A caller that wants
-//!   a pass runs it through [`Shell::fire_program`], which
-//!   [`Metal::shell_mut`] hands over.
+//! * A lane's `drafts` — ONE declared export axis the metal `Seated` still
+//!   does not carry, and the list used to hold two. **THE REASON WAS ALWAYS
+//!   NARROWER THAN IT LOOKED.** It used to be that neither answer had
+//!   anywhere to be DELIVERED: the M2 emitter bound ONE intrinsic buffer for
+//!   every `INTRINSIC_VAL` op, so a draft column and a score plane had no
+//!   second rectangle to stand in. The slot table closed that —
+//!   `program::launch` binds a rectangle per intrinsic and `serve.rs` points
+//!   `IntrinsicId::MtpLogits` at the `mtp` export — and what was left was a
+//!   different smaller thing for each axis. `drafts` is a DECLARATION the
+//!   shell cannot cross-check: the CUDA sibling holds `Seated::drafts`
+//!   against whether the fire's class word actually runs the draft arm, and
+//!   this `Seated` has no such field, so accepting the flag would be
+//!   accepting something nothing reads. (The arm itself is reachable — a lane
+//!   whose `word` carries the draft class is seated and its rows are written
+//!   — and an epilogue reading `mtp_logits` is served against them.) Serving
+//!   an arm and dropping its column is the silent success this refusal
+//!   prevents.
+//! * `captures_scores` is NOT in this list any more. Its two blockers are
+//!   both closed: `engine_metal::scores` carves the observability slab the
+//!   capture arm writes, and `ptir_m1_runtime.metal`'s `0xA0` handler grew an
+//!   arm on the intrinsic id, so an F32 score plane is read as F32
+//!   (`.wiki/alto/attn-score.md` §4). The flag crosses as
+//!   `Seated::captures_scores` and is cross-checked at the fire against the
+//!   artifact — `Fault::Scoreless` for a bake with no capture column,
+//!   `Fault::ScoreWord` for a lane whose word and whose ask disagree — which
+//!   is exactly the check whose absence kept it here.
+//! * `register_adapter` and `Lane::adapter` are NOT in this list any more.
+//!   Design §8's banks were half here for two waves — `weights.rs` reserves
+//!   and zeroes a bank for any plan that declares one and
+//!   [`Weights::register_adapter`](crate::weights::Weights) writes planes
+//!   into it — and what was missing was the READER. `kernels-metal`'s
+//!   `linear::lora::correct` is it, the dispatch layer calls it at
+//!   `Linear::LoraCorrect`, and `serve.rs` stages the per-row routes it
+//!   indexes with. So the verb forwards to the shell, a routed lane crosses
+//!   as `Seated::adapter`, and [`PoolFacts::adapter_banks`] answers the
+//!   smallest capacity this load's banks declare rather than zero. What is
+//!   still refused, by name and at the FIRE, is an id against an artifact
+//!   that bakes no correction (`Fault::Adapterless`) and an id whose lane's
+//!   word puts its rows outside the correction's window, or a word that puts
+//!   them inside with no id to route with (`Fault::AdapterWord`).
+//! * `Lane::positions` and `Lane::mask` are NOT in this list any more. A
+//!   stated position run reaches rope's seat verbatim and a mask of either
+//!   form expands into the sdpa entries' own plane; what each still refuses
+//!   is a shape that does not describe its lane, by name, at the fire.
+//! * `attachments` are NOT in this list any more. A guest program at a fire
+//!   BOUNDARY is served: an epilogue's `IntrinsicId::Logits` is bound at the
+//!   arena's out-seam rectangle, at the row its lane asked for, and its pass
+//!   is encoded into the model fire's own command buffer
+//!   ([`Shell::fire_attached`], `Session::stage_into`). The verdict is read
+//!   one frame later, from the harvest, which is the only place a proof
+//!   exists that the kernels ran. What is still refused, by name and before
+//!   anything is staged, is `Boundary::Prologue` (a prologue's writes are
+//!   INPUTS to the forward and this shell stages every fire input on the
+//!   host, before it opens a command buffer, so there is no point in the step
+//!   to encode one at), a program that reads `mtp_logits` against a load
+//!   whose model text bakes no `mtp` seam (there is a second rectangle now —
+//!   what there may not be is a draft column in THIS artifact),
+//!   an instance attached twice, an attachment naming a lane this fire does
+//!   not have, an instance whose rings are not ready, and a readout row list
+//!   that is not one ascending run.
 //! * `LoadRequest::ordinal` — see [`DeviceBoot`]. `MTLCreateSystemDefaultDevice`
 //!   takes no ordinal, so a request that names one is refused rather than
 //!   quietly given the default device.
@@ -80,28 +152,31 @@
 
 use std::path::{Path, PathBuf};
 
-use engine::engine_api::Engine;
-use engine::engine_api::adapter::AdapterRegistration;
-use engine::engine_api::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
-use engine::engine_api::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use engine::engine_api::error::{Error, Result as EngineResult};
-use engine::engine_api::fire::{
+use checkpoint::contract::ModelContract;
+use engine::Engine;
+use engine::adapter::AdapterRegistration;
+use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
+use engine::error::{Error, Result as EngineResult};
+use engine::fire::{
     FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
 };
-use engine::engine_api::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
-use engine::engine_api::program::{
+use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
+use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::engine_api::tensor_ir::registry::{GeometryClass, ModelProfile, PortMask};
-use engine::engine_api::tensor_ir::types::DType;
-use engine::engine_api::transfer::MemoryDomain;
+use engine::transfer::MemoryDomain;
+use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
+use eta_ir::types::Dtype;
 use model_compiler::{Budget, DeviceProfile};
 use model_ir::Trace;
-use model_loader::contract::ModelContract;
 
 use crate::error::Fault;
+use crate::experts;
 use crate::program::Session as ProgramSession;
-use crate::serve::{Boot, Lane, Seated, Shell};
+use crate::serve::{Attached, Boot, Landed, Lane, Seated, Shell, StepView};
+use crate::settle::Done;
+use crate::weights::AdapterPlane;
 
 /// How a caller answers "what does this checkpoint's bytes mean for this
 /// plan".
@@ -138,6 +213,24 @@ pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, S
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeviceBoot;
 
+/// **The readback plan one submitted step left behind**, plus the per-lane
+/// policy the SUBMISSION stated.
+///
+/// The shell answers one row per lane and the contract asks for a `Readout`
+/// per lane, and the two meet here rather than on the fire path: which rows a
+/// caller wants back is a contract question, and at the instant the step is
+/// enqueued nobody is asking it yet.
+struct PendingStep {
+    /// What each lane asked for, in submission order.
+    readout: Vec<Readout>,
+    /// The receipt the shell minted for this step.
+    landed: Landed,
+    /// The rows, once somebody has come for them. Cached rather than re-taken,
+    /// because `Engine::settle_frame` is documented idempotent and the shell's
+    /// settled ring hands a step's answer over exactly once.
+    rows: Option<Vec<Vec<f32>>>,
+}
+
 /// The Metal shell, behind [`Engine`].
 pub struct Metal {
     /// Empty today — see [`DeviceBoot`]. Held rather than dropped so the
@@ -149,6 +242,18 @@ pub struct Metal {
     caps: Option<Capabilities>,
     next_fire: FireId,
     next_frame: FrameId,
+    /// **Where step completions go**, installed once by the thread that owns
+    /// this engine ([`Engine::on_complete`]). `None` is a caller that does not
+    /// want to hear — a smoke test, a bench — and costs the completion handler
+    /// one branch.
+    sink: Option<engine::CompletionSink>,
+    /// **The last submitted frame's per-step readback plans**, held for a
+    /// caller that comes back for numbers ([`Engine::settle_frame`]).
+    ///
+    /// One frame's worth and no more, and that is a statement about the
+    /// readout seats rather than a cache policy: there are as many of them as
+    /// there are arms, and the frame after next reuses them.
+    pending: Option<(FrameId, Vec<PendingStep>)>,
 }
 
 impl Metal {
@@ -162,6 +267,8 @@ impl Metal {
             caps: None,
             next_fire: 1,
             next_frame: 1,
+            sink: None,
+            pending: None,
         }
     }
 
@@ -174,10 +281,11 @@ impl Metal {
 
     /// The loaded shell, mutably.
     ///
-    /// **THE ONE DOOR TO A GUEST PASS ON THIS PLANE.** The contract fires a
-    /// program by ATTACHING it to a model fire, and this shell has no
-    /// attachment path (module header); [`Shell::fire_program`] runs one on
-    /// its own and is reached through here.
+    /// **THE DOOR TO A GUEST PASS FIRED ON ITS OWN.** The contract fires a
+    /// program by ATTACHING it to a model fire, and `submit` serves that
+    /// directly now (module header); [`Shell::fire_program`] is the other
+    /// spelling — a pass beside no fire, which is what a program with no
+    /// `logits` intrinsic wants — and it is reached through here.
     pub fn shell_mut(&mut self) -> Option<&mut Shell> {
         self.shell.as_mut()
     }
@@ -191,7 +299,7 @@ impl Metal {
     /// Open a slot for a fresh sequence.
     ///
     /// Not a trait verb: the contract has no `open`, because
-    /// [`KvDelta`](engine::engine_api::KvDelta) says a lane whose `pages` are
+    /// [`KvDelta`](engine::KvDelta) says a lane whose `pages` are
     /// empty is one whose page table the SHELL owns, and a shell that owns it
     /// opens the slot itself. A runtime that keeps its own page table never
     /// calls this — it states the same fact as `KvDelta::held == 0`, and the
@@ -213,8 +321,12 @@ impl Metal {
     /// because "this handle is gone" is what the caller can act on, and a
     /// channel door is exactly where a torn-down instance is discovered.
     fn instance(&mut self, id: InstanceId) -> EngineResult<&mut ProgramSession> {
+        // **THE FENCE RIDES ON THIS DOOR** (`Shell::program_instance`): a
+        // channel read or write while that instance's epilogue is still
+        // airborne would see the cursors of the fire before last.
         self.loaded_mut()?
             .program_instance(id)
+            .map_err(fault)?
             .ok_or(Error::Closed {
                 what: "instance",
                 id,
@@ -243,7 +355,7 @@ impl Metal {
 /// [`Fault::Ceiling`] is `Impossible` and not `Exhausted` because every
 /// ceiling this shell states was reserved at LOAD: no amount of freeing makes
 /// a pool carved for 256 slots seat a 257th, which is exactly the distinction
-/// `engine_api::error`'s header draws.
+/// `engine::error`'s header draws.
 ///
 /// **THERE IS NO `Exhausted` ARM HERE, AND THE ABSENCE IS THE MAP.** The CUDA
 /// twin has one because `cudaMalloc` reports a shortfall as two numbers
@@ -293,57 +405,77 @@ fn fault(fault: Fault) -> Error {
             Error::Load(fault.to_string())
         }
         Fault::Straddled { .. } => Error::Load(fault.to_string()),
-        // A mask that does not describe its lane, one against a plan with no
-        // masked arm, or one whose word says the other thing, is the
-        // SUBMISSION's — the caller stated it and the caller can state it
-        // differently. `Invalid`, not `Impossible`: a retry with a mask of
-        // the lane's own extent is a real answer. On this plane
-        // `Fault::Maskless` also covers the unconditional refusal
-        // `Seated::mask` documents — no mask bits are staged yet — and it is
-        // still the caller's field, still fixable by dropping it.
-        Fault::Mask { .. } | Fault::Maskless { .. } | Fault::MaskWord { .. } => {
+        // **EVERY MASK REFUSAL IS `Invalid` NOW, AND THE ONE THAT WAS NOT IS
+        // THE MEASURE OF THE WAVE.** A mask that does not describe its lane,
+        // a per-row mask of the wrong height, one against a plan with no
+        // masked arm, one whose word says the other thing, and a stated
+        // position run that is not the lane's height are all the SUBMISSION's
+        // — the caller stated it and the caller can state it differently. A
+        // retry with a mask of the lane's own extent, or with as many rows as
+        // the lane feeds, is a real answer, which is what `Invalid` means and
+        // `Impossible` does not.
+        //
+        // `Fault::MaskRows` answered `Unsupported` here while the per-row form
+        // had no expansion on this plane — "the caller's answer is another
+        // engine, not another mask". It has one ([`crate::mask`]), so the
+        // sentence is a submission's again and the verb it named is served.
+        Fault::Mask { .. }
+        | Fault::MaskRows { .. }
+        | Fault::Maskless { .. }
+        | Fault::MaskWord { .. }
+        | Fault::Positions { .. } => Error::Invalid(fault.to_string()),
+        // The adapter axis's two fire refusals, sorted with the mask's for
+        // the mask's reason: a lane routed against an artifact with no
+        // correction, or against a word that puts it outside the
+        // correction's window, is the SUBMISSION's, and a retry that states
+        // the id and the word as one reading of one lane is a real answer.
+        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => {
             Error::Invalid(fault.to_string())
         }
-        // THE PER-ROW MASK IS `Unsupported`, NOT `Invalid`, AND THE
-        // DIFFERENCE IS WHOSE PROBLEM IT IS. Every refusal above is about a
-        // mask the caller could state differently — a wrong extent, a word
-        // that disagrees, an artifact with no arm. `Masking::Rows` is a
-        // well-formed submission this ENGINE has no expansion for
-        // (`crate::mask`'s last section), and the caller's answer is another
-        // engine, not another mask. `Unsupported` is the word the contract
-        // reserves for exactly that, and it names the verb the way
-        // `Lane::validate_for`'s refusals do.
-        Fault::MaskRows { .. } => Error::Unsupported {
-            verb: "Lane::mask as Masking::Rows (a per-query-row attention mask)",
-            engine: "metal",
-        },
-        // An adapter registration this load's banks cannot seat is the
-        // CALLER's too, and for the same reason the mask arms are: the bank
-        // is a shape the model text declared and the planes are bytes the
-        // caller assembled, so a plane of one slot's width is a real retry.
-        // It reaches this shell at all because a bank is a
-        // `ParamSource::Registered` weight and `Weights` reserves one for any
-        // plan that declares it — what does not run is the CORRECTION, which
-        // `linear.lora_correct` refuses by name one dispatch later.
-        Fault::Adapter { .. } => Error::Invalid(fault.to_string()),
+        // The observability axis's two, sorted with the adapter's for the
+        // adapter's reason: a lane asking to be observed against an artifact
+        // that declares no capture column, or against a word that puts it
+        // outside the capture window, is the SUBMISSION's, and a retry that
+        // states the ask and the word as one reading of one lane is a real
+        // answer (`.wiki/alto/attn-score.md` §4).
+        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => {
+            Error::Invalid(fault.to_string())
+        }
+        // The REGISTRATION's is `Load`, and the twin sorts it there for the
+        // reason its own sentence gives: a bank's capacity and a slot's width
+        // are shapes the model text declared, so nothing the caller frees or
+        // restates makes room and the fix is the model text. It was `Invalid`
+        // here while the verb was refused at the door and the variant was
+        // unreachable; the door is open, so the two planes answer one word.
+        Fault::Adapter { .. } => Error::Load(fault.to_string()),
         // The guest-program plane's two, both `Program`, which is the word
-        // the contract reserves for it. `Compile` carries `engine::Failure`'s
+        // the contract reserves for it. `Compile` carries `eta_exec::Failure`'s
         // deterministic/retryable split and `Program` names the entry that
         // refused; neither is a model-fire condition and neither should reach
         // the lane loop as one.
-        Fault::Compile(_) | Fault::Program { .. } => Error::Program(fault.to_string()),
+        Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
+            Error::Program(fault.to_string())
+        }
         Fault::Fire(_) => Error::Invalid(fault.to_string()),
+        // **A RESIDENCY THIS SHELL CANNOT ARRANGE IS `Impossible`, NEVER
+        // `Exhausted`.** It is the same ruling `engine::load::Residency::admit`
+        // makes for the budget it owns, for the same reason: the refusal is
+        // about a tier this build does not have — dense planes that do not
+        // stream, a segment whose distinct experts outnumber its seats, a bake
+        // whose regions carry two mixtures — and nothing the deployment frees
+        // changes the answer. The sentence already names both numbers.
+        Fault::Residency(_) => Error::Impossible(fault.to_string()),
     }
 }
 
 /// The contract's bind extents, in the plane's spelling.
 ///
-/// Two names for one seven-role vector: [`ExtentRole`](engine::Role) is the
-/// tag space both are written in, and the conversion is field for field so
+/// Two names for one seven-role vector: [`SymbolicExtent`](eta_exec::Role) is
+/// the tag space both are written in, and the conversion is field for field so
 /// that adding a role to one without the other is a compile error rather than
 /// a silently unresolved axis.
-fn extents(stated: &BindExtents) -> engine::Extents {
-    engine::Extents {
+fn extents(stated: &BindExtents) -> eta_exec::Extents {
+    eta_exec::Extents {
         kv_len: stated.kv_len,
         page_count: stated.page_count,
         row_count: stated.row_count,
@@ -359,13 +491,14 @@ fn extents(stated: &BindExtents) -> engine::Extents {
 /// The contract carries seven numbers and `model_compiler::Budget` takes
 /// four; the other three (`page_size`, `max_context`, `slots`) are the POOLS'
 /// and go to [`Boot`] directly. Converted in one place, which is the whole
-/// reason `engine-api` states its own `Budget` rather than depending on the
+/// reason `engine` states its own `Budget` rather than depending on the
 /// compiler (`load.rs`'s note).
 ///
-/// `max_adapters` crosses unchanged even though this plane seats no bank: it
-/// is a BAKE input, and the compiler is entitled to refuse a plan that cannot
-/// carve what the deployment asked for. What the load then ADVERTISES is a
-/// different number, and it is zero — see [`Engine::load`].
+/// `max_adapters` crosses unchanged: it is a BAKE input, and the compiler is
+/// entitled to refuse a plan that cannot carve what the deployment asked for.
+/// What the load then ADVERTISES is a different number — the smallest
+/// capacity this plan's banks actually declare, which is what a lane's id is
+/// checked against (`PoolFacts::adapter_banks`, see [`Engine::load`]).
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
         max_lanes: budgets.max_lanes,
@@ -384,16 +517,48 @@ fn bake_budgets(budgets: &LoadBudgets) -> Budget {
 /// the width of the `out` seam — so there is one copy and nothing to keep in
 /// step.
 ///
-/// **EVERY MODEL-GATED INTRINSIC IS `false` ON THIS PLANE, AND ONE ANSWER
-/// COVERS ALL OF THEM.** Each one names a rectangle a guest program would
-/// bind a buffer of this fire's against, and the metal fire path produces
-/// exactly one rectangle — the `out` seam's logits, which
-/// [`Shell::fire_seated`] reads the last row of and hands back to the host.
-/// There is no second column for an mtp draft, a value head or an attention
-/// mass to stand in, and no attachment door to bind one through
-/// (module header). Advertising any of them would let a program bind at
-/// bind time and fail at its first fire, which is the opposite of a
-/// bind-time contract.
+/// **THE MODEL-GATED INTRINSICS USED TO BE `false` UNDER ONE ANSWER, AND ONE
+/// OF THEM IS NOT ANY MORE.** The answer was the ABI: the metal fire path
+/// produced exactly ONE rectangle a guest could be pointed at — the `out`
+/// seam's logits, bound as `IntrinsicId::Logits` — because the M2 emitter
+/// made one buffer at index 6 the first argument of EVERY `INTRINSIC_VAL`
+/// op. A second column had nowhere to go whatever the model text said.
+///
+/// **`has_mtp_logits` FOLLOWS THE BAKE NOW, WHICH IS WHAT IT ALWAYS MEANT.**
+/// `eta_compiler::codegen::metal::intrinsics` gives each intrinsic an
+/// argument index of its own, `program::launch` carries a slot table, and
+/// `Shell::enqueue` points `IntrinsicId::MtpLogits` at the `mtp` export's own
+/// rectangle at the attached lane's rows. So this is exactly the question the
+/// CUDA sibling has always asked — does this load's model text declare a
+/// draft head ([`Shell::drafts`]) — which is what a bind-time contract has to
+/// mean. A load that bakes no `mtp` seam still answers `false`, and
+/// `serve::prepare` refuses an attachment that would read one by name.
+///
+/// **`has_attn_score` FOLLOWS THE BAKE TOO NOW, AND FOR ITS OWN THREE
+/// REASONS.** It needed two things the slot table did not buy — an
+/// observability slab for the graph to write, and an element type, because a
+/// score plane is F32 and the emitted `0xA0` handler read `bfloat` with no
+/// second arm. `crate::scores` is the first: a slab the shell owns, carved off
+/// the `attn.scores` seam the model text already wrote, that the capture arm
+/// (`kernels_metal::attn::score`) fills as the graph runs. The second is an
+/// arm on the intrinsic id in `ptir_m1_runtime.metal`, which is where the
+/// element type has to live on a plane whose bindings are objects rather than
+/// addresses. So this asks what the CUDA sibling asks
+/// ([`Shell::observes_scores`]): does a fire of THIS load write scores.
+///
+/// The rest stay `false` and each keeps its own reason. `has_mtp_drafts` is
+/// `[k]` I32 TOKEN IDS, an argmax the guest can take for itself off
+/// `mtp_logits` and which no device path in this shell produces — the same
+/// sentence the CUDA sibling gives. And `has_value_head` has no export seam
+/// at all.
+///
+/// **AND `has_attn_page_mask` IS NOT ABOUT `Lane::mask`.** It gates the eta
+/// vocabulary's `attn_page_mask` SINK — a guest program writing a
+/// page-granular eviction mask from inside an attention stage — which is a
+/// different door from the lane's own run-length mask this shell now stages
+/// end to end. The CUDA plane answers `false` here too, for the same reason:
+/// there is no sink to honour. A lane-level mask arriving through
+/// `Lane::mask` is served whatever this bit says.
 fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
     let trace = shell.trace();
     let layers = trace
@@ -411,16 +576,34 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // means (`ModelProfile::activation`'s own doc): this device's own
         // activation type is bf16 — the one dtype `kernels-metal` stamps —
         // and it is not what a guest program reads.
-        activation: DType::F32,
-        // See the item doc: one rectangle, no attachment, so no intrinsic.
-        has_mtp_logits: false,
+        activation: Dtype::F32,
+        // **THE DRAFT COLUMN HAS SOMEWHERE TO STAND** — see the item doc.
+        // This was `false` under "one rectangle and one intrinsic buffer",
+        // and that sentence was true until the M2 slot table landed. It is
+        // the bake's question now, and nothing else's.
+        has_mtp_logits: shell.drafts(),
+        // `[k]` I32 token ids, which is an argmax the guest takes for itself
+        // off `mtp_logits`; no device path in this shell produces them.
         has_mtp_drafts: false,
         has_value_head: false,
-        has_attn_score: false,
+        // **THE PER-KEY RECTANGLE HAS SOMEWHERE TO BE WRITTEN AND SOMEWHERE
+        // TO BE READ** — see the item doc. Two conditions in one question,
+        // which is what `Shell::observes_scores` answers: this load's text
+        // declares a capture column AND the slab that observes it was carved.
+        has_attn_score: shell.observes_scores(),
         has_attn_page_mask: false,
-        // And this one is `false` twice over: no `attn_page_mask` sink to
-        // honour, and no `linear.lora_correct` arm to apply a delta at
-        // (`serve.rs`'s "what this plane refuses"). §8's standing open item.
+        // **AND THIS ONE IS `false` THOUGH THE ADAPTER AXIS IS SERVED, WHICH
+        // IS NOT A CONTRADICTION.** `has_lora` is the ETA guest-sink gate —
+        // "this backend can consume a `lora` sink's A/B/SITES configuration
+        // and apply the delta at the sites a GUEST PROGRAM declared"
+        // (`eta_ir::registry::ModelProfile::has_lora`, `eta_ir::validate`'s
+        // own check) — and no such sink is honoured here. What IS served is
+        // the MODEL's own correction class: banks the model text declared,
+        // `Engine::register_adapter`, `Lane::adapter`, and
+        // `PoolFacts::adapter_banks` above, which is the field that answers
+        // "may a control plane place a corrected request here". The CUDA
+        // plane serves the same axis and answers `false` here for the same
+        // reason (`engine-cuda/src/api.rs`'s own `has_lora`).
         has_lora: false,
         kernels: Vec::new(),
     })
@@ -463,13 +646,14 @@ impl Engine for Metal {
             budgets,
             residency,
             ordinal,
-            // **STATED AND NOT SPENT, AND THAT IS THE HONEST ANSWER HERE.**
-            // The run-ahead depth sizes an asynchronous shell's staging ring;
-            // this shell settles inside `submit` and answers filled readouts
-            // (`Engine::settles_asynchronously` is `false` for it), so it has
-            // exactly one step in flight whatever the deployment states and
-            // nothing to carve per slot.
-            frames_in_flight: _,
+            // **SPENT NOW, AND IT IS THE WHOLE OF THIS SHELL'S RUN-AHEAD.**
+            // It used to be stated and dropped, with a comment saying so:
+            // this shell settled inside `submit`, so it had exactly one step
+            // in flight whatever the deployment asked for. It carves the A/B
+            // seats now — one resident-input plane and one readout seat per
+            // in-flight step — and article 1's floor of two is what
+            // `Runahead::default` answers when a deployment states nothing.
+            frames_in_flight,
         } = request;
 
         // THE ORDINAL IS REFUSED RATHER THAN IGNORED. `LoadRequest::ordinal`
@@ -499,6 +683,28 @@ impl Engine for Metal {
         let path = PathBuf::from(path);
         let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
 
+        // ── RESIDENCY (alto design §7), PLANNED AND ADMITTED BEFORE A BYTE
+        //    LANDS. The plan is decided off the trace and the load plan's
+        //    pairings — a quantized bank's factors and zero points are part of
+        //    an expert's seat, so the decision cannot be made off the trace
+        //    alone (`crate::experts`'s header says why moving the codes alone
+        //    is wrong rather than merely partial). It costs one metadata parse
+        //    and one plan compile, and reads no tensor bytes.
+        //
+        //    **AND THE HOST DEMAND IS HONESTLY ZERO.** The CUDA twin admits a
+        //    pinned tier here because a device address and a host address are
+        //    different addresses there. On unified memory they are not: an
+        //    expert's source bytes are host bytes the process holds either way
+        //    (a `Vec<u8>` today, the mapped artifact in the next wave), and no
+        //    byte of them is a second copy the device reads through. So the
+        //    second argument is zero, and `Plan::host_demand` is where the
+        //    sentence lives.
+        let planes = crate::weights::attachments(&trace, &contract, &path).map_err(fault)?;
+        let residency_plan = experts::Plan::of(&trace, &planes, residency.device_weight_budget)
+            .map_err(fault)?;
+        residency.admit(residency_plan.device_demand(), residency_plan.host_demand())?;
+        let streams = residency_plan.streams();
+
         let shell = Shell::load(Boot {
             trace,
             contract: &contract,
@@ -514,25 +720,17 @@ impl Engine for Metal {
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
+            // ARTICLE 9: the knob is typed here, not read from anywhere. The
+            // clamp is `Runahead::of`'s — one place knows the bound a seat
+            // ring can carry, and a caller that states zero means one.
+            runahead: engine::runahead::Runahead::of(frames_in_flight),
+            residency: residency_plan,
         })
         .map_err(fault)?;
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
 
-        // ── RESIDENCY (alto design §7). One tier: the whole table lands in
-        //    one shared buffer and never moves. A stated `device_weight_budget`
-        //    under what the table needs is a load this shell cannot serve, and
-        //    `Residency::admit` refuses it with both numbers in the message
-        //    rather than landing the whole thing anyway.
-        //
-        //    It is checked AFTER the shell lands rather than before, and the
-        //    CUDA twin checks it before: there the demand is read off the plan
-        //    (`weights::device_demand`) so the refusal costs no device work,
-        //    and here the equivalent arithmetic is not exposed. The answer is
-        //    the same, and a load that refuses has done work it will throw
-        //    away — which is a cost, not a lie.
-        residency.admit(weight_bytes, 0)?;
         let paging = shell.paging();
         let profile = profile(&shell, &budgets)?;
 
@@ -580,7 +778,7 @@ impl Engine for Metal {
                 storage_max_tile_bytes: shell.max_buffer(),
                 // The guest-program plane compiles MSL through
                 // `MTLDevice::newLibraryWithSource:`, which is exactly what
-                // `tensor_compiler::codegen::Backend::Metal` emits and what
+                // `eta_compiler::codegen::Backend::Metal` emits and what
                 // it advertises under this name.
                 codegen_backend: Some("metal".to_string()),
             },
@@ -592,22 +790,26 @@ impl Engine for Metal {
                 // slots apart from the seats it opened, which is `slots`.
                 state_slots: paging.slots,
                 state_slot_bytes: 0,
-                // **ZERO, AND NOT BECAUSE THE MODEL DECLARED NOTHING.** The
-                // CUDA twin answers the smallest capacity any one bank of the
-                // model declares, which is the id ceiling a lane may route
-                // against. `weights.rs` reserves those same banks here — a
-                // bank is a `ParamSource::Registered` param and gets its
-                // zeroed residency like any other — but nothing on this plane
-                // READS one: `kernels-metal` stubs `linear.lora_correct`, so
-                // `Lane::adapter` is refused at the fire and
-                // `register_adapter` is refused at the door.
+                // **WHAT THE LOAD ACTUALLY SEATS, READ OFF THE PLAN** — the
+                // twin's answer, and now the honest one here too. The
+                // smallest capacity any one bank of this model declares is
+                // the id ceiling: an adapter occupies one slot of EVERY bank
+                // it fills, so a load whose `A` seats eight and whose `B`
+                // seats four holds four. Zero for a model whose text declares
+                // no correction, and then `Lane::adapter` has nowhere to go
+                // and is refused by name at the fire (`Fault::Adapterless`).
                 //
                 // This field is what a caller PLANS against, so it answers
-                // the routes that will be served rather than the bytes that
-                // were reserved. A non-zero count would tell a control plane
-                // it may place a corrected request here, which is the one
-                // thing it must not conclude. Design §8's standing open item.
-                adapter_banks: 0,
+                // the routes that will be SERVED. It answered zero while
+                // nothing read a bank; `kernels-metal`'s correction entry and
+                // this shell's routes staging are what changed the truth,
+                // not this line.
+                adapter_banks: shell
+                    .banks()
+                    .iter()
+                    .map(|&(_, adapters, _)| adapters)
+                    .min()
+                    .unwrap_or(0),
                 // The pools are not virtual, so `resize_pool` is not served
                 // and zero is what says so.
                 elastic_page_bytes: 0,
@@ -622,24 +824,39 @@ impl Engine for Metal {
                 max_context: paging.context(),
             },
             profile,
-            // **THIS SHELL RESOLVES NO DESCRIPTOR PORT ON THE DEVICE, AND
-            // `NONE` IS THE WHOLE OF THAT SENTENCE.** The CUDA twin claims
-            // `PortMask::DECODE_ENVELOPE` because `crate::program::ports`
-            // reads `embed_tokens`, `positions` and `kv_len` off an ATTACHED
-            // instance's own device rings at fire time. There are no attached
-            // instances here (module header): a guest pass runs beside a fire
-            // and never inside one, so no port of a guest's is ever resolved
-            // against a model fire's buffers, and there is nothing for a
-            // decode envelope to be carved from.
+            // **THIS SHELL RESOLVES A DECODE ENVELOPE ON THE DEVICE, AND
+            // THREE PORTS ARE THE WHOLE OF THAT SENTENCE.** `serve::stage`
+            // resolves `embed_tokens`, `positions` and `kv_len` off an
+            // attached instance's own device rings at step 0b — before
+            // `compose`, behind the fence `admit_attachments` takes — and the
+            // lane loop then takes its token ids from the port instead of
+            // from `Seated::lane.tokens`. That is the guest telling the model
+            // what to run rather than the model handing the guest its answer,
+            // and what it buys is the one thing a host cannot buy: the
+            // sampled token stops travelling out through `take_channel`,
+            // through a guest await, and back in through `publish_channel`,
+            // so a second decode step can be submitted behind the first
+            // inside one frame.
+            //
+            // **AND `DEVICE_GEOMETRY` IS STILL REFUSED, BY NAME AND FOR A
+            // REASON.** The other four ports of that mask — `pages`,
+            // `page_indptr`, `w_slot`, `w_off` — describe a page table this
+            // shell OWNS: `store::kv::geometry_with` derives all four from
+            // the seat, and reading the guest's copy would be reading a
+            // second opinion about a table the guest does not hold. A load
+            // that wanted to claim them would have to let the guest's page
+            // ids reach the pool, which is the pooled device-geometry class
+            // and a different piece of work. `crate::program::ports`'s own
+            // header is where that line is drawn.
             //
             // The consequence is the one `Capabilities::admits` is written
-            // for, and it is a BIND-TIME refusal rather than a fire-time
-            // surprise: a program bound in `GeometryClass::DecodeEnvelope` or
-            // `DeviceGeometry` is refused at `bind_instance`, by name, and
-            // `GeometryClass::Host` — the class that asks for nothing — is
-            // what this load serves.
-            ports: PortMask::NONE,
-            geometry: GeometryClass::Host,
+            // for, and it stays a BIND-TIME refusal rather than a fire-time
+            // surprise: a program bound in `GeometryClass::DeviceGeometry` is
+            // refused at `bind_instance`, by name, while `Host` — the class
+            // that asks the model for nothing and is handed its logits — and
+            // `DecodeEnvelope` are both served.
+            ports: PortMask::DECODE_ENVELOPE,
+            geometry: GeometryClass::DecodeEnvelope,
             // **NO DIRECTION IS SERVED, AND UNIFIED MEMORY DOES NOT CHANGE
             // THAT.** It is tempting to claim the host directions on a plane
             // where `contents()` makes host and device the same bytes — a
@@ -679,10 +896,18 @@ impl Engine for Metal {
             facts: LoadFacts {
                 trace_name,
                 weight_bytes,
-                // ONE TIER, AND `Residency::admit` REFUSED ANY REQUEST FOR A
-                // SECOND (alto design §7): this shell lands the whole table
-                // in one shared buffer and never moves it.
-                weights_resident: true,
+                // **WHAT THIS LOAD ACTUALLY HOLDS** (alto design §7). `true`
+                // is a full-residency load — every byte of the table in one
+                // shared buffer that never moves — and `false` says the
+                // routed bands went to the wired-slab tier and the fires are
+                // cut into segments around it (`engine_metal::experts`).
+                //
+                // THERE IS STILL ONLY ONE TIER, AND THE HOST BUDGET STILL
+                // ADMITS EVERYTHING. Unified memory has no second address
+                // space for a pinned copy to live in, so a streamed load's
+                // host demand is zero and `host_weight_budget` has nothing to
+                // refuse — which is the platform, not a gap.
+                weights_resident: !streams,
                 // **THIS PLANE HAS NO WARM-BOOT ARTIFACT CACHE, AND IT SAYS
                 // SO RATHER THAN LEAVING THE FIELD OUT** — the same
                 // capability honesty `sms: 0` and `fp8_native: false` are
@@ -709,58 +934,231 @@ impl Engine for Metal {
     }
 
     fn register_adapter(&mut self, registration: &AdapterRegistration) -> EngineResult<()> {
-        // **REFUSED BY NAME, AND NOT BECAUSE THE WRITE IS MISSING.** Design
-        // §8's banks are declared by the model text and reserved at load, and
-        // that half is here: `Weights::register_adapter` looks a bank up,
-        // checks the id against its declared capacity and the plane against
-        // its slot width, and copies. What is missing is the READER —
-        // `kernels-metal` stubs `linear.lora_correct` (`serve.rs`'s "what
-        // this plane refuses") — so a registration that succeeded would land
-        // bytes no dispatch ever reaches. The [`Shell`] publishes no door
-        // onto that write for exactly this reason, and
-        // `PoolFacts::adapter_banks` answers zero.
+        // **THE DOOR IS OPEN, AND IT IS THREE LINES AND A `Shell` FORWARD.**
+        // This body refused for one reason — nothing on this plane READ a
+        // bank, so a registration that succeeded would have landed bytes no
+        // dispatch reaches and told the caller the correction was applied.
+        // `kernels-metal`'s `linear::lora::correct` is the reader, the
+        // dispatch layer's `Linear::LoraCorrect` arm is where it is called,
+        // and `serve.rs` stages the routes the arm indexes with. So the
+        // dangerous answer is now the true one.
         //
-        // `Ok(())` is the dangerous answer and it is the one this refuses,
-        // and note that it would be dangerous even though the copy would
-        // SUCCEED: a caller that registered an adapter and got a success
-        // would run every following fire against the base weights and be
-        // told the correction was applied. §8's standing open item, and it
-        // stays open until the dispatch layer has an arm — at which point
-        // this body is three lines and a `Shell` forward, not a redesign.
-        let _ = registration;
-        Err(self.unsupported("register_adapter"))
+        // No graph is touched: the composition is what keys a fire and a
+        // bank's contents are not in it, so a registration between two fires
+        // costs a memcpy through the shared mapping and leaves every recorded
+        // walk valid (decision 17).
+        //
+        // BORROWED, NOT COPIED. The contract's `AdapterPlane` owns its bytes
+        // and this crate's borrows them; the conversion is a reborrow per
+        // plane, and no scaling happens at either side of it — `α/r` is
+        // folded into the up bank's contents by whoever assembled the plane
+        // (`model_ir::Linear::LoraCorrect`'s own note), exactly as on the
+        // CUDA plane.
+        let planes: Vec<AdapterPlane<'_>> = registration
+            .planes
+            .iter()
+            .map(|plane| AdapterPlane {
+                bank: plane.bank.as_str(),
+                bytes: &plane.bytes,
+            })
+            .collect();
+        self.loaded_mut()?
+            .register_adapter(registration.id, &planes)
+            .map_err(fault)
     }
 
     fn submit(&mut self, frame: &FrameSubmission) -> EngineResult<FrameTicket> {
-        // ARTICLE 4, MECHANICALLY: every step validated before any of them
-        // runs, one id for the frame, the steps in order. This shell settles
-        // inside each step — its command buffer is committed and waited on —
-        // so a k-step frame here is k fires back to back and costs exactly
-        // that, which is what F1 promises everywhere else too.
+        // ── ARTICLE 4, MECHANICALLY: every step validated before any of them
+        //    runs, one id for the frame, the steps in order. `Step::validate`
+        //    is where the check lives — the contract wrote the arithmetic once
+        //    and a second spelling of it here would be a second thing to keep
+        //    in step.
         frame.validate()?;
         let id = self.next_frame;
         self.next_frame = self.next_frame.wrapping_add(1);
+        // **THE PREVIOUS FRAME'S NUMBERS DIE HERE**, and the drop is the rule:
+        // there are as many readout seats as there are arms, so a frame's rows
+        // survive exactly until the frames behind it have taken the seats
+        // back. A caller that wanted numbers had to ask before now
+        // ([`Metal::settle_frame`], which says so by refusing).
+        self.pending = None;
+
         let mut steps = Vec::with_capacity(frame.steps.len());
-        for step in &frame.steps {
-            steps.push(self.fire_step(step)?);
+        let mut pending = Vec::with_capacity(frame.steps.len());
+        for (index, step) in frame.steps.iter().enumerate() {
+            // ── THE NEXT STEP, STATED (`Engine::expect_fire`, advisory). Two
+            //    parties know a successor and the frame verb splits them: the
+            //    runtime states the launch queued behind this FRAME, and a
+            //    frame that crosses whole is one whose successors the engine
+            //    already knows.
+            if let Some(next) = frame.steps.get(index + 1) {
+                self.expect_fire(next);
+            }
+            // ── ARTICLE 1, AND THE ERROR ARM IS ARTICLE 4's OTHER HALF. A
+            //    step that faults POISONS THE FRAME'S REMAINING STEPS — the
+            //    loop stops, so nothing after it is prepared or enqueued — and
+            //    the steps already committed settle normally, because they are
+            //    real work the device is really doing and pretending otherwise
+            //    would leave their arms held forever.
+            let at = engine::StepDone {
+                frame: id,
+                step: index as u32,
+            };
+            match self.fire_step(step, at) {
+                Ok((ticket, step_pending)) => {
+                    steps.push(ticket);
+                    pending.push(step_pending);
+                }
+                Err(error) => {
+                    self.pending = None;
+                    return Err(error);
+                }
+            }
         }
-        Ok(FrameTicket { id, steps })
+        let mut ticket = FrameTicket { id, steps };
+        self.pending = Some((id, pending));
+
+        // ── **THE EAGER SHELL, KEPT REACHABLE AND KEPT HONEST.** At
+        //    `frames_in_flight == 1` there is one arm, one step may be in
+        //    flight, and this shell answers filled readouts before it returns
+        //    — which is byte for byte what it did before the asynchronous wave
+        //    and is the golden model a divergence at depth two is bisected
+        //    against. `settles_asynchronously` answers `false` for it, so the
+        //    runtime settles its own bookkeeping on the spot and never waits
+        //    for a completion that already happened.
+        //
+        //    Above depth one this line is not taken and the verb returns with
+        //    the device still running: article 1, and the exit from the
+        //    registered exception this shell was the last holder of.
+        if !self.settles_asynchronously() {
+            self.settle_frame(&mut ticket)?;
+        }
+        Ok(ticket)
     }
 
-    /// **NOTHING TO WARM, SAID OUT LOUD.** The advisory next-fire hint
-    /// exists for an engine whose fire path keys prepared state on the
-    /// composition — `engine-cuda`'s folded exec cache prebinds the hinted
-    /// composition under the running fire. This shell keys nothing on a
-    /// composition ahead of time: every fire encodes its own command
-    /// buffer from the submission it is handed. Stated as an explicit
-    /// empty body rather than left to the trait default so that the next
-    /// reader — and the day this shell grows a graph cache of its own —
-    /// finds the decision where the other verbs are, not in a default it
-    /// has to know exists. (`bind_thread` above earns its body the same
-    /// way: "nothing to do" is a real answer, and this shell says it
-    /// itself.)
+    /// **Yes above depth one, and the depth is the deployment's**
+    /// (design §2, article 1).
+    ///
+    /// At `frames_in_flight >= 2` `submit` returns with the device still
+    /// running: every step's launches are on the command queue, every step's
+    /// completion handler is armed, and not one host read stands between them.
+    /// The receipts carry ids and empty readouts; the outcomes arrive on
+    /// [`Engine::on_complete`]'s sink, called from Metal's own completion
+    /// thread.
+    ///
+    /// At depth one it is `false` and it is the truth: that shell waits.
+    fn settles_asynchronously(&self) -> bool {
+        self.shell
+            .as_ref()
+            .is_some_and(|shell| shell.frames_in_flight() > 1)
+    }
+
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
+        self.sink = Some(sink);
+    }
+
+    /// **Fill in the last submitted frame's readouts** (design §4's readback
+    /// obligation).
+    ///
+    /// Waits for the steps the host has not caught up with and reads the rows
+    /// their own command buffers copied out — the same rows, off the same
+    /// rectangle, in the same order F1's in-fire readback took, so what a
+    /// caller gets here is byte-identical to depth-one execution.
+    ///
+    /// **AND IT REFUSES A FRAME WHOSE SEATS ARE GONE.** A step's answer lives
+    /// in the readout seat its arm owns, and the frames behind it take those
+    /// seats back; a caller that submits again before it asks has asked too
+    /// late. That is a named refusal rather than a silent wrong answer,
+    /// because the bytes in those seats afterwards are a real logits row
+    /// belonging to somebody else's step and nothing about them looks wrong.
+    ///
+    /// Idempotent: the rows are cached on the pending record the first time
+    /// they are taken, because the shell hands a step's answer over once.
+    fn settle_frame(&mut self, ticket: &mut FrameTicket) -> EngineResult<()> {
+        let Some((id, _)) = self.pending.as_ref() else {
+            return Err(Error::Invalid(format!(
+                "frame {}'s numbers are gone: nothing is pending, so either it was \
+                 never submitted to this engine or a later frame has already taken \
+                 its readout seats",
+                ticket.id
+            )));
+        };
+        if *id != ticket.id {
+            return Err(Error::Invalid(format!(
+                "frame {}'s numbers are gone: frame {id} has been submitted since, and \
+                 a step's rows live in the readout seat its arm owns. Ask for a \
+                 frame's readouts before submitting the next one",
+                ticket.id
+            )));
+        }
+        let (_, mut pending) = self.pending.take().expect("checked just above");
+        let mut refused = None;
+        match self.shell.as_mut() {
+            None => {
+                refused = Some(Error::Load("the metal engine has no model loaded".into()));
+            }
+            Some(shell) => {
+                for step in &mut pending {
+                    if step.rows.is_some() {
+                        continue;
+                    }
+                    match shell.rows_of(&step.landed) {
+                        Ok(rows) => step.rows = Some(rows),
+                        Err(why) => {
+                            refused = Some(fault(why));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // The record goes back whatever happened, so a caller that hits a
+        // device fault can still read the steps that did answer.
+        self.pending = Some((ticket.id, pending));
+        if let Some(error) = refused {
+            return Err(error);
+        }
+        let (_, pending) = self.pending.as_ref().expect("just put back");
+        for (receipt, step) in ticket.steps.iter_mut().zip(pending) {
+            receipt.readouts = readouts_of(step);
+        }
+        Ok(())
+    }
+
+    /// **THE HINT IS SPENT ON THE SEATS, WHICH IS THE ONE THING THIS SHELL
+    /// HAS TO WARM.**
+    ///
+    /// This body was empty, and the comment that stood here said why: nothing
+    /// on this plane keys prepared state on a composition, because there is no
+    /// capture and every fire encodes its own command buffer. That is still
+    /// true and it is no longer the whole story. What a step needs before it
+    /// can be staged is an ARM — a resident-input plane and a readout seat the
+    /// device is not still reading — and an arm comes free when the step that
+    /// held it is harvested. So the hint is taken as *another step is coming*,
+    /// and the answer is to harvest every flight the device has ALREADY
+    /// finished, without waiting for any of them
+    /// ([`Shell::reap`](crate::Shell::reap), which asks `status` and never
+    /// blocks).
+    ///
+    /// The win is the one run-ahead exists for: at steady state the next
+    /// `prepare` finds a free seat and never enters the kernel, where without
+    /// the hint it would have discovered the shortage at the moment it had
+    /// work to do.
+    ///
+    /// **CORRECTNESS NEVER DEPENDS ON IT** (the contract's own promise). A
+    /// hint for a fire that never comes costs one non-blocking status query
+    /// per in-flight step; a fire that arrives unhinted harvests inside
+    /// `prepare` exactly as it would have. Nothing here reads the submission
+    /// at all, which is why a hint stated before the tokens are sampled is
+    /// as good as any other.
     fn expect_fire(&mut self, submission: &Step) {
         let _ = submission;
+        if let Some(shell) = self.shell.as_mut() {
+            // A refusal here is a device fault on a step that has ALREADY
+            // finished, and it belongs to whoever comes for that step's
+            // numbers — this verb answers `()` and has nowhere to put it.
+            let _ = shell.reap();
+        }
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
@@ -789,8 +1187,9 @@ impl Engine for Metal {
     fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
         // REFUSED AT BIND, WHICH IS THE CONTRACT'S OWN READING: a class is a
         // claim about which descriptor ports the device resolves, and the
-        // caps this load answered say which those are — none, on this plane
-        // (see `load`). Asked through `Capabilities::admits` rather than by
+        // caps this load answered say which those are — the decode envelope
+        // and no more, on this plane (see `load`), so `DeviceGeometry` is what
+        // this refuses. Asked through `Capabilities::admits` rather than by
         // re-deriving the subset test here, because the contract wrote that
         // negotiation down once and a second spelling of it is a second thing
         // to keep in step. A program bound in a class this load does not
@@ -882,64 +1281,139 @@ impl Metal {
     /// `submit`'s per-step body, in its own inherent method for the same
     /// reason the CUDA twin's is: the contract's verb is the FRAME, and a
     /// step is this shell's private unit inside it.
-    fn fire_step(&mut self, submission: &Step) -> EngineResult<FireTicket> {
-        // ATTACHMENTS FIRST, AND BEFORE A FIRE ID IS SPENT. The CUDA twin
-        // asks its readiness gate here — is every attached instance's ring
-        // ready, and is a block a scheduling answer rather than a failure —
-        // because it is about to run those instances INSIDE the fire. This
-        // shell has no `fire_attached`: a guest pass runs beside a model
-        // fire, at neither of its boundaries, through
-        // `Shell::fire_program`. So there is no gate to ask, and the
-        // attachment itself is what is refused — silently ignoring one would
-        // run the model, answer logits, and never tell the caller that the
-        // program it attached did not execute.
-        if !submission.attachments.is_empty() {
-            return Err(Error::unsupported(
-                "metal",
-                "guest-program attachment at a fire boundary",
-            ));
-        }
+    fn fire_step(
+        &mut self,
+        submission: &Step,
+        at: engine::StepDone,
+    ) -> EngineResult<(FireTicket, PendingStep)> {
+        // ATTACHMENTS FIRST, AND BEFORE A FIRE ID IS SPENT. This is a
+        // field-for-field lift and nothing more: every question an attachment
+        // can be refused on is a question about the SHELL's state — is this
+        // instance ready, is it attached twice, does its program read a
+        // column this ABI has no second buffer for — and none of them is a
+        // fact about the submission alone. `Shell::admit_attachments` asks
+        // all six, at `prepare`, before anything is staged.
+        //
+        // **THE BLANKET REFUSAL THAT STOOD HERE IS GONE**, and what removed
+        // it was a fire path that can encode a guest pass into the model
+        // fire's own command buffer (`Session::stage_into`) and read its
+        // verdict from the harvest (`Session::settle_launched`). While the
+        // only spelling of a guest pass was one that opened its own command
+        // buffer and WAITED, there was no point inside `enqueue` to put one
+        // at, and refusing was the only honest answer.
+        let attached: Vec<Attached> = submission
+            .attachments
+            .iter()
+            .map(|attachment| Attached {
+                lane: attachment.lane,
+                instance: attachment.instance,
+                at: attachment.at,
+            })
+            .collect();
 
         let id = self.next_fire;
         self.next_fire = self.next_fire.wrapping_add(1);
 
+        // **THE READOUT POLICY IS CHECKED BEFORE ANYTHING RUNS** (article 4).
+        // It used to be read in a loop after the fire, which was harmless when
+        // the fire was over by then; under run-ahead a refusal there would
+        // arrive with the step already on the device.
+        //
+        // **AND IT IS THE READOUT SEAT'S ARITHMETIC THAT REFUSES, NOT A
+        // MISSING KERNEL.** Reading an interior row needs the logits
+        // rectangle addressable after the walk, which it is (`slots.0[out]`)
+        // — but under run-ahead the step behind this one carves over that
+        // rectangle, so every row a reader wants is blitted into the arm's
+        // own seat inside this step's command buffer, and that seat is a
+        // load-time reservation of exactly `max_lanes` rows of the out seam.
+        // A row LIST has no such ceiling: its bound is `max_tokens`, which is
+        // 8192 at the default budget and, at a qwen vocabulary, 2.4 GiB of
+        // `MTLBuffer` per arm for a column almost every fire leaves cold.
+        // Serving it wants either a stated readout ceiling in `Boot` or a
+        // seat that grows, and a seat that grew would move bytes a committed
+        // command buffer had already been told to copy into.
+        //
+        // **AND THE REFUSAL IS SPLIT, BECAUSE A FIRE'S LOGITS HAVE TWO
+        // READERS AND ONLY ONE OF THEM IS THIS SEAT.** Everything above is
+        // about the HOST mirror — the seat, its ceiling, the copy that fills
+        // it — and it is all still true. The other reader is a GUEST: an
+        // epilogue that reads `intrinsics::logits()` inside a `fwd.epilogue`
+        // and argmaxes on the DEVICE, which is how every sampler and every
+        // speculative verifier in the corpus gets its tokens. It reads its
+        // rows out of the arena rectangle at an offset the shell binds, so
+        // the seat's ceiling is not its ceiling and never was — the paragraph
+        // above said as much while the attachment path was refused and there
+        // was nothing to do about it.
+        //
+        // So a row list is served for the lane whose epilogue asked for it,
+        // and refused for a lane that has no epilogue at all. The rows of an
+        // attached lane are DELIVERED — on the device, to the program that
+        // named them — and the empty `LaneReadout` `readouts_of` answers for
+        // it is not a drop: it is the same answer `Readout::None` gets, and
+        // the caller asking for those rows was the guest.
+        for (index, lane) in submission.lanes.iter().enumerate() {
+            let listed = matches!(lane.readout, Readout::Rows(_));
+            let served = attached
+                .iter()
+                .any(|a| a.lane as usize == index && a.at == engine::fire::Boundary::Epilogue);
+            if listed && !served {
+                return Err(Error::unsupported("metal", "row-selected readout"));
+            }
+        }
+
+        // The sink is cloned out before the shell is borrowed: one `Arc`
+        // bump, and it is what a completed command buffer publishes through.
+        let sink = self.sink.clone();
         let shell = self.loaded_mut()?;
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
             .map(|lane| {
-                if !lane.positions.is_empty() {
-                    // The shell derives positions as `held .. held + rows`.
-                    // An explicit list means a speculative fire re-feeding
-                    // rejected positions or an mRoPE lane, and both need a
-                    // staged `positions` vector this fire path does not take.
-                    return Err(Error::unsupported("metal", "explicit lane positions"));
-                }
-                // THE THREE AXES THE METAL `Seated` DOES NOT CARRY, REFUSED
-                // ONE BY ONE RATHER THAN DROPPED. On the CUDA plane each of
-                // these is a declared axis with a runtime input, and the
-                // refusal is deferred to the fire so it can name the MODEL
-                // TEXT ("this artifact declares no `linear.lora_correct`
-                // arm"). Here the answer does not depend on the artifact:
-                // the dispatch layer stubs the ops all three would run in, so
-                // no plan this shell can load has an arm for any of them, and
-                // the refusal belongs at the door where it is cheapest and
-                // clearest.
+                // THE ONE AXIS THE METAL `Seated` DOES NOT CARRY, REFUSED
+                // RATHER THAN DROPPED. **THE ADAPTER USED TO BE THE THIRD AND
+                // THE CAPTURE THE SECOND, AND NEITHER IS ANY MORE**, and the
+                // difference is exactly the difference the paragraph below
+                // draws: an adapter is a declared axis with a runtime input
+                // and an arm that now runs, so the answer depends on the
+                // ARTIFACT and the refusal moved to the fire, where it can
+                // name the model text (`Fault::Adapterless`,
+                // `Fault::AdapterWord`). `captures_scores` has just made the
+                // same journey — the shell carves an observability slab, the
+                // capture arm writes it and an epilogue's `attn_score`
+                // intrinsic is bound at it — so it crosses as
+                // `Seated::captures_scores` and is answered at the fire
+                // against the artifact (`Fault::Scoreless`,
+                // `Fault::ScoreWord`), which is what a declared axis's
+                // refusal has to be able to say. `drafts` does not depend on
+                // the artifact in that way, so its refusal stays at the door
+                // where it is cheapest and clearest.
                 //
-                // What makes it worth three separate refusals is what each
-                // silent drop would look like: an adapter dropped answers the
-                // base model as if corrected, a draft dropped answers a
-                // one-token step to a speculator expecting `k`, and a capture
-                // dropped answers an empty `scores` that reads as "this lane
-                // had no attention mass".
-                if lane.adapter.is_some() {
-                    return Err(Error::unsupported("metal", "adapter-routed lane"));
-                }
+                // What makes it worth refusing rather than dropping is what a
+                // silent drop would look like: a draft dropped answers a
+                // one-token step to a speculator expecting `k`.
+                //
+                // **`drafts` IS THE ONE WHOSE REFUSAL IS ABOUT THE
+                // DECLARATION AND NOT THE READER ANY MORE.** It used to be
+                // the reader: the M2 emitter gave every intrinsic one buffer
+                // at index 6, so a draft column had no second rectangle and
+                // `serve::prepare` refused to attach a program that read one.
+                // The slot table ended that — `IntrinsicId::MtpLogits` is
+                // bound at the `mtp` export's rectangle for a guest epilogue,
+                // exactly as the CUDA shell does it — and the arm was never
+                // the problem: the draft head is ordinary text and `compose`
+                // puts a lane whose WORD carries the draft class in the `mtp`
+                // window without complaint.
+                //
+                // What this flag is, and what this plane cannot yet do with
+                // it, is the CROSS-CHECK. `Seated::drafts` on the CUDA side
+                // is held against whether the fire's class word actually runs
+                // the draft arm, and against whether the load exports the
+                // seam at all; this `Seated` carries no such field, so
+                // accepting the flag would be accepting a declaration nothing
+                // compares to anything. A caller that means to draft says so
+                // in `Lane::word`, and its epilogue is served.
                 if lane.drafts {
                     return Err(Error::unsupported("metal", "mtp draft readout"));
-                }
-                if lane.captures_scores {
-                    return Err(Error::unsupported("metal", "attention score capture"));
                 }
                 Ok(Seated {
                     lane: Lane {
@@ -949,58 +1423,157 @@ impl Metal {
                     },
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
-                    // **THE ONE AXIS THAT IS CARRIED RATHER THAN REFUSED
-                    // HERE, AND IT IS STILL REFUSED — ONE LAYER DOWN.** The
-                    // `masked` fact is a declared axis (design §0/§8) and the
-                    // mask itself is a runtime input, so the shell carries
-                    // the bits and answers for them at the fire: this plane
-                    // stages no mask bits yet (`Seated::mask`'s own doc — the
-                    // metal sdpa shaders read a mask plane indexed by the
-                    // launch's local row, a different ABI from the CUDA
-                    // shell's packed runs plus an indptr), so a lane carrying
-                    // one is `Fault::Maskless`.
-                    //
-                    // Passed through instead of refused up here on purpose:
-                    // the shell also checks the WORD against the class table
-                    // in the same pass (`Fault::MaskWord`), which catches a
-                    // lane whose word puts it in a masked class while its
-                    // mask says otherwise. Refusing at this door would answer
-                    // the first half and lose the second.
+                    // **THE OBSERVABILITY AXIS, CARRIED AND ANSWERED AT THE
+                    // FIRE** (`.wiki/alto/attn-score.md` §4), exactly as the
+                    // masked one below it. The ask is a declaration; whether
+                    // this lane's word really puts its rows in the capture
+                    // window is the shell's to check, and it does.
+                    captures_scores: lane.captures_scores,
+                    // **THE MASKED AXIS, CARRIED AND ANSWERED AT THE FIRE.**
+                    // The `masked` fact is a declared axis (design §0/§8) and
+                    // the mask itself is a runtime input, so the shell takes
+                    // the bits and expands them (`crate::mask`) into the
+                    // dense plane the metal sdpa entries read. What is
+                    // answered at the fire rather than here is everything
+                    // that depends on the ARTIFACT and on the composition: a
+                    // mask against a plan that bakes no masked class
+                    // (`Fault::Maskless`), a mask whose presence and whose
+                    // word say different things (`Fault::MaskWord`), and a
+                    // mask that does not describe the lane it rides on
+                    // (`Fault::Mask`, `Fault::MaskRows`). None of those can
+                    // be asked at this door, because none of them is a fact
+                    // about the submission alone.
                     mask: lane.mask.as_ref(),
+                    // **THE ADAPTER AXIS, CARRIED AND ANSWERED AT THE FIRE**,
+                    // by the argument the mask closed one field up: an
+                    // adapter is a declared axis, the id is a runtime input,
+                    // and the PLAN decides whether anything reads it. An id
+                    // against an artifact that bakes no correction is
+                    // `Fault::Adapterless`; an id that disagrees with the
+                    // word the runtime stamped is `Fault::AdapterWord`. Both
+                    // are facts about the artifact and the composition, so
+                    // neither can be asked at this door.
+                    adapter: lane.adapter,
+                    // **EMPTY IS THE DERIVED RUN AND IT CROSSES AS EMPTY.**
+                    // The contract spells "absent" as a zero-length vector
+                    // rather than as `None`, and this hands the slice over
+                    // unchanged so the shell makes the same distinction on
+                    // the same evidence — `Seated::positions` argues which
+                    // seat a stated run reaches and which ones it does not.
+                    positions: &lane.positions,
+                    // **THE ROW LIST CROSSES TO THE DEVICE HALF, AND ONLY
+                    // THERE.** `readouts_of` fills the host mirror from the
+                    // arm's seat, which holds one row per lane; this hands
+                    // the row indices to the fire, because the other reader
+                    // of a fire's logits is a guest epilogue and the shell is
+                    // the only party that knows where a lane's run sits in
+                    // the arena rectangle.
+                    //
+                    // `Last` and `None` both cross as `None`, which is the
+                    // lane's last row: that is the row every epilogue was
+                    // given before a list could be stated, and a lane that
+                    // asked for no host mirror may still carry one.
+                    readout: match &lane.readout {
+                        Readout::Rows(rows) => Some(rows.as_slice()),
+                        Readout::Last | Readout::None => None,
+                    },
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
 
-        let rows = shell.fire_seated(&seated).map_err(fault)?;
+        // ── **THE THREE PHASES, AND THE VERB RETURNS BEFORE THE DEVICE
+        //    DOES** (articles 1 and 2). `prepare` makes every host decision,
+        //    takes an A/B seat and commits the step's demand against the
+        //    pools; `enqueue` encodes the whole walk, copies the answer out of
+        //    the arena into that seat and commits the command buffer without
+        //    waiting; `settle` files the flight. Three calls and not one wait.
+        //
+        //    `Shell::fire_seated` is the SYNCHRONOUS spelling of the same
+        //    three with the harvest on the end; it is what the native surface
+        //    and the smoke tests use, and it is deliberately not what this
+        //    path calls.
+        let landed = {
+            use engine::frame::Shell as FrameShell;
+            let done = sink.map(|sink| Done { at, sink });
+            let prepared = FrameShell::prepare(
+                shell,
+                StepView {
+                    lanes: &seated,
+                    attachments: &attached,
+                    done,
+                },
+                None,
+            )
+            .map_err(fault)?;
+            let enqueued = FrameShell::enqueue(shell, prepared).map_err(fault)?;
+            FrameShell::settle(shell, enqueued).map_err(fault)?
+        };
 
-        // THE SHELL READS THE LAST ROW AND ONLY THE LAST ROW, which is
-        // `Readout::Last` — the default, and the reason a prefill does not
-        // hand back half a megabyte per teacher-forced position.
-        let mut readouts = Vec::with_capacity(rows.len());
-        for (lane, values) in submission.lanes.iter().zip(rows) {
-            readouts.push(match &lane.readout {
-                // `scores` is empty and stays empty: no lane on this plane
-                // captured, because `captures_scores` was refused above.
-                Readout::None => LaneReadout::default(),
-                Readout::Last => LaneReadout {
+        // **EMPTY READOUTS, AND THE CONTRACT ALREADY SAID SO** (`FireTicket`'s
+        // own doc: "an asynchronous shell answers with the id and an empty
+        // readout list"). The numbers, for a caller that wants them, come from
+        // `Engine::settle_frame` — which `submit` itself calls at depth one,
+        // so the eager shell's receipts are filled exactly as they always
+        // were.
+        Ok((
+            FireTicket {
+                id,
+                readouts: Vec::new(),
+            },
+            PendingStep {
+                readout: submission
+                    .lanes
+                    .iter()
+                    .map(|lane| lane.readout.clone())
+                    .collect(),
+                landed,
+                rows: None,
+            },
+        ))
+    }
+}
+
+/// **One step's rows, in the shape each lane asked for.**
+///
+/// The shell answers one row per lane — the last one, which is what a sampler
+/// wants and the reason a prefill does not hand back half a megabyte per
+/// teacher-forced position — and this is where that becomes the contract's
+/// per-lane record.
+///
+/// **A `Readout::Rows` LANE ANSWERS AN EMPTY RECORD, AND THAT IS NOT A
+/// DROP.** A row list reaches this shell only for a lane whose epilogue asked
+/// for it — `fire_step` refuses one that has no epilogue — and those rows
+/// were delivered: on the device, into the guest program that named them, at
+/// the arena rectangle `serve::enqueue` bound its `logits` intrinsic to. The
+/// host mirror is a different reader with a different ceiling (one row per
+/// lane, the arm's seat), and it is the reader this lane did not ask.
+fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
+    let rows: &[Vec<f32>] = step.rows.as_deref().unwrap_or(&[]);
+    step.readout
+        .iter()
+        .enumerate()
+        .map(|(lane, policy)| match policy {
+            // `scores` is empty and stays empty, and that is no longer a
+            // statement about whether anything captured. `LaneReadout::scores`
+            // is the per-QUERY column palo C4b named — `LayerScores { layer,
+            // rows, heads, lse }` — and the observability door publishes a
+            // different number (per-KEY mass, `.wiki/alto/attn-score.md` §2.3
+            // calls pointing one at the other "a lie that computes"). A
+            // capturing lane on this plane is served on the DEVICE, where the
+            // epilogue's `attn_score` intrinsic reads the slab in place; the
+            // host mirror of the other column has no writer here.
+            Readout::None | Readout::Rows(_) => LaneReadout::default(),
+            Readout::Last => {
+                let values = rows.get(lane).cloned().unwrap_or_default();
+                LaneReadout {
                     rows: 1,
                     width: u32::try_from(values.len()).unwrap_or(u32::MAX),
                     values,
                     ..LaneReadout::default()
-                },
-                Readout::Rows(_) => {
-                    // Reading an interior row means keeping the whole logits
-                    // rectangle addressable after the walk, which the arena
-                    // does — `slots.0[out]` is the rectangle — but the row
-                    // list has to reach the read-back loop, and
-                    // `Shell::fire_seated` answers one row per lane by
-                    // design.
-                    return Err(Error::unsupported("metal", "row-selected readout"));
                 }
-            });
-        }
-        Ok(FireTicket { id, readouts })
-    }
+            }
+        })
+        .collect()
 }
 
 // STILL `unsafe impl`, and the CUDA sibling's rule holds over different

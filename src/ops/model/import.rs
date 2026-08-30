@@ -39,18 +39,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 
-use model_loader::checkpoint::read::{parse_checkpoint_attributes, parse_checkpoint_metadata};
-use model_loader::checkpoint::write::CheckpointWriter;
-use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
-use model_loader::contract::materialize::{Materialization, materialize_contract};
-use model_loader::executor::Progress;
-use model_loader::executor::sink::TensorSink;
-use model_loader::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
-use model_loader::types::{CheckpointFormat, Encoding, TensorDecl, Visibility};
-use model_loader::verify::ContractView;
+use checkpoint::file::read::{parse_attributes, parse_metadata};
+use checkpoint::file::write::Writer;
+use checkpoint::file::{Metadata, RawTensor};
+use checkpoint::contract::materialize::{Materialization, materialize_contract};
+use checkpoint::executor::Progress;
+use checkpoint::executor::sink::TensorSink;
+use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
+use checkpoint::types::{CheckpointFormat, Encoding, TensorDecl, Visibility};
+use checkpoint::verify::ContractView;
 
-use model_loader::checkpoint::Attributes;
-use model_loader::checkpoint::meta::{SOURCE_ENCODING_KEY, SOURCE_KEY, VERSION_KEY, meta_name};
+use checkpoint::file::Attributes;
+use checkpoint::file::meta::{SOURCE_ENCODING_KEY, SOURCE_KEY, VERSION_KEY, meta_name};
 // The artifact's on-disk names come from whoever owns them: the loader owns
 // the metadata namespace and the provenance attributes, and the object the
 // checkpoint's own config lands in belongs to the party that reads it back.
@@ -95,6 +95,17 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{text:?} is not a usable size"))
 }
 
+/// **WHERE AN OVERLAY'S TENSORS LAND** (campaign M-4).
+///
+/// One string, here, because two parties have to agree on it and neither can
+/// derive it: this command writes it and a model text reads it
+/// (`model::qwen_3::model::Recipe::Eagle`). It is a `.`-terminated prefix so
+/// that the joined name is the overlay's own spelling with a namespace in
+/// front of it — `fc.weight` becomes `aux.fc.weight` — which keeps the head's
+/// internal names readable in `pie model info` and keeps the two sets
+/// provably disjoint.
+pub const AUX_PREFIX: &str = "aux.";
+
 /// The pie that is running, as recorded in what it writes.
 ///
 /// The same string `pie --version` prints.
@@ -108,6 +119,17 @@ pub struct ImportArgs {
     /// single `.safetensors`/`.gguf`/`.zt` file. A repo ID that is not in the
     /// local cache is fetched first.
     pub source: String,
+    /// **An AUX DRAFT HEAD to overlay onto this checkpoint** (campaign M-4):
+    /// a repo ID, a snapshot directory, or a single weight file, whose tensors
+    /// are copied into the same artifact with every name prefixed `aux.`.
+    ///
+    /// The prefix is the whole of the contract and it is FAMILY-BLIND, like
+    /// everything else here: this command does not know or ask what a draft
+    /// head is. What makes those bytes one is a model text naming them —
+    /// `qwen_3`'s `Recipe::Eagle` binds `aux.fc.weight` and `aux.layers.0.*`
+    /// — exactly as the base checkpoint's own names are the text's to name.
+    #[arg(long, value_name = "SOURCE")]
+    pub aux: Option<String>,
     /// Write the artifact here instead of the model store. A path ending in
     /// `.zt` is the artifact; a directory receives `<name>.zt`.
     #[arg(long)]
@@ -161,7 +183,7 @@ pub struct ImportArgs {
 /// behind would be worse than leaving nothing — the next reader would get
 /// zeros instead of an error.
 struct Consumed<'a> {
-    metadata: &'a CheckpointMetadata,
+    metadata: &'a Metadata,
 }
 
 impl Drop for Consumed<'_> {
@@ -171,9 +193,32 @@ impl Drop for Consumed<'_> {
 }
 
 pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
-    let source = resolve_source(&args.source)?;
-    let metadata = parse_checkpoint_metadata(&source.path)
+    let mut source = resolve_source(&args.source)?;
+    let metadata = parse_metadata(&source.path)
         .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?;
+
+    // **THE OVERLAY, RESOLVED BESIDE THE BASE** (campaign M-4). A second
+    // checkpoint whose tensors land in the same artifact under `AUX_PREFIX`,
+    // so that one `.zt` carries a model and the draft head trained for it and
+    // the loader opens ONE file. Read here, before anything is written,
+    // because an unreadable head must refuse before the base is converted.
+    //
+    // **AND IT JOINS `origin`**, which is what `staleness` compares a stored
+    // artifact against: an artifact built from a base alone and one built from
+    // the same base plus a head are different artifacts, and a re-import that
+    // called the second up to date would serve a model whose draft head
+    // silently went away.
+    let aux = match &args.aux {
+        Some(spec) => {
+            let overlay = resolve_source(spec)?;
+            let meta = parse_metadata(&overlay.path)
+                .map_err(|err| anyhow!("cannot read {}: {err}", overlay.path.display()))?;
+            source.origin = format!("{} +aux {}", source.origin, overlay.origin);
+            Some((overlay, meta))
+        }
+        None => None,
+    };
+    let source = source;
 
     let out_file = match &args.out {
         Some(out) => artifact_path(out, &source.name),
@@ -421,6 +466,79 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         // own spelling and costs no copy per tensor.
         passthrough.push((raw, file.path.as_str(), raw.name.as_str()));
     }
+
+    // **THE OVERLAY'S TENSORS, PREFIXED** (campaign M-4). The writer already
+    // separates a tensor's SOURCE address from the name it lands under — the
+    // entry list is `(raw, file, output)` and has been since the merge was
+    // written — so an overlay is a second set of copies with a different
+    // `output`, and not a second write path.
+    //
+    // **COPIES ONLY, AND A NARROWING IS REFUSED BY NAME.** The base's own
+    // narrowing runs through a `LoadPlan` and a decode stream; a second plan
+    // over a second checkpoint would be a second decoder in a function whose
+    // whole shape is one. A head is eleven small tensors and the element it is
+    // read in is the element the trace declares, so the honest answer is to
+    // say so at the door rather than to grow the machine.
+    let mut mat_passthrough: Vec<String> = Vec::new();
+    let aux_names: Vec<String> = match &aux {
+        Some((overlay, meta)) => {
+            let mat = materialize_contract(meta)
+                .map_err(|err| anyhow!("cannot convert {}: {err}", overlay.path.display()))?;
+            if !mat.decoded.is_empty() {
+                bail!(
+                    "the aux checkpoint {} holds {} tensor(s) this import would have to \
+                     narrow on the way in ({}), and an overlay is copied byte for byte. \
+                     Convert it to the element the model text declares first.",
+                    crate::ui::short_path(&overlay.path),
+                    mat.decoded.len(),
+                    mat.decoded.join(", "),
+                );
+            }
+            mat_passthrough = mat.passthrough.clone();
+            mat_passthrough
+                .iter()
+                .map(|name| format!("{AUX_PREFIX}{name}"))
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    if let Some((overlay, meta)) = &aux {
+        // A collision here is a base that already publishes the namespace the
+        // overlay is being given, which would put two producers under one name
+        // — the thing every other check in this file exists to forbid.
+        if let Some(clash) = metadata
+            .weights()
+            .find(|tensor| tensor.name.starts_with(AUX_PREFIX))
+        {
+            bail!(
+                "{} already publishes `{}`, so an overlay under `{AUX_PREFIX}` would \
+                 give one name two producers",
+                source.name,
+                clash.name,
+            );
+        }
+        // Zipped against the SAME list the names were built from, and not
+        // against a second walk of the metadata. Two orderings of one set look
+        // identical in the artifact's name list and pair every tensor with
+        // somebody else's bytes; what catches it is a shape check four stages
+        // later, in a refusal that names neither this command nor the overlay.
+        for (name, output) in mat_passthrough.iter().zip(aux_names.iter()) {
+            let raw = meta
+                .tensor_by_name(name)
+                .ok_or_else(|| anyhow!("'{name}' is in the overlay's list but not its files"))?;
+            let file = meta
+                .files
+                .iter()
+                .find(|file| file.id == raw.file_id)
+                .ok_or_else(|| anyhow!("'{name}' points at a file the overlay lacks"))?;
+            passthrough.push((raw, file.path.as_str(), output.as_str()));
+        }
+        println!(
+            "convert: overlaying {} tensor(s) from {} under `{AUX_PREFIX}`",
+            aux_names.len(),
+            crate::ui::short_path(&overlay.path),
+        );
+    }
     let copy_bytes: u64 = passthrough.iter().map(|(raw, _, _)| raw.span_bytes).sum();
 
     // pie's own objects, named into the reserved namespace so the write can
@@ -451,7 +569,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
             max_tile_bytes: 64 << 20,
             ..StorageTarget::default()
         };
-        let plan = model_loader::plan::compile(&metadata, &materialization.contract, target)
+        let plan = checkpoint::plan::compile(&metadata, &materialization.contract, target)
             .map_err(|err| anyhow!("cannot compile the decode: {err}"))?;
         // A SECOND OPINION, before a byte is read.
         //
@@ -469,7 +587,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         // reason for that asymmetry: an import reads gigabytes and writes an
         // artifact other machines will serve, so it is the caller with the most
         // to gain from finding out here rather than at load.
-        if let Err(violations) = model_loader::verify::verify_plan(
+        if let Err(violations) = checkpoint::verify::verify_plan(
             &plan,
             Some(&ContractView::of(&materialization.contract)),
         ) {
@@ -516,7 +634,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     let mut spool = match &plan {
         Some(plan) if !ordered => {
             let mut spool = Spool::create(&out_file)?;
-            model_loader::executor::Execution::new(plan, &source.base())
+            checkpoint::executor::Execution::new(plan, &source.base())
                 .streaming()
                 .sink(&mut spool)
                 .progress(&mut |progress| {
@@ -546,8 +664,8 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         (SOURCE_ENCODING_KEY.to_string(), source_encoding(&metadata)),
     ]);
     let mut writer = match args.max_shard_size {
-        Some(max) => CheckpointWriter::create_sharded(&out_file, &provenance, max),
-        None => CheckpointWriter::create(&out_file, &provenance),
+        Some(max) => Writer::create_sharded(&out_file, &provenance, max),
+        None => Writer::create(&out_file, &provenance),
     }
     .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
     if consume {
@@ -635,7 +753,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
 /// the architecture, and the config wants the whole block — and the file is
 /// the same file. The cost is a header parse rather than a scan, but a second
 /// one still buys nothing.
-fn gguf_attributes(source: &Source, metadata: &CheckpointMetadata) -> Option<Attributes> {
+fn gguf_attributes(source: &Source, metadata: &Metadata) -> Option<Attributes> {
     if !metadata
         .files
         .iter()
@@ -643,7 +761,7 @@ fn gguf_attributes(source: &Source, metadata: &CheckpointMetadata) -> Option<Att
     {
         return None;
     }
-    parse_checkpoint_attributes(&source.path).ok()
+    parse_attributes(&source.path).ok()
 }
 
 // `ingest_map`, `apply_ingest`, `unpermute` and `report_servability` STOOD
@@ -653,7 +771,7 @@ fn gguf_attributes(source: &Source, metadata: &CheckpointMetadata) -> Option<Att
 // which row it would identify as. R3 deleted the catalog and the contract
 // that read those names, so all four are gone: see the note in `run`.
 
-fn report_would_delete(metadata: &CheckpointMetadata) {
+fn report_would_delete(metadata: &Metadata) {
     let bytes = source_bytes(metadata);
     println!(
         "dry run: would then delete {} source weight file(s), freeing {} MB",
@@ -670,8 +788,8 @@ fn report_would_delete(metadata: &CheckpointMetadata) {
 /// checkpoint files the metadata names go, each with the blob its cache
 /// symlink points at, plus the shard index that would otherwise keep naming
 /// files that no longer exist.
-fn delete_source(repo_id: &str, metadata: &CheckpointMetadata, artifact: &Path) -> Result<()> {
-    let verified = model_loader::checkpoint::zt::verify_checkpoint(artifact).map_err(|err| {
+fn delete_source(repo_id: &str, metadata: &Metadata, artifact: &Path) -> Result<()> {
+    let verified = checkpoint::file::zt::verify(artifact).map_err(|err| {
         anyhow!(
             "refusing to delete the source: {} does not verify: {err}",
             artifact.display()
@@ -690,7 +808,7 @@ fn delete_source(repo_id: &str, metadata: &CheckpointMetadata, artifact: &Path) 
 /// The checkpoint files the metadata names, each with the blob its cache
 /// symlink points at, plus the shard index that would otherwise keep naming
 /// files that no longer exist. Config and tokenizer files are untouched.
-fn remove_source_files(metadata: &CheckpointMetadata) -> Result<()> {
+fn remove_source_files(metadata: &Metadata) -> Result<()> {
     for file in &metadata.files {
         remove_cache_file(Path::new(&file.path))?;
     }
@@ -708,7 +826,7 @@ fn remove_source_files(metadata: &CheckpointMetadata) -> Result<()> {
 }
 
 /// What deleting the source weight files gives back.
-fn source_bytes(metadata: &CheckpointMetadata) -> u64 {
+fn source_bytes(metadata: &Metadata) -> u64 {
     metadata.files.iter().map(|file| file.size_bytes).sum()
 }
 
@@ -857,10 +975,10 @@ impl TensorSink for Spool {
         &mut self,
         name: &str,
         bytes: &[u8],
-    ) -> std::result::Result<(), model_loader::error::Error> {
+    ) -> std::result::Result<(), checkpoint::error::Error> {
         use std::io::Write;
         self.file.write_all(bytes).map_err(|err| {
-            model_loader::error::Error::Checkpoint(format!(
+            checkpoint::error::Error::Checkpoint(format!(
                 "cannot spool '{name}' to {}: {err}",
                 self.path.display()
             ))
@@ -881,7 +999,7 @@ impl TensorSink for Spool {
 /// `Progress`.
 ///
 /// The adapter is here rather than in `ui` so the presentation module stays
-/// free of `model_loader` -- what it needs to draw a bar is two numbers and a
+/// free of `checkpoint` -- what it needs to draw a bar is two numbers and a
 /// label, and `Progress` is where those two numbers happen to live today.
 pub(crate) struct ProgressLine {
     bar: crate::ui::Bar,
@@ -942,7 +1060,7 @@ impl ProgressLine {
 /// The scheme *name* is still `Debug`-derived, and that is fine — it is a
 /// label, read by operators and never branched on. What must not depend on a
 /// `Debug` impl is the classification, and now it does not.
-fn source_encoding(metadata: &model_loader::checkpoint::CheckpointMetadata) -> String {
+fn source_encoding(metadata: &checkpoint::file::Metadata) -> String {
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for tensor in metadata.weights() {
         seen.insert(match &tensor.encoding {
@@ -954,16 +1072,18 @@ fn source_encoding(metadata: &model_loader::checkpoint::CheckpointMetadata) -> S
             // this string is asked. `build::quantized_source` holds no table
             // by design; this is where the `Encoding` is in hand, so this is
             // where the judgement goes.
-            model_loader::types::Encoding::Raw(dtype) if dtype.is_block_scaled() => {
+            checkpoint::types::Encoding::Raw(dtype)
+                if checkpoint::types::is_block_scaled(*dtype) =>
+            {
                 format!("quant:{}", format!("{dtype:?}").to_lowercase())
             }
-            model_loader::types::Encoding::Raw(dtype) => {
+            checkpoint::types::Encoding::Raw(dtype) => {
                 format!("raw:{}", format!("{dtype:?}").to_lowercase())
             }
             // The variant name lowercased, minus the `Gguf` family prefix:
             // `GgufQ4_0` is the scheme llama.cpp and every model card call
             // `Q4_0`, and this string is read by operators, not by Rust.
-            model_loader::types::Encoding::Quant(spec) => {
+            checkpoint::types::Encoding::Quant(spec) => {
                 let name = format!("{:?}", spec.scheme);
                 format!(
                     "quant:{}",
@@ -1253,7 +1373,7 @@ fn drop_tied_head(materialization: &mut Materialization, heads: &[String]) -> Ve
 /// regression: `declares_tied_head` reads `tie_word_embeddings` out of a
 /// `config.json` a GGUF does not have, so the drop was never reachable from
 /// the format's own statement in the first place.
-fn tied_head_sources(metadata: &CheckpointMetadata) -> Vec<String> {
+fn tied_head_sources(metadata: &Metadata) -> Vec<String> {
     metadata
         .tensors
         .iter()
@@ -1331,7 +1451,7 @@ pub(crate) fn carry_config(source: &Source) -> Result<Option<Vec<u8>>> {
 /// the reason — and never produces an artifact that cannot serve.
 pub(crate) fn compile_tokenizer(
     source: &Source,
-    metadata: &CheckpointMetadata,
+    metadata: &Metadata,
 ) -> Result<Option<tokenizer::canonical::CanonicalTokenizer>> {
     let Some(path) = tokenizer_path(source) else {
         return gguf_tokenizer(source, metadata);
@@ -1388,7 +1508,7 @@ pub(crate) fn compile_tokenizer(
 /// already the command that converts what it cannot serve and says so.
 fn gguf_tokenizer(
     source: &Source,
-    metadata: &CheckpointMetadata,
+    metadata: &Metadata,
 ) -> Result<Option<tokenizer::canonical::CanonicalTokenizer>> {
     if !metadata
         .files
@@ -1397,7 +1517,7 @@ fn gguf_tokenizer(
     {
         return Ok(None);
     }
-    let tables = model_loader::checkpoint::read::parse_checkpoint_tokenizer(&source.path)?;
+    let tables = checkpoint::file::read::parse_tokenizer(&source.path)?;
     if tables.is_empty() {
         return Ok(None);
     }
@@ -1429,7 +1549,7 @@ fn gguf_tokenizer(
 /// It is a release version, not a build identity, so it does *not* move while
 /// the converter is being worked on. `--force` is the tool for that.
 fn staleness(artifact: &Path, version: &str, source: &str) -> Option<String> {
-    let attributes = match model_loader::checkpoint::zt::read_attributes(artifact) {
+    let attributes = match checkpoint::file::zt::read_attributes(artifact) {
         Ok(attributes) => attributes,
         Err(err) => return Some(format!("cannot read its provenance: {err}")),
     };
@@ -1475,8 +1595,8 @@ enum From<'a> {
 /// means it runs here, on a thread of its own, straight into the merge.
 #[allow(clippy::too_many_arguments)]
 fn write_artifact<'a>(
-    writer: &mut CheckpointWriter,
-    plan: Option<&'a model_loader::plan::LoadPlan>,
+    writer: &mut Writer,
+    plan: Option<&'a checkpoint::plan::LoadPlan>,
     base: &Path,
     spool: Option<&'a mut Spool>,
     passthrough: &[(&'a RawTensor, &'a str, &'a str)],
@@ -1612,7 +1732,7 @@ type Lane = (
 /// The ascending merge itself: one ordered pass over `entries`.
 #[allow(clippy::too_many_arguments)]
 fn merge_entries(
-    writer: &mut CheckpointWriter,
+    writer: &mut Writer,
     entries: &[(&str, From<'_>)],
     chunks: &[Chunk<'_>],
     decoded: &mut Decoded<'_>,
@@ -1643,7 +1763,7 @@ fn merge_entries(
             }
             From::Meta(bytes) => {
                 let path = name
-                    .strip_prefix(model_loader::checkpoint::meta::META_PREFIX)
+                    .strip_prefix(checkpoint::file::meta::META_PREFIX)
                     .expect("metadata entries carry the namespace prefix");
                 writer
                     .add_meta(path, bytes)
@@ -1860,13 +1980,13 @@ impl Decoded<'_> {
 /// `watch` is handed the executor's `(read_bytes, total_read_bytes)`, since
 /// this thread cannot touch the caller's progress line.
 fn decode_into(
-    plan: &model_loader::plan::LoadPlan,
+    plan: &checkpoint::plan::LoadPlan,
     base: &Path,
     to: &std::sync::mpsc::SyncSender<std::result::Result<(String, Vec<u8>), String>>,
     watch: &(dyn Fn(u64, u64) + Sync),
 ) {
     let mut sink = Handoff { to };
-    let outcome = model_loader::executor::Execution::new(plan, base)
+    let outcome = checkpoint::executor::Execution::new(plan, base)
         .streaming()
         .sink(&mut sink)
         .progress(&mut |progress| watch(progress.read_bytes, progress.total_read_bytes))
@@ -1886,11 +2006,11 @@ impl TensorSink for Handoff<'_> {
         &mut self,
         name: &str,
         bytes: &[u8],
-    ) -> std::result::Result<(), model_loader::error::Error> {
+    ) -> std::result::Result<(), checkpoint::error::Error> {
         self.to
             .send(Ok((name.to_string(), bytes.to_vec())))
             .map_err(|_| {
-                model_loader::error::Error::Checkpoint(format!(
+                checkpoint::error::Error::Checkpoint(format!(
                     "the artifact writer stopped before '{name}'"
                 ))
             })
@@ -1907,8 +2027,8 @@ mod tests {
     // stood, above `carry_config`.
 
     use super::*;
-    use model_loader::checkpoint::write::{WriteTensor, write_zt};
-    use model_loader::types::{DType, Encoding, TensorId};
+    use checkpoint::file::write::{WriteTensor, write_zt};
+    use checkpoint::types::{DType, Encoding, TensorId};
 
     #[test]
     fn a_repo_id_becomes_one_flat_store_name() {
@@ -2113,14 +2233,14 @@ mod tests {
     /// to use would work until a checkpoint chose the other one.
     #[test]
     fn a_tied_head_is_dropped_from_every_set_that_would_write_it() {
-        use model_loader::contract::{Expr, ModelContract, TensorContract};
+        use checkpoint::contract::{Expr, ModelContract, TensorContract};
 
         let head = |name: &str| {
             TensorContract::new(
                 name,
-                Expr::src(name).cast(Encoding::Raw(DType::BF16)),
+                Expr::src(name).cast(Encoding::Raw(DType::Bf16)),
                 vec![151936, 1024],
-                Encoding::Raw(DType::BF16),
+                Encoding::Raw(DType::Bf16),
             )
         };
         let mut m = Materialization {

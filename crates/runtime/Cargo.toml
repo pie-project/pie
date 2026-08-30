@@ -15,26 +15,41 @@ path = "src/lib.rs"
 [dependencies]
 # tart: the declared-forward toolchain, and OPTIONAL now.
 #
-engine-api = { path = "../engine-api" }
-# THE NEUTRAL SUBSTRATE, and the runtime reads exactly one module of it in the
-# library: `engine::runahead`, which design §1 article 8 names as the
-# enforcement of *one number, one owner*. The runtime owns the run-ahead
-# policy and the guest-visible ring size, so it has to DERIVE them from the
-# formula rather than transcribe it — a second spelling of `frames_in_flight
-# + 1` in this crate is the three-depth knot growing back.
-#
-# It is also the host half of the guest-program plane: `engine::program` is a
-# complete interpreter of the same launch package the CUDA shell executes —
-# same ops, same channel semantics, same pass-atomic commit — and
-# `tests/cuda_program_epilogue.rs` diffs the two over a real model fire's
-# logits. That was a dev-dependency until wave E promoted the edge.
 engine = { path = "../engine" }
-tensor-ir = { path = "../tensor-ir" }
-tensor-compiler = { path = "../tensor-compiler" }
+# `engine` IS GONE FROM THIS MANIFEST ENTIRELY, and the two steps that emptied
+# it are worth keeping because each one was a smaller claim than it looked.
+#
+# First it became a dev-dependency: `runahead` was this crate's one library
+# reader and it lives in `engine` now — where a formula both sides of the
+# load boundary derive from belongs — so every remaining mention of the
+# substrate in `src/` was PROSE, and the one code reader was a test.
+#
+# Then that test went too. tests/cuda_program_epilogue.rs — unbackticked
+# because it is gone, which is this tree's convention for naming something a
+# reader cannot open — drove the guest-program plane's host interpreter
+# against the CUDA shell, which is a
+# claim about a SHELL and not about this crate: it reached past the pipeline it
+# nominally tested and used `runtime` only for the three load helpers
+# (`engine::load::{contract_for, request, classify}`). Its four siblings that
+# do exactly that — `cuda_kv_page_graft`, `cuda_row_selected_readout`,
+# `cuda_shared_device_ring`, `cuda_width_invariance` — live in `tests/gpu/`,
+# which is the workspace member for a test that depends on the runtime rather
+# than being one.
+#
+# The consequence is worth the line: `worker` no longer reaches the
+# model-execution substrate through this crate at all, in any profile.
+eta-ir = { path = "../eta-ir" }
+# The trace vocabulary this crate hands across the load boundary (`Trace`,
+# `Platform`, `ParamSource`). Named directly rather than through `engine`'s
+# re-export, which is gone: a crate that spells a type depends on the crate
+# that owns it.
+model-ir = { path = "../model-ir" }
+eta-compiler = { path = "../eta-compiler" }
 # THE CUTOVER, DONE. This was `engine-cuda-new` beside a C++ `engine-cuda`
 # that supplied the same thirteen `pie_cuda_*` symbols, so which archive
-# the seam linked was the whole switch and `backend/cuda.rs` was unchanged
-# either way. There is one now, and it has the name.
+# the seam linked was the whole switch and the boot reader was unchanged
+# either way. There is one now, and it has the name. (That reader was
+# `backend/cuda.rs`; it is `engine_cuda::boot` now.)
 # `default-features = false` drops the shell's `probe` feature — the gate-only
 # hooks (`Session::skew_prediction`) that exist to make the engine disagree
 # with itself on purpose. A serving binary has no business compiling one.
@@ -145,20 +160,20 @@ model = { path = "../model" }
 # decision 18). `model` above supplies the catalog and the per-SKU import; the
 # three edges below are what it takes to USE them at the boundary:
 #
-#   * `model-loader` names `ModelContract`, the value `model::import_of`
-#     builds and `engine_api`'s `LoadRequest` deliberately has no seat for —
-#     the contract's dependency floor is `model-ir`/`tensor-ir`/serde/thiserror,
+#   * `checkpoint` names `ModelContract`, the value `model::import_of`
+#     builds and `engine`'s `LoadRequest` deliberately has no seat for —
+#     the contract's dependency floor is `model-ir`/`eta-ir`/serde/thiserror,
 #     and a loader type in it would put the whole checkpoint plane in the graph
 #     of everyone who reads a `KvHandle`. So the shell takes it through a
 #     function pointer this crate installs (`engine::load`).
 #   * `ztensor` + `ztensor-compat` open the checkpoint the import is checked
-#     against — the same pair `model-loader` itself takes, for the reason its
+#     against — the same pair `checkpoint` itself takes, for the reason its
 #     manifest gives: `ztensor` owns the container format, `ztensor-compat`
 #     owns the foreign projections (a stock safetensors snapshot is one).
 #
 # `default-features = false` on the loader drops its testkit (oracle, contract
 # fixture builder, CPU executor); nothing here reaches them.
-model-loader = { path = "../model-loader", default-features = false }
+checkpoint = { path = "../checkpoint", default-features = false }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 # Host-side media decode for the model-agnostic multimodal API
@@ -222,8 +237,8 @@ _engine-cuda = ["dep:engine-cuda"]
 # — deliberately, so its host tests run on a laptop — so a binary that names
 # `engine-cuda-13` here and nothing over there LINKS a shell that cannot bind
 # a device. They were dropped in the palo step-4 wave as dead refs, which they
-# were while nothing in this crate constructed a shell; `backend::cuda::open`
-# constructs one now.
+# were while nothing in this crate constructed a shell;
+# `engine::backend::open::cuda` constructs one now.
 engine-cuda-12 = ["_engine-cuda", "engine-cuda/cuda-12"]
 engine-cuda-13 = ["_engine-cuda", "engine-cuda/cuda-13"]
 # The Metal shell. There is no ABI to choose and so no version in the name:

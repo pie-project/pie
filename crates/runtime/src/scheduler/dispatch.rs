@@ -21,11 +21,11 @@
 
 use std::sync::Arc;
 
-use ::engine_api::transfer::{KvMove, MemoryDomain, StateMove};
+use ::engine::transfer::{KvMove, MemoryDomain, StateMove};
 use anyhow::Result;
-use tensor_ir::registry::GeometryClass;
+use eta_ir::registry::GeometryClass;
 
-use ::engine_api::program::BindExtents;
+use ::engine::program::BindExtents;
 
 use crate::engine::{
     BoundInstance, ChannelEndpoint, ChannelRegistration, ChannelValue, EngineId, InstanceBindingPlan,
@@ -98,9 +98,9 @@ pub(crate) async fn register_channels(
 /// THAT KNOWS BOTH.** The runtime's channel plane addresses a channel by its
 /// GLOBAL id — [`ChannelValue::channel`](crate::engine::ChannelValue), the id
 /// a `ChannelRegistration` was minted with — and the contract's
-/// [`ChannelSeed`](engine_api::ChannelSeed) addresses it by its index in the
+/// [`ChannelSeed`](engine::ChannelSeed) addresses it by its index in the
 /// package's DECLARATION order, the same numbering
-/// [`Engine::publish_channel`](engine_api::Engine::publish_channel) uses and
+/// [`Engine::publish_channel`](engine::Engine::publish_channel) uses and
 /// the numbering an instance's rings are carved in.
 ///
 /// Both sites below used to spell the conversion `u32::try_from(global_id)`,
@@ -109,7 +109,7 @@ pub(crate) async fn register_channels(
 /// constructs a channel; declaration order is the order the TRACE holds them
 /// in (`Traced::channel_order`), which the builder derives from how the ports
 /// and stages use them. They coincide by accident or not at all — the first
-/// PTIR inferlet through this door seeded a five-token `toks` cell into a
+/// ETA inferlet through this door seeded a five-token `toks` cell into a
 /// two-lane `rng` ring, which is where the CUDA shell caught it
 /// ("a i32 wire cell of 2 lane(s) is 8 bytes and 20 were offered").
 ///
@@ -124,7 +124,7 @@ pub(crate) async fn register_channels(
 fn seeds_in_declaration_order(
     channel_ids: &[u64],
     seed_values: Vec<ChannelValue>,
-) -> Result<Vec<::engine_api::channel::ChannelSeed>> {
+) -> Result<Vec<::engine::channel::ChannelSeed>> {
     seed_values
         .into_iter()
         .map(|value| {
@@ -138,7 +138,7 @@ fn seeds_in_declaration_order(
                         channel_ids
                     )
                 })?;
-            Ok(::engine_api::channel::ChannelSeed {
+            Ok(::engine::channel::ChannelSeed {
                 channel: u32::try_from(at).unwrap_or(u32::MAX),
                 bytes: value.bytes,
             })
@@ -176,7 +176,7 @@ pub(crate) async fn register_channels_bind_classified(
     // `requested_instance_id` NO LONGER TRAVELS. The contract's
     // `InstanceBinding` carries what an engine needs and nothing the runtime
     // wanted back unchanged; the engine mints the id and the runtime keeps its
-    // own tables (`engine-api::program`'s note). The argument survives because
+    // own tables (`engine::program`'s note). The argument survives because
     // callers still name the instance they staged channels for.
     let _ = requested_instance_id;
     let handle = scheduler_handle(engine_idx)?;

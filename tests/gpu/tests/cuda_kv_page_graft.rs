@@ -60,11 +60,11 @@
 
 mod common;
 
-use engine_api::model_ir::Platform;
-use engine_api::{
+use engine::{
     Budgets, FrameSubmission, KvCopy, KvDelta, KvMove, Lane, MemoryDomain, Readout,
     RsReset, RsVerb, StateCopy, StateMove, Step,
 };
+use model_ir::Platform;
 use runtime::engine::backend::open;
 
 /// The catalog row this gate serves, spelled as the catalog spells it.
@@ -160,7 +160,7 @@ fn a_grafted_page_run_decodes_exactly_as_the_run_it_was_copied_from() {
         &checkpoint,
         Platform::Cuda,
         budgets,
-        engine_api::Residency::uncapped(),
+        engine::Residency::uncapped(),
         0,
         1,
     )
@@ -187,7 +187,7 @@ fn a_grafted_page_run_decodes_exactly_as_the_run_it_was_copied_from() {
     assert!(
         matches!(
             host_to_host,
-            Err(engine_api::Error::Unsupported { engine: "cuda", .. })
+            Err(engine::Error::Unsupported { engine: "cuda", .. })
         ),
         "a host-pinned copy plan is refused by name, not served: {host_to_host:?}"
     );

@@ -43,15 +43,37 @@ const PLATFORMS: [Platform; 4] = [
     Platform::Vulkan,
 ];
 
-/// The one shipping SKU whose checkpoint publishes a draft head.
-const DRAFTING: &str = "qwen36-27b-bf16-kv-bf16";
+/// **EVERY SKU THAT DECLARES A DRAFT HEAD, UNDER EITHER RECIPE** (campaign
+/// M-4).
+///
+/// The first publishes its head INSIDE the base checkpoint (`mtp.*`, fifteen
+/// tensors); the second carries an overlay one baked beside the base by
+/// `pie model import --aux` (`aux.*`, twelve). What the axis is made of is
+/// identical either way — one fact bit, one window, one kv row, one export
+/// seam — and asking BOTH is what says the generalization did not quietly
+/// become two axes with one name.
+const DRAFTING: [&str; 2] = [
+    "qwen36-27b-bf16-kv-bf16",
+    "qwen35-d0.8b-eagle-bf16-kv-bf16",
+];
 
 /// The workhorse the capture arm is asked about — small, dense, and the SKU
 /// palo C2 ran the adapter goldens on.
 const CAPTURING: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
-/// `drafts` and `captures_scores`, as bits of a lane's word.
-const NEW_BITS: u64 = (1 << 2) | (1 << 3);
+/// **EVERY AXIS DECLARED AFTER THE PIN**, as bits of a lane's word:
+/// `drafts` (2) and `captures_scores` (3), which this file was written for,
+/// and `masked` (4), which qwen's text grew afterwards.
+///
+/// The mask is the question's subject, not a detail of it. What is pinned
+/// below is what a lane that declares NONE of the new axes costs, so a new
+/// axis is admitted here the day its bit is declared — otherwise its own
+/// classes are counted as "old words", the class count doubles, and the
+/// failure reads as a regression in behaviour when it is the arrival of an
+/// axis. With `masked` admitted the three pinned numbers are UNMOVED: four
+/// classes, the same nodes, the same arena to the byte. That is the claim,
+/// and it is now made about three axes instead of two.
+const NEW_BITS: u64 = (1 << 2) | (1 << 3) | (1 << 4);
 
 fn budgets_for(trace: &Trace) -> Budget {
     let seats = trace
@@ -106,23 +128,24 @@ fn exported(trace: &Trace, seam: &str) -> ValueId {
 /// them is which cache each walks — `kv.mtp` is the head's and nobody else's.
 #[test]
 fn a_drafting_lane_lands_in_a_class_that_runs_the_draft_head() {
-    let classify = model::classify_of(DRAFTING).expect("and its classifier");
+    for sku in DRAFTING {
+    let classify = model::classify_of(sku).expect("and its classifier");
     for platform in PLATFORMS {
-        let trace = trace_of(DRAFTING, platform);
-        let classes = resolve_classes(&trace).expect("the qwen36 plan resolves every merge");
+        let trace = trace_of(sku, platform);
+        let classes = resolve_classes(&trace).expect("the drafting plan resolves every merge");
 
         // Which cache index is the head's own row.
         let head_cache = trace
             .caches
             .iter()
             .position(|row| matches!(row, model_dsl::CacheRow::Kv { name, .. } if name == "kv.mtp"))
-            .unwrap_or_else(|| panic!("{platform:?}: the draft head declares no kv row"))
+            .unwrap_or_else(|| panic!("`{sku}` as {platform:?}: the draft head declares no kv row"))
             as u32;
         let head_pages = trace
             .values
             .iter()
             .position(|v| v.def == model_dsl::Def::Cache(head_cache))
-            .unwrap_or_else(|| panic!("{platform:?}: nothing reads the draft head's kv row"))
+            .unwrap_or_else(|| panic!("`{sku}` as {platform:?}: nothing reads the draft head's kv row"))
             as u32;
 
         let runs_the_head = |class: usize| {
@@ -165,6 +188,7 @@ fn a_drafting_lane_lands_in_a_class_that_runs_the_draft_head() {
              draft head — the window is not a window and every fire pays for a \
              second transformer block and a second vocabulary GEMM"
         );
+    }
     }
 }
 
@@ -254,7 +278,7 @@ fn a_capturing_lane_lands_in_a_class_that_runs_the_lse_attention() {
 /// and far easier to miss.
 #[test]
 fn the_draft_readout_outlives_the_trunk_readout() {
-    for sku in [DRAFTING, CAPTURING] {
+    for sku in DRAFTING.into_iter().chain([CAPTURING]) {
         for platform in PLATFORMS {
             let trace = trace_of(sku, platform);
             // Every value on every export seam, in the order the plan states
@@ -280,11 +304,11 @@ fn the_draft_readout_outlives_the_trunk_readout() {
             // ever names two.
             let out = exported(&trace, "out");
             assert!(exports.contains(&("out", out)));
-            if sku == DRAFTING {
+            if DRAFTING.contains(&sku) {
                 let draft = exported(&trace, "mtp");
                 assert!(
                     exports.contains(&("mtp", draft)),
-                    "`{sku}` is the SKU whose checkpoint publishes a draft head"
+                    "`{sku}` is a SKU whose artifact carries a draft head"
                 );
             }
 
@@ -482,7 +506,7 @@ fn the_new_axes_cost_the_old_words_nothing() {
 /// per-layer score columns.
 #[test]
 fn every_export_is_demanded_and_nothing_else_is_dead() {
-    for sku in [DRAFTING, CAPTURING] {
+    for sku in DRAFTING.into_iter().chain([CAPTURING]) {
         for platform in PLATFORMS {
             let trace = trace_of(sku, platform);
             let classes = resolve_classes(&trace).expect("the plan resolves every merge");

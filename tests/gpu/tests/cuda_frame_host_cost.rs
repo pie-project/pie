@@ -17,7 +17,7 @@
 //!
 //! * `text-completion` carries its token through the HOST — `submit` then
 //!   `take_host().await`, one fire in flight, `GeometryClass::Host`.
-//! * `token-healing --heal=false` carries it on the DEVICE — `ptir::run_ahead`
+//! * `token-healing --heal=false` carries it on the DEVICE — `eta::run_ahead`
 //!   keeps a window of frames outstanding and the shell reads the token off
 //!   the ring (`GeometryClass::DecodeEnvelope`). It also asks for the whole
 //!   vocabulary at startup, which is where its per-launch constant lives.

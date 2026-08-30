@@ -31,6 +31,20 @@
 //! As `serve_smoke.rs`: skipped at run time when the machine, the checkpoint
 //! or the tokenizer is missing, rather than `#[ignore]`d.
 //!
+//! **AND `#[ignore]` IS ON THEM NOW, WHICH REVERSES THAT.** The reading above
+//! was right about the risk and wrong about which box it meant. The one box in
+//! the fleet with a GPU is CI's self-hosted `pie-worker (engine-cuda)` job, and
+//! that job only ever BUILT these (`--no-run`) — so "the box that could run it"
+//! was a developer's machine, and what ran them was a plain `cargo test`. That
+//! cost 1580 s of a 1864 s workspace sweep across thirteen binaries, which is
+//! how a pre-push sweep becomes 31 minutes and then becomes a sweep nobody
+//! runs. Trading one gate for the whole suite is the worse bargain.
+//!
+//! The run-time skip stays — it is still what a developer sees when the
+//! snapshot is missing. What is added is that the sweep no longer waits for a
+//! model to load, and that the CUDA job now runs `-- --ignored` rather than
+//! only compiling. The gate did not weaken; it moved to the hardware.
+//!
 //! ```text
 //! RUSTFLAGS="--force-warn missing_docs" \
 //!   cargo test -p engine-cuda --features cuda-13 --test graph_replay -- --nocapture
@@ -146,6 +160,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(4, 256),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,
@@ -208,6 +223,7 @@ fn warm(millis: &[f64]) -> f64 {
 /// Claim 1: eager and replayed produce the same tokens, and the three modes
 /// say which layer any difference belongs to.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_replayed_fire_says_token_for_token_what_an_eager_fire_says() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the capture A/B") else {
@@ -256,6 +272,16 @@ fn a_replayed_fire_says_token_for_token_what_an_eager_fire_says() {
         "the graph mode neither captured nor replayed anything, so this test \
          compared eager against eager"
     );
+    // **EVERY COUNT BELOW IS PER FIRE BECAUSE THIS SKU IS ONE CAPTURE UNIT**
+    // (multimodal §5.3). A fire launches one exec PER UNIT, so a two-unit
+    // plan — a text that declares a vision tower — makes `execs`, `captures`
+    // and `replays` count units and not fires, and every arithmetic assertion
+    // in this file would be off by the unit count. That is no longer a
+    // property of the tree: `qwen35-d0.8b-vision-bf16-kv-bf16` bakes two units
+    // today (`model --test the_tower_is_its_own_capture_unit`). It is a
+    // property of THE SKU THIS FILE LOADS, which is the text-only row, and the
+    // day someone points the file at a tower row the numbers move for a reason
+    // this comment names rather than for one they have to find.
     assert_eq!(
         golden, shaped,
         "graph-shaped attention schedules changed the continuation before any \
@@ -279,6 +305,7 @@ fn a_replayed_fire_says_token_for_token_what_an_eager_fire_says() {
 /// of the key rather than of this fire's kv contents. The prefill lane is
 /// re-seated every step so the mixed shape repeats and therefore captures.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_mixed_fire_replays_what_it_says_eagerly() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the mixed-fire replay") else {
@@ -366,6 +393,7 @@ fn mixed(
 /// recaptured every fire would produce exactly the right tokens, slowly. So
 /// the counter is the instrument.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_key_captures_once_and_a_new_shape_captures_once_more() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the graph cache") else {
@@ -463,7 +491,12 @@ fn a_key_captures_once_and_a_new_shape_captures_once_more() {
     );
     assert_eq!(
         two_lane.execs, 2,
-        "two shapes, two execs — and the first was not evicted",
+        "two shapes, two execs — and the first was not evicted. TWO SHAPES is \
+         what this counts, and it reads as two FIRES only because this SKU is \
+         one capture unit: a tower text launches one exec per unit per fire, so \
+         the same two shapes would seat four here (multimodal §5.3, and \
+         `model --test the_tower_is_its_own_capture_unit` for which rows are \
+         which)",
     );
     assert_eq!(
         two_lane.replays,

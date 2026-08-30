@@ -1,12 +1,12 @@
 //! Generates JSON while enforcing a caller-supplied JSON Schema.
 //!
 //! The host grammar matcher advances after every accepted token and supplies
-//! the next allowed-token mask to a PTIR `mask_apply` + argmax epilogue.
+//! the next allowed-token mask to an ETA `mask_apply` + argmax epilogue.
 
 use inferlet::chat;
 use inferlet::grammar::{Grammar, Matcher};
 use inferlet::mask::unpack_mask;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
 

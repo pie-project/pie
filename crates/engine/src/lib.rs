@@ -1,11 +1,96 @@
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
-// `deny(missing_docs)` stood here, and the workspace lints table still says
-// deny; the allow below overrides it. The program/ plane's prose was stripped
-// by the owner's sweep, and a lint that contradicts the text it governs
-// forced a RUSTFLAGS override onto every consumer build — the lint follows
-// the text (palo ruling). New modules (fire/) document themselves by
-// convention, not by threat.
-#![allow(missing_docs)]
+//! The runtime↔engine contract: what an engine *is*, in types.
+//!
+//! ```text
+//! engine.rs    trait Engine — load, register_program, register_channel,
+//!              bind_instance, close_*, submit, copy_kv, copy_state,
+//!              encode
+//! error.rs     Error                       ← the PIE_STATUS_* graveyard
+//! load.rs      LoadRequest { plan, checkpoint, budgets, residency } -> Loaded { facts, caps }
+//! fire.rs      FrameSubmission { steps: Vec<Step { lanes, attachments }> }
+//!              -> FrameTicket                    ← the execution plane's unit
+//! frame.rs     Prepared / Enqueued / Shell — the typed prepare/enqueue/
+//!              settle seam every shell steps through
+//! runahead.rs  Runahead — every run-ahead depth, derived from one number
+//! program.rs   ProgramRegistration / InstanceBinding / BoundInstance /
+//!              BindExtents — what a caller states and the engine answers.
+//!              The LaunchPackage lineage it used to hold is `eta-compiler`'s
+//! channel.rs   the typed channel declaration
+//! adapter.rs   AdapterRegistration — the correction class's residency verb
+//! transfer.rs  KvHandle / KvLayout / the three movement verbs' arguments
+//! caps.rs      DeviceFacts, Capabilities
+//! ```
+//!
+//! # What this crate was
+//!
+//! A C header's ghost. There is no C on either side of this boundary any more
+//! — every engine in the workspace is Rust, linked into the same process, and
+//! called through a `&mut dyn Engine` — but the crate kept the shape of one
+//! for years after the C++ went:
+//!
+//! * an `i32` status ladder (`PIE_STATUS_OK` … `PIE_STATUS_IMPOSSIBLE`), so a
+//!   caller needed a table to read a failure and a second, unrelated string to
+//!   learn what it was about;
+//! * `PIE_DRIVER_ABI_VERSION: u32 = 25`, stamped into every capability record
+//!   and checked on every load — an ABI version on a call between two crates
+//!   Cargo compiles together;
+//! * `type DeviceDomain = u32` with seven `PIE_MEMORY_DOMAIN_*` constants and
+//!   a `pie_memory_domain_is_valid` predicate, sitting three files away from
+//!   `enum MemoryDomain`, which is the same axis and cannot be invalid;
+//! * forty-odd `u8` tag constants re-spelling `eta-ir`'s own vocabulary
+//!   (dtypes, host roles, extern directions, readiness, stages, ports) with
+//!   nothing checking that the two numberings agreed;
+//! * thirteen `PIE_DEVICE_PORT_*` bits in a private numbering that disagreed
+//!   with the port registry's;
+//! * and an 807-line completion broker — a waker table, a recycling pool of
+//!   `#[repr(C)]` atomic terminal cells, per-work-item leases — living inside
+//!   the description of what an engine is.
+//!
+//! # What it is now
+//!
+//! The verb set survived; the encoding did not. The five decisions the rewrite
+//! executed (palo design §7, decisions 18–20):
+//!
+//! 1. **`model-ir` is a dependency.** The runtime traces, `Trace` crosses at
+//!    load, `CompiledModel` never crosses, and `model_ir::Dtype` is *the* dtype — the
+//!    `KvDtype` that spelled five of its variants a second time is gone.
+//! 2. **The completion broker went to the runtime.** Run-ahead is a scheduling
+//!    policy, and this crate keeps only the receipt
+//!    ([`fire::FireTicket`]).
+//! 3. **The ports went to `eta-ir`.** `PIE_DEVICE_PORT_*` and
+//!    `GeometryClass` live in `eta_ir::registry` beside the `Port` enum
+//!    they were a second numbering of. This crate names them; it does not
+//!    re-export them.
+//! 4. **Every noun is serde and the trait is object-safe.** There is no wire
+//!    version here: remote is a property of a transport, not an encoding of a
+//!    contract.
+//! 5. **The dead `LaunchPlan`-era types are gone**, and the ones with living
+//!    consumers got typed successors.
+//!
+//! # The dependency floor
+//!
+//! `model-ir`, `eta-ir`, `eta-compiler`, `serde`, `thiserror`.
+//!
+//! **Four of the five are leaves; `eta-compiler` is not, and that is the
+//! honest version of a sentence this header used to get away with.** The
+//! launch package is the compiler's output artifact, and it was declared here
+//! only because this crate was the one both sides could name — which forced
+//! the producer to depend on the contract to describe its own output, and left
+//! five types (`LibraryOp`, `RegionKind`, `KernelKind`, `EmittedKernel`,
+//! `RegionAnalysis`) declared once on each side with conversions bridging
+//! them. [`program`] names `eta_compiler`'s now, and `eta-compiler` names
+//! nothing here.
+//!
+//! What that costs a reader's graph is `eta-compiler` and nothing else.
+//! Measured feature-resolved, `eta-compiler`'s own closure after losing its
+//! edge to this crate is `{eta-ir, serde}` — a strict subset of what a
+//! `KvHandle` reader already carried — so the edge is added and no crate is.
+//!
+//! What this crate still does not drag into that graph: `tarpc` (and tokio,
+//! and its wasm/windows platform closure), `waker` (and `loom`, and a C
+//! compiler), `anyhow`, `crossbeam-queue`. Both of the crate's Cargo features
+//! existed to hold those back, and both are gone with them.
+
+#![deny(missing_docs)]
 #![deny(
     clippy::todo,
     clippy::unimplemented,
@@ -13,76 +98,54 @@
     clippy::mem_forget
 )]
 #![deny(clippy::print_stdout, clippy::print_stderr)]
+#![forbid(unsafe_code)]
 
-mod error;
-mod program;
-
-// A THIRD OF THIS LIST WAS EXPORTING ITSELF (alto E, survey debt 5). Twenty
-// names had zero consumers anywhere outside this crate — `resolve.rs`'s CSR
-// ghost and `names.rs`'s MLX weight table whole, and beside them a scattering
-// of items the shells never asked for: the six `CHANNEL_*` lane-table flag
-// bits, four `#[repr(C)]` mirrors of a device lane table, the op-metadata
-// pair, `bounded_mtp_row_base`, `decode_wire`. The exports are gone; where the
-// ITEM had no reader inside the crate either, the item went with them and its
-// line says what it was for.
+// `pub use model_ir; pub use eta_ir; pub use eta_compiler;` STOOD HERE, and
+// the argument for them was that a consumer naming a `KvLayout`'s dtype or a
+// `ProgramRegistration`'s package should not have to declare an edge of its
+// own to spell the type inside it.
 //
-// THE MODEL PLANE, AND IT IS NAVIGATED BY PATH. Every `pub use` below flattens
-// the guest-program plane into the crate root, which is the shape 22 files of
-// one subsystem grew into and not a shape worth extending: `fire` is new API
-// with a small, deliberate surface — `fire::compose`, `fire::walk`,
-// `fire::FireDescriptor`, `fire::Sink` — and a reader who sees `fire::walk` at
-// a call site knows where to go and what it is about.
+// What the argument cost, measured when the substrate's own pass-through
+// re-export came out: twenty-nine call sites reaching a leaf through this
+// crate — `engine::model_ir::Platform`, `engine::eta_ir::registry::Stage` —
+// and half of them in `runtime`, which DECLARES `eta-ir` already and was
+// paying the extra hop for nothing. The saving was never real either: a
+// consumer that names a type is a consumer of the crate that owns it, and
+// writing that down is one manifest line, not a dependency it did not have.
+//
+// So the leaves are named directly now, by everyone. `transport` came out
+// better than the rest — it wanted an element type and not an IR, so it
+// declares `dtype` and this crate is no longer between it and the enum.
+
+pub mod adapter;
+pub mod caps;
+pub mod channel;
+pub mod engine;
+pub mod error;
 pub mod fire;
-// THE EXECUTION PLANE, AND IT IS NAVIGATED BY PATH FOR THE SAME REASON `fire`
-// IS. `frame` is the typed prepare/enqueue/settle seam (alto design §3) and
-// `runahead` is the one place a depth is spelled (article 8); both are small,
-// deliberate surfaces that a reader should reach through their module name.
 pub mod frame;
-pub mod law;
+pub mod load;
+pub mod program;
 pub mod runahead;
-pub mod store;
+pub mod transfer;
 
+pub use adapter::{AdapterPlane, AdapterRegistration};
+pub use caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+pub use channel::{
+    ChannelId, ChannelRegistration, ChannelSeed, HostMirror, RegisteredChannel, Ticket,
+};
+pub use engine::{CompletionSink, Engine, StepDone, StepOutcome};
 pub use error::{Error, Result};
-
-pub use engine_api;
-
-pub use tensor_ir;
-
-pub use program::cache::{
-    Bounded, Failure, MAX_NEGATIVE_ENTRIES, MAX_PROGRAM_ENTRIES, MAX_STAGE_ENTRIES,
-    Stats as CacheStats,
+pub use fire::{
+    Attachment, Boundary, FireId, FireTicket, FoldLen, FrameId, FrameSubmission, FrameTicket,
+    KvDelta, Lane, LaneReadout, LayerScores, Mask, Masking, MediaEncode, Readout, RsReset, RsVerb,
+    Serves, Step,
 };
-pub use program::channel::{
-    ChannelState, HostOp, InterpInstance, host_put, host_take, make_host_instance,
+pub use load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded, Residency};
+pub use program::{
+    BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-pub use program::emitted::{Duplicate, Emitted, Slot};
-pub use program::extent::{Extents, Role, Unresolvable, ValueDesc, describe};
-pub use program::group::{GroupKey, MAX_CHANNELS, used_channel_slots};
-pub use program::identity::{
-    Backend, COMPILER_VERSION, REGION_PLAN_VERSION, Versions, cache_identity, combined_signature,
+pub use transfer::{
+    KvCopy, KvExport, KvHandle, KvLayout, KvLayoutKind, KvMove, KvRegion, MemoryDomain, StateCopy,
+    StateMove,
 };
-pub use program::lane::{
-    ABI_VERSION as LANE_ABI_VERSION, ChannelSlot as LaneChannelSlot,
-    HEADER_BYTES as LANE_HEADER_BYTES, Header as LaneHeader, RECORD_BYTES as LANE_RECORD_BYTES,
-    Record as LaneRecord, SLOT_BYTES as LANE_SLOT_BYTES, Shape as LaneShape,
-};
-pub use program::meta::{Malformed, channel_effects};
-pub use program::params::{OpParams, Runtime as OpRuntime};
-pub use program::plan::{Boundaries, ExecPlan, adopt_launch_package, adopt_launch_package_with};
-pub use program::readiness::{NO_TICKET, Readiness, Ticket, Words, check};
-pub use program::registry::{
-    Channel, ChannelSpec, Direction, EmittedKernel, Endpoint, Geometry, HostRole, Instance,
-    Program, Registry,
-};
-pub use program::scratch::{ALIGN as SCRATCH_ALIGN, Layout, MAX_BYTES as SCRATCH_MAX_BYTES, layout};
-pub use program::stage_cache::{Lookup, Stages};
-pub use program::status::{
-    Fault, FaultClass, Outcome as StatusOutcome, STATUS_BYTES, Site, State, Status, describe_fault,
-    report as report_status,
-};
-pub use program::step::{PassInputs, StepOutcome, step};
-pub use program::value::{Value, concrete_dtype, encode_wire, value_matches, wire_cell_bytes};
-
-pub(crate) fn shape_numel(dims: &[u32]) -> u64 {
-    dims.iter().map(|&d| u64::from(d)).product()
-}

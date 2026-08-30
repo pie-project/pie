@@ -19,9 +19,9 @@
 //! # The contract the wrapper cannot state, and how it is supplied
 //!
 //! [`LoadRequest`] carries `{ trace, checkpoint, budgets, ordinal }` and NOT a
-//! `ModelContract` — deliberately, because `engine-api`'s dependency floor is
-//! `model-ir`, `tensor-ir`, `serde`, `thiserror` (its own header), and a
-//! contract type in it would put `model-loader` in the graph of everyone who
+//! `ModelContract` — deliberately, because `engine`'s dependency floor is
+//! `model-ir`, `eta-ir`, `serde`, `thiserror` (its own header), and a
+//! contract type in it would put `checkpoint` in the graph of everyone who
 //! reads a `KvHandle`. But [`Weights::resident`](crate::weights::Weights)
 //! needs one: how a checkpoint's tensors become this plan's params is the
 //! MODEL's declaration, and the shell must not grow an arm per family to
@@ -53,7 +53,7 @@
 //! serves DEVICE-TO-DEVICE inside this load's own pools and refuses every
 //! other direction BY NAME: a host-pinned end is a swap pool this shell does
 //! not reserve, and a second device's is a peer mapping it has not opened.
-//! [`Capabilities::kv_copy`](engine::engine_api::caps::Capabilities) is where
+//! [`Capabilities::kv_copy`](engine::caps::Capabilities) is where
 //! that is stated rather than discovered. `resize_pool` is not on the trait at
 //! all any more (design §8, wave C: an elastic pool grows as a side effect of
 //! frame admission).
@@ -62,26 +62,26 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use engine::engine_api::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
-use engine::engine_api::channel::{
+use checkpoint::contract::ModelContract;
+use engine::Engine;
+use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
+use engine::channel::{
     ChannelId, ChannelRegistration, HostMirror, RegisteredChannel,
 };
-use engine::engine_api::error::{Error, Result as EngineResult};
-use engine::engine_api::fire::{
+use engine::error::{Error, Result as EngineResult};
+use engine::fire::{
     FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
     Step,
 };
-use engine::engine_api::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
-use engine::engine_api::program::{
+use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
+use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
-use engine::engine_api::transfer::{KvCopy, MemoryDomain, StateCopy};
-use engine::engine_api::Engine;
-use model_compiler::{Budget, DeviceProfile};
+use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
+use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
+use eta_ir::types::Dtype;
+use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use model_ir::Trace;
-use model_loader::contract::ModelContract;
-use engine::engine_api::tensor_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
-use engine::engine_api::tensor_ir::types::DType;
 
 use crate::error::Fault;
 use crate::program::Session as ProgramSession;
@@ -141,6 +141,20 @@ pub struct DeviceBoot {
     /// compiles through NVRTC and nothing is stored, which costs time and
     /// never an answer.
     pub program_cache_dir: Option<std::path::PathBuf>,
+    /// **Where this deployment keeps its shared adapters** (alto adapter
+    /// §3.3), from `[model] adapter_dir`.
+    ///
+    /// A read-only directory whose subdirectories are adapters: one
+    /// `adapter.toml` and the plane files it names. It is a deployment fact
+    /// for the same reason the two cache directories above it are — the
+    /// mount belongs to the machine and the operator, every model this engine
+    /// loads reads the same one, and adding a LoRA to a serving box is
+    /// writing a file into it rather than calling a verb.
+    ///
+    /// `None` is the feature off: shared binds refuse by name and a
+    /// byte-seeded adapter is unaffected. **TYPED, NOT `getenv`**
+    /// (article 9).
+    pub adapter_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for DeviceBoot {
@@ -151,6 +165,7 @@ impl Default for DeviceBoot {
             knobs: Knobs::default(),
             weight_cache_dir: None,
             program_cache_dir: None,
+            adapter_dir: None,
         }
     }
 }
@@ -199,7 +214,7 @@ pub struct Cuda {
     /// this engine ([`Engine::on_complete`]). `None` is a caller that does not
     /// want to hear — the smoke tests, a bench — and costs the settlement
     /// callback one branch.
-    sink: Option<engine::engine_api::CompletionSink>,
+    sink: Option<engine::CompletionSink>,
     /// **The last submitted frame's per-step readback plans**, held for a
     /// caller that comes back for numbers ([`Engine::settle_frame`]).
     ///
@@ -209,6 +224,22 @@ pub struct Cuda {
     /// only until the frame after it is enqueued. Holding two would be
     /// offering to answer with bytes the device has overwritten.
     pending: Option<(FrameId, Vec<PendingStep>)>,
+    /// **WHICH ADAPTER SLOT EACH BOUND INSTANCE ROUTES TO** (alto adapter
+    /// §6.4: the plan says WHETHER, the bind says WHICH).
+    ///
+    /// An instance whose program declares the `lora` sink has its weights
+    /// landed ONCE, at [`Engine::bind_instance`], out of the cells the guest
+    /// seeded — never at fire time, which is §6.1's whole ruling. The slot the
+    /// store answered is kept here, and every lane a fire attaches to that
+    /// instance is stamped with it while the fire is composed. Instances with
+    /// no adapter are not in this map at all, and a fire whose lanes are all
+    /// of that kind reads it once, finds nothing, and costs the axis nothing.
+    ///
+    /// **A BIND IS A REFERENCE AND IS GIVEN BACK AT `close_instance`**, which
+    /// is what makes a slot reclaimable; a map that only ever grew would fill
+    /// the bank and refuse the ninth instance of a serving box that had long
+    /// since finished the first eight.
+    adapters: BTreeMap<InstanceId, crate::Binding>,
 }
 
 impl Cuda {
@@ -225,6 +256,7 @@ impl Cuda {
             channels: BTreeMap::new(),
             sink: None,
             pending: None,
+            adapters: BTreeMap::new(),
         }
     }
 
@@ -249,7 +281,7 @@ impl Cuda {
     /// Open a slot for a fresh sequence.
     ///
     /// Not a trait verb: the contract has no `open`, because
-    /// [`KvDelta`](engine::engine_api::KvDelta) says a lane whose `pages` are
+    /// [`KvDelta`](engine::KvDelta) says a lane whose `pages` are
     /// empty is one whose page table the SHELL owns, and a shell that owns it
     /// opens the slot itself. A runtime that keeps its own page table never
     /// calls this — it states the same fact as `KvDelta::held == 0`, and the
@@ -302,7 +334,7 @@ impl Cuda {
 /// [`Fault::Ceiling`] is `Impossible` and not `Exhausted` because every
 /// ceiling this shell states was reserved at LOAD: no amount of freeing makes
 /// a graph recorded for 8192 rows take 9000, which is exactly the distinction
-/// `engine_api::error`'s header draws.
+/// `engine::error`'s header draws.
 fn fault(fault: Fault) -> Error {
     match fault {
         Fault::Runtimeless | Fault::Device { .. } | Fault::Schedule { .. } => {
@@ -370,6 +402,22 @@ fn fault(fault: Fault) -> Error {
         | Fault::Scoreless { .. }
         | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
+        // The shared-adapter mount's two, and they sort apart. A blob refusal
+        // is the deployment's — a name that is not in the mount, a manifest
+        // that disagrees with the model text's banks — and nothing a caller
+        // frees changes it, so it is `Load` beside the registration above.
+        // Slot exhaustion is the only one of the axis that a caller CAN clear:
+        // `slots` bounds concurrent residency, so a bind that waits for
+        // another instance to finish is a real answer.
+        Fault::Blob { .. } => Error::Load(fault.to_string()),
+        // One slot wanted, none reclaimable — the numbers are about what is
+        // FREE and not what exists, because a table whose every seat is
+        // pinned has no free one whatever its width.
+        Fault::AdapterSlots { .. } => Error::Exhausted {
+            resource: "adapter slots",
+            wanted: 1,
+            available: 0,
+        },
         // A `Fault::Blocked` arm stood here and crossed as `Error::Exhausted`
         // — an attached guest's ring with no room right now, which the host
         // was to drain before re-submitting the identical frame. Article 4
@@ -378,19 +426,26 @@ fn fault(fault: Fault) -> Error {
         // readiness miss past admission is a contract violation and
         // `serve::committed_or` names it. `Fault::OutOfMemory` above is the
         // only exhaustion this shell reports, and it is about device bytes.
-        Fault::Compile(_) | Fault::Program { .. } => Error::Program(fault.to_string()),
-        Fault::Fire(_) => Error::Invalid(fault.to_string()),
+        Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
+            Error::Program(fault.to_string())
+        }
+        // A submission whose two halves disagree is the caller's statement
+        // and not the device's condition, so it crosses as `Invalid` beside
+        // the fire faults it is the shell-side twin of — no amount of freeing
+        // makes a short patch payload the geometry it claimed.
+        Fault::Fire(_) | Fault::PatchPayload { .. } => Error::Invalid(fault.to_string()),
     }
 }
 
 /// The contract's bind extents, in the plane's spelling.
 ///
-/// Two names for one seven-role vector: [`ExtentRole`] is the tag space both
+/// Two names for one seven-role vector: [`SymbolicExtent`](eta_exec::Role) is
+/// the tag space both
 /// are written in, and the conversion is field for field so that adding a
 /// role to one without the other is a compile error rather than a silently
 /// unresolved axis.
-fn extents(stated: &BindExtents) -> engine::Extents {
-    engine::Extents {
+fn extents(stated: &BindExtents) -> eta_exec::Extents {
+    eta_exec::Extents {
         kv_len: stated.kv_len,
         page_count: stated.page_count,
         row_count: stated.row_count,
@@ -495,7 +550,7 @@ pub(crate) fn lattice(stated: Vec<u32>, max_tokens: u32) -> Vec<u32> {
 /// The contract carries seven numbers and `model_compiler::Budget` takes
 /// four; the other three (`page_size`, `max_context`, `slots`) are the POOLS'
 /// and go to `Boot` directly. Converted in one place, which is the whole
-/// reason `engine-api` states its own `Budget` rather than depending on the
+/// reason `engine` states its own `Budget` rather than depending on the
 /// compiler (`load.rs`'s note).
 fn bake_budgets(budgets: &LoadBudgets) -> Budget {
     Budget {
@@ -504,6 +559,81 @@ fn bake_budgets(budgets: &LoadBudgets) -> Budget {
         buckets: budgets.buckets.clone(),
         max_adapters: budgets.max_adapters,
     }
+}
+
+/// **THE SECOND ROW AXIS'S LADDER, DERIVED FROM THE TEXT THAT NEEDS ONE**
+/// (multimodal §5.5) — `bake_budgets`' twin for the patch axis.
+///
+/// `None` for a plan that states no `Dim::Patches`, which is every SKU served
+/// before the towers and is G4's invariant restated at the door: the ladder
+/// only exists when a text asks for it, so a text-only artifact bakes through
+/// `model_compiler::compile` exactly as it always did.
+///
+/// # The rungs, and the argument for each number
+///
+/// * **the floor is [`PATCH_LATTICE_FLOOR`]**, which is the module's own — the
+///   smallest whole image a resize policy admits (64 rows at patch-16 /
+///   merge-2). A rung below it rounds up to a fire that cannot exist.
+/// * **the ceiling is the token rectangle's, capped at two whole images.**
+///   Every tower row ends up scattered into a TOKEN row, so a fire can never
+///   usefully carry more patch rows than `max_tokens`; and the catalog's
+///   towers store a 48 x 48 position grid, so one image at its native grid is
+///   at most 2304 patch rows and [`DERIVED_PATCH_CEILING`] admits two of them.
+///   The smaller of the two wins, because a deployment that stated a small
+///   token rectangle meant it.
+/// * **the rungs double**, as the token lattice does and for the reason it
+///   does not: patches-per-image is fixed by the resize policy, so a handful
+///   of rungs covers "one image", "two", "four" without a rung that no fire
+///   lands on.
+/// * **`max_images` is the ceiling at the floor** — as many images as the
+///   patch ceiling holds if every one of them is the smallest whole image.
+///   That is the honest bound rather than a guess, and it costs
+///   `(images + 1) * 4` bytes of indptr to be generous with.
+///
+/// An operator who has measured their traffic states
+/// [`Budgets::max_patches`](LoadBudgets::max_patches) and
+/// [`max_images`](LoadBudgets::max_images) instead, and then this function
+/// only supplies the rungs.
+///
+/// `pub` so a gate can boot a tower against the ladder this engine would
+/// derive for it, rather than against a ladder the gate invented — which is
+/// the difference between proving the derivation serves and proving some
+/// ladder does.
+pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder> {
+    /// Two whole images at the catalog towers' native 48 x 48 grid.
+    const DERIVED_PATCH_CEILING: u32 = 4096;
+
+    // **THE PLAN IS WHAT ASKS.** Read off the types a text already wrote
+    // (`Dim::axis`), never off a flag: a value on the patch axis is the whole
+    // of what makes a plan a two-unit one, and the ladder follows the same
+    // reading `model_compiler::unit` does.
+    let declares_patches = trace.values.iter().any(|decl| {
+        matches!(&decl.ty, model_ir::Ty::Tensor { shape, .. }
+            if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Patches))
+    });
+    if !declares_patches {
+        return None;
+    }
+
+    let max_patches = budgets
+        .max_patches
+        .unwrap_or_else(|| budgets.max_tokens.min(DERIVED_PATCH_CEILING))
+        .max(PATCH_LATTICE_FLOOR);
+    let mut buckets = Vec::new();
+    let mut rung = PATCH_LATTICE_FLOOR;
+    while rung < max_patches {
+        buckets.push(rung);
+        rung = rung.saturating_mul(2);
+    }
+    buckets.push(max_patches);
+    Some(PatchLadder {
+        max_images: budgets
+            .max_images
+            .unwrap_or_else(|| max_patches / PATCH_LATTICE_FLOOR)
+            .max(1),
+        max_patches,
+        buckets,
+    })
 }
 
 /// The guest-visible profile of a loaded plan.
@@ -530,7 +660,7 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // The INTERPRETER-VISIBLE materialization, which is what the field
         // means (`ModelProfile::activation`'s own doc): the device's own
         // activation type is bf16 and is not what a guest program reads.
-        activation: DType::F32,
+        activation: Dtype::F32,
         // Every one of these is a MODEL-GATED intrinsic the guest-program
         // plane would have to point at a buffer of this fire's, and the
         // attachment binds exactly ONE — `IntrinsicId::Logits`, at the arena's
@@ -553,18 +683,111 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // `MtpLogits` and which no device path in this shell produces.
         has_mtp_drafts: false,
         has_value_head: false,
-        // Still `false`, and NOT because the column is missing — the capture
-        // arm writes one and `LaneReadout::scores` reads it. `AttnScore` is
-        // registered at `Stage::OnAttn`, a mid-graph tap, and design §9
-        // abolished the third boundary; it also promises `[num_heads, kv_len]`
-        // per-key softmax weights, where this axis exports a per-query mass.
-        // Advertising it would let a program bind against a shape and a place
-        // that do not exist here.
-        has_attn_score: false,
+        // **AND NOW THE SCORE COLUMN HAS SOMEWHERE TO STAND TOO**
+        // (`.wiki/alto/attn-score.md` §4, wave S1). This was `false` under a
+        // note that named two blockers, and both are gone rather than
+        // waived. `AttnScore` was registered at `Stage::OnAttn`, a mid-graph
+        // tap design §9 abolished — it is registered at `Stage::Epilogue`
+        // now, and the capture arm ACCUMULATES the per-key rectangle in-graph
+        // instead of a boundary being torn open to compute it. And it
+        // promised per-key softmax weights where this axis exported a
+        // per-query mass — it gets per-key softmax weights now, from
+        // `attention.score_capture`, written into the shell's own slab.
+        //
+        // So this is exactly "does this load export a capture column, and did
+        // the slab that observes it get carved", which is what a bind-time
+        // contract has to mean. A text with no `attn.scores` seam still
+        // answers `false`, and every refusal downstream still fires by name.
+        has_attn_score: shell.observes_scores(),
         has_attn_page_mask: false,
-        has_lora: false,
+        // **HONEST, AND NOW OPEN** (alto adapter §6.4, wave A2). This was
+        // `false`, and `false` was the truth: `plan.needs.lora` had zero
+        // readers in this crate, so a program carrying the sink would have
+        // bound, compiled, fired and quietly answered the BASE MODEL — the one
+        // wrong answer this axis must never give, and the reason the
+        // capability existed shut rather than open.
+        //
+        // It is `true` because the sink is consumed now. `Cuda::bind_instance`
+        // reads the sink off the launch package, takes the weights off the
+        // cells the guest seeded, converts them into the banks' own dtype and
+        // lands them in a slot; `Cuda::fire_step` stamps that slot onto every
+        // lane attached to the instance, with the fact word moved into the
+        // correction's window beside it. A load whose model text declares no
+        // bank still refuses by name (`Fault::Adapterless`), which is a
+        // sentence and not a silent zero.
+        has_lora: true,
         kernels: Vec::new(),
     })
+}
+
+/// **ONE INSTANCE'S ADAPTER, LANDED OFF ITS SEEDS** (alto adapter §6.1, §6.4).
+///
+/// `Ok(None)` is the ordinary answer: this program declares no `lora` sink, so
+/// nothing about the adapter axis touches it. `Ok(Some(binding))` says the
+/// weights crossed — once, here, on the host — and names the slot every lane
+/// attached to this instance routes to.
+///
+/// # Why the SEED and not the ring
+///
+/// The sink's operands are `chan_read`s, and reading them at fire time is
+/// exactly what §6.1 ruled out. A seeded channel's cell is already on this
+/// side of the wire at bind ([`InstanceBinding::seeds`]), so the resolver
+/// takes it from there, converts it into the banks' own dtype, and never looks
+/// at the ring again. A guest that publishes new adapter weights mid-pass is
+/// therefore NOT serving a new adapter — the honest reading of "swapping an
+/// adapter is re-seeding", which is a re-BIND.
+///
+/// # Errors
+///
+/// Whatever [`crate::adapter::sink_of`] and [`crate::adapter::planes_of`] say,
+/// [`Error::Load`] for a sink channel this bind seeded nothing into, and
+/// whatever the landing said — [`Fault::AdapterSlots`] when every slot is
+/// pinned by a live bind, [`Fault::Adapter`] when the planes are not this
+/// load's banks.
+fn adapter_of(
+    shell: &mut Shell,
+    program: engine::program::ProgramId,
+    instance: InstanceId,
+    seeds: &[(u32, Vec<u8>)],
+) -> EngineResult<Option<crate::Binding>> {
+    let Some(sink) = shell.program_adapter_sink(program).map_err(fault)? else {
+        return Ok(None);
+    };
+    let seats = shell.bank_seats();
+    let mut built: Vec<(String, Vec<u8>)> = Vec::new();
+    for (role, channel) in &sink.planes {
+        // **A CHANNEL THE SINK NAMES AND THE BIND DID NOT SEED IS A REFUSAL**,
+        // not a plane of zeros. A zero `A` is the IDENTITY adapter — it is the
+        // construction every bank gate starts from — so accepting an unseeded
+        // channel would answer the base model under a program that asked for a
+        // correction, and answer it silently.
+        let wire = seeds
+            .iter()
+            .find(|(seeded, _)| seeded == channel)
+            .map(|(_, bytes)| bytes.as_slice())
+            .ok_or_else(|| {
+                Error::Load(format!(
+                    "this program's `lora` sink reads its `{}` plane out of channel \
+                     {channel} and this bind seeded nothing into it; an adapter's \
+                     weights are the seed, because the fire path never reads the cell \
+                     (alto adapter §6.1), so an unseeded plane is a correction of zero \
+                     that nobody asked for",
+                    role.bank()
+                ))
+            })?;
+        built.extend(crate::adapter::planes_of(*role, wire, &seats).map_err(fault)?);
+    }
+    let planes: Vec<crate::AdapterPlane<'_>> = built
+        .iter()
+        .map(|(bank, bytes)| crate::AdapterPlane {
+            bank: bank.as_str(),
+            bytes,
+        })
+        .collect();
+    shell
+        .bind_adapter(crate::AdapterSource::Own { instance, planes: &planes })
+        .map(Some)
+        .map_err(fault)
 }
 
 impl Engine for Cuda {
@@ -660,15 +883,58 @@ intended for diagnostics, not serving",
         //    question, because the pinned tier holds every expert of every
         //    streamed bank and a `host_weight_budget` under it is a load this
         //    machine cannot hold either.
-        let plan =
-            crate::experts::Plan::of(&trace, residency.device_weight_budget).map_err(fault)?;
-        residency.admit(plan.device_demand(), plan.host_demand())?;
+        //    **AND THE PLAN IS READ OFF THE LOAD PLAN'S PAIRINGS TOO**, not
+        //    off the trace alone: a QUANTIZED bank is codes beside factors,
+        //    two params under one `Def::Weight`, and a residency decision that
+        //    moved one of them would leave the other reading somebody else's
+        //    expert (`crate::experts`'s header states it whole). The pairing
+        //    is the loader's own record; `weights::prospect` reads it for one
+        //    metadata parse and one plan compile, and no tensor bytes.
+        //
+        //    **AND THERE IS A THIRD TIER NOW** (alto streaming §2, wave W-1).
+        //    Both budgets reach the planner, so a packed bank neither of them
+        //    holds is planned onto the MAPPED artifact rather than refusing
+        //    the load. Whether that artifact exists is a question about a file
+        //    and is answered here, once, by opening it; `admit_tiers` is the
+        //    statute that turns "spilled bytes, no source" into an
+        //    `Impossible` naming the one thing an operator can do about it.
+        let prospect = crate::weights::prospect(&trace, &contract, &path).map_err(fault)?;
+        let plan = crate::experts::Plan::of(
+            &trace,
+            &prospect.planes,
+            crate::experts::Budgets {
+                device: residency.device_weight_budget,
+                host: residency.host_weight_budget,
+            },
+        )
+        .map_err(fault)?;
+        let sourced = plan.spill_demand() > 0
+            && crate::weights::spill_source(
+                self.boot.weight_cache_dir.as_deref(),
+                prospect.resident_key,
+            )
+            .is_some();
+        residency.admit_tiers(engine::load::Tiers {
+            device: plan.device_demand(),
+            host: plan.host_demand(),
+            spilled: plan.spill_demand(),
+            sourced,
+        })?;
 
-        let shell = Shell::load(Boot {
+        // Derived BEFORE the trace moves into the boot — the ladder is a
+        // reading of the plan, so it is taken while the plan is still here.
+        let patches = patch_ladder(&trace, &budgets);
+        let mut shell = Shell::load(Boot {
             trace,
             contract: &contract,
             checkpoint: &path,
             budget: bake_budgets(&budgets),
+            // **AND THE SECOND AXIS'S, WHEN THE TEXT ASKS FOR ONE.** A literal
+            // `None` until now, which made every vision SKU a load that could
+            // not happen (`Error::Unsized`, named at the door); it is the
+            // plan's own declaration that decides, so a text-only SKU still
+            // gets the literal `None` G4 depends on.
+            patches,
             // `None` takes this device's measured SM count. Costs are input,
             // not knowledge (design §6): a deployment that has measured its
             // own would state them, and one that has not still bakes
@@ -703,6 +969,15 @@ intended for diagnostics, not serving",
             residency: plan,
         })
         .map_err(fault)?;
+
+        // **THE SHARED-ADAPTER MOUNT, STATED AFTER THE LOAD** (alto adapter
+        // §3.3). It is not a `Boot` field because it is not a property of the
+        // BAKE: the banks are, and they came off the model text above. Where
+        // the shared adapters live is the deployment's, it outlives every
+        // load, and §3.3's hot-add is a file drop into it — so it arrives as
+        // a verb, typed off the boot document, and never out of the
+        // environment (article 9).
+        shell.mount_adapters(self.boot.adapter_dir.clone());
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
@@ -877,7 +1152,7 @@ intended for diagnostics, not serving",
 
     fn register_adapter(
         &mut self,
-        registration: &engine::engine_api::adapter::AdapterRegistration,
+        registration: &engine::adapter::AdapterRegistration,
     ) -> EngineResult<()> {
         // `palo C2`: design §8's banks are declared by the model text and
         // reserved at load; this is the write. No graph is touched — the key
@@ -905,7 +1180,7 @@ intended for diagnostics, not serving",
         // The engine's own answer about channel tickets rides in: a
         // prediction this shell validates on the device is accepted, and one
         // it could only ignore is refused by name (`Lane::validate_for`).
-        frame.validate_for(engine::engine_api::Serves {
+        frame.validate_for(engine::Serves {
             device_channel_commit: self
                 .caps
                 .as_ref()
@@ -946,7 +1221,7 @@ intended for diagnostics, not serving",
             //    the frame (it settles every terminal cell FAILED) and drops
             //    the frame's registration, so the completions that arrive
             //    afterwards for steps 0..k find nothing to resurrect.
-            let at = engine::engine_api::StepDone {
+            let at = engine::StepDone {
                 frame: id,
                 step: index as u32,
             };
@@ -980,7 +1255,7 @@ intended for diagnostics, not serving",
         true
     }
 
-    fn on_complete(&mut self, sink: engine::engine_api::CompletionSink) {
+    fn on_complete(&mut self, sink: engine::CompletionSink) {
         self.sink = Some(sink);
     }
 
@@ -1046,15 +1321,39 @@ intended for diagnostics, not serving",
     /// nothing — both are the advisory contract's "a wrong hint costs only
     /// the hidden work", not errors.
     fn expect_fire(&mut self, submission: &Step) {
+        // The HINT sees the same words the fire will, adapters included: the
+        // prebind caches a composition, and a composition is a set of classes
+        // — so a hint stated in the unadapted classes would warm the wrong
+        // one and the fire it was for would find nothing. Advisory either way
+        // (a wrong hint costs only the hidden work), which is why the lookup
+        // here refuses nothing and simply leaves the word alone.
+        let adapted: Vec<bool> = if self.adapters.is_empty() {
+            vec![false; submission.lanes.len()]
+        } else {
+            let mut adapted = vec![false; submission.lanes.len()];
+            for attachment in &submission.attachments {
+                if self.adapters.contains_key(&attachment.instance)
+                    && let Some(lane) = adapted.get_mut(attachment.lane as usize)
+                {
+                    *lane = true;
+                }
+            }
+            adapted
+        };
         let Ok(shell) = self.loaded_mut() else {
             return;
         };
         let lanes: Vec<Lane<'_>> = submission
             .lanes
             .iter()
-            .map(|lane| Lane {
+            .enumerate()
+            .map(|(at, lane)| Lane {
                 slot: lane.slot,
-                word: lane.word,
+                word: if adapted[at] {
+                    shell.adapted_word(lane.word).unwrap_or(lane.word)
+                } else {
+                    lane.word
+                },
                 tokens: &lane.tokens,
             })
             .collect();
@@ -1130,13 +1429,13 @@ intended for diagnostics, not serving",
             .map(|&dim| dim as usize)
             .product::<usize>()
             .max(1);
-        let device_only = registration.host_role == engine::tensor_ir::container::HostRole::None;
+        let device_only = registration.host_role == eta_ir::container::HostRole::None;
         let cell_bytes = u32::try_from(if device_only {
             // The slab the emitted kernels index, not the wire the mirror
             // holds — see `endpoints_for`.
             crate::program::launch::native_cell_bytes(registration.dtype.program_dtype(), numel)
         } else {
-            engine::wire_cell_bytes(registration.dtype.program_dtype(), numel)
+            eta_exec::wire_cell_bytes(registration.dtype.program_dtype(), numel)
         })
         .map_err(|_| {
             Error::Program(format!(
@@ -1200,7 +1499,7 @@ intended for diagnostics, not serving",
         // zero-fills three rows that no launch faults on. Converted here
         // because `BindExtents` is the contract's spelling and `Extents` is
         // the plane's — the same seven roles, and the tags are
-        // `ExtentRole`'s in both.
+        // `SymbolicExtent`'s in both.
         // **THE DENSE INDEX MEETS THE CHANNEL ID, ONCE.** `InstanceBinding`
         // names this instance's channels in the package's declaration order,
         // which is the only place the caller's ids and the program's dense
@@ -1214,8 +1513,8 @@ intended for diagnostics, not serving",
             .iter()
             .map(|id| self.channels.get(id).cloned())
             .collect();
-        let id = self
-            .loaded_mut()?
+        let shell = self.loaded_mut()?;
+        let id = shell
             .bind_program(
                 binding.program,
                 &seeds,
@@ -1225,6 +1524,31 @@ intended for diagnostics, not serving",
                 &binding.channels,
             )
             .map_err(fault)?;
+        // ── **THE ADAPTER LANDS HERE, AND NOWHERE ELSE** (alto adapter §6.1,
+        //    §6.4). The plan says WHETHER this program carries a `lora` sink;
+        //    the cells the guest seeded say what the weights ARE; the store
+        //    says WHICH slot they go in. All three are host questions and all
+        //    three are asked once, at bind — because §6.1's ruling is that a
+        //    channel is a naming device and never a weight transport: a
+        //    12 MiB cell materialised into per-lane scratch and dragged over
+        //    mapped-pinned PCIe EVERY FIRE is the cost this instant exists to
+        //    refuse.
+        //
+        //    A refused landing closes the instance it was for. An instance
+        //    bound with an adapter that did not arrive would fire the base
+        //    model under a program that asked for a correction, which is the
+        //    silently-wrong answer the whole axis is written against.
+        let landed = adapter_of(shell, binding.program, id, &seeds);
+        let bound = match landed {
+            Ok(bound) => bound,
+            Err(why) => {
+                let _ = shell.close_program_instance(id);
+                return Err(why);
+            }
+        };
+        if let Some(bound) = bound {
+            self.adapters.insert(id, bound);
+        }
         Ok(BoundInstance {
             id,
             program: binding.program,
@@ -1233,9 +1557,19 @@ intended for diagnostics, not serving",
     }
 
     fn close_instance(&mut self, id: InstanceId) -> EngineResult<()> {
-        self.loaded_mut()?
-            .close_program_instance(id)
-            .map_err(fault)
+        // **THE BIND IS GIVEN BACK BEFORE THE INSTANCE IS** (alto adapter
+        // §3.3). The slot KEEPS its contents — eviction is under pressure and
+        // not eager, so an adapter somebody comes back to does not re-pay its
+        // H2D — and what the release changes is only that the slot is now
+        // reclaimable. A close that skipped this would pin a slot forever and
+        // the bank would fill up with adapters nobody is using, which is a
+        // refusal that looks like a leak.
+        let held = self.adapters.remove(&id);
+        let shell = self.loaded_mut()?;
+        if let Some(held) = held {
+            shell.release_adapter(held);
+        }
+        shell.close_program_instance(id).map_err(fault)
     }
 
     fn close_channel(&mut self, id: ChannelId) -> EngineResult<()> {
@@ -1362,7 +1696,7 @@ intended for diagnostics, not serving",
     ///
     /// Article 8: page ids are the runtime's policy and the bytes under them
     /// are the engine's supply. A page id here indexes the same arenas
-    /// [`KvDelta::pages`](engine::engine_api::fire::KvDelta) indexes, which is
+    /// [`KvDelta::pages`](engine::fire::KvDelta) indexes, which is
     /// what makes "copy the pages, then fire against the copies" mean
     /// anything.
     ///
@@ -1380,7 +1714,7 @@ intended for diagnostics, not serving",
     /// a move whose two ends overlap — and [`Error::Impossible`] for a page
     /// past the pool.
     ///
-    /// [`Capabilities::kv_copy`]: engine::engine_api::caps::Capabilities
+    /// [`Capabilities::kv_copy`]: engine::caps::Capabilities
     /// [`store::Move`]: crate::store::Move
     fn copy_kv(&mut self, copy: &KvCopy) -> EngineResult<()> {
         copy.validate()?;
@@ -1495,7 +1829,7 @@ impl Cuda {
     fn fire_step(
         &mut self,
         submission: &Step,
-        at: engine::engine_api::StepDone,
+        at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)> {
         let id = self.next_fire;
         self.next_fire = self.next_fire.wrapping_add(1);
@@ -1507,11 +1841,59 @@ impl Cuda {
                 at,
                 sink: std::sync::Arc::clone(sink),
             });
+        // ── **WHICH LANE CARRIES WHICH ADAPTER** (alto adapter §6.4: the plan
+        //    says WHETHER, the bind says WHICH). A lane's adapter is the slot
+        //    its ATTACHED INSTANCE landed at bind — never a channel this fire
+        //    reads, and never a number a guest names. `Lane::adapter` arrives
+        //    from the runtime as `None` for every lane (the ETA port
+        //    vocabulary has no adapter port, and §3.1 rejected adding one), so
+        //    this is where the axis becomes real.
+        //
+        //    An instance with no adapter contributes nothing, and a fire whose
+        //    lanes are all of that kind walks a `BTreeMap` that is empty in
+        //    every deployment that never bound one — which is what makes A-5's
+        //    "byte- and launch-count-identical" claim hold on this side.
+        let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
+        if !self.adapters.is_empty() {
+            for attachment in &submission.attachments {
+                let Some(bound) = self.adapters.get(&attachment.instance) else {
+                    continue;
+                };
+                if let Some(slot) = lane_adapters.get_mut(attachment.lane as usize) {
+                    *slot = Some(bound.slot);
+                }
+            }
+        }
         let shell = self.loaded_mut()?;
+        // ── **AND THE WORD MOVES WITH IT.** A lane's fact word and its adapter
+        //    are one reading of one lane — `Fault::AdapterWord` refuses a fire
+        //    where the two disagree — and the runtime stamped this word before
+        //    anybody knew there was a slot. So the word is re-stated here, into
+        //    the class this bake's correction window actually covers, and a
+        //    bake that has no such class refuses BY NAME rather than firing the
+        //    lane uncorrected.
+        let mut words: Vec<u64> = submission.lanes.iter().map(|lane| lane.word).collect();
+        for (at, slot) in lane_adapters.iter().enumerate() {
+            if slot.is_none() {
+                continue;
+            }
+            words[at] = shell.adapted_word(words[at]).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "lane {at} is attached to an instance that bound an adapter, and \
+                     this load's model text has no corrected class for its fact word \
+                     {:#x}: the text declares no `linear.lora_correct` arm, or the arm's \
+                     window is not decided by one fact. A lane that asked for a \
+                     correction and got the base model is the one wrong answer this \
+                     axis refuses to give",
+                    words[at]
+                ))
+            })?;
+        }
         let seated: Vec<Seated<'_>> = submission
             .lanes
             .iter()
-            .map(|lane| {
+            .enumerate()
+            .map(|(at, lane)| {
                 if !lane.positions.is_empty() {
                     // The shell derives positions as `held .. held + rows`.
                     // An explicit list means a speculative fire re-feeding
@@ -1525,7 +1907,7 @@ impl Cuda {
                 Ok(Seated {
                     lane: Lane {
                         slot: lane.slot,
-                        word: lane.word,
+                        word: words[at],
                         tokens: &lane.tokens,
                     },
                     pages: &lane.kv.pages,
@@ -1554,7 +1936,14 @@ impl Cuda {
                     // word the runtime stamped is `Fault::AdapterWord`. Both
                     // are named at the fire, before anything launches, rather
                     // than refused for every model here.
-                    adapter: lane.adapter,
+                    // **DERIVED FROM THE BINDING, NOT FROM THE SUBMISSION**
+                    // (alto adapter §6.4). `Lane::adapter` in the contract is
+                    // still the door a caller driving this engine directly
+                    // comes through; what arrives on the runtime's path is
+                    // always `None`, and the slot above is the instance's own.
+                    // The two are taken in that order — a bind that landed
+                    // wins, because it is the one that knows a slot exists.
+                    adapter: lane_adapters[at].or(lane.adapter),
                     // `palo C3b`/`C4b`, closed the same way once more, and
                     // the only thing that changes is that these two carry no
                     // runtime input at all. What the submission states is the
@@ -1651,6 +2040,12 @@ impl Cuda {
                 crate::serve::StepView {
                     lanes: &seated,
                     attachments: &attached,
+                    // THE RUNTIME CARRIES NO IMAGE YET (multimodal M3): the
+                    // contract's `Step` has no media rows, so this door
+                    // submits none and every lane through it is text-only.
+                    // The seam it would arrive through is `StepView::media`,
+                    // and the shell path behind it is complete.
+                    media: &[],
                 },
                 None,
             )
@@ -1812,7 +2207,126 @@ unsafe impl Sync for Cuda {}
 
 #[cfg(test)]
 mod tests {
-    use super::{LATTICE_FLOOR, default_lattice, lattice};
+    use super::{LATTICE_FLOOR, default_lattice, lattice, patch_ladder};
+    use engine::load::Budgets as LoadBudgets;
+    use model_compiler::PATCH_LATTICE_FLOOR;
+    use model_ir::{Def, Dim, Dtype, RuntimeInput, Trace, Ty, ValueDecl};
+
+    /// A trace holding one runtime input of the stated shape and nothing else
+    /// — the ladder reads types, so a type is all a gate needs to hand it.
+    fn trace_with(shape: Vec<Dim>) -> Trace {
+        Trace {
+            name: "gate".into(),
+            platform: model_ir::Platform::Cuda,
+            params: Vec::new(),
+            caches: Vec::new(),
+            values: vec![ValueDecl {
+                def: Def::Input(RuntimeInput::Tokens),
+                ty: Ty::Tensor {
+                    shape,
+                    dtype: Dtype::I32,
+                },
+            }],
+            nodes: Vec::new(),
+            seams: Vec::new(),
+        }
+    }
+
+    /// **G4 AT THE ENGINE DOOR.** A plan that states no patch row gets no
+    /// ladder, which is the literal `None` this field held before it was
+    /// derived and the reason a text-only artifact is bit-identical either
+    /// way.
+    #[test]
+    fn a_text_only_plan_gets_no_ladder_at_all() {
+        assert_eq!(
+            patch_ladder(&trace_with(vec![Dim::Tokens]), &LoadBudgets::default()),
+            None
+        );
+        // `Lanes` is the token axis too — `Dim::axis` is what decides, not the
+        // variant's name.
+        assert_eq!(
+            patch_ladder(&trace_with(vec![Dim::Lanes]), &LoadBudgets::default()),
+            None
+        );
+    }
+
+    /// A plan that states a patch row serves with ZERO configuration, and the
+    /// rungs it gets are whole images from the patch lattice's own floor.
+    #[test]
+    fn a_tower_plan_derives_a_ladder_from_nothing_but_its_own_declaration() {
+        let ladder = patch_ladder(&trace_with(vec![Dim::Patches, Dim::Const(768)]), &LoadBudgets::default())
+            .expect("a plan that states patch rows gets a ladder");
+        assert_eq!(ladder.max_patches, 4096, "two whole images at the native grid");
+        assert_eq!(
+            ladder.buckets,
+            vec![64, 128, 256, 512, 1024, 2048, 4096],
+            "rungs double from the patch lattice's floor to the ceiling"
+        );
+        assert_eq!(
+            ladder.max_images, 4096 / PATCH_LATTICE_FLOOR,
+            "as many images as the ceiling holds at the smallest whole image"
+        );
+
+        // Every other patch-axis dim reaches the same answer, because the
+        // reading is `Dim::axis` and not a list of variants.
+        for shape in [vec![Dim::Images], vec![Dim::ImagesPlus(1)]] {
+            assert!(patch_ladder(&trace_with(shape), &LoadBudgets::default()).is_some());
+        }
+    }
+
+    /// **THE TOKEN RECTANGLE BOUNDS THE PATCH ONE**, because every tower row
+    /// ends up scattered into a token row — so a deployment that stated a
+    /// small `max_tokens` meant it, and the floor still wins under both.
+    #[test]
+    fn the_derived_ceiling_never_outruns_the_token_rectangle() {
+        for (max_tokens, want) in [(512u32, 512u32), (8192, 4096), (65536, 4096), (16, 64)] {
+            let budgets = LoadBudgets {
+                max_tokens,
+                ..LoadBudgets::default()
+            };
+            let ladder = patch_ladder(&trace_with(vec![Dim::Patches]), &budgets)
+                .expect("a tower plan gets a ladder");
+            assert_eq!(
+                ladder.max_patches, want,
+                "at max_tokens = {max_tokens} the patch ceiling should be {want}"
+            );
+            assert!(
+                ladder.buckets.iter().all(|rung| *rung <= ladder.max_patches),
+                "a rung past the ceiling is what `model_compiler` refuses by name"
+            );
+            assert!(
+                ladder.buckets.windows(2).all(|pair| pair[0] < pair[1]),
+                "the rungs ascend strictly, which is the ladder's own rule"
+            );
+            assert_eq!(*ladder.buckets.last().expect("a rung"), ladder.max_patches);
+        }
+    }
+
+    /// An operator who has measured their traffic states the two numbers, and
+    /// then the derivation only supplies the rungs.
+    #[test]
+    fn a_stated_ceiling_wins_and_still_gets_its_rungs() {
+        let budgets = LoadBudgets {
+            max_patches: Some(1024),
+            max_images: Some(3),
+            ..LoadBudgets::default()
+        };
+        let ladder = patch_ladder(&trace_with(vec![Dim::Patches]), &budgets).expect("a ladder");
+        assert_eq!(ladder.max_patches, 1024);
+        assert_eq!(ladder.max_images, 3);
+        assert_eq!(ladder.buckets, vec![64, 128, 256, 512, 1024]);
+
+        // And a stated ceiling under the floor is raised to it rather than
+        // refused: a rung below the smallest whole image rounds up to a fire
+        // that cannot exist.
+        let tiny = LoadBudgets {
+            max_patches: Some(8),
+            ..LoadBudgets::default()
+        };
+        let raised = patch_ladder(&trace_with(vec![Dim::Patches]), &tiny).expect("a ladder");
+        assert_eq!(raised.max_patches, PATCH_LATTICE_FLOOR);
+        assert_eq!(raised.buckets, vec![PATCH_LATTICE_FLOOR]);
+    }
 
     /// The lattice a `Boot` that stated none is served, spelled out: geometric
     /// above a floor of eight, so that no fire computes more than twice its own

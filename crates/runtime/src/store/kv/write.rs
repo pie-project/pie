@@ -15,7 +15,7 @@
 use super::hash::Hash256;
 use super::page_table::{PhysicalKvPageId, WorkingSetId};
 
-/// One write target, classified by the CoW rules ("Every PTIR KV output is a
+/// One write target, classified by the CoW rules ("Every ETA KV output is a
 /// write intent"):
 /// - fresh reserved slot -> fresh backing, no copy;
 /// - private, unobserved owned page -> write in place;

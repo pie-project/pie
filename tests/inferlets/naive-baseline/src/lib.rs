@@ -2,7 +2,7 @@
 //!
 //! Structurally identical to every truncation/penalty inferlet in this
 //! directory: one N-wide prefill fire, then a device-carried decode loop
-//! driven by `ptir::run_ahead`, which keeps the runtime's run-ahead window
+//! driven by `eta::run_ahead`, which keeps the runtime's run-ahead window
 //! (`model.channel-capacity()`) full ahead of the host drain. The only
 //! difference is the epilogue, which does nothing but temperature-scale the
 //! logits and draw a Gumbel-max sample. Whatever an algorithm inferlet costs
@@ -13,7 +13,7 @@
 //! algorithm compute. Running with and without it separates the cost of the
 //! extra host round-trip channels from the cost of the algorithm itself.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]

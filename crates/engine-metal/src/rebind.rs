@@ -17,7 +17,7 @@
 //! the reservation table  executeCommandsInBuffer(icb, 0..slots)
 //! ```
 //!
-//! and the host does not walk. `engine::fire::walk` is still what the eager
+//! and the host does not walk. `model_exec::fire::walk` is still what the eager
 //! path runs and still what the recorder recorded — the shader is a
 //! translation of `abi::Law::at` and of nothing else, which is why a test can
 //! diff the two in host arithmetic before ever dispatching.
@@ -113,7 +113,7 @@ pub struct Rebinder {
     slabs: Buffer,
     /// The header.
     plan: Buffer,
-    /// The packed `engine::fire::descriptor` bytes — the ONE thing a fire
+    /// The packed `model_exec::fire::descriptor` bytes — the ONE thing a fire
     /// writes.
     descriptor: Buffer,
     /// The coordinate recipe.
@@ -446,8 +446,8 @@ pub(crate) fn lower(
         abi.len() as u32,
         abi.axes.len() as u32,
         classes as u32,
-        engine::fire::MAGIC,
-        engine::fire::ABI_VERSION,
+        model_exec::fire::MAGIC,
+        model_exec::fire::ABI_VERSION,
     );
     let mut handle = Buffer::zeroed(device, 8)?;
     handle.write(0, &resource_id(icb.gpuResourceID()).to_ne_bytes())?;
@@ -540,7 +540,7 @@ fn law_row(law: &Law, at_kind: u32, at_index: u32, place: Option<(u32, u32, u32)
             row.div = narrow(*div);
             row
         }
-        // The one form no fit produces (`engine::law::Law::Slot`): a number
+        // The one form no fit produces (`model_exec::law::Law::Slot`): a number
         // read out of the fire's own descriptor rather than solved from its
         // coordinates. The rebind shader has no row for it, and
         // `lower` refuses the table before it reaches here.

@@ -68,6 +68,7 @@ fn budgets_for(trace: &Trace) -> Budget {
 }
 
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn no_concurrent_pair_shares_a_written_value() {
     let mut wrong: Vec<String> = Vec::new();
 
@@ -121,6 +122,7 @@ fn no_concurrent_pair_shares_a_written_value() {
 }
 
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn no_concurrent_pair_shares_an_arena_byte_it_writes() {
     let mut wrong: Vec<String> = Vec::new();
 
@@ -209,6 +211,7 @@ fn no_concurrent_pair_shares_an_arena_byte_it_writes() {
 /// not. The full table is printed in the failure message, so a reader who
 /// wants the counts gets them from the run that noticed.
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn the_catalog_forks_where_it_declares_disjoint_windows() {
     /// Families whose model text splits attention into arms over disjoint
     /// classes. Every one of them must find a fork group.
@@ -279,6 +282,7 @@ fn the_catalog_forks_where_it_declares_disjoint_windows() {
 /// one the streams-on bake carves, because the relation only ever WIDENS what
 /// counts as one instant.
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn the_off_arm_bakes_what_the_pass_never_ran_and_costs_no_bytes() {
     let off = DeviceProfile {
         side_streams: 0,

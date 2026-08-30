@@ -22,8 +22,8 @@
 //!
 //! [`LoadRequest`] states `{ plan, checkpoint, budgets, ordinal }` and nothing
 //! about how a checkpoint's tensors become this plan's params. That is
-//! deliberate and it is the contract's own note (`engine-api::load`): the
-//! crate's dependency floor is `model-ir`, `tensor-ir`, `serde` and
+//! deliberate and it is the contract's own note (`engine::load`): the
+//! crate's dependency floor is `model-ir`, `eta-ir`, `serde` and
 //! `thiserror`, and a `ModelContract` field would put the whole checkpoint
 //! plane in the dependency graph of everyone who reads a `KvHandle`.
 //!
@@ -43,14 +43,25 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use engine_api::load::{Budgets, Checkpoint, LoadRequest, Residency};
-use engine_api::model_ir::Trace;
-use model_loader::contract::ModelContract;
+// `checkpoint` the CRATE, and `Checkpoint` the engine enum below, are two
+// different things a sentence in this file can be about: the first is the
+// loader, the second is "where the weights are" in a `LoadRequest`. The
+// crate's reader module used to be called `checkpoint` too, which made a
+// third; it is `file` now, so a path that starts with `checkpoint` means the
+// crate and nothing else. `zt` comes in by module because its door is spelled
+// `parse`, and a bare `parse` beside `parse_metadata` would not say which of
+// the two doors it opened.
+use checkpoint::file::Metadata;
+use checkpoint::file::read::parse_metadata;
+use checkpoint::file::zt;
+use checkpoint::contract::ModelContract;
+use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
+use model_ir::Trace;
 
 /// The platform every door here takes, handed out beside them: a caller that can
-/// reach [`identify`] should not have to name `engine-api` to say which
+/// reach [`identify`] should not have to name `engine` to say which
 /// backend it is asking about.
-pub use engine_api::model_ir::Platform;
+pub use model_ir::Platform;
 
 /// The catalog row a load names: its SKU, the tensor-parallel width it was
 /// traced for, the trace itself, and how it sorts a request into the fact
@@ -160,7 +171,7 @@ fn open_source(checkpoint: &Path) -> Result<ztensor::Source> {
 /// and not the checkpoint's.
 ///
 /// A directory holding `model.zt` is ONE container and not a set, which is
-/// `model_loader::checkpoint::read::discover`'s own rule and is followed here
+/// `checkpoint::file::read::discover`'s own rule and is followed here
 /// so that the source this module opens and the metadata
 /// [`checkpoint_metadata`] parses never disagree about what the checkpoint is:
 /// a `.zt` root resolves its own data shards positionally, and handing those
@@ -215,7 +226,7 @@ fn containers(checkpoint: &Path) -> Result<Vec<PathBuf>> {
 /// So the loop below does that check itself, once per candidate, and the
 /// answer is the SKU whose params the checkpoint actually holds.
 ///
-/// `model_loader::plan::compile` is what does the checking, and it is the
+/// `checkpoint::plan::compile` is what does the checking, and it is the
 /// same call `engine_cuda::weights::Weights::resident` makes: this is the
 /// load's own arithmetic run for its verdict rather than its bytes.
 ///
@@ -232,11 +243,11 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<&'static str> {
     // one the contract declares — which is the only question here — so the
     // one the plan will be traced for is as good as any.
     let backend = match platform {
-        Platform::Metal => model_loader::types::BackendKind::Metal,
-        Platform::Vulkan | Platform::Wgpu => model_loader::types::BackendKind::Vulkan,
-        Platform::Cuda => model_loader::types::BackendKind::Cuda,
+        Platform::Metal => checkpoint::types::BackendKind::Metal,
+        Platform::Vulkan | Platform::Wgpu => checkpoint::types::BackendKind::Vulkan,
+        Platform::Cuda => checkpoint::types::BackendKind::Cuda,
     };
-    let target = model_loader::plan::StorageTarget::for_backend(backend, 0, 1);
+    let target = checkpoint::plan::StorageTarget::for_backend(backend, 0, 1);
 
     let mut misses: Vec<String> = Vec::new();
     for (sku, import) in ::model::imports() {
@@ -255,7 +266,7 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<&'static str> {
                 continue;
             }
         };
-        match model_loader::plan::compile(&metadata, &contract, target.clone()) {
+        match checkpoint::plan::compile(&metadata, &contract, target.clone()) {
             Ok(_) => return Ok(sku),
             Err(why) => misses.push(format!("{sku}: {why}")),
         }
@@ -271,13 +282,11 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<&'static str> {
 /// The same two doors `Weights::resident` opens, for the same reason: a
 /// directory is discovered the way `pie model import` discovers one, a file is
 /// read directly.
-fn checkpoint_metadata(checkpoint: &Path) -> Result<model_loader::checkpoint::CheckpointMetadata> {
+fn checkpoint_metadata(checkpoint: &Path) -> Result<Metadata> {
     if checkpoint.is_dir() {
-        model_loader::checkpoint::read::parse_checkpoint_metadata(checkpoint)
-            .map_err(|error| anyhow!("reading {checkpoint:?}: {error}"))
+        parse_metadata(checkpoint).map_err(|error| anyhow!("reading {checkpoint:?}: {error}"))
     } else {
-        model_loader::checkpoint::zt::parse_checkpoint(checkpoint)
-            .map_err(|error| anyhow!("reading {checkpoint:?}: {error}"))
+        zt::parse(checkpoint).map_err(|error| anyhow!("reading {checkpoint:?}: {error}"))
     }
 }
 

@@ -1,0 +1,32 @@
+# Why this file exists: `cargo test --workspace` on this repo spends almost all
+# of its wall clock in the LINKER, not in tests. Measured 2026-08-30, after the
+# thirteen real-hardware `engine-cuda` suites moved behind `#[ignore]`:
+#
+#   test execution, summed over every binary      12 s
+#   wall clock                                    10 min+
+#   test binaries on disk                         517 files, mean 691 MB
+#
+# 691 MB is debug info, copied into every executable at link time. This
+# workspace has ~120 test targets and each pays for it twice — once to write it
+# and once to hold it — which is how `target/` reached 700 GB and filled a 2 TB
+# volume mid-session.
+
+[profile.dev]
+# Debug info goes into separate object files and is REFERENCED by the
+# executable rather than copied into it. gdb, lldb and backtraces all still
+# work: the data is on disk, it is just not inlined into 120 binaries. This is
+# the setting with no debugging cost, which is why it is the one that is on.
+split-debuginfo = "unpacked"
+
+# `debug = "line-tables-only"` STOOD HERE, COMMENTED, and it is the bigger lever
+# if the line above is not enough. Panics keep file and line — which is all a
+# failing assertion needs — and everything else goes: types, variables, lexical
+# scopes. That is a real cost to anyone stepping through this code, so it is a
+# decision to take deliberately rather than a default to inherit.
+#
+#   debug = "line-tables-only"
+#
+# The third lever is a faster linker (`mold`, or `lld` via `-C link-arg`).
+# Neither is installed on this machine, and adding a toolchain dependency to
+# make `cargo test` fast is a heavier ask than either setting above, so it is
+# named here rather than configured.

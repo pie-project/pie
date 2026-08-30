@@ -1,6 +1,6 @@
 # sampling-primitives
 
-Regression test for the generated PTIR sampling primitives. This is not an
+Regression test for the generated ETA sampling primitives. This is not an
 algorithm inferlet; it exists because one un-fused sampler path used to hang the
 GPU.
 

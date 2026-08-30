@@ -1,0 +1,19 @@
+[package]
+name = "snapkv-eviction"
+version = "0.1.0"
+description = "SnapKV eviction, executed — the prefill epilogue's scores choose which KV pages the decode is served, and a needle survives the cut"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+needle = {type = "string", optional = true, description = "The fact hidden in the haystack"}
+question = {type = "string", optional = true, description = "The question whose answer is the needle"}
+filler = {type = "int", optional = true, description = "How many filler sentences surround the needle (default: 24)"}
+depth = {type = "float", optional = true, description = "Where in the haystack the needle sits, 0.0 = front, 1.0 = back (default: 0.35)"}
+page_budget = {type = "int", optional = true, description = "Prompt KV pages the decode is served (default: 6)"}
+max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 12)"}
+evict = {type = "bool", optional = true, description = "Run the eviction; false serves the whole prompt and is the control arm"}
+layers = {type = "int", optional = true, description = "Exported attention layers (default: 6, qwen35-d0.8b)"}
+heads = {type = "int", optional = true, description = "Query heads per exported layer (default: 8, qwen35-d0.8b)"}

@@ -33,6 +33,20 @@
 //! than being `#[ignore]`d — an ignored test on the one box that could run it
 //! is a test nobody runs.
 //!
+//! **AND `#[ignore]` IS ON THEM NOW, WHICH REVERSES THAT.** The reading above
+//! was right about the risk and wrong about which box it meant. The one box in
+//! the fleet with a GPU is CI's self-hosted `pie-worker (engine-cuda)` job, and
+//! that job only ever BUILT these (`--no-run`) — so "the box that could run it"
+//! was a developer's machine, and what ran them was a plain `cargo test`. That
+//! cost 1580 s of a 1864 s workspace sweep across thirteen binaries, which is
+//! how a pre-push sweep becomes 31 minutes and then becomes a sweep nobody
+//! runs. Trading one gate for the whole suite is the worse bargain.
+//!
+//! The run-time skip stays — it is still what a developer sees when the
+//! snapshot is missing. What is added is that the sweep no longer waits for a
+//! model to load, and that the CUDA job now runs `-- --ignored` rather than
+//! only compiling. The gate did not weaken; it moved to the hardware.
+//!
 //! ```text
 //! RUSTFLAGS="--force-warn missing_docs" \
 //!   cargo test -p engine-cuda --features cuda-13 --test serve_smoke -- --nocapture
@@ -246,6 +260,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         // 248320-wide logit column, and this test needs a prompt, not a
         // batch.
         budget: Budget::new(4, 256),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,
@@ -283,6 +298,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
 }
 
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_real_checkpoint_prefills_decodes_and_says_something_true() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the serve smoke") else {
@@ -358,6 +374,7 @@ fn solo(shell: &mut Shell, slot: u32, prompt: &[u32], steps: usize) -> Vec<u32> 
 /// Lengths differ on purpose: equal-length lanes make an indptr that is right
 /// for the wrong reason.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn two_lanes_batched_say_what_they_say_alone() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the batching smoke") else {
@@ -459,6 +476,7 @@ fn two_lanes_batched_say_what_they_say_alone() {
 /// as often as decode-in-a-mixed-fire, and a drift that only shows on the
 /// second occurrence has somewhere to show.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_fire_that_mixes_prefill_and_decode_says_what_each_lane_says_alone() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the mixed-fire golden") else {
@@ -537,6 +555,7 @@ fn a_fire_that_mixes_prefill_and_decode_says_what_each_lane_says_alone() {
 /// decode window holds more than one request and the seriation has to place
 /// both of them before the prefill's rows (or both after).
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn three_lanes_two_decoding_and_one_prefilling_agree_with_their_solo_runs() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the three-lane mixed fire") else {
@@ -646,6 +665,7 @@ fn three_lanes_two_decoding_and_one_prefilling_agree_with_their_solo_runs() {
 /// prompts DIFFER, because two shells computing the same continuation would
 /// agree whether or not they were staging over each other.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn two_shells_firing_at_once_say_what_each_says_alone() {
     // Held against the OTHER tests in this file — four shells at once is four
     // copies of the weights — and released inside for the two of its own.

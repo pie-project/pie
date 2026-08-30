@@ -1,5 +1,5 @@
 //! **Stage-2 engine `mtp_logits` value-verify** (charlie) — drives the
-//! `mtp-native-verify` inferlet (bravo's PTIR-native draft→verify→accept) on the
+//! `mtp-native-verify` inferlet (bravo's ETA-native draft→verify→accept) on the
 //! a real CUDA device + Qwen3.5-0.8B, exercising the engine's `mtp_logits` plumbing (the
 //! MTP head produces K draft rows in `ws.logits`; `ctx.mtp_draft_row` points the
 //! `Intrinsic::MtpLogits [K,vocab]` binding at them).

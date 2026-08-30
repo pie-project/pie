@@ -34,75 +34,128 @@
 //! messages, where a failing run shows them and a passing run costs nothing.
 
 use model_compiler::{
-    Budget, DeviceProfile, Lowering, Phase, Placement, collectives_are_never_elided, compile,
+    Budget, Lowering, PATCH_LATTICE_FLOOR, Phase, Placement, collectives_are_never_elided,
 };
-use model_dsl::Platform;
 use model_ir::ValueId;
 
-/// Every platform a plan can be traced at. A model text may emit a different op
-/// per platform, so the split-and-merge structure is not the same graph on each,
-/// and one platform passing says nothing about the others.
-const PLATFORMS: [Platform; 4] = [
-    Platform::Cuda,
-    Platform::Metal,
-    Platform::Wgpu,
-    Platform::Vulkan,
-];
+mod common;
+use common::{PLATFORMS, bake, patch_ladder_for, states_patches};
 
-/// A deployment's ceilings: 256 concurrent requests, 8192 token rows, the
-/// bucket lattice a decode-heavy serve rounds up to, and as many adapters as
-/// THIS plan's banks seat.
+/// **THE RESTATEMENT IS CHECKED AGAINST THE RULE IT RESTATES.**
 ///
-/// **`max_adapters` STOPPED BEING A NUMBER NOBODY READ** (palo C2). It sat
-/// here at a flat 32 while the IR had no bank seat, so it named an intention
-/// and checked nothing; `compile` now refuses a load whose ask is bigger than
-/// the model text's own capacity (design §8: the budget IS the shape), and a
-/// flat 32 across the catalog would refuse five families for declaring no
-/// bank and qwen for declaring eight. So the fixture asks each plan for what
-/// it seats — which is what a worker does, and which keeps the bank-declaring
-/// SKUs baking AT their ceiling rather than under it.
-fn budgets_for(trace: &model_ir::Trace) -> Budget {
-    let seats = trace
-        .params
-        .iter()
-        .filter(|param| param.source == model_ir::ParamSource::Registered)
-        .map(|param| param.shape.first().copied().unwrap_or(0))
-        .min()
-        .unwrap_or(0);
-    Budget {
-        max_lanes: 256,
-        max_tokens: 8192,
-        buckets: vec![
-            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192,
-        ],
-        max_adapters: u32::try_from(seats).unwrap_or(u32::MAX),
+/// `patch_ladder_for` above is a second statement of
+/// `engine_cuda::api::patch_ladder`, and model-compiler cannot call the
+/// authority to diff against it — the dependency runs the other way, which is
+/// the whole reason there are two. What CAN be asserted here is that this copy
+/// obeys the RULE in prose rather than some list somebody typed: read the
+/// ladder back and check each clause separately from the loop that built it.
+///
+/// A cross-crate diff belongs on engine-cuda's side, where `api.rs`'s own unit
+/// tests can depend on model-compiler and ask both. This is the half that can
+/// be asked from here, and it is what turns "somebody changed the rule and not
+/// this file" from a silence into a red line.
+///
+/// NOT `#[ignore]`d: it bakes nothing and reads no catalog.
+#[test]
+fn the_ladder_this_file_derives_is_the_one_the_rule_describes() {
+    for max_tokens in [8192u32, 4096, 2048, 1024, 96, 8] {
+        let budget = Budget::new(256, max_tokens);
+        let ladder = patch_ladder_for(&budget);
+
+        // The ceiling: the token rectangle's, capped at two whole images, and
+        // never below one whole image.
+        let want = max_tokens.min(4096).max(PATCH_LATTICE_FLOOR);
+        assert_eq!(ladder.max_patches, want, "the ceiling at {max_tokens} tokens");
+
+        // The rungs: they start at the floor, they double, and the last one is
+        // the ceiling. Asked of the vector rather than of the loop.
+        assert_eq!(
+            ladder.buckets.first().copied(),
+            Some(PATCH_LATTICE_FLOOR),
+            "the ladder starts at the smallest whole image: {:?}",
+            ladder.buckets,
+        );
+        assert_eq!(
+            ladder.buckets.last().copied(),
+            Some(ladder.max_patches),
+            "the ladder ends at its ceiling: {:?}",
+            ladder.buckets,
+        );
+        for pair in ladder.buckets.windows(2) {
+            let (low, high) = (pair[0], pair[1]);
+            assert!(
+                high == low * 2 || high == ladder.max_patches,
+                "rung {high} follows {low} and is neither its double nor the \
+                 ceiling: {:?}",
+                ladder.buckets,
+            );
+        }
+
+        // `max_images` is the ceiling AT the floor, and never zero — a
+        // deployment that admits patch rows admits at least one image.
+        assert_eq!(
+            ladder.max_images,
+            (ladder.max_patches / PATCH_LATTICE_FLOOR).max(1),
+            "as many images as the ceiling holds at the floor",
+        );
+        assert!(ladder.max_images >= 1, "a ladder admits at least one image");
     }
+
+    // AND IT IS THE LADDER THE SIBLING FILE STATES BY HAND. At the 8192-token
+    // deployment every sweep in this tree uses,
+    // `the_second_row_axis_costs_the_first_nothing`'s `also_admitting_patches`
+    // writes the rungs out as a literal; a derivation that disagreed with the
+    // one hand-written ladder in the crate would be one of the two being wrong.
+    let ladder = patch_ladder_for(&Budget::new(256, 8192));
+    assert_eq!(ladder.max_patches, 4096);
+    assert_eq!(ladder.buckets, vec![64, 128, 256, 512, 1024, 2048, 4096]);
 }
 
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn every_sku_bakes_on_every_platform() {
     let mut refused: Vec<String> = Vec::new();
+    let (mut pairs, mut towers) = (0usize, 0usize);
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            if let Err(refusal) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) {
+            pairs += 1;
+            towers += usize::from(states_patches(&trace));
+            if let Err(refusal) = bake(&trace) {
                 refused.push(format!("`{sku}` as {platform:?}: {}", refusal.say(&trace)));
             }
         }
     }
 
     assert!(refused.is_empty(), "\n{}\n", refused.join("\n"));
+    // NOT VACUOUS ON EITHER AXIS. This sweep baked the whole catalog through
+    // token-only ceilings until the towers arrived, and then refused the two
+    // rows that state `Dim::Patches` — correctly, and by name: token ceilings
+    // size no patch rectangle. What fixed it was the fixture deriving a ladder,
+    // so a run that exercised no patch-stating row would be green for the
+    // reason it was green before, and a run that exercised ONLY them would have
+    // stopped covering the catalog.
+    assert!(
+        towers > 0,
+        "no row of the catalog states `Dim::Patches`, so the ladder this file \
+         derives is never asked for and the second axis is untested here",
+    );
+    assert!(
+        towers < pairs,
+        "every row states `Dim::Patches`, so the token-only path is never taken",
+    );
 }
 
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn no_sku_carves_an_arena_that_shares_live_bytes() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue; // the test above is the one that says so.
             };
 
@@ -164,13 +217,14 @@ fn no_sku_carves_an_arena_that_shares_live_bytes() {
 /// second pass, an adapter bank — this test is what will be standing when the
 /// second clause stops being vacuous.
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn the_refined_clash_rule_agrees_with_the_v1_oracle_wherever_no_column_is_shared() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue;
             };
             let arena = &compiled.arena;
@@ -253,13 +307,14 @@ fn co_tenants(arena: &model_compiler::ArenaMap) -> Vec<(ValueId, ValueId)> {
 /// test on a number that legitimately moves when a model text changes. What
 /// cannot legitimately move is that a transformer's scratch is reused at all.
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn the_carve_lands_on_the_busiest_instant_and_not_the_sum() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue;
             };
             let total: u64 = compiled
@@ -308,13 +363,14 @@ fn the_carve_lands_on_the_busiest_instant_and_not_the_sum() {
 /// stands before every capture one, which is the property
 /// `engine::fire::walk` refuses a template for lacking.
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue;
             };
             // Exactly once: a node counted twice is a rectangle written twice,
@@ -386,13 +442,14 @@ fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
 /// are asked; this is the arena file's own restatement, so that a change to
 /// the lowering has to break something here too.
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn a_collective_is_never_elided_and_a_conditional_is_a_structural_arm() {
     let mut wrong: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue;
             };
             if !collectives_are_never_elided(&compiled) {
@@ -406,12 +463,34 @@ fn a_collective_is_never_elided_and_a_conditional_is_a_structural_arm() {
                 .iter()
                 .filter(|r| r.lowering != Lowering::AlwaysLaunch)
                 .count();
-            let expected = usize::from(sku.starts_with("qwen36-27b"));
+            // **ASKED OF THE TEXT, NOT OF THE SKU NAME**, and there are now
+            // TWO things a text can declare that earn one.
+            //
+            // The first is the MTP head: `trace.seams`, the same predicate
+            // `engine-cuda`'s `export_axes` asks. A prefix match said
+            // `qwen36-27b*` and meant "the drafting SKU", and the two stopped
+            // being the same set when the quant wave shipped
+            // `qwen36-27b-mlxu4-kv-bf16` off `Model::d27b_undrafted`: mlx_lm
+            // implements no multi-token-prediction arm for this family, so
+            // the 4-bit artifacts carry none of the fifteen `mtp.*` planes and
+            // a text that demanded them would refuse every one of them.
+            //
+            // The second is the VISION TOWER, and it is the newer half. A
+            // tower is guarded by `Facts::media` — alto M-1 put the guard on
+            // the merge — so a fire whose lanes carry no image skips the whole
+            // tower rather than launching it over an empty window. That is a
+            // conditional in exactly the sense this gate means: rare,
+            // deliberate and structural, and the entire reason the media fact
+            // exists. It was invisible here until this file learned to derive
+            // a patch ladder, because a tower row refused the bake and every
+            // sweep in this tree skipped past it.
+            let expected = usize::from(trace.seams.iter().any(|seam| seam.seam == "mtp"))
+                + usize::from(states_patches(&trace));
             if conditional != expected {
                 wrong.push(format!(
                     "`{sku}` as {platform:?}: {conditional} conditional regions, and \
-                     the catalog's answer at this profile is {expected} — the MTP \
-                     head and nothing else",
+                     the catalog's answer at this profile is {expected} — one per \
+                     `mtp` seam, one per media-guarded tower, and nothing else",
                 ));
             }
             // **P6 LANDED, SO "EVERY REGION IS ON STREAM 0" IS NO LONGER THE
@@ -440,30 +519,46 @@ fn a_collective_is_never_elided_and_a_conditional_is_a_structural_arm() {
     assert!(wrong.is_empty(), "\n{}\n", wrong.join("\n"));
 }
 
-/// **THE CORRECTION'S WINDOW IS ONE RUN, AND IT IS ONE RUN BECAUSE P4 WAS
-/// ASKED** (palo C2, decision #9's seat).
+/// **THE CORRECTION'S WINDOW IS ONE RUN, OR THE MENU SAYS HOW IT IS SERVED**
+/// (palo C2, decision #9's seat).
 ///
 /// Design decision #9 says correction and weight-varied ops are excluded from
 /// layout constraints, "gather absorbs them". Read as written it would take
 /// `linear.lora_correct`'s region out of the C1P matrix — and that is the one
 /// reading this test exists to refute, because in this system a region's rows
-/// are a SLICE, not a gather: `Windows::of` refuses a region whose classes are
-/// not consecutive in the fire's order, whatever the layout thought of it.
+/// are a SLICE, not a gather: a region whose classes are not consecutive in
+/// the fire's order cannot be one launch over one rectangle, whatever the
+/// layout thought of it.
 ///
-/// So: every region carrying a correction must have a mask that P4's chosen
-/// order makes into one run. `layout::gather_absorbs`' own note carries the
-/// measurement that says withdrawing it does not.
+/// **WHAT THE REFUSAL ACTUALLY IS.** `Windows::of` refuses a fragmented region
+/// that was owed NOTHING — a region P4 seated and then did not. It does not
+/// refuse one the fallback menu wrote a row for: that region is SERVED, as
+/// `r` launches over its own intervals, or as one over a copy of their union,
+/// or as one over a segment list. So the invariant is not "every correction
+/// region is an interval" — it is that a correction region is an interval OR
+/// it carries an answer. A region that is neither is the bug: a fire the shell
+/// meets at run time with no way to launch it.
+///
+/// Both arms occur in the shipped catalog and both are asserted, because a
+/// gate that only ever saw one of them would be half a gate. Since alto A-6
+/// put the correction in five more texts, gemma's three attention arms win
+/// C1P and its correction lands at order positions `[1, 3, 5]` — three runs,
+/// and answered `Copy` below the crossover and `Split { r: 3 }` above it.
+/// `layout::gather_absorbs`' own note carries the measurement that says
+/// withdrawing it does not come free.
 #[test]
+#[ignore = "catalog sweep: bakes every SKU on every platform (and, for the renumbering gate, every permutation of its fact bits); minutes, not seconds. Run it with `-- --ignored`, which CI's workspace-verify job does"]
 fn every_correction_region_gets_a_window_of_one_run() {
     use model_ir::{Linear, Operation};
 
     let mut checked = 0usize;
+    let (mut intervals, mut answered) = (0usize, 0usize);
     let mut broken: Vec<String> = Vec::new();
 
     for (sku, _, trace, _) in model::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budgets_for(&trace), &DeviceProfile::default()) else {
+            let Ok(compiled) = bake(&trace) else {
                 continue; // `every_sku_bakes_on_every_platform` is what says so.
             };
             // Where each class stands in the order P4 chose, with every class
@@ -498,11 +593,24 @@ fn every_correction_region_gets_a_window_of_one_run() {
                     .windows(2)
                     .filter(|pair| pair[1] != pair[0] + 1)
                     .count();
-                if runs != 1 {
+                // The answer the menu wrote for this region, if it wrote one:
+                // the rows are keyed by node, and any node of the region
+                // carrying one is the region being served.
+                let served = compiled
+                    .fallback
+                    .rows
+                    .iter()
+                    .any(|row| region.nodes.contains(&row.node));
+                if runs == 1 {
+                    intervals += 1;
+                } else if served {
+                    answered += 1;
+                } else {
                     broken.push(format!(
                         "`{sku}` as {platform:?}: correction region {index} covers classes \
-                         at positions {positions:?} of the order, which is {runs} runs; \
-                         `Windows::of` refuses that fire by name"
+                         at positions {positions:?} of the order, which is {runs} runs, \
+                         and the fallback menu wrote it no row; `Windows::of` refuses \
+                         that fire by name"
                     ));
                 }
             }
@@ -513,5 +621,19 @@ fn every_correction_region_gets_a_window_of_one_run() {
     assert!(
         checked > 0,
         "no SKU in the catalog states a correction op, and then this test is vacuous"
+    );
+    // BOTH ARMS, OR IT IS HALF A GATE. A run where every correction region is
+    // an interval never exercises the menu; one where none of them is never
+    // exercises the seat, and would pass on a P4 that had stopped trying.
+    assert!(
+        intervals > 0,
+        "no correction region in the catalog is an interval of its order, so P4 \
+         seats none of them and this gate is only reading the fallback menu",
+    );
+    assert!(
+        answered > 0,
+        "every correction region in the catalog is an interval, so the served \
+         arm is never taken — true before alto A-6 and worth re-reading rather \
+         than deleting if it is true again",
     );
 }

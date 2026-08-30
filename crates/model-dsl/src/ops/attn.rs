@@ -1014,3 +1014,36 @@ pub fn pool_lse(
     );
     (o, lse)
 }
+
+/// **BIDIRECTIONAL ATTENTION OVER THE PATCH WINDOW** — the vision towers' one
+/// real kernel (multimodal §2), block-diagonal per image.
+///
+/// `segments` is the patch axis's own indptr
+/// ([`Input::patch_segments`](crate::Input::patch_segments)): patch row `n`
+/// attends over the rows of the image whose span contains it, both ways, and
+/// over nothing else. No cache, no plan, no mask — everything this op needs is
+/// four tensors and two numbers.
+pub fn dense(
+    q: &Value,
+    k: &Value,
+    v: &Value,
+    segments: &Value,
+    head_dim: u32,
+    sm_scale: f32,
+) -> Value {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    r.push(
+        Attention::Dense {
+            q: q.id(),
+            k: k.id(),
+            v: v.id(),
+            segments: segments.id(),
+            head_dim,
+            sm_scale,
+            o: o.id(),
+        },
+        &[q, k, v, segments],
+    );
+    o
+}

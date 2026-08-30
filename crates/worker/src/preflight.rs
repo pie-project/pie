@@ -98,7 +98,7 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[model.engine.options] for {:?}: {e}", m.name))?;
+                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
             let device = m.engine.device.first().ok_or_else(|| {
                 anyhow!(
                     "model {:?}: cuda_native requires at least one device",
@@ -120,7 +120,7 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
                 .options
                 .clone()
                 .try_into()
-                .map_err(|e| anyhow!("[model.engine.options] for {:?}: {e}", m.name))?;
+                .map_err(|e| anyhow!("[engine] options for {:?}: {e}", m.name))?;
             Ok(EngineOptions::Metal(p))
         }
     }

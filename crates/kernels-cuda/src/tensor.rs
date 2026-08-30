@@ -13,7 +13,7 @@
 //! takes its outputs as `&mut Tensor` to *say* what it writes, and that
 //! signature is the whole record of write intent (design §5).
 
-use model_ir::Dtype;
+use dtype::Dtype;
 
 use crate::jit::ArgValue;
 

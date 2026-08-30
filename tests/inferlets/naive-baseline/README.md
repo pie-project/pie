@@ -25,7 +25,7 @@ structural one that no bug fix can change: a baseline is only a baseline if it
 is measured through the *identical* code path. `chat-completion` builds a chat
 template and drains through the client edge; `text-completion-bench` is a
 throughput harness with its own budget loop. This crate has the algorithm
-inferlets' exact skeleton — one N-wide prefill fire, a `ptir::run_ahead` decode
+inferlets' exact skeleton — one N-wide prefill fire, a `eta::run_ahead` decode
 loop, the same channel wiring — and differs from them in the epilogue and
 nowhere else. Subtracting it therefore leaves the algorithm and nothing else.
 

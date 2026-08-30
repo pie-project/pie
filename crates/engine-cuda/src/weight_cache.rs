@@ -13,13 +13,13 @@
 //! This module makes that second boot a file read. After a cold load the
 //! device store is snapshotted beside a key; on a warm boot with a matching
 //! key the blob goes straight to the device and the whole host-side transform
-//! pipeline ([`model_loader::executor::Execution`]) never runs.
+//! pipeline ([`checkpoint::executor::Execution`]) never runs.
 //!
 //! # Why the key is a hash of the recipe and not a name
 //!
 //! dev's rule, kept: **a false miss costs one re-materialization; a false hit
 //! puts silently wrong weights on the device.** So the key errs toward
-//! missing. It mixes the whole [`LoadPlan`](model_loader::plan::LoadPlan)
+//! missing. It mixes the whole [`LoadPlan`](checkpoint::plan::LoadPlan)
 //! through `serde_json` — the plan IS the recipe, so hashing it whole is the
 //! only formulation that cannot go stale when a plan grows a field — plus the
 //! checkpoint's own identity, plus the device layout this shell chose, plus a
@@ -45,36 +45,123 @@
 //! does a failed one: every error in here is counted and swallowed, because
 //! the cache is an optimization and the cold path is always correct.
 //!
-//! # What is NOT here
+//! # How the bytes cross
 //!
-//! dev's `staged_h2d.hpp` — the four-lane pinned double-buffered H2D whose
-//! measured argument is that one staging lane already outruns NVMe by 1.6×,
-//! so GDS buys nothing under ~7 GB/s per reader. The restore path here uses
-//! the shell's ordinary blocking [`Buffer::write`], which is correct and
-//! slower; the lanes are a throughput refinement with a measurement attached
-//! and they belong with the elastic supply, not with the contract.
+//! Through [`crate::staged_h2d`] — dev's four-lane pinned double-buffered H2D,
+//! whose measured argument is that one staging lane already outruns NVMe by
+//! 1.6×, so GDS buys nothing under ~7 GB/s per reader. The artifact is mmap'd
+//! and the lanes stream it, so the read and the copy overlap instead of
+//! alternating; the digest runs beside them over the same mapping, which is
+//! what keeps "always verified" from becoming the new floor. The blocking
+//! [`Buffer::write`] loop that came first is still here behind
+//! [`restore_through_the_pump`], because the gate that justifies the pump has
+//! to measure it against something.
+//!
+//! # And what the file has become
+//!
+//! **A SERVING-TIME SOURCE, NOT ONLY A BOOT ACCELERATOR** (alto streaming §0).
+//! The stored weights need no load-time conversion, and that format already
+//! existed: this one. So the artifact now carries a **plane-group index** — the
+//! device store's own `(offset, bytes, reserved)` per plane, transcribed, not
+//! computed — ahead of a page-aligned blob, and [`Artifact`] opens, maps and
+//! resolves it without copying a byte. That index is what the T2 pointer class
+//! of streaming §2 will point through; the HMM arm itself is a later wave.
+//!
+//! The version bump that carried it is the one place the two doors disagree.
+//! On the boot path a stale artifact stays dev's MISS — the shell recomputes
+//! and overwrites, loudly — because the cost of being wrong is one
+//! re-materialization. On the serving door it is a [`Refused::StaleFormat`]
+//! with both numbers in it, because a caller that opened a file to serve out
+//! of has no recipe to fall back to.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::device::alloc::Buffer;
 use crate::error::Result;
 
+/// **The read side of the promotion** (alto streaming §0 and build-order item
+/// 2): the artifact opened, mapped, and resolved plane-group by plane-group
+/// without a copy. Separate file because it is a different verb on the same
+/// bytes — this module WRITES the format and restores from it; that one serves
+/// out of it.
+mod mapped;
+
+pub use mapped::{Artifact, Refused};
+
 /// The artifact format's own version.
 ///
-/// **A DIFFERENT ONE IS A MISS, NOT AN ERROR** (dev's `SCHEMA_VERSION`): the
-/// shell recomputes and overwrites. Bump it whenever the bytes on disk mean
-/// something different — a header field, a layout rule, an alignment.
-const FORMAT: u32 = 1;
+/// **A DIFFERENT ONE IS A MISS ON THE RESTORE PATH, AND A REFUSAL ON THE
+/// SERVING PATH.** dev's `SCHEMA_VERSION` rule — the shell recomputes and
+/// overwrites — still governs [`restore`], because there a stale artifact
+/// costs one re-materialization and nothing else. It does NOT govern
+/// [`Artifact::open`]: a caller that asked to SERVE from this file cannot be
+/// handed silence, so an old version comes back as
+/// [`Refused::StaleFormat`] by name. Bump this whenever the bytes on disk
+/// mean something different — a header field, a layout rule, an alignment.
+///
+/// **2** was the promotion of alto streaming §0: the same blob, now preceded
+/// by a plane-group index, so the file is a mmap-able serving-time source and
+/// not only a boot accelerator.
+///
+/// **3 is the striped digest** (W-4's follow-on). The header still carries one
+/// `digest`, but it now folds [`STRIPES`] independent FNV chains instead of
+/// being one chain over every byte, and the chains themselves are written
+/// beside it. The bytes of the blob did not move; what a reader must COMPUTE
+/// from them did, which is exactly the kind of change this number exists to
+/// announce — a v2 file's digest would disagree with a v3 reader's arithmetic
+/// and be indicted as corruption if the version did not speak first.
+const FORMAT: u32 = 3;
 
 /// What every artifact starts with, so a file that is not one is a miss
 /// rather than a parse.
+///
+/// **UNCHANGED ACROSS THE VERSION BUMP, ON PURPOSE.** The magic says "this is
+/// a weight artifact"; [`FORMAT`] says which one. Keeping them separate is
+/// what lets a version-1 file be RECOGNIZED and refused by name rather than
+/// mistaken for somebody else's file.
 const MAGIC: [u8; 8] = *b"PIEWCAC1";
 
-/// Header bytes: magic, format, key, blob length, digest, reserved.
-const HEADER: usize = 8 + 4 + 8 + 8 + 8 + 4;
+/// Header bytes. The layout, which is the file's whole contract:
+///
+/// ```text
+///    0..8   magic                       "PIEWCAC1"
+///    8..12  format          u32          FORMAT
+///   12..16  groups          u32          how many index entries follow
+///   16..24  key             u64          Identity::key
+///   24..32  total           u64          blob bytes = the device store's size
+///   32..40  digest          u64          FNV-1a over the blob, and ONLY it
+///   40..48  index_digest    u64          FNV-1a over the index entries
+///   48..56  index_at        u64          file offset of the first entry
+///   56..64  blob_at         u64          file offset of the first blob byte
+///   64..96  stripes         u64 x 4      one FNV-1a per stripe of the blob
+/// ```
+///
+/// **`digest` covers the blob alone**, deliberately: it is the same number
+/// [`digest_of`] computes from what is resident on the device, so a gate can
+/// compare a file and a card without knowing this header exists. The index
+/// gets its own digest rather than being folded into that one.
+///
+/// Since v3 that number is [`fold`] of the four `stripes` rather than a single
+/// chain over the blob. **The stripes are written as well as folded**, and not
+/// for the restore's benefit — the restore checks the fold and would be
+/// satisfied without them. They are here because a serving-time reader
+/// (streaming §2) faults in one plane, not the file, and a per-stripe digest is
+/// the coarsest thing it can check without hashing bytes it never mapped.
+const HEADER: usize = 64 + STRIPES * 8;
+
+/// One index entry on disk: `id`, `plane`, `offset`, `bytes`, `reserved`.
+const ENTRY: usize = 4 + 4 + 8 + 8 + 8;
+
+/// What the blob's first byte is aligned to.
+///
+/// A page, because the whole point of the promotion is that this file is
+/// mmap'd and a plane's bytes are resolved to an offset a device may fault on
+/// (streaming §2's third pointer class). A blob that starts mid-page would put
+/// every plane's alignment at the mercy of how many params the model has.
+const BLOB_ALIGN: u64 = 4096;
 
 /// How much room the write wants BEYOND the blob before it will use the disk.
 ///
@@ -97,7 +184,7 @@ const CHUNK: usize = 64 << 20;
 /// is: a gate at the runtime level holds the engine behind a `Box<dyn Engine>`
 /// on a lane thread and cannot ask the instance anything. The per-load answer
 /// a CALLER wants rides home on
-/// [`LoadFacts::weights_from_cache`](engine::engine_api::load::LoadFacts);
+/// [`LoadFacts::weights_from_cache`](engine::load::LoadFacts);
 /// this is what a test counts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Observed {
@@ -194,6 +281,163 @@ impl Fnv {
     }
 }
 
+// ── the striped digest ──────────────────────────────────────────────────────
+
+/// **How many independent FNV chains cover the blob.**
+///
+/// The digest used to be ONE chain over every byte, and W-4's measurement
+/// found that this — not the disk, and not the PCIe bus — was what a warm boot
+/// waited on. Each byte's multiply depends on the previous byte's, so the
+/// chain runs on exactly one core at ~0.93 GB/s, while the same filesystem
+/// feeds four parallel readers at 3.7 GB/s. The pump had already hidden the
+/// read and the upload behind that hash and could go no faster: 1.6 GiB
+/// restored in 2.08s against a 1.84s digest floor.
+///
+/// **Four, and the arithmetic picks the number — not the pump's lane count.**
+/// With `N` stripes a pumped restore costs `max(T, H/N)`: `T` for the transfer
+/// the lanes overlap, `H/N` for the hash they cannot. It therefore stops
+/// improving the moment `H/N` drops under `T`. Measured on the L40S box over
+/// 1.6 GiB: `H = 1.84s`, `T ≈ 0.6s`, so the knee is at `N = H/T ≈ 3` and four
+/// is the first power of two past it. **Eight would not make a restore
+/// faster** — the pump is transfer-bound by then — it would only make the
+/// blocking arm cheaper and the measured advantage smaller.
+///
+/// The 8-thread figure that box turns in for *reading* (5.41 GB/s) is not the
+/// number that sets this one. The hash is CPU-bound, so what governs is cores
+/// spent per byte, not queue depth against the disk.
+///
+/// It equals [`crate::staged_h2d::LANES`] by arithmetic rather than by
+/// coincidence — one hash thread per pump lane is a tidy result, not a
+/// requirement — and nothing here reads that constant, so the two may diverge
+/// the day either measurement moves.
+pub const STRIPES: usize = 4;
+
+/// **Where each stripe starts and how long it is.**
+///
+/// Contiguous and page-aligned: stripe `i` covers `[i*span, (i+1)*span)` for a
+/// `span` rounded DOWN to [`BLOB_ALIGN`], and the last stripe carries whatever
+/// the rounding left over. The alignment is not decoration — the parallel hash
+/// walks a mapping, and a boundary mid-page would put two threads on one page
+/// and make them fault against each other.
+///
+/// A blob too small to give every stripe a page puts all of it in stripe 0 and
+/// leaves the rest empty. Empty stripes hash to the FNV basis and fold
+/// deterministically, so a tiny artifact needs no special case anywhere else.
+#[must_use]
+fn stripe_spans(total: u64) -> [(u64, u64); STRIPES] {
+    let span = total / STRIPES as u64 / BLOB_ALIGN * BLOB_ALIGN;
+    let mut out = [(0u64, 0u64); STRIPES];
+    if span == 0 {
+        out[0] = (0, total);
+        return out;
+    }
+    for (which, slot) in out.iter_mut().enumerate() {
+        let at = which as u64 * span;
+        *slot = if which == STRIPES - 1 {
+            (at, total - at)
+        } else {
+            (at, span)
+        };
+    }
+    out
+}
+
+/// **The one number the stripes fold to** — [`Head::digest`], and what
+/// [`digest_of`] answers.
+///
+/// So that a gate can still compare a file against a card with a single
+/// `assert_eq!` and never learn that the digest acquired a shape.
+#[must_use]
+pub fn fold(stripes: &[u64; STRIPES]) -> u64 {
+    let mut hash = Fnv::default();
+    for digest in stripes {
+        hash.number(*digest);
+    }
+    hash.finish()
+}
+
+/// **Hash every stripe of `blob` at once**, one thread per stripe.
+///
+/// The whole point of the striping: [`STRIPES`] independent chains over
+/// disjoint spans of one mapping, so the digest costs a core-second per stripe
+/// rather than a wall-second per blob. The spans are disjoint by construction,
+/// which is what lets this be safe code — each thread gets its own `&[u8]`.
+#[must_use]
+pub fn stripe_digests(blob: &[u8]) -> [u64; STRIPES] {
+    let mut out = [0u64; STRIPES];
+    std::thread::scope(|scope| {
+        let mut hashing = Vec::with_capacity(STRIPES);
+        for (at, len) in stripe_spans(blob.len() as u64) {
+            let part = blob
+                .get(usize::try_from(at).unwrap_or(usize::MAX)..)
+                .and_then(|rest| rest.get(..usize::try_from(len).unwrap_or(0)))
+                .unwrap_or(&[]);
+            hashing.push(scope.spawn(move || {
+                let mut hash = Fnv::default();
+                hash.raw(part);
+                hash.finish()
+            }));
+        }
+        for (slot, thread) in out.iter_mut().zip(hashing) {
+            *slot = thread.join().unwrap_or(0);
+        }
+    });
+    out
+}
+
+/// **The streaming twin of [`stripe_digests`]**, for the paths that never hold
+/// the whole blob.
+///
+/// The write side reads the device a chunk at a time and the device-side
+/// digest reads it back the same way; neither can map what it is hashing. So
+/// bytes arrive here IN ORDER, in chunks of any size, and each is routed to
+/// whichever stripe spans hold it — a chunk that straddles a boundary is split.
+///
+/// It answers exactly what the parallel version answers over the same bytes,
+/// and that agreement is not left to inspection:
+/// [`seed`] writes an artifact through this and [`Artifact::verify`] checks it
+/// through the other, so `the_artifact_says_where_every_plane_lives` goes red
+/// the day the two arithmetics part company.
+struct Striper {
+    spans: [(u64, u64); STRIPES],
+    hash: [Fnv; STRIPES],
+    /// How many blob bytes have already been fed — the absolute offset the
+    /// next slice starts at, which is what makes routing possible without
+    /// holding anything.
+    at: u64,
+}
+
+impl Striper {
+    fn new(total: u64) -> Striper {
+        Striper {
+            spans: stripe_spans(total),
+            hash: [Fnv::default(); STRIPES],
+            at: 0,
+        }
+    }
+
+    /// Mix the next `bytes` of the blob into whichever stripes they land in.
+    fn feed(&mut self, bytes: &[u8]) {
+        let from = self.at;
+        let to = from.saturating_add(bytes.len() as u64);
+        for (span, hash) in self.spans.iter().zip(self.hash.iter_mut()) {
+            let (at, len) = *span;
+            let start = at.max(from);
+            let end = at.saturating_add(len).min(to);
+            if start < end {
+                let lo = usize::try_from(start - from).unwrap_or(0);
+                let hi = usize::try_from(end - from).unwrap_or(0);
+                hash.raw(&bytes[lo..hi]);
+            }
+        }
+        self.at = to;
+    }
+
+    fn finish(self) -> [u64; STRIPES] {
+        self.hash.map(Fnv::finish)
+    }
+}
+
 /// **Everything the materialized table is a function of.**
 ///
 /// Three groups, and the module header argues each: which checkpoint, which
@@ -280,8 +524,241 @@ fn stat_identity(path: &Path) -> u64 {
 
 // ── the artifact ────────────────────────────────────────────────────────────
 
+/// **What every artifact says about itself before its bytes.**
+///
+/// The whole of [`HEADER`], decoded. It is a public type because the mmap side
+/// ([`Artifact`]) answers with it and a gate reads it: the file's identity, its
+/// two digests, and where its two payloads start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Head {
+    /// [`FORMAT`] as this file states it. A different one is the version
+    /// refusal.
+    pub format: u32,
+    /// How many [`Group`] entries the index holds. Zero is legal and means an
+    /// artifact written by a caller that had no layout to declare.
+    pub groups: u32,
+    /// [`Identity::key`] — which deployment's weights these are.
+    pub key: u64,
+    /// The blob's length, which is the device store's length.
+    pub total: u64,
+    /// FNV-1a over the blob and only the blob — the same number
+    /// [`digest_of`] computes from the device.
+    pub digest: u64,
+    /// FNV-1a over the index entries as they are written.
+    pub index_digest: u64,
+    /// Where the first index entry starts.
+    pub index_at: u64,
+    /// Where the blob's first byte starts.
+    pub blob_at: u64,
+    /// **One FNV-1a per stripe of the blob**, in stripe order, which
+    /// [`fold`] folds into `digest`.
+    ///
+    /// Written since format 3. The restore checks the fold and would be
+    /// satisfied without ever reading these; they are on disk for the serving
+    /// reader that maps one plane and wants to check something narrower than
+    /// the whole file.
+    pub stripes: [u64; STRIPES],
+}
+
+impl Head {
+    /// The bytes that go on the front of the file.
+    #[must_use]
+    fn encode(&self) -> [u8; HEADER] {
+        let mut out = [0u8; HEADER];
+        out[..8].copy_from_slice(&MAGIC);
+        out[8..12].copy_from_slice(&self.format.to_le_bytes());
+        out[12..16].copy_from_slice(&self.groups.to_le_bytes());
+        out[16..24].copy_from_slice(&self.key.to_le_bytes());
+        out[24..32].copy_from_slice(&self.total.to_le_bytes());
+        out[32..40].copy_from_slice(&self.digest.to_le_bytes());
+        out[40..48].copy_from_slice(&self.index_digest.to_le_bytes());
+        out[48..56].copy_from_slice(&self.index_at.to_le_bytes());
+        out[56..64].copy_from_slice(&self.blob_at.to_le_bytes());
+        for (which, digest) in self.stripes.iter().enumerate() {
+            let at = Head::STRIPES_AT as usize + which * 8;
+            out[at..at + 8].copy_from_slice(&digest.to_le_bytes());
+        }
+        out
+    }
+
+    /// Read one back. `None` for anything that is not an artifact at all —
+    /// too short, or the wrong magic — which is the only outcome this function
+    /// judges. **The version is decoded, not checked**, because the two
+    /// callers disagree about what a stale one means.
+    #[must_use]
+    fn decode(bytes: &[u8]) -> Option<Head> {
+        if bytes.len() < HEADER || bytes[..8] != MAGIC {
+            return None;
+        }
+        // Every slice below is inside the length just checked, so the
+        // fallbacks are unreachable rather than lenient.
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap_or([0; 4]));
+        let long = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]));
+        Some(Head {
+            format: word(8),
+            groups: word(12),
+            key: long(16),
+            total: long(24),
+            digest: long(32),
+            index_digest: long(40),
+            index_at: long(48),
+            blob_at: long(56),
+            stripes: core::array::from_fn(|which| long(Head::STRIPES_AT as usize + which * 8)),
+        })
+    }
+
+    /// Where `digest` sits. The header is written twice — once with the digest
+    /// fields blank, once whole over the top when the blob has been read — so
+    /// these two offsets are part of the format rather than literals somebody
+    /// has to keep in step by hand.
+    pub const DIGEST_AT: u64 = 32;
+
+    /// Where the stripe digests start.
+    pub const STRIPES_AT: u64 = 64;
+}
+
+/// **One plane group, and where the store keeps it.**
+///
+/// The index entry of alto streaming §3's item 2. The three numbers are the
+/// DEVICE STORE'S OWN — `weights.rs`' `Place`, verbatim — which is the whole
+/// reason the promotion is a formalization rather than a format design: the
+/// artifact is a snapshot of the store, so the store's offsets already address
+/// it. Nothing here is computed; it is transcribed.
+///
+/// `id` and `plane` name the group rather than a byte range so that a
+/// split-plane bank (one weight id, two device planes —
+/// [`WeightRow::Planes`](crate::run::WeightRow)) is two entries under one id,
+/// and a dense row is one entry with `plane: 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Group {
+    /// The param's ordinal in the plan's own order — the number `places`
+    /// indexes by, which is what makes this an index and not a name table.
+    pub id: u32,
+    /// Which plane of that group: `0` for a dense row, `0`/`1` for a
+    /// split-plane bank.
+    pub plane: u32,
+    /// Where the plane starts in the store, and therefore in the blob.
+    pub offset: u64,
+    /// The plane's own bytes — what the checkpoint publishes.
+    pub bytes: u64,
+    /// What the store gives it, aligned up. Equal to `bytes` for every plane
+    /// of a fully-resident load, and larger for a streamed routed bank whose
+    /// slab seats only its resident experts.
+    pub reserved: u64,
+}
+
+impl Group {
+    /// The entry as it goes on disk.
+    #[must_use]
+    fn encode(&self) -> [u8; ENTRY] {
+        let mut out = [0u8; ENTRY];
+        out[..4].copy_from_slice(&self.id.to_le_bytes());
+        out[4..8].copy_from_slice(&self.plane.to_le_bytes());
+        out[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        out[16..24].copy_from_slice(&self.bytes.to_le_bytes());
+        out[24..32].copy_from_slice(&self.reserved.to_le_bytes());
+        out
+    }
+
+    /// Read one back.
+    #[must_use]
+    fn decode(bytes: &[u8]) -> Option<Group> {
+        if bytes.len() < ENTRY {
+            return None;
+        }
+        // As `Head::decode`: the length is checked above.
+        Some(Group {
+            id: u32::from_le_bytes(bytes[..4].try_into().unwrap_or([0; 4])),
+            plane: u32::from_le_bytes(bytes[4..8].try_into().unwrap_or([0; 4])),
+            offset: u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8])),
+            bytes: u64::from_le_bytes(bytes[16..24].try_into().unwrap_or([0; 8])),
+            reserved: u64::from_le_bytes(bytes[24..32].try_into().unwrap_or([0; 8])),
+        })
+    }
+}
+
+/// The index's own digest, over the entries exactly as they are written.
+fn index_digest(groups: &[Group]) -> u64 {
+    let mut hash = Fnv::default();
+    hash.number(groups.len() as u64);
+    for group in groups {
+        hash.raw(&group.encode());
+    }
+    hash.finish()
+}
+
+/// Where the blob starts, given how many groups precede it.
+fn blob_at(groups: usize) -> u64 {
+    ((HEADER + groups * ENTRY) as u64).next_multiple_of(BLOB_ALIGN)
+}
+
+/// **Every index entry is inside the blob it indexes.**
+///
+/// The one structural claim a reader can check without the bytes, and the
+/// reason it is checked: an entry that points past the end would hand a device
+/// address to a caller that resolved it, and `Buffer`'s door is not on that
+/// path. A `Some` is the reason it failed.
+fn index_fault(groups: &[Group], total: u64) -> Option<String> {
+    for group in groups {
+        // An overflow is a fault of its own and not a `None`: a group whose
+        // end does not fit a `u64` is exactly the entry a bounds check exists
+        // to catch.
+        let Some(end) = group.offset.checked_add(group.reserved) else {
+            return Some(format!(
+                "plane group {}/{} states a span that overflows: {} + {}",
+                group.id, group.plane, group.offset, group.reserved
+            ));
+        };
+        if end > total {
+            return Some(format!(
+                "plane group {}/{} states bytes {}..{} of a {total}-byte table",
+                group.id, group.plane, group.offset, end
+            ));
+        }
+    }
+    None
+}
+
+// ── the restore path's one switch ───────────────────────────────────────────
+
+/// Whether a restore goes through [`crate::staged_h2d`] or through the
+/// blocking read-then-`Buffer::write` loop that shipped before it.
+///
+/// **A CODE-LEVEL SWITCH AND NOT A DEPLOYMENT ONE** (article 9: shells read no
+/// environment). It exists for exactly one reason — the W-4 checkpoint gate
+/// measures the pump against what it replaced, and a measurement needs both
+/// arms in one process — so the setter is a `probe` hook, dropped by a serving
+/// binary the same way [`ProgramSession::skew_prediction`](crate::ProgramSession)
+/// is. Serving always takes the pump.
+static PUMPED: AtomicBool = AtomicBool::new(true);
+
+/// **Send the next restores through the blocking path instead of the pump.**
+///
+/// The W-4 gate's other arm. Gate-only: this is behind `probe`, which a
+/// serving binary drops with `default-features = false`.
+#[cfg(feature = "probe")]
+pub fn restore_through_the_pump(pumped: bool) {
+    PUMPED.store(pumped, Ordering::Relaxed);
+}
+
+/// Which arm the next restore will take.
+#[cfg(feature = "probe")]
+#[must_use]
+pub fn restore_is_pumped() -> bool {
+    PUMPED.load(Ordering::Relaxed)
+}
+
+// ── reading and writing one ─────────────────────────────────────────────────
+
 /// Where this key's artifact lives under `dir`.
-fn artifact_path(dir: &Path, key: u64) -> PathBuf {
+///
+/// **PUBLIC BECAUSE THE SERVING SIDE HAS TO NAME THE SAME FILE** (alto
+/// streaming §2, wave W-1). `weights::spill_source` opens this path to map a
+/// load's T2 tier out of it, and a second spelling of the filename in another
+/// module is exactly the drift that makes a cache miss look like a corruption.
+/// One home for one string.
+#[must_use]
+pub fn artifact_path(dir: &Path, key: u64) -> PathBuf {
     dir.join(format!("{key:016x}.weights"))
 }
 
@@ -293,6 +770,15 @@ fn artifact_path(dir: &Path, key: u64) -> PathBuf {
 /// digest that does not match — answers `false`, and the caller runs the full
 /// load. The store is left ZEROED on a `false`, whatever was written into it,
 /// so the full load starts from the same state a cold boot would.
+///
+/// # How the bytes cross
+///
+/// Through [`crate::staged_h2d`]: the file is mmap'd and four pinned lanes
+/// stream it to the device, so the read and the H2D copy overlap instead of
+/// alternating. The digest runs beside them on a fifth thread over the same
+/// mapping, which is what keeps "always verified" from becoming the new floor.
+/// [`restore_through_the_pump`] selects the old blocking arm for the gate that
+/// measures the difference.
 ///
 /// # Errors
 ///
@@ -335,45 +821,179 @@ pub fn restore(dir: Option<&Path>, key: u64, store: &mut Buffer) -> Result<bool>
 
 /// `Ok(true)` restored, `Ok(false)` no artifact for this key, `Err` corrupt.
 fn read_into(path: &Path, key: u64, store: &mut Buffer) -> std::result::Result<bool, String> {
-    let Ok(mut file) = fs::File::open(path) else {
-        return Ok(false);
+    let (head, groups) = match mapped::read_head(path) {
+        Ok(read) => read,
+        // Not a file, not an artifact, or a version this build does not read.
+        // All three are MISSES on this path — dev's rule, and the cheap
+        // direction: the shell recomputes and overwrites. The version is the
+        // one that is said out loud, because an operator who upgraded a build
+        // over a populated cache should learn why the first boot was slow.
+        Err(Refused::StaleFormat { states, reads }) => {
+            eprintln!(
+                "engine-cuda: weight artifact {path:?} states format {states} and this build \
+                 reads {reads}; recomputing the table and overwriting it"
+            );
+            return Ok(false);
+        }
+        Err(Refused::Unreadable { .. } | Refused::NotAnArtifact) => return Ok(false),
+        Err(other) => return Err(other.to_string()),
     };
-    let mut header = [0u8; HEADER];
-    if file.read_exact(&mut header).is_err() {
+    // A key from another deployment is a MISS, not a fault.
+    if head.key != key {
         return Ok(false);
     }
-    if header[..8] != MAGIC {
-        return Ok(false);
-    }
-    let format = u32::from_le_bytes(header[8..12].try_into().unwrap_or([0; 4]));
-    let stated_key = u64::from_le_bytes(header[12..20].try_into().unwrap_or([0; 8]));
-    let total = u64::from_le_bytes(header[20..28].try_into().unwrap_or([0; 8]));
-    let digest = u64::from_le_bytes(header[28..36].try_into().unwrap_or([0; 8]));
-    // A stale format or a key from another deployment is a MISS. Neither is
-    // a fault: the shell recomputes and overwrites.
-    if format != FORMAT || stated_key != key {
-        return Ok(false);
-    }
-    if total != store.bytes() as u64 {
+    if head.total != store.bytes() as u64 {
         // The layout is part of the key, so this cannot happen without the
         // key having been reused for a different table. Treat it as
         // corruption rather than as a miss: a file that lies about its own
         // size is the case the digest exists to catch.
         return Err(format!(
-            "states {total} bytes for a table of {}",
+            "states {} bytes for a table of {}",
+            head.total,
             store.bytes()
         ));
     }
+    if let Some(why) = index_fault(&groups, head.total) {
+        return Err(why);
+    }
 
-    let mut hash = Fnv::default();
+    // **THE CHECKSUM IS NOT A MODE, AND STRIPING DID NOT MAKE IT ONE.** Both
+    // arms below hash EVERY byte they move, across all `STRIPES` chains, and
+    // compare the lot to the header before answering `true`. The switch changes
+    // how the bytes cross — four pinned lanes or one blocking loop — and
+    // nothing about what is verified.
+    //
+    // Both arms also pay the SAME digest: `stripe_digests` on `STRIPES`
+    // threads. That is deliberate and it is what makes the W-4 gate's ratio
+    // mean something — an arm that hashed serially while the other hashed in
+    // parallel would be losing a race it was entered into carrying weight.
+    let stripes = if PUMPED.load(Ordering::Relaxed) {
+        pumped_into(path, &head, store)?
+    } else {
+        blocking_into(path, &head, store)?
+    };
+    // Named per stripe, because "the digest is wrong" about a 1.6 GiB file says
+    // less than it could when the file is already divided into four answers.
+    for (which, (found, stated)) in stripes.iter().zip(head.stripes.iter()).enumerate() {
+        if found != stated {
+            let (at, len) = stripe_spans(head.total)[which];
+            return Err(format!(
+                "stripe {which} of {STRIPES} (bytes {at}..{}) hashes to {found:016x} \
+                 where the header states {stated:016x}",
+                at + len,
+            ));
+        }
+    }
+    if fold(&stripes) != head.digest {
+        return Err(format!(
+            "the stripes agree one by one but fold to {:016x} where the header states \
+             {:016x} over {} bytes",
+            fold(&stripes),
+            head.digest,
+            head.total,
+        ));
+    }
+    Ok(true)
+}
+
+/// **The pump's arm**: mmap, four staging lanes, and the striped digest
+/// beside them.
+///
+/// Answers the stripe digests of what it moved, so the caller does the
+/// comparing — one place, both arms.
+///
+/// **What this arm pays**: `max(transfer, digest)`. The lanes and the hash
+/// threads run over the same mapping at the same time, so the read, the
+/// staging memcpy, the DMA and all `STRIPES` chains are one wall-clock cost
+/// rather than four.
+fn pumped_into(
+    path: &Path,
+    head: &Head,
+    store: &mut Buffer,
+) -> std::result::Result<[u64; STRIPES], String> {
+    let artifact = Artifact::open(path).map_err(|why| why.to_string())?;
+    let blob = artifact.blob();
+    if blob.len() as u64 != head.total {
+        return Err(format!(
+            "maps {} blob bytes where its header states {}",
+            blob.len(),
+            head.total
+        ));
+    }
+    // **THE ONE BOUNDS CHECK ON THIS PATH.** The pump takes device addresses,
+    // so the span meets the store's length HERE rather than at
+    // `Buffer::write`'s door, which this arm does not go through.
+    let base = store.at(0).map_err(|why| why.to_string())?;
+    let _ = store
+        .at(head.total)
+        .map_err(|why| format!("the artifact does not fit the store: {why}"))?;
+
+    let mut lanes = crate::staged_h2d::Lanes::standard().map_err(|why| why.to_string())?;
+    let transfer = [crate::staged_h2d::Transfer {
+        dst: base,
+        src: blob.as_ptr(),
+        len: head.total,
+    }];
+    // **THE DIGEST RUNS BESIDE THE LANES, AND NOW IT ALSO RUNS BESIDE
+    // ITSELF.** Taking it off the copy's critical path was the first half of
+    // the answer and it was not enough: one FNV chain over 1.6 GiB is 1.84s of
+    // one core, which simply became the new floor once the transfer went
+    // parallel. `stripe_digests` spawns `STRIPES` chains over disjoint spans of
+    // this same mapping, so the hash finishes in a quarter of that and the
+    // transfer is the thing in front again.
+    let (moved, stripes) = std::thread::scope(|scope| {
+        let hashing = scope.spawn(|| stripe_digests(blob));
+        let moved = lanes.pump(&transfer);
+        let stripes = hashing.join().unwrap_or([0; STRIPES]);
+        (moved, stripes)
+    });
+    moved.map_err(|why| format!("staged upload failed: {why}"))?;
+    Ok(stripes)
+}
+
+/// **The arm the pump replaced**, kept whole for the measurement that
+/// justifies the pump: one chunk of host memory, read then uploaded, in
+/// series. Selected by [`restore_through_the_pump`] and by nothing else.
+///
+/// **What this arm pays**: `read + upload + digest`, the three of them end to
+/// end. That is the ONE property that makes it the right control — it overlaps
+/// nothing — and it is why the digest below runs after the transfer rather
+/// than beside it.
+///
+/// **But the digest itself is the same parallel one the pump uses**, and that
+/// is a deliberate correction to an earlier shape of this function, which
+/// hashed inline on one core. Leaving it serial would have handed the pump a
+/// four-fold head start on a cost that has nothing to do with how bytes cross,
+/// and the gate's ratio would have been measuring the striping instead of the
+/// overlap. Both arms are charged `H/STRIPES`; only one of them gets to hide it.
+///
+/// The hash reads the file a second time, through a mapping, rather than
+/// hashing each chunk as it passes. A single in-order reader CANNOT feed
+/// `STRIPES` parallel chains over contiguous spans — it produces byte 0 before
+/// byte `total/4`, so three of the four chains would sit idle waiting for
+/// bytes that have not been read yet. The second pass costs a walk of the page
+/// cache this loop just filled, which is the cheapest way to buy the arm the
+/// same digest the pump gets.
+fn blocking_into(
+    path: &Path,
+    head: &Head,
+    store: &mut Buffer,
+) -> std::result::Result<[u64; STRIPES], String> {
+    use std::io::Seek;
+
+    // ── the transfer, strictly in series
+    let mut file = fs::File::open(path).map_err(|why| format!("{why}"))?;
+    file.seek(std::io::SeekFrom::Start(head.blob_at))
+        .map_err(|why| format!("{why}"))?;
     let mut at = 0u64;
     let mut chunk = vec![0u8; CHUNK.min(store.bytes().max(1))];
-    while at < total {
-        let want = usize::try_from(total - at).unwrap_or(usize::MAX).min(chunk.len());
+    while at < head.total {
+        let want = usize::try_from(head.total - at)
+            .unwrap_or(usize::MAX)
+            .min(chunk.len());
         let slice = &mut chunk[..want];
         file.read_exact(slice)
             .map_err(|why| format!("truncated at byte {at}: {why}"))?;
-        hash.raw(slice);
         // Uploaded as it is read: the host never holds more than one chunk.
         // The digest is checked AFTER, which is why a mismatch has to throw
         // the store away rather than leave it half-written (dev's
@@ -384,14 +1004,24 @@ fn read_into(path: &Path, key: u64, store: &mut Buffer) -> std::result::Result<b
             .map_err(|why| format!("upload failed at byte {at}: {why}"))?;
         at += want as u64;
     }
-    if hash.finish() != digest {
+    drop(chunk);
+    drop(file);
+
+    // ── then the digest, striped and parallel — the same cost the pump pays,
+    //    and the only thing this arm does not overlap it with.
+    let artifact = Artifact::open(path).map_err(|why| why.to_string())?;
+    let blob = artifact.blob();
+    if blob.len() as u64 != head.total {
         return Err(format!(
-            "digest {:016x} does not match its {total} bytes",
-            digest
+            "maps {} blob bytes where its header states {}",
+            blob.len(),
+            head.total
         ));
     }
-    Ok(true)
+    Ok(stripe_digests(blob))
 }
+
+// ── writing one ─────────────────────────────────────────────────────────────
 
 /// **Snapshot `store` beside `key`, if there is room.**
 ///
@@ -400,11 +1030,33 @@ fn read_into(path: &Path, key: u64, store: &mut Buffer) -> std::result::Result<b
 /// write with both figures named, and any failure at all means a declined
 /// write. None of them fails the load, because the load already succeeded —
 /// the store this is reading from is the answer.
+///
+/// **WITH NO INDEX.** The layout lives in the loader, which forms the key from
+/// it and has never had to hand it any further; this is the call it makes
+/// today. The format carries the index either way, so the day the loader
+/// passes its `places` across, that is one argument at one call site and no
+/// change here — and until then a v2 artifact with zero groups restores
+/// exactly as it always did.
 pub fn store(dir: Option<&Path>, key: u64, store: &Buffer) {
+    store_indexed(dir, key, &[], store);
+}
+
+/// **Snapshot `store` beside `key` WITH its plane-group index.**
+///
+/// [`store`] plus the thing that makes the file a serving-time source rather
+/// than only a boot accelerator (alto streaming §0): the groups are written
+/// ahead of the blob, so a later open can resolve a plane to an offset without
+/// the load plan that produced it.
+///
+/// The groups are transcribed, not computed — they are the device store's own
+/// `(offset, bytes, reserved)`, which is exactly what the key already mixes,
+/// so an index that disagreed with the blob would be an index for a different
+/// key.
+pub fn store_indexed(dir: Option<&Path>, key: u64, groups: &[Group], store: &Buffer) {
     let Some(dir) = dir else {
         return;
     };
-    if let Err(why) = write_out(dir, key, store) {
+    if let Err(why) = write_out(dir, key, groups, store) {
         bump(Stat::Declined);
         eprintln!("engine-cuda: declined to cache this load's weights: {why}");
         return;
@@ -412,10 +1064,16 @@ pub fn store(dir: Option<&Path>, key: u64, store: &Buffer) {
     bump(Stat::Stored);
 }
 
-fn write_out(dir: &Path, key: u64, store: &Buffer) -> std::result::Result<(), String> {
+fn write_out(
+    dir: &Path,
+    key: u64,
+    groups: &[Group],
+    store: &Buffer,
+) -> std::result::Result<(), String> {
     fs::create_dir_all(dir).map_err(|why| format!("{dir:?}: {why}"))?;
     let total = store.bytes() as u64;
-    let need = total.saturating_add(MARGIN);
+    let blob_at = blob_at(groups.len());
+    let need = total.saturating_add(blob_at).saturating_add(MARGIN);
     let free = available_bytes(dir)?;
     if free < need {
         return Err(format!(
@@ -436,16 +1094,35 @@ fn write_out(dir: &Path, key: u64, store: &Buffer) -> std::result::Result<(), St
     let temp_path = dir.join(format!("{key:016x}.weights.{}.part", std::process::id()));
     let outcome = (|| -> std::result::Result<(), String> {
         let mut file = fs::File::create(&temp_path).map_err(|why| format!("{temp_path:?}: {why}"))?;
-        let mut header = [0u8; HEADER];
-        header[..8].copy_from_slice(&MAGIC);
-        header[8..12].copy_from_slice(&FORMAT.to_le_bytes());
-        header[12..20].copy_from_slice(&key.to_le_bytes());
-        header[20..28].copy_from_slice(&total.to_le_bytes());
-        // The digest is written last, over the header's placeholder, once the
-        // blob has been read; a rewind is cheaper than holding the store.
-        file.write_all(&header).map_err(|why| format!("{why}"))?;
+        let head = Head {
+            format: FORMAT,
+            groups: u32::try_from(groups.len())
+                .map_err(|_| format!("{} plane groups is more than a header states", groups.len()))?,
+            key,
+            total,
+            // Written last, over these placeholders, once the blob has been
+            // read; a rewind is cheaper than holding the store.
+            digest: 0,
+            stripes: [0; STRIPES],
+            index_digest: index_digest(groups),
+            index_at: HEADER as u64,
+            blob_at,
+        };
+        file.write_all(&head.encode()).map_err(|why| format!("{why}"))?;
+        for group in groups {
+            file.write_all(&group.encode()).map_err(|why| format!("{why}"))?;
+        }
+        // The gap that puts the blob on a page boundary. Written rather than
+        // seeked over, so the file has no hole a later mmap would read as
+        // zeros it did not intend.
+        let pad = blob_at - (HEADER + groups.len() * ENTRY) as u64;
+        file.write_all(&vec![0u8; usize::try_from(pad).unwrap_or(0)])
+            .map_err(|why| format!("{why}"))?;
 
-        let mut hash = Fnv::default();
+        // Streamed, because the host never holds more than one chunk of a
+        // store that may be tens of gigabytes — so the stripes are accumulated
+        // by routing rather than by mapping.
+        let mut striper = Striper::new(total);
         let mut at = 0u64;
         let mut chunk = vec![0u8; CHUNK.min(store.bytes().max(1))];
         while at < total {
@@ -454,15 +1131,23 @@ fn write_out(dir: &Path, key: u64, store: &Buffer) -> std::result::Result<(), St
             store
                 .read(at, slice)
                 .map_err(|why| format!("reading the store at {at}: {why}"))?;
-            hash.raw(slice);
+            striper.feed(slice);
             file.write_all(slice).map_err(|why| format!("{why}"))?;
             at += want as u64;
         }
+        // The whole header goes back over the top, rather than two seeks to
+        // two fields: the digests are the only things that changed, and
+        // re-encoding what was already computed cannot get them out of step.
         use std::io::Seek;
-        file.seek(std::io::SeekFrom::Start(28))
+        let stripes = striper.finish();
+        let head = Head {
+            digest: fold(&stripes),
+            stripes,
+            ..head
+        };
+        file.seek(std::io::SeekFrom::Start(0))
             .map_err(|why| format!("{why}"))?;
-        file.write_all(&hash.finish().to_le_bytes())
-            .map_err(|why| format!("{why}"))?;
+        file.write_all(&head.encode()).map_err(|why| format!("{why}"))?;
         file.sync_all().map_err(|why| format!("{why}"))?;
         Ok(())
     })();
@@ -474,6 +1159,92 @@ fn write_out(dir: &Path, key: u64, store: &Buffer) -> std::result::Result<(), St
         let _ = fs::remove_file(&temp_path);
         format!("publishing {final_path:?}: {why}")
     })
+}
+
+/// **Write an artifact from host bytes** — the seed a gate synthesizes.
+///
+/// The device-free twin of [`store_indexed`], for the tests that have to
+/// assert what the format promises on a machine with no GPU in it: the same
+/// header, the same index, the same digest discipline, a blob that came from a
+/// `Vec` instead of from a card.
+///
+/// Gate-only (`probe`), like every other hook in this crate that exists so a
+/// test can state something a serving path never would.
+///
+/// # Errors
+///
+/// The filesystem's own words. Nothing here declines for space: a synthetic
+/// blob is kilobytes.
+#[cfg(feature = "probe")]
+pub fn seed(path: &Path, key: u64, groups: &[Group], blob: &[u8]) -> std::result::Result<(), String> {
+    use std::io::Seek;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|why| format!("{parent:?}: {why}"))?;
+    }
+    let blob_at = blob_at(groups.len());
+    let mut file = fs::File::create(path).map_err(|why| format!("{path:?}: {why}"))?;
+    let head = Head {
+        format: FORMAT,
+        groups: u32::try_from(groups.len()).map_err(|_| "too many plane groups".to_string())?,
+        key,
+        total: blob.len() as u64,
+        digest: 0,
+        stripes: [0; STRIPES],
+        index_digest: index_digest(groups),
+        index_at: HEADER as u64,
+        blob_at,
+    };
+    file.write_all(&head.encode()).map_err(|why| format!("{why}"))?;
+    for group in groups {
+        file.write_all(&group.encode()).map_err(|why| format!("{why}"))?;
+    }
+    let pad = blob_at - (HEADER + groups.len() * ENTRY) as u64;
+    file.write_all(&vec![0u8; usize::try_from(pad).unwrap_or(0)])
+        .map_err(|why| format!("{why}"))?;
+    file.write_all(blob).map_err(|why| format!("{why}"))?;
+    // Through the STREAMING striper even though the whole blob is in hand, so
+    // that the seed exercises the arithmetic the write path uses and
+    // `Artifact::verify` — which reads through the parallel one — is checking
+    // that the two agree.
+    let mut striper = Striper::new(blob.len() as u64);
+    striper.feed(blob);
+    let stripes = striper.finish();
+    let head = Head {
+        digest: fold(&stripes),
+        stripes,
+        ..head
+    };
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|why| format!("{why}"))?;
+    file.write_all(&head.encode()).map_err(|why| format!("{why}"))?;
+    file.sync_all().map_err(|why| format!("{why}"))?;
+    Ok(())
+}
+
+/// **Overwrite an artifact's stated format** — the only way a gate can hold a
+/// file from a build that no longer exists.
+///
+/// Gate-only, and it writes nothing but the four version bytes: everything
+/// else about the file stays true, which is what makes the refusal it provokes
+/// a refusal about the VERSION and not about a corruption.
+///
+/// # Errors
+///
+/// The filesystem's own words.
+#[cfg(feature = "probe")]
+pub fn restate_format(path: &Path, format: u32) -> std::result::Result<(), String> {
+    use std::io::Seek;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|why| format!("{path:?}: {why}"))?;
+    file.seek(std::io::SeekFrom::Start(8))
+        .map_err(|why| format!("{why}"))?;
+    file.write_all(&format.to_le_bytes())
+        .map_err(|why| format!("{why}"))?;
+    file.sync_all().map_err(|why| format!("{why}"))
 }
 
 /// Bytes available to an unprivileged writer under `dir`.
@@ -501,11 +1272,17 @@ fn available_bytes(dir: &Path) -> std::result::Result<u64, String> {
 /// What a gate compares between two loads: not "the same size" and not "the
 /// same source", but the same bytes.
 ///
+/// **[`fold`] of the stripes**, which is the same number [`Head::digest`]
+/// carries — so a gate still compares a card against a file with one
+/// `assert_eq!` and never has to learn that the digest is four chains. Serial,
+/// because the bytes come back over PCIe a chunk at a time and this is a gate's
+/// helper, not a load path.
+///
 /// # Errors
 ///
 /// A device failure reading the store back.
 pub fn digest_of(store: &Buffer) -> Result<u64> {
-    let mut hash = Fnv::default();
+    let mut striper = Striper::new(store.bytes() as u64);
     let total = store.bytes() as u64;
     let mut chunk = vec![0u8; CHUNK.min(store.bytes().max(1))];
     let mut at = 0u64;
@@ -513,10 +1290,10 @@ pub fn digest_of(store: &Buffer) -> Result<u64> {
         let want = usize::try_from(total - at).unwrap_or(usize::MAX).min(chunk.len());
         let slice = &mut chunk[..want];
         store.read(at, slice)?;
-        hash.raw(slice);
+        striper.feed(slice);
         at += want as u64;
     }
-    Ok(hash.finish())
+    Ok(fold(&striper.finish()))
 }
 
 #[cfg(test)]
@@ -578,5 +1355,157 @@ mod tests {
 
         // And the same recipe is the same key, which is the whole point.
         assert_eq!(key, base.key());
+    }
+
+    /// **THE HEADER ROUND-TRIPS**, field for field, through the bytes it
+    /// writes. Every field is given a different value, because a header whose
+    /// fields are all zero would round-trip through an encoder that dropped
+    /// half of them.
+    #[test]
+    fn a_header_round_trips_through_the_bytes_it_writes() {
+        let head = Head {
+            format: FORMAT,
+            groups: 3,
+            key: 0x0123_4567_89ab_cdef,
+            total: 1 << 30,
+            digest: 0xfedc_ba98_7654_3210,
+            index_digest: 0x1111_2222_3333_4444,
+            index_at: HEADER as u64,
+            blob_at: 4096,
+            stripes: [
+                0xaaaa_0000_0000_0001,
+                0xbbbb_0000_0000_0002,
+                0xcccc_0000_0000_0003,
+                0xdddd_0000_0000_0004,
+            ],
+        };
+        let bytes = head.encode();
+        assert_eq!(bytes.len(), HEADER, "the header is exactly its own length");
+        assert_eq!(bytes[..8], MAGIC, "and it starts with the magic");
+        assert_eq!(Head::decode(&bytes), Some(head), "every field came back");
+
+        // The header is written twice — once with the digest fields blank,
+        // once whole over the top — so both offsets are part of the format and
+        // not literals somebody has to keep in step by hand.
+        let mut patched = bytes;
+        patched[Head::DIGEST_AT as usize..Head::DIGEST_AT as usize + 8]
+            .copy_from_slice(&0u64.to_le_bytes());
+        let read = Head::decode(&patched).expect("still an artifact");
+        assert_eq!(read.digest, 0, "DIGEST_AT names the digest field");
+        assert_eq!(
+            read.stripes, head.stripes,
+            "and nothing else — blanking the fold left the stripes alone"
+        );
+
+        let mut patched = bytes;
+        let at = Head::STRIPES_AT as usize;
+        patched[at..at + STRIPES * 8].fill(0);
+        let read = Head::decode(&patched).expect("still an artifact");
+        assert_eq!(read.stripes, [0; STRIPES], "STRIPES_AT names the stripe vector");
+        assert_eq!(
+            read.digest, head.digest,
+            "and nothing else — blanking the stripes left the fold alone"
+        );
+        assert_eq!(
+            HEADER,
+            Head::STRIPES_AT as usize + STRIPES * 8,
+            "the stripe vector is the last thing in the header"
+        );
+
+        // Anything that is not one answers `None` rather than a guess.
+        assert_eq!(Head::decode(&bytes[..HEADER - 1]), None, "too short");
+        let mut foreign = bytes;
+        foreign[0] = b'X';
+        assert_eq!(Head::decode(&foreign), None, "not the magic");
+    }
+
+    /// **AN INDEX ENTRY ROUND-TRIPS**, and it is exactly [`ENTRY`] bytes —
+    /// which is what lets a reader `chunks_exact` its way through the index
+    /// without a per-entry length.
+    #[test]
+    fn a_plane_group_round_trips_through_a_fixed_width_entry() {
+        let group = Group {
+            id: 41,
+            plane: 1,
+            offset: 1 << 20,
+            bytes: 300,
+            reserved: 512,
+        };
+        let bytes = group.encode();
+        assert_eq!(bytes.len(), ENTRY);
+        assert_eq!(Group::decode(&bytes), Some(group));
+        assert_eq!(Group::decode(&bytes[..ENTRY - 1]), None, "a short entry");
+    }
+
+    /// The blob starts on a page, whatever the index costs — the alignment
+    /// the mmap side depends on.
+    #[test]
+    fn the_blob_starts_on_a_page_however_many_groups_precede_it() {
+        for groups in [0usize, 1, 7, 128, 4096] {
+            let at = blob_at(groups);
+            assert_eq!(at % BLOB_ALIGN, 0, "{groups} groups did not land on a page");
+            assert!(
+                at >= (HEADER + groups * ENTRY) as u64,
+                "{groups} groups do not fit before their blob"
+            );
+        }
+    }
+
+    /// **AN ENTRY THAT POINTS OUTSIDE THE TABLE IS A FAULT WITH A SENTENCE.**
+    ///
+    /// The one structural claim a reader can check without the bytes, and it
+    /// is checked because resolving such an entry would hand a caller a span
+    /// `Buffer`'s door never saw.
+    #[test]
+    fn an_index_entry_past_the_end_of_the_table_is_named() {
+        let inside = [Group {
+            id: 0,
+            plane: 0,
+            offset: 0,
+            bytes: 100,
+            reserved: 256,
+        }];
+        assert_eq!(index_fault(&inside, 256), None, "a group that fits");
+        assert!(
+            index_fault(&inside, 255).is_some_and(|why| why.contains("plane group 0/0")),
+            "a group one byte too long names itself"
+        );
+
+        let overflowing = [Group {
+            id: 4,
+            plane: 1,
+            offset: u64::MAX,
+            bytes: 8,
+            reserved: 8,
+        }];
+        assert!(
+            index_fault(&overflowing, u64::MAX).is_some_and(|why| why.contains("overflows")),
+            "a span that does not fit a u64 is a fault and not a wrap"
+        );
+    }
+
+    /// The index's digest is a function of every entry, in order — so a
+    /// reordered index is a different index.
+    #[test]
+    fn the_index_digest_moves_with_every_entry_and_with_their_order() {
+        let one = Group {
+            id: 0,
+            plane: 0,
+            offset: 0,
+            bytes: 8,
+            reserved: 256,
+        };
+        let other = Group {
+            id: 1,
+            plane: 0,
+            offset: 256,
+            bytes: 8,
+            reserved: 256,
+        };
+        let straight = index_digest(&[one, other]);
+        assert_ne!(straight, index_digest(&[other, one]), "order counts");
+        assert_ne!(straight, index_digest(&[one]), "length counts");
+        assert_ne!(straight, index_digest(&[]), "an empty index is its own digest");
+        assert_eq!(straight, index_digest(&[one, other]), "and it is a function");
     }
 }

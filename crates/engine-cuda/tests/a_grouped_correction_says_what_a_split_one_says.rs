@@ -361,6 +361,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         contract: &contract,
         checkpoint: &checkpoint,
         budget: budget.clone(),
+        patches: None,
         // **THE TWO ARMS MUST WITHDRAW THE SAME CONSUMER**, or they are two
         // artifacts and the comparison prices nothing. The withdrawal is
         // chosen by cost (`model_compiler::layout::choose`), and naming an op
@@ -432,15 +433,15 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         .find(|region| region.nodes.clone().any(|node| corrections.contains(&node)))
         .map(|region| region.mask.clone())
         .expect("some region holds a correction");
-    let mut mixed: Vec<engine::fire::Lane> = Vec::with_capacity(8);
+    let mut mixed: Vec<model_exec::fire::Lane> = Vec::with_capacity(8);
     for &(adapted, captures) in &CLASSES {
-        mixed.push(engine::fire::Lane::new(word(1, adapted, captures), 1));
+        mixed.push(model_exec::fire::Lane::new(word(1, adapted, captures), 1));
     }
     for &(adapted, captures) in &CLASSES {
         let rows = fresh.len() as u32;
-        mixed.push(engine::fire::Lane::new(word(rows, adapted, captures), rows));
+        mixed.push(model_exec::fire::Lane::new(word(rows, adapted, captures), rows));
     }
-    let runs = engine::fire::compose(compiled, &budget, &mixed)
+    let runs = model_exec::fire::compose(compiled, &budget, &mixed)
         .expect("the mixed fire composes")
         .classes()
         .spans(&mask)
@@ -488,6 +489,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
 /// the logits must be identical to the bit, and the recorded graph must hold
 /// exactly `2 x nodes x (r - 1)` fewer launches.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_grouped_correction_is_bit_identical_to_a_split_one_and_costs_fewer_launches() {
     let _serial = serialized();
     assert!(

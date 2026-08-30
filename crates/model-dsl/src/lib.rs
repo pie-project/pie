@@ -7,7 +7,7 @@
 //!
 //! WHERE A WEIGHT'S BYTES COME FROM IS NOT SAID HERE. It was, in a `load`
 //! module of production tables with a source algebra of their own, and that
-//! algebra was a second spelling of one `model-loader` already owns:
+//! algebra was a second spelling of one `checkpoint` already owns:
 //! `contract::Expr` and `ModelContract` are the typed load-contract language,
 //! its own doc names `model::contract` as the declarer, and `infer`/`compile`/
 //! `executor` are what check and run it. Each family writes its provenance in
@@ -54,8 +54,8 @@ pub use forward::*;
 /// `model/tests/every_class_resolves_every_merge.rs` reads traced plans with
 /// these two, and reading a plan goes through this door.
 pub use model_ir::{
-    Attention, CacheRow, Def, Dtype, Linear, Operands, Operation, Param, ParamSource, Trace,
-    Platform, Shard, ValueId, resolve_classes,
+    Attention, CacheRow, Def, Dtype, Linear, MropeForm, Operands, Operation, Param, ParamSource,
+    Trace, Platform, Shard, ValueId, resolve_classes,
 };
 pub use record::{Recorder, Refine, SplitSpec, Value};
 

@@ -4,7 +4,7 @@
 //!
 //! # The ring moved to this side of the boundary
 //!
-//! `RegisteredChannel` used to carry an `engine_api::ChannelBinding`: eleven
+//! `RegisteredChannel` used to carry an `engine::ChannelBinding`: eleven
 //! `u64`/`u32` fields naming DEVICE addresses and word indices —
 //! `mirror_base`, `word_base`, `head_word_index`, `poison_word_index`, … —
 //! that the runtime dereferenced directly. The contract deleted it, and its
@@ -27,8 +27,8 @@
 //! joins them is [`ChannelJoin`], and it is a PUMP rather than a mapping:
 //! wire cells move across at the fire's boundary, in the direction the
 //! channel's [`HostRole`] declares, through
-//! [`Engine::publish_channel`](engine_api::Engine::publish_channel) and
-//! [`Engine::take_channel`](engine_api::Engine::take_channel).
+//! [`Engine::publish_channel`](engine::Engine::publish_channel) and
+//! [`Engine::take_channel`](engine::Engine::take_channel).
 //!
 //! ```text
 //!   guest put ──▶ host ring ──pump_in──▶ device ring ──▶ the pass takes
@@ -53,7 +53,7 @@
 //!
 //! Everything above describes a runtime that owns the host ring and an engine
 //! that owns the device ring, joined a cell at a time. An engine that declares
-//! [`device_channel_commit`](engine_api::Capabilities::device_channel_commit)
+//! [`device_channel_commit`](engine::Capabilities::device_channel_commit)
 //! allocates the host ring ITSELF, in mapped pinned memory its control kernels
 //! dereference, and publishes the addresses at registration; [`HostRing`]
 //! becomes a view of those bytes ([`HostRing::adopt`]) and the two halves stop
@@ -79,7 +79,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// A value put into a channel — the wire cells, as the ring holds them.
 ///
-/// The contract spells the same thing [`ChannelSeed`](engine_api::ChannelSeed)
+/// The contract spells the same thing [`ChannelSeed`](engine::ChannelSeed)
 /// and the runtime converts at the one bind site; this stays because the
 /// runtime's own channel plane names the channel by its GLOBAL id and a seed
 /// names it by its index in the package's declaration order.
@@ -94,7 +94,7 @@ pub struct ChannelValue {
 /// One channel's host ring: the cells and the four control words.
 ///
 /// **THE RUNTIME OWNS THESE BYTES NOW** — see the module header. The layout is
-/// the one `engine_api::ChannelBinding` described, kept exactly, because
+/// the one `engine::ChannelBinding` described, kept exactly, because
 /// `pipeline::channel`'s ring arithmetic is written against it and that
 /// arithmetic is not what this wave is changing.
 ///
@@ -144,10 +144,10 @@ impl HostRing {
     /// invariant I5).
     ///
     /// An engine that declares
-    /// [`device_channel_commit`](engine_api::Capabilities::device_channel_commit)
+    /// [`device_channel_commit`](engine::Capabilities::device_channel_commit)
     /// allocates this channel's host half itself — mapped pinned memory its
     /// control kernels dereference — and publishes the two addresses as
-    /// [`HostMirror`](engine_api::HostMirror). Adopting them is what deletes
+    /// [`HostMirror`](engine::HostMirror). Adopting them is what deletes
     /// the pump: a guest that writes a cell here has written it where
     /// `channel::pull_validate` will read it, and a pass that publishes one
     /// wrote it where the guest will read it. **No cell is ever copied across
@@ -189,8 +189,8 @@ impl HostRing {
     /// answer `engine::wire_cell_bytes` gives, restated here because the
     /// runtime does not link the shell's substrate.
     #[must_use]
-    pub fn wire_cell_bytes(dtype: tensor_ir::types::DType, numel: usize) -> usize {
-        if dtype == tensor_ir::types::DType::Bool {
+    pub fn wire_cell_bytes(dtype: eta_ir::types::Dtype, numel: usize) -> usize {
+        if dtype == eta_ir::types::Dtype::Bool {
             numel.div_ceil(8)
         } else {
             numel.saturating_mul(4)
@@ -219,7 +219,7 @@ impl HostRing {
 /// Where one channel's cells and cursors are, as an address and four indices.
 ///
 /// **THIS IS NO LONGER A CONTRACT TYPE.** It was
-/// `engine_api::local::ChannelBinding`, filled in by an engine and validated
+/// `engine::local::ChannelBinding`, filled in by an engine and validated
 /// by `validate_channel_endpoint_binding`; now it is a view of a
 /// [`HostRing`] the runtime allocated, so there is nothing left to validate —
 /// an engine cannot fill it in wrongly because no engine fills it in.
@@ -351,7 +351,7 @@ pub struct ChannelJoin {
     channels: std::collections::HashMap<u64, JoinedChannel>,
     /// Per bound instance: its channels in the package's DECLARATION order,
     /// which is the numbering `publish_channel`/`take_channel` address. The
-    /// list is [`InstanceBinding::channels`](engine_api::InstanceBinding)
+    /// list is [`InstanceBinding::channels`](engine::InstanceBinding)
     /// verbatim.
     instances: std::collections::HashMap<u64, Vec<u64>>,
 }
@@ -364,7 +364,7 @@ struct JoinedChannel {
     /// program keeps to itself — loop-carried state, a mask it computes and
     /// re-reads — and the pump never touches one: its cells never leave the
     /// device ring, so moving them would be inventing a reader.
-    host_role: tensor_ir::container::HostRole,
+    host_role: eta_ir::container::HostRole,
 }
 
 impl ChannelJoin {
@@ -407,7 +407,7 @@ impl ChannelJoin {
     pub fn insert(
         &mut self,
         registered: RegisteredChannel,
-        host_role: tensor_ir::container::HostRole,
+        host_role: eta_ir::container::HostRole,
     ) {
         self.channels.insert(
             registered.id(),
@@ -448,14 +448,14 @@ impl ChannelJoin {
     ///
     /// # Errors
     ///
-    /// Whatever the engine refused. [`Unsupported`](engine_api::Error::Unsupported)
+    /// Whatever the engine refused. [`Unsupported`](engine::Error::Unsupported)
     /// is NOT one of them: a shell with no guest-program plane never has an
     /// instance to pump for.
     pub fn pump_in(
         &self,
-        engine: &mut dyn engine_api::Engine,
+        engine: &mut dyn engine::Engine,
         instance: u64,
-    ) -> engine_api::Result<()> {
+    ) -> engine::Result<()> {
         let Some(channels) = self.instances.get(&instance) else {
             return Ok(());
         };
@@ -463,7 +463,7 @@ impl ChannelJoin {
             let Some(joined) = self.channels.get(id) else {
                 continue;
             };
-            if joined.host_role != tensor_ir::container::HostRole::Writer {
+            if joined.host_role != eta_ir::container::HostRole::Writer {
                 continue;
             }
             // ── **THE PUMP IS OVER FOR AN ADOPTED CHANNEL** (alto design §5,
@@ -536,9 +536,9 @@ impl ChannelJoin {
     /// As [`ChannelJoin::pump_in`].
     pub fn pump_out(
         &self,
-        engine: &mut dyn engine_api::Engine,
+        engine: &mut dyn engine::Engine,
         instance: u64,
-    ) -> engine_api::Result<()> {
+    ) -> engine::Result<()> {
         self.pump_out_with(engine, instance, None)
     }
 
@@ -561,10 +561,10 @@ impl ChannelJoin {
     /// As [`ChannelJoin::pump_out`].
     pub fn pump_out_with(
         &self,
-        engine: &mut dyn engine_api::Engine,
+        engine: &mut dyn engine::Engine,
         instance: u64,
         mut deferred: Option<&mut Vec<u64>>,
-    ) -> engine_api::Result<()> {
+    ) -> engine::Result<()> {
         let Some(channels) = self.instances.get(&instance) else {
             return Ok(());
         };
@@ -572,7 +572,7 @@ impl ChannelJoin {
             let Some(joined) = self.channels.get(id) else {
                 continue;
             };
-            if joined.host_role != tensor_ir::container::HostRole::Reader {
+            if joined.host_role != eta_ir::container::HostRole::Reader {
                 continue;
             }
             // As `pump_in`: `channel::scatter_publish` wrote the committed
@@ -604,7 +604,7 @@ impl ChannelJoin {
                     break;
                 };
                 if bytes.len() != cell_bytes {
-                    return Err(engine_api::Error::Program(format!(
+                    return Err(engine::Error::Program(format!(
                         "channel {id} published a {}-byte cell into a ring of \
                          {cell_bytes}-byte ones",
                         bytes.len()

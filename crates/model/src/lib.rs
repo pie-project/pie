@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod contract;
 pub mod deepseek_v4;
 pub mod gemma_4;
@@ -7,9 +8,9 @@ pub mod kimi_k3;
 pub mod qwen_3;
 pub mod template;
 
+use checkpoint::contract::ModelContract;
+use checkpoint::types::{DType, Encoding, QuantScheme, QuantSpec};
 use model_dsl::Dtype;
-use model_loader::contract::ModelContract;
-use model_loader::types::{DType, Encoding, QuantScheme, QuantSpec};
 
 /// The vocabulary a caller needs to USE the catalog's fourth column, through
 /// the same door the column comes out of. A party that holds a [`ClassifyFn`]
@@ -92,22 +93,79 @@ pub fn import_of(
         .map(|(_, make)| make)
 }
 
+/// The dtype the planes BESIDE a bank of `banks` are stated in.
+///
+/// **A NORM IS NOT A BANK, AND A QUANTIZED SKU IS NOT A SECOND FAMILY TEXT.**
+/// A family's `new` takes one weight representation and stamps it on every
+/// plane it declares, which was right while every representation stored itself
+/// verbatim. `Mxfp4` and `MlxU4` do not: they are a bank's codes, they come
+/// with companion planes, and no checkpoint in either scheme quantizes a
+/// layernorm — MLX's own rule is that a group of sixty-four codes needs
+/// sixty-four columns to group, and a `[hidden]` norm has one axis and no
+/// contracted one at all.
+///
+/// So the text asks here rather than forking. `layer.0.q_proj` is stated in
+/// `banks` and `layer.0.mixer_norm` in what `banks` MULTIPLIES AS, which for
+/// every unpacked representation is `banks` itself — so a bf16 SKU declares
+/// exactly the weights it always declared, byte for byte, and the quantized
+/// row beside it is the same sentences with one word changed.
+pub(crate) fn dense(banks: Dtype) -> Dtype {
+    model_dsl::compute_dtype(banks)
+        .unwrap_or_else(|| panic!("`{banks:?}` is not a weight representation a family declares"))
+}
+
 pub(crate) fn encoding(dtype: Dtype) -> Encoding {
     match dtype {
-        Dtype::Bf16 => Encoding::Raw(DType::BF16),
+        Dtype::Bf16 => Encoding::Raw(DType::Bf16),
         Dtype::F16 => Encoding::Raw(DType::F16),
         Dtype::F32 => Encoding::Raw(DType::F32),
         Dtype::I32 => Encoding::Raw(DType::I32),
         Dtype::U32 => Encoding::Raw(DType::U32),
         Dtype::U8 => Encoding::Raw(DType::U8),
         Dtype::I8 => Encoding::Raw(DType::I8),
-        Dtype::Fp8E4m3 => Encoding::Raw(DType::F8E4M3),
-        Dtype::E8m0 => Encoding::Raw(DType::E8M0),
+        Dtype::Fp8E4m3 => Encoding::Raw(DType::Fp8E4m3),
+        Dtype::E8m0 => Encoding::Raw(DType::E8m0),
+        // The six the checkpoint vocabulary brought when the two dtype enums
+        // merged. Each stores itself verbatim, so each is `Raw` of itself —
+        // the same answer every row above gives.
+        Dtype::Fp8E5m2 => Encoding::Raw(DType::Fp8E5m2),
+        Dtype::I64 => Encoding::Raw(DType::I64),
+        Dtype::I16 => Encoding::Raw(DType::I16),
+        Dtype::U64 => Encoding::Raw(DType::U64),
+        Dtype::U16 => Encoding::Raw(DType::U16),
+        Dtype::Bool => Encoding::Raw(DType::Bool),
         Dtype::Mxfp4 => Encoding::Quant(QuantSpec {
             scheme: QuantScheme::Mxfp4E2M1E8M0,
-            logical_dtype: DType::BF16,
+            logical_dtype: DType::Bf16,
             bits_per_element: 4,
             group_size: 32,
+            channel_axis: None,
+        }),
+        // MLX's affine U4, in the loader's own vocabulary: sixty-four codes
+        // under one bf16 scale and one bf16 offset, dequantized to bf16. The
+        // channel axis is stated by whoever holds the shape —
+        // `contract::grouped` — because a rank is not a fact about a scheme.
+        Dtype::MlxU4 => Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::MlxAffineU4,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 4,
+            group_size: 64,
+            channel_axis: None,
+        }),
+        // **THE SAME SCHEME AT TWICE THE WIDTH.** `MlxAffineU4` names the
+        // arithmetic — affine codes, sixty-four to a group, one bf16 scale and
+        // one bf16 offset apiece — and `bits_per_element` has always been the
+        // field that says how wide a code is, which is why an eight-bit MLX
+        // bank needs no scheme of its own. `Landing::affine_point_of` reports
+        // this number to the engine and `kernels_metal::linear::quant` stamps
+        // a point at both widths, so the two travel the whole way down as one
+        // path with a number in it. See `dtype::Dtype::MlxU8` for the
+        // checkpoint that mixes them.
+        Dtype::MlxU8 => Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::MlxAffineU4,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 8,
+            group_size: 64,
             channel_axis: None,
         }),
         Dtype::Fp4 => panic!(

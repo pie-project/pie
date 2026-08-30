@@ -1,5 +1,5 @@
 //! Which pool slot a sequence sits in — the runtime's half of
-//! [`Lane::slot`](engine_api::fire::Lane).
+//! [`Lane::slot`](engine::fire::Lane).
 //!
 //! # What a slot is, and who was supposed to own it
 //!
@@ -38,8 +38,8 @@
 //! # The ceiling
 //!
 //! `capacity` is what the deployment's engine advertises as
-//! [`PoolFacts::state_slots`](engine_api::caps::PoolFacts) — the same number
-//! the contract calls [`Budgets::slots`](engine_api::load::Budgets) ("how
+//! [`PoolFacts::state_slots`](engine::caps::PoolFacts) — the same number
+//! the contract calls [`Budgets::slots`](engine::load::Budgets) ("how
 //! many sequences the pools seat at once") and the same number that sizes
 //! this store registry's `RsStore`. A fire that would seat more sequences
 //! than that is refused HERE, by name and with both numbers, rather than

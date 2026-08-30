@@ -7,7 +7,7 @@
 
 use core::cmp::Reverse;
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::attn::plan::{Built, Device, PrefillPlanSm90Info};
 use crate::attn::sched::{
@@ -68,11 +68,7 @@ pub struct Schedule {
     pub work_indptr: Vec<i32>,
 }
 
-pub fn schedule(
-    op: &'static str,
-    req: &Request<'_>,
-    device: &Device,
-) -> Result<Schedule, KernelError> {
+pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     if req.batch_size == 0 {
         return Err(refuse(op, "the batch is empty"));
     }
@@ -202,7 +198,7 @@ pub fn plan(
     req: &Request<'_>,
     device: &Device,
     int_bytes: usize,
-) -> Result<Built<PrefillPlanSm90Info>, KernelError> {
+) -> Result<Built<PrefillPlanSm90Info>, Error> {
     let sched = schedule(op, req, device)?;
     let mut info = PrefillPlanSm90Info {
         same_schedule_for_all_heads: sched.same_schedule_for_all_heads,

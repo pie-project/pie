@@ -3,8 +3,8 @@
 //!
 //! **THE PAGE ARITHMETIC IS NO LONGER HERE.** `Paging`, `Seat`, `Geometry`,
 //! `geometry`/`geometry_with` and `indptr` — every item this file used to
-//! carry a `// engine::store candidate` marker over — live in
-//! [`engine::store::kv`], byte-identical on both shells and host-tested
+//! carry a `// model_exec::store candidate` marker over — live in
+//! [`model_exec::store::kv`], byte-identical on both shells and host-tested
 //! there. What is re-exported below is that module, spelled at the path this
 //! shell's callers already use; what is written out below it is the half that
 //! did NOT survive the merge, because the two shells' probes disagree.
@@ -40,11 +40,11 @@ use model_ir::{Attention, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 use crate::error::{Fault, Result};
 
-pub use engine::store::kv::{
+pub use model_exec::store::kv::{
     Geometry, Paging, Reader, Seat, SpaceFacts, indptr, reads, row_of, space_of,
 };
 
-/// Compute one fire's geometry — [`engine::store::kv::geometry`], in this
+/// Compute one fire's geometry — [`model_exec::store::kv::geometry`], in this
 /// shell's `Result`.
 ///
 /// # Errors
@@ -52,11 +52,11 @@ pub use engine::store::kv::{
 /// [`Fault::Ceiling`] for a lane past the pool's slots or past its slot's
 /// page block.
 pub fn geometry(paging: &Paging, seats: &[Seat]) -> Result<Geometry> {
-    Ok(engine::store::kv::geometry(paging, seats)?)
+    Ok(model_exec::store::kv::geometry(paging, seats)?)
 }
 
 /// Compute one fire's geometry against a caller-supplied page table —
-/// [`engine::store::kv::geometry_with`], in this shell's `Result`.
+/// [`model_exec::store::kv::geometry_with`], in this shell's `Result`.
 ///
 /// # Errors
 ///
@@ -64,10 +64,10 @@ pub fn geometry(paging: &Paging, seats: &[Seat]) -> Result<Geometry> {
 /// past its slot's page block (shell-owned only), or — caller-owned — one
 /// whose stated pages do not cover the tokens it is about to hold.
 pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Result<Geometry> {
-    Ok(engine::store::kv::geometry_with(paging, seats, tables)?)
+    Ok(model_exec::store::kv::geometry_with(paging, seats, tables)?)
 }
 
-/// A value's row width — [`engine::store::kv::width_of`], in this shell's
+/// A value's row width — [`model_exec::store::kv::width_of`], in this shell's
 /// `Result`.
 ///
 /// # Errors
@@ -76,7 +76,7 @@ pub fn geometry_with(paging: &Paging, seats: &[Seat], tables: &[&[u32]]) -> Resu
 /// declares a host struct rather than a rectangle, and for one whose width
 /// carries a symbolic dim.
 pub fn width_of(trace: &Trace, value: ValueId) -> Result<u64> {
-    Ok(engine::store::kv::width_of(trace, value)?)
+    Ok(model_exec::store::kv::width_of(trace, value)?)
 }
 
 /// One attention schedule as its plan op states it: which struct it defines —

@@ -15,19 +15,25 @@ thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 
 # KV layout + handle vocabulary live in `engine` (the dependency floor):
-# `engine::{KvLayout, KvDtype, KvLayoutKind, KvHandle, KvRegion,
-# MemoryDomain}` — pure-Rust types (the engine crate is Python-free, no features).
-engine-api = { path = "../engine-api", default-features = false }
+# `engine::{KvLayout, KvLayoutKind, KvHandle, KvRegion, MemoryDomain}` — pure
+# -Rust types (the engine crate has no features at all, so the
+# `default-features = false` below is a no-op kept for the day it does).
+engine = { path = "../engine", default-features = false }
+# The element type a `KvLayout` names, from the leaf that owns it rather than
+# through `engine`. This crate wants a dtype and not an IR; it reached the
+# enum as `engine::model_ir::Dtype` only because the contract re-exported the
+# whole IR, and `model_ir::Dtype` was always a re-export of this.
+dtype = { path = "../dtype" }
 # `WorkerId` now lives on the interface leaf (`ids`); transport names a
 # transfer's src/dst by it. Plain serde, no internal deps.
 ids = { path = "../ids" }
 
 [features]
 # Cross-node RDMA/TCP/NVMe path via NIXL. Off by default: the on-device build
-# ships NIXL-free with only the `local` engine; the datacenter build enables it
+# ships NIXL-free with only the `local` backend; the datacenter build enables it
 # and bundles NIXL (only cuda/rocm pull it). Enabling it turns on the `bindgen`
 # build-dependency, which generates the C-API bindings from the vendored
-# `engines/nixl/wrapper.h` and links the wheel's `libnixl_capi.so` from
+# `backends/nixl/wrapper.h` and links the wheel's `libnixl_capi.so` from
 # `$NIXL_PREFIX` (see `build.rs`).
 nixl = ["dep:bindgen"]
 

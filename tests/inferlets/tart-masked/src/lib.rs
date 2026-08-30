@@ -7,7 +7,7 @@
 //! scheduler's region table and the engine's planned mask split.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;
@@ -158,7 +158,7 @@ async fn main(input: Input) -> Result<String> {
     }
     if let Some(scale) = input.adapter_scale {
         let (a, b) = make_lora_channels(scale, input.lora_rank.unwrap_or(LORA_RANK), input.lora_layers, input.lora_d_in, input.lora_d_out);
-        use inferlet::ptir::adapter::{mm, Site};
+        use inferlet::eta::adapter::{mm, Site};
         prefill.adapter(Site::Q, |x, y| y + mm(&b, mm(&a, x)))?;
     }
     prefill.embed(&prompt_tokens, &prefill_embed_indptr)?;
@@ -226,7 +226,7 @@ async fn main(input: Input) -> Result<String> {
     }
     if let Some(scale) = input.adapter_scale {
         let (a, b) = make_lora_channels(scale, input.lora_rank.unwrap_or(LORA_RANK), input.lora_layers, input.lora_d_in, input.lora_d_out);
-        use inferlet::ptir::adapter::{mm, Site};
+        use inferlet::eta::adapter::{mm, Site};
         decode.adapter(Site::Q, |x, y| y + mm(&b, mm(&a, x)))?;
     }
     if input.hook {

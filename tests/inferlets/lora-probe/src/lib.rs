@@ -1,38 +1,63 @@
-//! LoRA configuration-sink probe (tensor-ir-log.md §6.5, plan §5.1).
+//! **THE ADAPTER PROBE** — naive-baseline plus one PEFT adapter, and nothing
+//! else different (alto adapter §6, campaign gate A-1).
 //!
-//! Structurally naive-baseline (one N-wide prefill fire, then a
-//! device-carried decode loop) plus exactly one addition: every forward pass
-//! carries a PROLOGUE `intrinsics::kernel::lora(A, B, SITES)` whose adapter
-//! weights are host-seeded channels. The A/B contents are a deterministic
-//! pattern; `adapter_scale` is folded into B's seed (the same slot the LoRA
-//! `alpha/R` folds into, §6.5), so:
+//! # What this program is for
 //!
-//!   * `adapter_scale = 0.0` — B is all zeros, the CORRECTION term
-//!     `(xAᵀ)Bᵀ` is exactly zero, and the output must be byte-identical to
-//!     naive-baseline at the same seed/prompt (§5.1: "with no adapters the
-//!     code is what it was" — here, zero-B).
-//!   * `adapter_scale > 0.0` — the delta lands on the q projection at every
-//!     layer; the text differs and must be deterministic across runs.
+//! `cuda_lora_parity` asks the one LoRA question that can be answered without
+//! a reference implementation: *with no adapter, is the answer the base
+//! model's?* The base model is sitting right there. So this inferlet is
+//! `naive-baseline` — same prompt, same seed, same temperature, same Gumbel-max
+//! draw, same epilogue — with exactly one addition: every forward pass carries
+//! a `Pass::adapter` at the mixer-output site, whose `A` and `B` weights are
+//! host-built, deterministic, and seeded into channels.
 //!
-//! v0 sites: `q` only (bit 0 of the llama-like site vocabulary,
-//! crates/driver-cuda/csrc/src/model/lora.hpp). One lane carries ONE (A, B) pair with one
-//! trace-known d_out, and qwen3-0.6b's q width (2048) differs from its v
-//! width (1024), so a q+v adapter would need either per-site pairs or a
-//! packed layout — the algebra proof only needs one site. `v` is the
-//! documented next step.
+//! * `adapter_scale = 0.0` — `B` is all zeros, the correction `B(Ax)` is
+//!   EXACTLY zero (adding a bf16 zero is exact), and the output must be
+//!   byte-identical to `naive-baseline` at the same seed and prompt.
+//! * `adapter_scale > 0.0` — the delta lands on the mixer output at every
+//!   layer, the token moves, and it moves the SAME WAY every run.
+//!
+//! # Where the weights actually go (alto adapter §6.1)
+//!
+//! The channels are a NAMING device, not a weight transport. The engine reads
+//! the sink's channels once, at instance bind, converts the f32 cells into the
+//! banks' own bf16 and lands them in a bank slot; no fire ever reads the cell.
+//! That is why the seeds below are stated once per pass and never re-published:
+//! swapping an adapter is re-BINDING, never re-publishing.
+//!
+//! # The site, and why there is only one
+//!
+//! `qwen_3`'s text corrects the MIXER OUTPUT and nothing else
+//! (`crates/model/src/qwen_3/forward.rs`, `ops::linear::lora_correct` over the
+//! reduced mixer result), so [`Site::O`] is the only site this family can
+//! honestly serve today — adapter.md §2's "one site, not six", and §4's wave 4
+//! is where the other five arrive. Both ends of that site are the replicated
+//! hidden stream, so `A` is `[layers, rank, hidden]` and `B` is
+//! `[layers, hidden, rank]` at ONE width: qwen35-d0.8b's 1024.
+//!
+//! # The geometry, and why it is a parameter
+//!
+//! The defaults are qwen35-d0.8b's — 24 layers, hidden 1024, the bank's own
+//! rank 16 (`Adapters { slots: 8, rank: 16 }`). A different SKU passes its own
+//! numbers rather than editing this file, because a rank is TRACE-KNOWN: a
+//! different rank is a different traced program, which is exactly what a
+//! parameter that reaches the channel shape expresses.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::adapter::{Site, mm};
+use inferlet::eta::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 
-// Qwen3-0.6B adapter geometry: trace-known shape (a different rank is a
-// different traced program); the CONTENTS are per-instance data.
-const RANK: u32 = 8;
-// Model geometry DEFAULTS (Qwen3-0.6B); override per model via args.
-const DEF_LAYERS: u32 = 28;
-const DEF_D_IN: u32 = 1024;
-const DEF_D_OUT: u32 = 2048;
-const SITE_Q: u32 = 1 << 0;
+/// qwen35-d0.8b's bank, as the model text declares it: `Adapters { slots: 8,
+/// rank: 16 }` over 24 layers of hidden 1024.
+const DEF_RANK: u32 = 16;
+const DEF_LAYERS: u32 = 24;
+const DEF_HIDDEN: u32 = 1024;
+
+/// The mixer-output site's bit, for the raw-sink surface below — the same
+/// number [`Site::O`] answers, spelled here because the sink intrinsic takes a
+/// constant rather than the enum.
+const SITE_O: u32 = 1 << 3;
 
 #[derive(Deserialize)]
 struct Input {
@@ -44,39 +69,40 @@ struct Input {
     max_tokens: usize,
     #[serde(default = "default_seed")]
     seed: u32,
-    /// Scale folded into B's seed contents. 0.0 = zero-B adapter.
+    /// The scale folded into `B`'s contents. `0.0` is the zero-`B` adapter —
+    /// a correction that is exactly zero — and there is no scalar argument to
+    /// the sink because the LoRA `alpha/R` folds into `B` exactly here
+    /// (adapter.md §2: weights are data).
     #[serde(default)]
     adapter_scale: f32,
-    /// Which surface attaches the adapter: "sink" (kernel::lora, the
-    /// original) or "adapter" (fwd.adapter, the PEFT v0a surface —
-    /// must be byte-identical: same channels, same lowering).
+    /// Which surface states the adapter: `"adapter"` (the current SDK
+    /// spelling, `Pass::adapter` with its closed expression language) or
+    /// `"sink"` (the raw `intrinsics::kernel::lora` prologue the surface
+    /// lowers to). The two must be BYTE-IDENTICAL: same channels, same
+    /// lowering, same sink.
     #[serde(default = "default_surface")]
     surface: String,
-    /// Which sites carry adapters: "q" (the original single-site probe)
-    /// or "qv" (the per-site-pairs rung: distinct shapes per site,
-    /// adapter surface only).
-    #[serde(default = "default_sites")]
-    sites: String,
-    /// Model geometry overrides (defaults = Qwen3-0.6B).
+    /// `"lowrank"` (the served form) or `"scale"` (IA3's two-argument
+    /// spelling). The scale form is REFUSED by the engine by name —
+    /// `model-ir` declares no `AdapterScale` op for a bank to be read by — so
+    /// this exists to make that refusal reachable from a guest.
+    #[serde(default = "default_form")]
+    form: String,
+    /// Model geometry overrides; the defaults are qwen35-d0.8b's.
     #[serde(default)]
     layers: Option<u32>,
     #[serde(default)]
-    d_in: Option<u32>,
+    hidden: Option<u32>,
     #[serde(default)]
-    d_out: Option<u32>,
-    /// Scale-vector deviation from ones (the scale/DoRA modes):
-    /// l = 1 + scale_l * pattern. 0.0 = ones (the multiplicative
-    /// identity).
-    #[serde(default)]
-    scale_l: f32,
-}
-
-fn default_sites() -> String {
-    "q".into()
+    rank: Option<u32>,
 }
 
 fn default_surface() -> String {
-    "sink".into()
+    "adapter".into()
+}
+
+fn default_form() -> String {
+    "lowrank".into()
 }
 
 fn default_prompt() -> String {
@@ -101,6 +127,11 @@ struct Output {
     text: String,
     count: usize,
     adapter_scale: f32,
+    /// What the adapter's shape actually was, so a gate reading this JSON can
+    /// say which geometry produced the text rather than assuming the defaults.
+    rank: u32,
+    layers: u32,
+    hidden: u32,
 }
 
 /// Splitmix-style integer hash: deterministic, platform-independent.
@@ -121,8 +152,7 @@ fn pattern(i: u32, salt: u32, amp: f32) -> f32 {
 }
 
 /// One sampling step: temperature, then a Gumbel-max draw over the full
-/// vocab. Byte-for-byte the naive-baseline step — the comparison depends on
-/// it.
+/// vocab. Byte-for-byte `naive-baseline`'s step — the parity depends on it.
 fn step(logits: Tensor, temperature: f32, rng_state: &Tensor) -> Tensor {
     let scaled = if temperature == 1.0 {
         logits
@@ -130,6 +160,86 @@ fn step(logits: Tensor, temperature: f32, rng_state: &Tensor) -> Tensor {
         &logits / temperature
     };
     gumbel_max(scaled, rng_state)
+}
+
+/// The adapter's two planes, in the orientations §6.3 fixes: `A` rank-major
+/// `[layers, rank, hidden]`, `B` out-major `[layers, hidden, rank]`.
+///
+/// A fresh pair PER PASS, because a channel's seed is consumed by the first
+/// pass that binds it — the prefill and the decode are two instances and each
+/// one lands its own copy.
+struct Weights {
+    a: Vec<f32>,
+    b: Vec<f32>,
+    layers: u32,
+    hidden: u32,
+    rank: u32,
+}
+
+impl Weights {
+    fn build(layers: u32, hidden: u32, rank: u32, scale: f32) -> Weights {
+        let a = (0..layers * rank * hidden)
+            .map(|i| pattern(i, 0x0a0a_a0a0, 0.05))
+            .collect();
+        // **THE SCALE IS FOLDED INTO `B` AND NOWHERE ELSE.** At `scale = 0.0`
+        // every element is exactly `0.0`, so `B(Ax)` is exactly zero and the
+        // parity claim is an identity rather than a tolerance.
+        let b = (0..layers * hidden * rank)
+            .map(|i| pattern(i, 0x0b0b_b0b0, 0.5) * scale)
+            .collect();
+        Weights {
+            a,
+            b,
+            layers,
+            hidden,
+            rank,
+        }
+    }
+
+    fn channels(&self) -> (Channel, Channel) {
+        (
+            Channel::from_shaped([self.layers, self.rank, self.hidden], self.a.clone())
+                .named("lora_a"),
+            Channel::from_shaped([self.layers, self.hidden, self.rank], self.b.clone())
+                .named("lora_b"),
+        )
+    }
+
+    /// IA3's per-channel vector, for the refusal probe: `[layers, hidden]`,
+    /// ones plus a deterministic deviation.
+    fn scale_channel(&self) -> Channel {
+        Channel::from_shaped(
+            [self.layers, self.hidden],
+            (0..self.layers * self.hidden)
+                .map(|i| 1.0f32 + pattern(i, 0x0d0d_d0d0, 0.2))
+                .collect::<Vec<f32>>(),
+        )
+        .named("lora_l")
+    }
+}
+
+/// State the adapter on one pass, through whichever surface was asked for.
+fn attach(fwd: &ForwardPass, w: &Weights, surface: &str, form: &str) -> Result<()> {
+    if form == "scale" {
+        let l = w.scale_channel();
+        return fwd
+            .adapter(Site::O, |_x, y| inferlet::eta::adapter::scale(y, &l))
+            .map_err(|e| e.into());
+    }
+    let (a, b) = w.channels();
+    if surface == "sink" {
+        // The RAW sink, which is what the surface lowers to. Stated here so a
+        // gate can assert the two spellings answer the same bytes: same
+        // channels, same trace-known placement constant, same `SinkCall`.
+        fwd.prologue(move || {
+            intrinsics::kernel::lora(a.read(), b.read(), Tensor::constant(SITE_O));
+        });
+        return Ok(());
+    }
+    // The CURRENT SDK SPELLING: a closed expression the surface CLASSIFIES —
+    // never interprets — into the low-rank lowering `y + mm(b, mm(a, x))`.
+    fwd.adapter(Site::O, |x, y| y + mm(&b, mm(&a, x)))
+        .map_err(|e| e.into())
 }
 
 #[inferlet::main]
@@ -143,53 +253,27 @@ async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
     let temperature = input.temperature;
     let adapter_scale = input.adapter_scale;
-    #[allow(non_snake_case)]
-    let NUM_LAYERS: u32 = input.layers.unwrap_or(DEF_LAYERS);
-    #[allow(non_snake_case)]
-    let D_IN: u32 = input.d_in.unwrap_or(DEF_D_IN);
-    #[allow(non_snake_case)]
-    let D_OUT: u32 = input.d_out.unwrap_or(DEF_D_OUT);
+    let layers = input.layers.unwrap_or(DEF_LAYERS);
+    let hidden = input.hidden.unwrap_or(DEF_HIDDEN);
+    let rank = input.rank.unwrap_or(DEF_RANK);
+    let surface = input.surface.clone();
+    let form = input.form.clone();
     let ws = WorkingSet::new();
     let page_size = kv_page_size();
 
-    if max_tokens == 0 {
-        return Ok(Output {
-            sampler: "lora-probe",
-            text: String::new(),
-            count: 0,
-            adapter_scale,
-        });
-    }
-
-    // ── Adapter weights: host-built, deterministic. ──
-    // A: [num_layers, R, d_in]; B: [num_layers, d_out, R] with adapter_scale
-    // folded into the contents (there is no scalar argument — §6.5). Each
-    // PASS gets its own seeded channel pair below: a channel's seed is
-    // consumed by the first pass that binds it, so a pair cannot be shared
-    // across the prefill and decode passes.
-    let a_len = (NUM_LAYERS * RANK * D_IN) as usize;
-    let b_len = (NUM_LAYERS * D_OUT * RANK) as usize;
-    let a_host: Vec<f32> = (0..a_len as u32)
-        .map(|i| pattern(i, 0x0a0a_a0a0, 0.05))
-        .collect();
-    let b_host: Vec<f32> = (0..b_len as u32)
-        .map(|i| pattern(i, 0x0b0b_b0b0, 0.5) * adapter_scale)
-        .collect();
-    // The v site's pair (per-site rung): SAME d_in and rank, its OWN
-    // d_out (v width) and its own deterministic contents.
-    const D_OUT_V: u32 = 1024; // kv width = 8 heads * head_dim 128
-    let bv_len = (NUM_LAYERS * D_OUT_V * RANK) as usize;
-    let bv_host: Vec<f32> = (0..bv_len as u32)
-        .map(|i| pattern(i, 0x0c0c_c0c0, 0.5) * adapter_scale)
-        .collect();
-    let make_lora_channels = |a_host: &Vec<f32>, b_host: &Vec<f32>| {
-        (
-            Channel::from_shaped([NUM_LAYERS, RANK, D_IN], a_host.clone())
-                .named("lora_a"),
-            Channel::from_shaped([NUM_LAYERS, D_OUT, RANK], b_host.clone())
-                .named("lora_b"),
-        )
+    let report = |text: String, count: usize| Output {
+        sampler: "lora-probe",
+        text,
+        count,
+        adapter_scale,
+        rank,
+        layers,
+        hidden,
     };
+
+    if max_tokens == 0 {
+        return Ok(report(String::new(), 0));
+    }
 
     let mut prompt = wit_model::encode(&input.prompt);
     if prompt.is_empty() {
@@ -202,8 +286,8 @@ async fn main(input: Input) -> Result<Output> {
 
     let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
 
-    // ── PREFILL (chunked, C-wide) — naive-baseline's shape, plus the lora
-    // prologue on every pass so the whole forward applies the delta. ──
+    // ── PREFILL (chunked, C-wide) — naive-baseline's shape, plus the adapter
+    //    on every pass so the whole forward applies the delta. ──
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let spans = prefill_chunks(n, None);
     let pipe = Pipeline::new();
@@ -227,68 +311,9 @@ async fn main(input: Input) -> Result<Output> {
         let rng_p = Channel::from(vec![input.seed, 0]).named("rng_p");
         let tok_out_p = Channel::new([1], dtype::i32).named("tok_out_p");
 
-        let (lora_a, lora_b) = make_lora_channels(&a_host, &b_host);
+        let weights = Weights::build(layers, hidden, rank, adapter_scale);
         let fwd_p = ForwardPass::new();
-        // The configuration sink: reads are peeks (no edge onto the decode
-        // chain), SITES is trace-known placement. The "adapter" surface
-        // states the SAME thing through the PEFT v0a classifier.
-        if input.surface == "adapter" {
-            use inferlet::ptir::adapter::{mm, Site};
-            if input.sites != "scale_q" && input.sites != "dora_q" {
-                fwd_p
-                    .adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
-                    .map_err(|e| e.to_string())?;
-            }
-            if input.sites == "scale_q" || input.sites == "dora_q" {
-                use inferlet::ptir::adapter::scale;
-                let scale_l = input.scale_l;
-                let l = Channel::from_shaped(
-                    [NUM_LAYERS, D_OUT],
-                    (0..(NUM_LAYERS * D_OUT))
-                        .map(|i| 1.0f32
-                            + pattern(i, 0x0d0d_d0d0, 0.2) * scale_l)
-                        .collect::<Vec<f32>>())
-                    .named("lora_l_q");
-                if input.sites == "dora_q" {
-                    let (da, db) = make_lora_channels(&a_host, &b_host);
-                    fwd_p.adapter(Site::Q, |x, y| {
-                        scale(y + mm(&db, mm(&da, x)), &l)
-                    })
-                    .map_err(|e| e.to_string())?;
-                } else {
-                    fwd_p.adapter(Site::Q, |_x, y| scale(y, &l))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            if input.sites == "qv" {
-                let av = Channel::from_shaped(
-                    [NUM_LAYERS, RANK, D_IN], a_host.clone())
-                    .named("lora_a_v");
-                let bv = Channel::from_shaped(
-                    [NUM_LAYERS, D_OUT_V, RANK], bv_host.clone())
-                    .named("lora_b_v");
-                fwd_p
-                    .adapter(Site::V, |x, y| y + mm(&bv, mm(&av, x)))
-                    .map_err(|e| e.to_string())?;
-            }
-        } else if input.surface == "clone" {
-            let (a2, b2) = (lora_a.clone(), lora_b.clone());
-            fwd_p.prologue(move || {
-                intrinsics::kernel::lora(
-                    a2.read(),
-                    b2.read(),
-                    Tensor::constant(SITE_Q),
-                );
-            });
-        } else {
-            fwd_p.prologue(move || {
-                intrinsics::kernel::lora(
-                    lora_a.read(),
-                    lora_b.read(),
-                    Tensor::constant(SITE_Q),
-                );
-            });
-        }
+        attach(&fwd_p, &weights, &surface, &form)?;
         fwd_p.embed(&toks_p, &embed_indptr_p)?;
         fwd_p.attention(
             &ws,
@@ -325,7 +350,7 @@ async fn main(input: Input) -> Result<Output> {
     generated.push(g0 as u32);
 
     // ── DECODE LOOP (1-wide, run-ahead) — naive-baseline's shape, plus the
-    // lora prologue. ──
+    //    adapter. ──
     if generated.len() < max_tokens {
         let tok_in = Channel::from(vec![g0; 1]).named("tok_in");
         let rng = Channel::from(vec![input.seed ^ 0x5bd1, 0]).named("rng");
@@ -341,54 +366,9 @@ async fn main(input: Input) -> Result<Output> {
         let w_off = Channel::from(vec![n % page_size]).named("w_off");
         let kv_len = Channel::from(vec![n + 1]).named("kv_len");
 
-        let (lora_a, lora_b) = make_lora_channels(&a_host, &b_host);
+        let weights = Weights::build(layers, hidden, rank, adapter_scale);
         let fwd = ForwardPass::new();
-        if input.surface == "adapter" {
-            use inferlet::ptir::adapter::{mm, Site};
-            if input.sites != "scale_q" && input.sites != "dora_q" {
-                fwd.adapter(Site::Q, |x, y| y + mm(&lora_b, mm(&lora_a, x)))
-                    .map_err(|e| e.to_string())?;
-            }
-            if input.sites == "scale_q" || input.sites == "dora_q" {
-                use inferlet::ptir::adapter::scale;
-                let scale_l = input.scale_l;
-                let l = Channel::from_shaped(
-                    [NUM_LAYERS, D_OUT],
-                    (0..(NUM_LAYERS * D_OUT))
-                        .map(|i| 1.0f32
-                            + pattern(i, 0x0d0d_d0d0, 0.2) * scale_l)
-                        .collect::<Vec<f32>>())
-                    .named("lora_l_q");
-                if input.sites == "dora_q" {
-                    let (da, db) = make_lora_channels(&a_host, &b_host);
-                    fwd.adapter(Site::Q, |x, y| {
-                        scale(y + mm(&db, mm(&da, x)), &l)
-                    })
-                    .map_err(|e| e.to_string())?;
-                } else {
-                    fwd.adapter(Site::Q, |_x, y| scale(y, &l))
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            if input.sites == "qv" {
-                let av = Channel::from_shaped(
-                    [NUM_LAYERS, RANK, D_IN], a_host.clone())
-                    .named("lora_a_v");
-                let bv = Channel::from_shaped(
-                    [NUM_LAYERS, D_OUT_V, RANK], bv_host.clone())
-                    .named("lora_b_v");
-                fwd.adapter(Site::V, |x, y| y + mm(&bv, mm(&av, x)))
-                    .map_err(|e| e.to_string())?;
-            }
-        } else {
-            fwd.prologue(move || {
-                intrinsics::kernel::lora(
-                    lora_a.read(),
-                    lora_b.read(),
-                    Tensor::constant(SITE_Q),
-                );
-            });
-        }
+        attach(&fwd, &weights, &surface, &form)?;
         fwd.embed(&tok_in, &lane1)?;
         fwd.attention(
             &ws,
@@ -437,10 +417,6 @@ async fn main(input: Input) -> Result<Output> {
     }
     pipe.close();
 
-    Ok(Output {
-        sampler: "lora-probe",
-        text: wit_model::decode(&generated)?,
-        count: generated.len(),
-        adapter_scale,
-    })
+    let count = generated.len();
+    Ok(report(wit_model::decode(&generated)?, count))
 }

@@ -1,12 +1,12 @@
 //! The remote seam — an engine that is not here yet, and says so.
 //!
-//! # `palo B-remote`: the envelope died with `engine_api::remote`
+//! # `palo B-remote`: the envelope died with `engine::remote`
 //!
 //! What stood here was a 539-line tarpc client: `ExecutorRpcClient`,
 //! `ExecutorRequest`/`ExecutorResponse`, `RemoteLaunch`, `RemoteBindInstance`,
 //! `RemoteRegisterChannel`, `RemoteChannelValue`, `ScratchGrant`,
 //! `TerminalCellState`, `RemoteError`/`RemoteErrorKind`,
-//! `REMOTE_WIRE_VERSION` — every one of them a type in `engine-api::remote`,
+//! `REMOTE_WIRE_VERSION` — every one of them a type in `engine::remote`,
 //! and every one of them deleted by the palo contract rewrite. The rewrite's
 //! ruling (design §7, decision 19) is one sentence:
 //!
@@ -28,15 +28,15 @@
 //! frame is:
 //!
 //! * **identity and admission** — which `Trace` the peer loaded, which
-//!   [`Capabilities`](engine_api::Capabilities) it answered, and the scratch
+//!   [`Capabilities`](engine::Capabilities) it answered, and the scratch
 //!   grant (base page + count) the caller may address inside its pool. The
 //!   old `ScratchGrant` + `HelloRequest`/`HelloResponse` pair.
 //! * **a wire version, on the TRANSPORT** — `REMOTE_WIRE_VERSION` was an
-//!   `engine-api` constant checked at hello; it belongs where the bytes are.
+//!   `engine` constant checked at hello; it belongs where the bytes are.
 //! * **liveness** — the disconnect notification that closes every outstanding
 //!   completion at once. That half is NOT dead and is kept below, because it
 //!   is runtime bookkeeping (the broker) rather than an encoding.
-//! * **an asynchronous ticket** — [`FireTicket`](engine_api::FireTicket) is
+//! * **an asynchronous ticket** — [`FireTicket`](engine::FireTicket) is
 //!   answered with an empty `readouts` by an engine that answers before the
 //!   device is done, and `FireTicket::id` is what the runtime-side broker
 //!   correlates the later completion on. A remote engine is the first one
@@ -45,13 +45,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use engine_api::channel::{ChannelRegistration, RegisteredChannel};
-use engine_api::error::{Error, Result};
-use engine_api::fire::{FrameSubmission, FrameTicket, MediaEncode, Step};
-use engine_api::load::{LoadRequest, Loaded};
-use engine_api::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine_api::transfer::{KvCopy, StateCopy};
-use engine_api::{ChannelId, Engine};
+use engine::channel::{ChannelRegistration, RegisteredChannel};
+use engine::error::{Error, Result};
+use engine::fire::{FrameSubmission, FrameTicket, MediaEncode, Step};
+use engine::load::{LoadRequest, Loaded};
+use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use engine::transfer::{KvCopy, StateCopy};
+use engine::{ChannelId, Engine};
 
 use crate::engine::CompletionBroker;
 
@@ -136,7 +136,7 @@ impl RemoteEngine {
             peer = %self.peer,
             verb,
             "the remote engine has no transport: palo B-remote redesigns the \
-             envelope `engine_api::remote` carried"
+             envelope `engine::remote` carried"
         );
         Error::unsupported("remote", verb)
     }

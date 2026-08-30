@@ -53,7 +53,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use kernels_metal::{ArgValue, Encode, Fire, KernelError};
+use kernels_metal::{ArgValue, Encode, Error, Fire};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -286,7 +286,7 @@ impl Icb {
         taped: &Recording,
     ) -> Result<Rebound> {
         // **THE ALIGNMENT, AND IT IS THE WHOLE OF WHAT MAKES ONE BUFFER SERVE
-        // EVERY COMPOSITION.** `engine::fire::walk` skips a zero-row region's
+        // EVERY COMPOSITION.** `model_exec::fire::walk` skips a zero-row region's
         // nodes, so an all-decode fire walks FEWER dispatches than the mixed
         // one this buffer was built at. Design §5's answer is that the
         // artifact holds every launch and the fire turns the absent ones off,
@@ -731,14 +731,14 @@ impl<'a> Builder<'a> {
 }
 
 impl Encode for Builder<'_> {
-    fn fire(&self, fire: Fire, args: &[ArgValue]) -> std::result::Result<(), KernelError> {
-        self.encode(fire, args).map_err(|fault| KernelError::Backend {
+    fn fire(&self, fire: Fire, args: &[ArgValue]) -> std::result::Result<(), Error> {
+        self.encode(fire, args).map_err(|fault| Error::Backend {
             op: fire.entrypoint,
             detail: fault.to_string(),
         })
     }
 
-    fn absent(&self) -> std::result::Result<ArgValue, KernelError> {
+    fn absent(&self) -> std::result::Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
     }
 }

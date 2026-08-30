@@ -17,10 +17,15 @@
 //!    and the walk skips a zero-row region at RECORD time — so an all-decode
 //!    exec holds only the all-decode launches. Measured here as the captured
 //!    node count of one key against another.
-//! 3. **A conditionalized artifact is refused by name, at the capture and not
-//!    at the fire.** An eager walk may ignore the bracket and be right; a
-//!    recording one may not, and this shell records no conditional nodes.
-//!    `Fault::Unlowered` says so and says what is missing.
+//! 3. **A conditionalized artifact RECORDS, and says what the eager walk
+//!    says.** An eager walk may ignore the bracket and be right; a recording
+//!    one may not, and since the graphs wave it does not have to — it places a
+//!    real `CU_GRAPH_NODE_TYPE_CONDITIONAL` node and captures the region's
+//!    launches into its child graph, with the predicate stored by a kernel
+//!    reading the region's row count off the device. This claim is the
+//!    CORRECTNESS one: same prompt, same greedy tokens, conditionals on and
+//!    conditionals off, over an artifact whose every windowed region is behind
+//!    a node.
 //!
 //! # Gating
 //!
@@ -133,6 +138,7 @@ fn ready(what: &str, profile: Option<DeviceProfile>) -> Option<(Shell, tokenizer
         contract: &contract,
         checkpoint: &checkpoint,
         budget: budget(),
+        patches: None,
         profile,
         page_size: 16,
         context: 512,
@@ -334,15 +340,24 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
     );
 }
 
-/// Claim 3: a conditionalized artifact reaches the capture and is refused
-/// there, by name.
+/// Claim 3 — **THE CORRECTNESS GATE.** A conditionalized artifact reaches the
+/// capture, records real conditional nodes, and replays the tokens the eager
+/// walk produced.
 ///
-/// The profile is the lever, exactly as `Knobs::side_streams` is P6's:
-/// costs are DATA the caller passes, so a deployment that states a zero
-/// fatness floor gets conditionals on every windowed region — and this shell
-/// says so rather than recording their bodies outside their nodes.
+/// The profile is the lever, exactly as `Knobs::side_streams` is P6's: costs
+/// are DATA the caller passes, so a deployment that states a zero fatness
+/// floor gets conditionals on every windowed region. That is a far heavier
+/// artifact than anything P3 chooses at the default profile — dozens of nodes
+/// rather than the catalog's one — which is exactly what makes it the right
+/// instrument: if the bracket were wrong anywhere, this is where it shows.
+///
+/// **THE EAGER ARM IS THE REFERENCE AND IT IS TAKEN FIRST**, on the same
+/// shell, from the same slot, over the same prompt. Two shells would be two
+/// loads of the same weights and a second source of disagreement; one shell
+/// switching modes is the smallest instrument that can tell a conditional
+/// apart from everything else in a fire.
 #[test]
-fn a_conditionalized_artifact_is_refused_at_the_capture_and_not_at_the_fire() {
+fn a_conditionalized_artifact_records_its_nodes_and_replays_what_the_eager_walk_said() {
     let _serial = serialized();
     let forcing = DeviceProfile {
         fat_region_us: 0.0,
@@ -350,15 +365,36 @@ fn a_conditionalized_artifact_is_refused_at_the_capture_and_not_at_the_fire() {
         cond_per_arm_us: 0.0,
         ..DeviceProfile::default()
     };
-    let Some((mut shell, tokenizer)) = ready("the conditional refusal", Some(forcing)) else {
+    // How many regions this profile actually conditionalizes — printed, so
+    // that a run which forced NOTHING is visible rather than silently vacuous.
+    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let forced = {
+        let trace = trace(Platform::Cuda);
+        let compiled = compile(&trace, &budget(), &forcing).expect("the forced bake bakes");
+        compiled
+            .regions
+            .iter()
+            .filter(|region| region.lowering != Lowering::AlwaysLaunch)
+            .count()
+    };
+    assert!(
+        forced > 0,
+        "this profile conditionalized nothing, so the gate below would pass          over an always-launch artifact and prove nothing",
+    );
+
+    let Some((mut shell, tokenizer)) = ready("the conditional capture", Some(forcing)) else {
         return;
     };
     let prompt = tokenizer.encode(PROMPT);
 
-    // EAGER FIRES ARE FINE, and that is the half worth asserting. The walk's
-    // zero-row rule decides what the conditional decides, so an eager pass
-    // over a conditionalized artifact runs the same nodes over the same rows
-    // (design §4).
+    /// How many tokens each arm generates. Long enough that a wrong window or
+    /// a body that ran when it should not have has somewhere to show up, short
+    /// enough that a capture happens well inside it.
+    const STEPS: usize = 12;
+
+    // EAGER FIRST, and it is the reference. The walk's zero-row rule decides
+    // what the conditional decides, so an eager pass over a conditionalized
+    // artifact runs the same nodes over the same rows (design §4).
     shell.set_mode(Graphs::Off);
     shell.open(0).expect("slot 0 opens");
     let seeded = shell
@@ -369,7 +405,8 @@ fn a_conditionalized_artifact_is_refused_at_the_capture_and_not_at_the_fire() {
         }])
         .expect("an eager fire ignores the bracket and computes");
     let mut carried = argmax(&seeded[0]);
-    for _ in 0..2 {
+    let mut eager = vec![carried];
+    for _ in 0..STEPS {
         let out = shell
             .fire(&[Lane {
                 slot: 0,
@@ -378,29 +415,47 @@ fn a_conditionalized_artifact_is_refused_at_the_capture_and_not_at_the_fire() {
             }])
             .expect("an eager decode fires");
         carried = argmax(&out[0]);
+        eager.push(carried);
     }
 
-    // The capture is where it stops. Two warm fires, then the third records —
-    // and the recording cursor refuses the first conditional region it meets.
+    // **AND NOW THE SAME WALK, WRITTEN DOWN.** The prefill re-seeds the slot,
+    // two warm fires pass, and the third records — conditional nodes and all.
     shell.set_mode(Graphs::On);
-    let mut refusal = None;
-    for _ in 0..4 {
-        match shell.fire(&[Lane {
+    shell.open(0).expect("slot 0 reopens");
+    let seeded = shell
+        .fire(&[Lane {
             slot: 0,
-            word: word(1),
-            tokens: &[carried],
-        }]) {
-            Ok(out) => carried = argmax(&out[0]),
-            Err(why) => {
-                refusal = Some(why.to_string());
-                break;
-            }
-        }
+            word: word(prompt.len() as u32),
+            tokens: &prompt,
+        }])
+        .expect("a recorded prefill fires");
+    let mut carried = argmax(&seeded[0]);
+    let mut recorded = vec![carried];
+    for _ in 0..STEPS {
+        let out = shell
+            .fire(&[Lane {
+                slot: 0,
+                word: word(1),
+                tokens: &[carried],
+            }])
+            .expect("a recorded decode fires");
+        carried = argmax(&out[0]);
+        recorded.push(carried);
     }
-    let said = refusal.expect("the capture refuses a conditionalized artifact");
-    assert!(
-        said.contains("conditional nodes"),
-        "the refusal should name what is missing: {said}",
+
+    let stats = shell.graph_stats();
+    eprintln!(
+        "{forced} regions conditionalized; {} captures, {} execs, {} nodes
+           eager    {eager:?}
+  recorded {recorded:?}",
+        stats.captures, stats.execs, stats.nodes,
     );
-    eprintln!("refused: {said}");
+    assert!(
+        stats.captures > 0,
+        "no capture happened, so nothing recorded a conditional node and the          two arms are the same eager walk twice",
+    );
+    assert_eq!(
+        eager, recorded,
+        "the recorded arm of a conditionalized artifact answered different          tokens from the eager one",
+    );
 }

@@ -15,7 +15,7 @@
 use core::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::jit::refuse;
 
@@ -48,7 +48,7 @@ impl AlignedAllocator {
         size: usize,
         alignment: usize,
         what: &'static str,
-    ) -> Result<u32, KernelError> {
+    ) -> Result<u32, Error> {
         let padding = if alignment > 1 {
             (alignment - (self.allocated % alignment)) % alignment
         } else {
@@ -99,7 +99,7 @@ impl Staging {
         offset: usize,
         values: &[i32],
         what: &'static str,
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), Error> {
         let len = values.len() * 4;
         self.check(offset + len, len, what)?;
         for (slot, value) in self.bytes[offset..offset + len]
@@ -111,12 +111,7 @@ impl Staging {
         Ok(())
     }
 
-    pub fn put_i32(
-        &mut self,
-        offset: usize,
-        value: i32,
-        what: &'static str,
-    ) -> Result<(), KernelError> {
+    pub fn put_i32(&mut self, offset: usize, value: i32, what: &'static str) -> Result<(), Error> {
         self.put_i32s(offset, &[value], what)
     }
 
@@ -125,7 +120,7 @@ impl Staging {
         offset: usize,
         values: impl Iterator<Item = bool>,
         what: &'static str,
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), Error> {
         for (i, v) in values.enumerate() {
             self.check(offset + i + 1, 1, what)?;
             self.bytes[offset + i] = u8::from(v);
@@ -139,7 +134,7 @@ impl Staging {
         self.bytes
     }
 
-    fn check(&self, end: usize, size: usize, what: &'static str) -> Result<(), KernelError> {
+    fn check(&self, end: usize, size: usize, what: &'static str) -> Result<(), Error> {
         if end > self.bytes.len() {
             return Err(refuse(
                 self.op,
@@ -164,7 +159,7 @@ pub fn spans(
     which: &'static str,
     indptr: &[i32],
     batch: usize,
-) -> Result<Vec<u32>, KernelError> {
+) -> Result<Vec<u32>, Error> {
     if indptr.len() < batch + 1 {
         return Err(refuse(
             op,
@@ -192,7 +187,7 @@ pub fn lengths(
     which: &'static str,
     table: &[i32],
     batch: usize,
-) -> Result<Vec<u32>, KernelError> {
+) -> Result<Vec<u32>, Error> {
     if table.len() < batch {
         return Err(refuse(
             op,
@@ -220,17 +215,13 @@ pub fn at(offset: Option<u32>) -> usize {
 }
 
 /// Narrows a host-computed schedule value to the i32 the device text reads.
-pub fn narrow(op: &'static str, what: &'static str, value: i64) -> Result<i32, KernelError> {
+pub fn narrow(op: &'static str, what: &'static str, value: i64) -> Result<i32, Error> {
     i32::try_from(value)
         .map_err(|_| refuse(op, format!("`{what}` reaches {value}, past the device's i32")))
 }
 
 /// [`narrow`], over a whole staged vector.
-pub fn narrow_all(
-    op: &'static str,
-    what: &'static str,
-    values: &[i64],
-) -> Result<Vec<i32>, KernelError> {
+pub fn narrow_all(op: &'static str, what: &'static str, values: &[i64]) -> Result<Vec<i32>, Error> {
     values.iter().map(|&v| narrow(op, what, v)).collect()
 }
 

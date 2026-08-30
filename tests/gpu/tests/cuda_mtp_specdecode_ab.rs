@@ -6,7 +6,7 @@
 //! This began as a device-resident A/B: A was to read its drafts through a
 //! `Binding::MtpDrafts` intrinsic plus a `carrier::next_inputs_drafts`
 //! retain/inject command, so the `[k]` drafts never round-tripped through the
-//! host. Both halves of that capability were REMOVED in the ptir refactor, so A
+//! host. Both halves of that capability were REMOVED in the ETA refactor, so A
 //! and B are now the SAME algorithm reached through two independently written
 //! call sites. The decode times printed below are therefore NOT a
 //! device-residency signal — A runs first and absorbs warm-up — and must not be

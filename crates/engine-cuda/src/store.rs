@@ -5,7 +5,7 @@
 //! token lands in is [`kv`]'s arithmetic, backend-neutral and host-tested;
 //! this module owns only what that arithmetic cannot: `cudaMalloc`, and the
 //! [`KvPool`]/[`RecurrentPool`] rows the dispatch arms resolve a cache id to.
-//! The split is design §6's `engine::store` / shell `store/` line, drawn here
+//! The split is design §6's `model_exec::store` / shell `store/` line, drawn here
 //! ahead of the module that will hold the first half.
 //!
 //! # Sizes come off the plan, not off a config
@@ -66,20 +66,20 @@ use crate::store::kv::{Facts, Paging};
 
 /// The neutral store's refusals, in this shell's vocabulary.
 ///
-/// **THE CONDITION IS SHARED AND THE SENTENCE IS NOT.** `engine::store` owns
+/// **THE CONDITION IS SHARED AND THE SENTENCE IS NOT.** `model_exec::store` owns
 /// the arithmetic that decides a lane overran its block or a value's width is
 /// symbolic; each shell owns how that reads to somebody holding a stack trace
 /// ("the shell reserved" here, "the load reserved" on the Metal plane). This
 /// is the one place the two meet, and it is a variant-for-variant map because
 /// both shells already carried these three under these names.
-impl From<engine::store::Fault> for Fault {
-    fn from(fault: engine::store::Fault) -> Fault {
+impl From<model_exec::store::Fault> for Fault {
+    fn from(fault: model_exec::store::Fault) -> Fault {
         match fault {
-            engine::store::Fault::Ceiling { what, need, have } => {
+            model_exec::store::Fault::Ceiling { what, need, have } => {
                 Fault::Ceiling { what, need, have }
             }
-            engine::store::Fault::Unbound { what } => Fault::Unbound { what },
-            engine::store::Fault::Straddled {
+            model_exec::store::Fault::Unbound { what } => Fault::Unbound { what },
+            model_exec::store::Fault::Straddled {
                 value,
                 node,
                 planned,
@@ -251,8 +251,8 @@ impl Seats {
 /// cells starting at `(page, token)` on each side. So the shell flattens the
 /// two spellings here rather than growing two loops that would drift.
 ///
-/// [`KvCopy::src_page_ids`]: engine::engine_api::transfer::KvCopy
-/// [`KvCopy::moves`]: engine::engine_api::transfer::KvCopy
+/// [`KvCopy::src_page_ids`]: engine::transfer::KvCopy
+/// [`KvCopy::moves`]: engine::transfer::KvCopy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Move {
     /// The page read.

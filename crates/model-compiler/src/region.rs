@@ -27,20 +27,27 @@
 //! it there is restoring an order rather than choosing one. [`hoist`] proves
 //! that of the plan in front of it instead of assuming it.
 
-use model_ir::{Def, Operands, Operation, Trace, Ty, ValueId};
+use model_ir::{Def, Operands, Operation, RowAxis, Trace, Ty, ValueId};
 
 use crate::compiled::{Lowering, Phase, Region};
 use crate::error::Error;
+use crate::unit::node_axis;
 use model_ir::ClassTable;
 
 /// The regions of a plan, in program order, covering every node exactly once.
 pub(crate) fn coalesce(trace: &Trace, classes: &ClassTable) -> Vec<Region> {
     let mut regions: Vec<Region> = Vec::new();
     let mut outs: Vec<ValueId> = Vec::new();
+    // The axis of the run currently open, alongside the mask and the phase.
+    // `None` is "nothing in this run has said yet", which a `Const`-shaped
+    // node leaves untouched — see `crate::unit` for why that is what keeps a
+    // one-axis plan's region table exactly the one P2 always built.
+    let mut open_axis: Option<RowAxis> = None;
 
     for (j, node) in trace.nodes.iter().enumerate() {
         let j = j as u32;
         let phase = phase_of(trace, node, &mut outs);
+        let axis = node_axis(trace, node, &mut outs);
         let collective = matches!(node.op, Operation::Collective(_));
         // `node_mask` is parallel to `trace.nodes`, so the index is the same
         // one — but this crate is a front door, and a plan whose sweep and
@@ -52,33 +59,44 @@ pub(crate) fn coalesce(trace: &Trace, classes: &ClassTable) -> Vec<Region> {
             .cloned()
             .unwrap_or_default();
 
+        // THE THIRD REASON A RUN BREAKS, AND THE STRONGEST. Phase splits host
+        // work from graph body; the mask splits two windows of one row space;
+        // an axis splits two ROW SPACES, whose counts come out of different
+        // window tables entirely. A node that names no axis constrains
+        // nothing and joins whatever is open (multimodal §1).
+        let joins = axis.is_none() || open_axis.is_none() || open_axis == axis;
         match regions.last_mut() {
-            Some(open) if open.phase == phase && open.mask == mask => {
+            Some(open) if open.phase == phase && open.mask == mask && joins => {
                 open.nodes.end = j + 1;
                 open.collective |= collective;
+                open_axis = open_axis.or(axis);
             }
-            _ => regions.push(Region {
-                nodes: j..j + 1,
-                mask,
-                phase,
-                // EVERY REGION, WITHOUT EXCEPTION, IN v1. Zero-row
-                // always-launch is the correctness mechanism and conditionals
-                // are the optimization (design §4); P3 is where the profile
-                // gets consulted and some of these become `Switch` or `If`.
-                lowering: Lowering::AlwaysLaunch,
-                // ONE STREAM, until P6 says otherwise. `crate::stream` builds
-                // the dep DAG over these regions and stamps the three fields
-                // below in place; a plan it finds nothing in keeps exactly
-                // what P2 wrote here, which is what "pays nothing" means.
-                stream: 0,
-                wait: Vec::new(),
-                open: None,
-                close: None,
-                // P6's other half, and deferred past it: SM partition is
-                // capture-baked, so a variant multiplies bodies (decision #14).
-                sm_hint: None,
-                collective,
-            }),
+            _ => {
+                regions.push(Region {
+                    nodes: j..j + 1,
+                    mask,
+                    phase,
+                    // EVERY REGION, WITHOUT EXCEPTION, IN v1. Zero-row
+                    // always-launch is the correctness mechanism and conditionals
+                    // are the optimization (design §4); P3 is where the profile
+                    // gets consulted and some of these become `Switch` or `If`.
+                    lowering: Lowering::AlwaysLaunch,
+                    // ONE STREAM, until P6 says otherwise. `crate::stream` builds
+                    // the dep DAG over these regions and stamps the three fields
+                    // below in place; a plan it finds nothing in keeps exactly
+                    // what P2 wrote here, which is what "pays nothing" means.
+                    stream: 0,
+                    wait: Vec::new(),
+                    open: None,
+                    close: None,
+                    // P6's other half, and deferred past it: SM partition is
+                    // capture-baked, so a variant multiplies bodies (decision #14).
+                    sm_hint: None,
+                    collective,
+                });
+                // A fresh run opens on this node's axis, `None` included.
+                open_axis = axis;
+            }
         }
     }
 

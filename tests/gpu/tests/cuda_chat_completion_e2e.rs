@@ -2,7 +2,7 @@
 //!
 //! The `chat-completion` inferlet is the default chat-generation path — prompt
 //! prefill, then a device-carried decode loop with an in-graph top-p sampler,
-//! all of it authored in `inferlet::ptir` — and this boots the standalone over
+//! all of it authored in `inferlet::eta` — and this boots the standalone over
 //! the real CUDA shell and asserts the continuation is coherent.
 //!
 //! It runs against `DECODE_ENVELOPE` and nothing wider, which is why it is a
@@ -95,7 +95,7 @@ async fn chat_completion_on_real_engine() -> Result<()> {
 
     pie.shutdown().await;
 
-    // Coherence gate: the migrated ptir path must attend the prompt and produce
+    // Coherence gate: the migrated ETA path must attend the prompt and produce
     // a non-empty continuation. "Paris" is the unambiguous factual answer for a
     // prefill that actually attends "The capital of France is".
     anyhow::ensure!(
@@ -107,6 +107,6 @@ async fn chat_completion_on_real_engine() -> Result<()> {
         lower.contains("paris"),
         "chat-completion e2e: continuation did not attend the prompt (expected 'Paris'): {out:?}"
     );
-    eprintln!("[chat-completion-e2e] GREEN — PTIR chat completion attended the prompt: {out:?}");
+    eprintln!("[chat-completion-e2e] GREEN — ETA chat completion attended the prompt: {out:?}");
     Ok(())
 }

@@ -37,9 +37,9 @@
 //! [`Run::tensor`]: crate::run::Run
 //! [`SlotTable`]: crate::run::SlotTable
 
-use engine::store::arena::rect;
 use kernels_cuda::Tensor;
 use model_compiler::ArenaMap;
+use model_exec::store::arena::rect;
 use model_ir::ValueId;
 
 use crate::device::Buffer;
@@ -77,11 +77,16 @@ impl Arena {
         self.store.bytes() as u64
     }
 
-    /// The table a fire of `tokens` rows over `lanes` requests resolves
-    /// through.
+    /// The table a fire of these row counts resolves through.
+    ///
+    /// **BOTH AXES' COUNTS, BECAUSE EVERY VALUE RESOLVES HERE.** A tower
+    /// rectangle is `Dim::Patches`-rowed and `Run::whole` reads it out of this
+    /// table like any other; a caller that handed over only the token pair
+    /// would size every one of them at zero and the failure would arrive a
+    /// launch later, inside a GEMM whose destination has no rows.
     #[must_use]
-    pub fn slots(&self, map: &ArenaMap, tokens: u64, lanes: u64) -> SlotTable {
-        carve(self.base(), map, tokens, lanes)
+    pub fn slots(&self, map: &ArenaMap, rows: model_compiler::FireRows) -> SlotTable {
+        carve(self.base(), map, rows)
     }
 
     /// Copy `into.len()` bytes back from an address inside this arena.
@@ -112,22 +117,22 @@ impl Arena {
 /// rectangle its root names, at the row count this fire has — is arithmetic,
 /// and a test that needed a GPU to check it would not be run.
 ///
-/// **THE RECTANGLE IS [`engine::store::arena::rect`]'s AND THE ADDITION IS
+/// **THE RECTANGLE IS [`model_exec::store::arena::rect`]'s AND THE ADDITION IS
 /// THIS SHELL'S**, which is the whole of what separated this function from
 /// its Metal twin. The offsets, the row expressions and the aliasing through
 /// `root` were the same arithmetic written twice; what is left here is the
 /// one line a CUDA view is — `base + offset`, a `u64` a kernel dereferences,
 /// where the Metal plane mints a bounds-checked handle row instead.
 #[must_use]
-pub fn carve(base: u64, map: &ArenaMap, tokens: u64, lanes: u64) -> SlotTable {
-    let mut rows: Vec<Option<Tensor>> = Vec::with_capacity(map.placements.len());
+pub fn carve(base: u64, map: &ArenaMap, rows: model_compiler::FireRows) -> SlotTable {
+    let mut cells: Vec<Option<Tensor>> = Vec::with_capacity(map.placements.len());
     for value in 0..map.placements.len() {
         let value = ValueId(value as u32);
-        rows.push(rect(map, value, tokens, lanes).map(|rect| {
+        cells.push(rect(map, value, rows).map(|rect| {
             Tensor::new(base + rect.offset, rect.rows, rect.width, rect.dtype)
         }));
     }
-    SlotTable(rows)
+    SlotTable(cells)
 }
 
 #[cfg(test)]
@@ -151,7 +156,7 @@ mod tests {
     #[test]
     fn every_op_output_resolves_and_nothing_else_does() {
         let (trace, compiled) = compiled();
-        let slots = carve(1 << 20, &compiled.arena, 13, 2);
+        let slots = carve(1 << 20, &compiled.arena, model_compiler::FireRows::text_only(13, 2));
 
         assert_eq!(slots.0.len(), trace.values.len(), "one row per trace value");
         for (at, decl) in trace.values.iter().enumerate() {
@@ -180,8 +185,8 @@ mod tests {
     #[test]
     fn a_rectangle_grows_with_the_fire_and_its_offset_does_not() {
         let (_, compiled) = compiled();
-        let small = carve(0, &compiled.arena, 1, 1);
-        let large = carve(0, &compiled.arena, 64, 4);
+        let small = carve(0, &compiled.arena, model_compiler::FireRows::text_only(1, 1));
+        let large = carve(0, &compiled.arena, model_compiler::FireRows::text_only(64, 4));
 
         let mut moved = 0;
         for (a, b) in small.0.iter().zip(&large.0) {
@@ -209,7 +214,7 @@ mod tests {
             .and_then(|seam| seam.values.first().copied())
             .expect("every traced plan carries an out seam");
 
-        let slots = carve(0, &compiled.arena, 7, 1);
+        let slots = carve(0, &compiled.arena, model_compiler::FireRows::text_only(7, 1));
         let logits = slots.0[out.0 as usize].expect("the out seam is an arena rectangle");
         assert_eq!(logits.rows, 7, "one row of logits per token row");
         assert_eq!(logits.width, 248_320, "the SKU's vocabulary");
@@ -219,7 +224,7 @@ mod tests {
     #[test]
     fn the_carve_fits_the_allocation_it_asks_for() {
         let (_, compiled) = compiled();
-        let slots = carve(0, &compiled.arena, 64, 4);
+        let slots = carve(0, &compiled.arena, model_compiler::FireRows::text_only(64, 4));
         for handle in slots.0.iter().flatten() {
             let end = handle.ptr
                 + handle.elements()

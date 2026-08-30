@@ -1,0 +1,507 @@
+# A pin of the extended corpus (`msl_corpus::extended_traces`) -- the traces
+# added to reach the ops, intrinsics, schedules and stages that
+# `corpus_stages()` never compiles.
+#
+# Source of truth: THIS COMPILER. Unlike `golden-{msl,cuda}/`, no C++ oracle
+# ever produced or reviewed these bytes -- they were never cross-checked against
+# a second implementation. They pin *what the emitters do today*, so that a
+# change to it shows up as a diff instead of passing unnoticed.
+#
+# A mismatch here is a question, not a verdict: decide whether the new output is
+# right, then re-pin with `PTIR_REGEN=1 cargo test -p pie-compiler-tests`.
+#
+# Where a kernel is digested, `bytes` and the hash cover what the *compiler*
+# generated: the hand-written device text under `crates/eta-compiler/runtime/` is
+# dropped first, so tuning a kernel does not re-pin every case. That the
+# emitters still splice those blocks in whole is
+# `every_live_device_file_is_spliced_into_a_kernel_verbatim`.
+=== extended_unary#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0x44e9adf791cff710
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=910 fnv1a64=0x9727b306407f9de2
+metal_grouped: ok bytes=3252 fnv1a64=0x83074597433b2150
+=== extended_unary#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1838 fnv1a64=0x481275f7d3fdce9c
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=919 fnv1a64=0x876c75000f33240d
+metal_grouped: ok bytes=3261 fnv1a64=0xe4980ffc4a68cfff
+=== extended_unary#0 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1838 fnv1a64=0xb400e5d2bb5014e1
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=919 fnv1a64=0x2d1bc6da52eec84a
+metal_grouped: ok bytes=3261 fnv1a64=0x0f8ebf44008b02fe
+=== extended_unary#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1838 fnv1a64=0x128eecc3e3f1666e
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=919 fnv1a64=0x25264b72641c315f
+metal_grouped: ok bytes=3261 fnv1a64=0x3a472a280f06e66d
+=== extended_unary#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1838 fnv1a64=0xbb9b9dae0d5ecb83
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=919 fnv1a64=0x7320f6cd27f9f884
+metal_grouped: ok bytes=3261 fnv1a64=0x7e0217b5b43fa484
+=== extended_unary#0 singleton#5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0x3676bf2555dc340a
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=935 fnv1a64=0xc53af8454d881f4e
+metal_grouped: ok bytes=3407 fnv1a64=0xd31a1f0325520a9c
+=== extended_unary#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
+cuda_fused: ok bytes=5330 fnv1a64=0xc587c1463bb753d8
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1786 fnv1a64=0xf4eae9e1afa7eb97
+metal_grouped: ok bytes=4823 fnv1a64=0x3778131317c5cb2b
+=== extended_minmax#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0xadf666ff7ba1a25a
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1196 fnv1a64=0x406dfb63bf7a5336
+metal_grouped: ok bytes=4202 fnv1a64=0xe28224310922af64
+=== extended_minmax#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0xf06446a46f8c0cc0
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1196 fnv1a64=0x4abbf5f38a6613fe
+metal_grouped: ok bytes=4202 fnv1a64=0x253dac7bacee40fe
+=== extended_minmax#0 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+cuda_fused: ok bytes=1852 fnv1a64=0xce8564daddd87fea
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1219 fnv1a64=0x435e4a8a354f469d
+metal_grouped: ok bytes=4225 fnv1a64=0xb9018bc50de64529
+=== extended_minmax#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+cuda_fused: ok bytes=1852 fnv1a64=0x4e1fb1536864898e
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1219 fnv1a64=0xe447dfa1fd45b9d5
+metal_grouped: ok bytes=4225 fnv1a64=0x3186a5b1b5165b4d
+=== extended_minmax#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1825 fnv1a64=0xefab46af8b214bbf
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1206 fnv1a64=0xb3a5ce4805f02e1c
+metal_grouped: ok bytes=4212 fnv1a64=0xc1be63a1f7e3223a
+=== extended_minmax#0 singleton#5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xc52760d7c40b9061
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1221 fnv1a64=0xefc0a9f75a1d48be
+metal_grouped: ok bytes=4357 fnv1a64=0xe46208b910e9a361
+=== extended_minmax#0 singleton#6
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0x11ea7704633d9560
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1221 fnv1a64=0x6d8faf6cbf2cd5ee
+metal_grouped: ok bytes=4357 fnv1a64=0x11af07e680bd915c
+=== extended_minmax#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=7 inputs=0 outputs=0 sinks=2
+cuda_fused: ok bytes=7653 fnv1a64=0x1ae2ac993590746f
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=2280 fnv1a64=0xda34ff993fb3d133
+metal_grouped: ok bytes=6224 fnv1a64=0xae5b245dc9378534
+=== extended_predicates#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0x072028746d7c2591
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1053 fnv1a64=0x240b04e26aec01e3
+metal_grouped: ok bytes=3727 fnv1a64=0x6a3cc6c6fdbd88d8
+=== extended_predicates#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0x9a403ca070171e3b
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1053 fnv1a64=0x5924fc6ee92ded35
+metal_grouped: ok bytes=3727 fnv1a64=0xa9bead36246a9900
+=== extended_predicates#0 singleton#2
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+cuda_fused: ok bytes=1852 fnv1a64=0x0b2cdea018df7f13
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1076 fnv1a64=0x1d45f5f20f67c278
+metal_grouped: ok bytes=3750 fnv1a64=0x90b954c6f3bc0f3b
+=== extended_predicates#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+cuda_fused: ok bytes=1852 fnv1a64=0x274af83004ea0799
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1076 fnv1a64=0x6265db2d5db28f40
+metal_grouped: ok bytes=3750 fnv1a64=0x2dbf5c8bf4580017
+=== extended_predicates#0 singleton#4
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+cuda_fused: ok bytes=1852 fnv1a64=0xa848a5426669b04a
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1076 fnv1a64=0x335872c48db612d9
+metal_grouped: ok bytes=3750 fnv1a64=0xf6346e637a198516
+=== extended_predicates#0 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+cuda_fused: ok bytes=1852 fnv1a64=0x03e112520b7bfd7b
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1076 fnv1a64=0x710048b9ace88572
+metal_grouped: ok bytes=3750 fnv1a64=0x4e2213c254f81afd
+=== extended_predicates#0 singleton#6
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1839 fnv1a64=0x862dd46e920195c1
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1063 fnv1a64=0xc4a2d77b938d6e58
+metal_grouped: ok bytes=3737 fnv1a64=0xc7e3482ed0406245
+=== extended_predicates#0 singleton#7
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+cuda_fused: ok bytes=1852 fnv1a64=0xf851f5901b60d9d9
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1076 fnv1a64=0xb8310ad10617fe90
+metal_grouped: ok bytes=3750 fnv1a64=0x4b540d8ebb0aae81
+=== extended_predicates#0 singleton#8
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0x98638bcfcf5225ce
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1078 fnv1a64=0xed6a5aeb76c737b7
+metal_grouped: ok bytes=3882 fnv1a64=0x2c0a1276b422875d
+=== extended_predicates#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=9 inputs=0 outputs=0 sinks=1
+cuda_fused: ok bytes=6525 fnv1a64=0xdefa18dac443d72b
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=2507 fnv1a64=0x115080e4d56ba1e4
+metal_grouped: ok bytes=6215 fnv1a64=0x8923237fe0366bfa
+=== extended_transpose_cumsum#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0xce2856a63a060c82
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1196 fnv1a64=0x405718e713cb74ee
+metal_grouped: ok bytes=4202 fnv1a64=0xd306ec7fcd144e1c
+=== extended_transpose_cumsum#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1836 fnv1a64=0xa0465a331bd0f15d
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1206 fnv1a64=0xc3a3a195cea9474d
+metal_grouped: ok bytes=4212 fnv1a64=0x1813af3e5a42a0ab
+=== extended_transpose_cumsum#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0x637632d6e502d605
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1221 fnv1a64=0xf7a799409bae0353
+metal_grouped: ok bytes=4357 fnv1a64=0x4ed227967bed1dc1
+=== extended_transpose_cumsum#0 singleton#3
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0xd99abdd590fa12ce
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1196 fnv1a64=0x42118ddce705d530
+metal_grouped: ok bytes=4202 fnv1a64=0x059d30a3018d5e30
+=== extended_transpose_cumsum#0 singleton#4
+region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: err generated region contains a non-generated boundary (scan)
+cuda_validate: ok=false error=generated region contains a non-generated boundary (scan)
+cuda_second_party: false
+metal_fused: ok bytes=1206 fnv1a64=0x8ab7618b1e1b72e0
+metal_grouped: ok bytes=4212 fnv1a64=0x261a5fe2ea744d70
+=== extended_transpose_cumsum#0 singleton#5
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xa17be8d4bc9a89b3
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1221 fnv1a64=0xe12a63ed51ffed71
+metal_grouped: ok bytes=4357 fnv1a64=0xc1de0d1ceb368817
+=== extended_transpose_cumsum#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=4 inputs=0 outputs=1 sinks=1
+cuda_fused: ok bytes=4972 fnv1a64=0x3dc214026e6a6271
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1720 fnv1a64=0x13a77683b021f576
+metal_grouped: ok bytes=5195 fnv1a64=0xc7666b1f71c2746e
+=== extended_transpose_cumsum#0 fused#1
+region: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: err generated region contains a non-generated boundary (scan)
+cuda_validate: ok=false error=generated region contains a non-generated boundary (scan)
+cuda_second_party: false
+metal_fused: ok bytes=1206 fnv1a64=0x7d79852f414f97e5
+metal_grouped: ok bytes=4212 fnv1a64=0x5ea76087baedcbf9
+=== extended_transpose_cumsum#0 fused#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xae4c2271850a1aa8
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1221 fnv1a64=0xc87b586bd47162ec
+metal_grouped: ok bytes=4357 fnv1a64=0xee47de13bfdce062
+=== extended_gather_scatter#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0x51ed028ef90b9d13
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1339 fnv1a64=0x95611486d8242fdf
+metal_grouped: ok bytes=4677 fnv1a64=0x2fd005463e9b3bcc
+=== extended_gather_scatter#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0xa176e2da4bf28bdd
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1339 fnv1a64=0xa3e4654ead0243d9
+metal_grouped: ok bytes=4677 fnv1a64=0x2bdf8e210286da50
+=== extended_gather_scatter#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0x8d2793b2545cbb27
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1339 fnv1a64=0x45743941cb3214e3
+metal_grouped: ok bytes=4677 fnv1a64=0xe5415fa585864750
+=== extended_gather_scatter#0 singleton#3
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
+cuda_fused: ok bytes=1870 fnv1a64=0x9f7b65a98cd9330b
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1362 fnv1a64=0xc6b222d918858c29
+metal_grouped: ok bytes=4700 fnv1a64=0x956e8138fc199ea2
+=== extended_gather_scatter#0 singleton#4
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xa23cd3d9e9b73256
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1364 fnv1a64=0xa616e8b4d02983f4
+metal_grouped: ok bytes=4832 fnv1a64=0x3913cab0d57f58fb
+=== extended_gather_scatter#0 singleton#5
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
+cuda_fused: ok bytes=2030 fnv1a64=0x86205d8a204ea134
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1375 fnv1a64=0x6258fdabb83bcc55
+metal_grouped: ok bytes=4713 fnv1a64=0x717a6d8e622ccb54
+=== extended_gather_scatter#0 singleton#6
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xfcd0fea68b7afb37
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1364 fnv1a64=0x5d106bf500907800
+metal_grouped: ok bytes=4832 fnv1a64=0x5409f959bb882ac2
+=== extended_gather_scatter#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=7 inputs=0 outputs=0 sinks=2
+cuda_fused: ok bytes=8098 fnv1a64=0x17910cd720011400
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=2426 fnv1a64=0x0e371dfcbffc2fda
+metal_grouped: ok bytes=6702 fnv1a64=0xaca273fdac699e36
+=== extended_rng_stream#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=1827 fnv1a64=0xe55cc9625d582c7d
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=766 fnv1a64=0xbe73d5725d343aa1
+metal_grouped: ok bytes=2775 fnv1a64=0x7e71a8da6abcaa87
+=== extended_rng_stream#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xda8a7cf70e17ab4e
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=793 fnv1a64=0xde55dce828873238
+metal_grouped: ok bytes=2932 fnv1a64=0x937479c82cbdd58d
+=== extended_rng_stream#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
+cuda_fused: ok bytes=3899 fnv1a64=0x45147bd7fa8da663
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=954 fnv1a64=0x2a7892bb854911ff
+metal_grouped: ok bytes=3206 fnv1a64=0x077e0220df615540
+=== extended_hierarchical#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0xf970cb732f79069e
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=910 fnv1a64=0xfc9dbe1cb2816f94
+metal_grouped: ok bytes=3252 fnv1a64=0xa8e9f23cf508e2b2
+=== extended_hierarchical#0 singleton#1
+region: library=0 library_op=0 schedule=2 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1825 fnv1a64=0x55ffe13318511bf3
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=920 fnv1a64=0x0a8809f5b34bee9c
+metal_grouped: ok bytes=3262 fnv1a64=0x915c8156238c8232
+=== extended_hierarchical#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xc459a02787cc15d1
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=935 fnv1a64=0x90d06ec9d84f7d8d
+metal_grouped: ok bytes=3407 fnv1a64=0x10254661e0e79f4b
+=== extended_hierarchical#0 fused#0
+region: library=0 library_op=0 schedule=2 nodes=3 inputs=0 outputs=0 sinks=1
+cuda_fused: ok bytes=4429 fnv1a64=0x859fb3bfbbf5b137
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1271 fnv1a64=0x9d161879e8db6046
+metal_grouped: ok bytes=3969 fnv1a64=0xcdce32e0e310dc4a
+=== extended_hidden#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2154 fnv1a64=0x4419d9572363009d
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: err Metal binds only the logits buffer for intrinsics; intrinsic id 2 has no binding
+metal_grouped: err Metal binds only the logits buffer for intrinsics; intrinsic id 2 has no binding
+=== extended_hidden#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1825 fnv1a64=0x06196f3eb28a6a28
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=778 fnv1a64=0xac6318c924f2e168
+metal_grouped: ok bytes=2787 fnv1a64=0x15c9ac45bf50dab2
+=== extended_hidden#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xe43198c342d05d8a
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=793 fnv1a64=0xd3e2b78204823bf2
+metal_grouped: ok bytes=2932 fnv1a64=0x0e744d5e096faacb
+=== extended_hidden#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=0 sinks=1
+cuda_fused: ok bytes=4509 fnv1a64=0x05189bf4111f6b30
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: err Metal binds only the logits buffer for intrinsics; intrinsic id 2 has no binding
+metal_grouped: err Metal binds only the logits buffer for intrinsics; intrinsic id 2 has no binding
+=== extended_on_attn#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2217 fnv1a64=0x2028ed98ff50bbad
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: err Metal binds only the logits buffer for intrinsics; intrinsic id 5 has no binding
+metal_grouped: err Metal binds only the logits buffer for intrinsics; intrinsic id 5 has no binding
+=== extended_on_attn#0 singleton#1
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0x2f632b057e91b3ea
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=793 fnv1a64=0x1fb041c8f8ef4d9c
+metal_grouped: ok bytes=2932 fnv1a64=0x17c34e2361000dc9
+=== extended_on_attn#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
+cuda_fused: ok bytes=4289 fnv1a64=0x82cf639f0ef1ad53
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: err Metal binds only the logits buffer for intrinsics; intrinsic id 5 has no binding
+metal_grouped: err Metal binds only the logits buffer for intrinsics; intrinsic id 5 has no binding
+=== extended_attn_score#0 singleton#0
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2154 fnv1a64=0x1c4ece7d4f896db3
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=822 fnv1a64=0xdfa86346f1733026
+metal_grouped: err Metal binds only the logits buffer for intrinsics; intrinsic id 7 has no binding
+=== extended_attn_score#0 singleton#1
+region: library=0 library_op=0 schedule=1 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: ok bytes=1825 fnv1a64=0x426f5f5b3c558922
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=778 fnv1a64=0x612c196bf255be76
+metal_grouped: ok bytes=2787 fnv1a64=0x198c02cc5a36a9bc
+=== extended_attn_score#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0x1b314a018563d718
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=793 fnv1a64=0x3eac5f449f6296b8
+metal_grouped: ok bytes=2932 fnv1a64=0xe20334c88c1e666d
+=== extended_attn_score#0 fused#0
+region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=0 sinks=1
+cuda_fused: ok bytes=4509 fnv1a64=0x7d4331954ca7854e
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=1183 fnv1a64=0x452f911faf59f42f
+metal_grouped: err Metal binds only the logits buffer for intrinsics; intrinsic id 7 has no binding
+=== extended_metal_identity#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0xacab4e25bdc7a372
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=910 fnv1a64=0x13f8eff2c962a10c
+metal_grouped: ok bytes=3252 fnv1a64=0x3412e7422189e7ca
+=== extended_metal_identity#0 singleton#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: err generated region contains a non-generated boundary (second_party)
+cuda_validate: ok=false error=generated region contains a non-generated boundary (second_party)
+cuda_second_party: false
+metal_fused: ok bytes=921 fnv1a64=0x114783df7106f5aa
+metal_grouped: ok bytes=3263 fnv1a64=0x8655da630e6a7c40
+=== extended_metal_identity#0 singleton#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xf3596954bd7a1855
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=935 fnv1a64=0x9367727e91efa0e5
+metal_grouped: ok bytes=3407 fnv1a64=0x6baf586a6c241163
+=== extended_metal_identity#0 fused#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0xacab4e25bdc7a372
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=910 fnv1a64=0x13f8eff2c962a10c
+metal_grouped: ok bytes=3252 fnv1a64=0x3412e7422189e7ca
+=== extended_metal_identity#0 fused#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
+cuda_fused: err generated region contains a non-generated boundary (second_party)
+cuda_validate: ok=false error=generated region contains a non-generated boundary (second_party)
+cuda_second_party: false
+metal_fused: ok bytes=921 fnv1a64=0x114783df7106f5aa
+metal_grouped: ok bytes=3263 fnv1a64=0x8655da630e6a7c40
+=== extended_metal_identity#0 fused#2
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
+cuda_fused: ok bytes=3614 fnv1a64=0xf3596954bd7a1855
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=935 fnv1a64=0x9367727e91efa0e5
+metal_grouped: ok bytes=3407 fnv1a64=0x6baf586a6c241163
+=== extended_metal_discard#0 singleton#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0x9873a787efaf9668
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=768 fnv1a64=0x964c346e599dcc87
+metal_grouped: ok bytes=2777 fnv1a64=0xd28f99648222eb09
+=== extended_metal_discard#0 singleton#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+cuda_fused: err generated region contains a non-generated boundary (second_party)
+cuda_validate: ok=false error=generated region contains a non-generated boundary (second_party)
+cuda_second_party: false
+metal_fused: ok bytes=766 fnv1a64=0xcafea1994b4dd6d0
+metal_grouped: ok bytes=2775 fnv1a64=0x751a68bb076844be
+=== extended_metal_discard#0 fused#0
+region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
+cuda_fused: ok bytes=2074 fnv1a64=0x9873a787efaf9668
+cuda_validate: ok=true error=
+cuda_second_party: false
+metal_fused: ok bytes=768 fnv1a64=0x964c346e599dcc87
+metal_grouped: ok bytes=2777 fnv1a64=0xd28f99648222eb09
+=== extended_metal_discard#0 fused#1
+region: library=1 library_op=5 schedule=3 nodes=1 inputs=1 outputs=0 sinks=0
+cuda_fused: err generated region contains a non-generated boundary (second_party)
+cuda_validate: ok=false error=generated region contains a non-generated boundary (second_party)
+cuda_second_party: false
+metal_fused: ok bytes=766 fnv1a64=0xcafea1994b4dd6d0
+metal_grouped: ok bytes=2775 fnv1a64=0x751a68bb076844be

@@ -1,5 +1,5 @@
+use checkpoint::contract::{Expr, ModelContract, TensorType};
 use model_dsl::Dtype;
-use model_loader::contract::{Expr, ModelContract, TensorType};
 
 use super::model::{Mlp, Model};
 use crate::contract::{ALIGNMENT, ModelError, copy, declare, fused};

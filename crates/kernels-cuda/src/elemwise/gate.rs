@@ -2,7 +2,7 @@
 //! lived beside `Mlp` in the old plane (its unit still does); the IR gives
 //! the family its own file, one entry per variant like every other.
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
 use crate::tensor::Tensor;
@@ -11,7 +11,7 @@ const BLOCK: u32 = 256;
 
 /// `x *= sigmoid(gate)`, per element, in place on `x` (the IR aliases
 /// `x_out` onto `x`).
-pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, x: &mut Tensor) -> Result<(), KernelError> {
+pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.gate_sigmoid_mul";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(gate.dtype, x.dtype, "the gate rides the rectangle's dtype");

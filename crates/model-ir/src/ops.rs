@@ -34,7 +34,7 @@ pub mod linear;
 pub use attn::Attention;
 pub use collective::Collective;
 pub use custom_cuda::CustomCuda;
-pub use elemwise::Elementwise;
+pub use elemwise::{Elementwise, MropeForm};
 pub use layout::Layout;
 pub use linear::Linear;
 

@@ -1,0 +1,94 @@
+[package]
+name = "eta-exec"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The ETA channel plane, in Rust: launch-package adoption, the channel ring, the reference pass, and every bind-time derivation a device shell needs. Backend-agnostic — the CUDA and Metal shells both read it."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "eta_exec"
+path = "src/lib.rs"
+
+# This crate can afford the workspace lints in full, and that is the point of
+# it being a crate. `engine-metal` and `engine-cuda` both opt OUT of
+# `[lints] workspace = true` because `unsafe_code = "forbid"` is violated by
+# construction — every objc2 message send, every `cudarc::*::sys` call. Nothing
+# here sends a message or calls a driver: the whole layer is arithmetic over
+# `#[repr(C)]` records and `Vec`s. So the forbid is free, and it is worth
+# having, because it is the mechanical proof of the claim this crate makes:
+# that the ETA plane needs no device.
+[lints]
+workspace = true
+
+[dependencies]
+# The op table, dtypes, intrinsic ids, the port registry and the canonical RNG
+# contract. `eval_op`'s numerics are a contract, not an implementation, and
+# this is where the contract is written down.
+eta-ir = { path = "../eta-ir" }
+
+# WAS A DEV-DEPENDENCY, and the sentence that kept it there was right about the
+# layering and wrong about what follows from it: "a regular dependency would
+# invert the layering -- the compiler produces what this crate consumes."
+#
+# The inversion it names is real for `codegen` and `eval`. It is not what this
+# crate mostly reaches for. What it needs is `plan` -- the backend-neutral
+# middle end, whose own docs say "backends consume the result and supply only
+# code generation": the lane-table ABI this crate PACKS, the version numbers it
+# keys a compiled-module cache on. That is vocabulary both ends must agree on,
+# not machinery this crate drives, and the arrow does not invert by naming it.
+#
+# Refusing the whole crate to keep out the rest cost five copies in PRODUCTION
+# code -- `lane::{ABI_VERSION, Header, Record, ChannelSlot}`,
+# `identity::{COMPILER_VERSION, REGION_PLAN_VERSION}`, `status::FAULT_CLASSES`
+# -- each with a drift test whose doc explained why the copy was safe. A copy
+# that is only safe because something watches it is a copy that costs the watch.
+#
+# ONE OF THE FIVE IS NOT LIKE THE OTHERS, and it is worth naming rather than
+# smoothing over: `status::FAULT_CLASSES` mirrors `codegen::fault`, which is
+# genuinely the emitter's -- `metal::effects` and `metal::fused` write those
+# codes INTO the kernels. The engine needs them to decode what a kernel
+# reported, so it is not vocabulary the two share, it is a decision the emitter
+# made that the engine has to be told. The end state for that one is a field on
+# the emitted artifact, not an import; importing it is what this line does
+# today and it is strictly better than the copy, but it is not where it lands.
+#
+# SINCE THEN THE EDGE GREW A SECOND HALF, and it is `codegen` — the module the
+# paragraph above says the inversion is real for. `LaunchPackage` and its
+# lineage moved from the engine contract to their producer (`codegen::launch`),
+# taking `EmittedKernel` and `KernelKind` (`codegen::program`) and
+# `RegionAnalysis` (`codegen::cuda::region_analysis`) with them, so eight files
+# in this crate name `codegen` in PRODUCTION code now.
+#
+# That is not the inversion the old sentence feared, and the reason is the one
+# it already gave for `plan`: an ARTIFACT is vocabulary both ends must agree
+# on, not machinery this crate drives. `codegen::launch` declares what an
+# engine executes; nothing under it plans, emits, or compiles anything. The
+# import that would invert the layering is `emit_program`, and this crate does
+# not call it — the runtime does, and hands the result over.
+#
+# THE PARAGRAPH THAT USED TO CLOSE THIS COMMENT IS GONE, and it is worth
+# saying why rather than letting it vanish. It read: "`lib.rs` re-exports this
+# crate for the same reason it re-exports the engine contract: the shells hold
+# `eta-compiler` as a DEV edge on purpose, and a `LaunchStagePlan` in their
+# production code has to arrive through here." Both halves of that stopped
+# being true in the same pass. There is no `pub use eta_compiler;` any more —
+# a shell that reads a `LaunchStagePlan` in production declares `eta-compiler`
+# in production, which is the honest manifest and which its own line now says
+# — and there is no engine-contract edge here to be the "same reason":
+# `eta-exec` names the contract crate nowhere, by rule.
+eta-compiler = { path = "../eta-compiler" }
+
+# WHAT IS NOT HERE. The crate this one was carved out of declared the engine
+# contract, and this half never used it: the launch package moved to its
+# producer above, so the only two mentions left in 4107 lines were a re-export
+# and a sentence in a comment. The rule is now stated rather than measured —
+# the ETA execution substrate does not name the runtime↔engine contract — and
+# it costs nothing to keep, because there was nothing to give up.
+#
+# The model-plane toolchain (`model-ir`, `model-compiler`, and the dispatch
+# contract that used to be `kernels` and is `model-exec`'s now) is not
+# here either, for the plainer reason that it never was: those edges belonged
+# to `fire`/`store`/`law`, which are `model-exec` now.

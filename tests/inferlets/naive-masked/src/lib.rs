@@ -11,7 +11,7 @@
 //! the mask binding plus the mask-evolution epilogue ops (iota/le/put) —
 //! the attention-path swap is the measured object.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use inferlet::{Result, model as wit_model};
 use serde::{Deserialize, Serialize};
 

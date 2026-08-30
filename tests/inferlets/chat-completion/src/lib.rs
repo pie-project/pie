@@ -2,13 +2,13 @@
 //!
 //! The prompt is prefilled in one forward pass. A device-carried decode loop
 //! then applies temperature scaling, nucleus filtering, and Gumbel-max sampling
-//! in the PTIR epilogue.
+//! in the ETA epilogue.
 //!
 //! The host reads each sampled token for streaming detokenization and stop-token
 //! handling; the sampled token itself remains device-carried into the next pass.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 
 // Qwen3-0.6B

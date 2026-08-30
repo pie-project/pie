@@ -35,8 +35,8 @@
 //! than hidden: a fused single-launch form would keep the waist in registers
 //! and is what a rank-diverse deployment should measure next.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
@@ -109,9 +109,9 @@ pub struct Segments {
 ///
 /// # Errors
 ///
-/// [`KernelError::Backend`] for banks whose widths do not divide into a
+/// [`Error::Backend`] for banks whose widths do not divide into a
 /// common rank, for a bank pair that names two different adapter counts, or
-/// for a fire past the GEMV's grid; [`KernelError::DtypeUnsupported`] for an
+/// for a fire past the GEMV's grid; [`Error::DtypeUnsupported`] for an
 /// activation this plane has no instantiation for.
 pub fn correct(
     ctx: &Ctx,
@@ -121,7 +121,7 @@ pub fn correct(
     routes: Tensor,
     y: &mut Tensor,
     segments: Option<Segments>,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "linear.lora_correct";
 
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });

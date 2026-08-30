@@ -34,6 +34,26 @@
 //! view recorded at load stays the bytes a later fire reads. Registering the
 //! thirty-second adapter moves nothing.
 //!
+//! # ONE ALLOCATION, AND A STREAMED LOAD STILL ONLY HAS ONE
+//!
+//! A load whose `device_weight_budget` cannot hold its routed banks
+//! (`crate::experts`) does not get a second device allocation and does not get
+//! a second table. What it gets is a smaller RESERVATION for the bands it
+//! streams — `slots` expert seats where the plan declares `experts` of them,
+//! which is [`places`] reading [`Plan::resident`] and nothing more — and one
+//! host `Vec<u8>` holding those bands whole, which the landing sink fills
+//! instead of the store. The weight rows are minted exactly as they always
+//! were: a `Tensor` over the seats, at the same alignment, resolved through
+//! the same handle table. Every kernel that reads one computes
+//! `base + e * stride` and is told nothing, because between two command
+//! buffers the host has rewritten `e` to name a SEAT (`crate::experts`'s
+//! header is where that argument lives).
+//!
+//! So the two facts this module's header opens with are both still true, and
+//! the third — that the store never moves — is what makes the whole mechanism
+//! legal: a seat is written in place, at a fixed address, while no command
+//! buffer is running.
+//!
 //! # A weight row is a HANDLE, and that is what "stability" means here
 //!
 //! **THE CUDA SIBLING'S ROWS ARE ADDRESSES; THESE ARE TABLE ROWS.** A
@@ -78,30 +98,40 @@
 //! alignment and the tile budget — but the arena handed to the executor is a
 //! `Vec<u8>`, so `ArenaBacking::runs_named_kernels` is false and every cast
 //! runs host-side. Here that is not a temporary state of affairs the way it
-//! is on the CUDA side: `model_loader::executor` ships a `cuda` arm and no
-//! metal one, so there is no device path to fall back FROM. The mask the
-//! loader admits for this backend (`METAL_TILE_MAP_MASK`) is chosen on
-//! exactly that basis, and every transform it admits has a host
-//! implementation. For the SKUs this shell serves today it is a handful of
-//! bf16→f32 widenings on norm scales.
+//! is on the CUDA side: there is one device arena for load transforms in this
+//! tree and it is `engine-cuda`'s `weights::arena`, with no metal twin, so
+//! there is no device path to fall back FROM. (It stood in `checkpoint`'s
+//! `executor` behind a `cuda` feature until it moved to the crate that owns
+//! the device; the seam it plugs into, `ArenaBacking`, is still the loader's
+//! and is still backend-neutral.) The mask the loader admits for this backend
+//! (`METAL_TILE_MAP_MASK`) is chosen on exactly that basis, and every
+//! transform it admits has a host implementation. For the SKUs this shell
+//! serves today it is a handful of bf16→f32 widenings on norm scales.
 //!
 //! [`Handles`]: crate::device::Handles
 //! [`Handles::seal`]: crate::device::Handles::seal
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+// The two readers. `zt` comes in by module because its door is spelled
+// `parse` — the module path is what says what is parsed, and a bare `parse`
+// beside `parse_metadata` would say nothing about which of the two doors
+// this line opened.
+use checkpoint::file::read::parse_metadata;
+use checkpoint::file::zt;
+use checkpoint::contract::ModelContract;
+use checkpoint::error::Error as LoadError;
+use checkpoint::executor::{Execution, sink::TensorSink};
+use checkpoint::plan::{LoadPlan, StorageTarget, compile};
+use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_metal::Tensor;
 use model_ir::{Dtype, ParamSource, Trace};
-use model_loader::checkpoint;
-use model_loader::contract::ModelContract;
-use model_loader::error::Error as LoadError;
-use model_loader::executor::{Execution, sink::TensorSink};
-use model_loader::plan::{StorageTarget, compile};
-use model_loader::types::BackendKind;
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
+use crate::experts::{Attachments, Plan, Tier};
 use crate::run::{WeightRow, WeightTable};
 
 /// What a matrix operand wants, and what a Metal buffer's own base is already
@@ -109,7 +139,7 @@ use crate::run::{WeightRow, WeightTable};
 /// would have been. The same number the loader's `StorageTarget` states for
 /// this backend, for the same reason; `newBufferWithLength:` returns
 /// page-aligned storage, so the constant is about the VIEWS inside it.
-const ALIGN: u64 = 256;
+pub(crate) const ALIGN: u64 = 256;
 
 /// One plane of a registered adapter, as the caller hands it over.
 ///
@@ -135,6 +165,19 @@ pub struct AdapterPlane<'a> {
 pub struct Weights {
     store: Buffer,
     table: WeightTable,
+    /// **The routed-expert tier, opened only for a streamed load**
+    /// (`crate::experts`): the host band table, the wired slabs, and the seat
+    /// bookkeeping the segment cut drives.
+    ///
+    /// `None` is full residency and is what every load in this workspace does
+    /// today; everything downstream asks this field whether a fire is cut at
+    /// all, so a full-residency load pays nothing for the mechanism existing.
+    ///
+    /// A `RefCell` because the swap happens INSIDE the walk — `walk_once`
+    /// takes `&self`, the encode sink takes `&self`, and what moves between
+    /// two segments is seats. The cell's borrow is taken and dropped inside
+    /// one cut, between two command buffers, on the lane thread.
+    tier: Option<RefCell<Tier>>,
     /// Bank name -> (param index, adapters, bytes per adapter slot). Built at
     /// load off `ParamSource::Registered`, which is the only place a bank is
     /// declared; `register_adapter` is a lookup in here and a write.
@@ -169,10 +212,14 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
         .map(|(param, place)| {
             let adapters =
                 u32::try_from(param.shape.first().copied().unwrap_or(0)).unwrap_or(u32::MAX);
+            // The DECLARED plane, not the reserved one: an adapter bank is
+            // `ParamSource::Registered` and is never routed, so the two are
+            // equal — and reading `full` is what keeps them equal the day a
+            // plan states a bank that is both.
             let slot = if adapters == 0 {
                 0
             } else {
-                place.bytes / u64::from(adapters)
+                place.full / u64::from(adapters)
             };
             (
                 param.name.clone(),
@@ -212,14 +259,12 @@ impl Weights {
         trace: &Trace,
         contract: &ModelContract,
         path: &Path,
+        plan: &Plan,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
-            (checkpoint::read::parse_checkpoint_metadata(path)?, path)
+            (parse_metadata(path)?, path)
         } else {
-            (
-                checkpoint::zt::parse_checkpoint(path)?,
-                path.parent().unwrap_or(Path::new(".")),
-            )
+            (zt::parse(path)?, path.parent().unwrap_or(Path::new(".")))
         };
 
         // tp=1: the plan's `Shard::Cut` segments still describe the whole
@@ -229,7 +274,7 @@ impl Weights {
         let target = StorageTarget::for_backend(BackendKind::Metal, 0, 1);
         let landing = compile(&metadata, contract, target)?;
 
-        let places = places(trace)?;
+        let places = places(trace, plan)?;
         let total = places.last().map_or(0, |p| p.offset + p.reserved);
         let mut store = Buffer::zeroed(device, total)?;
 
@@ -246,8 +291,15 @@ impl Weights {
             .enumerate()
             .map(|(at, param)| (param.name.as_str(), at))
             .collect();
+        // The host band table, sized off the plan and empty for a
+        // full-residency load — where a streamed band's bytes go instead of
+        // into the store.
+        let mut host =
+            vec![0u8; usize::try_from(plan.source_bytes()).unwrap_or(0)];
         let mut sink = Landing {
             store: &mut store,
+            host: &mut host,
+            plan,
             places: &places,
             index: &index,
             landed: vec![false; places.len()],
@@ -259,6 +311,8 @@ impl Weights {
 
         let landed = sink.landed;
         drop(scratch);
+
+        let pairings = pairings(&landing, &index)?;
 
         let mut table = Vec::with_capacity(places.len());
         for (at, place) in places.iter().enumerate() {
@@ -275,24 +329,54 @@ impl Weights {
                     why: "is a plan param the load contract never published",
                 });
             }
-            // Every row of this catalog is one dense handle. A split-plane
-            // bank (`WeightRow::Planes`) arrives the day a SKU with mxfp4
-            // banks does, through the load plan's `attachments` — the
-            // pairing is stated there rather than guessed from a `.scales`
-            // suffix, which is how a scale tensor gets read as the wrong
-            // one's.
-            table.push(Some(WeightRow::Dense(Tensor::new(
-                handles.bind(&store, place.offset, place.bytes)?,
-                place.rows,
-                place.width,
-                place.dtype,
-            ))));
+            let dense = |place: &Place| -> Result<Tensor> {
+                Ok(Tensor::new(
+                    handles.bind(&store, place.offset, place.bytes)?,
+                    place.rows,
+                    place.width,
+                    place.dtype,
+                ))
+            };
+            table.push(Some(match pairings.get(trace.params[at].name.as_str()) {
+                Some(pairing) => WeightRow::Planes(kernels_metal::Bank {
+                    codes: dense(place)?,
+                    scales: dense(&places[pairing.scales])?,
+                    biases: pairing.biases.map(|at| dense(&places[at])).transpose()?,
+                    group: pairing.group,
+                    bits: pairing.bits,
+                }),
+                None => WeightRow::Dense(dense(place)?),
+            }));
         }
+        // **THE TIER IS OPENED AFTER THE LANDING AND BEFORE THE FIRST FIRE**,
+        // which is the only instant where both halves exist: the host table is
+        // full, the store's seats are reserved and still zeroed, and no
+        // command buffer has been committed. `Tier::open` copies the identity
+        // prefix in, so a load that never routes outside it never copies again.
+        let tier = plan
+            .streams()
+            .then(|| {
+                let offsets: Vec<u64> = places.iter().map(|place| place.offset).collect();
+                Tier::open(plan, &store, host, &offsets).map(RefCell::new)
+            })
+            .transpose()?;
         Ok(Weights {
             store,
             table: WeightTable(table),
+            tier,
             banks: banks(trace, &places),
         })
+    }
+
+    /// **The routed-expert tier this load opened, or `None` for a
+    /// full-residency one.**
+    ///
+    /// The one question `serve` asks to decide whether a fire is walked in one
+    /// command buffer or in segments — and the handle the encode sink takes
+    /// its swap through.
+    #[must_use]
+    pub fn tier(&self) -> Option<&RefCell<Tier>> {
+        self.tier.as_ref()
     }
 
     /// Write one adapter's planes into the banks (design §8).
@@ -385,17 +469,268 @@ impl Weights {
     }
 }
 
+/// **A routed bank's other device planes, off the load plan** — what
+/// [`experts::Plan::of`] needs before a byte is landed, and the reason it can
+/// be asked for without one.
+///
+/// A quantized bank is codes plus factors plus (for an affine codec) zero
+/// points, and all three are indexed by the number the routing vector carries
+/// — so a residency decision that moved the codes alone would leave two
+/// planes reading somebody else's expert. The pairing is the LOAD PLAN's, read
+/// exactly as [`pairings`] reads it and never off a name; this door exists so
+/// that the decision can be made BEFORE `Weights::resident` reserves the
+/// store, which is what puts the admission gate in front of the landing rather
+/// than behind it.
+///
+/// Costs one metadata parse and one plan compile, and reads no tensor bytes.
+///
+/// # Errors
+///
+/// [`Fault::Load`] for a checkpoint the contract does not fit,
+/// [`Fault::Param`] for an attachment this plan cannot resolve.
+///
+/// [`experts::Plan::of`]: crate::experts::Plan::of
+pub fn attachments(trace: &Trace, contract: &ModelContract, path: &Path) -> Result<Attachments> {
+    let metadata = if path.is_dir() {
+        parse_metadata(path)?
+    } else {
+        zt::parse(path)?
+    };
+    let landing = compile(
+        &metadata,
+        contract,
+        StorageTarget::for_backend(BackendKind::Metal, 0, 1),
+    )?;
+    let index: BTreeMap<&str, usize> = trace
+        .params
+        .iter()
+        .enumerate()
+        .map(|(at, param)| (param.name.as_str(), at))
+        .collect();
+    let mut out = Attachments::new();
+    for (name, pairing) in pairings(&landing, &index)? {
+        let Some(&at) = index.get(name) else {
+            continue;
+        };
+        let mut planes = vec![pairing.scales];
+        planes.extend(pairing.biases);
+        out.insert(at, planes);
+    }
+    Ok(out)
+}
+
+/// One quantized weight's other planes, as rows of [`places`].
+#[derive(Debug, Clone, Copy)]
+struct Pairing {
+    scales: usize,
+    /// The zero points, for an affine scheme; `None` for a symmetric one.
+    biases: Option<usize>,
+    group: u32,
+    bits: u32,
+}
+
+/// Which params are quantized weights, and what their other planes are.
+///
+/// # The pairing is the PLAN's, and it is read structurally
+///
+/// Every scale plane in this tree is named `<weight>.scales` and every zero
+/// point `<weight>.biases`, and none of that is what this function reads. A
+/// suffix is a convention, and a convention is exactly what silently pairs a
+/// weight with somebody else's scales the day a checkpoint ships a tensor
+/// whose own name ends in `.scales`. `LoadPlan::attachments` is the pairing
+/// STATED, by the two places that create a scale plane — the contract that
+/// declares one the checkpoint shipped, and the encode that writes one the
+/// loader computed — each recording it at the moment it knew both halves.
+///
+/// # The format is [`ScaleForm`], and the numbers are the attachment's
+///
+/// **ONE FIELD DECIDES, AND IT IS THE FIELD WHOSE WHOLE JOB IS TO DECIDE.**
+/// `ScaleForm` is the loader's answer to "what does a kernel reading these
+/// bytes get" — `RawE8M0` for exponent bytes that ARE the dequantization,
+/// `Bf16AffineFactors` for factors that are half of one and imply the zero
+/// points beside them. Its own doc records that an engine inferring this from
+/// `group_size == 32` was right only by accident, because mxfp4 happened to
+/// be the one scheme at that group. So the group size and the bit width are
+/// read as NUMBERS here and never as evidence: the group off the attachment,
+/// the width off the plan's per-tensor `QuantSpec` (`affine_point_of`), which
+/// is the only reading that survives `mlx_lm`'s 4-bit stack with its 8-bit
+/// router gate.
+///
+/// An attachment naming a tensor this trace has no param for is not an
+/// error: a contract may compute internal tensors, and only the ones the
+/// trace declares become weight rows.
+fn pairings<'a>(
+    landing: &'a LoadPlan,
+    index: &BTreeMap<&str, usize>,
+) -> Result<BTreeMap<&'a str, Pairing>> {
+    // Keyed by the id's own number: `TensorId` is `Hash` and `Eq` and not
+    // `Ord`, and a derive on the loader's type is not this shell's to add.
+    let named: BTreeMap<u32, &str> = landing
+        .tensors
+        .iter()
+        .map(|decl| (decl.id.0, decl.name.as_str()))
+        .collect();
+    let mut out = BTreeMap::new();
+    for attachment in &landing.attachments {
+        let Some(of) = named.get(&attachment.tensor.0) else {
+            continue;
+        };
+        // Only a plane the trace declares becomes a weight row; a contract
+        // may compute internal tensors, and an attachment on one of those is
+        // a pairing about bytes no `Def::Weight` names.
+        if !index.contains_key(of) {
+            continue;
+        }
+        let name = of;
+        let row = |id: TensorId, what: &'static str| -> Result<usize> {
+            named
+                .get(&id.0)
+                .and_then(|plane| index.get(plane))
+                .copied()
+                .ok_or_else(|| Fault::Param {
+                    name: (*name).to_string(),
+                    why: what,
+                })
+        };
+        let bits = match attachment.scale_form {
+            // E2M1 is four bits by its own name, and the plan does not carry
+            // a `QuantSpec` width for it to disagree with: `affine_point_of`
+            // answers `None` for an mxfp4 tensor on purpose, because an
+            // mxfp4 bank is not read at an affine point at all.
+            ScaleForm::RawE8M0 => 4,
+            ScaleForm::Bf16AffineFactors => match landing.affine_point_of(name) {
+                Some((_, bits)) => bits,
+                None => {
+                    return Err(Fault::Param {
+                        name: (*name).to_string(),
+                        why: "carries affine scale factors and no quantized encoding for \
+                              them to be factors OF; the point a kernel is selected at is \
+                              the tensor's own `QuantSpec`, and this one has none",
+                    });
+                }
+            },
+            // The third form expands to f32 multipliers before a kernel sees
+            // them, which is a plane this shell's points do not read: every
+            // one of them takes its scales in the stored width.
+            ScaleForm::F32Factors => {
+                return Err(Fault::Param {
+                    name: (*name).to_string(),
+                    why: "wants its scales expanded to f32 factors, and every quantized \
+                          point this shell stamps reads them in the width they are stored",
+                });
+            }
+        };
+        // **AN AFFINE BANK WITHOUT ITS ZERO POINTS IS REFUSED, NOT
+        // DOWNGRADED.** `code * scale` alone is the right spread around the
+        // wrong centre — a model that computes, produces no NaN, and is
+        // wrong — so a form that says the groups are offset and an
+        // attachment that names nothing to offset by is a hole in the
+        // contract and is answered as one. A contract states the plane with
+        // `TensorContract::offsetting`; an encode the loader performs
+        // records the id itself.
+        let biases = match (attachment.scale_form, attachment.zero_point_tensor) {
+            (_, Some(id)) => Some(row(
+                id,
+                "is an affine bank whose zero points this plan does not publish as a \
+                 param of their own",
+            )?),
+            (ScaleForm::Bf16AffineFactors, None) => {
+                return Err(Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an affine bank whose scales are half of its dequantization, \
+                          and this plan names no zero points for the other half; a \
+                          contract states them with `TensorContract::offsetting`",
+                });
+            }
+            (_, None) => None,
+        };
+        out.insert(
+            *name,
+            Pairing {
+                scales: row(
+                    attachment.scale_tensor,
+                    "is a quantized weight whose scales this plan does not publish as a \
+                     param of their own",
+                )?,
+                biases,
+                group: attachment.group_size,
+                bits,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Where one param's plane sits in the store.
 #[derive(Debug, Clone, Copy)]
 struct Place {
     offset: u64,
-    /// The plane's own bytes.
+    /// What the store RESERVES for it — the plane's own bytes for a param
+    /// held whole, and `slots x stride` for a band the residency plan
+    /// streams.
     bytes: u64,
     /// Those bytes, rounded up to the next view alignment.
     reserved: u64,
+    /// **What the plane DECLARES**, which is what the checkpoint publishes
+    /// and what the landing sink checks an arriving tensor against. Equal to
+    /// [`bytes`](Place::bytes) for every param of a full-residency load; the
+    /// whole bank for a streamed band, whose bytes go to the host table
+    /// instead of here.
+    full: u64,
+    /// Whether the residency plan streams this param — the one bit that sends
+    /// its bytes to the host band table rather than into the store.
+    streamed: bool,
     rows: u32,
     width: u32,
     dtype: Dtype,
+}
+
+/// **What every param's plane DECLARES**, in bytes, `Trace::params`-indexed —
+/// the arithmetic [`places`] lays out and [`experts::Plan`] budgets against,
+/// stated once so that the two cannot disagree about how big a bank is.
+///
+/// **THE TWO PACKED PLANES ARE DECLARED IN TWO DIFFERENT UNITS, AND
+/// `elem_bytes` CAN ANSWER FOR NEITHER.** `model_dsl::Weight::planes` gives an
+/// mxfp4 bank the rectangle it OCCUPIES — each 32-code block folded into a
+/// trailing axis of sixteen, which is the block's bytes — and gives an MLX
+/// affine bank its LOGICAL rectangle, four bits an element, because that is
+/// the shape the qmm and qmv points index it by. So neither is
+/// `elements x element size`, and taking `elem_bytes`'s honest `None` for the
+/// four-bit code as a refusal is what refuses every quantized SKU at its first
+/// param.
+///
+/// # Errors
+///
+/// [`Fault::Param`] for a param declared in a storage element that has no
+/// byte size.
+///
+/// [`experts::Plan`]: crate::experts::Plan
+pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
+    trace
+        .params
+        .iter()
+        .map(|param| {
+            let (rows, width) = rectangle(&param.shape);
+            Ok(match param.dtype {
+                Dtype::Mxfp4 => rows.saturating_mul(width),
+                Dtype::MlxU4 => rows.saturating_mul(width).div_ceil(2),
+                // The same logical rectangle at a whole byte a code — see
+                // `dtype::Dtype::MlxU8`, and note that the `div_ceil` above is
+                // the one thing that does NOT carry over: an eight-bit code
+                // owns its byte, so no row can round up into the next.
+                Dtype::MlxU8 => rows.saturating_mul(width),
+                other => {
+                    let element =
+                        model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
+                            name: param.name.clone(),
+                            why: "is declared in a packed storage element that has no element \
+                                  size",
+                        })?;
+                    rows.saturating_mul(width).saturating_mul(element)
+                }
+            })
+        })
+        .collect()
 }
 
 /// The store's layout, decided before a byte is read.
@@ -405,26 +740,36 @@ struct Place {
 /// take whatever arrived; this one refuses a plane that is not the size its
 /// own declaration says it is, which is the only cheap check there is that a
 /// contract and a plan describe the same model.
-fn places(trace: &Trace) -> Result<Vec<Place>> {
+///
+/// **AND `plan` IS THE ONE MAP THAT MAKES A BANK SMALLER THAN ITS
+/// DECLARATION.** A param the residency plan streams reserves `slots` expert
+/// seats instead of `experts` of them — the leading axis is the only axis
+/// that shrinks, because a seat is one whole rectangle at intra-seat offset
+/// zero (`experts::Plan::of` proves that before it plans anything). Its
+/// declared size is kept in `full`, because that is still what the checkpoint
+/// publishes and what the landing sink checks.
+fn places(trace: &Trace, plan: &Plan) -> Result<Vec<Place>> {
+    let bytes = plane_bytes(trace)?;
     let mut out = Vec::with_capacity(trace.params.len());
     let mut at = 0u64;
-    for param in &trace.params {
-        let element =
-            model_compiler::arena::elem_bytes(param.dtype).ok_or_else(|| Fault::Param {
-                name: param.name.clone(),
-                why: "is declared in a packed storage element that has no element size",
-            })?;
+    for (index, param) in trace.params.iter().enumerate() {
         let (rows, width) = rectangle(&param.shape);
-        let bytes = rows.saturating_mul(width).saturating_mul(element);
+        let full = bytes[index];
+        let (reserve, rows) = match plan.resident(index) {
+            Some(slots) if rows > 0 => (full / rows * u64::from(slots), u64::from(slots)),
+            _ => (full, rows),
+        };
         out.push(Place {
             offset: at,
-            bytes,
-            reserved: bytes.next_multiple_of(ALIGN),
+            bytes: reserve,
+            reserved: reserve.next_multiple_of(ALIGN),
+            full,
+            streamed: plan.resident(index).is_some(),
             rows: u32::try_from(rows).unwrap_or(u32::MAX),
             width: u32::try_from(width).unwrap_or(u32::MAX),
             dtype: param.dtype,
         });
-        at += bytes.next_multiple_of(ALIGN);
+        at += reserve.next_multiple_of(ALIGN);
     }
     Ok(out)
 }
@@ -444,9 +789,22 @@ fn rectangle(shape: &[u64]) -> (u64, u64) {
     }
 }
 
-/// The sink that puts each finalized tensor where the layout said it goes.
+/// The sink that puts each finalized tensor where the layout said it goes —
+/// the store for a param held whole, the host band table for one the
+/// residency plan streams.
+///
+/// **THE DIVERT IS A BRANCH ON THE PLAN AND NOT A SECOND SINK.** Every
+/// transform already runs host-side here (this module's header argues why), so
+/// a streamed band arrives at exactly the same instant, in exactly the same
+/// finalized bytes, as a landed one — the only question is which mapping they
+/// are copied into. Answering it here keeps `Execution` unaware that residency
+/// exists, which is what lets the loader stay backend-neutral.
 struct Landing<'a> {
     store: &'a mut Buffer,
+    /// Every expert of every streamed band, at the offsets
+    /// [`Plan::host_at`](crate::experts::Plan::host_at) states.
+    host: &'a mut [u8],
+    plan: &'a Plan,
     places: &'a [Place],
     index: &'a BTreeMap<&'a str, usize>,
     landed: Vec<bool>,
@@ -461,17 +819,34 @@ impl TensorSink for Landing<'_> {
             ))
         })?;
         let place = self.places[at];
-        if bytes.len() as u64 != place.bytes {
+        // The DECLARED size, not the reserved one: a streamed band reserves
+        // `slots` seats and the checkpoint still publishes every expert.
+        if bytes.len() as u64 != place.full {
             return Err(LoadError::Contract(format!(
                 "`{name}` lands {} bytes and the plan declares {} — a plane read \
                  at the wrong width is a model that computes",
                 bytes.len(),
-                place.bytes
+                place.full
             )));
         }
-        self.store
-            .write(place.offset, bytes)
-            .map_err(|fault| LoadError::Internal(fault.to_string()))?;
+        if place.streamed {
+            let from = usize::try_from(self.plan.host_at(at).unwrap_or(0)).unwrap_or(usize::MAX);
+            let into = self
+                .host
+                .get_mut(from..from + bytes.len())
+                .ok_or_else(|| {
+                    LoadError::Internal(format!(
+                        "`{name}` is a streamed band whose {} bytes leave the host band \
+                         table at offset {from}",
+                        bytes.len()
+                    ))
+                })?;
+            into.copy_from_slice(bytes);
+        } else {
+            self.store
+                .write(place.offset, bytes)
+                .map_err(|fault| LoadError::Internal(fault.to_string()))?;
+        }
         self.landed[at] = true;
         Ok(())
     }
@@ -488,7 +863,8 @@ mod tests {
         let trace =
             model::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships the SKU");
         let trace = trace(Platform::Metal);
-        let places = places(&trace).expect("every param of a bf16 SKU has an element size");
+        let places = places(&trace, &Plan::default())
+            .expect("every param of a bf16 SKU has an element size");
 
         assert_eq!(places.len(), trace.params.len());
         let mut end = 0u64;

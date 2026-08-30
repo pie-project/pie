@@ -13,10 +13,10 @@
 //! The two exceptions carry their own annotated `allow` at the field.
 
 use grammar::brle::RunMask;
-use tensor_ir::container::{PortSource, TraceContainer};
-use tensor_ir::op::Op;
-use tensor_ir::registry::{Port, PortMask};
-use tensor_ir::types::DType;
+use eta_ir::container::{PortSource, TraceContainer};
+use eta_ir::op::Op;
+use eta_ir::registry::{Port, PortMask};
+use eta_ir::types::Dtype;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeEnvelope {
@@ -204,8 +204,8 @@ pub fn classify_decode_envelope_why(
         || token_dims[0] == 0
         || !matches!(
             token.dtype,
-            tensor_ir::container::ChanDType::Concrete(DType::I32)
-                | tensor_ir::container::ChanDType::Concrete(DType::U32)
+            eta_ir::container::ChanDType::Concrete(Dtype::I32)
+                | eta_ir::container::ChanDType::Concrete(Dtype::U32)
         )
     {
         return Err("decode envelope tokens must be a non-empty i32/u32 vector".to_string());
@@ -214,7 +214,7 @@ pub fn classify_decode_envelope_why(
     let qo_indptr = match channel_for(Port::EmbedIndptr) {
         None => vec![0, token_count],
         Some(PortSource::Const { dtype, shape, data })
-            if *dtype == DType::U32 && shape.dims().len() == 1 =>
+            if *dtype == Dtype::U32 && shape.dims().len() == 1 =>
         {
             if data.len() % 4 != 0 {
                 return Err("decode envelope EmbedIndptr has a partial u32".to_string());
@@ -231,7 +231,7 @@ pub fn classify_decode_envelope_why(
             if declaration.shape.dims() != [token_count + 1]
                 || !matches!(
                     declaration.dtype,
-                    tensor_ir::container::ChanDType::Concrete(DType::U32)
+                    eta_ir::container::ChanDType::Concrete(Dtype::U32)
                 )
             {
                 return Err(format!(
@@ -256,7 +256,7 @@ pub fn classify_decode_envelope_why(
     if kv_len.shape.dims() != [lane_count]
         || !matches!(
             kv_len.dtype,
-            tensor_ir::container::ChanDType::Concrete(DType::U32)
+            eta_ir::container::ChanDType::Concrete(Dtype::U32)
         )
     {
         return Err(format!(
@@ -269,7 +269,7 @@ pub fn classify_decode_envelope_why(
         match (&binding.port, &binding.source) {
             (Port::EmbedTokens | Port::KvLen, PortSource::Channel(_)) => {}
             (Port::EmbedIndptr, PortSource::Const { dtype, shape, data })
-                if *dtype == DType::U32
+                if *dtype == Dtype::U32
                     && shape.dims() == [lane_count + 1]
                     && data.len() == (lane_count as usize + 1) * 4 => {}
             (Port::EmbedIndptr, PortSource::Channel(channel)) => {
@@ -279,16 +279,16 @@ pub fn classify_decode_envelope_why(
                 if declaration.shape.dims() != [lane_count + 1]
                     || !matches!(
                         declaration.dtype,
-                        tensor_ir::container::ChanDType::Concrete(DType::U32)
+                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
                     )
                 {
                     return Err("device EmbedIndptr must be a [lanes+1] u32 vector".to_string());
                 }
             }
             (Port::Positions, PortSource::Const { dtype, shape, .. })
-                if *dtype == DType::U32 && shape.dims() == [token_count] => {}
+                if *dtype == Dtype::U32 && shape.dims() == [token_count] => {}
             (Port::Readout, PortSource::Const { dtype, shape, data })
-                if *dtype == DType::U32
+                if *dtype == Dtype::U32
                     && shape.dims().len() == 1
                     && data.len() == shape.dims()[0] as usize * 4
                     && data.chunks_exact(4).all(|bytes| {
@@ -302,14 +302,14 @@ pub fn classify_decode_envelope_why(
                 if declaration.shape.dims().len() != 1
                     || !matches!(
                         declaration.dtype,
-                        tensor_ir::container::ChanDType::Concrete(DType::U32)
+                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
                     )
                 {
                     return Err("device Readout must be a u32 vector".to_string());
                 }
             }
             (Port::PageIndptr, PortSource::Const { dtype, shape, data })
-                if *dtype == DType::U32
+                if *dtype == Dtype::U32
                     && shape.dims() == [lane_count + 1]
                     && data.len() == (lane_count as usize + 1) * 4 => {}
             (Port::Positions, PortSource::Channel(channel)) => {
@@ -320,7 +320,7 @@ pub fn classify_decode_envelope_why(
                 if declaration.shape.dims() != [token_count]
                     || !matches!(
                         declaration.dtype,
-                        tensor_ir::container::ChanDType::Concrete(DType::U32)
+                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
                     )
                 {
                     return Err(format!(
@@ -342,7 +342,7 @@ pub fn classify_decode_envelope_why(
                 if !valid_shape
                     || !matches!(
                         declaration.dtype,
-                        tensor_ir::container::ChanDType::Concrete(DType::U32)
+                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
                     )
                 {
                     return Err(
@@ -358,7 +358,7 @@ pub fn classify_decode_envelope_why(
                 if declaration.shape.dims() != [lane_count + 1]
                     || !matches!(
                         declaration.dtype,
-                        tensor_ir::container::ChanDType::Concrete(DType::U32)
+                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
                     )
                 {
                     return Err("device PageIndptr must be a [lanes+1] u32 vector".to_string());
@@ -372,7 +372,7 @@ pub fn classify_decode_envelope_why(
                 if declaration.shape.dims() != [token_count]
                     || !matches!(
                         declaration.dtype,
-                        tensor_ir::container::ChanDType::Concrete(DType::U32)
+                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
                     )
                 {
                     return Err("device WSlot/WOff must be a [tokens] u32 vector".to_string());
@@ -397,7 +397,7 @@ pub fn classify_decode_envelope_why(
                     .ok_or_else(|| "decode envelope mask channel is out of range".to_string())?;
                 if !matches!(
                     declaration.dtype,
-                    tensor_ir::container::ChanDType::Concrete(DType::Bool)
+                    eta_ir::container::ChanDType::Concrete(Dtype::Bool)
                 ) {
                     return Err("device attention mask must be a bool channel".to_string());
                 }
@@ -434,9 +434,9 @@ pub fn classify_decode_envelope_why(
 /// class demands of an engine.
 pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> PortMask {
     // THE PORTS WENT HOME (palo design §7, decision 19). These were
-    // `PIE_DEVICE_PORT_*`, thirteen bits in a private `engine-api` numbering
+    // `PIE_DEVICE_PORT_*`, thirteen bits in a private `engine` numbering
     // that disagreed with the registry's own and had nothing checking the
-    // two agreed. They are `tensor_ir::registry::Port` now, and the mask is
+    // two agreed. They are `eta_ir::registry::Port` now, and the mask is
     // the registry's.
     let mut required = PortMask::of(&[Port::EmbedTokens, Port::KvLen]);
     if envelope.device_positions {
@@ -464,7 +464,7 @@ fn const_port(container: &TraceContainer, port: Port) -> Option<&[u8]> {
     })
 }
 
-/// The forward geometry a PTIR pass contributes to a `LaunchPlan`.
+/// The forward geometry an ETA pass contributes to a `LaunchPlan`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReqGeometry {
     /// Input token ids (from `embed_tokens`).
@@ -482,7 +482,7 @@ pub struct ReqGeometry {
     ///
     /// Was `kv_last_page_lens`, which is this number modulo the page size and
     /// was derived here only because the wire form asked for it. The
-    /// contract's [`KvDelta::held`](engine_api::KvDelta) is the extent BEFORE
+    /// contract's [`KvDelta::held`](engine::KvDelta) is the extent BEFORE
     /// the append, which is this minus the lane's rows — so keeping the
     /// undivided number is what lets the lowering state `held` without
     /// knowing a page size.
@@ -523,7 +523,7 @@ impl ReqGeometry {
     /// parallel arms — `token_ids`/`qo_indptr`, `kv_page_indices`/
     /// `kv_page_indptr`, `sampling_indices`/`sampling_indptr` — were the
     /// runtime flattening its per-lane state so an engine could walk it back
-    /// into per-lane form (`engine_api::fire`'s header). The contract's
+    /// into per-lane form (`engine::fire`'s header). The contract's
     /// [`Lane`] IS the per-lane form, so the flattening ends at this
     /// function and there is nothing on the far side to undo it.
     ///
@@ -560,7 +560,7 @@ impl ReqGeometry {
                 let readout = cut(&self.sampling_indices, &self.sampling_indptr, lane);
                 crate::engine::Lane {
                     // The runtime keeps the page table, so a lane's SLOT is
-                    // its working set — see `crate::engine::fire`. A PTIR
+                    // its working set — see `crate::engine::fire`. An ETA
                     // fire's geometry ports carry no slot of their own, so
                     // it is stamped by `crate::pipeline::fire::
                     // stamp_lane_slots`, from the book the working set owns
@@ -608,7 +608,7 @@ impl ReqGeometry {
                     // the lane's word — so any caller that sets them gets the
                     // axis. What no path in this crate sets them FROM is a
                     // per-request ask, because a request has nowhere to state
-                    // one: the PTIR port vocabulary this fire path is
+                    // one: the ETA port vocabulary this fire path is
                     // assembled from names no draft port and no capture port,
                     // and adding them is the client-facing half this wave
                     // deliberately did not build (`crate::engine`'s
@@ -750,7 +750,7 @@ impl FireAttnMask {
 pub(crate) fn lower_attn_mask_evaluated(
     container: &TraceContainer,
     qo_indptr: &[u32],
-    evaluated: &[(Port, Result<tensor_compiler::eval::interp::Value, String>)],
+    evaluated: &[(Port, Result<eta_compiler::eval::interp::Value, String>)],
 ) -> Result<FireAttnMask, String> {
     let Some(binding) = container
         .ports
@@ -774,7 +774,7 @@ pub(crate) fn lower_attn_mask_evaluated(
             ));
         }
     };
-    let tensor_compiler::eval::interp::Value::Bool(dense) = value else {
+    let eta_compiler::eval::interp::Value::Bool(dense) = value else {
         return Err(format!(
             "attention-mask evaluated as {:?}, expected bool",
             value.dtype()
@@ -815,8 +815,8 @@ pub(crate) fn lower_attn_mask_evaluated(
 
 /// Evaluate and lower the mask against this fire's host-shadow value oracle.
 pub(crate) fn evaluate_attn_mask(
-    bound: &tensor_ir::validate::BoundTrace,
-    known: &mut dyn FnMut(u32) -> Option<tensor_compiler::eval::interp::Value>,
+    bound: &eta_ir::validate::BoundTrace,
+    known: &mut dyn FnMut(u32) -> Option<eta_compiler::eval::interp::Value>,
     qo_indptr: &[u32],
 ) -> Result<FireAttnMask, String> {
     if !bound
@@ -827,7 +827,7 @@ pub(crate) fn evaluate_attn_mask(
     {
         return Ok(FireAttnMask::Omitted);
     }
-    let evaluated = tensor_compiler::eval::pareval::eval_descriptor_ports(bound, known)
+    let evaluated = eta_compiler::eval::pareval::eval_descriptor_ports(bound, known)
         .map_err(|blocker| format!("attention-mask evaluation failed: {blocker}"))?
         .into_iter()
         .map(|(port, value)| (port, value.map_err(|blocker| blocker.to_string())))
@@ -841,7 +841,7 @@ pub type ChannelValues<'a> = &'a [Option<Vec<u8>>];
 
 /// Per-port evaluation outcomes, recorded alongside a mapped geometry: for each
 /// port that was consulted, the value it evaluated to or the reason it declined.
-pub type PortEvaluations = Vec<(Port, Result<tensor_compiler::eval::interp::Value, String>)>;
+pub type PortEvaluations = Vec<(Port, Result<eta_compiler::eval::interp::Value, String>)>;
 
 /// An evaluated-geometry failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -882,7 +882,7 @@ fn port_dims(container: &TraceContainer, port: Port) -> Option<Vec<u32>> {
 }
 
 /// Map a pass's descriptor ports to forward geometry by **evaluating** the
-/// geometry prologue over host-known channel values (`tensor_compiler::eval::pareval`) —
+/// geometry prologue over host-known channel values (`eta_compiler::eval::pareval`) —
 /// the general form of `map_geometry`, which reads only directly-present
 /// values and is its degenerate case. Returns the geometry plus every port's
 /// evaluated value (the canonical-KV gate verifies evidence against these).
@@ -915,15 +915,15 @@ fn port_dims(container: &TraceContainer, port: Port) -> Option<Vec<u32>> {
 ///
 /// [`EvaluatedGeometryError`], minus the ports in `device_resolved`.
 pub fn map_geometry_evaluated_with(
-    bound: &tensor_ir::validate::BoundTrace,
-    known: &mut dyn FnMut(u32) -> Option<tensor_compiler::eval::interp::Value>,
+    bound: &eta_ir::validate::BoundTrace,
+    known: &mut dyn FnMut(u32) -> Option<eta_compiler::eval::interp::Value>,
     device_resolved: PortMask,
 ) -> Result<(ReqGeometry, PortEvaluations), EvaluatedGeometryError> {
-    use tensor_compiler::eval::interp::Value;
+    use eta_compiler::eval::interp::Value;
 
     let container = &bound.container;
     let ports =
-        tensor_compiler::eval::pareval::eval_descriptor_ports(bound, known).map_err(|blocker| {
+        eta_compiler::eval::pareval::eval_descriptor_ports(bound, known).map_err(|blocker| {
             EvaluatedGeometryError::BadValue {
                 port: Port::EmbedTokens,
                 reason: blocker.to_string(),
@@ -1076,8 +1076,8 @@ pub fn map_geometry_evaluated_with(
 
 /// Reinterpret an evaluated value's lanes as `u32` (i32 tokens bit-cast, the
 /// engine's `token_ids` convention; bool as 0/1).
-pub(crate) fn value_as_u32(value: &tensor_compiler::eval::interp::Value) -> Vec<u32> {
-    use tensor_compiler::eval::interp::Value;
+pub(crate) fn value_as_u32(value: &eta_compiler::eval::interp::Value) -> Vec<u32> {
+    use eta_compiler::eval::interp::Value;
     match value {
         Value::U32(v) => v.clone(),
         Value::I32(v) => v.iter().map(|&x| x as u32).collect(),
@@ -1251,12 +1251,12 @@ fn as_u32(port: Port, bytes: &[u8]) -> Result<Vec<u32>, GeometryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tensor_ir::container::{
+    use eta_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use tensor_ir::op::Op;
-    use tensor_ir::registry::Stage;
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::op::Op;
+    use eta_ir::registry::Stage;
+    use eta_ir::types::{Dtype, Shape};
 
     fn u32_bytes(v: &[u32]) -> Vec<u8> {
         v.iter().flat_map(|w| w.to_le_bytes()).collect()
@@ -1265,13 +1265,13 @@ mod tests {
         PortBinding {
             port,
             source: PortSource::Const {
-                dtype: DType::U32,
+                dtype: Dtype::U32,
                 shape: Shape::vector(words.len() as u32),
                 data: u32_bytes(words),
             },
         }
     }
-    fn chan(shape: Shape, dtype: DType) -> ChannelDecl {
+    fn chan(shape: Shape, dtype: Dtype) -> ChannelDecl {
         ChannelDecl {
             shape,
             dtype: ChanDType::Concrete(dtype),
@@ -1287,8 +1287,8 @@ mod tests {
             names: vec![],
             externs: vec![],
             channels: vec![
-                chan(Shape::vector(1), DType::I32), // 0 tok
-                chan(Shape::vector(1), DType::U32), // 1 len
+                chan(Shape::vector(1), Dtype::I32), // 0 tok
+                chan(Shape::vector(1), Dtype::U32), // 1 len
             ],
             ports: vec![
                 PortBinding {
@@ -1312,23 +1312,23 @@ mod tests {
         let position = container.channels.len() as u32;
         container
             .channels
-            .push(chan(Shape::vector(tokens), DType::U32));
+            .push(chan(Shape::vector(tokens), Dtype::U32));
         let pages = container.channels.len() as u32;
         container
             .channels
-            .push(chan(Shape::matrix(lanes, 2), DType::U32));
+            .push(chan(Shape::matrix(lanes, 2), Dtype::U32));
         let page_indptr = container.channels.len() as u32;
         container
             .channels
-            .push(chan(Shape::vector(lanes + 1), DType::U32));
+            .push(chan(Shape::vector(lanes + 1), Dtype::U32));
         let w_slot = container.channels.len() as u32;
         container
             .channels
-            .push(chan(Shape::vector(tokens), DType::U32));
+            .push(chan(Shape::vector(tokens), Dtype::U32));
         let w_off = container.channels.len() as u32;
         container
             .channels
-            .push(chan(Shape::vector(tokens), DType::U32));
+            .push(chan(Shape::vector(tokens), Dtype::U32));
         for (port, channel) in [
             (Port::Positions, position),
             (Port::Pages, pages),
@@ -1420,7 +1420,7 @@ mod tests {
         ];
         add_explicit_geometry(&mut container, 1, 1);
         let indptr = container.channels.len() as u32;
-        container.channels.push(chan(Shape::vector(2), DType::U32));
+        container.channels.push(chan(Shape::vector(2), Dtype::U32));
         container
             .ports
             .iter_mut()
@@ -1448,7 +1448,7 @@ mod tests {
         let mask = container.channels.len() as u32;
         container
             .channels
-            .push(chan(Shape::matrix(1, 8), DType::Bool));
+            .push(chan(Shape::matrix(1, 8), Dtype::Bool));
         container.ports.push(PortBinding {
             port: Port::AttnMask,
             source: PortSource::Channel(mask),
@@ -1474,7 +1474,7 @@ mod tests {
         // A non-bool mask channel is a classification error, not a fallback —
         // checked BEFORE the decline, so a malformed mask is still loud.
         let bad = container.channels.len() as u32 - 1;
-        container.channels[bad as usize].dtype = ChanDType::Concrete(DType::U32);
+        container.channels[bad as usize].dtype = ChanDType::Concrete(Dtype::U32);
         assert!(classify_decode_envelope(&container).is_err());
     }
     #[test]
@@ -1532,10 +1532,10 @@ mod tests {
             names: vec![],
             externs: vec![],
             channels: vec![
-                chan(Shape::vector(b), DType::I32),    // 0 toks
-                chan(Shape::vector(b), DType::U32),    // 1 pos
-                chan(Shape::matrix(b, p), DType::U32), // 2 pages
-                chan(Shape::vector(b), DType::U32),    // 3 klen
+                chan(Shape::vector(b), Dtype::I32),    // 0 toks
+                chan(Shape::vector(b), Dtype::U32),    // 1 pos
+                chan(Shape::matrix(b, p), Dtype::U32), // 2 pages
+                chan(Shape::vector(b), Dtype::U32),    // 3 klen
             ],
             ports: vec![
                 PortBinding {
@@ -1631,7 +1631,7 @@ mod tests {
         let mask = container.channels.len() as u32;
         container
             .channels
-            .push(chan(Shape::matrix(2, 4), DType::Bool));
+            .push(chan(Shape::matrix(2, 4), Dtype::Bool));
         container.ports.push(PortBinding {
             port: Port::AttnMask,
             source: PortSource::Channel(mask),
@@ -1667,7 +1667,7 @@ mod tests {
         let dense = vec![true, true, false, true, false, true, true, false];
         let evaluated = vec![(
             Port::AttnMask,
-            Ok(tensor_compiler::eval::interp::Value::Bool(dense.clone())),
+            Ok(eta_compiler::eval::interp::Value::Bool(dense.clone())),
         )];
         let lowered = lower_attn_mask_evaluated(&mask_container(), &[0, 1, 2], &evaluated).unwrap();
         let FireAttnMask::Host { masks, mask_indptr } = lowered.clone() else {
@@ -1720,7 +1720,7 @@ mod tests {
         ];
         let evaluated = vec![(
             Port::AttnMask,
-            Ok(tensor_compiler::eval::interp::Value::Bool(dense.clone())),
+            Ok(eta_compiler::eval::interp::Value::Bool(dense.clone())),
         )];
         let lowered = lower_attn_mask_evaluated(&mask_container(), &[0, 3], &evaluated).unwrap();
         let FireAttnMask::Host { masks, .. } = lowered.clone() else {
@@ -1759,7 +1759,7 @@ mod tests {
         let container = mask_container();
         let host = vec![(
             Port::AttnMask,
-            Ok(tensor_compiler::eval::interp::Value::Bool(vec![true; 8])),
+            Ok(eta_compiler::eval::interp::Value::Bool(vec![true; 8])),
         )];
         assert!(matches!(
             lower_attn_mask_evaluated(&container, &[0, 1, 2], &host).unwrap(),

@@ -44,6 +44,20 @@
 //! Skips at RUN time, saying which of the machine and the checkpoint was
 //! missing — an `#[ignore]` on the one box that could run it is a gate nobody
 //! runs.
+//!
+//! **AND `#[ignore]` IS ON THEM NOW, WHICH REVERSES THAT.** The reading above
+//! was right about the risk and wrong about which box it meant. The one box in
+//! the fleet with a GPU is CI's self-hosted `pie-worker (engine-cuda)` job, and
+//! that job only ever BUILT these (`--no-run`) — so "the box that could run it"
+//! was a developer's machine, and what ran them was a plain `cargo test`. That
+//! cost 1580 s of a 1864 s workspace sweep across thirteen binaries, which is
+//! how a pre-push sweep becomes 31 minutes and then becomes a sweep nobody
+//! runs. Trading one gate for the whole suite is the worse bargain.
+//!
+//! The run-time skip stays — it is still what a developer sees when the
+//! snapshot is missing. What is added is that the sweep no longer waits for a
+//! model to load, and that the CUDA job now runs `-- --ignored` rather than
+//! only compiling. The gate did not weaken; it moved to the hardware.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -179,6 +193,7 @@ fn ready(what: &str, runahead: Runahead) -> Option<(Shell, tokenizer::Tokenizer)
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(4, 256),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,
@@ -205,7 +220,7 @@ fn ready(what: &str, runahead: Runahead) -> Option<(Shell, tokenizer::Tokenizer)
 /// step on the compute stream, `settle_step` records the event and hangs the
 /// completion off the notify stream. Nothing in here waits.
 fn fire(shell: &mut Shell, lanes: &[Seated<'_>], done: Option<Done>) -> Settled {
-    let prepared = FramePhases::prepare(shell, StepView { lanes, attachments: &[] }, None)
+    let prepared = FramePhases::prepare(shell, StepView { lanes, attachments: &[], media: &[] }, None)
         .expect("the step prepares");
     let enqueued = FramePhases::enqueue(shell, prepared).expect("the step enqueues");
     shell.settle_step(enqueued, done).expect("the step registers its settlement")
@@ -229,6 +244,7 @@ fn lane(slot: u32, tokens: &[u32]) -> Seated<'_> {
 /// because `settle` ended in `cudaStreamSynchronize` and the count could never
 /// exceed the step being fired.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn submit_returns_with_the_device_still_running() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the saturation gate", Runahead::of(2)) else {
@@ -242,9 +258,9 @@ fn submit_returns_with_the_device_still_running() {
     // is the whole reason it is an `AtomicUsize` and not a `Cell`.
     let settled = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&settled);
-    let sink: engine::engine_api::CompletionSink = Arc::new(move |_at, outcome| {
+    let sink: engine::CompletionSink = Arc::new(move |_at, outcome| {
         assert!(
-            matches!(outcome, engine::engine_api::StepOutcome::Committed),
+            matches!(outcome, engine::StepOutcome::Committed),
             "a step that reached settlement committed"
         );
         seen.fetch_add(1, Ordering::Release);
@@ -266,7 +282,7 @@ fn submit_returns_with_the_device_still_running() {
     for frame in 0..FRAMES {
         for step in 0..STEPS {
             let done = Done {
-                at: engine::engine_api::StepDone {
+                at: engine::StepDone {
                     frame: frame as u64,
                     step: step as u32,
                 },
@@ -332,6 +348,7 @@ fn submit_returns_with_the_device_still_running() {
 /// duration; the synchronized arm's is there to show what "not small" looks
 /// like on the same box in the same minute.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_stream_does_not_go_idle_between_steps() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the stream-gap gate", Runahead::of(2)) else {
@@ -435,6 +452,7 @@ fn the_stream_does_not_go_idle_between_steps() {
 /// answer fluent garbage — so the assertion is on the bytes and not on the
 /// text.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn two_frames_in_flight_is_byte_identical_to_one() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the depth-1 arm", Runahead::F1) else {
@@ -501,6 +519,7 @@ fn decode(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, Vec<f32>) {
 /// submitted — which is the property a staging ring gets wrong by leaking a
 /// slot and a completion path gets wrong by resurrecting a failed frame.
 #[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_poisoned_step_fails_its_frame_without_touching_the_next() {
     let _serial = serialized();
     let Some((mut shell, tokenizer)) = ready("the poison gate", Runahead::of(2)) else {
@@ -528,6 +547,7 @@ fn a_poisoned_step_fails_its_frame_without_touching_the_next() {
         StepView {
             lanes: &bad_lane,
             attachments: &[],
+            media: &[],
         },
         None,
     );

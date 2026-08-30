@@ -10,7 +10,7 @@
 //! a value and every grid axis as a number, so the table is derivable — and
 //! this module derives it.
 //!
-//! # The component language lives in [`engine::law`]
+//! # The component language lives in [`model_exec::law`]
 //!
 //! **THE PROSE THAT WAS HERE MOVED WITH THE TYPES** (seat wave B-law). Why
 //! the language has exactly three fitted forms, why the third one is a
@@ -28,7 +28,7 @@
 //!
 //! What this module does is walk the same template many times against
 //! synthetic descriptors, [record](crate::record) each walk, and hand the
-//! differences to [`engine::law::fit`]:
+//! differences to [`model_exec::law::fit`]:
 //!
 //! ```text
 //! probe    : a base composition, and one LADDER per direction —
@@ -72,7 +72,7 @@
 //!
 //! # What the derivation does NOT cover, stated
 //!
-//! The walk skips a zero-row region's nodes (`engine::fire::walk` rule 1), so
+//! The walk skips a zero-row region's nodes (`model_exec::fire::walk` rule 1), so
 //! a composition with an empty window produces FEWER slots than one without.
 //! Every probe point here therefore holds every class, and the derived table
 //! is the FULL composition's — which is the point rather than a limitation:
@@ -82,13 +82,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use engine::law::fit;
+use model_exec::law::fit;
 
 use crate::error::{Fault, Result};
 use crate::record::{Arg, Point, Recording, Slot};
 
 // ─────────────────────────────────────────────────────────────────────────
-// The vocabulary — [`engine::law`], not this module's
+// The vocabulary — [`model_exec::law`], not this module's
 //
 // **THE LANGUAGE MOVED AND THE MODULE DOC ABOVE WENT WITH IT** (seat wave
 // B-law). `Law`, the basis it is written in (`Axis`), the inverse that reads
@@ -105,8 +105,8 @@ use crate::record::{Arg, Point, Recording, Slot};
 // stop: `At::Lane` is `At::Grid` and `At::Group` is `At::Block`. A CUDA node
 // carries both numbers too, and "group" only reads as the threadgroup from
 // one of the two planes.
-pub use engine::law::fit::{MAX_NUMERATOR_SCALE, MAX_TILE};
-pub use engine::law::{At, Axis, Law, Recipe};
+pub use model_exec::law::fit::{MAX_NUMERATOR_SCALE, MAX_TILE};
+pub use model_exec::law::{At, Axis, Law, Recipe};
 
 /// One arm of one slot: a shader point, the skeleton encoded for it, and the
 /// components that move within it.

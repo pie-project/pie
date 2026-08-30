@@ -5,7 +5,7 @@
 //! before Gumbel-max sampling.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 use std::hash::{DefaultHasher, Hash, Hasher};
 

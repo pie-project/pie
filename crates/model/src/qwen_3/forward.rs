@@ -1,6 +1,16 @@
-use model_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
+use model_dsl::{
+    Classify, ForwardHybrid, HybridSpec, Input, MropeForm, Predicate, Request, Value, ops, seam,
+};
 
-use super::model::{Attn, Gdn, Head, Mixer, Mlp, Model};
+use super::model::{Attn, Gdn, Head, Mixer, Mlp, Model, Tower};
+
+/// **THE TRUNK'S MULTIMODAL ROTARY SECTIONS**, and both qwen SKUs state the
+/// same three numbers: `text_config.rope_parameters.mrope_section` is
+/// `[11, 11, 10]` in Qwen3.5-0.8B and in Qwen3.6-27B, summing to 32, which is
+/// half of this family's `rotary_dim`. Read once here rather than per SKU
+/// because a section split that differed between two rows of one family would
+/// be two readings of one rotation.
+const MROPE_SECTIONS: [u32; 3] = [11, 11, 10];
 
 pub struct Facts {
     pub qo_one: bool,
@@ -8,6 +18,7 @@ pub struct Facts {
     pub drafts: bool,
     pub captures_scores: bool,
     pub masked: bool,
+    pub media: bool,
 }
 
 impl Facts {
@@ -106,6 +117,33 @@ impl Facts {
     pub fn masked() -> Predicate {
         Predicate::fact(4)
     }
+
+    /// **THE MEDIA WINDOW, AND IT IS ABOUT THE MERGE AND NOT THE TOWER**
+    /// (multimodal §1, campaign M-1).
+    ///
+    /// A lane that submitted images. The TOWER does not need it: every
+    /// rectangle in `tower` is `Dim::Patches`, so an axis-empty fire has zero
+    /// patch rows and `engine::fire::walk` skips the whole unit before it
+    /// dispatches anything — which is the free-when-unused property the second
+    /// row axis was designed around, and it is a property of the AXIS rather
+    /// than of any bit.
+    ///
+    /// **THE EMBED MERGE IS THE EXCEPTION, BECAUSE IT WRITES THE OTHER AXIS.**
+    /// `layout.scatter_live_rows` lands token rows, so `Operands::outputs`
+    /// puts it in the TRUNK's capture unit and the walk reads its TOKEN
+    /// window — which is full on every fire, image or not. Unguarded, a
+    /// text-only fire of a vision load resolves `RuntimeInput::PatchRoutes`
+    /// and the shell refuses by name: `value N reads where this fire's tower
+    /// rows land, and no lane of it submitted an image`. Measured at 1024 of
+    /// 1024 requests failed before this bit existed.
+    ///
+    /// So the guard goes on the merge alone. That is one node per fire, and it
+    /// makes gate (a) — "a fire with no image lane is the fire this engine
+    /// always fired" — structural rather than lucky.
+    #[must_use]
+    pub fn media() -> Predicate {
+        Predicate::fact(5)
+    }
 }
 
 impl Classify for Facts {
@@ -116,6 +154,7 @@ impl Classify for Facts {
             drafts: r.drafts(),
             captures_scores: r.captures_scores(),
             masked: r.has_custom_mask(),
+            media: r.has_media(),
         }
     }
 
@@ -125,6 +164,7 @@ impl Classify for Facts {
             | (u64::from(self.drafts) << 2)
             | (u64::from(self.captures_scores) << 3)
             | (u64::from(self.masked) << 4)
+            | (u64::from(self.media) << 5)
     }
 }
 
@@ -209,8 +249,40 @@ impl ForwardHybrid for Model {
         let plan_p = ops::attn::plan_prefill(&input_p, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_s = ops::attn::plan_prefill(&input_s, m.q_heads, m.kv_heads, m.head_dim, None);
         let mask = inputs.mask();
+
+        // **THE TOWER FIRST, AND THE ORDER IS THE PARTITION** (multimodal §1).
+        // Every node `tower` emits is a `Dim::Patches` rectangle, so the two
+        // capture units are the two RUNS of this node list — and a run is what
+        // `model_compiler::unit` can cut. Emitting one trunk node before the
+        // tower would interleave them and be refused by name
+        // (`Error::UnitsInterleave`). The plan builders above are prepare
+        // regions, which `hoist` keeps global-front whatever order they are
+        // written in, so they are not trunk nodes for this purpose.
+        let towered = m.tower.as_ref().map(|t| tower(&inputs, t));
+
         let ids = inputs.tokens();
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
+
+        // **THE EMBED MERGE**: the tower's rows written over the token rows
+        // the image placeholders occupy. `scatter_live_rows` and not the plain
+        // scatter, because `layout.merge_rows` compacts — its leading
+        // `rows / merge²` rows are the answer and the rest are whatever the
+        // arena held — so the tail routes carry the `-1` that means nowhere
+        // (multimodal §8.6). This is the one node that reads one row axis and
+        // writes the other, and `Operands::outputs` is what puts it in the
+        // TRUNK's unit.
+        //
+        // **AND IT IS GUARDED, WHICH THE TOWER ITSELF IS NOT** (`Facts::media`
+        // argues the asymmetry). Split on the media window, scatter over that
+        // arm, and hand the result back UNGUARDED — `Value::everywhere`, the
+        // ruling `linear.lora_correct` states for the identical shape: the
+        // NODE is narrow, but the column it writes through is the embedding
+        // every row of the fire already has, so a consumer that inherited the
+        // guard would carry it down the whole residual stream.
+        if let Some(t) = &towered {
+            let (imaged, _) = y.split(&Facts::media());
+            y = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
+        }
 
         let routes = inputs.adapter_routes();
         for (_, w) in inputs.walk_layers(&m.layers) {
@@ -377,14 +449,22 @@ impl ForwardHybrid for Model {
             // The fusion. `[a|b]·[Wₑ|W_h]ᵀ = a·Wₑᵀ + b·W_hᵀ`, said as two
             // matmuls and one add because the IR states no concatenation —
             // see `model::Mtp`'s own note for the ruling and its one cost.
+            //
+            // **AND THE TWO PRE-NORMS ARE THE RECIPE'S, NOT THE FUSION'S**
+            // (campaign M-4). MTP scales each stream before the bank; EAGLE
+            // fuses the raw pair, because the hidden it was trained against is
+            // the one the trunk's `final_norm` already produced and the
+            // embedding it was trained against is the table's own row. A
+            // `None` here is not a skipped norm — it is a recipe that has
+            // none, and its trace carries neither node.
             let e = ops::layout::embed(&dids, &m.embed, m.vocab);
-            let e = ops::elemwise::rmsnorm_plus_one(
-                &e,
-                &mtp.pre_fc_norm_embedding,
-                mtp.pre_fc_norm_eps,
-            );
-            let h =
-                ops::elemwise::rmsnorm_plus_one(&dx, &mtp.pre_fc_norm_hidden, mtp.pre_fc_norm_eps);
+            let (e, h) = match &mtp.pre_fc {
+                Some(pre) => (
+                    ops::elemwise::rmsnorm_plus_one(&e, &pre.embedding, pre.eps),
+                    ops::elemwise::rmsnorm_plus_one(&dx, &pre.hidden, pre.eps),
+                ),
+                None => (e, dx.clone()),
+            };
             let mut dy = ops::elemwise::residual_add(
                 &ops::linear::matmul(&e, &mtp.fc_embed),
                 &ops::linear::matmul(&h, &mtp.fc_hidden),
@@ -433,15 +513,183 @@ impl ForwardHybrid for Model {
             // is false and the checkpoint publishes no `mtp.lm_head`, so there
             // is one vocabulary projection in this model and both readouts go
             // through it.
-            let draft = ops::linear::lm_head(
-                &ops::elemwise::rmsnorm_plus_one(&dy, &mtp.norm, mtp.norm_eps),
-                head,
-            );
+            // The readout, through the BASE head, past this recipe's own final
+            // norm when it has one. EAGLE's does not: it reads the block out
+            // directly, the base `lm_head` being the projection it was trained
+            // against.
+            let read = match &mtp.norm {
+                Some(norm) => ops::elemwise::rmsnorm_plus_one(&dy, norm, mtp.norm_eps),
+                None => dy,
+            };
+            let draft = ops::linear::lm_head(&read, head);
             seam::at(seam::MTP, &[&draft]);
         }
 
         logits
     }
+}
+
+/// **THIS FAMILY'S ONE ROTATION, AND WHICH OF ITS TWO SPELLINGS A ROW TAKES.**
+///
+/// Both qwen SKUs' `text_config` states `mrope_interleaved: true` with
+/// `mrope_section: [11, 11, 10]`, and every lane carrying an image needs it:
+/// an image-placeholder row's position is its patch's `(t, h, w)` and not a
+/// scalar. A lane that cannot carry an image never has one — its triple is
+/// `(p, p, p)`, which `MropeForm::Interleaved` turns by the head's own ladder
+/// whichever section a pair took, so the answer is `rope_partial`'s to the
+/// last bit.
+///
+/// **SO THE SPELLING FOLLOWS THE TOWER AND NOT A FACT BIT.** A text-only row
+/// keeps the scalar rotation and the `[Tokens]` position stream it always had,
+/// which is what leaves its artifact — its node count, its class table and its
+/// arena to the byte — the artifact G4 and
+/// `the_new_axes_cost_the_old_words_nothing` are pinned on. A tower row states
+/// the triple, once, for every attention site including the draft head's:
+/// `Media::token_positions` is empty-means-`(p, p, p)`, so the stream is
+/// complete in every fire without a window, a class or a second arm.
+fn rotate(
+    q: &Value,
+    k: &Value,
+    inputs: &Input<Facts>,
+    m: &Model,
+    a: &Attn,
+    d: u32,
+) -> (Value, Value) {
+    match &m.tower {
+        None => ops::elemwise::rope_partial(q, k, &inputs.positions(), a.rotary_dim, d, a.theta),
+        Some(_) => ops::elemwise::rope_mrope(
+            q,
+            k,
+            &inputs.mrope_positions(),
+            MROPE_SECTIONS,
+            MropeForm::Interleaved,
+            a.rotary_dim,
+            d,
+            a.theta,
+        ),
+    }
+}
+
+/// **THE TOWER, AS ONE FUNCTION AND ONE CAPTURE UNIT** (multimodal §1, §2).
+///
+/// Every rectangle below is `Dim::Patches`, so `model_compiler::unit` reads
+/// this whole run of nodes onto the patch axis and the fire launches it as its
+/// own exec — chained on one stream ahead of the trunk's, with the embed merge
+/// as the single node that crosses. Nothing here is guarded: an axis-empty
+/// fire has zero patch rows, and `engine::fire::walk` skips a zero-row region
+/// before it dispatches anything, which is gate (a) at the window table and
+/// not a branch anybody wrote.
+///
+/// **IT MUST BE EMITTED BEFORE ONE TRUNK NODE**, or `model_compiler` refuses
+/// the plan by name (`Error::UnitsInterleave`): a capture unit is a RUN of the
+/// node list, so two units that alternate are two units the walk cannot cut.
+/// `forward` calls this first and reads its answer into `layout.embed`'s
+/// output afterwards.
+///
+/// Returns the merged `[Dim::Patches, trunk hidden]` rectangle whose leading
+/// `rows / merge²` rows are live — `layout.merge_rows`' own contract — which
+/// is why the caller scatters it with [`ops::layout::scatter_live_rows`] and a
+/// `-1`-sentinel route vector rather than the plain scatter.
+fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
+    let d = t.head_dim;
+    // The three streams this axis owes itself, cut from one submission at one
+    // instant: the pre-unfolded patch vectors, the per-image indptr the
+    // bidirectional attention is block-diagonal over, and the (t, h, w) each
+    // patch turns by.
+    let x = inputs.patches(t.patch_width);
+    let segments = inputs.patch_segments();
+    let grid = inputs.patch_positions();
+
+    // **THE PATCH EMBED IS A MATMUL, AND THE POSITION TABLE IS A GATHER.**
+    // The submission ships patch VECTORS (§2's contract decision), so the
+    // "convolution" is the GEMM this IR already has; and the learned table is
+    // read with `layout.embed_weighted` over the four bilinear taps the host
+    // computed (§11.3), which is one node against the four gathers and three
+    // adds the alternative would have been.
+    let mut y = ops::elemwise::add_bias(
+        &t.patch_embed_bias,
+        &ops::linear::matmul(&x, &t.patch_embed),
+    );
+    let ids = inputs.patch_embed_rows(t.taps);
+    let pos = if t.taps == 1 {
+        ops::layout::embed(&ids, &t.pos_embed, t.positions)
+    } else {
+        let weights = inputs.patch_embed_weights(t.taps);
+        ops::layout::embed_weighted(&ids, &weights, &t.pos_embed, t.positions)
+    };
+    y = ops::elemwise::residual_add(&pos, &y);
+
+    for b in &t.blocks {
+        let n = layernorm(&y, &b.norm1, &b.norm1_bias, t.norm_eps);
+        let (q, k, v) = ops::layout::split_qkv(
+            &ops::elemwise::add_bias(&b.qkv_bias, &ops::linear::matmul(&n, &b.qkv)),
+            t.hidden,
+            t.hidden,
+        );
+        // Two axes and no time, stated as a zero section rather than as a
+        // two-wide stream; `MropeForm::Blocked` is the block layout AND the
+        // per-block ladder restart, which is the half of
+        // `apply_rotary_pos_emb_vision` a plausible kernel gets wrong (§7.2).
+        let (q, k) = ops::elemwise::rope_mrope(
+            &q,
+            &k,
+            &grid,
+            [0, d / 4, d / 4],
+            MropeForm::Blocked,
+            d,
+            d,
+            t.theta,
+        );
+        let o = ops::attn::dense(&q, &k, &v, &segments, d, t.sm_scale);
+        y = ops::elemwise::residual_add(
+            &ops::elemwise::add_bias(&b.proj_bias, &ops::linear::matmul(&o, &b.proj)),
+            &y,
+        );
+
+        let n = layernorm(&y, &b.norm2, &b.norm2_bias, t.norm_eps);
+        let h = ops::elemwise::add_bias(&b.fc1_bias, &ops::linear::matmul(&n, &b.fc1));
+        let a = ops::linear::mlp_gelu_tanh(&h);
+        y = ops::elemwise::residual_add(
+            &ops::elemwise::add_bias(&b.fc2_bias, &ops::linear::matmul(&a, &b.fc2)),
+            &y,
+        );
+    }
+
+    // The merger. The norm is on the UNMERGED rows — the checkpoint's own
+    // `merger.norm` is `[hidden]` and not `[merge²·hidden]`, which is
+    // `use_postshuffle_norm: false` read off the shapes — and the fold comes
+    // after it.
+    let m = &t.merger;
+    let n = layernorm(&y, &m.norm, &m.norm_bias, t.norm_eps);
+    let folded = ops::layout::merge_rows(&n, t.merge);
+    let h = ops::elemwise::add_bias(&m.fc1_bias, &ops::linear::matmul(&folded, &m.fc1));
+    let a = ops::linear::mlp_gelu_tanh(&h);
+    ops::elemwise::add_bias(&m.fc2_bias, &ops::linear::matmul(&a, &m.fc2))
+}
+
+/// **`nn.LayerNorm`, SAID IN THREE OPS BECAUSE THE IMPORT CANNOT SAY IT IN
+/// ONE** (multimodal §6.1, §9.1).
+///
+/// `layernorm_no_scale` answers `(x − mean) · rsqrt(var + eps)`, a row whose
+/// rms is 1 by construction — so the `rmsnorm` on top of it normalizes
+/// nothing and multiplies by its weight, which is the scale, and `add_bias` is
+/// the bias. The second reduction costs a uniform per-row factor of
+/// `1 ± 1.4e-4` (the bf16 rounding of an already-normalized row, averaged over
+/// the width), which is thirty times inside bf16's own quantum.
+///
+/// The fold §6.1 proposed — `w` into the following GEMM, `b·Mᵀ` into its bias
+/// — is HALF expressible: `Expr::Scale`'s `PerBlock` factor is exactly
+/// `W · diag(w)`, and `Expr::Bias` adds one compile-time constant where a
+/// matrix-vector product is owed. And the two halves do not compose, because a
+/// runtime `add_bias` behind a scaled bank contributes `(b ⊙ w)·Mᵀ`. So the
+/// text says the whole norm and the import contract stays a copy. What is
+/// owed is a saving and not a correction: `elemwise::layernorm(x, w, eps)`
+/// would retire the middle line.
+fn layernorm(x: &Value, weight: &model_dsl::Weight, bias: &model_dsl::Weight, eps: f32) -> Value {
+    ops::elemwise::add_bias(
+        bias,
+        &ops::elemwise::rmsnorm(&ops::elemwise::layernorm_no_scale(x, eps), weight, eps),
+    )
 }
 
 fn attn_mixer(
@@ -456,7 +704,6 @@ fn attn_mixer(
     a: &Attn,
 ) -> Value {
     let pages = inputs.kv(&a.kv);
-    let positions = inputs.positions();
     let write_page = inputs.write_page(&a.kv);
     let write_offset = inputs.write_offset(&a.kv);
     let d = m.head_dim;
@@ -466,7 +713,7 @@ fn attn_mixer(
     seam::at(seam::ATTN_QV, &[&q, &v]);
     let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
-    let (q, k) = ops::elemwise::rope_partial(&q, &k, &positions, a.rotary_dim, d, a.theta);
+    let (q, k) = rotate(&q, &k, inputs, m, a, d);
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, &[&q]);
 
@@ -526,8 +773,9 @@ fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn)
     // Taken unrefined, as the trunk's own mixer takes them. `x` already
     // carries the draft window, and `Recorder::push` meets its inputs' guards:
     // a `Guard::Always` runtime input narrows to the window of whatever it is
-    // read beside, so splitting these would state the window twice.
-    let positions = inputs.positions();
+    // read beside, so splitting these would state the window twice. The
+    // position stream is `rotate`'s to ask for, because which of the two it
+    // is is the model's and not this site's.
     let write_page = inputs.write_page(&a.kv);
     let write_offset = inputs.write_offset(&a.kv);
     let d = m.head_dim;
@@ -536,7 +784,7 @@ fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn)
     let v = ops::linear::matmul(x, &a.v_proj);
     let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
-    let (q, k) = ops::elemwise::rope_partial(&q, &k, &positions, a.rotary_dim, d, a.theta);
+    let (q, k) = rotate(&q, &k, inputs, m, a, d);
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     let o = ops::attn::prefill(&q, plan, pages, None, d, m.kv_heads, a.sm_scale);
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)

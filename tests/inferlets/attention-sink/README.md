@@ -46,7 +46,7 @@ token  = argmax(logits)
 
 ## Implementation notes
 
-This is in the suite because it selects KV entries by **position**, which PTIR's
+This is in the suite because it selects KV entries by **position**, which ETA's
 geometry exposes. The attention-score eviction family — H2O, SnapKV, TOVA,
 Quest, RetrievalAttention — is not implementable today because `IntrinsicId`
 exposes logits, embeddings and geometry but no attention weights.

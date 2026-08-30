@@ -113,7 +113,7 @@ fn head(result: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "BLOCKED, and not on hardware: `PortMask::RS_BUFFER` -- \
             `RsBufferPages`, `RsBufferIndptr`, `RsBufferLen`, `RsWSlot`, \
-            `RsWOff` -- is RESERVED in `tensor-ir`'s registry and no engine in \
+            `RsWOff` -- is RESERVED in `eta-ir`'s registry and no engine in \
             this tree serves a bit of it, so a recurrent fold that reads its \
             length off a buffered slot has no port to read. The \
             `rs-buffer-bench` guest is gone with the workspace move to \

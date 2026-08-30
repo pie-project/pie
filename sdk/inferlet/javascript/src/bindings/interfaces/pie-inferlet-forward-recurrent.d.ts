@@ -159,7 +159,7 @@ export class ForwardPass {
   */
   readout(indices: Channel): void;
   /**
-  * Attach canonical PTIR bytes and channel handles in dense declaration
+  * Attach canonical ETA bytes and channel handles in dense declaration
   * order. Validation uses the engine-owned ModelProfile, and now also
   * rejects any stage this interface does not admit -- see the per-file
   * note on which stages are legal.

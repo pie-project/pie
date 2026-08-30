@@ -27,7 +27,7 @@ engine-cuda-13 = ["_engine-cuda", "pie/engine-cuda-13", "runtime/engine-cuda-13"
 # The private "the CUDA shell is linked" gate, the same shape and the same
 # underscore as `runtime`'s own. Two gates here drive the `Engine` CONTRACT
 # directly rather than the client edge -- `copy_kv` and `Readout::Rows` are
-# engine verbs with no guest spelling -- so they name `engine_api` and
+# engine verbs with no guest spelling -- so they name `engine` and
 # `engine_cuda` types, and a build with neither ABI selected must not compile
 # them.
 _engine-cuda = ["pie/_engine-cuda", "runtime/_engine-cuda"]
@@ -48,7 +48,7 @@ runtime = { path = "../../crates/runtime" }
 # `runtime::engine::backend::open` and submit their own frames -- the shape
 # `crates/runtime/tests/cuda_boot_smoke.rs` established one layer down. Every
 # other gate here goes over the websocket, which is still the point of them.
-engine-api = { path = "../../crates/engine-api" }
+engine = { path = "../../crates/engine" }
 # For `engine_cuda::device::present()`: those two gates skip at RUN time on a
 # machine with no card, rather than being `#[ignore]`d on a build flag.
 engine-cuda = { path = "../../crates/engine-cuda" }
@@ -56,12 +56,18 @@ engine-cuda = { path = "../../crates/engine-cuda" }
 # lane's fact word. A gate that spelled a word by hand would be pinning a
 # different model than the one it fires.
 model = { path = "../../crates/model" }
-# The guest-program half of `cuda_row_selected_readout`: it authors a PTIR
+# The guest-program half of `cuda_row_selected_readout`: it authors an ETA
 # epilogue at the LOAD's own vocabulary (a corpus golden is authored at the
 # dummy profile's and cannot bind here), plans it and emits CUDA for it —
 # which is the splice the scheduler lane makes and a gate holding the engine
 # directly has to make for itself.
-tensor-compiler = { path = "../../crates/tensor-compiler" }
+eta-compiler = { path = "../../crates/eta-compiler" }
+# The two IRs these tests author by hand: `model_ir::Platform` to pick a
+# shell, and `eta_ir::{container, op, registry, types, validate}` to build a
+# guest program and bind it. Both were reached through `engine`'s re-export
+# until that came out.
+model-ir = { path = "../../crates/model-ir" }
+eta-ir = { path = "../../crates/eta-ir" }
 # The checkpoint's own vocabulary: a tokenizer from another snapshot decodes
 # the right ids into the wrong words.
 tokenizer = { path = "../../crates/tokenizer" }

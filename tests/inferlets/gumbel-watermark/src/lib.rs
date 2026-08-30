@@ -70,7 +70,7 @@
 //! strongly favoured token yields `+∞` and destroys the statistic. See
 //! `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 

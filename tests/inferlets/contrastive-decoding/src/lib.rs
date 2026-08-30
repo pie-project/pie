@@ -7,7 +7,7 @@
 //! probability is at least `alpha` times the expert's maximum probability.
 
 use inferlet::chat;
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 
 const PAGE_T: u32 = 16;

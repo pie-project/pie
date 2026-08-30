@@ -52,7 +52,7 @@
 //! A `site_table` module stood here with two functions: `derive_sites`, which
 //! walked a `model_ir::trace::ForwardPlan` looking for `moe::topk_softmax` and
 //! read `(experts, top_k)` off its operands' widths, and `summary_sites`,
-//! which mapped an engine-reported `engine_api::ModelSiteSummary` into this
+//! which mapped an engine-reported `engine::ModelSiteSummary` into this
 //! vocabulary. Its own doc enumerated three links and measured all three as
 //! open: the producer (`engine-cuda`'s `serve/load.rs`) reported
 //! `ModelSiteSummary::default()`, the carrier ([`EngineSpec`]) had no field to
@@ -314,7 +314,7 @@ pub(crate) struct MemberFacts {
     /// it puts a pooled device-geometry member in its own suffix run instead
     /// of scattering it through the wire members -- which is what lets the
     /// sub-batch table say which class each run is.
-    pub(crate) geometry_class: tensor_ir::registry::GeometryClass,
+    pub(crate) geometry_class: eta_ir::registry::GeometryClass,
     /// Arrival position within the step group; the stable-order tiebreak.
     pub(crate) arrival: usize,
 }
@@ -552,9 +552,9 @@ mod tests {
             max_layers: None,
             multi_token: false,
             geometry_class: if device_resolved_geometry {
-                tensor_ir::registry::GeometryClass::DecodeEnvelope
+                eta_ir::registry::GeometryClass::DecodeEnvelope
             } else {
-                tensor_ir::registry::GeometryClass::Host
+                eta_ir::registry::GeometryClass::Host
             },
             arrival,
         }
@@ -568,7 +568,7 @@ mod tests {
             truncated: false,
             max_layers: None,
             multi_token: false,
-            geometry_class: tensor_ir::registry::GeometryClass::Host,
+            geometry_class: eta_ir::registry::GeometryClass::Host,
             arrival,
         }
     }

@@ -1,13 +1,24 @@
 //! `Elementwise`: the norm anchor, rope, gate, and hc arms.
 
-use kernels::{DispatchElementwise, KernelError};
 use kernels_cuda::{Tensor, elemwise};
-use model_ir::Elementwise;
+use model_exec::{DispatchElementwise, KernelError};
+use model_ir::{Elementwise, MropeForm};
 
 use crate::run::Run;
 
 impl DispatchElementwise for Run<'_> {
     fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError> {
+        self.elementwise(op).map_err(crate::error::kernel)
+    }
+}
+
+impl Run<'_> {
+    /// The arms themselves, in `kernels-cuda`'s error vocabulary and not
+    /// the contract's — which is what keeps each one a plain tail call with
+    /// a plain `?`. [`kernel`](crate::error::kernel) is the single line
+    /// above that lifts the family, and says why it is a call and not a
+    /// `From` impl.
+    fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_cuda::Error> {
         match op {
             // ---- norm (anchor) ----
             Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
@@ -63,6 +74,35 @@ impl DispatchElementwise for Run<'_> {
                 *head_dim,
                 *eps,
                 &mut self.tensor(*y),
+            ),
+            // **THE CENTRED NORM** (multimodal §6.1). The one part of the
+            // towers' `nn.LayerNorm` that does not fold into the GEMM behind
+            // it; the scale and the bias do, at import.
+            Elementwise::LayernormNoScale { x, eps, y } => elemwise::layernorm::layernorm_no_scale(
+                self.ctx(),
+                self.tensor(*x),
+                *eps,
+                &mut self.tensor(*y),
+            ),
+            // **THE CLIPPED LINEAR'S CLAMP** (multimodal §6.5), in place on
+            // `x` — the IR aliases `x_out` onto it.
+            Elementwise::Clamp { x, lo, hi, x_out: _ } => {
+                elemwise::clip::clamp(self.ctx(), *lo, *hi, &mut self.tensor(*x))
+            }
+            // **AND THE FORM WHOSE BOUNDS THE CHECKPOINT SHIPS** (multimodal
+            // §12.2): two `[1]` planes resolved like any other weight, which
+            // is `Elementwise::Scale`'s arm one row up read for a bound
+            // instead of a gain.
+            Elementwise::ClampLearned {
+                x,
+                lo,
+                hi,
+                x_out: _,
+            } => elemwise::clip::clamp_learned(
+                self.ctx(),
+                self.tensor(*lo),
+                self.tensor(*hi),
+                &mut self.tensor(*x),
             ),
             Elementwise::RmsnormGated {
                 x,
@@ -162,6 +202,36 @@ impl DispatchElementwise for Run<'_> {
                 &mut self.tensor(*q),
                 &mut self.tensor(*k),
                 self.tensor(*positions),
+                *rotary_dim,
+                *head_dim,
+                *theta,
+            ),
+            // **THE SECTION LAYOUT PICKS THE ENTRY** (multimodal §6.3). The
+            // trunk states `mrope_interleaved: true` and the tower's
+            // `apply_rotary_pos_emb_vision` hands its sections out in
+            // contiguous blocks; the two entries share every refusal and
+            // differ in one symbol, so this arm is a choice of function and
+            // not a second arm.
+            Elementwise::RopeMrope {
+                q,
+                k,
+                positions,
+                sections,
+                form,
+                rotary_dim,
+                head_dim,
+                theta,
+                q_out: _,
+                k_out: _,
+            } => (match form {
+                MropeForm::Interleaved => elemwise::rope_mrope::interleaved,
+                MropeForm::Blocked => elemwise::rope_mrope::blocked,
+            })(
+                self.ctx(),
+                &mut self.tensor(*q),
+                &mut self.tensor(*k),
+                self.tensor(*positions),
+                *sections,
                 *rotary_dim,
                 *head_dim,
                 *theta,

@@ -1,6 +1,6 @@
 //! Reads the core sampling measurements from one forward pass.
 //!
-//! A single PTIR epilogue publishes the greedy token, raw logits, entropy,
+//! A single ETA epilogue publishes the greedy token, raw logits, entropy,
 //! probabilities, log-probabilities, and a top-p nucleus keep-mask. The host
 //! then cross-checks that the independently useful outputs agree.
 //!
@@ -14,7 +14,7 @@
 //! (interp.rs `Predicate::CummassLe`) without depending on float summation
 //! order.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::Deserialize;
 
 const TOP_P: f32 = 0.9;

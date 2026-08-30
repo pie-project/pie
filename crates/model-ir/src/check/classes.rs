@@ -616,6 +616,10 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::Decode { .. }
             | Attention::Prefill { .. }
             | Attention::Masked { .. }
+            // The tower's attention touches no sequence cache at all — no kv
+            // pool, no page table, no append. It is an `Attention` by rule 1's
+            // first clause (tokens interact) and by nothing else.
+            | Attention::Dense { .. }
             | Attention::DecodeLse { .. }
             | Attention::PrefillLse { .. }
             | Attention::Sink { .. }

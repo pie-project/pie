@@ -4,11 +4,27 @@ use super::model::{Model, Reading};
 
 pub struct Facts {
     pub qo_one: bool,
+    pub has_adapter: bool,
 }
 
 impl Facts {
     pub fn qo_one() -> Predicate {
         Predicate::fact(0)
+    }
+
+    /// **THE ADAPTER WINDOW** (palo design §8, §0; campaign A-6).
+    ///
+    /// A lane that routed its rows to a registered adapter. §8 puts the
+    /// correction "over the adapter window", and §0 defines a window as the
+    /// rows of the lanes whose word satisfies the guard — so the axis needs a
+    /// bit, and the bit is what makes it FREE when nobody uses it: a fire no
+    /// lane routed has zero rows in this class, `engine::fire::walk` skips a
+    /// zero-row region before it dispatches anything, and the correction costs
+    /// that fire no launch, no empty grid and no instruction. A `Guard::Always`
+    /// correction would instead launch two kernels per layer over every row of
+    /// every fire to add zero to them, which is 1.0x nothing.
+    pub fn has_adapter() -> Predicate {
+        Predicate::fact(1)
     }
 }
 
@@ -16,11 +32,12 @@ impl Classify for Facts {
     fn of(r: &Request) -> Facts {
         Facts {
             qo_one: r.query_len() == 1,
+            has_adapter: r.has_adapter(),
         }
     }
 
     fn word(&self) -> u64 {
-        self.qo_one as u64
+        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1)
     }
 }
 
@@ -68,6 +85,7 @@ impl ForwardHybrid for Model {
         let mut y = ops::layout::embed(&ids, &m.embed, m.vocab);
         let d = m.head_dim;
 
+        let routes = inputs.adapter_routes();
         for (_, w) in inputs.walk_layers(&m.layers) {
             let at = &w.attn;
             let pages = inputs.kv(&at.kv);
@@ -134,7 +152,22 @@ impl ForwardHybrid for Model {
             } else {
                 o
             };
-            y = ops::elemwise::residual_add(&ops::elemwise::add_bias(&at.o_bias, &o), &y);
+            // **THE CORRECTION, OVER ITS WINDOW** (design §8, campaign A-6).
+            // One statement: the site's output — the reduced projection plus
+            // its bias — and this row's adapter's `B·(A·x)`, in place. No merge
+            // and no arm: the op writes THROUGH the arena column, so a class
+            // outside the window never runs the node and reads the uncorrected
+            // value at the same address, which is the identity for free.
+            //
+            // AFTER the reduce and after the bias, and `Layer::lora_a`'s own
+            // note argues both.
+            let o = ops::elemwise::add_bias(&at.o_bias, &o);
+            let o = {
+                let (adapted, _) = o.split(&Facts::has_adapter());
+                let (px, _) = x.split(&Facts::has_adapter());
+                ops::linear::lora_correct(&px, &w.lora_a, &w.lora_b, &routes, &adapted)
+            };
+            y = ops::elemwise::residual_add(&o, &y);
 
             let e = &w.mlp;
             let x = ops::elemwise::rmsnorm(&y, &w.mlp_norm, w.mlp_norm_eps);

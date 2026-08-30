@@ -1,6 +1,6 @@
 # chat-completion
 
-Reference chat completion harness with PTIR prefill, device-carried decode, and
+Reference chat completion harness with ETA prefill, device-carried decode, and
 in-graph top-p plus temperature sampling. This is not an algorithm inferlet.
 
 ## Purpose

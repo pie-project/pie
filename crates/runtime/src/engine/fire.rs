@@ -2,7 +2,7 @@
 //!
 //! # The CSRs were never a submission
 //!
-//! This module replaces `engine_api::plan::LaunchPlan` — sixty-two fields,
+//! This module replaces `engine::plan::LaunchPlan` — sixty-two fields,
 //! most of them parallel `Vec<u32>` arms (`qo_indptr`, `kv_page_indptr`,
 //! `rs_translation_indptr`, `embed_block_indptr`, `image_mrope_indptr`, …)
 //! — and the four-hundred-line `StepSubmission::validate` whose whole job was
@@ -33,8 +33,8 @@
 //! batch assembly is a concatenation instead of eleven simultaneous CSR
 //! merges (`scheduler::wire`, which was that merge and is now the trim).
 
-use engine_api::fire::{Step, KvDelta, Lane};
-use tensor_ir::registry::GeometryClass;
+use engine::fire::{Step, KvDelta, Lane};
+use eta_ir::registry::GeometryClass;
 
 use crate::engine::completion::TerminalCell;
 
@@ -48,7 +48,7 @@ use crate::engine::completion::TerminalCell;
 // meant to scatter a speculative window into a buffer was submitted as an
 // ordinary fold and the device folded it.
 //
-// `engine_api::RsVerb` and `engine_api::RsReset` are that vocabulary, and
+// `engine::RsVerb` and `engine::RsReset` are that vocabulary, and
 // they are fields of the LANE — so the arms have nowhere left to be:
 // `pipeline::fire::rs::PreparedRs::apply_to` stamps one verb and one reset
 // fact onto the lane that carries each row, `RsVerb::Buffer::pages` IS the
@@ -65,7 +65,7 @@ use crate::engine::completion::TerminalCell;
 // `offload::try_encode`'s `media.is_empty()` gate was true on every fire and
 // the encode seam was dead in front of a payload that did not exist. The
 // payload comes back with the verb that produces it
-// (`engine_api::MediaEncode` is `encode`'s argument, and what a fire needs
+// (`engine::MediaEncode` is `encode`'s argument, and what a fire needs
 // afterwards is rows in the arena — a seam the shell resolves).
 //
 // A `ChannelTicket` struct stood here too: a channel's expected ring cursors,
@@ -73,7 +73,7 @@ use crate::engine::completion::TerminalCell;
 // `device_channel_tickets` flag that said whether the engine had a device
 // half to check them, which `scheduler::batch` then transcribed onto the
 // attached lane. Both are gone. The reservation is stamped straight onto the
-// lane that carries the pass (`engine_api::Lane::channels`) by
+// lane that carries the pass (`engine::Lane::channels`) by
 // `pipeline::fire`'s `TicketReservation::apply_to` — the party that mints it
 // and the party that knows whether the instance's channels were adopted. Two
 // spellings of one number is what article 8 forbids.
@@ -87,7 +87,7 @@ pub struct FireRequest {
     /// Which geometry class this request fires in — how much of the fire's
     /// descriptor the engine resolves on the device rather than reading out
     /// of the submission. Stated at bind time
-    /// ([`InstanceBinding::geometry`](engine_api::InstanceBinding)); carried
+    /// ([`InstanceBinding::geometry`](engine::InstanceBinding)); carried
     /// here because the scheduler groups by it.
     pub geometry: GeometryClass,
     /// How many layers to run, for a partial-depth fire.
@@ -225,7 +225,7 @@ pub struct StepFire {
     /// Which bound instance each lane belongs to, parallel to the lanes.
     ///
     /// This is what
-    /// [`Step::attachments`](engine_api::Step) carries
+    /// [`Step::attachments`](engine::Step) carries
     /// for every lane whose request set
     /// [`FireRequest::boundary_program`] — `batch` builds the attachments out
     /// of exactly this vector. It stays here as well because the scheduler's
@@ -245,7 +245,7 @@ pub struct StepFire {
 /// rewrite for a fork mover no shell in this tree has — both spellings are
 /// deleted rather than carried (alto E); `required_kv_pages` was a
 /// frame-union high-water the engine used to size an admission check it
-/// makes for itself now ([`Error::Exhausted`](engine_api::Error::Exhausted)
+/// makes for itself now ([`Error::Exhausted`](engine::Error::Exhausted)
 /// carries the numbers).
 #[derive(Default)]
 pub struct FrameFire {
@@ -329,4 +329,4 @@ pub fn lane_of(slot: u32, tokens: Vec<u32>, held: u32, pages: Vec<u32>) -> Lane 
 
 /// Re-exported so a reader of this module does not have to reach two crates
 /// deep for the nouns its own signatures are written in.
-pub use engine_api::fire::{Attachment, Boundary, FireTicket, LaneReadout};
+pub use engine::fire::{Attachment, Boundary, FireTicket, LaneReadout};

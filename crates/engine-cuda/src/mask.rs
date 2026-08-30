@@ -107,7 +107,7 @@
 //! consumer take a sliced span table and the whole slab (the same shape
 //! `GeomKind::Indices` and its bounds vector already have).
 
-use engine::engine_api::fire::{Mask, Masking};
+use engine::fire::{Mask, Masking};
 
 use crate::error::{Fault, Result};
 

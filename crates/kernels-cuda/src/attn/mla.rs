@@ -5,8 +5,8 @@
 //! reads the arch from the context and the smem arms from the plan's device
 //! facts — none of it leaks above these entries.
 
-use kernels::KernelError;
-use model_ir::Dtype;
+use crate::error::Error;
+use dtype::Dtype;
 
 use crate::attn::kv;
 use crate::attn::plan::MlaPlan;
@@ -37,7 +37,7 @@ impl Layer {
         pool: &KvPool,
         kv_lora_rank: u32,
         rope_dim: i32,
-    ) -> Result<Self, KernelError> {
+    ) -> Result<Self, Error> {
         Ok(Self {
             ckv_pages: pool.keys.ptr,
             kpe_pages: pool.values.ptr,
@@ -52,7 +52,7 @@ impl Layer {
 /// `attn::row_heads`'s mirror (that one divides a width by the head width;
 /// this one divides by the count), kept separate because the two quotients
 /// are different quantities.
-fn rope_per_head(op: &'static str, q_pe: Tensor, heads: i32) -> Result<i32, KernelError> {
+fn rope_per_head(op: &'static str, q_pe: Tensor, heads: i32) -> Result<i32, Error> {
     if heads <= 0 {
         return Err(refuse(op, "the stated head count is zero"));
     }
@@ -75,7 +75,7 @@ fn split_kv_a_norm(
     eps: f32,
     kv_c: &mut Tensor,
     k_pe: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let t = dtype_dispatch!(op, kv_a.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let kv_lora = count(op, "the latent width this cut states", kv_c.width)?;
     let rope = stated(op, k_pe.width)?;
@@ -117,7 +117,7 @@ pub fn latents(
     kv_lora_rank: u32,
     kv_c: &mut Tensor,
     k_pe: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.mla_latents";
     debug_assert_eq!(
         kv_c.width, kv_lora_rank,
@@ -139,7 +139,7 @@ pub fn latents_rope(
     theta: f32,
     kv_c: &mut Tensor,
     k_pe: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.mla_latents_rope";
     dtype_dispatch!(OP, kv_a.dtype, { Bf16 => () });
     debug_assert_eq!(
@@ -159,7 +159,7 @@ pub fn split_q_b(
     rope_dim: u32,
     q_nope: &mut Tensor,
     q_pe: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.mla_split_q_b";
     let t = dtype_dispatch!(OP, q_b.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     let heads = count(OP, "the head count this cut states", heads)?;
@@ -205,7 +205,7 @@ pub fn absorb_q(
     nope_dim: u32,
     v_head_dim: u32,
     q_latent: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.mla_absorb_q";
     dtype_dispatch!(OP, q_nope.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this absorb states", heads)?;
@@ -254,7 +254,7 @@ pub fn absorb_out(
     v_head_dim: u32,
     nope_dim: u32,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.mla_absorb_out";
     dtype_dispatch!(OP, latent.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this absorb states", heads)?;
@@ -298,7 +298,7 @@ pub fn absorb_out(
 }
 
 #[cfg(feature = "_cuda")]
-fn cublas_refused(op: &'static str, status: i32) -> KernelError {
+fn cublas_refused(op: &'static str, status: i32) -> Error {
     refuse(
         op,
         format!("`cublasGemmStridedBatchedEx` answered {status}"),
@@ -381,7 +381,7 @@ pub fn kv_append(
     pool: &KvPool,
     write_page: Tensor,
     write_offset: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.mla_kv_append";
     let _ = (write_page, write_offset);
     dtype_dispatch!(OP, kv_c.data.dtype, { Bf16 => () });
@@ -407,7 +407,7 @@ pub fn kv_append(
 /// The naive scalar/mma kernels: the Blackwell path and the only engine the
 /// selected (sparse) variants have.
 mod naive {
-    use super::{ArgValue, Ctx, Fire, KernelError, Launch, refuse};
+    use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
     use crate::jit::Arg;
 
     pub const NAIVE_BLOCK: u32 = 256;
@@ -479,7 +479,7 @@ mod naive {
     /// no selection is stated, scalar otherwise. A shape neither can lane-
     /// split is refused — the old plane's silent decline was a no-launch
     /// that looked like success.
-    pub fn fire(ctx: &Ctx, op: &'static str, ptrs: Ptrs, shape: Shape) -> Result<(), KernelError> {
+    pub fn fire(ctx: &Ctx, op: &'static str, ptrs: Ptrs, shape: Shape) -> Result<(), Error> {
         const MMA_THREADS: u32 = 256;
 
         if shape.total_tokens <= 0 {
@@ -597,7 +597,7 @@ mod naive {
 /// The FlashInfer mla fa2 engine: cooperative grid, one by-value parameter
 /// block, smem arm chosen from the plan's device facts.
 mod mla_fa2 {
-    use super::{Ctx, KernelError, Layer, refuse};
+    use super::{Ctx, Error, Layer, refuse};
     use crate::attn::fa2_abi::{UintFastdiv, resolve};
     use crate::attn::plan::{MlaPlan, MlaPlanInfo};
     use crate::jit::{Fire, Launch};
@@ -836,7 +836,7 @@ mod mla_fa2 {
         causal: bool,
         params: &MlaParams,
         launch: Launch,
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), Error> {
         let Some(row) = INST.get(arm) else {
             return Err(refuse(
                 op,
@@ -869,7 +869,7 @@ fn dispatch_dense(
     sm_scale: f32,
     causal: bool,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     let Some(major) = ctx.compute_capability_major() else {
         return Err(refuse(op, "the device's compute capability is unknowable"));
     };
@@ -955,7 +955,7 @@ pub fn attention_decode(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.mla_decode";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
@@ -978,7 +978,7 @@ pub fn attention_prefill(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     const OP: &str = "attention.mla_prefill";
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     let heads = count(OP, "the head count this attention states", heads)?;
@@ -1005,7 +1005,7 @@ fn selected(
     sm_scale: f32,
     causal: bool,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
     debug_assert_eq!(selection.dtype, Dtype::I32, "the selection is i32 page ids");
     let heads = count(op, "the head count this attention states", heads)?;
@@ -1066,7 +1066,7 @@ pub fn attention_decode_selected(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     // MENLO-SEAM: the plan is accepted for the op's seat and goes unread —
     // the selected paths always run the naive engine (see [`selected`]).
     let _ = plan;
@@ -1097,7 +1097,7 @@ pub fn attention_prefill_selected(
     kv_lora_rank: u32,
     sm_scale: f32,
     o: &mut Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     // MENLO-SEAM: as `attention_decode_selected` — the plan goes unread on
     // the selected paths (see [`selected`]).
     let _ = plan;

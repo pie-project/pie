@@ -51,7 +51,7 @@
 //! fact -- qwen-3-0.6b has neither", and `the backend's model profile does not
 //! advertise this kernel` as something "one layer lower". Neither is about the
 //! checkpoint. `ModelProfile` is built in `runtime/src/pipeline/program.rs` by
-//! copying the ENGINE's `PtirCaps` field for field, and this engine states
+//! copying the ENGINE's `EtaCaps` field for field, and this engine states
 //! `has_attn_score: false`, `has_attn_page_mask: false`, `has_kv_envelopes:
 //! false`, `has_mtp_logits: false` and `has_value_head: false` as literals, in
 //! one block of `serve/load.rs`, under a comment that says exactly why: each is
@@ -59,9 +59,9 @@
 //! fixtures, one cause. Nobody needs to go looking in the checkpoint.
 //!
 //! Both refusals SAY that now -- the `IntrinsicUnavailable` and
-//! `KernelUnavailable` that `tensor-ir`'s `validate` raises (this crate does
+//! `KernelUnavailable` that `eta-ir`'s `validate` raises (this crate does
 //! not link it; the strings arrive over the wire) name the engine's
-//! `PtirCaps` and add, of the intrinsic one, that it "says nothing about the
+//! `EtaCaps` and add, of the intrinsic one, that it "says nothing about the
 //! checkpoint". The census quotes the old wording above because that is what
 //! the run printed when it was taken.
 //!
@@ -293,7 +293,7 @@
 //! false capability is a silent wrong answer.
 //!
 //! The emitter class is INTENTIONAL and is not a hole:
-//! `tensor-compiler/tests/cuda_every_region_runs`'s `REFUSED` table names it
+//! `eta-compiler/tests/cuda_every_region_runs`'s `REFUSED` table names it
 //! outright. A `RegionKind::Library` wrapping a single `top_k` would fall back
 //! to `ptir_m1_execute`, whose single-threaded form is O(len^2) and does not
 //! return at a real vocabulary, so refusing is the honest answer. What was

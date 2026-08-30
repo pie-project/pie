@@ -66,10 +66,10 @@
 
 mod common;
 
-use engine_api::model_ir::Platform;
-use engine_api::{
+use engine::{
     Budgets, FrameSubmission, KvDelta, Lane, LaneReadout, Readout, RsReset, RsVerb, Step,
 };
+use model_ir::Platform;
 use runtime::engine::backend::open;
 
 /// The catalog row this gate serves.
@@ -202,7 +202,7 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
         &checkpoint,
         Platform::Cuda,
         budgets,
-        engine_api::Residency::uncapped(),
+        engine::Residency::uncapped(),
         0,
         1,
     )
@@ -215,7 +215,7 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
     let neighbours: Vec<Vec<u32>> = NEIGHBOURS.iter().map(|p| tokenizer.encode(p)).collect();
 
     fn read(
-        engine: &mut dyn engine_api::Engine,
+        engine: &mut dyn engine::Engine,
         probe: Lane,
         neighbours: &[Vec<u32>],
         width: usize,
@@ -268,7 +268,7 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
     // n`.
     let held = probe.len() as u32;
     let step = vec![first];
-    let decode = |engine: &mut dyn engine_api::Engine, width: usize| -> LaneReadout {
+    let decode = |engine: &mut dyn engine::Engine, width: usize| -> LaneReadout {
         let _ = read(engine, prefill(), &neighbours, 1);
         read(engine, seated(0, held, &step), &neighbours, width)
     };

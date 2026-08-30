@@ -12,7 +12,7 @@ per-step valid-token masking rule to JSON Schema constraints.
 **Faithfulness: Faithful to the constrained-decoding mechanism.** The inferlet
 enforces an incremental grammar mask and validates the final JSON, but delegates
 the schema automaton construction to the host helper rather than expressing it in
-PTIR.
+ETA.
 
 ## What it does
 
@@ -22,7 +22,7 @@ matcher computes the set of tokens that can still lead to a valid completion, an
 all other logits are masked away before selection.
 
 This inferlet builds a JSON Schema constraint on the host, asks it for the
-current allowed-token mask, and uses a PTIR epilogue to choose the argmax among
+current allowed-token mask, and uses an ETA epilogue to choose the argmax among
 allowed logits. Generation stops only when the constraint reports termination;
 the decoded text is then parsed as JSON as a final sanity check.
 

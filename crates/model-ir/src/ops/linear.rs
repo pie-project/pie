@@ -42,6 +42,25 @@ pub enum Linear {
         up: ValueId,
         y: ValueId,
     },
+    /// **THE UNGATED GELU** (multimodal §6.2): `y = gelu_tanh(x)`, no `up`
+    /// half.
+    ///
+    /// `Qwen3_5VisionMLP` is `linear_fc2(act(linear_fc1(x)))` with
+    /// `hidden_act: gelu_pytorch_tanh` — NOT gated — and the merger is the
+    /// same shape. Every other gelu row here multiplies by an `up` half.
+    ///
+    /// **A ROW AND NOT A BAKE, AND THE BAKE IS THE ARGUMENT FOR THE ROW.**
+    /// It is expressible without this: declare `gate_up` at `[2·inter, hidden]`
+    /// with the `up` half ZERO and the `up` half of the bias ONE, and
+    /// [`MlpGegluTanhPacked`](Linear::MlpGegluTanhPacked) computes
+    /// `gelu_tanh(fc1(x)) · 1`. That pays the GEMM and the bank twice over —
+    /// 268 M parameters and 0.5 GiB of bf16 on qwen36's 27 blocks at
+    /// 1152 → 4304, written and multiplied to produce ones. The row costs one
+    /// kernel and one arm per shell.
+    MlpGeluTanh {
+        x: ValueId,
+        y: ValueId,
+    },
     MlpGegluTanhPacked {
         packed: ValueId,
         intermediate: u32,
@@ -152,7 +171,7 @@ pub enum Linear {
     /// `bank_a` is `[adapters, rank, in]` and `bank_b` is `[adapters, out,
     /// rank]` — first axis indexed by `routes`, and the LoRA scale `α/r` is
     /// folded into `bank_b`'s contents at registration, which is where every
-    /// per-adapter number belongs (the tensor-dsl adapter surface says the
+    /// per-adapter number belongs (the eta-dsl adapter surface says the
     /// same thing about the same scale). Rank diversity is bucketed by BANK,
     /// not by a runtime table: an adapter shorter than its bank's rank is
     /// registered zero-padded, which is exact, and a deployment that mixes
@@ -176,6 +195,7 @@ impl Operands for Linear {
             Self::MlpSwigluClamp { packed, .. } => sink.push(*packed),
             Self::MlpSwigluClampAlpha { packed, .. } => sink.push(*packed),
             Self::MlpGegluTanh { gate, up, .. } => sink.extend([*gate, *up]),
+            Self::MlpGeluTanh { x, .. } => sink.push(*x),
             Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
             Self::MlpSitu { packed, .. } => sink.push(*packed),
             Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
@@ -206,6 +226,7 @@ impl Operands for Linear {
             Self::MlpSwigluClamp { y, .. } => sink.push(*y),
             Self::MlpSwigluClampAlpha { y, .. } => sink.push(*y),
             Self::MlpGegluTanh { y, .. } => sink.push(*y),
+            Self::MlpGeluTanh { y, .. } => sink.push(*y),
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
             Self::MlpSitu { y, .. } => sink.push(*y),
             Self::MoeTopkSoftmax { routes, weights, .. } => sink.extend([*routes, *weights]),
@@ -233,6 +254,7 @@ impl Operands for Linear {
             | Self::MlpSwigluClamp { .. }
             | Self::MlpSwigluClampAlpha { .. }
             | Self::MlpGegluTanh { .. }
+            | Self::MlpGeluTanh { .. }
             | Self::MlpGegluTanhPacked { .. }
             | Self::MlpSitu { .. }
             | Self::MoeTopkSoftmax { .. }
@@ -254,6 +276,7 @@ impl Operands for Linear {
             Self::MlpSwigluClamp { .. } => "linear.mlp_swiglu_clamp",
             Self::MlpSwigluClampAlpha { .. } => "linear.mlp_swiglu_clamp_alpha",
             Self::MlpGegluTanh { .. } => "linear.mlp_geglu_tanh",
+            Self::MlpGeluTanh { .. } => "linear.mlp_gelu_tanh",
             Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",
             Self::MlpSitu { .. } => "linear.mlp_situ",
             Self::MoeTopkSoftmax { .. } => "linear.moe_topk_softmax",

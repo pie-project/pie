@@ -13,7 +13,7 @@
 //! where it is real, in the argument marshalling ([`Tensor::arg`] vs
 //! [`Tensor::arg_mut`]).
 
-use model_ir::Dtype;
+use dtype::Dtype;
 
 use crate::encode::ArgValue;
 
@@ -113,4 +113,52 @@ pub struct RecurrentPool {
 
     /// `f32` rolling convolution state, write side.
     pub new_conv_state: Tensor,
+}
+
+/// A quantized weight as the shaders read it: the packed codes, the scale
+/// each group is multiplied by, and — for an affine scheme — the offset each
+/// group is shifted by.
+///
+/// **THE THIRD PLANE IS AN `Option` AND NOT A ZERO HANDLE.** Whether a bank
+/// carries zero points is what separates the two four-bit formats this plane
+/// serves: MXFP4's e8m0 exponent is a pure scale, so `w = code * 2^(e-127)`
+/// and there is nothing to offset by, while MLX's affine u4 stores
+/// `w = code * scale + bias` and a bank read without its biases is not a
+/// coarser weight but a wrong one. Both entry families hold the biases seat —
+/// the mxfp4 points bind a null there — so the `Option` is what the driver
+/// says and the null is what the encoder does with it.
+///
+/// `group` and `bits` travel WITH the planes because they are the point
+/// selection: `affine_qmv_fast_bfloat16_gs_64_b_4` and its neighbours differ
+/// in nothing else, and a checkpoint is not uniform in them (`mlx_lm`
+/// publishes a 4-bit stack whose router gate is 8-bit). A shell holding one
+/// pair for the whole model reads the odd tensor at the wrong point and
+/// nothing anywhere says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bank {
+    /// The packed codes, `bits` apiece.
+    pub codes: Tensor,
+
+    /// One scale per `group` codes: bf16 factors for an affine bank, e8m0
+    /// exponent bytes for an mxfp4 one.
+    pub scales: Tensor,
+
+    /// One zero point per `group` codes, in the activation's dtype — `None`
+    /// for a symmetric scheme.
+    pub biases: Option<Tensor>,
+
+    /// Codes per scale entry.
+    pub group: u32,
+
+    /// Bits per code.
+    pub bits: u32,
+}
+
+impl Bank {
+    /// Whether this bank's groups are offset as well as scaled — the one
+    /// question that picks between the affine and the mxfp4 point families.
+    #[must_use]
+    pub const fn affine(&self) -> bool {
+        self.biases.is_some()
+    }
 }

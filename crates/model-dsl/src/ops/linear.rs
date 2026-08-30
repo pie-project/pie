@@ -90,6 +90,25 @@ pub fn mlp_geglu_tanh(gate: &Value, up: &Value) -> Value {
     y
 }
 
+/// **THE UNGATED GELU** (multimodal §6.2): `gelu_tanh(x)`, no `up` half.
+///
+/// The vision MLP and the merger are `fc2(act(fc1(x)))` at
+/// `hidden_act: gelu_pytorch_tanh`; every other gelu builder here multiplies
+/// by a gate. Landing it rather than baking a zero-`up` bank is what buys back
+/// 0.5 GiB on qwen36 — the row carries the arithmetic.
+pub fn mlp_gelu_tanh(x: &Value) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Linear::MlpGeluTanh {
+            x: x.id(),
+            y: y.id(),
+        },
+        &[x],
+    );
+    y
+}
+
 pub fn mlp_geglu_tanh_packed(packed: &Value, intermediate: u32) -> Value {
     let r = packed.rec();
     let y = r.fresh(tensor(packed.rows(), intermediate, packed.dtype()));

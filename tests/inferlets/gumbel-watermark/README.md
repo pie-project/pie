@@ -84,7 +84,7 @@ the `gumbel_max` helper.
 | `gumbel()` + `add` + `reduce_argmax` | 2.85 |
 | `gumbel_max()` | 3.60 |
 
-The two spellings are **the same program**. `gumbel_max` (`tensor-dsl/src/value.rs:912-927`)
+The two spellings are **the same program**. `gumbel_max` (`eta-dsl/src/value.rs:912-927`)
 emits `RngKeyed{Gumbel}`, `Add`, `ReduceArgmax`; `gumbel()` (ibid. `:754`) emits
 `RngKeyed{Gumbel}` and the caller adds the other two. Both compile to one fused
 region. So the 27 % gap is **not** attributable to the choice of op — it is

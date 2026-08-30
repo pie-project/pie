@@ -12,7 +12,7 @@
 //! `tests/inferlets/mtp-native-verify` in the pie repo, which builds a
 //! `pie:inferlet/forward-hybrid` pass over the same idiom.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use inferlet::{Result, chat, model as wit_model};
 use serde::Deserialize;
 

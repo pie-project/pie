@@ -1,7 +1,7 @@
-//! The guest-program plane, Metal half: PTIR at the fire's boundary.
+//! The guest-program plane, Metal half: ETA at the fire's boundary.
 //!
 //! **WHAT A GUEST PROGRAM IS.** A tensor program the guest authored, planned
-//! by `tensor-compiler` on the host into a `LaunchPackage` plus a table of
+//! by `eta-compiler` on the host into a `LaunchPackage` plus a table of
 //! emitted Metal Shading Language sources, and executed here against a set of
 //! channel rings. Design §9 places it at the boundary of the model fire and
 //! nowhere else: a prologue before the immutable graph, an epilogue after it,
@@ -16,7 +16,7 @@
 //! readiness, step       ->   session.rs   one instance's lifetime and its fire
 //! ```
 //!
-//! **THE HOST HALF IS THE GOLDEN AND IT IS NOT A MOCK.** `engine::program` is
+//! **THE HOST HALF IS THE GOLDEN AND IT IS NOT A MOCK.** `eta_exec` is
 //! a complete interpreter of the same launch package: same ops, same channel
 //! semantics, same pass-atomic commit. This half is the subject, and a parity
 //! test runs both over the same programs with the same inputs and demands
@@ -32,7 +32,7 @@
 //! no serializable image, so there is nothing for a disk tier to store. The
 //! whole argument is in [`compile`]'s module doc, at the place where `Disk`
 //! used to be; what survives is the memory tier and the negative tier, which
-//! is what [`engine::Bounded`] and [`engine::Failure`] are for.
+//! is what [`eta_exec::Bounded`] and [`eta_exec::Failure`] are for.
 //!
 //! **THE SEAM IS THE SHELL'S, AND THIS PLANE ONLY HOLDS ITS END.** An
 //! attachment names a lane and a bound instance, and a shell that runs them
@@ -40,17 +40,32 @@
 //!
 //! ```text
 //! gate       Plane::ready over EVERY attached instance      ← nothing has launched
-//! prologue   Plane::fire, per prologue attachment
-//! forward    compose -> windows -> walk
-//! bind       Plane::bind_intrinsic: the lane's logits ROW
-//! epilogue   Plane::fire, per epilogue attachment
+//! forward    compose -> windows -> walk                     ┐ one command
+//! bind       Plane::bind_intrinsic: each intrinsic's ROW     │ buffer, one
+//! epilogue   Plane::stage_into, per epilogue attachment     ┘ commit, no wait
+//! settle     Plane::settle_launched, from the harvest       ← one frame later
 //! ```
+//!
+//! **THERE IS NO PROLOGUE ROW, AND THAT IS A REFUSAL RATHER THAN AN
+//! OMISSION.** A prologue's channel writes are INPUTS to the forward, and
+//! this shell stages every fire input on the host — at `serve::stage`, before
+//! `walk_once` opens a command buffer at all — so there is no point in the
+//! step at which one could be encoded. `serve::prepare` refuses
+//! `Boundary::Prologue` by name.
 //!
 //! The gate is why [`Plane::ready`] exists. An epilogue fires after the
 //! forward has written the lane's KV, so a readiness refusal discovered there
 //! is a fire the caller cannot retry — the tokens are in the cache and the
 //! guest's pass never happened. Asking every attached instance first turns a
 //! blocked guest into a refusal the run-ahead retries for free.
+//!
+//! **AND THE PASS DOES NOT WAIT FOR ITSELF ANY MORE.** [`Plane::fire`] is one
+//! command buffer per region with a wait after each, which is right for a
+//! program fired beside no model fire and impossible inside `serve::enqueue`.
+//! [`Plane::stage_into`] encodes the same regions into the MODEL fire's
+//! buffer and reads nothing; [`Plane::settle_launched`] reads the verdict
+//! from the harvest, where the command buffer's own completion is the proof
+//! the kernels ran.
 
 pub mod compile;
 pub mod launch;
@@ -59,18 +74,19 @@ pub mod session;
 
 use std::collections::BTreeMap;
 
-use engine::adopt_launch_package;
-use engine::engine_api::program::ProgramRegistration;
-use engine::tensor_ir::registry::GeometryClass;
-use engine::{ExecPlan, Extents, Versions};
+use engine::program::ProgramRegistration;
+use eta_exec::adopt_launch_package;
+use eta_exec::{ExecPlan, Extents, Versions};
+use eta_ir::registry::GeometryClass;
 
 use crate::device::Context;
+use crate::device::ctx::Frame;
 use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Module, Region, Stage, Target};
 pub use launch::{ChannelShape, Cursor, Prepared, Rings};
 pub use ports::Envelope;
-pub use session::{Fired, Session, seeds_of};
+pub use session::{Fired, Launched, Session, seeds_of};
 
 /// One registered program: what the host planned, and what compiled from it.
 #[derive(Debug)]
@@ -146,7 +162,7 @@ impl Plane {
 
     /// What the compile tiers have been doing.
     #[must_use]
-    pub const fn stats(&self) -> engine::CacheStats {
+    pub const fn stats(&self) -> eta_exec::CacheStats {
         self.cache.stats()
     }
 
@@ -161,7 +177,7 @@ impl Plane {
     /// implements is a fact about the backend: the CUDA half overrides with
     /// `Boundaries::CUDA` because it answers `envelope_dot`, `lora` and
     /// `attn_page_mask`, and this half answers `metal.identity` and
-    /// `metal.discard` — which is exactly [`engine::Boundaries::METAL`], the
+    /// `metal.discard` — which is exactly [`eta_exec::Boundaries::METAL`], the
     /// default [`adopt_launch_package`] already applies. Spelling it out with
     /// `adopt_launch_package_with` would restate the default and then drift
     /// from it the day the Metal vocabulary grows a name.
@@ -310,30 +326,33 @@ impl Plane {
     /// `IntrinsicId::Logits` is pointed at the readout buffer a model fire
     /// produced, and one that reads none never calls this.
     ///
-    /// **FIVE ARGUMENTS FEWER THAN THE CUDA TWIN, AND THE MISSING ONES DO
-    /// NOT EXIST HERE.** That call takes a device address, a storage mode, a
-    /// width, a row stride and a row offset, because its kernel reads five
-    /// side tables. The Metal M2 emitter binds one buffer at index 6 and
-    /// reads it as `bfloat`, and Metal binds a buffer with an OFFSET — so a
-    /// storage mode has nothing to select, and what was a row offset is
-    /// bytes into the binding.
+    /// **THE CUDA TWIN'S FIVE NUMBERS, THREE OF WHICH ARE THE BINDING
+    /// ITSELF.** That call takes a device address, a storage mode, a width, a
+    /// row stride and a row offset, because its kernel reads five side
+    /// tables. Metal binds a buffer with an OFFSET, so the base, the stride
+    /// and the row offset arrive as `base` and `offset` and there is nothing
+    /// left for the kernel to be told. `width` and `dtype` are the two that
+    /// stay numbers, and they are here to be CHECKED rather than obeyed — see
+    /// [`Prepared::bind_intrinsic`](crate::program::launch::Prepared::bind_intrinsic).
     ///
     /// # Errors
     ///
-    /// [`Fault::Program`] for an unknown instance, or a second intrinsic
-    /// bound at a different rectangle in one stage.
+    /// [`Fault::Program`] for an unknown instance, and whatever the session's
+    /// own bind said about the rectangle.
     pub fn bind_intrinsic(
         &mut self,
         id: u64,
-        intrinsic: engine::tensor_ir::op::IntrinsicId,
+        intrinsic: eta_ir::op::IntrinsicId,
         base: &crate::device::Buffer,
         offset: u64,
+        width: u32,
+        dtype: eta_ir::Dtype,
     ) -> Result<()> {
         self.instances
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_intrinsic(intrinsic, base, offset)
+            .bind_intrinsic(intrinsic, base, offset, width, dtype)
     }
 
     /// The first channel of instance `id` whose declared requirement a fire
@@ -394,6 +413,170 @@ impl Plane {
         bound
             .session
             .fire(context, &self.pipelines, &program.compiled, &program.plan)
+    }
+
+    /// Encode instance `id`'s whole pass into a command buffer someone else
+    /// owns, and do not commit it — the ATTACHED spelling of [`Plane::fire`].
+    ///
+    /// The program is looked up through the instance's own record, for the
+    /// reason [`Plane::fire`] gives.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an unknown instance or one that already has a
+    /// pass airborne, and whatever the encode said.
+    pub fn stage_into(&mut self, frame: &Frame, id: u64) -> Result<Launched> {
+        let bound = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!(
+                    "instance {id} names program {}, which is gone",
+                    bound.program_id
+                ),
+            )
+        })?;
+        bound
+            .session
+            .stage_into(frame, &program.compiled, &program.plan)
+    }
+
+    /// Read the verdict of instance `id`'s airborne pass and commit its
+    /// cursors.
+    ///
+    /// The caller owes a proof that the command buffer landed — see
+    /// [`Session::settle_launched`].
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an unknown instance or one whose program is
+    /// gone, and whatever the status reads said.
+    pub fn settle_launched(&mut self, id: u64) -> Result<Fired> {
+        let bound = self
+            .instances
+            .get_mut(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!(
+                    "instance {id} names program {}, which is gone",
+                    bound.program_id
+                ),
+            )
+        })?;
+        bound.session.settle_launched(&program.plan)
+    }
+
+    /// Drop instance `id`'s airborne mark without reading a verdict, for a
+    /// staging whose command buffer will not be committed. A no-op for an
+    /// instance this plane does not carry.
+    ///
+    /// See [`Session::abandon_launched`] for what the caller owes.
+    pub fn abandon_launched(&mut self, id: u64) {
+        if let Some(bound) = self.instances.get_mut(&id) {
+            bound.session.abandon_launched();
+        }
+    }
+
+    /// Whether instance `id` has a pass in a command buffer that has not been
+    /// settled. `false` for an instance this plane does not carry.
+    #[must_use]
+    pub fn is_airborne(&self, id: u64) -> bool {
+        self.instances
+            .get(&id)
+            .is_some_and(|bound| bound.session.is_airborne())
+    }
+
+    /// Whether instance `id`'s program reads the draft column.
+    ///
+    /// **THE ONE THING AN ATTACHMENT GATE ASKS ABOUT THE PROGRAM RATHER THAN
+    /// THE INSTANCE.** The draft column is a rectangle of the `mtp` export,
+    /// and a load whose model text declares no draft head has none to point
+    /// at — so `serve::prepare` refuses such an attachment by name rather
+    /// than letting `Session::fire`'s unbound-intrinsic guard discover it
+    /// after the forward has already written the lane's KV.
+    ///
+    /// It used to be a question about the ABI: one buffer at index 6 meant no
+    /// program reading `mtp_logits` could be attached to ANY load. The slot
+    /// table answered that half, so what is left is a question about the
+    /// BAKE, which is what the CUDA sibling has always asked.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an unknown instance, or one whose program is
+    /// gone.
+    pub fn needs_mtp_logits(&self, id: u64) -> Result<bool> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!(
+                    "instance {id} names program {}, which is gone",
+                    bound.program_id
+                ),
+            )
+        })?;
+        Ok(program.plan.needs_mtp_logits)
+    }
+
+    /// Whether instance `id`'s program reads the `attn_score` intrinsic.
+    ///
+    /// [`Plane::needs_mtp_logits`]'s twin one axis over, and asked for its
+    /// reason: a rectangle bound for a program that never reads it takes an
+    /// argument index for nothing, and on this plane an unbound index is not
+    /// a nil — it is whatever the encoder last left there.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an instance this plane does not carry, or one
+    /// whose program is gone.
+    pub fn needs_attn_scores(&self, id: u64) -> Result<bool> {
+        let bound = self
+            .instances
+            .get(&id)
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!(
+                    "instance {id} names program {}, which is gone",
+                    bound.program_id
+                ),
+            )
+        })?;
+        Ok(program.plan.needs_attn_scores)
+    }
+
+    /// **HOW MANY SCORE PLANES INSTANCE `id` DECLARED**, or `None` for one
+    /// that reads no score rectangle at all.
+    ///
+    /// The row count is the PROGRAM's — a ceiling it states the way
+    /// `hidden(width)` states its width — and the shell is what refuses a
+    /// claim larger than the load exports (`eta_ir::validate`'s type rule says
+    /// so and can only check the width, because the plane count is not in the
+    /// profile). This is the reading that lets it: a rectangle bound at the
+    /// slab's pitch and read for more rows than a lane's block holds walks
+    /// into the NEXT lane's mass, which is the one failure the whole per-lane
+    /// addressing exists to prevent, and it is silent.
+    #[must_use]
+    pub fn declared_score_planes(&self, id: u64) -> Option<u32> {
+        let bound = self.instances.get(&id)?;
+        let program = self.programs.get(&bound.program_id)?;
+        program
+            .plan
+            .package
+            .values
+            .iter()
+            .filter(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::AttnScore))
+            .filter_map(|value| value.shape.first().copied())
+            .max()
     }
 
     /// Drop instance `id`, freeing its rings and its stage buffers.

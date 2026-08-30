@@ -2,7 +2,7 @@
 //! choice lives here, inside the entry (decision #13) — a dispatch arm never
 //! sees it.
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::tensor::Tensor;
@@ -25,25 +25,30 @@ const VECTOR_GROUP: u32 = 128;
 
 const LANES_PER_COLUMN: u32 = 32;
 
-pub fn matmul(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), KernelError> {
+pub fn matmul(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.matmul", act, w, y)
 }
 
-pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), KernelError> {
+pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.lm_head", act, w, y)
 }
 
 /// `y = act x w^T`. Skinny fires (fewer than [`TILE_M`] rows — the decode
-/// path) take the simdgroup gemv; everything else takes the 32x32 tile.
+/// path) take the simdgroup gemv; everything else takes the 32x32 tile. A fire
+/// with no rows lands nothing and encodes nothing: see [`extent`] for which of
+/// the three extents is allowed to be zero and why.
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
     op: &'static str,
     act: Tensor,
     w: Tensor,
     y: Tensor,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
     let (rows, columns, contraction) = extent(op, act, y)?;
+    if rows == 0 {
+        return Ok(());
+    }
     let (entry, grid) = if rows < TILE_M {
         (VECTOR_ENTRY, vector_grid(op, rows, columns)?)
     } else {
@@ -62,10 +67,17 @@ pub fn act_x_wt(
     )
 }
 
-fn extent(op: &'static str, act: Tensor, y: Tensor) -> Result<(u32, u32, u32), KernelError> {
-    if y.rows == 0 {
-        return Err(refuse(op, "the rows this projection lands are zero"));
-    }
+/// The three extents, of which exactly one may be zero.
+///
+/// The two WIDTHS are the weight's — fixed by the checkpoint, the same in
+/// every fire this artifact runs — so a zero in either is a malformed weight
+/// row that would land nothing forever, and is refused. The ROWS are the
+/// composition's: a guarded region can legitimately compose to none, and a
+/// refusal there would kill a whole fire over a node that simply had nothing
+/// to do, so a zero row count comes back as a zero and the caller no-ops on
+/// it. The widths are checked first, so a malformed weight answers the same on
+/// every fire and not only on the ones that had rows to project.
+fn extent(op: &'static str, act: Tensor, y: Tensor) -> Result<(u32, u32, u32), Error> {
     if y.width == 0 {
         return Err(refuse(op, "the columns this projection lands are zero"));
     }
@@ -79,8 +91,8 @@ fn extent(op: &'static str, act: Tensor, y: Tensor) -> Result<(u32, u32, u32), K
     Ok((y.rows, y.width, act.width))
 }
 
-fn tile_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, KernelError> {
-    let tiles = |extent: u32, tile: u32, per: u32, what: &'static str| -> Result<u32, KernelError> {
+fn tile_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error> {
+    let tiles = |extent: u32, tile: u32, per: u32, what: &'static str| -> Result<u32, Error> {
         extent
             .div_ceil(tile)
             .checked_mul(per)
@@ -96,7 +108,7 @@ fn tile_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, KernelEr
     ))
 }
 
-fn vector_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, KernelError> {
+fn vector_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error> {
     let lanes = columns
         .div_ceil(VECTOR_GROUP / LANES_PER_COLUMN)
         .checked_mul(VECTOR_GROUP)

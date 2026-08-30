@@ -109,7 +109,7 @@ def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
     # Derive the artifact from the manifest rather than hard-coding
     # text-completion-bench's (cargo folds dashes to underscores). Without this
     # the harness can bench exactly ONE inferlet, which is why the
-    # `ptir::run_ahead` change had no way to be measured.
+    # `eta::run_ahead` change had no way to be measured.
     rel = Path("target") / "wasm32-wasip2" / "release" / f"{pkg['name'].replace('-', '_')}.wasm"
     candidates = [inferlet_dir / rel]
     for parent in inferlet_dir.parents:
@@ -447,8 +447,6 @@ def build_config(args: argparse.Namespace):
         for key, value in requested_scheduler_kwargs.items()
         if key in scheduler_parameters
     }
-    if args.speculation_depth is not None and "speculation_depth" in scheduler_parameters:
-        scheduler_kwargs["speculation_depth"] = args.speculation_depth
 
     resolved_model = resolve_local_model(args.model)
     cfg = Config(
@@ -512,10 +510,6 @@ def build_config(args: argparse.Namespace):
         "resolved model": resolved_model,
         **engine_options,
     }
-    if args.speculation_depth is not None:
-        # Surface for the summary's "spec chain yield" derived stat —
-        # yield = hits / (attempted × depth).
-        config_blob["speculation depth"] = args.speculation_depth
     if args.warmup_max_tokens is not None:
         config_blob["warmup max tokens"] = args.warmup_max_tokens
     config_blob["warmup seconds"] = args.warmup_seconds
@@ -1483,14 +1477,6 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
         )
         sp.add_argument("--worker-threads", type=int, default=None)
-        sp.add_argument(
-            "--speculation-depth",
-            type=int,
-            default=None,
-            help="Per-ctx depth of pass-level speculative execution (0..=64). "
-                 "0 disables speculation; 1 is piggyback (default). Forwards "
-                 "to runtime.speculation_depth in the generated toml.",
-        )
         # `choices.values()` can yield the same parser under an alias, and
         # `common.py` registers some of these already; a duplicate
         # add_argument raises. Guard EACH flag by its own option string --

@@ -13,6 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::error::Error;
 use cudarc::cublas::sys::{
     cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmEx, cublasGetVersion_v2,
     cublasHandle_t, cublasOperation_t, cublasSetStream_v2, cublasStatus_t, cudaDataType,
@@ -24,7 +25,6 @@ use cudarc::runtime::sys::{
     cudaMemcpyAsync, cudaMemcpyKind, cudaMemsetAsync, cudaStreamCaptureStatus,
     cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamNonBlocking, cudaStreamSynchronize,
 };
-use kernels::KernelError;
 
 use super::gemv::gemv_bf16;
 use crate::jit::device::capture_status;
@@ -103,7 +103,7 @@ pub(crate) fn act_x_wt(
     m: i32,
     n: i32,
     k: i32,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     if m <= 0 || n <= 0 || k <= 0 {
         return Ok(());
     }

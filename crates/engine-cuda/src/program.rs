@@ -1,7 +1,7 @@
-//! The guest-program plane, CUDA half: PTIR at the fire's boundary.
+//! The guest-program plane, CUDA half: ETA at the fire's boundary.
 //!
 //! **WHAT A GUEST PROGRAM IS.** A tensor program the guest authored, planned
-//! by `tensor-compiler` on the host into a `LaunchPackage` plus a table of
+//! by `eta-compiler` on the host into a `LaunchPackage` plus a table of
 //! emitted CUDA sources, and executed here against a set of channel rings.
 //! Design §9 places it at the boundary of the model fire and nowhere else:
 //! a prologue before the immutable graph, an epilogue after it, and never a
@@ -16,7 +16,7 @@
 //! readiness, step       ->   session.rs   one instance's lifetime and its fire
 //! ```
 //!
-//! **THE HOST HALF IS THE GOLDEN AND IT IS NOT A MOCK.** `engine::program` is
+//! **THE HOST HALF IS THE GOLDEN AND IT IS NOT A MOCK.** `eta_exec` is
 //! a complete interpreter of the same launch package: same ops, same channel
 //! semantics, same pass-atomic commit. This half is the subject, and
 //! `tests/program_parity.rs` runs both over the same programs with the same
@@ -26,7 +26,7 @@
 //! a determinism clause in [`compile`] rather than a tuning flag.
 //!
 //! **THE SEAM IS WIRED** (`palo B2`). A [`Step`]'s
-//! [`Attachment`](engine::engine_api::fire::Attachment)s name a lane and a
+//! [`Attachment`](engine::fire::Attachment)s name a lane and a
 //! bound instance, and [`Shell::fire_attached`](crate::Shell::fire_attached)
 //! runs them at the two points design §9 allows:
 //!
@@ -55,16 +55,16 @@ pub mod wave;
 
 use std::collections::BTreeMap;
 
-use engine::engine_api::program::ProgramRegistration;
-use engine::tensor_ir::registry::GeometryClass;
-use engine::{Boundaries, ExecPlan, Extents, Versions, adopt_launch_package_with};
+use engine::program::ProgramRegistration;
+use eta_exec::{Boundaries, ExecPlan, Extents, Versions, adopt_launch_package_with};
+use eta_ir::registry::GeometryClass;
 
 use crate::device::Context;
 use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Disk, Module, Region, Stage, Target};
 pub use endpoint::Endpoint;
-pub use launch::{ChannelShape, Cursor, Prepared, Rings};
+pub use launch::{ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes};
 pub use ports::Envelope;
 pub use session::{Fired, Launched, Session, seeds_of};
 pub use wave::Wave;
@@ -212,7 +212,7 @@ impl Plane {
 
     /// What the compile tiers have been doing.
     #[must_use]
-    pub const fn stats(&self) -> engine::CacheStats {
+    pub const fn stats(&self) -> eta_exec::CacheStats {
         self.cache.stats()
     }
 
@@ -402,7 +402,7 @@ impl Plane {
     pub fn bind_intrinsic(
         &mut self,
         id: u64,
-        intrinsic: engine::tensor_ir::op::IntrinsicId,
+        intrinsic: eta_ir::op::IntrinsicId,
         base: u64,
         storage: u32,
         width: u32,
@@ -414,6 +414,31 @@ impl Plane {
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
             .bind_intrinsic(intrinsic, base, storage, width, row_stride, row_offset)
+    }
+
+    /// **HOW MANY SCORE PLANES INSTANCE `id` DECLARED**, or `None` for one
+    /// that reads no score rectangle at all.
+    ///
+    /// The row count is the PROGRAM's — a ceiling it states the way
+    /// `hidden(width)` states its width — and the shell is what refuses a
+    /// claim larger than the load exports (`eta_ir::validate`'s type rule
+    /// says so and can only check the width, because the plane count is not
+    /// in the profile). This is the reading that lets it: a rectangle bound
+    /// at the slab's pitch and read for more rows than a lane's block holds
+    /// walks into the NEXT lane's mass, which is the one failure the whole
+    /// per-lane addressing exists to prevent, and it is silent.
+    #[must_use]
+    pub fn declared_score_planes(&self, id: u64) -> Option<u32> {
+        let bound = self.instances.get(&id)?;
+        let program = self.programs.get(&bound.program_id)?;
+        program
+            .plan
+            .package
+            .values
+            .iter()
+            .filter(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::AttnScore))
+            .filter_map(|value| value.shape.first().copied())
+            .max()
     }
 
     /// The first channel of instance `id` whose declared requirement a fire
@@ -457,7 +482,7 @@ impl Plane {
     /// prediction its own fire would use, and a disagreement is named rather
     /// than silently resolved in the engine's favour.
     ///
-    /// A prediction of [`Ticket::NONE`](engine::engine_api::Ticket::NONE) is
+    /// A prediction of [`Ticket::NONE`](engine::Ticket::NONE) is
     /// no claim about that end of the ring and is not compared. A channel the
     /// caller names that this instance does not carry IS a disagreement: it
     /// predicted about somebody else's ring.
@@ -465,7 +490,7 @@ impl Plane {
     pub fn disagreeing_ticket(
         &self,
         id: u64,
-        tickets: &[engine::engine_api::Ticket],
+        tickets: &[engine::Ticket],
     ) -> Option<String> {
         let bound = self.instances.get(&id)?;
         for ticket in tickets {
@@ -477,7 +502,7 @@ impl Plane {
             };
             let cursor = bound.session.cursor(dense as u32)?;
             let stated = |claim: u64, held: u64, end: &str| {
-                (claim != engine::engine_api::Ticket::NONE && claim != held).then(|| {
+                (claim != engine::Ticket::NONE && claim != held).then(|| {
                     format!(
                         "instance {id}'s channel {} stands at {end} {held} and the caller \
                          predicted {claim}",
@@ -900,7 +925,7 @@ fn gather_endpoints(
     adopted: &[Option<std::sync::Arc<Endpoint>>],
     seated: &mut Vec<std::sync::Arc<Endpoint>>,
 ) -> Result<Vec<Option<std::sync::Arc<Endpoint>>>> {
-    use engine::tensor_ir::container::HostRole;
+    use eta_ir::container::HostRole;
 
     let mut endpoints = Vec::with_capacity(plan.package.channels.len());
     for (dense, declared) in plan.package.channels.iter().enumerate() {
@@ -941,11 +966,11 @@ fn gather_endpoints(
         // every reader addresses.
         let wire = if declared.host_role == HostRole::None {
             super::program::launch::native_cell_bytes(
-                engine::concrete_dtype(declared.dtype),
+                eta_exec::concrete_dtype(declared.dtype),
                 numel,
             )
         } else {
-            engine::wire_cell_bytes(engine::concrete_dtype(declared.dtype), numel)
+            eta_exec::wire_cell_bytes(eta_exec::concrete_dtype(declared.dtype), numel)
         };
         let wire_bytes = u32::try_from(wire).map_err(|_| {
             Fault::program(
@@ -1014,7 +1039,7 @@ fn gather_endpoints(
 /// which closes and rebuilds passes does not walk its ring up to the eight-seat
 /// bound one rebuild at a time.
 fn release_seats(endpoints: &[Option<std::sync::Arc<Endpoint>>]) {
-    use engine::tensor_ir::container::HostRole;
+    use eta_ir::container::HostRole;
 
     for endpoint in endpoints.iter().flatten() {
         if endpoint.role() == HostRole::None {

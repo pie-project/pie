@@ -18,13 +18,13 @@
 //! uniformly; the crossover tuning can return later as selection *below*
 //! these entries, where decision #13 keeps it.
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::jit::Ctx;
 use crate::tensor::Tensor;
 
 /// `buf = Σ_ranks buf`, in place (the IR aliases `buf_out` onto `buf`).
-pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), KernelError> {
+pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.all_reduce";
     let comm = ctx.comm(OP)?;
 
@@ -57,7 +57,7 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), KernelError> {
 }
 
 /// Concatenates each rank's `x` into `y` on every rank, rank-major.
-pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), KernelError> {
+pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.all_gather";
     let comm = ctx.comm(OP)?;
     debug_assert_eq!(x.dtype, y.dtype, "a gather does not change the dtype");
@@ -94,7 +94,7 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), KernelErro
 }
 
 /// Sums `x` across ranks, leaving each rank its own shard in `y`.
-pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), KernelError> {
+pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "collective.reduce_scatter";
     let comm = ctx.comm(OP)?;
     debug_assert_eq!(x.dtype, y.dtype, "a reduction does not change the dtype");
@@ -135,8 +135,8 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Kernel
 #[cfg(feature = "_cuda")]
 fn wire_dtype(
     op: &'static str,
-    dtype: model_ir::Dtype,
-) -> Result<cudarc::nccl::sys::ncclDataType_t, KernelError> {
+    dtype: dtype::Dtype,
+) -> Result<cudarc::nccl::sys::ncclDataType_t, Error> {
     use cudarc::nccl::sys::ncclDataType_t as t;
 
     Ok(crate::jit::dtype_dispatch!(op, dtype, {
@@ -161,7 +161,7 @@ fn answered(
     op: &'static str,
     call: &'static str,
     code: cudarc::nccl::sys::ncclResult_t,
-) -> Result<(), KernelError> {
+) -> Result<(), Error> {
     if code == cudarc::nccl::sys::ncclResult_t::ncclSuccess {
         return Ok(());
     }

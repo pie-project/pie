@@ -29,7 +29,7 @@
 //! Greedy (`reduce_argmax`) rather than sampled, because the point of the gate
 //! is that the same prompt produces the same continuation on every run.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -153,7 +153,7 @@ async fn main(input: Input) -> Result<Output> {
     // the readable extent — is DERIVED from the KV length by pure
     // arithmetic, so the epilogue carries it on the device and the runtime's
     // host shadow folds the same arithmetic
-    // (`tensor_compiler::eval::pareval`) to know what each fire will read.
+    // (`eta_compiler::eval::pareval`) to know what each fire will read.
     // That is `naive-baseline`'s decode exactly, minus the one put that makes
     // it undecidable: `tok_in.put(&token)`.
     //

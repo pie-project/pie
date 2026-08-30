@@ -70,8 +70,8 @@
 
 use std::path::{Path, PathBuf};
 
+use engine::fire::{FoldLen, RsReset, RsVerb};
 use engine_cuda::{Boot, Lane, Seated, Shell};
-use engine::engine_api::fire::{FoldLen, RsReset, RsVerb};
 use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
@@ -157,6 +157,7 @@ fn ready(what: &str) -> Option<Shell> {
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(4, 256),
+        patches: None,
         profile: None,
         page_size: PAGE,
         context: 512,

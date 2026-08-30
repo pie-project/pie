@@ -5,7 +5,7 @@
 //! and deterministic, not byte-identical to the C++ reference (see
 //! [`sched`](crate::attn::sched)).
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::attn::plan::{Built, Device, PrefillPlanInfo, Sizes};
 use crate::attn::sched::{at, AlignedAllocator, Staging, narrow, narrow_all, spans};
@@ -30,7 +30,7 @@ pub struct Request<'a> {
 }
 
 impl Request<'_> {
-    fn check(&self, op: &'static str) -> Result<(), KernelError> {
+    fn check(&self, op: &'static str) -> Result<(), Error> {
         if self.batch_size == 0 {
             return Err(refuse(op, "the batch is empty"));
         }
@@ -119,11 +119,7 @@ pub struct Schedule {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn schedule(
-    op: &'static str,
-    req: &Request<'_>,
-    device: &Device,
-) -> Result<Schedule, KernelError> {
+pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
     req.check(op)?;
     let batch = req.batch_size as usize;
     let qo_lens = spans(op, "qo_indptr", req.qo_indptr, batch)?;
@@ -269,7 +265,7 @@ fn layout(
     sched: &Schedule,
     int_space: usize,
     float_space: usize,
-) -> Result<Laid, KernelError> {
+) -> Result<Laid, Error> {
     let padded = sched.padded_batch_size;
     let mut info = PrefillPlanInfo {
         cta_tile_q: i64::from(sched.cta_tile_q),
@@ -317,7 +313,7 @@ fn stage(
     req: &Request<'_>,
     sched: &Schedule,
     laid: &Laid,
-) -> Result<Vec<u8>, KernelError> {
+) -> Result<Vec<u8>, Error> {
     let info = &laid.info;
     let mut staging = Staging::new(op, laid.int_bytes);
     staging.put_i32s(
@@ -378,7 +374,7 @@ pub fn plan(
     device: &Device,
     int_bytes: usize,
     float_bytes: usize,
-) -> Result<Built<PrefillPlanInfo>, KernelError> {
+) -> Result<Built<PrefillPlanInfo>, Error> {
     let sched = schedule(op, req, device)?;
     let laid = layout(op, req, &sched, int_bytes, float_bytes)?;
     let int_upload = stage(op, req, &sched, &laid)?;
@@ -396,7 +392,7 @@ pub fn workspace_size(
     op: &'static str,
     req: &Request<'_>,
     device: &Device,
-) -> Result<Sizes, KernelError> {
+) -> Result<Sizes, Error> {
     let sched = schedule(op, req, device)?;
     let laid = layout(op, req, &sched, usize::MAX, usize::MAX)?;
     Ok(Sizes {

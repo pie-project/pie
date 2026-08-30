@@ -1,7 +1,7 @@
 [package]
 name = "lora-probe"
 version = "0.1.0"
-description = "LoRA configuration-sink probe — naive-baseline plus a kernel::lora prologue with host-seeded adapter channels"
+description = "The adapter probe — naive-baseline plus one Pass::adapter at the mixer-output site, weights seeded into channels and landed in a bank slot at bind"
 authors = ["Pie Team"]
 
 [runtime]
@@ -10,5 +10,11 @@ core = "^0.2.0"
 [parameters]
 prompt = {type = "string", optional = true, description = "Prompt to send to the model"}
 max_tokens = {type = "int", optional = true, description = "Number of generated tokens (default: 32)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature; collapse it to take the sampler out of a parity claim"}
 seed = {type = "int", optional = true, description = "RNG key for Gumbel-max sampling"}
-adapter_scale = {type = "float", optional = true, description = "Scale folded into the B adapter's seed contents (0.0 = the correction term vanishes; default 0.0)"}
+adapter_scale = {type = "float", optional = true, description = "Scale folded into the B plane's contents (0.0 = the correction term is exactly zero; default 0.0)"}
+surface = {type = "string", optional = true, description = "How the adapter is stated: \"adapter\" (Pass::adapter, the current SDK spelling; default) or \"sink\" (the raw kernel::lora prologue it lowers to)"}
+form = {type = "string", optional = true, description = "\"lowrank\" (the served form; default) or \"scale\" (IA3's two-argument spelling, which the engine refuses by name)"}
+layers = {type = "int", optional = true, description = "Adapter layer count (default: 24, qwen35-d0.8b)"}
+hidden = {type = "int", optional = true, description = "Mixer-output width (default: 1024, qwen35-d0.8b)"}
+rank = {type = "int", optional = true, description = "Adapter rank; a different rank is a different traced program (default: 16, the bank's own)"}

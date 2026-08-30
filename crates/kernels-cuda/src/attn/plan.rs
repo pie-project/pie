@@ -19,7 +19,7 @@
 //! prepare phase (a [`stage`](DecodePlan::stage) call, or its own memcpy),
 //! and the capture-phase attention entries then only read.
 
-use kernels::KernelError;
+use crate::error::Error;
 
 use crate::attn::{sched_decode, sched_mla, sched_prefill, sched_sm90};
 
@@ -158,7 +158,7 @@ impl DecodePlan {
         op: &'static str,
         head_dim: u32,
         window: Option<u32>,
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), Error> {
         planned_head_dim(op, self.shape.head_dim, head_dim)?;
         if self.full_attention_variant() != window.is_none() {
             return Err(refuse(
@@ -171,7 +171,7 @@ impl DecodePlan {
     }
 
     /// Copies the staged int workspace to the device. Prepare-phase work.
-    pub fn stage(&self, ctx: &Ctx) -> Result<(), KernelError> {
+    pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
             "attention.plan_decode",
@@ -222,7 +222,7 @@ impl PrefillPlan {
         head_dim: u32,
         kv_heads: Option<u32>,
         window: Option<u32>,
-    ) -> Result<(), KernelError> {
+    ) -> Result<(), Error> {
         planned_head_dim(op, self.shape.head_dim, head_dim)?;
         if let Some(kv_heads) = kv_heads {
             if self.shape.num_kv_heads != kv_heads {
@@ -254,7 +254,7 @@ impl PrefillPlan {
         self.info.cta_tile_q as u32
     }
 
-    pub fn stage(&self, ctx: &Ctx) -> Result<(), KernelError> {
+    pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
             "attention.plan_prefill",
@@ -280,7 +280,7 @@ pub struct PrefillPlanSm90 {
 }
 
 impl PrefillPlanSm90 {
-    pub fn stage(&self, ctx: &Ctx) -> Result<(), KernelError> {
+    pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
             "attention.plan_prefill_sm90",
@@ -303,7 +303,7 @@ pub struct MlaPlan {
 }
 
 impl MlaPlan {
-    pub fn stage(&self, ctx: &Ctx) -> Result<(), KernelError> {
+    pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(ctx, "attention.mla_plan", &self.int_upload, self.workspace.int_ptr)
     }
 }
@@ -353,7 +353,7 @@ fn truthy(key: &str) -> bool {
 
 /// The sliding extent as the device text reads it: `-1` is "no window", and
 /// a stated window of zero is a degenerate statement, not an unwindowed one.
-pub(crate) fn window_left(op: &'static str, window: Option<u32>) -> Result<i32, KernelError> {
+pub(crate) fn window_left(op: &'static str, window: Option<u32>) -> Result<i32, Error> {
     match window {
         None => Ok(-1),
         Some(0) => Err(refuse(op, "the stated sliding window is zero")),
@@ -368,7 +368,7 @@ pub(crate) fn window_left(op: &'static str, window: Option<u32>) -> Result<i32, 
 
 /// The old `agrees`: a stated head width must be the one the plan was
 /// carved at.
-fn planned_head_dim(op: &'static str, planned: u32, stated: u32) -> Result<(), KernelError> {
+fn planned_head_dim(op: &'static str, planned: u32, stated: u32) -> Result<(), Error> {
     if planned == stated {
         return Ok(());
     }
@@ -381,7 +381,7 @@ fn planned_head_dim(op: &'static str, planned: u32, stated: u32) -> Result<(), K
     ))
 }
 
-fn instantiated(op: &'static str, head_dim: u32) -> Result<(), KernelError> {
+fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     if head_dim_instantiated(head_dim) {
         return Ok(());
     }
@@ -393,7 +393,7 @@ fn instantiated(op: &'static str, head_dim: u32) -> Result<(), KernelError> {
     ))
 }
 
-fn some_requests(op: &'static str, shape: &Shape) -> Result<(), KernelError> {
+fn some_requests(op: &'static str, shape: &Shape) -> Result<(), Error> {
     if shape.num_requests == 0 {
         return Err(refuse(op, "the batch is empty"));
     }
@@ -425,7 +425,7 @@ pub fn plan_decode(
     toggles: Toggles,
     device: &Device,
     workspace: Workspace,
-) -> Result<DecodePlan, KernelError> {
+) -> Result<DecodePlan, Error> {
     const OP: &str = "attention.plan_decode";
     let _ = kv_len;
     instantiated(OP, shape.head_dim)?;
@@ -501,7 +501,7 @@ pub fn plan_prefill(
     mask_indptr: Option<Tensor>,
     device: &Device,
     workspace: Workspace,
-) -> Result<PrefillPlan, KernelError> {
+) -> Result<PrefillPlan, Error> {
     const OP: &str = "attention.plan_prefill";
     let _ = kv_len;
     instantiated(OP, shape.head_dim)?;
@@ -579,7 +579,7 @@ pub fn plan_prefill_sm90(
     enable_cuda_graph: bool,
     device: &Device,
     workspace: Workspace,
-) -> Result<PrefillPlanSm90, KernelError> {
+) -> Result<PrefillPlanSm90, Error> {
     const OP: &str = "attention.plan_prefill_sm90";
     some_requests(OP, &shape)?;
     let req = sched_sm90::Request {
@@ -622,7 +622,7 @@ pub fn plan_mla(
     causal: bool,
     device: &Device,
     workspace: Workspace,
-) -> Result<MlaPlan, KernelError> {
+) -> Result<MlaPlan, Error> {
     const OP: &str = "attention.mla_plan";
     let req = sched_mla::Request {
         qo_indptr,
@@ -651,7 +651,7 @@ pub fn plan_mla(
 /// before capture, never inside it (the old plane pinned these bytes to
 /// smuggle the copy into capture; the prepare/capture split makes that
 /// machinery unnecessary).
-pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result<(), KernelError> {
+pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result<(), Error> {
     if bytes.is_empty() {
         return Ok(());
     }

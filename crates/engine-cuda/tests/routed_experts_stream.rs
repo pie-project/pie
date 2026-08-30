@@ -70,12 +70,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use engine_cuda::experts::Plan;
+use checkpoint::contract::ModelContract;
+use engine_cuda::experts::{Attachments, Budgets, Plan};
 use engine_cuda::{Boot, Graphs, Lane, Shell};
 use model_compiler::Budget;
 use model_dsl::{Classify, Dtype, Platform, Request};
 use model_ir::{ParamSource, Trace};
-use model_loader::contract::ModelContract;
 
 /// The tokens every fire of this file feeds. Arbitrary ids inside the micro
 /// text's 2048-token vocabulary — the model is synthetic, so a prompt is a
@@ -243,7 +243,7 @@ fn fixture(what: &str) -> Fixture {
 
 /// What the whole table demands on the device, off the trace alone.
 fn full_demand(trace: &Trace) -> u64 {
-    Plan::of(trace, None)
+    Plan::of(trace, &Attachments::new(), Budgets::uncapped())
         .expect("a bf16 routed text plans")
         .device_demand()
 }
@@ -255,6 +255,7 @@ fn load(fixture: &Fixture, residency: Plan) -> engine_cuda::Result<Shell> {
         contract: &fixture.contract,
         checkpoint: &fixture.container,
         budget: Budget::new(4, 64),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 128,
@@ -337,7 +338,7 @@ fn a_half_resident_load_says_what_a_fully_resident_one_says() {
     // ── THE STREAMED LOAD. A budget sized so that the slab can hold roughly
     //    half the experts: the dense planes whole, plus half the expert bytes.
     let budget = full - expert_bytes(&fixture.trace) / 2;
-    let planned = Plan::of(&fixture.trace, Some(budget)).expect("half the experts stream");
+    let planned = Plan::of(&fixture.trace, &Attachments::new(), Budgets::device(budget)).expect("half the experts stream");
     assert!(planned.streams(), "half the table cannot be held whole");
     let arity = planned.banks()[0].experts;
     let seated = planned.banks()[0].resident;
@@ -436,7 +437,7 @@ fn a_half_resident_load_says_what_a_fully_resident_one_says() {
 /// arity and the stride the whole bank is the product of.
 fn expert_bytes(trace: &Trace) -> u64 {
     let full = full_demand(trace);
-    Plan::of(trace, Some(full - 1))
+    Plan::of(trace, &Attachments::new(), Budgets::device(full - 1))
         .expect("one byte under full residency streams")
         .banks()
         .iter()
@@ -447,13 +448,20 @@ fn expert_bytes(trace: &Trace) -> u64 {
 // ── (d) the refusals ─────────────────────────────────────────────────────
 
 #[test]
-fn a_budget_under_the_dense_planes_is_refused_by_name() {
+fn a_budget_under_the_planes_that_cannot_move_is_refused_by_name() {
+    // **THE FLOOR MOVED AT D2b.** It used to be the DENSE planes — none of
+    // them could leave the device, so a budget under them was the end of the
+    // conversation. They can leave now (streaming §2's static demand shape),
+    // and what is left under any budget is the planes that genuinely cannot:
+    // a REGISTERED adapter bank, whose store offset `register_adapter` writes
+    // at, plus one expert slot of every routed bank.
     let (_, trace) = micro();
-    let why = Plan::of(&trace, Some(1 << 16)).expect_err("64 KiB holds no model");
+    let why = Plan::of(&trace, &Attachments::new(), Budgets::device(1 << 16))
+        .expect_err("64 KiB holds no model");
     let said = why.to_string();
     assert!(
-        said.contains("DENSE") && said.contains("do not stream"),
-        "the refusal names the tier that cannot hold less: {said}"
+        said.contains("REGISTERED") && said.contains("cannot be moved to another tier"),
+        "the refusal names the planes that cannot hold less: {said}"
     );
 }
 
@@ -461,9 +469,9 @@ fn a_budget_under_the_dense_planes_is_refused_by_name() {
 fn a_host_budget_under_the_pinned_tier_is_refused_by_name() {
     let (_, trace) = micro();
     let full = full_demand(&trace);
-    let plan = Plan::of(&trace, Some(full * 3 / 4)).expect("three quarters streams");
+    let plan = Plan::of(&trace, &Attachments::new(), Budgets::device(full * 3 / 4)).expect("three quarters streams");
     assert!(plan.streams());
-    let residency = engine::engine_api::load::Residency {
+    let residency = engine::load::Residency {
         device_weight_budget: Some(full * 3 / 4),
         host_weight_budget: Some(plan.host_demand() - 1),
     };
@@ -480,7 +488,7 @@ fn a_host_budget_under_the_pinned_tier_is_refused_by_name() {
 #[test]
 fn an_uncapped_budget_opens_no_tier_at_all() {
     let (_, trace) = micro();
-    let plan = Plan::of(&trace, None).expect("uncapped plans");
+    let plan = Plan::of(&trace, &Attachments::new(), Budgets::uncapped()).expect("uncapped plans");
     assert!(!plan.streams());
     assert_eq!(
         plan.host_demand(),

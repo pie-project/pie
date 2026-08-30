@@ -39,6 +39,16 @@ pub(crate) fn block(rows: u64, width: u64) -> Ty {
     }
 }
 
+/// The TOWER's rectangle: one row per patch, `width` elements wide. The second
+/// row axis, in the only vocabulary a plan has for it — a leading
+/// `Dim::Patches` and nothing else said anywhere.
+pub(crate) fn patch(width: u64) -> Ty {
+    Ty::Tensor {
+        shape: vec![Dim::Patches, Dim::Const(width)],
+        dtype: Dtype::Bf16,
+    }
+}
+
 /// `Guard::Fact(bit)`, spelled short.
 pub(crate) fn fact(bit: u8) -> Guard {
     Guard::Fact(bit)

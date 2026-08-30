@@ -3,7 +3,7 @@
 //! **THE HOST GATES AND THE HOST COMMITS; THE DEVICE COMPUTES.** A fire is
 //! readiness, then every stage's regions, then one commit for the whole
 //! program — and the first and third of those are arithmetic over ring
-//! cursors that [`engine::program`](engine) already writes, once, for the host
+//! cursors that [`eta_exec`](engine) already writes, once, for the host
 //! interpreter. The lineage compiled that arithmetic into device control
 //! kernels so a blocked fire never had to reach the host; this half runs it
 //! host-side instead, and the reason is the one the whole step exists for:
@@ -11,7 +11,7 @@
 //! that can actually differ — the emitted arithmetic — rather than diffing a
 //! second implementation of a ring against the first.
 //!
-//! It is also honest about where PTIR sits. Design §9 puts guest computation
+//! It is also honest about where ETA sits. Design §9 puts guest computation
 //! *at the fire's boundary*, outside the immutable graph, and a boundary is
 //! exactly where a wait is already paid.
 //!
@@ -58,10 +58,24 @@
 //! travelling through the RUNTIME's asynchronous host plane — out through
 //! `take_channel`, through a guest `await`, back in through
 //! `publish_channel` — and that is [`super::ports`], which reads the committed
-//! cell in the shell. The two kernels stay unbuilt, and the condition that
-//! would build them is unchanged and now sharper: a fire path that does NOT
-//! wait on its command buffer before the next fire's ports are read. That is
-//! not this shell.
+//! cell in the shell. The two kernels stay unbuilt.
+//!
+//! **AND THE CONDITION THAT WOULD BUILD THEM HAS NOW HALF-FIRED, WHICH IS WHY
+//! THIS FILE HAS TWO DISCHARGES INSTEAD OF ONE.** The condition was stated as
+//! "a fire path that does NOT wait on its command buffer before the next
+//! fire's ports are read", and [`Session::stage_into`] is exactly that path:
+//! a guest pass attached to a model fire is encoded into that fire's command
+//! buffer and the host walks away without committing anything of its own.
+//! What did NOT follow is the device gate, and the reason is the fence rather
+//! than the wait. `serve.rs` harvests any flight holding an airborne pass for
+//! an instance BEFORE it reads that instance's cursors or stages a second
+//! pass into it — so at the instant a readiness question is asked, the host
+//! can still look, for free, and a device readiness kernel would still be
+//! computing an answer the host already has from a second implementation of
+//! the ring arithmetic. The gate moved; the duplication did not become worth
+//! it. The kernels get built the day a SECOND pass into one instance may be
+//! staged while the first is airborne, which is a batching change and not
+//! this one.
 //!
 //! **ONE COMMIT PER FIRE, NOT PER STAGE.** A program's stages are separate
 //! programs joined only by channels: nothing flows between them in scratch,
@@ -70,20 +84,32 @@
 //! launches when one refuses — the dummy run, so a refused fire costs what a
 //! running one does — and then nothing moves.
 //!
+//! That property is what makes the split below possible at all: because every
+//! stage resolves against the SAME cursors, all of them can be refreshed and
+//! encoded up front, with nothing host-side in between.
+//!
 //! ```text
-//! fire
-//! ----
-//! readiness   every channel the program declares a requirement for   host
-//! refresh     each stage's lane table -> this fire's cell addresses  host
-//! launch      each stage's regions, in stage order, one wait each    device
-//! verdict     the worst `engine::Status` any stage left behind       device
-//! commit      heads advance for takes, tails for puts                host
+//! fire (standalone)                 stage_into + settle_launched (attached)
+//! ----                              ----
+//! readiness  host                   readiness  host   | stage_into,
+//! refresh    host                   refresh    host   | before the model
+//! launch     device, a wait each    encode     host   | fire commits
+//! verdict    device                 ------------------ the command buffer
+//! commit     host                   verdict    device | settle_launched,
+//!                                   commit     host   | after it lands
 //! ```
+//!
+//! The two halves answer the same [`Fired`] over the same arithmetic; what
+//! differs is only where the wait is, and in the attached spelling there
+//! isn't one — the model fire's own completion is the proof the kernels ran.
 
-use engine::tensor_ir::op::IntrinsicId;
-use engine::tensor_ir::validate::Direction;
-use engine::{ExecPlan, Extents};
+use eta_compiler::codegen::launch::LaunchPackage;
+use eta_exec::{ExecPlan, Extents};
+use eta_ir::op::IntrinsicId;
+use eta_ir::types::name_or_unknown;
+use eta_ir::validate::Direction;
 
+use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Pipelines};
 use crate::error::{Fault, Result};
 
@@ -93,7 +119,7 @@ use super::ports::{self, Envelope};
 
 /// What one fire produced.
 ///
-/// Deliberately the shape of [`engine::StepOutcome`], because the parity test
+/// Deliberately the shape of [`eta_exec::StepOutcome`], because the parity test
 /// compares the two directly: a device fire that blocks must block on the same
 /// channel the host interpreter blocks on, and neither half may quietly turn a
 /// refusal into a commit.
@@ -102,22 +128,41 @@ pub enum Fired {
     /// Every stage ran and the cursors advanced.
     Committed,
     /// Nothing launched: this channel did not meet the program's declared
-    /// requirement. The counterpart of [`engine::StepOutcome::Blocked`].
+    /// requirement. The counterpart of [`eta_exec::StepOutcome::Blocked`].
     Blocked(u32),
     /// A stage's kernel declined the fire from inside — a readiness guard the
     /// emitted code observed for itself. The cursors are left where they
     /// were, so the next fire sees the same inputs and a caller may retry.
     Declined,
     /// The instance is unusable and stays so. The counterpart of
-    /// [`engine::StepOutcome::Faulted`], and on this plane it is reachable
+    /// [`eta_exec::StepOutcome::Faulted`], and on this plane it is reachable
     /// from the DEVICE as well as from the commit: see [`Session::fire`].
     Faulted(String),
+}
+
+/// **What the STAGING half of an attached fire answers** —
+/// [`Session::stage_into`].
+///
+/// Deliberately not a [`Fired`], and for the CUDA twin's reason: the two
+/// outcomes a staging can reach are "this is in a command buffer that has not
+/// been committed yet and owes a settlement" and "nothing was encoded and its
+/// verdict is already final", and collapsing them would let a caller settle
+/// something that never flew — or, worse, skip settling something that did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Launched {
+    /// The pass is in the caller's command buffer.
+    /// [`Session::settle_launched`] owes it a verdict, once that buffer has
+    /// landed.
+    Airborne,
+    /// Nothing was encoded and nothing is owed: a blocked channel or a
+    /// poisoned instance.
+    Refused(Fired),
 }
 
 /// One bound instance's device state.
 ///
 /// The cursors are `u64` sequence numbers that never wrap, exactly as the host
-/// half's [`ChannelState`](engine::ChannelState) keeps them; a ring position
+/// half's [`ChannelState`](eta_exec::ChannelState) keeps them; a ring position
 /// is the residue. Keeping the same spelling is what makes a slot-for-slot
 /// diff of the two halves mean anything.
 #[derive(Debug)]
@@ -140,6 +185,18 @@ pub struct Session {
     bound: u64,
     poisoned: bool,
     fires: u64,
+    /// The stages this instance has encoded into a command buffer that has
+    /// not been settled yet, or `None` when nothing is outstanding.
+    ///
+    /// **ONE AIRBORNE PASS PER INSTANCE, AND THE LIST IS WHAT SETTLES IT.**
+    /// A second staging would refresh the scratch and the status word of
+    /// stages whose first pass has not been read, so the verdict of the first
+    /// would be the verdict of the second — and it would gate against cursors
+    /// the first pass has not committed. `serve.rs` fences that from the
+    /// outside by harvesting the flight that holds it; this refuses it from
+    /// the inside, by name, so a fence that ever slipped is a sentence rather
+    /// than a silently doubled commit.
+    airborne: Option<Vec<usize>>,
 }
 
 impl Session {
@@ -147,7 +204,7 @@ impl Session {
     /// then seed the channels the program declares seeds for.
     ///
     /// `seeds` are WIRE cells, one per `(channel, bytes)` pair — the same
-    /// encoding [`engine::Registry::bind_instance`] takes, so an instance that
+    /// encoding [`eta_exec::Registry::bind_instance`] takes, so an instance that
     /// already exists on the host half is adopted by handing over what its
     /// rings hold (see [`seeds_of`]) rather than by a second seeding rule.
     ///
@@ -206,6 +263,7 @@ impl Session {
             bound: 0,
             poisoned: false,
             fires: 0,
+            airborne: None,
         };
         for (channel, wire) in seeds {
             if !session.publish(*channel, wire)? {
@@ -262,7 +320,7 @@ impl Session {
     /// Push one wire cell into channel `channel`, answering `false` when the
     /// ring has no room — back-pressure, not a drop.
     ///
-    /// The host-side counterpart of [`engine::host_put`], and the only door a
+    /// The host-side counterpart of [`eta_exec::host_put`], and the only door a
     /// caller's bytes enter this plane through.
     ///
     /// **A WIRE CELL AND A METAL CELL ARE THE SAME BYTES, SO NOTHING IS
@@ -294,7 +352,7 @@ impl Session {
                 format!(
                     "a {} cell of {} lane(s) on channel {channel} is {want} bytes and {} \
                      were offered",
-                    shape.dtype.name(),
+                    name_or_unknown(shape.dtype),
                     shape.numel,
                     wire.len()
                 ),
@@ -309,7 +367,7 @@ impl Session {
     /// Take channel `channel`'s committed cell as wire bytes, advancing its
     /// head; `None` when the ring is empty.
     ///
-    /// The counterpart of [`engine::host_take`]. The bytes come back exactly
+    /// The counterpart of [`eta_exec::host_take`]. The bytes come back exactly
     /// as the ring holds them — see [`Session::publish`] for why there is no
     /// unpacking step on this plane.
     ///
@@ -356,7 +414,7 @@ impl Session {
     /// [`Prepared::refresh`] publishes to the emitted kernel as
     /// `committed_cell` — so the shell's read and the guest's take are one
     /// value. Nothing is consumed: the pass's own commit advances `head` for
-    /// every port [`Port::consumes`](engine::tensor_ir::registry::Port::consumes)
+    /// every port [`Port::consumes`](eta_ir::registry::Port::consumes)
     /// names, and draining here as well would spend two cells per fire.
     ///
     /// # Errors
@@ -380,15 +438,17 @@ impl Session {
     /// that rebinds the same buffer every fire and one that binds it once
     /// behave the same.
     ///
-    /// **THE ROW GEOMETRY IS NOT AN ARGUMENT HERE, AND THAT IS THE PLATFORM
-    /// AGAIN.** The CUDA twin takes `(base, storage, width, row_stride,
+    /// **THE ROW GEOMETRY IS ARGUED WITH RATHER THAN OBEYED, AND THAT IS THE
+    /// PLATFORM.** The CUDA twin takes `(base, storage, width, row_stride,
     /// row_offset)` and writes five side tables, because a CUDA kernel is
     /// handed a raw `u64` device address and has to be told how to walk it.
     /// Metal binds an object: `base` is the allocation and `offset` is the
     /// byte the intrinsic starts at, which is what
-    /// `setBuffer:offset:atIndex:` takes, and the row walk is a property of
-    /// the buffer the encoder bound rather than of a number in a table. Any
-    /// caller that used to pass a `row_offset` passes it as bytes in `offset`.
+    /// `setBuffer:offset:atIndex:` takes, so the row walk is a property of
+    /// the binding rather than of a number in a table. Any caller that used
+    /// to pass a `row_offset` passes it as bytes in `offset`. What `width`
+    /// and `dtype` buy is the CHECK — see [`Prepared::bind_intrinsic`], which
+    /// holds them against what this stage's own readers declared.
     ///
     /// # Errors
     ///
@@ -399,9 +459,11 @@ impl Session {
         intrinsic: IntrinsicId,
         base: &Buffer,
         offset: u64,
+        width: u32,
+        dtype: eta_ir::Dtype,
     ) -> Result<()> {
         for prepared in self.prepared.iter_mut().flatten() {
-            prepared.bind_intrinsic(intrinsic, base, offset)?;
+            prepared.bind_intrinsic(intrinsic, base, offset, width, dtype)?;
         }
         self.bound |= 1u64 << (intrinsic as u32);
         Ok(())
@@ -422,7 +484,7 @@ impl Session {
     /// **A STATUS, NOT A BOOLEAN.** The CUDA twin reads one `u32` its kernel
     /// started at 1 and CLEARS to refuse, so every refusal it can express is
     /// [`Fired::Declined`]. The M1 kernel writes a sixteen-byte
-    /// [`engine::Status`] — a state, a fault class and a guard site — so this
+    /// [`eta_exec::Status`] — a state, a fault class and a guard site — so this
     /// half can tell the two apart and does:
     ///
     /// ```text
@@ -434,13 +496,21 @@ impl Session {
     /// ```
     ///
     /// The mapping is not this file's opinion: it is
-    /// [`engine::StatusOutcome::of`], the same three-way verdict the host half
+    /// [`eta_exec::StatusOutcome::of`], the same three-way verdict the host half
     /// reads, and the sentence a fault carries is
-    /// [`engine::report_status`] — which composes `describe_fault`'s class and
+    /// [`eta_exec::report_status`] — which composes `describe_fault`'s class and
     /// channel with the diagnosis and the guard site. (`describe_fault` alone
     /// answers a struct with no `Display`; reaching for it directly would mean
     /// re-writing the formatter `engine` already ships, and then a fault would
     /// read differently depending on which shell printed it.)
+    ///
+    /// Both take the launch package, and that is the point of the argument
+    /// rather than a convenience: the fault-class table rides on
+    /// `plan.package`, so the number a kernel wrote is named by the table of
+    /// the emitter that compiled that kernel. It used to be a `pub use` in
+    /// `eta_exec::status`, which named it against whatever table THIS binary
+    /// links — and `registration.emitter_version`, the only other thing that
+    /// could have caught a mismatch, is read here purely as a cache key.
     ///
     /// A device fault poisons the instance, because that is what
     /// [`Fired::Faulted`] promises: a guard that refused this fire refuses the
@@ -464,8 +534,170 @@ impl Session {
         compiled: &Compiled,
         plan: &ExecPlan,
     ) -> Result<Fired> {
+        // The standalone verb takes the same refusal `stage_into` takes, and
+        // for a sharper reason: `refresh` resets every stage's scratch and
+        // status word, so a fire issued while an attached pass of this
+        // instance is still in someone's command buffer would overwrite a
+        // verdict nobody has read and gate against cursors that pass has not
+        // committed. `serve.rs` fences this from the outside; this is the
+        // refusal that makes a slipped fence a sentence.
+        if self.airborne.is_some() {
+            return Err(Fault::program(
+                "program::session",
+                "this instance has a pass airborne in someone else's command buffer: a \
+                 standalone fire would reset the status word that pass has not been \
+                 read from, and both fires would report the second's verdict",
+            ));
+        }
+        if let Some(refused) = self.gate(compiled, plan)? {
+            return Ok(refused);
+        }
+
+        let mut launched = Vec::with_capacity(compiled.stages.len());
+        for (index, stage) in compiled.stages.iter().enumerate() {
+            let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
+                // A stage with nothing to launch needs no buffers and no
+                // launch. Not an empty case: the adapter prologue is exactly
+                // this shape.
+                continue;
+            };
+            prepared.refresh(&self.rings, &self.cursors)?;
+            for region in stage.regions.iter() {
+                prepared.launch_region(device, pipelines, &self.rings, region)?;
+            }
+            // No synchronize between stages: `launch_region` has already
+            // waited on the command buffer it committed, so this stage's
+            // writes to the shared rings are visible to the next stage's
+            // `refresh` and to the status read in `verdict`.
+            launched.push(index);
+        }
+
+        self.verdict(plan, &launched)
+    }
+
+    /// **Encode every stage of `compiled` into a command buffer someone else
+    /// owns, and do not commit it** — the attached half of [`Session::fire`].
+    ///
+    /// **THIS IS THE FIRE PATH THAT DOES NOT WAIT**, and it exists because a
+    /// guest pass at a model fire's boundary must ride in that fire's own
+    /// command buffer. `serve::enqueue` may not block — it is the phase whose
+    /// whole contract is "encode and commit, no wait" — so the verdict this
+    /// call cannot read is read by [`Session::settle_launched`] from the
+    /// harvest, one frame later.
+    ///
+    /// **EVERY STAGE IS REFRESHED AND ENCODED UP FRONT, AND THE MODULE HEADER
+    /// IS WHY THAT IS SOUND.** A program's stages resolve their cell
+    /// addresses from the SAME cursors, so nothing a later stage needs
+    /// depends on an earlier one having run on the host; and the caller's
+    /// pass is `MTLDispatchTypeSerial`, so what a later stage needs from an
+    /// earlier one on the DEVICE — a channel cell written through the shared
+    /// rings — is ordered by the encoder.
+    ///
+    /// The gates are the standalone verb's, unchanged and shared: a poisoned
+    /// instance and a blocked channel both answer [`Launched::Refused`] with
+    /// nothing encoded, which is what lets `serve::prepare` ask the same
+    /// question early and refuse the whole fire before the forward runs.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] when the compiled stages and their plans are not
+    /// parallel, when an intrinsic the program reads was never bound, or when
+    /// this instance already has a pass airborne; whatever the encode said
+    /// otherwise, and [`Fault::Deviceless`] off Apple.
+    pub fn stage_into(
+        &mut self,
+        frame: &Frame,
+        compiled: &Compiled,
+        plan: &ExecPlan,
+    ) -> Result<Launched> {
+        if self.airborne.is_some() {
+            return Err(Fault::program(
+                "program::session",
+                "this instance already has a pass airborne: a second staging would \
+                 refresh the scratch and the status word of stages whose first pass \
+                 has not been read, so both fires would report the second's verdict \
+                 and the first's commit would be lost",
+            ));
+        }
+        if let Some(refused) = self.gate(compiled, plan)? {
+            return Ok(Launched::Refused(refused));
+        }
+
+        let mut launched = Vec::with_capacity(compiled.stages.len());
+        for (index, stage) in compiled.stages.iter().enumerate() {
+            let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
+            prepared.refresh(&self.rings, &self.cursors)?;
+            for region in stage.regions.iter() {
+                prepared.encode_into(frame, region)?;
+            }
+            launched.push(index);
+        }
+
+        self.airborne = Some(launched);
+        Ok(Launched::Airborne)
+    }
+
+    /// **The verdict half of an attached fire**: read the status every staged
+    /// stage left behind, and commit the cursors if they all agree.
+    ///
+    /// **THE CALLER OWES A PROOF THAT THE KERNELS RAN.** Not because the read
+    /// is unsafe without one — the status word is shared storage and a stale
+    /// read is a wrong verdict, not a fault — but because a verdict read
+    /// before the command buffer landed is an answer about the PREVIOUS fire.
+    /// On this plane the proof is `Pending::wait`, and `serve::harvest_one` is
+    /// the one place that holds it.
+    ///
+    /// Answers [`Fired::Committed`] for a session with nothing airborne,
+    /// because an instance that staged nothing has nothing outstanding to be
+    /// wrong about.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the status reads said.
+    pub fn settle_launched(&mut self, plan: &ExecPlan) -> Result<Fired> {
+        let Some(launched) = self.airborne.take() else {
+            return Ok(Fired::Committed);
+        };
+        self.verdict(plan, &launched)
+    }
+
+    /// **Drop the airborne mark without reading a verdict** — for a staging
+    /// that was abandoned before its command buffer was committed.
+    ///
+    /// **NOT A SETTLEMENT, AND THE DIFFERENCE IS THE POISON.** Reading the
+    /// status of a pass that never ran answers `State::Unset`, which
+    /// [`Verdict`] maps to `Faulted` and which poisons the instance — the
+    /// right answer for a kernel that did not reach its end, and exactly the
+    /// wrong one for a kernel that was never committed. Nothing ran, the
+    /// cursors did not move, and the scratch and status word are in the state
+    /// a fresh [`Prepared::refresh`] leaves them in, so the next fire is the
+    /// one this one would have been.
+    ///
+    /// The caller owes the other half of the promise: that the command buffer
+    /// those regions were encoded into is not committed.
+    pub fn abandon_launched(&mut self) {
+        self.airborne = None;
+    }
+
+    /// Whether a pass of this instance is in a command buffer that has not
+    /// been settled.
+    #[must_use]
+    pub const fn is_airborne(&self) -> bool {
+        self.airborne.is_some()
+    }
+
+    /// The three questions both fire paths ask before anything is encoded,
+    /// answering `Some` with the verdict when one of them refuses.
+    ///
+    /// Shared rather than transcribed because `serve::prepare` opens the same
+    /// gate a third time, over every attached instance, before the forward
+    /// runs — and three implementations of one readiness rule is exactly what
+    /// [`Session::blocked_channel`]'s own note says this plane will not have.
+    fn gate(&mut self, compiled: &Compiled, plan: &ExecPlan) -> Result<Option<Fired>> {
         if self.poisoned {
-            return Ok(Fired::Faulted("instance is poisoned".to_string()));
+            return Ok(Some(Fired::Faulted("instance is poisoned".to_string())));
         }
         stages_and_plans_agree(compiled)?;
 
@@ -497,38 +729,74 @@ impl Session {
             ));
         }
 
+        // AND THE SCORE RECTANGLE GETS THE THIRD GUARD, FOR THE SECOND ONE'S
+        // REASON (`.wiki/alto/attn-score.md` §4).
+        //
+        // **THIS USED TO BE A FLAT REFUSAL, AND EVERY BLOCKER IT NAMED IS
+        // GONE.** It read: no second intrinsic rectangle for an epilogue, no
+        // slab for the graph to write, and an element type — a score plane is
+        // F32 where the emitted `0xA0` handler read `bfloat`. The slot table
+        // answered the first, `crate::scores` the second, and the runtime's
+        // arm on `p.intr` the third. So the sentence is the ordinary one now:
+        // a program reads `attn_score` only when the shell bound this lane's
+        // block of the observability slab, and the shell binds it only for a
+        // lane that CAPTURED. A capturing ask that reached a plain lane would
+        // read whatever the encoder last left at that argument index — the
+        // failure the two guards above exist to prevent — and the axis's own
+        // refusal (`Fault::ScoreWord`) fires earlier, on the model side, for
+        // the same disagreement stated in the model's vocabulary. This is the
+        // guest-plane half of it.
+        if plan.needs_attn_scores
+            && self.bound & (1u64 << (IntrinsicId::AttnScore as u32)) == 0
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `attn_score` intrinsic and no buffer has been \
+                 bound to it; a lane that did not ask to capture its attention has no \
+                 block of the observability slab for it to point at",
+            ));
+        }
+
         // ── Readiness. THE SAME GATE THE HOST INTERPRETER OPENS. ──
         //
         // Read off the program's declared per-channel requirement, in channel
         // order, and answering with the FIRST channel that fails — because
-        // `engine::step` does exactly that and a caller retries on the name.
+        // `eta_exec::step` does exactly that and a caller retries on the name.
         if let Some(blocked) = self.blocked_channel(plan) {
-            return Ok(Fired::Blocked(blocked));
+            return Ok(Some(Fired::Blocked(blocked)));
         }
 
+        Ok(None)
+    }
+
+    /// Fold the status every stage in `launched` left behind, and commit the
+    /// cursors if the fold is `Committed`.
+    ///
+    /// **THE LAST STAGE TO SPEAK WINS NOTHING**: the verdict is folded worst-
+    /// first over every stage, and every stage launched whatever the fold
+    /// says, so a refused fire costs what a running one does.
+    ///
+    /// A device fault poisons the instance, because that is what
+    /// [`Fired::Faulted`] promises: a guard that refused this fire refuses the
+    /// next one from the same inputs.
+    fn verdict(&mut self, plan: &ExecPlan, launched: &[usize]) -> Result<Fired> {
         // The highest channel index a per-channel fault class can encode, as
-        // `engine::describe_fault` spells the bound: a class occupies
+        // `eta_exec::describe_fault` spells the bound: a class occupies
         // `base ..= base + max_channel`, so the number is the last valid
         // index and not the count.
         let max_channel = u32::try_from(self.shapes.len().saturating_sub(1)).unwrap_or(u32::MAX);
 
         let mut verdict = Verdict::Committed;
-        for (index, stage) in compiled.stages.iter().enumerate() {
-            let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
-                // A stage with nothing to launch needs no buffers and no
-                // launch. Not an empty case: the adapter prologue is exactly
-                // this shape.
+        for &index in launched {
+            let Some(prepared) = self.prepared.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            prepared.refresh(&self.rings, &self.cursors)?;
-            for region in stage.regions.iter() {
-                prepared.launch_region(device, pipelines, &self.rings, region)?;
-            }
-            // No synchronize between stages: `launch_region` has already
-            // waited on the command buffer it committed, so this stage's
-            // writes to the shared rings are visible to the next stage's
-            // `refresh` and to the read on the next line.
-            verdict = verdict.worse(verdict_of(index, prepared.status()?, max_channel));
+            verdict = verdict.worse(verdict_of(
+                &plan.package,
+                index,
+                prepared.status()?,
+                max_channel,
+            ));
         }
 
         match verdict {
@@ -589,7 +857,7 @@ impl Session {
 
     /// Advance the cursors of a fire that ran.
     ///
-    /// **THIS IS `engine::program::step`'s COMMIT, OVER THIS SHELL'S OWN
+    /// **THIS IS `eta_exec::step`'s COMMIT, OVER THIS SHELL'S OWN
     /// CURSORS**, and it is transcribed rather than called because the host's
     /// operates on `ChannelState` — a host ring with a host mutex — and this
     /// one operates on a device ring's sequence numbers. The arithmetic is the
@@ -676,7 +944,10 @@ impl Verdict {
     }
 }
 
-/// One stage's [`engine::Status`], read as a [`Verdict`].
+/// One stage's [`eta_exec::Status`], read as a [`Verdict`].
+///
+/// `package` is here for the fault-class table it carries: naming a raw code
+/// is a lookup in the table the EMITTER shipped, not in one this binary holds.
 ///
 /// `dispatched` is passed as `true` unconditionally, and that is a statement
 /// rather than a shortcut: this function is only reached after every one of
@@ -686,11 +957,16 @@ impl Verdict {
 /// path that would produce it returns a [`Fault`] from `launch_region`
 /// instead, and calling it a status would turn a shell error into a guest
 /// refusal.
-fn verdict_of(stage: usize, status: engine::Status, max_channel: u32) -> Verdict {
+fn verdict_of(
+    package: &LaunchPackage,
+    stage: usize,
+    status: eta_exec::Status,
+    max_channel: u32,
+) -> Verdict {
     match status.state() {
         // **STATE ONE IS THE COMMIT ON THIS PATH, AND THAT IS THE M2
         // KERNEL'S CONTRACT RATHER THAN A LOOSE READING.**
-        // `engine::StatusOutcome::of` reads `Running` as "the kernel started
+        // `eta_exec::StatusOutcome::of` reads `Running` as "the kernel started
         // and did not reach its end", because the plane it was written for
         // ends every pass with a DEVICE commit kernel that raises the word
         // to `Committed`. Build log 15 and 18 ruled readiness and commit
@@ -702,15 +978,15 @@ fn verdict_of(stage: usize, status: engine::Status, max_channel: u32) -> Verdict
         // at THREE when `m1_fault_op` raised it. Reading one as a failure
         // faults every correct pass; that is the first thing this plane's
         // parity gate found.
-        Some(engine::State::Running) => Verdict::Committed,
-        Some(engine::State::Committed) => Verdict::Committed,
-        Some(engine::State::Retry) => Verdict::Declined,
+        Some(eta_exec::State::Running) => Verdict::Committed,
+        Some(eta_exec::State::Committed) => Verdict::Committed,
+        Some(eta_exec::State::Retry) => Verdict::Declined,
         // `Unset` is the word nothing wrote, which on this plane means the
         // status reservation was clobbered — `Session::fire` writes ONE into
         // it before every launch.
-        Some(engine::State::Fault | engine::State::Unset) | None => Verdict::Faulted(format!(
+        Some(eta_exec::State::Fault | eta_exec::State::Unset) | None => Verdict::Faulted(format!(
             "stage {stage}: {}",
-            engine::report_status(status, true, max_channel)
+            eta_exec::report_status(package, status, true, max_channel)
         )),
     }
 }
@@ -728,14 +1004,14 @@ fn verdict_of(stage: usize, status: engine::Status, max_channel: u32) -> Verdict
 /// Cells are returned oldest first, so republishing them reproduces the ring's
 /// order. A channel whose ring is empty contributes nothing.
 #[must_use]
-pub fn seeds_of(interp: &engine::InterpInstance, plan: &ExecPlan) -> Vec<(u32, Vec<u8>)> {
+pub fn seeds_of(interp: &eta_exec::InterpInstance, plan: &ExecPlan) -> Vec<(u32, Vec<u8>)> {
     let mut seeds = Vec::new();
     for (channel, ring) in interp.channels.iter().enumerate() {
         let declared = match plan.package.channels.get(channel) {
             Some(declared) => declared,
             None => continue,
         };
-        let dtype = engine::concrete_dtype(declared.dtype);
+        let dtype = eta_exec::concrete_dtype(declared.dtype);
         let numel = declared
             .shape
             .iter()
@@ -743,8 +1019,8 @@ pub fn seeds_of(interp: &engine::InterpInstance, plan: &ExecPlan) -> Vec<(u32, V
             .product::<usize>()
             .max(1);
         for sequence in ring.head()..ring.tail() {
-            let mut wire = vec![0u8; engine::wire_cell_bytes(dtype, numel)];
-            engine::encode_wire(&ring.decode_sequence(sequence), &mut wire);
+            let mut wire = vec![0u8; eta_exec::wire_cell_bytes(dtype, numel)];
+            eta_exec::encode_wire(&ring.decode_sequence(sequence), &mut wire);
             seeds.push((channel as u32, wire));
         }
     }
@@ -812,7 +1088,21 @@ fn stage_plans_are_parallel(stages: &[(u64, bool)], plans: &[u64]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+    use eta_compiler::codegen::launch::LaunchPackage;
+
     use super::{Verdict, verdict_of};
+
+    /// A package carrying the fault table, which is where a fault's class name
+    /// comes from now that it travels on the artifact rather than being linked
+    /// ambiently. Production builds this in `codegen::launch::build`; a test
+    /// that decoded against a `default()` package would assert nothing, because
+    /// an empty table names no class.
+    fn package() -> LaunchPackage {
+        LaunchPackage {
+            fault_classes: eta_compiler::codegen::fault::classes(),
+            ..LaunchPackage::default()
+        }
+    }
 
     /// The served shape, and the one a "single stage only" guard used to
     /// refuse outright: an adapter prologue that launches nothing beside a
@@ -874,13 +1164,13 @@ mod tests {
     fn a_kernel_fault_is_faulted_and_names_its_class() {
         // `M1_NOT_FULL` is `0x400` and is per-channel, so `0x401` is that
         // class on channel 1.
-        let status = engine::Status {
+        let status = eta_exec::Status {
             state: 3,
             fault: 0x401,
             reserved0: 0,
             reserved1: 0,
         };
-        let Verdict::Faulted(why) = verdict_of(2, status, 3) else {
+        let Verdict::Faulted(why) = verdict_of(&package(), 2, status, 3) else {
             panic!("state 3 is a fault, not a decline");
         };
         assert!(why.contains("stage 2"), "names which stage: {why}");
@@ -894,13 +1184,13 @@ mod tests {
     /// caller can fire again.
     #[test]
     fn a_kernel_readiness_miss_is_a_decline_and_not_a_fault() {
-        let status = engine::Status {
+        let status = eta_exec::Status {
             state: 2,
             fault: 0x480,
             reserved0: 0,
             reserved1: 0,
         };
-        assert!(matches!(verdict_of(0, status, 3), Verdict::Declined));
+        assert!(matches!(verdict_of(&package(), 0, status, 3), Verdict::Declined));
     }
 
     /// A stage whose status was never written did not run, and a fire that
@@ -909,8 +1199,8 @@ mod tests {
     /// commit here; this is the case the richer status buys.
     #[test]
     fn a_status_nothing_wrote_is_a_fault_rather_than_a_commit() {
-        let status = engine::Status::default();
-        assert!(matches!(verdict_of(0, status, 0), Verdict::Faulted(_)));
+        let status = eta_exec::Status::default();
+        assert!(matches!(verdict_of(&package(), 0, status, 0), Verdict::Faulted(_)));
     }
 
     /// The fold is ordered: a fault anywhere in the fire outranks a decline

@@ -24,9 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
-use tensor_ir::container;
+use eta_ir::container;
 #[cfg(test)]
-use tensor_ir::container::HostRole;
+use eta_ir::container::HostRole;
 
 use super::program::RegisteredProgram;
 #[cfg(test)]
@@ -655,16 +655,16 @@ mod tests {
     use super::*;
     use crate::pipeline::program::{Registry, register};
     use std::num::NonZeroUsize;
-    use tensor_ir::container::{
+    use eta_ir::container::{
         ChanDType, ChannelDecl, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use tensor_ir::op::{IntrinsicId, Op};
-    use tensor_ir::registry::{ModelProfile, Port, Stage};
-    use tensor_ir::types::{DType, Shape};
+    use eta_ir::op::{IntrinsicId, Op};
+    use eta_ir::registry::{ModelProfile, Port, Stage};
+    use eta_ir::types::{Dtype, Shape};
 
     const VOCAB: u32 = 32;
 
-    fn chan(shape: Shape, dtype: DType, role: HostRole, seeded: bool) -> ChannelDecl {
+    fn chan(shape: Shape, dtype: Dtype, role: HostRole, seeded: bool) -> ChannelDecl {
         ChannelDecl {
             shape,
             dtype: ChanDType::Concrete(dtype),
@@ -678,7 +678,7 @@ mod tests {
         PortBinding {
             port,
             source: PortSource::Const {
-                dtype: DType::U32,
+                dtype: Dtype::U32,
                 shape,
                 data: values
                     .iter()
@@ -694,7 +694,7 @@ mod tests {
             Op::IntrinsicVal {
                 intr: IntrinsicId::Logits,
                 shape: Shape::matrix(1, VOCAB),
-                dtype: DType::F32,
+                dtype: Dtype::F32,
             },
             Op::Reshape {
                 value: 0,
@@ -711,8 +711,8 @@ mod tests {
             names: vec![],
             externs: vec![],
             channels: vec![
-                chan(Shape::vector(1), DType::I32, HostRole::None, true),
-                chan(Shape::vector(1), DType::I32, HostRole::Reader, false),
+                chan(Shape::vector(1), Dtype::I32, HostRole::None, true),
+                chan(Shape::vector(1), Dtype::I32, HostRole::Reader, false),
             ],
             ports: vec![
                 PortBinding {
@@ -722,7 +722,7 @@ mod tests {
                 PortBinding {
                     port: Port::EmbedIndptr,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(2),
                         data: [0u32, 1].iter().flat_map(|w| w.to_le_bytes()).collect(),
                     },
@@ -733,7 +733,7 @@ mod tests {
                 PortBinding {
                     port: Port::KvLen,
                     source: PortSource::Const {
-                        dtype: DType::U32,
+                        dtype: Dtype::U32,
                         shape: Shape::vector(1),
                         data: 1u32.to_le_bytes().to_vec(),
                     },
@@ -916,8 +916,8 @@ mod tests {
 
     #[test]
     fn register_instantiate_run_on_mock_interp() {
-        use tensor_compiler::eval::interp::Value;
-        use tensor_compiler::eval::interp::{Instance as Interp, NoKernels, PassInputs};
+        use eta_compiler::eval::interp::Value;
+        use eta_compiler::eval::interp::{Instance as Interp, NoKernels, PassInputs};
 
         let prog = register(
             greedy().encode(),

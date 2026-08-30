@@ -1,6 +1,6 @@
 //! The completion broker — run-ahead's bookkeeping, home at last.
 //!
-//! **THIS CODE IS A LIFT, NOT A REWRITE.** It stood in `engine-api` as
+//! **THIS CODE IS A LIFT, NOT A REWRITE.** It stood in `engine` as
 //! `completion.rs` (807 lines) plus the terminal cell out of `local.rs`, and
 //! the palo rewrite evicted it: a waker table, a recycling pool of atomic
 //! terminal cells and a per-work-item lease are how the RUNTIME decides to run
@@ -10,7 +10,7 @@
 //!
 //! # What changed on the way over
 //!
-//! * The terminal cell is local. It was `engine_api::local::TerminalCell`, a
+//! * The terminal cell is local. It was `engine::local::TerminalCell`, a
 //!   `#[repr(C)]` word a C engine published into across the ABI. Nothing
 //!   crosses the boundary now — [`crate::engine::Engine::fire`] answers a
 //!   `Result<FireTicket>` and the settle happens on this side of it — so the
@@ -877,13 +877,13 @@ impl Drop for WorkItemCompletion {
 /// to write these words itself: the runtime handed `*mut TerminalCell` across
 /// the ABI inside `StepSubmission` and the device's completion thread stored
 /// into them. The contract has no such field any more —
-/// [`Engine::fire`](engine_api::Engine::fire) answers a
+/// [`Engine::fire`](engine::Engine::fire) answers a
 /// `Result<FireTicket, Error>` and the shells in this workspace are
 /// synchronous — so the runtime writes them, once, from the answer it got.
 ///
 /// Which outcome a caller passes is the whole of the run-ahead policy:
 /// [`TERMINAL_OUTCOME_RETRY`] for a
-/// [scheduling](engine_api::Error::is_scheduling) refusal, because the
+/// [scheduling](engine::Error::is_scheduling) refusal, because the
 /// work item is still alive and its next attempt resets the cell;
 /// [`TERMINAL_OUTCOME_FAILED`] for anything else.
 pub fn settle(cells: &[*mut TerminalCell], outcome: TerminalOutcomeCode) {
@@ -1047,8 +1047,8 @@ impl FrameSettlements {
     /// Publishes nothing until the frame's LAST step reports, except on a
     /// fault, which resolves the frame immediately: the steps behind a faulted
     /// one were poisoned at submit and are never coming.
-    pub fn settled(&self, frame: u64, outcome: &engine_api::StepOutcome, broker: &CompletionBroker) {
-        let failed = matches!(outcome, engine_api::StepOutcome::Faulted(_));
+    pub fn settled(&self, frame: u64, outcome: &engine::StepOutcome, broker: &CompletionBroker) {
+        let failed = matches!(outcome, engine::StepOutcome::Faulted(_));
         let pending = {
             let mut book = self.inner.lock().unwrap();
             let Some(pending) = book.frames.get_mut(&frame) else {

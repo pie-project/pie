@@ -3,9 +3,9 @@
 //! (`channel`), and the launch-side re-exports the rest of the runtime reads.
 //!
 //! This is the RUNTIME's half of the engine boundary and nothing else. The
-//! contract — [`Engine`](engine_api::Engine) and the fourteen verbs, the
+//! contract — [`Engine`](engine::Engine) and the fourteen verbs, the
 //! completion an engine mints, the bind plan, the registration an engine answers —
-//! is `engine-api`'s, because both sides say it. What only the runtime does is
+//! is `engine`'s, because both sides say it. What only the runtime does is
 //! pick a backend, keep it in a registry under an `EngineId`, and hold the
 //! channel endpoints applications wait on.
 //!
@@ -40,7 +40,7 @@ pub use channel::{
 
 // THE BROKER CAME HOME (palo design §7, decision 19). `CompletionBroker`,
 // `SubmissionCompletion`, `WorkItemCompletion` and the terminal cell were
-// 807 lines inside `engine-api`, describing how the RUNTIME runs ahead of a
+// 807 lines inside `engine`, describing how the RUNTIME runs ahead of a
 // device. They are `engine::completion` and `engine::instance` now, and the
 // contract keeps only the receipt — `FireTicket`.
 pub use completion::{
@@ -57,23 +57,23 @@ pub use fire::{
 };
 
 // The contract, re-exported at the path the runtime already reads it from.
-pub use ::engine_api::adapter::{AdapterPlane, AdapterRegistration};
-pub use ::engine_api::caps::Capabilities;
-pub use ::engine_api::channel::ChannelRegistration;
-pub use ::engine_api::error::{Error, Result as EngineResult};
-pub use ::engine_api::fire::{
+pub use ::engine::adapter::{AdapterPlane, AdapterRegistration};
+pub use ::engine::caps::Capabilities;
+pub use ::engine::channel::ChannelRegistration;
+pub use ::engine::error::{Error, Result as EngineResult};
+pub use ::engine::fire::{
     Attachment, Boundary, FireTicket, FrameSubmission, FrameTicket, KvDelta, Lane, LaneReadout,
     Mask, Masking, MediaEncode, Readout, RsReset, RsVerb, Step,
 };
-pub use ::engine_api::load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
-pub use ::engine_api::program::ProgramRegistration;
-pub use ::engine_api::transfer::{KvCopy, KvMove, MemoryDomain, StateCopy, StateMove};
-pub use ::engine_api::Engine;
+pub use ::engine::load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
+pub use ::engine::program::ProgramRegistration;
+pub use ::engine::transfer::{KvCopy, KvMove, MemoryDomain, StateCopy, StateMove};
+pub use ::engine::Engine;
 
 /// The four recurrent-state verbs, as a slot's flag byte spells them.
 ///
-/// **`palo B-rs`**: these were `engine_api::plan::RS_FLAG_*`. The byte no
-/// longer travels — `engine_api::RsVerb` and `engine_api::RsReset` are what
+/// **`palo B-rs`**: these were `engine::plan::RS_FLAG_*`. The byte no
+/// longer travels — `engine::RsVerb` and `engine::RsReset` are what
 /// crosses the boundary since wave F3-tail, and `PreparedRs::apply_to` reads
 /// `RESET` here to state which of the two a lane's slot is. The numbering
 /// stays because the runtime's own recurrent store is built on it.
@@ -112,7 +112,7 @@ pub mod verbs {
     /// Which backend an engine's guest-program codegen emits for.
     ///
     /// Was `Engine::codegen_backend()`, a trait method; it is a field of
-    /// [`DeviceFacts`](engine_api::DeviceFacts) now, because it is a fact
+    /// [`DeviceFacts`](engine::DeviceFacts) now, because it is a fact
     /// about the machine and the contract already has a record for those.
     #[must_use]
     pub fn codegen_backend(engine: &EngineBox) -> Option<&str> {
@@ -131,13 +131,13 @@ pub mod verbs {
     /// bytes reach the bank and a lane can say which row it wants, and this
     /// is the first half: one call, one id, one plane per bank, forwarded.
     ///
-    /// The second half is [`Lane::adapter`](engine_api::fire::Lane::adapter),
+    /// The second half is [`Lane::adapter`](engine::fire::Lane::adapter),
     /// which the contract has carried since the rewrite, which the CUDA shell
     /// now honours end to end, and which
     /// [`stamp_lane_words`](crate::pipeline::fire) reads to compute the lane's
     /// fact word — so any caller that sets it gets the axis. What no path in
     /// this crate SETS it from yet is a per-request adapter id, because a
-    /// request has nowhere to state one: the PTIR port vocabulary the fire
+    /// request has nowhere to state one: the ETA port vocabulary the fire
     /// path is assembled from names no such port, and adding one is the
     /// client-facing half this wave deliberately did not build.
     ///
@@ -145,11 +145,11 @@ pub mod verbs {
     ///
     /// Whatever the engine refused — a bank it does not declare, an id past
     /// its capacity, a plane that is not one slot's bytes, or
-    /// [`Unsupported`](engine_api::Error::Unsupported) from a shell
+    /// [`Unsupported`](engine::Error::Unsupported) from a shell
     /// whose loads seat no bank.
     pub fn register_adapter(
         engine: &mut EngineBox,
-        registration: &engine_api::adapter::AdapterRegistration,
+        registration: &engine::adapter::AdapterRegistration,
     ) -> Result<()> {
         engine
             .register_adapter(registration)
@@ -170,7 +170,7 @@ pub mod verbs {
     ///
     /// Whatever the engine refused, widened to `anyhow` for the scheduler's
     /// mailbox.
-    pub fn settled(result: engine_api::Result<()>) -> Result<SubmissionCompletion> {
+    pub fn settled(result: engine::Result<()>) -> Result<SubmissionCompletion> {
         result
             .map(|()| SubmissionCompletion::ready())
             .map_err(anyhow::Error::from)
@@ -195,7 +195,7 @@ pub mod verbs {
     ///                    fire's boundary
     /// ```
     ///
-    /// [`Unsupported`](engine_api::Error::Unsupported) is the third: a shell
+    /// [`Unsupported`](engine::Error::Unsupported) is the third: a shell
     /// with no standalone channel to register at all. It is TOLERATED — and
     /// only it — and falls into the second shape; any other refusal is real
     /// and is returned.
@@ -216,7 +216,7 @@ pub mod verbs {
         let table = waker::WakerTable::global();
         let answered = match engine.register_channel(registration) {
             Ok(answer) => Some(answer),
-            Err(engine_api::Error::Unsupported { .. }) => None,
+            Err(engine::Error::Unsupported { .. }) => None,
             Err(error) => return Err(anyhow::Error::from(error)),
         };
         let mint = |id: u64| if id == 0 { table.alloc() } else { id };

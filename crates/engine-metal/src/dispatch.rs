@@ -19,6 +19,16 @@
 //!
 //! The impls live one per family in the modules below — one file per
 //! `Dispatch*` trait, each importing only what its own arms resolve through.
+//!
+//! [`copy`] is the seventh module and the one that is not a `Dispatch*`
+//! family: it is `model_exec::fire::Serve`, the walk's OTHER seam, which
+//! brackets a copied region's nodes with a row gather and its inverse rather
+//! than serving an op. It lives here because it is written the way the six
+//! are — destructure the region, resolve through the same `Run`, call a
+//! `kernels-metal` entry — and because the CUDA sibling puts its twin in the
+//! same place.
+
+pub(crate) mod copy;
 
 mod attn;
 mod collective;

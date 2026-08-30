@@ -30,8 +30,9 @@ use crate::state::Cluster;
 use crate::topology::{Topology, reassign, routing_only};
 
 /// Messages the actor processes. The only way to touch cluster state. The
-/// service extracts these from the wire calls (e.g. `register_worker` drops the
-/// unused `capability` field).
+/// service extracts these from the wire calls; `register_worker` takes the
+/// whole of what `WorkerInfo` still carries (the wire type used to carry an
+/// engine capability record too, dropped here and now gone from the contract).
 pub enum Command {
     /// Register a worker; reply with its minted [`WorkerId`].
     RegisterWorker {

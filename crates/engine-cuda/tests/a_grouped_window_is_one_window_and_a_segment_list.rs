@@ -8,7 +8,7 @@
 //! right or the launch corrects somebody else's tokens:
 //!
 //! - **one window, not `r`.** `Windows::runs` must answer `1`, because
-//!   `engine::fire::walk` turns its launch loop once for this region and a
+//!   `model_exec::fire::walk` turns its launch loop once for this region and a
 //!   table that cut `r` would leave runs 1..r unreachable and their rows
 //!   uncorrected;
 //! - **the union is exactly the union.** First row of the first interval to
@@ -27,10 +27,12 @@
 //! NO DEVICE. `Windows::of` is arithmetic over a class table and a boundary
 //! vector; nothing here opens a context, allocates, or launches.
 
-use engine::fire::{Lane, MaskSpan, compose, fallback};
 use engine_cuda::window::{Copies, Windows};
 use model_compiler::{CompiledModel, Budget, DeviceProfile, Fallback, FamilyCosts, PqTree, compile};
 use model_dsl::Platform;
+use model_exec::fire::{Lane, MaskSpan, compose, fallback};
+use std::collections::BTreeSet;
+
 use model_ir::{ClassSet, Operands, Trace};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -156,9 +158,9 @@ fn the_grouped_region_gets_one_window_whose_segments_are_the_splits_own_spans() 
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
     let boundaries = indptr(&rows);
 
-    let split_windows = Windows::of(&plan, &split, fire.classes(), &boundaries, Copies::off())
+    let split_windows = Windows::of(&plan, &split, fire.classes(), fire.patch_classes(), &boundaries, Copies::off())
         .expect("a fragmented window is a slow path, not a fault");
-    let grouped_windows = Windows::of(&plan, &grouped, fire.classes(), &boundaries, Copies::off())
+    let grouped_windows = Windows::of(&plan, &grouped, fire.classes(), fire.patch_classes(), &boundaries, Copies::off())
         .expect("a grouped window is one window");
 
     let mut checked = 0usize;
@@ -172,7 +174,7 @@ fn the_grouped_region_gets_one_window_whose_segments_are_the_splits_own_spans() 
         );
         checked += 1;
 
-        // ONE WINDOW, NOT `r` — the number `engine::fire::walk` loops on.
+        // ONE WINDOW, NOT `r` — the number `model_exec::fire::walk` loops on.
         assert_eq!(split_windows.runs(at), spans.len() as u32);
         assert_eq!(grouped_windows.runs(at), 1, "region {at}");
 
@@ -256,7 +258,7 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
     let lanes = one_lane_per_class(&grouped);
     let fire = compose(&grouped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
-    let mut windows = Windows::of(&plan, &grouped, fire.classes(), &indptr(&rows), Copies::off()).expect("the windows");
+    let mut windows = Windows::of(&plan, &grouped, fire.classes(), fire.patch_classes(), &indptr(&rows), Copies::off()).expect("the windows");
 
     let packed = windows.packed();
     // A base that is not zero, so an implementation that forgot to add it
@@ -312,12 +314,24 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
 /// nothing groupable is withdrawn" — true while an arbitrary tie-break picked
 /// the loser, and false now that cost does. `Grouped` is one launch where a
 /// split is `r`, so a groupable consumer is nearly free to lose and
-/// `layout::choose` picks it: the score window keeps its interval, the
-/// correction takes a segment list, and the artifact goes from twelve rows
-/// that cost launches to twenty-four that cost none. That is the composition
-/// the two features were built for, and it is why
-/// `engine_cuda::Knobs::grouped` has an off arm — it is an improvement, but
-/// it is a DIFFERENT artifact from the one the off arm bakes.
+/// `layout::choose` picks it. That is the composition the two features were
+/// built for, and it is why `engine_cuda::Knobs::grouped` has an off arm — it
+/// is an improvement, but it is a DIFFERENT artifact from the one the off arm
+/// bakes.
+///
+/// **WHAT THE TWO BAKES MEASURE AT TWELVE CLASSES.** `8cb1b6ce6` added
+/// `Facts::masked` and took qwen3.5's class set from eight to twelve, which
+/// moved every number here. The plain bake withdraws TWO windows — the score
+/// window `{4, 5, 6, 7}` and the masked window `{8, 9, 10, 11}`, both at
+/// `Split { r: 4 }`, twenty-four rows that cost launches. Naming the ops seats
+/// the masked window outright, drops the score window to `Split { r: 2 }`, and
+/// buys twenty-four `Grouped` rows that cost nothing: twenty-four
+/// launch-paying rows down to twelve.
+///
+/// So the claim is no longer "every row is `Grouped`" — that was the
+/// eight-class form, back when the correction was the only consumer that ever
+/// had to be withdrawn and the two sentences were the same sentence. It is
+/// stated below as the four things it always meant.
 #[test]
 fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
     let (_, _, trace, _) = model::catalog()
@@ -344,19 +358,76 @@ fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
         "the default bake owes {:?}",
         plain.fallback.rows,
     );
-    // Naming the ops moves the withdrawal onto them, and every row it owes is
-    // one launch over a segment list — at every bucket, since one launch beats
-    // `r` at every scale and there is no crossover to consult.
+    let named = engine_cuda::GROUPED;
+    let op_of = |node: u32| trace.nodes[node as usize].op.name();
+
+    // (1) AND (2). Every named op that is withdrawn answers `Grouped` — at
+    // every bucket, since one launch beats `r` at every scale and there is no
+    // crossover to consult — and nothing that answers otherwise is a named op.
+    // Stated as one iff rather than two loops: a grouped answer must be
+    // neither denied to a consumer that asked for it nor handed to one that
+    // did not, and both directions are the same bug seen from two ends.
+    for row in &shipped.fallback.rows {
+        assert_eq!(
+            row.fallback == Fallback::Grouped,
+            named.contains(&op_of(row.node)),
+            "node {} is `{}` and answers {:?}",
+            row.node,
+            op_of(row.node),
+            row.fallback,
+        );
+    }
     assert!(
-        !shipped.fallback.rows.is_empty()
-            && shipped
-                .fallback
-                .rows
-                .iter()
-                .all(|row| row.fallback == Fallback::Grouped),
-        "naming the grouped ops left somebody paying launches: {:?}",
+        shipped
+            .fallback
+            .rows
+            .iter()
+            .any(|row| row.fallback == Fallback::Grouped),
+        "naming the grouped ops withdrew none of them, so nothing below is \
+         about a withdrawal that moved: {:?}",
         shipped.fallback.rows,
     );
+
+    // (3) THE WITHDRAWAL ACTUALLY MOVED. Every node that answers `Grouped`
+    // here is SEATED in the plain bake — which is the whole of "onto them".
+    // Without this the iff above would still pass on a bake that had been
+    // withdrawing the correction all along.
+    for row in &shipped.fallback.rows {
+        if row.fallback != Fallback::Grouped {
+            continue;
+        }
+        assert!(
+            fallback::answers(&plain, row.node..row.node + 1).is_empty(),
+            "node {} was already withdrawn before its op was named groupable, \
+             so naming it moved nothing",
+            row.node,
+        );
+    }
+
+    // (4) AND NAMING THEM ONLY FREED CONSTRAINTS. A groupable withdrawal is
+    // nearly free, so `layout::choose` prefers it and the search it unblocks
+    // can seat what the plain bake could not. The windows still paying
+    // launches here are therefore a STRICT SUBSET of the plain bake's — a
+    // superset would mean the discount bought a launch rather than sold one.
+    let paying = |compiled: &CompiledModel| -> BTreeSet<String> {
+        compiled
+            .template()
+            .iter()
+            .filter(|region| {
+                fallback::answers(compiled, region.nodes.clone())
+                    .iter()
+                    .any(|answer| *answer != Fallback::Grouped)
+            })
+            .map(|region| format!("{:?}", region.mask.iter().collect::<Vec<_>>()))
+            .collect()
+    };
+    let (paid, pays) = (paying(&plain), paying(&shipped));
+    assert!(
+        pays.is_subset(&paid) && pays.len() < paid.len(),
+        "naming the grouped ops did not reduce what pays launches: plain \
+         {paid:?}, shipped {pays:?}",
+    );
+
     assert_ne!(
         shipped.order.tree().map(PqTree::frontier),
         plain.order.tree().map(PqTree::frontier),
@@ -367,7 +438,7 @@ fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
     let fire = compose(&shipped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
     let windows =
-        Windows::of(&trace, &shipped, fire.classes(), &indptr(&rows), Copies::off())
+        Windows::of(&trace, &shipped, fire.classes(), fire.patch_classes(), &indptr(&rows), Copies::off())
             .expect("the windows");
     // A segment list where the artifact answered `Grouped` and NOWHERE ELSE:
     // one window, `r` segments; and every region the table said nothing about
@@ -396,8 +467,32 @@ fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
         "this fire groups nothing under the shipped bake, so the assertions \
          above are about a presence nobody could have produced",
     );
-    assert_eq!(
-        split_regions, 0,
-        "naming the grouped ops was supposed to leave nobody splitting",
+    // WHAT STILL SPLITS IS ONLY WHAT THE SHELL NEVER NAMED. `split_regions == 0`
+    // was the eight-class form of this: once the correction was grouped there
+    // was nothing left that could split. At twelve the score window survives
+    // its own withdrawal and its seven regions cut into two runs each, so the
+    // checkable claim is not that nobody splits — it is that nobody who ASKED
+    // to be grouped splits. A named op cut into runs would be the shell
+    // claiming a kernel and then not using it, which is the bug the count was
+    // ever standing in for.
+    for at in 0..shipped.template().len() as u32 {
+        if windows.runs(at) < 2 {
+            continue;
+        }
+        for node in shipped.template()[at as usize].nodes.clone() {
+            assert!(
+                !named.contains(&op_of(node)),
+                "region {at} holds `{}`, which the shell named groupable, and it \
+                 was cut into {} runs anyway",
+                op_of(node),
+                windows.runs(at),
+            );
+        }
+    }
+    assert!(
+        split_regions > 0,
+        "nothing in this fire splits at all, so the loop above asserts nothing \
+         — the score window stopped surviving its withdrawal and this gate \
+         should be re-read rather than re-pointed",
     );
 }

@@ -98,7 +98,7 @@ return when each has an executor for the compiled forward pass (P5).
 |---|---|
 | `src/` | The `pie` CLI and the three role daemons — the invariant entry point |
 | `crates/runtime/` | Inferlet runtime |
-| `crates/tensor-*/` | Tensor-program toolchain: authoring eDSL → PTIR → planning → CUDA/Metal codegen (+ the reference interpreter) |
+| `crates/eta-*/` | ETA (Embedded Tensor Algebra) toolchain: authoring eDSL → ETA → planning → CUDA/Metal codegen (+ the reference interpreter) |
 | `crates/model*/` | What a model is: the catalog, the authoring eDSL and its traced IR, the forward compiler, the checkpoint loader |
 | `crates/controller/` | Cluster-coordination control plane (pairing · roles · health) |
 | `crates/transport/` | Worker↔worker P2P KV-tensor data plane |

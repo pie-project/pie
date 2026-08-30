@@ -12,7 +12,7 @@
 //!     (`pivot_threshold(logits, rank_le(k_min))`).
 //!   - `k_min=0` (no floor override): the plain, degenerate control.
 
-use inferlet::ptir::attention::prelude::*;
+use inferlet::eta::attention::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]

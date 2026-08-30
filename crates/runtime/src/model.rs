@@ -17,7 +17,7 @@
 //! read the tokens back are `model::template` re-exports. The other two are
 //! HERE, because a serving fabric is the party that asks them:
 //!
-//! * [`ROWS`], the `(layers, vocab, arch)` a sampler, the PTIR lowering and
+//! * [`ROWS`], the `(layers, vocab, arch)` a sampler, the ETA lowering and
 //!   the media front-ends are sized and dispatched from;
 //! * [`ModelMetadata`], the shape an artifact's compiled metadata arrives in.
 //!   `worker` lifts it off the checkpoint and hands it here in the boot
@@ -69,7 +69,7 @@ pub struct ModelMetadata {
 /// it holds a plan:
 ///
 /// * `layers` and `vocab` are computation facts — the tower's depth and the
-///   `embed` table's leading extent — that the sampler and the PTIR lowering
+///   `embed` table's leading extent — that the sampler and the ETA lowering
 ///   are sized from at boot, when nothing in this process has traced
 ///   anything;
 /// * `arch` is a deployment fact and no plan states one: a trace says what a
@@ -145,6 +145,14 @@ pub const ROWS: &[Row] = &[
         vocab: 262_144,
         arch: "gemma4",
     },
+    // mlx 4-bit row: same trunk geometry as its bf16 sibling (see the qwen
+    // mlxu4 rows below for the argument).
+    Row {
+        id: "gemma4-31b-mlxu4-kv-bf16",
+        layers: 60,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
     Row {
         id: "gemma4-31b-bf16-kv-bf16-tp2",
         layers: 60,
@@ -165,6 +173,14 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         id: "gptoss-20b-bf16-mxfp4-kv-bf16",
+        layers: 24,
+        vocab: 201_088,
+        arch: "gptoss",
+    },
+    // mlx 4-bit row: same trunk geometry as its bf16 sibling (the qwen mlxu4
+    // rows state the argument).
+    Row {
+        id: "gptoss-20b-mlxu4-mxfp4-kv-bf16",
         layers: 24,
         vocab: 201_088,
         arch: "gptoss",
@@ -205,6 +221,20 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // The mlx 4-bit rows: same trunk geometry as their bf16 siblings — the
+    // quant is a storage fact, and nothing in this table reads storage.
+    Row {
+        id: "qwen36-27b-mlxu4-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen35-d0.8b-mlxu4-kv-bf16",
+        layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
     Row {
         id: "qwen35-a3b-bf16-kv-bf16",
         layers: 40,
@@ -225,6 +255,43 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         id: "qwen35-d0.8b-bf16-kv-bf16",
+        layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    // **THE SAME TRUNK, WITH AN OVERLAID DRAFT HEAD** (campaign M-4). Every
+    // number here is a fact about the TRUNK — layers, logits width, the
+    // architecture a front-end dispatches on — and a draft head changes none
+    // of them: it is a second readout of the same twenty-four layers, not a
+    // second model. What makes the row necessary is the id space, which this
+    // table and `::model::catalog()` share by the test below: a catalog SKU
+    // with no serving row is a model an engine can load and this runtime
+    // cannot name, and that is exactly the refusal an overlay artifact hit.
+    // The M-1 and M-2 rows. Every number is the TRUNK's, for the eagle row's
+    // reason: a vision tower is a second row axis over the same twenty-four
+    // (or sixty-four) layers, and `arch` is what a front-end dispatches its
+    // image preprocessing on — which is the same `qwen3_5` either way, because
+    // the tower these rows read is the one that family's checkpoints ship.
+    Row {
+        id: "qwen35-d0.8b-vision-eagle-bf16-kv-bf16",
+        layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen35-d0.8b-vision-bf16-kv-bf16",
+        layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen36-27b-vision-bf16-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen35-d0.8b-eagle-bf16-kv-bf16",
         layers: 24,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -316,7 +383,7 @@ pub fn register(
     model_id: &str,
     kv_page_size: u32,
     rs: RsCaps,
-    ptir: PtirCaps,
+    eta: EtaCaps,
     tokenizer_path: PathBuf,
     metadata: &ModelMetadata,
 ) -> Result<()> {
@@ -409,7 +476,7 @@ pub fn register(
         classify,
         kv_page_size,
         rs_caps: rs,
-        ptir_caps: ptir,
+        eta_caps: eta,
         tokenizer,
         vocab: OnceLock::new(),
         vocab_size,
@@ -454,7 +521,7 @@ pub struct Model {
     /// (`rs-state-size`/`rs-buffer-page-size`/`rs-fold-granularity`). All
     /// 0/0/1 for pure-attention models.
     rs_caps: RsCaps,
-    ptir_caps: PtirCaps,
+    eta_caps: EtaCaps,
     tokenizer: Arc<Tokenizer>,
     /// **THE TOKEN TABLE, BUILT ONCE PER RUNTIME.**
     ///
@@ -492,9 +559,9 @@ pub struct RsCaps {
     pub fold_granularity: u32,
 }
 
-/// Model-gated values that a loaded backend can bind into PTIR programs.
+/// Model-gated values that a loaded backend can bind into ETA programs.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct PtirCaps {
+pub struct EtaCaps {
     pub has_mtp_logits: bool,
     pub has_mtp_drafts: bool,
     pub has_value_head: bool,
@@ -704,8 +771,8 @@ impl Model {
         self.rs_caps
     }
 
-    pub fn ptir_caps(&self) -> PtirCaps {
-        self.ptir_caps
+    pub fn eta_caps(&self) -> EtaCaps {
+        self.eta_caps
     }
 }
 
