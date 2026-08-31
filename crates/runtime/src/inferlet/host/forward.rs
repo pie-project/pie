@@ -976,7 +976,7 @@ impl ProcessCtx {
                 // the argument: the first is the caller's routing (the
                 // scheduler dispatch facade already holds it) and the other
                 // two are what a registration ANSWERS.
-                registration_plans.push(crate::engine::ChannelRegistration {
+                registration_plans.push(::engine::ChannelRegistration {
                     id: cell.lock().unwrap().global_id,
                     shape: decls[dense].shape.dims().to_vec(),
                     dtype: decls[dense].dtype,
@@ -997,7 +997,7 @@ impl ProcessCtx {
             // doubled the turnover convoy (V6 iteration 25).
             let channel_ids: Vec<u64> = cells.iter().map(|c| c.lock().unwrap().global_id).collect();
             let channel_reps: Vec<u32> = channels.iter().map(|c| c.rep()).collect();
-            let program_registration = crate::engine::ProgramRegistration {
+            let program_registration = ::engine::ProgramRegistration {
                 program_hash: prog.hash,
                 launch: prog.launch().clone(),
                 reference_ptir: prog.bytes.clone(),

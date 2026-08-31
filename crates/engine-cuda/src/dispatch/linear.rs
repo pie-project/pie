@@ -22,18 +22,49 @@ impl Run<'_> {
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
         match op {
             // ---- gemm (anchor) ----
-            Linear::Matmul { act, w, y } => linear::gemm::matmul(
-                self.ctx(),
-                self.tensor(*act),
-                self.tensor(*w),
-                &mut self.tensor(*y),
-            ),
-            Linear::LmHead { act, w, y } => linear::gemm::lm_head(
-                self.ctx(),
-                self.tensor(*act),
-                self.tensor(*w),
-                &mut self.tensor(*y),
-            ),
+            //
+            // **THE ANCHOR RESOLVES ITS WEIGHT'S SEATING FIRST** (qwen4
+            // stored-form wave) — `engine_metal::dispatch::linear`'s own
+            // ladder, mirrored: a projection whose weight seats as an MLX
+            // affine triplet (`WeightRow::Planes`) takes the quant point,
+            // and a one-handle row takes the dense gemm it always took.
+            // Nothing is chosen here: which rows seat as planes is the
+            // trace's declaration, made when the text stated what the file
+            // holds.
+            Linear::Matmul { act, w, y } => match self.maybe_planes(*w) {
+                Some((codes, scales, biases, seat)) => linear::quant::matmul(
+                    self.ctx(),
+                    self.tensor(*act),
+                    codes,
+                    scales,
+                    biases,
+                    &mut self.tensor(*y),
+                    seat,
+                ),
+                None => linear::gemm::matmul(
+                    self.ctx(),
+                    self.tensor(*act),
+                    self.tensor(*w),
+                    &mut self.tensor(*y),
+                ),
+            },
+            Linear::LmHead { act, w, y } => match self.maybe_planes(*w) {
+                Some((codes, scales, biases, seat)) => linear::quant::lm_head(
+                    self.ctx(),
+                    self.tensor(*act),
+                    codes,
+                    scales,
+                    biases,
+                    &mut self.tensor(*y),
+                    seat,
+                ),
+                None => linear::gemm::lm_head(
+                    self.ctx(),
+                    self.tensor(*act),
+                    self.tensor(*w),
+                    &mut self.tensor(*y),
+                ),
+            },
             // ---- mlp ----
             Linear::MlpSwiglu {
                 packed,
@@ -121,6 +152,22 @@ impl Run<'_> {
                 &mut self.tensor(*routes),
                 &mut self.tensor(*weights),
             ),
+            Linear::MoeTopkSoftmaxScaled {
+                logits,
+                scale,
+                experts,
+                top_k,
+                routes,
+                weights,
+            } => linear::moe::topk_softmax_scaled(
+                self.ctx(),
+                self.tensor(*logits),
+                self.tensor(*scale),
+                *experts,
+                *top_k,
+                &mut self.tensor(*routes),
+                &mut self.tensor(*weights),
+            ),
             Linear::MoeTopkSigmoid {
                 logits,
                 experts,
@@ -190,7 +237,12 @@ impl Run<'_> {
                 routes,
                 y,
             } => {
-                let (codes, scales, seat) = self.planes(*bank);
+                let (codes, scales, affine, seat) = self.planes(*bank);
+                debug_assert!(
+                    affine.is_none(),
+                    "the biased select is the mxfp4 gate/up leg's; an affine bank's \
+                     zero points ride the quant twin"
+                );
                 linear::moe::matmul_select_bias(
                     self.ctx(),
                     self.tensor(*x),
@@ -206,12 +258,13 @@ impl Run<'_> {
             // added inside the fold: the down leg's routed bias lands after
             // the reduce, through `MoeBiasSum`.
             Linear::MoeMatmulSelectQuant { x, bank, routes, y } => {
-                let (codes, scales, seat) = self.planes(*bank);
+                let (codes, scales, biases, seat) = self.planes(*bank);
                 linear::moe::matmul_select_quant(
                     self.ctx(),
                     self.tensor(*x),
                     codes,
                     scales,
+                    biases,
                     self.tensor(*routes),
                     &mut self.tensor(*y),
                     seat,

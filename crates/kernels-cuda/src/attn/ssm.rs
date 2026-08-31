@@ -157,11 +157,13 @@ pub fn causal_conv1d(
     weight: Tensor,
     state: &RecurrentPool,
     conv_width: u32,
+    dilation: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let (channels, c, k) = conv_extents(OP, x, y, conv_width)?;
+    let dil = stated(OP, nonzero(OP, "the conv's dilation", dilation)?)?;
     let rows = nonzero(OP, "rows", x.rows)?;
     seated(
         OP,
@@ -186,6 +188,7 @@ pub fn causal_conv1d(
             stated(OP, rows)?.arg(),
             c.arg(),
             k.arg(),
+            dil.arg(),
         ],
     )
 }
@@ -199,6 +202,7 @@ pub fn causal_conv1d_chunked(
     weight: Tensor,
     state: &RecurrentPool,
     conv_width: u32,
+    dilation: u32,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d_chunked";
@@ -211,6 +215,7 @@ pub fn causal_conv1d_chunked(
 
     dtype_dispatch!(OP, x.data.dtype, { Bf16 => () });
     let (channels, c, k) = conv_extents(OP, x.data, y, conv_width)?;
+    let dil = stated(OP, nonzero(OP, "the conv's dilation", dilation)?)?;
     let lanes = requests(OP, x)?;
     seated(OP, state, "ssm_causal_conv1d_chunked_batched", true, true, true)?;
     let (entrypoint, launch) = if lanes >= CHANNEL_TILE_FROM {
@@ -241,6 +246,7 @@ pub fn causal_conv1d_chunked(
             state.conv_stride.arg(),
             c.arg(),
             k.arg(),
+            dil.arg(),
             // **THE THREE RS SEATS, FILLED.** `write_state` false is the
             // buffered scatter (the conv computes its rows and leaves the
             // rolling state alone), the mask is the per-request fold

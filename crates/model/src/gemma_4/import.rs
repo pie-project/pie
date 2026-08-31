@@ -3,9 +3,7 @@ use checkpoint::contract::{Expr, ModelContract};
 use super::model::{AttnBanks, Model};
 use checkpoint::contract::TensorType;
 
-use crate::contract::{
-    ALIGNMENT, ModelError, copy, declare, extents, fused, planes, planes_fused,
-};
+use checkpoint_dsl::{Builder, Error, extents};
 
 /// **WHERE A SAFETENSORS CHECKPOINT OF THIS FAMILY PUTS ITS TRUNK.** Two
 /// spellings, and the difference is one swapped pair of path components —
@@ -82,11 +80,7 @@ impl Layout {
 }
 
 impl Model {
-    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
-        assert!(
-            self.tp == 1,
-            "an import states the whole checkpoint; build the model at tp = 1"
-        );
+    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
         let gguf = "token_embd.weight";
         for layout in [Layout::Transformers, Layout::Mlx] {
             if src.get(&layout.embed()).is_some() {
@@ -96,7 +90,7 @@ impl Model {
         if src.get(gguf).is_some() {
             return self.import_from_gguf(src);
         }
-        Err(ModelError::Illegible {
+        Err(Error::Illegible {
             name: "gemma4".to_string(),
             detail: format!(
                 "it holds none of `{}`, `{}` or `{gguf}`",
@@ -109,7 +103,7 @@ impl Model {
     pub fn import_from_huggingface(
         &self,
         src: &ztensor::Source,
-    ) -> Result<ModelContract, ModelError> {
+    ) -> Result<ModelContract, Error> {
         self.import_from_safetensors(src, Layout::Transformers)
     }
 
@@ -117,33 +111,22 @@ impl Model {
         &self,
         src: &ztensor::Source,
         layout: Layout,
-    ) -> Result<ModelContract, ModelError> {
-        let mut tensors = planes(src, &self.embed, layout.embed())?;
-        tensors.push(copy(src, &self.final_norm, layout.at("norm.weight"))?);
+    ) -> Result<ModelContract, Error> {
+        let mut b = Builder::new(src, self.tp);
+        b.read(&self.embed, layout.embed())?;
+        b.read(&self.final_norm, layout.at("norm.weight"))?;
 
         for (l, w) in self.layers.iter().enumerate() {
             let n = |leaf: &str| layout.layer(l, leaf);
 
-            tensors.push(copy(src, &w.attn_norm, n("input_layernorm.weight"))?);
-            tensors.push(copy(
-                src,
-                &w.post_attn_norm,
-                n("post_attention_layernorm.weight"),
-            )?);
-            tensors.push(copy(
-                src,
-                &w.pre_ffw_norm,
-                n("pre_feedforward_layernorm.weight"),
-            )?);
-            tensors.push(copy(
-                src,
-                &w.post_ffw_norm,
-                n("post_feedforward_layernorm.weight"),
-            )?);
-            tensors.push(copy(src, &w.attn.q_norm, n("self_attn.q_norm.weight"))?);
+            b.read(&w.attn_norm, n("input_layernorm.weight"))?;
+            b.read(&w.post_attn_norm, n("post_attention_layernorm.weight"))?;
+            b.read(&w.pre_ffw_norm, n("pre_feedforward_layernorm.weight"))?;
+            b.read(&w.post_ffw_norm, n("post_feedforward_layernorm.weight"))?;
+            b.read(&w.attn.q_norm, n("self_attn.q_norm.weight"))?;
             match &w.attn.banks {
                 AttnBanks::Owned { qkv, k_norm, .. } => {
-                    tensors.push(copy(src, k_norm, n("self_attn.k_norm.weight"))?);
+                    b.read(k_norm, n("self_attn.k_norm.weight"))?;
                     let k = n("self_attn.k_proj.weight");
                     let v = n("self_attn.v_proj.weight");
                     // **`attention_k_eq_v`: THE LAYER WITH NO VALUE
@@ -189,24 +172,58 @@ impl Model {
                     // sixty `v_proj` — so the discriminator is whether this
                     // file holds one, which is what an import is for.
                     let value = if src.get(&v).is_some() { v } else { k.clone() };
-                    tensors.extend(planes_fused(
-                        src,
-                        qkv,
-                        [n("self_attn.q_proj.weight"), k, value],
-                    )?);
+                    b.read_concat(qkv, [n("self_attn.q_proj.weight"), k, value])?;
                 }
 
                 AttnBanks::Shared { q_proj } => {
-                    tensors.extend(planes(src, q_proj, n("self_attn.q_proj.weight"))?);
+                    b.read(q_proj, n("self_attn.q_proj.weight"))?;
                 }
             }
-            tensors.extend(planes(src, &w.o_proj, n("self_attn.o_proj.weight"))?);
-            tensors.extend(planes_fused(
-                src,
-                &w.gate_up,
-                [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
-            )?);
-            tensors.extend(planes(src, &w.down, n("mlp.down_proj.weight"))?);
+            b.read(&w.o_proj, n("self_attn.o_proj.weight"))?;
+            b.read_concat(&w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+            b.read(&w.down, n("mlp.down_proj.weight"))?;
+
+            // **THE ROUTED BRANCH** (`model::Moe`), where the checkpoint
+            // ships one. Six names and one rewrite.
+            //
+            // **THE REWRITE IS THE ROUTER'S NORM.** `mlx_lm`'s `Router` reads
+            // `mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)` —
+            // the stored `router.scale` times `hidden**-0.5`, ONE gain handed
+            // to one norm — so the constant belongs to the plane rather than
+            // to the forward. It cannot be dropped: the norm's output feeds a
+            // softmax through `router.proj`, so a uniform factor on it changes
+            // which experts win by changing how sharp the distribution is.
+            //
+            // **AND THE EXPERT BANKS ARE SPLIT IN THIS LAYOUT**, the way
+            // `qwen_3::import`'s are. `Gemma4TextModel.sanitize` cuts a
+            // transformers `experts.gate_up_proj` into
+            // `experts.switch_glu.gate_proj` and `.up_proj` on the way in, and
+            // `mlx_lm.convert` writes the split form — `mlx-community/gemma-4
+            // -26b-a4b-it-4bit` holds two `[128, 704, 352]` banks per layer
+            // where a transformers file holds one `[128, 1408, 2816]`.
+            // `read_concat` joins them on the axis `.bank([inter, inter])`
+            // cut, gate first, carrying each part's `.scales` and `.biases` to
+            // the same seams.
+            if let Some(x) = &w.moe {
+                let root = (self.hidden as f32).powf(-0.5);
+                b.read_expr(
+                    &x.router_norm,
+                    Expr::src(n("router.scale")).scale(root),
+                )?;
+                b.read(&x.router, n("router.proj.weight"))?;
+                b.read(&x.per_expert_scale, n("router.per_expert_scale"))?;
+                b.read(&x.pre_ffw_norm_2, n("pre_feedforward_layernorm_2.weight"))?;
+                b.read(&x.post_ffw_norm_1, n("post_feedforward_layernorm_1.weight"))?;
+                b.read(&x.post_ffw_norm_2, n("post_feedforward_layernorm_2.weight"))?;
+                b.read_concat(
+                    &x.gate_up,
+                    [
+                        n("experts.switch_glu.gate_proj.weight"),
+                        n("experts.switch_glu.up_proj.weight"),
+                    ],
+                )?;
+                b.read(&x.down, n("experts.switch_glu.down_proj.weight"))?;
+            }
 
             // **THE PER-LAYER SCALAR, WHERE THE LAYER OWNS IT.** See
             // `model::Layer::scalar`: a stack with no per-layer embedding
@@ -214,41 +231,32 @@ impl Model {
             // multiplies by it. A PLE stack's is claimed below instead,
             // because there it is the last term of the relay.
             if let Some(scalar) = &w.scalar {
-                tensors.push(copy(src, scalar, n("layer_scalar"))?);
+                b.read(scalar, n("layer_scalar"))?;
             }
         }
 
         if let Some(ple) = &self.ple {
-            tensors.extend(planes(
-                src,
-                &ple.model_proj,
-                layout.at("per_layer_model_projection.weight"),
-            )?);
-            tensors.push(copy(
-                src,
-                &ple.model_norm,
-                layout.at("per_layer_projection_norm.weight"),
-            )?);
+            b.read(&ple.model_proj, layout.at("per_layer_model_projection.weight"))?;
+            b.read(&ple.model_norm, layout.at("per_layer_projection_norm.weight"))?;
             let width = i64::from(ple.dim);
             for (l, p) in ple.per_layer.iter().enumerate() {
                 let n = |leaf: &str| layout.layer(l, leaf);
                 let at = i64::try_from(l).expect("a layer index inside i64") * width;
-                tensors.push(declare(
-                    src,
+                b.read_expr(
                     &p.table,
                     Expr::src(layout.at("embed_tokens_per_layer.weight")).slice(1, at, width),
-                )?);
-                tensors.extend(planes(src, &p.gate, n("per_layer_input_gate.weight"))?);
-                tensors.extend(planes(src, &p.proj, n("per_layer_projection.weight"))?);
-                tensors.push(copy(src, &p.norm, n("post_per_layer_input_norm.weight"))?);
+                )?;
+                b.read(&p.gate, n("per_layer_input_gate.weight"))?;
+                b.read(&p.proj, n("per_layer_projection.weight"))?;
+                b.read(&p.norm, n("post_per_layer_input_norm.weight"))?;
 
-                tensors.push(copy(src, &p.scalar, n("layer_scalar"))?);
+                b.read(&p.scalar, n("layer_scalar"))?;
             }
         }
 
         // **THE TOWER, PLANE FOR PLANE** (multimodal §12, campaign M-2).
         //
-        // Every entry a `copy` but one: the norms are RMSNorm and applied by
+        // Every entry a plain `read` but one: the norms are RMSNorm and applied by
         // ops, the clip bounds are read as `[1]` weights rather than baked
         // into a plan constant, and the only rewrite is the position table.
         // `position_embedding_table` is stored `[2, positions, hidden]` — an
@@ -259,47 +267,38 @@ impl Model {
         // transform.
         if let Some(t) = &self.tower {
             let v = |s: &str| format!("model.vision_tower.{s}");
-            tensors.push(copy(
-                src,
-                &t.patch_embed,
-                v("patch_embedder.input_proj.weight"),
-            )?);
-            tensors.push(declare(
-                src,
+            b.read(&t.patch_embed, v("patch_embedder.input_proj.weight"))?;
+            b.read_expr(
                 &t.pos_embed,
                 flattened(
                     src,
                     v("patch_embedder.position_embedding_table"),
                     extents(&t.pos_embed),
                 )?,
-            )?);
-            tensors.push(copy(
-                src,
-                &t.projection,
-                "model.embed_vision.embedding_projection.weight",
-            )?);
-            for (l, b) in t.blocks.iter().enumerate() {
+            )?;
+            b.read(&t.projection, "model.embed_vision.embedding_projection.weight")?;
+            for (l, blk) in t.blocks.iter().enumerate() {
                 let n = |s: &str| v(&format!("encoder.layers.{l}.{s}"));
                 for (weight, from) in [
-                    (&b.attn_norm, n("input_layernorm.weight")),
-                    (&b.post_attn_norm, n("post_attention_layernorm.weight")),
-                    (&b.pre_ffw_norm, n("pre_feedforward_layernorm.weight")),
-                    (&b.post_ffw_norm, n("post_feedforward_layernorm.weight")),
-                    (&b.q_norm, n("self_attn.q_norm.weight")),
-                    (&b.k_norm, n("self_attn.k_norm.weight")),
+                    (&blk.attn_norm, n("input_layernorm.weight")),
+                    (&blk.post_attn_norm, n("post_attention_layernorm.weight")),
+                    (&blk.pre_ffw_norm, n("pre_feedforward_layernorm.weight")),
+                    (&blk.post_ffw_norm, n("post_feedforward_layernorm.weight")),
+                    (&blk.q_norm, n("self_attn.q_norm.weight")),
+                    (&blk.k_norm, n("self_attn.k_norm.weight")),
                 ] {
-                    tensors.push(copy(src, weight, from)?);
+                    b.read(weight, from)?;
                 }
                 for (c, stem) in [
-                    (&b.q, n("self_attn.q_proj")),
-                    (&b.k, n("self_attn.k_proj")),
-                    (&b.v, n("self_attn.v_proj")),
-                    (&b.o, n("self_attn.o_proj")),
-                    (&b.gate, n("mlp.gate_proj")),
-                    (&b.up, n("mlp.up_proj")),
-                    (&b.down, n("mlp.down_proj")),
+                    (&blk.q, n("self_attn.q_proj")),
+                    (&blk.k, n("self_attn.k_proj")),
+                    (&blk.v, n("self_attn.v_proj")),
+                    (&blk.o, n("self_attn.o_proj")),
+                    (&blk.gate, n("mlp.gate_proj")),
+                    (&blk.up, n("mlp.up_proj")),
+                    (&blk.down, n("mlp.down_proj")),
                 ] {
-                    tensors.push(copy(src, &c.bank, format!("{stem}.linear.weight"))?);
+                    b.read(&c.bank, format!("{stem}.linear.weight"))?;
                     // The four bounds. Stored as rank-0 scalars, read as `[1]`.
                     for (weight, suffix) in [
                         (&c.in_lo, "input_min"),
@@ -307,11 +306,10 @@ impl Model {
                         (&c.out_lo, "output_min"),
                         (&c.out_hi, "output_max"),
                     ] {
-                        tensors.push(declare(
-                            src,
+                        b.read_expr(
                             weight,
                             flattened(src, format!("{stem}.{suffix}"), extents(weight))?,
-                        )?);
+                        )?;
                     }
                 }
             }
@@ -327,16 +325,8 @@ impl Model {
             // `[hidden, 2·hidden]` over `[embedding | hidden]`, embedding
             // first.
             let half = extents(&a.fc_embed)[1];
-            tensors.push(declare(
-                src,
-                &a.fc_embed,
-                Expr::src("aux.fc.weight").slice(1, 0, half),
-            )?);
-            tensors.push(declare(
-                src,
-                &a.fc_hidden,
-                Expr::src("aux.fc.weight").slice(1, half, half),
-            )?);
+            b.read_expr(&a.fc_embed, Expr::src("aux.fc.weight").slice(1, 0, half))?;
+            b.read_expr(&a.fc_hidden, Expr::src("aux.fc.weight").slice(1, half, half))?;
             let n = |s: &str| format!("aux.layers.0.{s}");
             for (weight, from) in [
                 (&a.attn_norm, n("input_layernorm.weight")),
@@ -346,43 +336,33 @@ impl Model {
                 (&a.attn.q_norm, n("self_attn.q_norm.weight")),
                 (&a.o_proj, n("self_attn.o_proj.weight")),
             ] {
-                tensors.push(copy(src, weight, from)?);
+                b.read(weight, from)?;
             }
             if let AttnBanks::Owned { qkv, k_norm, .. } = &a.attn.banks {
-                tensors.extend(planes_fused(
-                    src,
+                b.read_concat(
                     qkv,
                     [
                         n("self_attn.q_proj.weight"),
                         n("self_attn.k_proj.weight"),
                         n("self_attn.v_proj.weight"),
                     ],
-                )?);
-                tensors.push(copy(src, k_norm, n("self_attn.k_norm.weight"))?);
+                )?;
+                b.read(k_norm, n("self_attn.k_norm.weight"))?;
             }
-            tensors.push(fused(
-                src,
-                &a.gate_up,
-                [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
-            )?);
-            tensors.push(copy(src, &a.down, n("mlp.down_proj.weight"))?);
+            b.read_concat(&a.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+            b.read(&a.down, n("mlp.down_proj.weight"))?;
         }
 
-        Ok(ModelContract {
-            alignment: ALIGNMENT,
-            tensors,
-
-            groups: Vec::new(),
-        })
+        Ok(b.build())
     }
 
-    pub fn import_from_gguf(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
+    pub fn import_from_gguf(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
         // No GGUF converter writes `model.vision_tower.*` under any settled
         // spelling, and inventing one would publish a contract whose first
         // symptom is a load that lands the trunk and zeroes four hundred
         // planes.
         if self.draft.is_some() {
-            return Err(ModelError::Illegible {
+            return Err(Error::Illegible {
                 name: "aux".to_string(),
                 detail: "this SKU declares an aux draft head and no GGUF \
                          spelling of one is settled; import it from the \
@@ -391,7 +371,7 @@ impl Model {
             });
         }
         if self.tower.is_some() {
-            return Err(ModelError::Illegible {
+            return Err(Error::Illegible {
                 name: "vision_tower".to_string(),
                 detail: "this SKU declares a vision tower and no GGUF spelling \
                          of one is settled; import it from the safetensors \
@@ -399,97 +379,80 @@ impl Model {
                     .to_string(),
             });
         }
-        let mut tensors = Vec::new();
-
-        tensors.push(copy(src, &self.embed, "token_embd.weight")?);
-        tensors.push(copy(src, &self.final_norm, "output_norm.weight")?);
+        // A named refusal for the reason the two above are named ones: the
+        // routed branch is six planes a layer under a spelling no GGUF
+        // converter of this family has settled, and a contract that skipped
+        // them would load a stack whose second feedforward branch is zero —
+        // fluent text, and not this model's.
+        if self.layers.iter().any(|w| w.moe.is_some()) {
+            return Err(Error::Illegible {
+                name: "experts".to_string(),
+                detail: "this SKU declares a routed feedforward branch and no \
+                         GGUF spelling of gemma 4's `experts.switch_glu.*` or \
+                         `router.*` is settled; import it from the \
+                         safetensors checkpoint"
+                    .to_string(),
+            });
+        }
+        let mut b = Builder::new(src, self.tp);
+        b.read(&self.embed, "token_embd.weight")?;
+        b.read(&self.final_norm, "output_norm.weight")?;
 
         for (l, w) in self.layers.iter().enumerate() {
-            tensors.push(copy(
-                src,
-                &w.attn_norm,
-                format!("blk.{l}.attn_norm.weight"),
-            )?);
-            tensors.push(copy(
-                src,
-                &w.post_attn_norm,
-                format!("blk.{l}.post_attention_norm.weight"),
-            )?);
-            tensors.push(copy(
-                src,
-                &w.pre_ffw_norm,
-                format!("blk.{l}.ffn_norm.weight"),
-            )?);
-            tensors.push(copy(
-                src,
-                &w.post_ffw_norm,
-                format!("blk.{l}.post_ffw_norm.weight"),
-            )?);
-            tensors.push(copy(
-                src,
-                &w.attn.q_norm,
-                format!("blk.{l}.attn_q_norm.weight"),
-            )?);
+            b.read(&w.attn_norm, format!("blk.{l}.attn_norm.weight"))?;
+            b.read(&w.post_attn_norm, format!("blk.{l}.post_attention_norm.weight"))?;
+            b.read(&w.pre_ffw_norm, format!("blk.{l}.ffn_norm.weight"))?;
+            b.read(&w.post_ffw_norm, format!("blk.{l}.post_ffw_norm.weight"))?;
+            b.read(&w.attn.q_norm, format!("blk.{l}.attn_q_norm.weight"))?;
             match &w.attn.banks {
                 AttnBanks::Owned { qkv, k_norm, .. } => {
-                    tensors.push(copy(src, k_norm, format!("blk.{l}.attn_k_norm.weight"))?);
-                    tensors.push(fused(
-                        src,
+                    b.read(k_norm, format!("blk.{l}.attn_k_norm.weight"))?;
+                    b.read_concat(
                         qkv,
                         [
                             format!("blk.{l}.attn_q.weight"),
                             format!("blk.{l}.attn_k.weight"),
                             format!("blk.{l}.attn_v.weight"),
                         ],
-                    )?);
+                    )?;
                 }
 
                 AttnBanks::Shared { q_proj } => {
-                    tensors.push(copy(src, q_proj, format!("blk.{l}.attn_q.weight"))?);
+                    b.read(q_proj, format!("blk.{l}.attn_q.weight"))?;
                 }
             }
-            tensors.push(copy(src, &w.o_proj, format!("blk.{l}.attn_output.weight"))?);
-            tensors.push(fused(
-                src,
+            b.read(&w.o_proj, format!("blk.{l}.attn_output.weight"))?;
+            b.read_concat(
                 &w.gate_up,
-                [
-                    format!("blk.{l}.ffn_gate.weight"),
-                    format!("blk.{l}.ffn_up.weight"),
-                ],
-            )?);
-            tensors.push(copy(src, &w.down, format!("blk.{l}.ffn_down.weight"))?);
+                [format!("blk.{l}.ffn_gate.weight"), format!("blk.{l}.ffn_up.weight")],
+            )?;
+            b.read(&w.down, format!("blk.{l}.ffn_down.weight"))?;
             // See the safetensors door: a stack with no PLE owns its own
             // scalar, and a PLE stack's is claimed with the relay below.
             if let Some(scalar) = &w.scalar {
-                tensors.push(copy(src, scalar, format!("blk.{l}.layer_scalar"))?);
+                b.read(scalar, format!("blk.{l}.layer_scalar"))?;
             }
         }
 
         if let Some(ple) = &self.ple {
-            tensors.push(copy(src, &ple.model_proj, "per_layer_model_proj.weight")?);
-            tensors.push(copy(src, &ple.model_norm, "per_layer_proj_norm.weight")?);
+            b.read(&ple.model_proj, "per_layer_model_proj.weight")?;
+            b.read(&ple.model_norm, "per_layer_proj_norm.weight")?;
             let width = i64::from(ple.dim);
             for (l, p) in ple.per_layer.iter().enumerate() {
                 let at = i64::try_from(l).expect("a layer index inside i64") * width;
-                tensors.push(declare(
-                    src,
+                b.read_expr(
                     &p.table,
                     Expr::src("per_layer_token_embd.weight").slice(1, at, width),
-                )?);
-                tensors.push(copy(src, &p.gate, format!("blk.{l}.inp_gate.weight"))?);
-                tensors.push(copy(src, &p.proj, format!("blk.{l}.proj.weight"))?);
-                tensors.push(copy(src, &p.norm, format!("blk.{l}.post_norm.weight"))?);
+                )?;
+                b.read(&p.gate, format!("blk.{l}.inp_gate.weight"))?;
+                b.read(&p.proj, format!("blk.{l}.proj.weight"))?;
+                b.read(&p.norm, format!("blk.{l}.post_norm.weight"))?;
 
-                tensors.push(copy(src, &p.scalar, format!("blk.{l}.layer_scalar"))?);
+                b.read(&p.scalar, format!("blk.{l}.layer_scalar"))?;
             }
         }
 
-        Ok(ModelContract {
-            alignment: ALIGNMENT,
-            tensors,
-
-            groups: Vec::new(),
-        })
+        Ok(b.build())
     }
 }
 
@@ -502,11 +465,11 @@ impl Model {
 /// `the_checkpoints_state_what_the_texts_read` writes — is let through for
 /// `qwen_3::import`'s reason, and the plan compiler checks it where the
 /// extents are real.
-fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, ModelError> {
+fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
-        return Err(ModelError::Missing(from));
+        return Err(Error::Missing(from));
     };
-    let illegible = |why: &dyn std::fmt::Display| ModelError::Illegible {
+    let illegible = |why: &dyn std::fmt::Display| Error::Illegible {
         name: from.clone(),
         detail: why.to_string(),
     };

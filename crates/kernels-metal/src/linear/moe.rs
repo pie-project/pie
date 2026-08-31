@@ -228,6 +228,48 @@ pub fn topk_softmax(
     )
 }
 
+/// The same router, times the learned per-expert gain.
+///
+/// **NO NEW KERNEL.** `moe_route.metal` instantiates `router_topk` at
+/// `SCALED = true` already — the seat at buffer 3 that [`topk_softmax`] binds
+/// absent is the gain plane, and the only difference between the two points is
+/// which instantiation the entry names.
+pub fn topk_softmax_scaled(
+    ctx: &Ctx<'_>,
+    logits: Tensor,
+    scale: Tensor,
+    experts: u32,
+    top_k: u32,
+    routes: Tensor,
+    weights: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_topk_softmax_scaled";
+    let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_scaled_f32w_bfloat16" });
+    debug_assert_eq!(
+        scale.dtype, logits.dtype,
+        "the gain is read at the router's own width"
+    );
+    debug_assert_eq!(
+        scale.rows * scale.width,
+        experts,
+        "the gain is indexed by expert, so it holds one entry per expert"
+    );
+    let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
+    ctx.fire(
+        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        &[
+            logits.arg(),
+            routes.arg_mut(),
+            weights.arg_mut(),
+            scale.arg(),
+            experts.arg(),
+            top_k.arg(),
+            SOFTMAX_OVER_SELECTED.arg(),
+            experts.arg(),
+        ],
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn topk_sigmoid(
     ctx: &Ctx<'_>,

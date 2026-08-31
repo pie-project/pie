@@ -493,7 +493,7 @@ pub async fn spawn(
 fn rs_state_copy_plan(
     src_slots: Vec<u32>,
     dst_slots: Vec<u32>,
-) -> Result<Option<crate::engine::StateCopy>> {
+) -> Result<Option<::engine::StateCopy>> {
     if src_slots.len() != dst_slots.len() {
         return Err(anyhow!(
             "recurrent-state copy source/destination lengths differ: {} != {}",
@@ -515,7 +515,7 @@ fn rs_state_copy_plan(
             token_count: 0,
         })
         .collect();
-    Ok(Some(crate::engine::StateCopy { moves: slot_ranges }))
+    Ok(Some(::engine::StateCopy { moves: slot_ranges }))
 }
 
 pub fn submit_async(
@@ -580,7 +580,7 @@ pub fn submit_async_with_kv_copy(
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::engine::KvCopy {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
         src: device_domain(engine_idx),
         dst: device_domain(engine_idx),
         src_page_ids: copy_src,
@@ -622,7 +622,7 @@ pub fn submit_prebuilt_async_with_kv_copy(
     copy_src: Vec<u32>,
     copy_dst: Vec<u32>,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::engine::KvCopy {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
         src: device_domain(engine_idx),
         dst: device_domain(engine_idx),
         src_page_ids: copy_src,
@@ -649,7 +649,7 @@ pub fn submit_prebuilt_async_with_kv_and_rs_copy(
     rs_copy_src: Vec<u32>,
     rs_copy_dst: Vec<u32>,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::engine::KvCopy {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
         src: device_domain(engine_idx),
         dst: device_domain(engine_idx),
         src_page_ids: copy_src,
@@ -710,7 +710,7 @@ pub(crate) fn submit_prebuilt_tracked_async_with_kv_and_rs_copy_on(
     hook_program: bool,
     lora_program: bool,
 ) -> Result<()> {
-    let prelaunch_copy = (!copy_src.is_empty()).then_some(crate::engine::KvCopy {
+    let prelaunch_copy = (!copy_src.is_empty()).then_some(::engine::KvCopy {
         // The HANDLE's, because this path is given a scheduler rather than an
         // engine id -- and it is the same answer, recorded when that
         // scheduler was built.

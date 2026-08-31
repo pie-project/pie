@@ -16,6 +16,36 @@
 //! readiness, step       ->   session.rs   one instance's lifetime and its fire
 //! ```
 //!
+//! **TWO EMITTED FORMS, AND THE CHOICE IS PER REGION.** [`compile::Form`]
+//! names them. The M2 *fused* kernel takes each channel's two cells as
+//! argument indices (`7 + 2k` / `8 + 2k`) and runs on one thread; the M3
+//! *grouped* kernel takes one lane table of raw device addresses and runs on
+//! a threadgroup. The second is not a faster spelling of the first — it is
+//! what makes two things possible at all:
+//!
+//! * **more than twelve channels.** Metal's last argument index is 30, so a
+//!   thirteenth channel has nowhere to bind and the emitter refuses the
+//!   region by name. `beam_epilogue`, at sixteen, had no kernel on this plane
+//!   until the grouped form was bound.
+//! * **a vocabulary-wide gather that is not serial.** The M2 kernel walks
+//!   248320 columns on one thread; the grouped one splits them across the
+//!   threadgroup, and where a gather's only consumer is an argmax the emitter
+//!   removes the gather outright.
+//!
+//! What that costs is `MTLBuffer.gpuAddress` — [`crate::device::Buffer::
+//! address_at`] — plus a `useResource:` declaration for every reservation an
+//! address escapes into, because a number in a table makes nothing resident.
+//! What it does NOT cost is a second arithmetic: the grouped runtime
+//! partitions only argmax and copies and runs every other op on thread 0
+//! through the same `ptir_m1_execute`, so the two forms answer the same bytes
+//! and `program_parity` holds them to it.
+//!
+//! **STILL ONE LANE PER LAUNCH.** A grouped kernel could serve a whole group
+//! and this shell gives it one, because a [`Session`] is one instance and
+//! co-batching two of them needs a frame admission this plane does not have.
+//! The lane table is built through [`eta_exec::LaneShape`] at `lane_count =
+//! 1`, so that day is a number rather than a rewrite.
+//!
 //! **THE HOST HALF IS THE GOLDEN AND IT IS NOT A MOCK.** `eta_exec` is
 //! a complete interpreter of the same launch package: same ops, same channel
 //! semantics, same pass-atomic commit. This half is the subject, and a parity
@@ -277,7 +307,11 @@ impl Plane {
     /// as well would be reading a second opinion about values that are
     /// already decided. A [`GeometryClass::DecodeEnvelope`] instance's
     /// submission carries placeholders for exactly those three, because the
-    /// runtime could not know them, and this is where they come from.
+    /// runtime could not know them, and this is where they come from. A
+    /// [`GeometryClass::DeviceGeometry`] instance's carries no geometry at all
+    /// — not even a row count — and the class is also what decides which of
+    /// the nine ports are read at all (`ports::resolves`), because the page
+    /// family means a different thing in each.
     ///
     /// # Errors
     ///
@@ -300,7 +334,10 @@ impl Plane {
                 ),
             )
         })?;
-        bound.session.envelope(&program.plan).map(Some)
+        bound
+            .session
+            .envelope(&program.plan, bound.geometry)
+            .map(Some)
     }
 
     /// The class instance `id` was bound in.

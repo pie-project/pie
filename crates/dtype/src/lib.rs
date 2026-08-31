@@ -119,6 +119,20 @@ pub enum Dtype {
     /// own spec. What this variant adds is the ability for a MODEL TEXT to say
     /// which width a weight is, which is the one thing `Dtype` is for.
     MlxU8,
+    /// `MlxU4` grouped by THIRTY-TWO codes instead of sixty-four — the same
+    /// affine scheme, the same `.scales`/`.biases` companions, half the
+    /// group.
+    ///
+    /// **IT EXISTS BECAUSE A ROW CAN BE TOO NARROW TO GROUP BY 64.** MLX
+    /// quantizes along the last axis and requires the group to divide it;
+    /// qwen4's PLE n-gram table stores 160-wide rows, `160 % 64 != 0`, so
+    /// `mlx_lm.convert` drops that one tensor family to `group_size: 32`
+    /// (`Qwen3.8-Flash-Next-MLX`'s `config.json` lists all 128 shards under
+    /// it) while everything beside it stays at 64. The width is four bits
+    /// either way; `QuantSpec::group_size` has always been the field that
+    /// says how many codes share a scale, and this variant is what lets a
+    /// model TEXT say it — `MlxU8`'s own argument, one spec field over.
+    MlxU4G32,
     /// OCP Microscaling's 8-bit exponent-only scale format: the stored byte
     /// `b` denotes `2^(b - 127)`. It carries no sign and no mantissa, so it
     /// only ever appears as the scale beside a block-scaled tensor -- which is
@@ -170,7 +184,7 @@ impl Dtype {
             | Self::U8
             | Self::MlxU8
             | Self::Bool => 8,
-            Self::Fp4 | Self::Mxfp4 | Self::MlxU4 => 4,
+            Self::Fp4 | Self::Mxfp4 | Self::MlxU4 | Self::MlxU4G32 => 4,
         }
     }
 

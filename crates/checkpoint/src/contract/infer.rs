@@ -26,7 +26,7 @@ use crate::error::{Error, OrOverflow};
 use crate::types::{Axis, DType, Encoding, RepackLayout, RepackSpec};
 
 use super::compile;
-use super::{Expr, Partition, ScaleFactor, TensorType, local_range, resolve_extents};
+use super::{BiasBy, Expr, Partition, ScaleFactor, TensorType, local_range, resolve_extents};
 
 /// Resolves [`Expr::Src`] names against a checkpoint.
 pub trait CheckpointTypes {
@@ -312,7 +312,21 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
         }
         Expr::Bias { src, by } => {
             let ty = infer(src, scope)?;
-            infer_bias(ty, *by)
+            match by {
+                BiasBy::Uniform(bits) => infer_bias(ty, *bits),
+                BiasBy::PerBlock { by } => {
+                    // The addends must exist, for the factors' reason.
+                    if !matches!(by.as_ref(), Expr::Out(_)) {
+                        return Err(Error::Contract(
+                            "Bias addends must be a declared tensor; declare \
+                             them first and bias by that name"
+                                .to_string(),
+                        ));
+                    }
+                    let by_ty = infer(by, scope)?;
+                    infer_bias_per_block(ty, by_ty)
+                }
+            }
         }
         Expr::Scale { src, factor } => {
             let ty = infer(src, scope)?;
@@ -1179,6 +1193,76 @@ fn infer_bias(ty: TensorType, by_bits: u32) -> Result<TensorType, Error> {
     Ok(ty)
 }
 
+/// The per-block `Bias`, `infer_scale_per_block`'s rules with the roles
+/// adjusted: the OPERAND must already be raw numbers (in an affine decode
+/// the per-block `Scale` before it is what turned codes into numbers, so a
+/// quantized operand here means the two nodes were composed in the wrong
+/// order), and the addends follow the factors' own blocking rules.
+fn infer_bias_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, Error> {
+    let dtype = match &ty.encoding {
+        Encoding::Raw(dtype) => *dtype,
+        Encoding::Quant(_) => {
+            return Err(Error::Contract(format!(
+                "Bias of a quantized tensor ({:?}) is not supported; scale it \
+                 per block first -- the scale is what turns codes into numbers \
+                 an addend can reach",
+                ty.encoding
+            )));
+        }
+    };
+    if !matches!(dtype, DType::F32 | DType::F16 | DType::Bf16) {
+        return Err(Error::Contract(format!(
+            "Bias requires F32, F16 or BF16 elements, got {dtype:?}"
+        )));
+    }
+    match &by.encoding {
+        Encoding::Raw(DType::F32 | DType::F16 | DType::Bf16) => {}
+        other => {
+            return Err(Error::Contract(format!(
+                "Bias addends must be raw F32, F16 or BF16 elements, got {other:?}"
+            )));
+        }
+    }
+    if by.shape.len() != ty.shape.len() {
+        return Err(Error::Contract(format!(
+            "Bias addends have shape {:?}, which is not a blocking of {:?} \
+             -- an addend tensor states its block size by having the same rank \
+             and dividing each axis",
+            by.shape, ty.shape
+        )));
+    }
+    let mut blocked = false;
+    for (axis, (&extent, &addends)) in ty.shape.iter().zip(by.shape.iter()).enumerate() {
+        if addends <= 0 {
+            return Err(Error::Contract(format!(
+                "Bias addends have extent {addends} on axis {axis}, so no \
+                 block size divides it"
+            )));
+        }
+        if extent % addends != 0 {
+            return Err(Error::Contract(format!(
+                "Bias addends have shape {:?}, but axis {axis} of {:?} is not \
+                 a whole number of blocks of {}",
+                by.shape,
+                ty.shape,
+                extent / addends
+            )));
+        }
+        if addends != extent {
+            blocked = true;
+        }
+    }
+    if !blocked && !ty.shape.is_empty() {
+        return Err(Error::Contract(format!(
+            "Bias addends have the operand's own shape {:?}, so they group \
+             nothing; an addend per element is an elementwise sum, not a \
+             block bias",
+            ty.shape
+        )));
+    }
+    Ok(ty)
+}
+
 /// A per-group `Scale` yields the logical type of what it read.
 ///
 /// Over `Raw` that is the input type unchanged, as with a uniform factor. Over
@@ -1268,7 +1352,7 @@ fn infer_scale_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{ModelContract, TensorContract};
+    use crate::contract::{BiasBy, ModelContract, TensorContract};
     use crate::types::{DType, QuantScheme, QuantSpec};
     use std::collections::HashMap;
 

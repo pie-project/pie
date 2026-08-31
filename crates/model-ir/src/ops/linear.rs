@@ -80,6 +80,24 @@ pub enum Linear {
         routes: ValueId,
         weights: ValueId,
     },
+    /// **ADDITIVE, FOR GEMMA 4's MIXTURE.** Softmax over the selected `top_k`
+    /// — the same denominator [`Self::MoeTopkSoftmax`] takes — and then one
+    /// more factor: the learned gain the router publishes for the expert each
+    /// slot chose, gathered by the routing vector this op just wrote.
+    ///
+    /// A variant rather than an optional operand on the plain softmax router,
+    /// for the reason [`Self::MoeTopkSqrtSoftplus`] is one: an unbound buffer
+    /// is not a null pointer on either shell, so a family with no gain would
+    /// have to bind a tensor it does not have.
+    MoeTopkSoftmaxScaled {
+        logits: ValueId,
+        /// `[experts]`, indexed by EXPERT and not by slot.
+        scale: ValueId,
+        experts: u32,
+        top_k: u32,
+        routes: ValueId,
+        weights: ValueId,
+    },
     MoeTopkSigmoid {
         logits: ValueId,
         experts: u32,
@@ -199,6 +217,7 @@ impl Operands for Linear {
             Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
             Self::MlpSitu { packed, .. } => sink.push(*packed),
             Self::MoeTopkSoftmax { logits, .. } => sink.push(*logits),
+            Self::MoeTopkSoftmaxScaled { logits, scale, .. } => sink.extend([*logits, *scale]),
             Self::MoeTopkSigmoid { logits, .. } => sink.push(*logits),
             Self::MoeTopkSqrtSoftplus { logits, bias, .. } => sink.extend([*logits, *bias]),
             Self::MoeMatmulSelect { x, bank, routes, .. } => sink.extend([*x, *bank, *routes]),
@@ -230,6 +249,7 @@ impl Operands for Linear {
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
             Self::MlpSitu { y, .. } => sink.push(*y),
             Self::MoeTopkSoftmax { routes, weights, .. } => sink.extend([*routes, *weights]),
+            Self::MoeTopkSoftmaxScaled { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeTopkSigmoid { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeTopkSqrtSoftplus { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeMatmulSelect { y, .. } => sink.push(*y),
@@ -258,6 +278,7 @@ impl Operands for Linear {
             | Self::MlpGegluTanhPacked { .. }
             | Self::MlpSitu { .. }
             | Self::MoeTopkSoftmax { .. }
+            | Self::MoeTopkSoftmaxScaled { .. }
             | Self::MoeTopkSigmoid { .. }
             | Self::MoeTopkSqrtSoftplus { .. }
             | Self::MoeMatmulSelect { .. }
@@ -280,6 +301,7 @@ impl Operands for Linear {
             Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",
             Self::MlpSitu { .. } => "linear.mlp_situ",
             Self::MoeTopkSoftmax { .. } => "linear.moe_topk_softmax",
+            Self::MoeTopkSoftmaxScaled { .. } => "linear.moe_topk_softmax_scaled",
             Self::MoeTopkSigmoid { .. } => "linear.moe_topk_sigmoid",
             Self::MoeTopkSqrtSoftplus { .. } => "linear.moe_topk_sqrt_softplus",
             Self::MoeMatmulSelect { .. } => "linear.moe_matmul_select",

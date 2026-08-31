@@ -33,7 +33,7 @@ use crate::file::{Metadata, RawTensor, Sources};
 use crate::contract::compile::{Leaf, Lowering, compile};
 use crate::contract::infer::{Resolver, repack_spec};
 use crate::contract::{
-    Expr, ModelContract, Partition, ScaleFactor, TensorContract, TensorType, Visibility,
+    BiasBy, Expr, ModelContract, Partition, ScaleFactor, TensorContract, TensorType, Visibility,
 };
 use crate::error::{Error, OrOverflow, Result};
 use crate::extent::Extent;
@@ -375,16 +375,37 @@ impl Builder<'_> {
                 let value = self.transform_with(payload, &decl, TileMapKind::Scale, extra, spec)?;
                 (value, decl)
             }
-            // A bias is the scale's shape with one operand: a constant the
-            // spec carries and an operand lowered like any other expression.
+            // A bias is the scale's shape at both ranks: a constant the spec
+            // carries, or one addend per block read from a declared tensor —
+            // the zero-point half of an affine decode. The per-block arm
+            // mirrors the scale's line for line, with one asymmetry: the
+            // operand reaches a bias as NUMBERS already (the scale before it
+            // decoded the codes), so there is no `from` scheme to state.
             Expr::Bias { src, by } => {
                 let (payload, _) = self.operand_bytes(src, &decl)?;
-                let spec = TransformSpec {
-                    bias_bits: *by,
-                    ..TransformSpec::default()
+                let (spec, extra) = match by {
+                    BiasBy::Uniform(bits) => (
+                        TransformSpec {
+                            bias_bits: *bits,
+                            ..TransformSpec::default()
+                        },
+                        Vec::new(),
+                    ),
+                    BiasBy::PerBlock { by } => {
+                        let operand = self.resolver.infer(src, &contract.name)?;
+                        let addend_ty = self.resolver.infer(by, &contract.name)?;
+                        let blocks = block_sizes(&operand.shape, &addend_ty.shape)?;
+                        let addends = self.scale_factors(by, &contract.name)?;
+                        (
+                            TransformSpec {
+                                scale_blocks: blocks,
+                                ..TransformSpec::default()
+                            },
+                            vec![addends],
+                        )
+                    }
                 };
-                let value =
-                    self.transform_with(payload, &decl, TileMapKind::Bias, Vec::new(), spec)?;
+                let value = self.transform_with(payload, &decl, TileMapKind::Bias, extra, spec)?;
                 (value, decl)
             }
             // A cast needs a kernel for the same reason a scale does, and its

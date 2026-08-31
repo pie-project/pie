@@ -88,6 +88,28 @@ pub mod layout_embed_weighted;
 #[path = "attn/score.rs"]
 pub mod attn_score;
 
+/// **THE PLE N-GRAM HASHER, RE-HOMED BY `#[path]`** (qwen4) — the same
+/// detour [`attn_dense`] and [`attn_score`] take: the file is
+/// `src/attn/ple.rs`, beside the recurrent mixers whose state discipline its
+/// entries follow, and the module PATH is here because `src/attn.rs` is
+/// closed to this wave.
+///
+/// **The one line that retires this block** is `pub mod ple;` inside
+/// `attn.rs`.
+#[path = "attn/ple.rs"]
+pub mod attn_ple;
+
+/// **THE GATHER THAT CONCATENATES, RE-HOMED BY `#[path]`** (qwen4's PLE
+/// n-gram embedding read) — a fifth file behind the door
+/// [`layout_embed_weighted`] documents: a second entry beside
+/// `layout::embed` rather than a widening of it, and `src/layout.rs` is
+/// closed to this wave either way.
+///
+/// **The one line that retires this block** is `pub mod embed_concat;`
+/// inside `layout.rs`.
+#[path = "layout/embed_concat.rs"]
+pub mod layout_embed_concat;
+
 pub mod channel;
 pub mod collective;
 pub mod custom;

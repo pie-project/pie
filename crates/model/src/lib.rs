@@ -1,15 +1,16 @@
 pub mod adapter;
-pub mod contract;
 pub mod deepseek_v4;
 pub mod gemma_4;
 pub mod glm_5;
 pub mod gpt_oss;
 pub mod kimi_k3;
+pub mod media;
 pub mod qwen_3;
+pub mod qwen_4;
 pub mod template;
+pub mod tokenizer;
 
 use checkpoint::contract::ModelContract;
-use checkpoint::types::{DType, Encoding, QuantScheme, QuantSpec};
 use model_dsl::Dtype;
 
 /// The vocabulary a caller needs to USE the catalog's fourth column, through
@@ -33,7 +34,7 @@ pub type Row = (&'static str, u32, model_dsl::TraceFn, model_dsl::ClassifyFn);
 
 pub type ImportRow = (
     &'static str,
-    fn(&ztensor::Source) -> Result<ModelContract, contract::ModelError>,
+    fn(&ztensor::Source) -> Result<ModelContract, checkpoint_dsl::Error>,
 );
 
 #[must_use]
@@ -45,6 +46,7 @@ pub fn catalog() -> Vec<Row> {
         gpt_oss::CATALOG,
         kimi_k3::CATALOG,
         qwen_3::CATALOG,
+        qwen_4::CATALOG,
     ]
     .concat()
 }
@@ -58,6 +60,7 @@ pub fn imports() -> Vec<ImportRow> {
         gpt_oss::IMPORTS,
         kimi_k3::IMPORTS,
         qwen_3::IMPORTS,
+        qwen_4::IMPORTS,
     ]
     .concat()
 }
@@ -86,7 +89,7 @@ pub fn classify_of(sku: &str) -> Option<model_dsl::ClassifyFn> {
 #[must_use]
 pub fn import_of(
     sku: &str,
-) -> Option<fn(&ztensor::Source) -> Result<ModelContract, contract::ModelError>> {
+) -> Option<fn(&ztensor::Source) -> Result<ModelContract, checkpoint_dsl::Error>> {
     imports()
         .into_iter()
         .find(|(n, _)| *n == sku)
@@ -114,66 +117,6 @@ pub(crate) fn dense(banks: Dtype) -> Dtype {
         .unwrap_or_else(|| panic!("`{banks:?}` is not a weight representation a family declares"))
 }
 
-pub(crate) fn encoding(dtype: Dtype) -> Encoding {
-    match dtype {
-        Dtype::Bf16 => Encoding::Raw(DType::Bf16),
-        Dtype::F16 => Encoding::Raw(DType::F16),
-        Dtype::F32 => Encoding::Raw(DType::F32),
-        Dtype::I32 => Encoding::Raw(DType::I32),
-        Dtype::U32 => Encoding::Raw(DType::U32),
-        Dtype::U8 => Encoding::Raw(DType::U8),
-        Dtype::I8 => Encoding::Raw(DType::I8),
-        Dtype::Fp8E4m3 => Encoding::Raw(DType::Fp8E4m3),
-        Dtype::E8m0 => Encoding::Raw(DType::E8m0),
-        // The six the checkpoint vocabulary brought when the two dtype enums
-        // merged. Each stores itself verbatim, so each is `Raw` of itself —
-        // the same answer every row above gives.
-        Dtype::Fp8E5m2 => Encoding::Raw(DType::Fp8E5m2),
-        Dtype::I64 => Encoding::Raw(DType::I64),
-        Dtype::I16 => Encoding::Raw(DType::I16),
-        Dtype::U64 => Encoding::Raw(DType::U64),
-        Dtype::U16 => Encoding::Raw(DType::U16),
-        Dtype::Bool => Encoding::Raw(DType::Bool),
-        Dtype::Mxfp4 => Encoding::Quant(QuantSpec {
-            scheme: QuantScheme::Mxfp4E2M1E8M0,
-            logical_dtype: DType::Bf16,
-            bits_per_element: 4,
-            group_size: 32,
-            channel_axis: None,
-        }),
-        // MLX's affine U4, in the loader's own vocabulary: sixty-four codes
-        // under one bf16 scale and one bf16 offset, dequantized to bf16. The
-        // channel axis is stated by whoever holds the shape —
-        // `contract::grouped` — because a rank is not a fact about a scheme.
-        Dtype::MlxU4 => Encoding::Quant(QuantSpec {
-            scheme: QuantScheme::MlxAffineU4,
-            logical_dtype: DType::Bf16,
-            bits_per_element: 4,
-            group_size: 64,
-            channel_axis: None,
-        }),
-        // **THE SAME SCHEME AT TWICE THE WIDTH.** `MlxAffineU4` names the
-        // arithmetic — affine codes, sixty-four to a group, one bf16 scale and
-        // one bf16 offset apiece — and `bits_per_element` has always been the
-        // field that says how wide a code is, which is why an eight-bit MLX
-        // bank needs no scheme of its own. `Landing::affine_point_of` reports
-        // this number to the engine and `kernels_metal::linear::quant` stamps
-        // a point at both widths, so the two travel the whole way down as one
-        // path with a number in it. See `dtype::Dtype::MlxU8` for the
-        // checkpoint that mixes them.
-        Dtype::MlxU8 => Encoding::Quant(QuantSpec {
-            scheme: QuantScheme::MlxAffineU4,
-            logical_dtype: DType::Bf16,
-            bits_per_element: 8,
-            group_size: 64,
-            channel_axis: None,
-        }),
-        Dtype::Fp4 => panic!(
-            "`Dtype::Fp4` names a kv-page quantization scheme, not a stored \
-             weight plane; no load contract declares one"
-        ),
-    }
-}
 
 pub fn identify(src: &ztensor::Source) -> Result<&'static str, Unmatched> {
     let mut misses: Vec<(&'static str, String)> = Vec::new();

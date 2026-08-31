@@ -34,7 +34,7 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: additive corpus growth: the lora_prologue stage (stage-4 lora sink) joined the shared corpus and the MSL dumps were never re-pinned for it, while the CUDA ones were -- the same reason those carry. The case list gains exactly lora_prologue#0's five entries and loses none; every pre-existing case keeps its identity, its order and its emitted text.
+#   reason: metal emitter 40->41: the grouped gather spent ONE number on two jobs. M3GroupLayout::vocab is the row PITCH the kernel strides source rows by, and emit_logits_gather / the fused gather-and-argmax also used it as the row WIDTH they walk each row for. While engine-metal wrote the reader's own declared width into vocab the two were equal and the conflation was invisible -- and it is exactly what made a narrow multi-row read inexpressible, because row r began 'last' elements in rather than a whole rectangle row, which is the shape beam search and consensus decoding read logits at. The two are now two: the width comes from intrinsic_desc.last / am_in.last (the reader's own claim, where the single-lane 0xA0 handler reads it too) and the pitch from layout->vocab, which the host now fills with the RECTANGLE's width. The relation checked is the CUDA handler's and not a stricter one -- ptir_m1_runtime_body.cuh faults on stride < logical_width and nothing else -- so a declared row stays a ceiling. Where a reader is full-width the two numbers are equal and no emitted behaviour moves. The grouped readiness and commit entry names carry the emitter version and move with the bump; nothing else in these dumps changed.
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3s_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -160,7 +160,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r0(
 function_name: ptir_m3s_b4fadd8446eb58dd_r1
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=52344 prefix=@runtime+@grouped tail_bytes=10875
+source: bytes=52493 prefix=@runtime+@grouped tail_bytes=11024
 kernel void ptir_m3s_b4fadd8446eb58dd_r1(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -277,16 +277,17 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r1(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[1];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[1]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -2963,7 +2964,7 @@ kernel void ptir_m3s_b4fadd8446eb58dd_r76(
 function_name: ptir_m3_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=1 nodes=14 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=55810 prefix=@runtime+@grouped tail_bytes=14341
+source: bytes=55959 prefix=@runtime+@grouped tail_bytes=14490
 kernel void ptir_m3_b4fadd8446eb58dd_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3083,16 +3084,17 @@ kernel void ptir_m3_b4fadd8446eb58dd_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[1];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[1]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -3886,7 +3888,7 @@ kernel void ptir_m3_f4e949004f50e90e_r0(
 function_name: ptir_m3s_4f4b856e5ef3e8b4_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=46572 prefix=@runtime+@grouped tail_bytes=5103
+source: bytes=46721 prefix=@runtime+@grouped tail_bytes=5252
 kernel void ptir_m3s_4f4b856e5ef3e8b4_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -3943,16 +3945,17 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -4577,7 +4580,7 @@ kernel void ptir_m3s_4f4b856e5ef3e8b4_r12(
 function_name: ptir_m3_4f4b856e5ef3e8b4_r0
 region: library=0 library_op=0 schedule=1 nodes=15 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=50899 prefix=@runtime+@grouped tail_bytes=9430
+source: bytes=51048 prefix=@runtime+@grouped tail_bytes=9579
 kernel void ptir_m3_4f4b856e5ef3e8b4_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4634,16 +4637,17 @@ kernel void ptir_m3_4f4b856e5ef3e8b4_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -4703,7 +4707,7 @@ kernel void ptir_m3_4f4b856e5ef3e8b4_r0(
 function_name: ptir_m3s_d01f407b22863878_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45147 prefix=@runtime+@grouped tail_bytes=3678
+source: bytes=45296 prefix=@runtime+@grouped tail_bytes=3827
 kernel void ptir_m3s_d01f407b22863878_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4745,16 +4749,17 @@ kernel void ptir_m3s_d01f407b22863878_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -4815,7 +4820,7 @@ kernel void ptir_m3s_d01f407b22863878_r1(
 function_name: ptir_m3_d01f407b22863878_r0
 region: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=45577 prefix=@runtime+@grouped tail_bytes=4108
+source: bytes=45726 prefix=@runtime+@grouped tail_bytes=4257
 kernel void ptir_m3_d01f407b22863878_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4857,16 +4862,17 @@ kernel void ptir_m3_d01f407b22863878_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -4884,7 +4890,7 @@ kernel void ptir_m3_d01f407b22863878_r0(
 function_name: ptir_m3s_f2566cc0c1e0529a_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45622 prefix=@runtime+@grouped tail_bytes=4153
+source: bytes=45771 prefix=@runtime+@grouped tail_bytes=4302
 kernel void ptir_m3s_f2566cc0c1e0529a_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -4931,16 +4937,17 @@ kernel void ptir_m3s_f2566cc0c1e0529a_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -5108,7 +5115,7 @@ kernel void ptir_m3s_f2566cc0c1e0529a_r4(
 function_name: ptir_m3_f2566cc0c1e0529a_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=47930 prefix=@runtime+@grouped tail_bytes=6461
+source: bytes=48015 prefix=@runtime+@grouped tail_bytes=6546
 kernel void ptir_m3_f2566cc0c1e0529a_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5154,16 +5161,17 @@ kernel void ptir_m3_f2566cc0c1e0529a_r0(
     const M1ValueDesc am_in = descriptors[0];
     const uint am_row_base = row_meta.offset + 0u;
     const uint am_vocab = layout->vocab;
-    if (am_vocab == 0u || am_in.last != am_vocab || am_in.rows > row_meta.count) { m1_fault(status, 0xA0u); return; }
+    const uint am_width = am_in.last == 0u ? am_vocab : am_in.last;
+    if (am_vocab == 0u || am_width == 0u || am_width > am_vocab || am_in.rows > row_meta.count) { m1_fault(status, 0xA0u); return; }
     device int* am_out = reinterpret_cast<device int*>(scratch + offsets[2]);
     for (uint am_r = 0u; am_r < am_in.rows; ++am_r) {
       const uint am_src_row = row_indices[am_row_base + am_r];
       const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;
       M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};
       M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;
-      constexpr uint am_w = 512u;
+      const uint am_w = m3_threads;
       uint am_c = m3_tid;
-      for (; am_c + 3u * am_w < am_vocab; am_c += 4u * am_w) {
+      for (; am_c + 3u * am_w < am_width; am_c += 4u * am_w) {
         const float v0 = float(am_src[am_c]);
         const float v1 = float(am_src[am_c + am_w]);
         const float v2 = float(am_src[am_c + 2u * am_w]);
@@ -5173,7 +5181,7 @@ kernel void ptir_m3_f2566cc0c1e0529a_r0(
         am_b2 = m1_argmax_combine(am_b2, M1ArgmaxCandidate{v2, am_c + 2u * am_w, isnan(v2) ? 0u : 1u, 0u});
         am_b3 = m1_argmax_combine(am_b3, M1ArgmaxCandidate{v3, am_c + 3u * am_w, isnan(v3) ? 0u : 1u, 0u});
       }
-      for (; am_c < am_vocab; am_c += am_w) {
+      for (; am_c < am_width; am_c += am_w) {
         const float am_v = float(am_src[am_c]);
         am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});
       }
@@ -5472,7 +5480,7 @@ kernel void ptir_m3_26849b68dee54237_r1(
 function_name: ptir_m3s_6612fe00a51d7edc_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45147 prefix=@runtime+@grouped tail_bytes=3678
+source: bytes=45296 prefix=@runtime+@grouped tail_bytes=3827
 kernel void ptir_m3s_6612fe00a51d7edc_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5514,16 +5522,17 @@ kernel void ptir_m3s_6612fe00a51d7edc_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -5768,7 +5777,7 @@ kernel void ptir_m3s_6612fe00a51d7edc_r5(
 function_name: ptir_m3_6612fe00a51d7edc_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=46437 prefix=@runtime+@grouped tail_bytes=4968
+source: bytes=46586 prefix=@runtime+@grouped tail_bytes=5117
 kernel void ptir_m3_6612fe00a51d7edc_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5810,16 +5819,17 @@ kernel void ptir_m3_6612fe00a51d7edc_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -5846,7 +5856,7 @@ kernel void ptir_m3_6612fe00a51d7edc_r0(
 function_name: ptir_m3s_101abcfb79b08b89_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=45622 prefix=@runtime+@grouped tail_bytes=4153
+source: bytes=45771 prefix=@runtime+@grouped tail_bytes=4302
 kernel void ptir_m3s_101abcfb79b08b89_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -5893,16 +5903,17 @@ kernel void ptir_m3s_101abcfb79b08b89_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -6172,7 +6183,7 @@ kernel void ptir_m3s_101abcfb79b08b89_r5(
 function_name: ptir_m3_101abcfb79b08b89_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=47200 prefix=@runtime+@grouped tail_bytes=5731
+source: bytes=47349 prefix=@runtime+@grouped tail_bytes=5880
 kernel void ptir_m3_101abcfb79b08b89_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6219,16 +6230,17 @@ kernel void ptir_m3_101abcfb79b08b89_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -6258,7 +6270,7 @@ kernel void ptir_m3_101abcfb79b08b89_r0(
 function_name: ptir_m3s_963137d4ffed0445_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=46572 prefix=@runtime+@grouped tail_bytes=5103
+source: bytes=46721 prefix=@runtime+@grouped tail_bytes=5252
 kernel void ptir_m3s_963137d4ffed0445_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -6315,16 +6327,17 @@ kernel void ptir_m3s_963137d4ffed0445_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -7132,7 +7145,7 @@ kernel void ptir_m3s_963137d4ffed0445_r21(
 function_name: ptir_m3_963137d4ffed0445_r0
 region: library=0 library_op=0 schedule=1 nodes=13 inputs=0 outputs=3 sinks=0
 ok: true
-source: bytes=50932 prefix=@runtime+@grouped tail_bytes=9463
+source: bytes=51230 prefix=@runtime+@grouped tail_bytes=9761
 kernel void ptir_m3_963137d4ffed0445_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7189,16 +7202,17 @@ kernel void ptir_m3_963137d4ffed0445_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -7209,16 +7223,17 @@ kernel void ptir_m3_963137d4ffed0445_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[1];
     const uint intrinsic_row_base = row_meta.mtp_offset;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[1]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -7424,7 +7439,7 @@ kernel void ptir_m3_963137d4ffed0445_r2(
 function_name: ptir_m3s_82921040f7bc2612_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=46097 prefix=@runtime+@grouped tail_bytes=4628
+source: bytes=46246 prefix=@runtime+@grouped tail_bytes=4777
 kernel void ptir_m3s_82921040f7bc2612_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -7476,16 +7491,17 @@ kernel void ptir_m3s_82921040f7bc2612_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -8340,7 +8356,7 @@ kernel void ptir_m3s_82921040f7bc2612_r16(
 function_name: ptir_m3_82921040f7bc2612_r0
 region: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=3 sinks=0
 ok: true
-source: bytes=46648 prefix=@runtime+@grouped tail_bytes=5179
+source: bytes=46797 prefix=@runtime+@grouped tail_bytes=5328
 kernel void ptir_m3_82921040f7bc2612_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -8392,16 +8408,17 @@ kernel void ptir_m3_82921040f7bc2612_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -8953,7 +8970,7 @@ kernel void ptir_m3_14f667a41eb30669_r3(
 function_name: ptir_m3s_dff3bc6795a9dcdf_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=47047 prefix=@runtime+@grouped tail_bytes=5578
+source: bytes=47196 prefix=@runtime+@grouped tail_bytes=5727
 kernel void ptir_m3s_dff3bc6795a9dcdf_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -9015,16 +9032,17 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -10029,7 +10047,7 @@ kernel void ptir_m3s_dff3bc6795a9dcdf_r34(
 function_name: ptir_m3_dff3bc6795a9dcdf_r0
 region: library=0 library_op=0 schedule=1 nodes=31 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=55499 prefix=@runtime+@grouped tail_bytes=14030
+source: bytes=55648 prefix=@runtime+@grouped tail_bytes=14179
 kernel void ptir_m3_dff3bc6795a9dcdf_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10091,16 +10109,17 @@ kernel void ptir_m3_dff3bc6795a9dcdf_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -10271,7 +10290,7 @@ error: Metal binds only the logits buffer for intrinsics; intrinsic id 4 has no 
 function_name: ptir_m3s_09a2719886970a85_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=46572 prefix=@runtime+@grouped tail_bytes=5103
+source: bytes=46721 prefix=@runtime+@grouped tail_bytes=5252
 kernel void ptir_m3s_09a2719886970a85_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10328,16 +10347,17 @@ kernel void ptir_m3s_09a2719886970a85_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -10901,7 +10921,7 @@ kernel void ptir_m3s_09a2719886970a85_r12(
 function_name: ptir_m3_09a2719886970a85_r0
 region: library=0 library_op=0 schedule=1 nodes=14 inputs=0 outputs=0 sinks=2
 ok: true
-source: bytes=50618 prefix=@runtime+@grouped tail_bytes=9149
+source: bytes=50767 prefix=@runtime+@grouped tail_bytes=9298
 kernel void ptir_m3_09a2719886970a85_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -10958,16 +10978,17 @@ kernel void ptir_m3_09a2719886970a85_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -11024,7 +11045,7 @@ kernel void ptir_m3_09a2719886970a85_r0(
 function_name: ptir_m3s_4cf3882bf2fff913_r0
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=0 outputs=1 sinks=0
 ok: true
-source: bytes=47047 prefix=@runtime+@grouped tail_bytes=5578
+source: bytes=47196 prefix=@runtime+@grouped tail_bytes=5727
 kernel void ptir_m3s_4cf3882bf2fff913_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11086,16 +11107,17 @@ kernel void ptir_m3s_4cf3882bf2fff913_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -11704,7 +11726,7 @@ kernel void ptir_m3s_4cf3882bf2fff913_r11(
 function_name: ptir_m3_4cf3882bf2fff913_r0
 region: library=0 library_op=0 schedule=1 nodes=19 inputs=0 outputs=0 sinks=4
 ok: true
-source: bytes=52508 prefix=@runtime+@grouped tail_bytes=11039
+source: bytes=52657 prefix=@runtime+@grouped tail_bytes=11188
 kernel void ptir_m3_4cf3882bf2fff913_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -11766,16 +11788,17 @@ kernel void ptir_m3_4cf3882bf2fff913_r0(
     const uint gather_step = m3_threads;
     const M1ValueDesc intrinsic_desc = descriptors[0];
     const uint intrinsic_row_base = 0u;
-    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
+    const uint gather_stride = layout->vocab;
+    const uint gather_width = intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;
+    if (gather_stride == 0u || gather_width == 0u || gather_stride < gather_width || intrinsic_desc.len % gather_width != 0u || intrinsic_row_base > row_meta.count || intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) { m1_fault(status, 0xA0u); return; }
     device float* intrinsic_out = reinterpret_cast<device float*>(scratch + offsets[0]);
-    const uint gather_vocab = layout->vocab;
-    const uint gather_rows = intrinsic_desc.len / gather_vocab;
+    const uint gather_rows = intrinsic_desc.len / gather_width;
     const uint gather_row_base = row_meta.offset + intrinsic_row_base;
     for (uint gr = 0u; gr < gather_rows; ++gr) {
       const uint source_row = row_indices[gather_row_base + gr];
-      const device bfloat* gather_src = logits + ulong(source_row) * gather_vocab;
-      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;
-      for (uint column = gather_begin; column < gather_vocab; column += gather_step) {
+      const device bfloat* gather_src = logits + ulong(source_row) * gather_stride;
+      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;
+      for (uint column = gather_begin; column < gather_width; column += gather_step) {
         gather_dst[column] = float(gather_src[column]);
       }
     }
@@ -14174,7 +14197,7 @@ kernel void ptir_m3s_9eda8aa42400c4c2_r5(
 function_name: ptir_m3_9eda8aa42400c4c2_r0
 region: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 ok: true
-source: bytes=48440 prefix=@runtime+@grouped tail_bytes=6971
+source: bytes=48525 prefix=@runtime+@grouped tail_bytes=7056
 kernel void ptir_m3_9eda8aa42400c4c2_r0(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
@@ -14234,16 +14257,17 @@ kernel void ptir_m3_9eda8aa42400c4c2_r0(
     const M1ValueDesc am_in = descriptors[1];
     const uint am_row_base = row_meta.offset + row_meta.mtp_offset;
     const uint am_vocab = layout->vocab;
-    if (am_vocab == 0u || am_in.last != am_vocab || am_in.rows > row_meta.count) { m1_fault(status, 0xA0u); return; }
+    const uint am_width = am_in.last == 0u ? am_vocab : am_in.last;
+    if (am_vocab == 0u || am_width == 0u || am_width > am_vocab || am_in.rows > row_meta.count) { m1_fault(status, 0xA0u); return; }
     device int* am_out = reinterpret_cast<device int*>(scratch + offsets[2]);
     for (uint am_r = 0u; am_r < am_in.rows; ++am_r) {
       const uint am_src_row = row_indices[am_row_base + am_r];
       const device bfloat* am_src = logits + ulong(am_src_row) * am_vocab;
       M1ArgmaxCandidate am_best = {-INFINITY, 0u, 0u, 0u};
       M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;
-      constexpr uint am_w = 512u;
+      const uint am_w = m3_threads;
       uint am_c = m3_tid;
-      for (; am_c + 3u * am_w < am_vocab; am_c += 4u * am_w) {
+      for (; am_c + 3u * am_w < am_width; am_c += 4u * am_w) {
         const float v0 = float(am_src[am_c]);
         const float v1 = float(am_src[am_c + am_w]);
         const float v2 = float(am_src[am_c + 2u * am_w]);
@@ -14253,7 +14277,7 @@ kernel void ptir_m3_9eda8aa42400c4c2_r0(
         am_b2 = m1_argmax_combine(am_b2, M1ArgmaxCandidate{v2, am_c + 2u * am_w, isnan(v2) ? 0u : 1u, 0u});
         am_b3 = m1_argmax_combine(am_b3, M1ArgmaxCandidate{v3, am_c + 3u * am_w, isnan(v3) ? 0u : 1u, 0u});
       }
-      for (; am_c < am_vocab; am_c += am_w) {
+      for (; am_c < am_width; am_c += am_w) {
         const float am_v = float(am_src[am_c]);
         am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});
       }

@@ -16,6 +16,30 @@ use super::*;
 /// rectangle: cut at the token window, sized by `max_tokens`, and assigned to
 /// the trunk's capture unit — wrong in three ways and loud in none of them.
 /// `a_gather_lands_on_its_ids_axis` is the test that keeps them apart now.
+/// **THE GATHER THAT CONCATENATES** ([`Layout::EmbedConcat`]): `y[r] =
+/// table[ids[r, 0]] ‖ … ‖ table[ids[r, heads−1]]` — the PLE n-gram read,
+/// every hashed head's row side by side. `ids` is `[rows, heads]` `i32`
+/// ([`attn::ple_ngram_ids`](super::attn::ple_ngram_ids)'s answer), and
+/// `heads` is read off its width, for [`embed_weighted`]'s reason.
+pub fn embed_concat(ids: &Value, table: &Weight, vocab: u32) -> Value {
+    let r = ids.rec();
+    let y = r.fresh(tensor(
+        ids.rows(),
+        ids.width() * table.dim(1),
+        table.compute_dtype(),
+    ));
+    r.push(
+        Layout::EmbedConcat {
+            ids: ids.id(),
+            table: r.weight(table),
+            vocab,
+            y: y.id(),
+        },
+        &[ids],
+    );
+    y
+}
+
 pub fn embed(ids: &Value, table: &Weight, vocab: u32) -> Value {
     let r = ids.rec();
     let y = r.fresh(tensor(ids.rows(), table.dim(1), table.compute_dtype()));

@@ -227,10 +227,19 @@ impl HybridSpec {
         });
     }
 
-    pub fn state(&mut self, name: impl Into<String>, slab: impl IntoIterator<Item = u64>) {
+    /// One recurrent-state slab. `dtype` is the slab's own — the ssm mixers
+    /// keep bf16 history, and qwen4's n-gram window keeps token ids, which
+    /// only an integer element holds past 256.
+    pub fn state(
+        &mut self,
+        name: impl Into<String>,
+        slab: impl IntoIterator<Item = u64>,
+        dtype: Dtype,
+    ) {
         self.rows.push(CacheRow::State {
             name: name.into(),
             slab: slab.into_iter().collect(),
+            dtype,
         });
     }
 }

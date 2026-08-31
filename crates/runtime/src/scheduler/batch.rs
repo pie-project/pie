@@ -26,7 +26,7 @@ use super::worker::PendingRequest;
 /// One step's assembled lanes, before the frame is sealed.
 pub(crate) struct StepBuild {
     /// The lanes, in member order.
-    pub(crate) lanes: Vec<crate::engine::Lane>,
+    pub(crate) lanes: Vec<::engine::Lane>,
     /// **THE MEDIA ROWS, REBASED ONTO THE STEP'S LANE NUMBERING**
     /// (media-door §6). A member states a lane index into its OWN lanes,
     /// because a submission cannot know which step it co-batches into; the
@@ -434,14 +434,14 @@ pub(crate) fn build_frame_submission(
                 continue;
             }
             let lane = build.member_lane_indptr[member];
-            attachments.push(crate::engine::Attachment {
+            attachments.push(::engine::Attachment {
                 lane,
                 instance,
-                at: crate::engine::Boundary::Epilogue,
+                at: ::engine::Boundary::Epilogue,
             });
         }
         steps.push(StepFire {
-            submission: crate::engine::Step {
+            submission: ::engine::Step {
                 lanes,
                 attachments,
                 media: build.media,
@@ -580,15 +580,15 @@ mod tests {
         let mut masked = decode(11, 3);
         masked.has_user_mask = true;
         masked.single_token_mode = false;
-        masked.lanes[0].mask = Some(crate::engine::Masking::Extent(
-            crate::engine::Mask::new(vec![0, 1], 1),
+        masked.lanes[0].mask = Some(::engine::Masking::Extent(
+            ::engine::Mask::new(vec![0, 1], 1),
         ));
 
         let requests = [pending(masked, 20), pending(decode(22, 4), 21)];
         let step = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(
             step.lanes[0].mask,
-            Some(crate::engine::Masking::Extent(crate::engine::Mask::new(
+            Some(::engine::Masking::Extent(::engine::Mask::new(
                 vec![0, 1],
                 1
             )))

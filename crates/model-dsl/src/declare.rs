@@ -142,24 +142,29 @@ impl Weight {
             // a code — `mlx_lm`'s `quant_predicate` raises a MoE router gate
             // to it while the stack around it stays at four (see
             // `dtype::Dtype::MlxU8`) — and everything below is a fact about
-            // the SCHEME rather than the width: the codes keep the logical
-            // shape, the group is sixty-four codes wide at either width, and
-            // both companions are one bf16 per group. So the plane carries
-            // `self.dtype` and the arm is shared; a width-specific arm here
-            // would be two copies of one paragraph.
-            Dtype::MlxU4 | Dtype::MlxU8 => {
+            // the SCHEME rather than the width or the group: the codes keep
+            // the logical shape and both companions are one bf16 per group.
+            // So the plane carries `self.dtype` and the arm is shared; a
+            // width- or group-specific arm here would be copies of one
+            // paragraph with one number changed — and the group IS that one
+            // number (`MlxU4G32` is the 160-wide-row reading, see its doc).
+            Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => {
+                let group = match self.dtype {
+                    Dtype::MlxU4G32 => 32,
+                    _ => 64,
+                };
                 let (&k, lead) = self
                     .shape
                     .split_last()
                     .expect("an affine bank's logical shape ends in its contracted axis");
                 assert!(
-                    k % 64 == 0,
+                    k % group == 0,
                     "`{}` is an affine bank contracting over {k}, which is not a whole \
-                     number of 64-code groups",
+                     number of {group}-code groups",
                     self.name,
                 );
                 let mut factors = lead.to_vec();
-                factors.push(k / 64);
+                factors.push(k / group);
                 vec![
                     BankPlane {
                         suffix: "",
@@ -281,7 +286,7 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         Dtype::Bf16 => Some(Dtype::Bf16),
         Dtype::F16 => Some(Dtype::F16),
         Dtype::F32 => Some(Dtype::F32),
-        Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 => Some(Dtype::Bf16),
+        Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => Some(Dtype::Bf16),
         Dtype::I32
         | Dtype::U32
         | Dtype::U8

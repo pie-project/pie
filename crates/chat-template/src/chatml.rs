@@ -15,9 +15,20 @@ use crate::{
 
 /// What one ChatML-speaking model does differently from another.
 pub struct ChatML {
-    /// The model emits `<think>…</think>` and its own history is replayed
-    /// without it.
+    /// The model emits `<think>…</think>`.
     pub thinking: bool,
+    /// Replayed assistant turns KEEP their `<think>` blocks.
+    ///
+    /// The knob upstream calls `preserve_thinking`, and the fact that split it
+    /// out of [`thinking`](ChatML::thinking): Qwen3.5/3.6 and GLM strip a past
+    /// turn's reasoning before replaying it (their templates' default), while
+    /// Qwen3.8 flips the default and replays it whole — its interleaved-
+    /// thinking convention, read off the two `chat_template.jinja`s one line
+    /// apart (`preserve_thinking is defined and … is true` became
+    /// `preserve_thinking is undefined or … is true`). Meaningless when
+    /// `thinking` is false: a model that emits no `<think>` has nothing to
+    /// strip or keep.
+    pub preserve_thinking: bool,
     /// The model was trained on the `<tool_call>` grammar below.
     pub tools: bool,
     /// Text appended to the assistant header when cueing generation.
@@ -106,6 +117,17 @@ impl ChatMLInstruct {
         }
     }
 
+    /// What a replayed assistant turn says: its whole message, or the message
+    /// with its reasoning stripped — the one decision
+    /// [`preserve_thinking`](ChatML::preserve_thinking) exists to state.
+    fn replay_body<'a>(config: &ChatML, msg: &'a str) -> &'a str {
+        if config.thinking && !config.preserve_thinking {
+            Self::without_thinking(msg)
+        } else {
+            msg
+        }
+    }
+
     fn tool_system_prompt(tools: &[String]) -> String {
         let mut prompt = String::from(
             " # Tools\n\n\
@@ -173,12 +195,10 @@ impl Instruct for ChatMLInstruct {
     }
 
     fn assistant(&self, msg: &str) -> Vec<u32> {
-        let body = if self.config.thinking {
-            Self::without_thinking(msg)
-        } else {
-            msg
-        };
-        self.turn(&self.assistant_prefix, body)
+        self.turn(
+            &self.assistant_prefix,
+            Self::replay_body(&self.config, msg),
+        )
     }
 
     fn cue(&self) -> Vec<u32> {
@@ -302,5 +322,57 @@ impl ToolDecoder for ChatMLToolDecoder {
         self.decoder.reset();
         self.accumulated.clear();
         self.inside = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TURN: &str = "<think>\nlet me count\n</think>\n\nfour";
+
+    fn config(thinking: bool, preserve_thinking: bool) -> ChatML {
+        ChatML {
+            thinking,
+            preserve_thinking,
+            tools: true,
+            generation_suffix: "",
+            stop_tokens: &["<|im_end|>"],
+        }
+    }
+
+    /// Qwen3.5/3.6 and GLM: a replayed turn is its answer alone.
+    #[test]
+    fn a_stripping_model_replays_the_answer_without_its_reasoning() {
+        assert_eq!(
+            ChatMLInstruct::replay_body(&config(true, false), TURN),
+            "four"
+        );
+    }
+
+    /// Qwen3.8's interleaved-thinking default: the turn is replayed whole,
+    /// `<think>` block and all.
+    #[test]
+    fn a_preserving_model_replays_the_turn_whole() {
+        assert_eq!(ChatMLInstruct::replay_body(&config(true, true), TURN), TURN);
+    }
+
+    /// A model that emits no `<think>` has nothing to strip or keep — even a
+    /// message that happens to contain the marker is replayed verbatim.
+    #[test]
+    fn a_non_thinking_model_replays_verbatim() {
+        assert_eq!(ChatMLInstruct::replay_body(&config(false, false), TURN), TURN);
+    }
+
+    /// The strip keeps only what follows the LAST `</think>`, which is
+    /// upstream's own `split('</think>')[-1].lstrip('\n')`.
+    #[test]
+    fn the_strip_reads_past_the_last_close_marker() {
+        let twice = "<think>a</think>\ninterim<think>b</think>\n\ndone";
+        assert_eq!(ChatMLInstruct::replay_body(&config(true, false), twice), "done");
+        assert_eq!(
+            ChatMLInstruct::replay_body(&config(true, false), "no reasoning here"),
+            "no reasoning here"
+        );
     }
 }

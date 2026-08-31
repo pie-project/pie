@@ -13,6 +13,34 @@ const CONV_GROUP: u32 = 256;
 
 const SCAN_WIDTH: u32 = 128;
 
+/// The file the REGISTER scan lives in, and the macro it publishes.
+///
+/// A second file and not a second entry in `ssm_gated_delta.metal`: this one
+/// is stamped per axis point and that one is spelled in source, so a library
+/// minted for one stamp here would otherwise carry the other's
+/// instantiations too.
+/// The macro is `PIE_STAMP_gdn_scan`, and it is spelled inside
+/// [`gdn_scan_points`]'s `concat!` rather than held here: the stamp is a
+/// whole invocation with its arguments, so a separate constant for the name
+/// alone could only be pasted back into the same literal.
+const GDN_SCAN_FILE: &str = "attn/ssm_gdn_scan.metal";
+
+/// **THE ONE LANE COUNT `ssm_gdn_scan.metal` IS STAMPED AT.**
+///
+/// Thirty-two, which is a simdgroup, so a lane group's `simd_shuffle_xor`
+/// tree spans exactly one and the kernel needs no barrier anywhere. The
+/// reference sweeps this axis down to four, where two or more row groups
+/// share a simdgroup and the tree has to stay inside an aligned slice of it;
+/// that packing is not ported, because its own sweep answers 32 on this
+/// machine and a lane count nothing here can select is a shape nothing here
+/// can test. [`crate::tuning::DeviceTuning::gdn_scan_lanes`] naming anything
+/// else is a fall back to [`gated_delta_chunked`], which takes any shape.
+const GDN_SCAN_LANES: u32 = 32;
+
+/// Lane groups per threadgroup — four simdgroups, 128 threads, which is the
+/// threadgroup the reference launches this shape at.
+const GDN_SCAN_TG_ROWS: u32 = 4;
+
 /// The widest head row a scan stages in threadgroup memory.
 const SCAN_HEAD_MAX: u32 = 256;
 
@@ -22,6 +50,112 @@ fn conv_grid(channels: u32, rows: u32) -> Grid {
 
 const fn recurrence_grid(heads: u32, rows: u32) -> Grid {
     Grid::of([SCAN_WIDTH, heads, rows], [SCAN_WIDTH, 1, 1])
+}
+
+/// **EVERY (VROWS, PER) POINT THE REGISTER SCAN IS STAMPED AT**, as literal
+/// entry names and literal stamps.
+///
+/// A `match` over literals and not a composed string, which is the one place
+/// this plane does it that way and it earns it: the axis is small and fixed,
+/// so `concat!` gives `&'static str` with no interning table behind it, and
+/// the set of points a reader can reach is the set written here.
+///
+/// `PER` is `k_dim / 32` — the slice of a cell one lane holds — so the three
+/// widths below are head widths 64, 128 and 256. `VROWS` is
+/// [`crate::tuning::DeviceTuning::gdn_scan_rows`].
+macro_rules! gdn_scan_points {
+    ($(($v:literal, $p:literal)),+ $(,)?) => {
+        fn gdn_scan_point(vrows: u32, per: u32) -> Option<(&'static str, &'static str)> {
+            match (vrows, per) {
+                $(($v, $p) => Some((
+                    concat!("gated_delta_scan_bfloat16_l_32_v_", $v, "_p_", $p),
+                    concat!(
+                        "PIE_STAMP_gdn_scan(\"gated_delta_scan_bfloat16_l_32_v_",
+                        $v, "_p_", $p, "\", 32, ", $v, ", ", $p, ")"
+                    ),
+                )),)+
+                _ => None,
+            }
+        }
+    };
+}
+
+gdn_scan_points!(
+    (1, 2),
+    (2, 2),
+    (4, 2),
+    (8, 2),
+    (1, 4),
+    (2, 4),
+    (4, 4),
+    (8, 4),
+    (1, 8),
+    (2, 8),
+    (4, 8),
+    (8, 8),
+);
+
+/// **THE REGISTER SCAN'S POINT AND GEOMETRY, OR `None` FOR THE THREADGROUP
+/// ONE.**
+///
+/// `ssm_gdn_scan.metal` computes `gated_delta_chunked`'s recurrence with the
+/// cell in registers and the two per-token folds on `simd_shuffle_xor`; what
+/// it cannot do is take a shape it was not stamped for, because holding the
+/// cell in registers means the slice width is a template argument and not a
+/// loop bound. So this is a selection with four ways to decline, and every
+/// one of them lands on the kernel that declines at nothing.
+///
+/// The launch is one lane group per `VROWS` value rows, and one simdgroup per
+/// lane group:
+///
+/// ```text
+///   threads        [32, v_dim / VROWS, requests x v_heads]
+///   threadgroup    [32, 4, 1]
+/// ```
+///
+/// On qwen3.6-27B (48 value heads, 128 wide) at one request that is 384
+/// threadgroups against `gated_delta_chunked`'s 48 — which is the point, on a
+/// machine with 24 cores.
+fn gdn_scan_launch(shape: &Delta, requests: u32) -> Option<(&'static str, &'static str, Grid)> {
+    let tuned = crate::tuning::current();
+    // A lane count this file does not stamp is a fall back and not a fault:
+    // see [`GDN_SCAN_LANES`].
+    if tuned.gdn_scan_lanes != GDN_SCAN_LANES {
+        return None;
+    }
+    gdn_scan_launch_at(shape, requests, tuned.gdn_scan_rows)
+}
+
+/// [`gdn_scan_launch`] with the fold stated rather than read, so a test can
+/// reach a fold this machine's table does not name.
+fn gdn_scan_launch_at(
+    shape: &Delta,
+    requests: u32,
+    vrows: u32,
+) -> Option<(&'static str, &'static str, Grid)> {
+    if vrows == 0 || shape.v_dim % vrows != 0 || shape.k_dim % GDN_SCAN_LANES != 0 {
+        return None;
+    }
+    let (entry, stamp) = gdn_scan_point(vrows, shape.k_dim / GDN_SCAN_LANES)?;
+    let row_groups = shape.v_dim / vrows;
+    // The threadgroup's row extent has to divide the grid's, or the launch
+    // would round up and a spare lane group would own a state row that is
+    // not there — and this scan is a read-modify-write, so two owners of one
+    // row is a wrong answer rather than wasted work.
+    let tg_rows = if row_groups % GDN_SCAN_TG_ROWS == 0 {
+        GDN_SCAN_TG_ROWS
+    } else {
+        1
+    };
+    let z = shape.v_heads.checked_mul(requests)?;
+    Some((
+        entry,
+        stamp,
+        Grid::of(
+            [GDN_SCAN_LANES, row_groups, z],
+            [GDN_SCAN_LANES, tg_rows, 1],
+        ),
+    ))
 }
 
 fn head_width(op: &'static str, width: u32, what: &'static str) -> Result<(), Error> {
@@ -319,20 +453,34 @@ pub fn gated_delta_chunked(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv.data, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     let lanes = requests(OP, qkv)?;
+    let args = [
+        qkv.data.arg(),
+        qkv.indptr.arg(),
+        gates.arg(),
+        state.state.arg_mut(),
+        state.slots.arg(),
+        y.arg_mut(),
+        stated(OP, shape.k_heads)?.arg(),
+        stated(OP, shape.v_heads)?.arg(),
+        stated(OP, shape.k_dim)?.arg(),
+        stated(OP, shape.v_dim)?.arg(),
+    ];
+    // **THE REGISTER SCAN, WHERE THE SHAPE IS STAMPED FOR IT.** Same
+    // operands, same buffer indices, same recurrence in the same order down
+    // the tokens; what differs is that the cell rides in registers and the
+    // two per-token folds are simdgroup shuffles, which on this machine is
+    // 60% of a qwen prefill. `ssm_gdn_scan.metal`'s header is the
+    // measurement and the statement of what it costs — the folds reassociate,
+    // so the two kernels drift.
+    if let Some((point, stamp, grid)) = gdn_scan_launch(&shape, lanes) {
+        return ctx.fire(
+            Fire::at(GDN_SCAN_FILE, point).stamp(stamp).apply(grid),
+            &args,
+        );
+    }
     ctx.fire(
         Fire::at("attn/ssm_gated_delta.metal", entry).apply(recurrence_grid(shape.v_heads, lanes)),
-        &[
-            qkv.data.arg(),
-            qkv.indptr.arg(),
-            gates.arg(),
-            state.state.arg_mut(),
-            state.slots.arg(),
-            y.arg_mut(),
-            stated(OP, shape.k_heads)?.arg(),
-            stated(OP, shape.v_heads)?.arg(),
-            stated(OP, shape.k_dim)?.arg(),
-            stated(OP, shape.v_dim)?.arg(),
-        ],
+        &args,
     )
 }
 
@@ -414,4 +562,71 @@ pub fn kda_chunked(
             norm_eps.arg(),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// qwen3.6-27B's gated-delta shape, which is also qwen3.5-0.8B's apart
+    /// from the head count.
+    const D27B: Delta = Delta {
+        k_heads: 16,
+        v_heads: 48,
+        k_dim: 128,
+        v_dim: 128,
+    };
+
+    #[test]
+    fn the_register_scan_takes_the_shape_the_catalog_ships() {
+        let (entry, stamp, grid) = gdn_scan_launch(&D27B, 1).expect("a stamped point");
+        assert_eq!(entry, "gated_delta_scan_bfloat16_l_32_v_4_p_4");
+        assert_eq!(
+            stamp,
+            "PIE_STAMP_gdn_scan(\"gated_delta_scan_bfloat16_l_32_v_4_p_4\", 32, 4, 4)"
+        );
+        // One lane group per four value rows, one simdgroup per lane group,
+        // and the `(request, value head)` pair down z — 384 threadgroups at
+        // one request against `recurrence_grid`'s 48.
+        assert_eq!(grid, Grid::of([32, 32, 48], [32, 4, 1]));
+        let wide = gdn_scan_launch(&D27B, 4).expect("a stamped point");
+        assert_eq!(wide.2, Grid::of([32, 32, 192], [32, 4, 1]));
+    }
+
+    #[test]
+    fn a_shape_the_stamp_does_not_name_falls_back() {
+        // A key width the 32 lanes do not divide has no slice to hold.
+        let odd = Delta {
+            k_dim: 100,
+            ..D27B
+        };
+        assert!(gdn_scan_launch(&odd, 1).is_none());
+        // A key width that divides but lands outside the stamped packs —
+        // 512 / 32 is 16, and the widest pack is 8.
+        let deep = Delta {
+            k_dim: 512,
+            ..D27B
+        };
+        assert!(gdn_scan_launch(&deep, 1).is_none());
+        // A value width the fold does not divide would leave a lane group
+        // owning a state row that is not there, and this scan is a
+        // read-modify-write.
+        let ragged = Delta { v_dim: 66, ..D27B };
+        assert!(gdn_scan_launch(&ragged, 1).is_none());
+    }
+
+    #[test]
+    fn the_threadgroup_row_extent_always_divides_the_grids() {
+        // 128 value rows folded eight ways is sixteen groups, which four
+        // simdgroups divide; folded three ways it would not — but three is
+        // not a stamped fold, so the case that reaches the fallback is a
+        // value width the four does not divide. `v_dim = 12` at `VROWS = 2`
+        // is six groups, and six is not a multiple of four.
+        let narrow = Delta {
+            v_dim: 12,
+            ..D27B
+        };
+        let (_, _, grid) = super::gdn_scan_launch_at(&narrow, 1, 2).expect("a stamped point");
+        assert_eq!(grid, Grid::of([32, 6, 48], [32, 1, 1]));
+    }
 }

@@ -607,7 +607,10 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::SsmGatedDelta { .. }
             | Attention::SsmGatedDeltaChunked { .. }
             | Attention::SsmKdaStep { .. }
-            | Attention::SsmKdaChunked { .. } => true,
+            | Attention::SsmKdaChunked { .. }
+            // The n-gram hasher's window of token ids is a state slab too.
+            | Attention::PleNgramIds { .. }
+            | Attention::PleNgramIdsChunked { .. } => true,
             // Everything else reads: the plan builders, the attention kernels
             // and their epilogues, the MLA projections, the indexer's scoring,
             // the pool's boundary math and gather.
@@ -692,6 +695,7 @@ mod tests {
                     caches: vec![crate::CacheRow::State {
                         name: "state".to_string(),
                         slab: vec![1],
+                        dtype: crate::Dtype::Bf16,
                     }],
                     values: Vec::new(),
                     nodes: Vec::new(),

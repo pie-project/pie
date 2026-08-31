@@ -15,7 +15,7 @@ use tokenizer::Tokenizer;
 use crate::decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, special, specials};
 
-const STOP_TOKENS: &[&str] = &["<|im_end|>", "[EOS]"];
+pub const STOP_TOKENS: &[&str] = &["<|im_end|>", "[EOS]"];
 const THINK_OPEN: &str = "<think>";
 
 pub struct Kimi {

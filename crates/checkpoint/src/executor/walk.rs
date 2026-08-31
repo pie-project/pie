@@ -36,6 +36,7 @@ use super::{Progress, Residency};
 use crate::codec::cast::{cast_elements, decode_values, encode_values};
 use crate::codec::fp8::{decode_fp8_e4m3_elements, f32_to_fp8_e4m3};
 use crate::codec::int4::decode_int4b8_elements;
+use crate::codec::mlx::decode_mlx_affine_codes;
 use crate::codec::mlx::mlx_affine_group_params;
 use crate::codec::mxfp4::{decode_mxfp4_elements, encode_mxfp4_group};
 use crate::codec::rows::{EncodeOperand, encode_rows};
@@ -1287,7 +1288,9 @@ impl Walk<'_, '_> {
             TileMapKind::Scale => {
                 self.scale_bytes(source, inputs, outputs.first().copied(), &input, &transform)?
             }
-            TileMapKind::Bias => self.bias_bytes(source, inputs, &input, &transform)?,
+            TileMapKind::Bias => {
+                self.bias_bytes(source, inputs, outputs.first().copied(), &input, &transform)?
+            }
             TileMapKind::Decode => {
                 self.decode_bytes(outputs.first().copied(), &input, &transform)?
             }
@@ -1515,14 +1518,14 @@ impl Walk<'_, '_> {
     /// single rounding a scale takes, and the reason both are stated as one
     /// kernel rather than as a host loop somebody writes twice.
     ///
-    /// There is no per-block form and no quantized operand; `infer_bias`
-    /// refused both before a plan existed, so anything reaching here is a
-    /// plain float buffer and the only thing that can go wrong is the dtype
-    /// being absent, which is a plan bug rather than a contract's.
+    /// The operand is always a plain float buffer — a quantized operand was
+    /// refused before a plan existed, at both ranks: the per-block `Scale`
+    /// before a per-block `Bias` is what turned codes into numbers.
     fn bias_bytes(
         &self,
         source: Option<&SourceExtent>,
         inputs: &[BufferId],
+        output: Option<BufferId>,
         bytes: &[u8],
         transform: &TransformSpec,
     ) -> Result<Vec<u8>, Error> {
@@ -1533,6 +1536,12 @@ impl Walk<'_, '_> {
         } else {
             return Err(invalid("host Bias requires a source or input buffer"));
         };
+        if !transform.scale_blocks.is_empty() {
+            let output =
+                output.ok_or_else(|| invalid("per-block Bias requires an output buffer"))?;
+            let values = decode_values(bytes, dtype)?;
+            return self.fold_per_block(values, inputs, output, transform, "Bias", |v, f| v + f);
+        }
         let by = f32::from_bits(transform.bias_bits);
         let mut values = decode_values(bytes, dtype)?;
         for value in &mut values {
@@ -1574,19 +1583,39 @@ impl Walk<'_, '_> {
             }
         };
         if !transform.scale_blocks.is_empty() {
+            let output =
+                output.ok_or_else(|| invalid("per-block Scale requires an output buffer"))?;
             let elements = match transform.from {
                 None => decode_values(bytes, payload()?)?,
                 Some(QuantScheme::Mxfp4E2M1E8M0) => decode_mxfp4_elements(bytes),
                 Some(QuantScheme::Int4B8) => decode_int4b8_elements(bytes),
                 Some(QuantScheme::Fp8E4M3) => decode_fp8_e4m3_elements(bytes),
+                // Both affine widths land here, and the payload does not say
+                // which this is: the element count does. A whole number of
+                // codes fills the bytes at exactly one of the two widths.
+                Some(QuantScheme::MlxAffineU4) => {
+                    let total: i64 = self.buffer_shape(output)?.iter().product();
+                    let total = usize::try_from(total)
+                        .map_err(|_| invalid("per-block Scale output has a negative extent"))?;
+                    let bits = match (bytes.len() * 2 == total, bytes.len() == total) {
+                        (true, false) => 4,
+                        (false, true) => 8,
+                        _ => {
+                            return Err(invalid(format!(
+                                "{} bytes of MLX affine codes fill {total} elements at \
+                                 neither four nor eight bits",
+                                bytes.len()
+                            )));
+                        }
+                    };
+                    decode_mlx_affine_codes(bytes, bits)
+                }
                 Some(other) => {
                     return Err(invalid(format!(
                         "host Scale does not implement {other:?} elements"
                     )));
                 }
             };
-            let output =
-                output.ok_or_else(|| invalid("per-block Scale requires an output buffer"))?;
             return self.scale_per_block(elements, inputs, output, transform);
         }
         let dtype = payload()?;
@@ -1694,22 +1723,35 @@ impl Walk<'_, '_> {
         ])
     }
 
+    /// The multiply, as one spelling of [`Self::fold_per_block`].
     fn scale_per_block(
+        &self,
+        values: Vec<f64>,
+        inputs: &[BufferId],
+        output: BufferId,
+        transform: &TransformSpec,
+    ) -> Result<Vec<u8>, Error> {
+        self.fold_per_block(values, inputs, output, transform, "Scale", |v, f| v * f)
+    }
+
+    fn fold_per_block(
         &self,
         mut values: Vec<f64>,
         inputs: &[BufferId],
         output: BufferId,
         transform: &TransformSpec,
+        what: &'static str,
+        fold: impl Fn(f32, f32) -> f32,
     ) -> Result<Vec<u8>, Error> {
         let factors = *inputs
             .last()
-            .ok_or_else(|| invalid("per-block Scale has no factor operand"))?;
+            .ok_or_else(|| invalid(format!("per-block {what} has no factor operand")))?;
         let factors = decode_values(&self.buffer_bytes(factors)?, self.buffer_dtype(factors)?)?;
         let shape = self.buffer_shape(output)?.to_vec();
         let blocks = &transform.scale_blocks;
         if shape.len() != blocks.len() {
             return Err(invalid(format!(
-                "per-block Scale blocks {blocks:?} do not match output shape {shape:?}"
+                "per-block {what} blocks {blocks:?} do not match output shape {shape:?}"
             )));
         }
 
@@ -1723,7 +1765,7 @@ impl Walk<'_, '_> {
             let block = blocks[axis];
             if block <= 0 || shape[axis] % block != 0 {
                 return Err(invalid(format!(
-                    "per-block Scale block {block} does not divide axis {axis} of {shape:?}"
+                    "per-block {what} block {block} does not divide axis {axis} of {shape:?}"
                 )));
             }
             counts[axis] = shape[axis] / block;
@@ -1733,13 +1775,13 @@ impl Walk<'_, '_> {
         let total: i64 = shape.iter().product();
         if values.len() as i64 != total {
             return Err(invalid(format!(
-                "per-block Scale has {} elements but shape {shape:?} needs {total}",
+                "per-block {what} has {} elements but shape {shape:?} needs {total}",
                 values.len()
             )));
         }
         if factors.len() as i64 != running {
             return Err(invalid(format!(
-                "per-block Scale has {} factors but blocking {blocks:?} of {shape:?} \
+                "per-block {what} has {} factors but blocking {blocks:?} of {shape:?} \
                  needs {running}",
                 factors.len()
             )));
@@ -1755,7 +1797,7 @@ impl Walk<'_, '_> {
                 index += (coord[axis] / blocks[axis]) * strides[axis];
             }
             let factor = factors[index as usize] as f32;
-            *value = f64::from(*value as f32 * factor);
+            *value = f64::from(fold(*value as f32, factor));
             for axis in (0..shape.len()).rev() {
                 coord[axis] += 1;
                 if coord[axis] < shape[axis] {

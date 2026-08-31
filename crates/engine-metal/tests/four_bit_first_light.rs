@@ -72,7 +72,7 @@
 //! else — one row tile of one 16-row block, per projection. The three
 //! tests after the first two carry prompts chosen for their ROW COUNTS rather
 //! than their words, and between them they fire every rung and every arm that
-//! ladder has: the pre-cast pair at all three row blocks, the split-K pair and
+//! ladder has: the pre-cast pair at all three row blocks, the plain point and
 //! the plain stamped point (in a process of their own, since the tuning table
 //! freezes once — see [`RESPAWN_KEY`]), and a pad of twenty-six and then
 //! forty-eight rows past the end of a prompt.
@@ -168,13 +168,13 @@ const STEPS: usize = 8;
 /// [`PROMPT`] encodes to eight tokens, over `qmm_min_batch` — so the
 /// first-light prompt does reach the batched ladder, and since the 8 rung
 /// landed it sits exactly on the narrowest step: `bm_rung` answers 8,
-/// `mb_rows` pads nothing, and every projection launches ONE row tile whose
+/// `mb_block` pads nothing, and every projection launches ONE row tile whose
 /// every row the fire wrote. Everything the ladder does above that — a
 /// second row tile, the wider rungs, the column tile the second tile
 /// selects — is what the wider prompts below exist for.
 ///
 /// Twenty tokens is where the pad and the tiling do real work: `bm_rung`
-/// answers 16, `mb_rows` pads 20 up to 32, and the launch is TWO row tiles
+/// answers 16, `mb_block` pads 20 up to 32, and the launch is TWO row tiles
 /// of which twelve rows hold nothing.
 const PADDED_PROMPT: &str = "1, 2, 3, 4, 5, 6, 7,";
 
@@ -188,10 +188,10 @@ const PADDED_PROMPT: &str = "1, 2, 3, 4, 5, 6, 7,";
 const PADDED_ROWS: usize = 20;
 
 /// **THE RAGGED PREFILL.** Thirty-eight tokens: `bm_rung` answers 32, so
-/// `mb_rows` pads to 64 and the launch is two 32-row tiles with TWENTY-SIX
+/// `mb_block` pads to 64 and the launch is two 32-row tiles with TWENTY-SIX
 /// rows past the end of the prompt.
 ///
-/// That tail is the claim `mb_rows` makes and this prompt is where it is
+/// That tail is the claim `mb_block` makes and this prompt is where it is
 /// tested — a GEMM row's output depends only on its own input row, so the
 /// product of twenty-six rows of whatever the activation slot happened to
 /// hold cannot reach a row the fire reads. It lands in the result slot all
@@ -234,7 +234,7 @@ const PADDED_TOKENS: &[u32] = &[220, 23, 11, 220, 24, 11, 220, 16, 15];
 /// [`PADDED_TOKENS`] for [`RAGGED_PROMPT`] — `13, 14, `.
 const RAGGED_TOKENS: &[u32] = &[220, 16, 18, 11, 220, 16, 19, 11, 220];
 
-/// **THE WIDEST RUNG.** Eighty tokens: `bm_rung` answers 64, `mb_rows` pads
+/// **THE WIDEST RUNG.** Eighty tokens: `bm_rung` answers 64, `mb_block` pads
 /// to 128, and the launch is two 64-row tiles with FORTY-EIGHT rows past the
 /// end of the prompt.
 ///
@@ -275,8 +275,10 @@ const RESPAWN_KEY: &str = "PIE_U4_FP16_OFF";
 /// The boot document the re-entered process opens. One key, and the reason
 /// it is worth a process: with the FP16 matrix path off, `fp16_gemm_format`
 /// answers `false` for this bank, the pre-cast rung declines, and the two
-/// arms BELOW it — the split-K pair, and the plain stamped point at the
-/// vocabulary head where `split_k` refuses the split — become reachable.
+/// arm BELOW it — the plain stamped point — becomes reachable. It used to
+/// reach the split-K pair as well; see
+/// [`the_plain_stamped_point_matches_the_same_tokens_with_fp16_off`] for
+/// where that arm went.
 const FP16_OFF: &[u8] = b"[metal.tuning]\nfp16_qmm = false\n";
 
 /// A contract lookup the re-entered process never reaches: [`FP16_OFF`] is
@@ -644,27 +646,34 @@ fn a_ragged_prefill_pads_to_the_wider_rungs_and_its_tail_reaches_no_real_row() {
     );
 }
 
-/// **RUNGS 3 AND 4: the split-K pair and the plain stamped point**, over the
-/// same three prompts and against the same pinned tokens — which is the claim,
-/// since a split that folded its partials wrongly, or a plain point whose
-/// column tile read the wrong scales, would answer something else.
+/// **THE PLAIN STAMPED POINT**, over the same three prompts and against the
+/// same pinned tokens — which is the claim, since a plain point whose column
+/// tile read the wrong scales would answer something else. `fp16_qmm` off is
+/// what reaches it: with the FP16 matrix path on, every dense projection of a
+/// 4-bit/group-64 checkpoint takes the pre-cast arm above and this one never
+/// runs.
 ///
-/// All three prompts, because the split is chosen PER PROJECTION and per row
-/// rung: at these counts the narrower projections take it 2 to 16 ways deep,
-/// the 7168- and 8192-wide ones have tiles enough of their own and fall to
-/// the plain point, and the vocabulary head is refused the split outright —
-/// `split_k` declines any output past 8192 — so one fire covers both arms and
-/// the three rungs cover the row tile each is stamped at.
+/// **IT USED TO REACH THE SPLIT-K PAIR TOO, AND THERE IS NO SPLIT ANY MORE.**
+/// `linear::quant::act_x_wt` took the split whenever the pre-cast arm
+/// declined, which with `fp16_qmm` off was every projection narrow enough;
+/// it is deleted, because a partitioned contraction is not the order the
+/// unsplit tile walks and its depth was a function of the FIRE's row count.
+/// `linear::quant::split_k` carries the argument and
+/// `affine_floor`'s fingerprint matrix carries the measurement. The three
+/// prompts and the pinned tokens stay exactly as they were — and that they
+/// still pass is worth something on its own: the split and the plain point
+/// were landing the same TOKENS while landing different BITS, which is the
+/// whole reason a greedy gate is not an invariance gate.
 ///
 /// Runs in a process of its own: see [`RESPAWN_KEY`].
 #[test]
-fn the_split_k_pair_and_the_plain_point_match_the_same_tokens_with_fp16_off() {
+fn the_plain_stamped_point_matches_the_same_tokens_with_fp16_off() {
     if std::env::var_os(RESPAWN_KEY).is_none() {
         if !engine_metal::device::present() {
-            eprintln!("skipping the split-K arm: this machine publishes no Metal device");
+            eprintln!("skipping the plain point: this machine publishes no Metal device");
             return;
         }
-        return respawn("the_split_k_pair_and_the_plain_point_match_the_same_tokens_with_fp16_off");
+        return respawn("the_plain_stamped_point_matches_the_same_tokens_with_fp16_off");
     }
     // The re-entered process. The table is laid down before anything has
     // asked for it, which is the entire reason this is a process and not a
@@ -676,13 +685,13 @@ fn the_split_k_pair_and_the_plain_point_match_the_same_tokens_with_fp16_off() {
          one that is only reachable when it does"
     );
     let _serial = serialized();
-    let Some((mut shell, tokenizer)) = ready("the split-K and plain arms") else {
+    let Some((mut shell, tokenizer)) = ready("the plain arm") else {
         return;
     };
     pinned(
         &mut shell,
         &tokenizer,
-        "the split-K pair",
+        "the plain point",
         PADDED_PROMPT,
         PADDED_ROWS,
         PADDED_TOKENS,
@@ -690,7 +699,7 @@ fn the_split_k_pair_and_the_plain_point_match_the_same_tokens_with_fp16_off() {
     pinned(
         &mut shell,
         &tokenizer,
-        "the split-K pair at the second rung",
+        "the plain point at the second rung",
         RAGGED_PROMPT,
         RAGGED_ROWS,
         RAGGED_TOKENS,
@@ -698,7 +707,7 @@ fn the_split_k_pair_and_the_plain_point_match_the_same_tokens_with_fp16_off() {
     pinned(
         &mut shell,
         &tokenizer,
-        "the split-K pair at the third rung",
+        "the plain point at the third rung",
         WIDE_PROMPT,
         WIDE_ROWS,
         WIDE_TOKENS,

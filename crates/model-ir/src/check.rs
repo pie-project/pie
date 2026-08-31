@@ -421,9 +421,15 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             Attention::PoolLse { .. } => {
                 &[(In(1), I32), (In(2), I32), (In(3), CACHE), (Out(1), F32)]
             }
+            // The hasher reads ids and writes ids; its window cache is the
+            // state slab between them.
+            Attention::PleNgramIds { .. } | Attention::PleNgramIdsChunked { .. } => {
+                &[(In(0), I32), (In(1), CACHE), (Out(0), I32)]
+            }
         },
         Operation::Linear(op) => match op {
             Linear::MoeTopkSoftmax { .. }
+            | Linear::MoeTopkSoftmaxScaled { .. }
             | Linear::MoeTopkSigmoid { .. }
             | Linear::MoeTopkSqrtSoftplus { .. } => &[(Out(0), I32), (Out(1), F32)],
             Linear::MoeMatmulSelect { .. } => &[(In(2), I32)],
@@ -484,10 +490,15 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::ResBlend { .. }
             | Elementwise::GateSigmoidMul { .. }
             | Elementwise::HcExpand { .. }
-            | Elementwise::HcFold { .. } => &[],
+            | Elementwise::HcFold { .. }
+            | Elementwise::RmsnormGroupedPlusOne { .. }
+            | Elementwise::SiluScaled { .. }
+            | Elementwise::HcMix { .. }
+            | Elementwise::HcInject { .. }
+            | Elementwise::PleGate { .. } => &[],
         },
         Operation::Layout(op) => match op {
-            Layout::Embed { .. } => &[(In(0), I32)],
+            Layout::Embed { .. } | Layout::EmbedConcat { .. } => &[(In(0), I32)],
             // The interpolating gather pins BOTH its geometry ports: the taps
             // are i32 like every index vector here, and the weights are f32
             // because they are the preprocessor's arithmetic and not the
@@ -552,7 +563,7 @@ impl Display for N {
             Dtype::I32 => "i32", Dtype::U32 => "u32", Dtype::U8 => "u8",
             Dtype::I8 => "i8", Dtype::Fp8E4m3 => "fp8e4m3", Dtype::Fp4 => "fp4",
             Dtype::Mxfp4 => "mxfp4", Dtype::MlxU4 => "mlxu4",
-            Dtype::MlxU8 => "mlxu8",
+            Dtype::MlxU8 => "mlxu8", Dtype::MlxU4G32 => "mlxu4g32",
             Dtype::E8m0 => "e8m0",
             Dtype::Fp8E5m2 => "fp8e5m2", Dtype::I64 => "i64", Dtype::I16 => "i16",
             Dtype::U64 => "u64", Dtype::U16 => "u16", Dtype::Bool => "bool",

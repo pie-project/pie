@@ -108,8 +108,15 @@ pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_pe
 /// are already plain, and the price of an archive that kept its source
 /// packing. The three masks below say the same thing about their own backends;
 /// this is the copy that states it.
+///
+/// `TILE_MAP_BIAS` arrived the way Metal's did: with the load that needed
+/// it, which is what the gap paragraph below demanded. `qwen38-flash-mlxu4`
+/// lands its projections dense out of a 4-bit file — an in-plan affine
+/// decode whose zero-point half is a per-block `Bias` — and every plain-norm
+/// import of an MLX spelling carries the `-1.0` fold-undo besides. Both run
+/// on the host, exactly as the `Scale` next to them does.
 pub const CUDA_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE;
+    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE | TILE_MAP_BIAS;
 
 /// The transforms a plan for a Metal target may CARRY.
 ///
@@ -148,12 +155,12 @@ pub const CUDA_TILE_MAP_MASK: u32 =
 /// take it back out; declaring that refused the load with a mask, four stages
 /// before anything ran.
 ///
-/// **CUDA AND VULKAN HAVE THE SAME GAP AND ARE LEFT ALONE HERE.** The
-/// argument above transfers verbatim — neither shell implements
-/// `run_tile_map` either — but no checkpoint in this lane exercised it, and a
-/// capability widened on reasoning rather than on a load that needed it is
-/// the kind of claim this file's own history warns about. `gemma-4` from a
-/// llama.cpp artifact is the case that will need it.
+/// **VULKAN KEEPS THE GAP.** The argument above transfers verbatim — its
+/// shell implements `run_tile_map` no more than the others — but no
+/// checkpoint in its lane has exercised it, and a capability widened on
+/// reasoning rather than on a load that needed it is the kind of claim this
+/// file's own history warns about. CUDA's copy of the gap closed when
+/// `qwen38-flash-mlxu4` arrived (see `CUDA_TILE_MAP_MASK`).
 ///
 /// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
 pub const METAL_TILE_MAP_MASK: u32 =

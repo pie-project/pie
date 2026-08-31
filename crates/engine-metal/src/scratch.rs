@@ -3,7 +3,7 @@
 //!
 //! **THE ARENA ANSWERS ONLY WHAT THE COMPILER CARVED.** `model_compiler::
 //! arena` places one rectangle per plan VALUE, and [`Run::tensor`] hands a
-//! dispatch arm exactly the rectangles its op named. Four measured wins want
+//! dispatch arm exactly the rectangles its op named. Three measured wins want
 //! something no op names and no value is: a staging plane the device writes
 //! and reads inside one dispatch chain, dead before the chain ends. This
 //! module is where that room comes from.
@@ -11,8 +11,6 @@
 //! ```text
 //! precast    rows x K halves      the FP16 pre-cast GEMM stages its
 //!                                 activation here once per projection
-//! partials   split x M x N f32    the split-K GEMM's per-split sums,
-//!                                 before `qmm_splitk_reduce` folds them
 //! routed     the sorted stack     the MoE sort-batch's permutation, its
 //!                                 inverse, the per-tile expert, and the
 //!                                 gathered x/y in expert-major order
@@ -49,21 +47,15 @@
 //! because the lifetimes are short enough to check by hand:
 //!
 //!   * **No two roles are live in one dispatch chain.** A dense projection
-//!     against a bank fires the pre-cast arm or the split arm, never both,
-//!     and neither is a routed matmul, which is a different op. So a role's
-//!     bytes are dead before the next role's first dispatch is encoded.
+//!     against a bank is not a routed matmul, which is a different op. So a
+//!     role's bytes are dead before the next role's first dispatch is
+//!     encoded.
 //!
-//!     **AND THAT IS THE LADDER'S RULE, NOT THE SHADER'S ABSENCE.** This
-//!     bullet used to say the two cannot compose because no point is stamped
-//!     `fp16_precast_splitk`, and `quant_qmm_t.metal` stamps six of them —
-//!     `affine_qmm_t_splitk_fp16_precast_{bfloat16,f32_bfloat16}` at all
-//!     three row rungs. What holds is one line above them:
-//!     `linear::quant::act_x_wt` RETURNS out of the pre-cast arm, so the
-//!     split arm is reachable only when the pre-cast one declined. A day this
-//!     plane wants the composed point is a day it must stop aliasing these
-//!     two rooms — the chain would stage its activation into the very bytes
-//!     it then writes partials over, which is a wrong answer and not a slow
-//!     one.
+//!     **THIS BULLET USED TO HAVE A THIRD ROLE TO ARGUE ABOUT.** It read the
+//!     pre-cast arm against the split-K arm and said the two cannot compose;
+//!     the split arm is gone (`linear::quant::act_x_wt`, for having different
+//!     bits from the rest of its family) and so is the plane it wrote, so
+//!     there are two aliased roles here and the question does not arise.
 //!   * **Within a role, order is the encoder's.** A compute pass opened by
 //!     `Context::frame` is `MTLDispatchTypeSerial`: every dispatch observes
 //!     the writes of every dispatch before it, which is what makes
@@ -77,9 +69,9 @@
 //!     is never read, because each role's first dispatch writes every byte it
 //!     later reads.
 //!
-//! So the footprint of those three is `max(precast, partials, routed)` and the
-//! two dense roles are free on any artifact whose mixture is bigger than they
-//! are, which is every artifact that has one.
+//! So the footprint of those two is `max(precast, routed)` and the dense role
+//! is free on any artifact whose mixture is bigger than it is, which is every
+//! artifact that has one.
 //!
 //! **AND THE COPY ROLE FAILS THE FIRST SENTENCE, SO IT IS ADDED RATHER THAN
 //! UNIONED.** A `Fallback::Copy` brackets a whole REGION
@@ -89,8 +81,8 @@
 //! live ACROSS the region's dispatch chains, not inside one — and a region is
 //! a coalesced run of nodes with one class mask, which is a set the compiler
 //! chooses and this file does not get to constrain. Nothing stops such a
-//! region from holding a quantized projection (precast, or split-K partials)
-//! or a routed matmul; P4's withdrawn regions on today's catalog hold neither,
+//! region from holding a quantized projection's pre-cast staging or a routed
+//! matmul; P4's withdrawn regions on today's catalog hold neither,
 //! but that is a fact about five model texts and not an invariant, and a
 //! reservation resting on it would come apart the first time a mixture landed
 //! in a withdrawn window. The three sentences above are checkable by hand
@@ -98,7 +90,7 @@
 //! not, so it is charged honestly:
 //!
 //! ```text
-//! bytes = max(precast, partials, routed) + copy
+//! bytes = max(precast, routed) + copy
 //! ```
 //!
 //! What that costs is bounded and small, and the bound is the bucket lattice's
@@ -116,9 +108,8 @@
 //! that taught it. This plane is not that, and the reason is arithmetic
 //! rather than intent: the precast rectangle is BY CONSTRUCTION one arena
 //! activation, and the arena holds dozens of those live at the same instant.
-//! A partials plane is smaller again, because the split declines itself for
-//! any output wide enough to matter. So the whole plane is a low single-digit
-//! percentage of the arena beside it, on every shape either one is sized at.
+//! So the whole plane is a low single-digit percentage of the arena beside
+//! it, on every shape it is sized at.
 //!
 //! # What each ceiling is, in arithmetic
 //!
@@ -130,17 +121,6 @@
 //! weight's declared rectangle is `[N, K]` for a dense bank and `[E, N*K]`
 //! for an expert bank, so a table walk that did not know which was which
 //! would size the plane at an expert bank's whole slab.
-//!
-//! **partials.** `split x M x N x 4B`, and the honest bound is not the
-//! product of three maxima — the split exists to supply threadgroups the
-//! output tiles do not, so it is large only where `M` and `N` are small.
-//! [`quant::split_k`] is the function that decides it, so this asks IT,
-//! sweeping the artifact's own `(N, K)` pairs against every row count the
-//! budget admits and taking the largest product any of them selects. The
-//! result is bounded by the selection's own target — a split dispatch aims
-//! near a fixed threadgroup count, each threadgroup covering one tile — which
-//! is why a partials plane is single-digit MiB on every model and not a
-//! function of the vocabulary.
 //!
 //! **routed.** Whatever [`RoutedScratch`] declares, at `sorted_rows` of the
 //! ceiling fire: four `i32` vectors and the gathered `x`/`y` at
@@ -164,7 +144,6 @@
 
 use kernels_metal::Tensor;
 use kernels_metal::linear::moe::{self, RoutedScratch};
-use kernels_metal::linear::quant;
 use model_compiler::{Budget, CompiledModel, Fallback, FireRows};
 use model_exec::store::arena::rect;
 use model_ir::{Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
@@ -256,7 +235,6 @@ pub struct Scratch {
     plane: Buffer,
 
     precast: Option<Room>,
-    partials: Option<Room>,
     routed: Option<Routed>,
     /// **NOT ALIASED ONTO THE THREE ABOVE**, and the header's fourth bullet
     /// is why: a copy's bytes are live across a whole region's dispatch
@@ -386,10 +364,6 @@ impl Scratch {
             let mut at = 0u64;
             Room::lay(&mut at, act_rows, act_k, Dtype::F16)
         });
-        let partials = split_ceiling(&dense, budget).map(|elements| {
-            let mut at = 0u64;
-            Room::lay(&mut at, 1, elements, Dtype::F32)
-        });
         let routed = (sorted > 0).then(|| {
             let mut at = 0u64;
             Routed {
@@ -409,7 +383,6 @@ impl Scratch {
 
         let union = precast
             .map_or(0, |r| r.at + r.bytes())
-            .max(partials.map_or(0, |r| r.at + r.bytes()))
             .max(routed.map_or(0, |r| r.y.at + r.y.bytes()));
         // **ADDED, NOT UNIONED** — the header's fourth bullet. It starts
         // where the three aliased roles end, so a copied region holding a
@@ -424,7 +397,6 @@ impl Scratch {
         Ok(Scratch {
             plane: Buffer::zeroed(device, bytes)?,
             precast,
-            partials,
             routed,
             copy,
             capacity: crate::arena::capacities(map),
@@ -476,34 +448,6 @@ impl Scratch {
             ..room
         }
         .bind(handles, &self.plane))
-    }
-
-    /// The split-K partials plane, cut to `split * rows x width` f32.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Ceiling`](crate::error::Fault::Ceiling) for a handle table
-    /// already full.
-    pub fn partials(
-        &self,
-        handles: &Handles,
-        split: u32,
-        rows: u32,
-        width: u32,
-    ) -> Option<Result<Tensor>> {
-        let room = self.partials?;
-        let want = u64::from(split) * u64::from(rows) * u64::from(width);
-        if want > room.bytes() / 4 {
-            return None;
-        }
-        Some(
-            Room {
-                rows: u32::try_from(u64::from(split) * u64::from(rows)).unwrap_or(u32::MAX),
-                width,
-                ..room
-            }
-            .bind(handles, &self.plane),
-        )
     }
 
     /// One rectangle of the copy role's slab, at `offset` bytes into it.
@@ -672,6 +616,9 @@ fn routers(trace: &Trace) -> Vec<u32> {
             Linear::MoeTopkSoftmax {
                 routes, experts, ..
             }
+            | Linear::MoeTopkSoftmaxScaled {
+                routes, experts, ..
+            }
             | Linear::MoeTopkSigmoid {
                 routes, experts, ..
             }
@@ -685,39 +632,4 @@ fn routers(trace: &Trace) -> Vec<u32> {
         }
     }
     out
-}
-
-/// The most f32 partials any split this artifact can select will hold.
-///
-/// **ASKS THE SELECTION RATHER THAN RESTATING ITS CONSTANTS.**
-/// [`quant::split_k`] is the function that decides how deep to split, and it
-/// declines the split entirely for an output too wide or a rectangle with
-/// tiles enough of its own — so the ceiling is found by sweeping the row
-/// counts the budget admits against this artifact's own `(N, K)` pairs and
-/// taking the largest thing the selection says yes to. A bound written here
-/// instead would be this plane's second copy of a rule that already has one,
-/// and would go stale the first time the target threadgroup count moved.
-///
-/// `None` when nothing in this artifact can take the split path at all.
-fn split_ceiling(dense: &[(u32, u32)], budget: &Budget) -> Option<u64> {
-    let mut most = 0u64;
-    for &(n, k) in dense {
-        let (Ok(n), Ok(k)) = (i32::try_from(n), i32::try_from(k)) else {
-            continue;
-        };
-        for rows in 1..=budget.max_tokens {
-            let Ok(m) = i32::try_from(rows) else { continue };
-            let bm = quant::bm_rung(m);
-            let split = quant::split_k(n, m, k, bm);
-            if split < 2 {
-                continue;
-            }
-            // The dispatch is grid-padded up to whole row tiles, so the
-            // partials are too: a split writes `ceil(M/BM)*BM` rows.
-            let padded = u64::from(m.unsigned_abs().div_ceil(bm.unsigned_abs()))
-                * u64::from(bm.unsigned_abs());
-            most = most.max(u64::from(split.unsigned_abs()) * padded * u64::from(n.unsigned_abs()));
-        }
-    }
-    (most > 0).then_some(most)
 }

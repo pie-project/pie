@@ -156,6 +156,31 @@ pub fn moe_topk_softmax(logits: &Value, experts: u32, top_k: u32) -> (Value, Val
     (routes, weights)
 }
 
+/// The same top-k and the same softmax over the selected, times the learned
+/// per-expert gain `scale[routes[t, k]]`.
+pub fn moe_topk_softmax_scaled(
+    logits: &Value,
+    scale: &Weight,
+    experts: u32,
+    top_k: u32,
+) -> (Value, Value) {
+    let r = logits.rec();
+    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
+    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
+    r.push(
+        Linear::MoeTopkSoftmaxScaled {
+            logits: logits.id(),
+            scale: r.weight(scale),
+            experts,
+            top_k,
+            routes: routes.id(),
+            weights: weights.id(),
+        },
+        &[logits],
+    );
+    (routes, weights)
+}
+
 pub fn moe_topk_sigmoid(
     logits: &Value,
     experts: u32,

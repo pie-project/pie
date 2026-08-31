@@ -172,6 +172,9 @@
   } else if (group_size == 8) {                              \
     constexpr size_t GROUP_SIZE = 8;                         \
     __VA_ARGS__                                              \
+  } else if (group_size == 12) {                             \
+    constexpr size_t GROUP_SIZE = 12;                        \
+    __VA_ARGS__                                              \
   } else {                                                   \
     std::ostringstream err_msg;                              \
     err_msg << "Unsupported group_size: " << group_size;     \

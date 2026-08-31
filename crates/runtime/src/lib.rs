@@ -30,35 +30,7 @@ pub mod inferlet;
 /// model are facts about serving, and this is the serving fabric.
 pub mod model;
 pub(crate) mod pipeline;
-pub mod offload {
-    pub use crate::pipeline::offload::{
-        OffloadCounterSnapshot, Partner, PartnerGuard, PartnerRole, TransferKind, clear_partners,
-        close_engine_surrogates, configure, configure_encode_injection, counters, home_kv_handle,
-        register_partner, remove_partner, select_partner, set_home_kv_handle,
-    };
-
-    pub fn register_remote_store(
-        model_idx: usize,
-        engine_idx: usize,
-        kv_page_size: u32,
-        base_page: u32,
-        num_kv_pages: usize,
-    ) -> anyhow::Result<()> {
-        crate::store::registry::register_engine_with_swap(
-            model_idx,
-            engine_idx,
-            kv_page_size,
-            base_page,
-            num_kv_pages,
-            0,
-            0,
-        )
-    }
-
-    pub fn unregister_remote_store(model_idx: usize, engine_idx: usize) -> anyhow::Result<()> {
-        crate::store::registry::unregister_engine(model_idx, engine_idx)
-    }
-}
+pub mod offload;
 pub mod planner;
 pub mod scheduler;
 pub mod server;

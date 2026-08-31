@@ -194,9 +194,67 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 // metal fingerprint; what moved in `golden-msl/` is again only the version
 // spelled into `ptir_m3_generic_{ready,commit}_v39`. CUDA took this fix first
 // and its row does not move.
+// Re-pinned an eleventh time, WITH a metal bump, and this one is a wrong
+// answer rather than a slow one. `emit_grouped_fused_region`'s fused
+// gather-and-argmax strode its columns by `constexpr uint am_w =
+// METAL_M3_REGION_THREADS`, on the reading that a grouped launch is always
+// that wide. It cannot be: a threadgroup's width is capped by the PIPELINE's
+// `maxTotalThreadsPerThreadgroup`, which falls with register pressure, and
+// `beam_epilogue`'s 67-op region measures 384 on an M1 Max. At any narrower
+// launch the columns the missing threads owned were never visited and the
+// argmax answered a confident wrong index. The stride is `m3_threads` now --
+// the number of threads that actually exist -- so the column classes
+// partition the row exactly at every width:
+//
+//   39 -> 40  the grouped argmax stops assuming its own launch width.
+//             `engine-metal` binds `KernelKind::Grouped` for the first time in
+//             this same wave (the twelve-channel ceiling and the single-thread
+//             sampler are both the M2 form's), so this is the wave that could
+//             first observe it -- and the bump is load-bearing rather than
+//             hygienic, because a library cached under 39 for one of these
+//             programs IS the 512-strided source.
+//
+// One golden moves, `emit_grouped_fused_region_msl.txt`, plus the version
+// spelled into `ptir_m3_generic_{ready,commit}_v40`. `emit_fused_region`'s
+// bytes are untouched -- the single-lane kernel has one thread and no stride
+// to get wrong -- and CUDA does not share this emitter at all, so its row
+// stands.
+// Re-pinned a twelfth time, WITH a metal bump, and this one adds an argument
+// rather than fixing one. `M3GroupLayout::vocab` is the grouped form's row
+// pitch -- the kernel already multiplied a row index by it -- but the emitted
+// gather spent that ONE number on two jobs: the pitch it strides the SOURCE by
+// and the width it walks each row for. While the host wrote the reader's own
+// declared width into it the two were the same number and the conflation was
+// invisible; it is also exactly what made a narrow multi-row read
+// inexpressible on this plane, because row `r` began `last` elements in rather
+// than a whole rectangle row. `engine-metal`'s `program::launch` said so by
+// name and refused the shape -- which is beam search's `[B, V]` logits read,
+// and consensus decoding's.
+//
+// The two numbers are now two. The gather and the fused gather-and-argmax take
+// their ROW WIDTH from `intrinsic_desc.last` / `am_in.last` -- the reader's own
+// claim, which is where the single-lane `0xA0` handler reads it too -- and
+// their PITCH from `layout->vocab`, which the host now fills with the
+// RECTANGLE's width. The relation checked is the CUDA handler's and not a
+// stricter one: `ptir_m1_runtime_body.cuh` faults on `stride < logical_width`
+// and on nothing else about the two, so a declared row stays a CEILING.
+//
+//   40 -> 41  the grouped gather stops spending one word on the pitch and the
+//             row width both. Where a reader is full-width the two are equal
+//             and not a byte of behaviour moves; where it is narrow, this is
+//             the whole of what `intrinsic_row_stride` buys the CUDA twin. The
+//             bump is load-bearing rather than hygienic: a library cached
+//             under 40 for one of these programs IS the source that strides
+//             the source rows by the reader's width.
+//
+// One golden moves, `emit_grouped_fused_region_msl.txt`, plus the version
+// spelled into `ptir_m3_generic_{ready,commit}_v41`. `emit_fused_region`'s
+// bytes are untouched -- the single-lane form still has no stride to be told,
+// and keeps its one-row refusal, now stated at encode where the form is known
+// -- and CUDA does not share this emitter, so its row stands.
 const PINNED: &[(&str, u16, u64)] = &[
     ("cuda", 24, 0xc692_ce36_f07d_34df),
-    ("metal", 39, 0x95ca_0859_8ea8_afeb),
+    ("metal", 41, 0x899e_c2bd_850b_0273),
 ];
 
 /// Everything an engine receives for both corpora, hashed.

@@ -1,7 +1,7 @@
 use checkpoint::contract::ModelContract;
 use model_dsl::{Dtype, Weight};
 
-use crate::contract::{ModelError, claim, elaborate};
+use checkpoint_dsl::Error;
 
 pub struct Model {
     pub hidden: u32,
@@ -428,49 +428,49 @@ impl Model {
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
 impl Model {
-    pub fn load(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
-        let mut claims = Vec::new();
-        let mut state = |w: &Weight| claims.push(claim(w, self.tp));
-        state(&self.embed);
-        state(&self.final_norm);
-        state(&self.head);
+    pub fn load(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
+        let mut b = checkpoint_dsl::Builder::new(src, self.tp);
+        let mut state = |w: &Weight| b.read_own(w);
+        state(&self.embed)?;
+        state(&self.final_norm)?;
+        state(&self.head)?;
         for layer in &self.layers {
-            state(&layer.mixer_norm);
-            state(&layer.mlp_norm);
+            state(&layer.mixer_norm)?;
+            state(&layer.mlp_norm)?;
             if let Some(res) = &layer.res_blend {
-                state(&res.norm);
-                state(&res.proj);
+                state(&res.norm)?;
+                state(&res.proj)?;
             }
             match &layer.mixer {
                 Mixer::Mla(a) => {
-                    state(&a.q_a_proj);
-                    state(&a.q_a_norm);
-                    state(&a.q_b_proj);
-                    state(&a.kv_a_proj);
-                    state(&a.kv_a_norm);
-                    state(&a.kv_b_proj);
+                    state(&a.q_a_proj)?;
+                    state(&a.q_a_norm)?;
+                    state(&a.q_b_proj)?;
+                    state(&a.kv_a_proj)?;
+                    state(&a.kv_a_norm)?;
+                    state(&a.kv_b_proj)?;
                     if let Some(gate) = &a.gate {
-                        state(gate);
+                        state(gate)?;
                     }
-                    state(&a.o_proj);
+                    state(&a.o_proj)?;
                 }
                 Mixer::Kda(k) => {
-                    state(&k.qkv);
-                    state(&k.conv);
-                    state(&k.f_a);
-                    state(&k.f_b);
-                    state(&k.b);
-                    state(&k.dt_bias);
-                    state(&k.a_log);
-                    state(&k.gate);
-                    state(&k.o_norm);
-                    state(&k.o_proj);
+                    state(&k.qkv)?;
+                    state(&k.conv)?;
+                    state(&k.f_a)?;
+                    state(&k.f_b)?;
+                    state(&k.b)?;
+                    state(&k.dt_bias)?;
+                    state(&k.a_log)?;
+                    state(&k.gate)?;
+                    state(&k.o_norm)?;
+                    state(&k.o_proj)?;
                 }
             }
             match &layer.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    state(gate_up);
-                    state(down);
+                    state(gate_up)?;
+                    state(down)?;
                 }
                 Mlp::Routed {
                     router,
@@ -479,16 +479,16 @@ impl Model {
                     shared,
                     ..
                 } => {
-                    state(router);
-                    state(gate_up);
-                    state(down);
+                    state(router)?;
+                    state(gate_up)?;
+                    state(down)?;
                     if let Some(s) = shared {
-                        state(&s.gate_up);
-                        state(&s.down);
+                        state(&s.gate_up)?;
+                        state(&s.down)?;
                     }
                 }
             }
         }
-        elaborate(src, claims)
+        Ok(b.build())
     }
 }

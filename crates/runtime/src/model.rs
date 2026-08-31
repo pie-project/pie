@@ -152,6 +152,12 @@ pub const ROWS: &[Row] = &[
         arch: "gemma4",
     },
     Row {
+        id: "gemma4-26b-a4b-mlxu4-kv-bf16",
+        layers: 30,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
+    Row {
         id: "gemma4-31b-bf16-kv-bf16",
         layers: 60,
         vocab: 262_144,
@@ -233,10 +239,29 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // **QWEN3.8-27B: THE SAME NUMBERS, AND THAT IS THE FINDING.** The 3.8
+    // checkpoint is 3.6's artifact surface tensor for tensor (the catalog's
+    // qwen38 comment carries the evidence); what changed is the chat template
+    // (interleaved thinking) and seven reserved audio/tts specials INSIDE the
+    // same vocab — so every number here is its twin's, and `arch` stays
+    // `qwen3_5` because the checkpoint's own `architectures` field says so.
+    // Reachable by `[model] sku`, never by identify (the twin shadows it).
+    Row {
+        id: "qwen38-27b-bf16-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
     // The mlx 4-bit rows: same trunk geometry as their bf16 siblings — the
     // quant is a storage fact, and nothing in this table reads storage.
     Row {
         id: "qwen36-27b-mlxu4-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen38-27b-mlxu4-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -298,6 +323,12 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         id: "qwen36-27b-vision-bf16-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen38-27b-vision-bf16-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -435,6 +466,29 @@ pub fn register(
         None => Tokenizer::from_file(&tokenizer_path)?,
     };
     let tokenizer = Arc::new(tokenizer);
+    // THE TOKENIZER CONTRACT, CHECKED BEFORE THE TEMPLATE RESOLVES A MARKER.
+    //
+    // The row declares what it reads from a vocabulary (stop markers, media
+    // delimiters, pinned specials — `model/<family>/tokenizer.rs`) and the
+    // artifact supplied one; whether they are each other's is settled here,
+    // as a named refusal, rather than by `chat_template::special`'s panic or
+    // by a media request failing an hour in. The pins are the teeth: a
+    // `qwen38` row pins the seven audio specials only a 3.8 tokenizer holds,
+    // so a 3.6 artifact deployed under the 3.8 SKU refuses at boot instead
+    // of serving bytes under a reading they were never trained for.
+    match ::model::tokenizer::contract_of(row.id) {
+        Some(contract) => contract.verify(&tokenizer).map_err(|fault| {
+            anyhow!("`{}` refuses this artifact's tokenizer: {fault}", row.id)
+        })?,
+        None => {
+            return Err(anyhow!(
+                "this build serves {:?} but ships no tokenizer contract for \
+                 it; `model::tokenizer::contracts()` has no row under that \
+                 SKU",
+                row.id
+            ));
+        }
+    }
     // THE CHAT TEMPLATE, CHOSEN BY THE ROW THE ENGINE LOADED.
     //
     // `create` used to take `arch_name` — a `model_type` string off the
@@ -522,7 +576,7 @@ pub fn model() -> &'static Arc<Model> {
 pub fn media_pad() -> Option<u32> {
     static PAD: OnceLock<Option<u32>> = OnceLock::new();
     *PAD.get_or_init(|| {
-        use crate::inferlet::host::media::{front_end_for, multimodal};
+        use crate::inferlet::host::media::multimodal;
         let m = model();
         let arch = m.arch_name();
         // **THE PAD IS THE FRONT-END'S OWN, AND ONLY ITS OWN** (wave MD-C).
@@ -533,7 +587,7 @@ pub fn media_pad() -> Option<u32> {
         // article 8 forbids, and this is what a disagreement between them
         // costs — the orphan-run scan looking for a token no span is ever
         // written with, on the one model where it matters.
-        let spelling = front_end_for(arch)
+        let spelling = ::model::media::vision_front_end(arch)
             .map(|fe| fe.delimiters().placeholder)
             .or_else(|| multimodal::audio_arch_supported(arch).then(multimodal::audio_placeholder))?;
         match m.tokenize(spelling)[..] {
@@ -964,6 +1018,17 @@ mod tests {
             assert!(
                 ::model::template::template_of(r.id).is_some(),
                 "`{}` is a serving row with no chat template",
+                r.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_serving_row_ships_a_tokenizer_contract() {
+        for r in ROWS {
+            assert!(
+                ::model::tokenizer::contract_of(r.id).is_some(),
+                "`{}` is a serving row with no tokenizer contract",
                 r.id
             );
         }

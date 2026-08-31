@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use model::contract::ModelError;
+use checkpoint_dsl::Error;
 use model_dsl::Platform;
 
 #[test]
@@ -64,6 +64,39 @@ fn every_sku_names_exactly_one_chat_template() {
             n => faults.push(format!(
                 "`{sku}` names {n} chat templates; `template_of` returns the \
                  first and the rest are unreachable"
+            )),
+        }
+    }
+
+    assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
+}
+
+#[test]
+fn every_sku_names_exactly_one_tokenizer_contract() {
+    let mut faults = Vec::new();
+    let catalog: BTreeSet<&str> = model::catalog().into_iter().map(|(sku, ..)| sku).collect();
+
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (sku, _) in model::tokenizer::contracts() {
+        if !catalog.contains(sku) {
+            faults.push(format!(
+                "a `TOKENIZERS` row states what `{sku}` reads from its \
+                 vocabulary and the catalog ships no such SKU"
+            ));
+        }
+        *counts.entry(sku).or_default() += 1;
+    }
+
+    for sku in &catalog {
+        match counts.get(sku).copied().unwrap_or(0) {
+            1 => {}
+            0 => faults.push(format!(
+                "`{sku}` ships and names no tokenizer contract, so serve boot \
+                 could not check its vocabulary demands"
+            )),
+            n => faults.push(format!(
+                "`{sku}` names {n} tokenizer contracts; `contract_of` returns \
+                 the first and the rest are unreachable"
             )),
         }
     }
@@ -142,8 +175,8 @@ fn every_import_row_reads_the_checkpoint_it_is_handed() {
                  tensor no model reads, so its import table never asked the \
                  file what it holds"
             )),
-            Err(ModelError::Missing(_) | ModelError::Illegible { .. }) => {}
-            Err(why @ ModelError::Incompatible { .. }) => {
+            Err(Error::Missing(_) | Error::Illegible { .. }) => {}
+            Err(why @ Error::Incompatible { .. }) => {
                 faults.push(format!(
                     "`{sku}` refuses a checkpoint that holds nothing it reads \
                      with `{why}`, and a file that states none of its planes \

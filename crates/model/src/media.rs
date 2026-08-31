@@ -1,19 +1,30 @@
-//! **The media front-end contract: encoded bytes in, one [`EncodedSpan`] out.**
+//! **The media front-end contract: decoded pixels in, one [`EncodedSpan`] out.**
 //!
 //! `.wiki/alto/media-door.md` §4 draws four layers between a guest's `bytes`
-//! and the engine's tower, and this crate is the third of them. The guest hands
-//! the host a PNG/JPEG/WAV; the runtime's media host dispatches on the bound
-//! model's `arch` — and stops there. Everything after the dispatch — decode,
-//! resize, patchify, normalize, the interpolation taps of a resampled position
-//! table, log-mel — is a property of one architecture's processor, and lives
-//! behind [`VisionFrontEnd`] / [`AudioFrontEnd`].
+//! and the engine's tower, and this module is the third of them — moved into
+//! the catalog crate because it is CATALOG KNOWLEDGE: which architecture
+//! preprocesses how is a fact of the family, and it lives beside the family's
+//! forward pass, import contract and chat template
+//! ([`crate::qwen_3::media`], [`crate::gemma_4::media`]) rather than in a
+//! crate of its own with the same families spelled a second way.
+//!
+//! **THE CODEC IS NOT HERE, AND THAT IS THE CRATE'S OWN RULE.** This crate's
+//! manifest states that every dependency is one every consumer of the catalog
+//! needs, and a compiler does not need a JPEG decoder — the `serve` feature
+//! that once gated an image codec into this crate was removed with the module
+//! it gated (M18), and this contract is written so it does not come back. So
+//! the seam takes PIXELS: the host decodes (`runtime`'s codec module, the one
+//! caller), the front-end computes its architecture's target from the source
+//! dims, and the one step that needs an image library — the resample — is
+//! LENT through [`Resample`] rather than owned. Everything the front-end does
+//! itself is arithmetic transcribed from a reference processor.
 //!
 //! **THE TRAIT IS THE SEAM, AND IT IS THE SEAM IN BOTH DIRECTIONS.** Above it,
-//! the runtime never names an architecture: it asks for a front-end and gets
-//! one or gets [`Fault::NoVisionFrontEnd`], which is the only sentence it has
-//! to know how to say. Below it, a front-end never names a WIT resource, a
-//! resource table, a submission or a fire: it is a pure function from bytes to
-//! a span, which is what makes it testable against a pinned transcription
+//! the runtime never names an architecture: it asks [`vision_front_end`] and
+//! gets one or gets [`Fault::NoVisionFrontEnd`], which is the only sentence it
+//! has to know how to say. Below it, a front-end never names a WIT resource, a
+//! resource table, a submission or a fire: it is a pure function from pixels
+//! to a span, which is what makes it testable against a pinned transcription
 //! rather than against a running engine.
 //!
 //! **AND THE SPAN IS ONE STRUCT, NOT TWO.** An image span and an audio span
@@ -22,18 +33,6 @@
 //! carry a payload the tower turns into embedding rows. So [`EncodedSpan`] is
 //! the output of both traits, and `media-span`'s variant in the WIT is about
 //! which resource the guest is holding, not about which struct crosses here.
-
-#![forbid(unsafe_code)]
-#![deny(missing_docs)]
-
-// **THE PER-ARCHITECTURE IMPLEMENTATIONS** (media-door §6, wave MD-B). Each is
-// a pinned transcription of one reference processor and nothing else: no
-// engine, no runtime, no WIT. `decode` is private because the decode
-// dependency is an implementation detail of this crate and of no caller —
-// which is the property that lets it be argued and swapped in one file.
-mod decode;
-pub mod gemma4;
-pub mod qwen3_5;
 
 use std::fmt;
 
@@ -108,13 +107,68 @@ pub struct Delimiters {
     pub suffix: &'static str,
 }
 
+/// A decoded image, 8-bit RGB, row-major HWC — the one shape every front-end
+/// patchifies from, and the one interchange form that costs this crate no
+/// image library: a decoder and a demuxer both already hold exactly this.
+///
+/// HWC and not CHW because that is the memory order a decoder hands back and
+/// the order both patchifiers stride over; a transpose to plane-major would
+/// buy one front-end nothing and cost a full copy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rgb8 {
+    /// Height in pixels.
+    pub h: u32,
+    /// Width in pixels.
+    pub w: u32,
+    /// `h · w · 3` bytes, row-major, R then G then B per pixel.
+    pub data: Vec<u8>,
+}
+
+impl Rgb8 {
+    /// Wrap already-decoded pixels, refusing the two shapes that could only
+    /// mislead downstream: a zero-sided frame (a span of no pixels occupies no
+    /// rows) and a buffer that is not `h · w · 3` bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Empty`] for a zero side; [`Fault::Decode`] for a wrong-length
+    /// buffer.
+    pub fn new(h: u32, w: u32, data: Vec<u8>) -> Result<Rgb8> {
+        if w == 0 || h == 0 {
+            return Err(Fault::Empty(format!(
+                "a frame of {h} x {w} pixels occupies no rows"
+            )));
+        }
+        let owed = h as usize * w as usize * 3;
+        if data.len() != owed {
+            return Err(Fault::Decode(format!(
+                "a {h} x {w} RGB frame is {owed} bytes and {} arrived",
+                data.len()
+            )));
+        }
+        Ok(Rgb8 { h, w, data })
+    }
+}
+
+/// **THE LENT RESAMPLE** — resize `src` to exactly `(target_h, target_w)`.
+///
+/// The one step of a front-end's pipe with no single right answer and no
+/// transcription (nobody transcribes a bicubic resampler), so the host that
+/// owns the image library lends it here and the choice of kernel is argued
+/// where the library is taken (`runtime`'s codec module: Catmull-Rom, which is
+/// PIL's `BICUBIC`, which is what `transformers`' PIL backend resizes with).
+/// Exact and not fit-inside: the front-end has already computed the target
+/// from its own policy, and a resize that preserved aspect ratio a second time
+/// would silently disagree with the grid the front-end then patchifies over.
+pub type Resample = fn(&Rgb8, u32, u32) -> Rgb8;
+
 /// **One preprocessed media span — what a front-end answers and the only thing
 /// above it reads.**
 ///
-/// Every field is derived from the source bytes and the bound architecture, and
-/// nothing here knows about a sequence, a lane or a fire: the runtime derives
-/// the anchors, the lane-relative routes and the trunk's token triples from
-/// these numbers once it knows where the run landed (media-door §3).
+/// Every field is derived from the source pixels and the bound architecture,
+/// and nothing here knows about a sequence, a lane or a fire: the runtime
+/// derives the anchors, the lane-relative routes and the trunk's token triples
+/// from these numbers once it knows where the run landed (media-door §3).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EncodedSpan {
     /// Hidden-state rows / KV slots this span occupies — the LENGTH OF THE
@@ -127,7 +181,7 @@ pub struct EncodedSpan {
     /// Extent in merged-token units — what the LLM's rectangle sees.
     pub grid: Grid,
     /// Extent in pre-merge patch units — what the tower's rotation stream is
-    /// indexed by. `cells() == rows` of [`patches`](EncodedSpan::patches).
+    /// indexed by. `cells() == rows` of [`payload`](EncodedSpan::payload).
     pub patch_grid: Grid,
     /// Does the bound architecture rotate this span with M-RoPE? Decides
     /// whether the runtime owes the contract a token-position triple stream or
@@ -185,56 +239,15 @@ impl EncodedSpan {
         out
     }
 
-    /// **A STABLE CONTENT HASH OF THE PREPROCESSED SPAN** (media-door §5, the
-    /// cache statute).
-    ///
-    /// Over the PAYLOAD and its layout, deliberately not over the source
-    /// bytes: two encodings of one photograph — a re-JPEG, a re-crop that
-    /// resizes back to the same grid — are the same span to the model, and a
-    /// digest that separated them would make a correct cache miss look like a
-    /// correctness bug. The tokens are NOT folded in, because folding them
-    /// would make the digest useless for the thing it exists for: two
-    /// different images produce identical token lists, and this is what tells
-    /// them apart.
-    #[must_use]
-    pub fn digest(&self) -> Vec<u8> {
-        let mut h = blake3::Hasher::new();
-        // Domain separation, so a future audio/vision payload of identical
-        // bytes and identical extent cannot collide across modalities.
-        h.update(b"pie:media-span:v1");
-        for n in [
-            self.token_count,
-            self.position_span,
-            self.rows,
-            self.grid.t,
-            self.grid.h,
-            self.grid.w,
-            self.patch_grid.t,
-            self.patch_grid.h,
-            self.patch_grid.w,
-        ] {
-            h.update(&n.to_le_bytes());
-        }
-        h.update(&[u8::from(self.uses_mrope)]);
-        for f in &self.payload {
-            h.update(&f.to_le_bytes());
-        }
-        for p in &self.positions {
-            h.update(&p.to_le_bytes());
-        }
-        for r in &self.embed_rows {
-            h.update(&r.to_le_bytes());
-        }
-        for w in &self.embed_weights {
-            h.update(&w.to_le_bytes());
-        }
-        h.finalize().as_bytes().to_vec()
-    }
-
     /// Fill the id fields from a tokenizer's answer for this front-end's
     /// [`Delimiters`]. The runtime calls this once, immediately after the
     /// front-end returns, because it holds the tokenizer and the front-end
     /// does not.
+    ///
+    /// The span's content DIGEST — media-door §5's cache statute — is the
+    /// runtime's too (`runtime::inferlet::host::media::span_digest`), for the
+    /// same dependency rule that keeps the codec out: the statute needs a
+    /// hasher, and the catalog's consumers do not.
     pub fn spell_with(&mut self, prefix: Vec<u32>, placeholder: u32, suffix: Vec<u32>) {
         self.prefix = prefix;
         self.placeholder = placeholder;
@@ -308,56 +321,34 @@ pub type Result<T> = std::result::Result<T, Fault>;
 
 /// **One architecture's vision preprocessing.**
 ///
-/// Implemented once per architecture family, in this crate, against pinned
-/// transcriptions of the reference processor. The runtime holds a
-/// `dyn VisionFrontEnd` and asks it two questions: how does this architecture
-/// spell a span, and what does this image encode to.
+/// Implemented once per architecture family, in the family's own module
+/// beside its forward pass and template, against pinned transcriptions of the
+/// reference processor. The runtime holds a `dyn VisionFrontEnd` and asks it
+/// two questions: how does this architecture spell a span, and what does this
+/// picture encode to.
 pub trait VisionFrontEnd: Send + Sync {
     /// The `ROWS.arch` string this front-end answers for. Used for diagnostics
     /// and for the dispatch table's own consistency test; the dispatch itself
-    /// is the runtime's.
+    /// is [`vision_front_end`]'s.
     fn arch(&self) -> &'static str;
 
     /// How this architecture wraps a visual span.
     fn delimiters(&self) -> Delimiters;
 
-    /// Decode + resize + patchify + normalize `bytes` under `budget`.
+    /// Resize (through the lent `resample`) + patchify + normalize `src`
+    /// under `budget`.
+    ///
+    /// One verb for a still image and a demuxed video frame, because past the
+    /// decode they are the same pixels: the host decodes its container — a
+    /// PNG, or one frame of a clip — and everything after is this
+    /// architecture's arithmetic, so the two doors cannot answer two different
+    /// spans for one picture.
     ///
     /// # Errors
     ///
-    /// [`Fault::Decode`] when the bytes are not an image this front-end reads;
-    /// [`Fault::Empty`] when they decode to a span occupying no rows.
-    fn encode_image(&self, bytes: &[u8], budget: Budget) -> Result<EncodedSpan>;
-
-    /// **THE SAME ENCODE, ON A FRAME THAT IS ALREADY DECODED.**
-    ///
-    /// A video arrives as one animated container and leaves as N spans, so its
-    /// frames are demuxed once, above this trait, and never re-encoded to be
-    /// handed back down. `rgb8` is `height · width · 3` bytes, row-major,
-    /// 8 bits per channel — the one interchange form that needs no image
-    /// library in this crate's dependency graph.
-    ///
-    /// Defaulted so a front-end that only reads still images compiles, and
-    /// defaulted to a REFUSAL rather than to silence: a video whose frames
-    /// quietly encoded as nothing would be a clip the model never saw.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Decode`] for a buffer that is not `height · width · 3` bytes,
-    /// or from a front-end that does not implement this.
-    fn encode_rgb8(
-        &self,
-        rgb8: &[u8],
-        width: u32,
-        height: u32,
-        budget: Budget,
-    ) -> Result<EncodedSpan> {
-        let _ = (rgb8, width, height, budget);
-        Err(Fault::Decode(format!(
-            "front-end '{}' reads encoded containers only and was handed a              decoded frame",
-            self.arch()
-        )))
-    }
+    /// [`Fault::Empty`] when the pixels encode to a span occupying no rows, or
+    /// when the architecture's own resize policy refuses the shape.
+    fn encode(&self, src: &Rgb8, budget: Budget, resample: Resample) -> Result<EncodedSpan>;
 }
 
 /// **One architecture's audio preprocessing.**
@@ -366,6 +357,10 @@ pub trait VisionFrontEnd: Send + Sync {
 /// may have either tower without the other: Gemma has both, Qwen has vision
 /// only, and a text model has neither. Two traits is what lets the two
 /// refusals be two sentences.
+///
+/// Bytes rather than pixels, because an audio clip has no lent step: WAV
+/// decode and log-mel are hand-rolled arithmetic with no library behind them,
+/// so the whole pipe is the implementer's.
 pub trait AudioFrontEnd: Send + Sync {
     /// The `ROWS.arch` string this front-end answers for.
     fn arch(&self) -> &'static str;
@@ -382,14 +377,32 @@ pub trait AudioFrontEnd: Send + Sync {
     fn encode_audio(&self, bytes: &[u8]) -> Result<EncodedSpan>;
 }
 
-/// **A front-end that decodes nothing, for the tests above the seam.**
+/// **THE DISPATCH IS A CATALOG FACT** (media-door §4): the arch string to its
+/// family's front-end, or `None` for a family with no served tower — the same
+/// sentence `catalog!`'s fourth column already writes for a lane's class:
+/// nothing outside a family's own module says how that family preprocesses,
+/// and no layer above this one names an architecture at all.
+///
+/// Boxed because the arms are different types and every caller wants a
+/// `dyn VisionFrontEnd` — the seam itself, in both directions. The runtime
+/// turns `None` into [`Fault::NoVisionFrontEnd`], naming the model it holds
+/// and this crate does not.
+#[must_use]
+pub fn vision_front_end(arch: &str) -> Option<Box<dyn VisionFrontEnd>> {
+    match arch {
+        crate::qwen_3::media::ARCH => Some(Box::new(crate::qwen_3::media::Qwen35Vision::new())),
+        crate::gemma_4::media::ARCH => Some(Box::new(crate::gemma_4::media::Gemma4Vision::new())),
+        _ => None,
+    }
+}
+
+/// **A front-end that reads no real picture, for the tests above the seam.**
 ///
 /// The run scan, the word stamp and the refusal set are all properties of the
 /// runtime and none of them care what an image looked like — they care that a
 /// span occupies `n` rows and spells itself with a particular pad. So the
 /// tests that exercise them take this rather than a real photograph, which is
-/// what keeps them deterministic and keeps a decode dependency out of the
-/// runtime's test graph.
+/// what keeps them deterministic and keeps a codec out of their graph.
 #[derive(Clone, Copy, Debug)]
 pub struct StubFrontEnd {
     /// The arch this stub claims.
@@ -425,10 +438,7 @@ impl VisionFrontEnd for StubFrontEnd {
         self.delimiters
     }
 
-    fn encode_image(&self, bytes: &[u8], budget: Budget) -> Result<EncodedSpan> {
-        if bytes.is_empty() {
-            return Err(Fault::Decode("stub front-end: zero bytes".into()));
-        }
+    fn encode(&self, src: &Rgb8, budget: Budget, _resample: Resample) -> Result<EncodedSpan> {
         let rows = match budget {
             Budget::Still => self.token_count,
             // Half the budget, so a test can tell the two apart.
@@ -443,9 +453,9 @@ impl VisionFrontEnd for StubFrontEnd {
             grid: Grid::still(1, rows),
             patch_grid: Grid::still(1, rows),
             uses_mrope: false,
-            // The bytes themselves, so two different inputs digest differently
-            // — which is the property §5's statute rests on.
-            payload: bytes.iter().map(|&b| f32::from(b)).collect(),
+            // The pixels themselves, so two different inputs digest
+            // differently — which is the property §5's statute rests on.
+            payload: src.data.iter().map(|&b| f32::from(b)).collect(),
             rows,
             positions: Vec::new(),
             embed_rows: Vec::new(),
@@ -461,9 +471,15 @@ impl VisionFrontEnd for StubFrontEnd {
 mod tests {
     use super::*;
 
+    fn pixels(bytes: &[u8]) -> Rgb8 {
+        let mut data = bytes.to_vec();
+        data.resize(3, 0);
+        Rgb8::new(1, 1, data).expect("one pixel")
+    }
+
     fn spelled(rows: u32, pad: u32) -> EncodedSpan {
         let mut span = StubFrontEnd::new("stub", rows)
-            .encode_image(b"abc", Budget::Still)
+            .encode(&pixels(b"abc"), Budget::Still, |src, _, _| src.clone())
             .expect("stub encodes");
         span.spell_with(vec![7], pad, vec![8]);
         span
@@ -479,47 +495,53 @@ mod tests {
         );
     }
 
-    /// media-door §5: the run is the same tokens whatever the picture was, so
-    /// the digest is the only thing that tells two spans apart.
+    /// The spelling is the tokenizer's: the same span under two checkpoints'
+    /// special ids answers two token lists from one front-end.
     #[test]
-    fn two_spans_share_a_token_list_and_not_a_digest() {
-        let mut a = StubFrontEnd::new("stub", 4)
-            .encode_image(b"one", Budget::Still)
-            .expect("a");
-        let mut b = StubFrontEnd::new("stub", 4)
-            .encode_image(b"two", Budget::Still)
-            .expect("b");
-        a.spell_with(vec![7], 99, vec![8]);
-        b.spell_with(vec![7], 99, vec![8]);
-        assert_eq!(a.tokens(), b.tokens(), "the ledger cannot tell them apart");
-        assert_ne!(a.digest(), b.digest(), "the statute's key must");
-        assert_eq!(a.digest().len(), 32);
-    }
-
-    #[test]
-    fn a_digest_is_stable_across_two_readings_of_one_span() {
-        let span = spelled(3, 5);
-        assert_eq!(span.digest(), span.digest());
-        assert_eq!(span.digest(), span.clone().digest());
-    }
-
-    /// The spelling is the tokenizer's, so the same span under two
-    /// checkpoints' special ids answers two token lists and ONE digest.
-    #[test]
-    fn respelling_moves_the_tokens_and_not_the_digest() {
+    fn respelling_moves_the_tokens() {
         let a = spelled(2, 11);
         let b = spelled(2, 22);
         assert_ne!(a.tokens(), b.tokens());
-        assert_eq!(a.digest(), b.digest());
     }
 
     #[test]
     fn a_video_frame_gets_the_frame_budget() {
         let fe = StubFrontEnd::new("stub", 8);
-        let still = fe.encode_image(b"x", Budget::Still).expect("still");
-        let frame = fe.encode_image(b"x", Budget::VideoFrame).expect("frame");
+        let identity: Resample = |src, _, _| src.clone();
+        let still = fe
+            .encode(&pixels(b"x"), Budget::Still, identity)
+            .expect("still");
+        let frame = fe
+            .encode(&pixels(b"x"), Budget::VideoFrame, identity)
+            .expect("frame");
         assert_eq!(still.token_count, 8);
         assert_eq!(frame.token_count, 4);
+    }
+
+    /// The two shapes [`Rgb8::new`] refuses, each by the right name.
+    #[test]
+    fn degenerate_pixels_are_refused_by_name() {
+        assert_eq!(
+            Rgb8::new(0, 4, Vec::new()).expect_err("zero side").name(),
+            "Empty"
+        );
+        assert_eq!(
+            Rgb8::new(2, 2, vec![0; 5]).expect_err("wrong length").name(),
+            "Decode"
+        );
+    }
+
+    /// media-door §4: every arch with a served tower answers the dispatch, and
+    /// each spells its run with its own reserved pad.
+    #[test]
+    fn the_two_vision_archs_spell_their_runs_differently() {
+        let qwen = vision_front_end("qwen3_5").expect("qwen has a tower").delimiters();
+        let gemma = vision_front_end("gemma4").expect("gemma has a tower").delimiters();
+        assert_eq!(qwen.placeholder, "<|image_pad|>");
+        assert_eq!(qwen.prefix, "<|vision_start|>");
+        assert_eq!(gemma.placeholder, "<|image|>");
+        assert_ne!(qwen.placeholder, gemma.placeholder);
+        assert!(vision_front_end("deepseek_v4").is_none());
     }
 
     #[test]

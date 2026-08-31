@@ -90,6 +90,7 @@ pub const fn class_of(d: Dtype) -> Option<DtypeClass> {
         | Dtype::Mxfp4
         | Dtype::MlxU4
         | Dtype::MlxU8
+        | Dtype::MlxU4G32
         | Dtype::E8m0
         | Dtype::I64
         | Dtype::I16

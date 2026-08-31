@@ -271,11 +271,16 @@ pub enum Attention {
 
     // Recurrent-state mixers: causal conv, gated delta nets, KDA. `state` is
     // the recurrent cache — storage only, updated in place by the kernel.
+    //
+    // `dilation` spreads the taps: tap `j` reads `dilation · j` positions
+    // back, so the state keeps `(conv_width − 1) · dilation` columns. Every
+    // GDN mixer states 1; qwen4's PLE convolution states its `ngram_size`.
     SsmCausalConv1d {
         x: ValueId,
         weight: ValueId,
         state: ValueId,
         conv_width: u32,
+        dilation: u32,
         y: ValueId,
     },
     /// Prefill form: walks the fire's ambient request boundaries.
@@ -284,6 +289,7 @@ pub enum Attention {
         weight: ValueId,
         state: ValueId,
         conv_width: u32,
+        dilation: u32,
         y: ValueId,
     },
     /// Folds `ba` with dt bias and A-log into per-head decay gates.
@@ -430,6 +436,39 @@ pub enum Attention {
         o: ValueId,
         lse: ValueId,
     },
+
+    // The PLE n-gram hasher (qwen4). An `Attention` by rule 1's second
+    // clause alone: it touches a sequence cache — the last `mults.len() − 1`
+    // token ids of each lane, kept so a decode step can hash the window its
+    // fire cannot see. Everything else about it is per-token integer math.
+    /// `ngram_ids[r, g·heads_per_ngram + h]` = the hashed (g+2)-gram id of
+    /// token `r` under head `h`'s own prime: ids at `r, r−1, …` (eos where
+    /// the window crosses a sequence start) are multiplied by `mults`,
+    /// xor-folded, and reduced modulo `primes[·]` plus `offsets[·]` — the
+    /// reference's splitmix64-seeded hash, with the derived constants stated
+    /// on the node because no checkpoint plane needs to be read to know them.
+    PleNgramIds {
+        ids: ValueId,
+        state: ValueId,
+        eos: u32,
+        mults: Vec<u64>,
+        primes: Vec<u64>,
+        offsets: Vec<u64>,
+        heads_per_ngram: u32,
+        ngram_ids: ValueId,
+    },
+    /// Prefill form: walks the fire's ambient request boundaries, as the
+    /// chunked convolution does.
+    PleNgramIdsChunked {
+        ids: ValueId,
+        state: ValueId,
+        eos: u32,
+        mults: Vec<u64>,
+        primes: Vec<u64>,
+        offsets: Vec<u64>,
+        heads_per_ngram: u32,
+        ngram_ids: ValueId,
+    },
 }
 
 impl Operands for Attention {
@@ -537,6 +576,8 @@ impl Operands for Attention {
             Self::PoolLse { q, positions, request_of_token, entries, .. } => {
                 sink.extend([*q, *positions, *request_of_token, *entries]);
             }
+            Self::PleNgramIds { ids, state, .. } => sink.extend([*ids, *state]),
+            Self::PleNgramIdsChunked { ids, state, .. } => sink.extend([*ids, *state]),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -585,6 +626,8 @@ impl Operands for Attention {
             Self::PoolGather { entries, .. } => sink.push(*entries),
             Self::PoolKvAppend { .. } => {}
             Self::PoolLse { o, lse, .. } => sink.extend([*o, *lse]),
+            Self::PleNgramIds { ngram_ids, .. } => sink.push(*ngram_ids),
+            Self::PleNgramIdsChunked { ngram_ids, .. } => sink.push(*ngram_ids),
         }
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
@@ -629,6 +672,8 @@ impl Operands for Attention {
             Self::PoolGather { .. } => {}
             Self::PoolKvAppend { .. } => {}
             Self::PoolLse { .. } => {}
+            Self::PleNgramIds { .. } => {}
+            Self::PleNgramIdsChunked { .. } => {}
         }
     }
     fn name(&self) -> &'static str {
@@ -673,6 +718,8 @@ impl Operands for Attention {
             Self::PoolGather { .. } => "attention.pool_gather",
             Self::PoolKvAppend { .. } => "attention.pool_kv_append",
             Self::PoolLse { .. } => "attention.pool_lse",
+            Self::PleNgramIds { .. } => "attention.ple_ngram_ids",
+            Self::PleNgramIdsChunked { .. } => "attention.ple_ngram_ids_chunked",
         }
     }
 }

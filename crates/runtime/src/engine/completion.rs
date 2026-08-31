@@ -12,7 +12,7 @@
 //!
 //! * The terminal cell is local. It was `engine::local::TerminalCell`, a
 //!   `#[repr(C)]` word a C engine published into across the ABI. Nothing
-//!   crosses the boundary now — [`crate::engine::Engine::fire`] answers a
+//!   crosses the boundary now — [`engine::Engine::fire`] answers a
 //!   `Result<FireTicket>` and the settle happens on this side of it — so the
 //!   cell is the runtime's private word and its `#[repr(C)]` is gone with the
 //!   caller that needed it.

@@ -106,6 +106,7 @@
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::op::IntrinsicId;
+use eta_ir::registry::GeometryClass;
 use eta_ir::types::name_or_unknown;
 use eta_ir::validate::Direction;
 
@@ -419,10 +420,22 @@ impl Session {
     ///
     /// # Errors
     ///
+    /// **AND WHICH PORTS ARE READ IS THE CLASS'S, NOT THE PROGRAM'S.** Almost
+    /// every attention guest binds `pages` and `page_indptr` — the SDK's
+    /// `KvGeometry` sugar makes them part of an ordinary bind — and states
+    /// them as working-set-relative indexes, which the runtime has already
+    /// translated for every class but one. So the set comes from the class
+    /// this instance was BOUND in (`ports::resolves`), and a decode-envelope
+    /// instance resolves its three ports and nothing else, exactly as it did
+    /// before the wider class existed.
+    ///
+    /// # Errors
+    ///
     /// [`Fault::Program`] for a port naming a channel this instance does not
-    /// carry or holding a non-integer cell, and whatever the read said.
-    pub fn envelope(&self, plan: &ExecPlan) -> Result<Envelope> {
-        ports::resolve(plan, &self.rings, &self.cursors, &self.shapes)
+    /// carry or holding a cell of the wrong element type, and whatever the
+    /// read said.
+    pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
+        ports::resolve(plan, class, &self.rings, &self.cursors, &self.shapes)
     }
 
     /// Point one intrinsic at a device buffer, for every stage of this

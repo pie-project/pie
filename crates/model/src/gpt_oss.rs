@@ -2,6 +2,7 @@ pub mod forward;
 pub mod import;
 pub mod model;
 pub mod template;
+pub mod tokenizer;
 
 use model::Model;
 use model_dsl::Dtype;
@@ -67,4 +68,11 @@ pub const TEMPLATES: &[crate::template::TemplateRow] = &[
     ("gptoss-20b-bf16-mxfp4-kv-bf16", template::gpt_oss),
     ("gptoss-120b-bf16-mxfp4-kv-bf16", template::gpt_oss),
     ("gptoss-120b-bf16-mxfp4-kv-bf16-tp2", template::gpt_oss),
+];
+
+pub const TOKENIZERS: &[crate::tokenizer::ContractRow] = &[
+    ("gptoss-20b-mlxu4-mxfp4-kv-bf16", &tokenizer::CONTRACT),
+    ("gptoss-20b-bf16-mxfp4-kv-bf16", &tokenizer::CONTRACT),
+    ("gptoss-120b-bf16-mxfp4-kv-bf16", &tokenizer::CONTRACT),
+    ("gptoss-120b-bf16-mxfp4-kv-bf16-tp2", &tokenizer::CONTRACT),
 ];

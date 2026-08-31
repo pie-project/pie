@@ -1,7 +1,9 @@
 pub mod forward;
 pub mod import;
+pub mod media;
 pub mod model;
 pub mod template;
+pub mod tokenizer;
 
 use model::Model;
 use model_dsl::Dtype;
@@ -14,10 +16,28 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
         Model::d27b(Dtype::Bf16, Dtype::Bf16, 1)
     ),
     (
+        "qwen38-27b-bf16-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::d27b(Dtype::Bf16, Dtype::Bf16, 1)
+    ),
+    (
         "qwen36-27b-mlxu4-kv-bf16",
         1,
         model_dsl::trace_hybrid,
         Model::d27b_undrafted(Dtype::MlxU4, Dtype::Bf16, 1)
+    ),
+    (
+        "qwen38-27b-mlxu4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::d27b_undrafted(Dtype::MlxU4, Dtype::Bf16, 1)
+    ),
+    (
+        "qwen36-35b-a3b-mlxu4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::a3b(Dtype::MlxU4, Dtype::Bf16, 1)
     ),
     (
         "qwen35-a3b-bf16-kv-bf16",
@@ -51,6 +71,12 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
     ),
     (
         "qwen36-27b-vision-bf16-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::d27b_vision(Dtype::Bf16, Dtype::Bf16, 1)
+    ),
+    (
+        "qwen38-27b-vision-bf16-kv-bf16",
         1,
         model_dsl::trace_hybrid,
         Model::d27b_vision(Dtype::Bf16, Dtype::Bf16, 1)
@@ -138,6 +164,28 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
 /// and `the_vision_imports_cover_their_plans_over_the_real_census` fails the
 /// day one moves without the other.
 ///
+/// **AND EVERY `qwen38` ROW IS A SHADOWED TWIN, ON PURPOSE.** Qwen3.8-27B is
+/// Qwen3.6-27B's artifact surface tensor for tensor — the two `config.json`s
+/// differ in `transformers_version` and in nothing else, the canonical tensor
+/// name sets are equal, the `mtp.*` head and the 27-block tower both ship —
+/// so no WEIGHT contract can tell the artifacts apart and `identify` walking this
+/// order will always answer the `qwen36` row first. The `qwen38` rows exist
+/// because the SKU NAME is what selects the chat template, and the template
+/// is the one thing 3.8 actually changed: it replays assistant `<think>`
+/// blocks instead of stripping them (`template::chatml_interleaved`), and its
+/// tokenizer reserves seven audio/tts specials (ids 248070–248076, inside the
+/// same vocab). A 3.8 deployment therefore names its row — `[model] sku =
+/// "qwen38-27b-…"` — and a deployment that does not gets 3.6's reading, which
+/// serves the same bytes with yesterday's replay convention. Each twin sits
+/// beside the row it shadows as documentation, not reachability. The twin has
+/// since grown teeth of its own kind: [`tokenizer::CONTRACT_38`] pins the
+/// seven specials (the one artifact-visible fact that tells the tokenizers
+/// apart), so a `qwen38` SKU deployed against a 3.6 artifact refuses at
+/// serve boot instead of answering under a reading it was never trained
+/// for. `identify` still walks weight contracts alone and still answers
+/// `qwen36`; letting it read the pins too is the open item that would
+/// retire the sku requirement.
+///
 /// [`forward::Facts::media`]: super::forward::Facts::media
 ///
 pub const IMPORTS: &[crate::ImportRow] = &[
@@ -147,8 +195,25 @@ pub const IMPORTS: &[crate::ImportRow] = &[
     ("qwen35-d0.8b-mlxu4-kv-bf16", |src| {
         Model::d0_8b(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
     }),
+    // **AHEAD OF `qwen35-a3b-bf16`, WHICH IS THE SAME FORTY LAYERS**
+    // (campaign M-5). The two rows read one architecture — every number
+    // `Model::a3b` states was checked against
+    // `mlx-community/Qwen3.6-35B-A3B-4bit`'s own `text_config` and matches to
+    // the digit — so the ordering rule above is what separates them, and it
+    // separates them the strict way: this row's every projection is a
+    // `.weight`/`.scales`/`.biases` triplet, and a bf16 A3B checkpoint holds
+    // only the first.
+    ("qwen36-35b-a3b-mlxu4-kv-bf16", |src| {
+        Model::a3b(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
+    }),
     ("qwen36-27b-bf16-kv-bf16", |src| {
         Model::d27b(Dtype::Bf16, Dtype::Bf16, 1).import(src)
+    }),
+    ("qwen38-27b-bf16-kv-bf16", |src| {
+        Model::d27b(Dtype::Bf16, Dtype::Bf16, 1).import(src)
+    }),
+    ("qwen38-27b-mlxu4-kv-bf16", |src| {
+        Model::d27b_undrafted(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
     }),
     ("qwen35-a3b-bf16-kv-bf16", |src| {
         Model::a3b(Dtype::Bf16, Dtype::Bf16, 1).import(src)
@@ -171,6 +236,9 @@ pub const IMPORTS: &[crate::ImportRow] = &[
     ("qwen36-27b-vision-bf16-kv-bf16", |src| {
         Model::d27b_vision(Dtype::Bf16, Dtype::Bf16, 1).import(src)
     }),
+    ("qwen38-27b-vision-bf16-kv-bf16", |src| {
+        Model::d27b_vision(Dtype::Bf16, Dtype::Bf16, 1).import(src)
+    }),
     ("qwen35-d0.8b-vision-bf16-kv-bf16", |src| {
         Model::d0_8b_vision(Dtype::Bf16, Dtype::Bf16, 1).import(src)
     }),
@@ -178,7 +246,11 @@ pub const IMPORTS: &[crate::ImportRow] = &[
 
 pub const TEMPLATES: &[crate::template::TemplateRow] = &[
     ("qwen36-27b-bf16-kv-bf16", template::chatml),
+    ("qwen38-27b-bf16-kv-bf16", template::chatml_interleaved),
+    ("qwen38-27b-mlxu4-kv-bf16", template::chatml_interleaved),
+    ("qwen38-27b-vision-bf16-kv-bf16", template::chatml_interleaved),
     ("qwen36-27b-mlxu4-kv-bf16", template::chatml),
+    ("qwen36-35b-a3b-mlxu4-kv-bf16", template::chatml),
     ("qwen35-a3b-bf16-kv-bf16", template::chatml),
     ("qwen35-d3b-bf16-kv-bf16", template::chatml),
     ("qwen35-d0.8b-bf16-kv-bf16", template::chatml),
@@ -188,4 +260,22 @@ pub const TEMPLATES: &[crate::template::TemplateRow] = &[
     ("qwen36-27b-vision-bf16-kv-bf16", template::chatml),
     ("qwen35-d0.8b-vision-bf16-kv-bf16", template::chatml),
     ("qwen35-a3b-bf16-kv-bf16-tp2", template::chatml),
+];
+
+pub const TOKENIZERS: &[crate::tokenizer::ContractRow] = &[
+    ("qwen36-27b-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen38-27b-bf16-kv-bf16", &tokenizer::CONTRACT_38),
+    ("qwen36-27b-mlxu4-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen38-27b-mlxu4-kv-bf16", &tokenizer::CONTRACT_38),
+    ("qwen36-35b-a3b-mlxu4-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen35-a3b-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen35-d3b-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen35-d0.8b-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen35-d0.8b-mlxu4-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen35-d0.8b-vision-eagle-bf16-kv-bf16", &tokenizer::CONTRACT_VISION),
+    ("qwen36-27b-vision-bf16-kv-bf16", &tokenizer::CONTRACT_VISION),
+    ("qwen38-27b-vision-bf16-kv-bf16", &tokenizer::CONTRACT_38_VISION),
+    ("qwen35-d0.8b-vision-bf16-kv-bf16", &tokenizer::CONTRACT_VISION),
+    ("qwen35-d0.8b-eagle-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen35-a3b-bf16-kv-bf16-tp2", &tokenizer::CONTRACT),
 ];

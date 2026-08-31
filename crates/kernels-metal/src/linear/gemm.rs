@@ -2,51 +2,53 @@
 //! choice lives here, inside the entry (decision #13) — a dispatch arm never
 //! sees it.
 //!
-//! # A LANE'S LOGITS MUST NOT DEPEND ON HOW MANY LANES RODE WITH IT
+//! # THREE RUNGS, KEYED ON THE FIRE'S ROWS
 //!
-//! The row count this entry keys its arm on is the FIRE'S, and a fire's rows
-//! are however many rows the composition put in it — which is to say, who
-//! else was being served at that instant. So an arm chosen on that number is
-//! a lane's answer chosen on its neighbours, and the only thing that makes
-//! that legal is two arms that land the same bits.
+//! ```text
+//!   rows < VECTOR_MAX_ROWS (4)   dense_gemv_t_bfloat16
+//!   rows < TILE_M (32)           dense_gemm_t_bfloat16_bm_8_bk_64_bn_32
+//!   otherwise                    dense_gemm_t_bfloat16_bm_32_bk_32_bn_32
+//! ```
 //!
-//! **THEY DID NOT.** Until this was fixed the narrow rung was
-//! `dense_gemv_t_bfloat16`, which splits K across a simdgroup's 32 lanes and
-//! folds the pieces with `simd_sum`; the wide rung walks K in ascending
-//! 8-wide chunks on the matrix unit. Same arithmetic, different order,
-//! different rounding — and a 31-token prompt is 31 rows alone (the vector
-//! kernel) and 248 rows eight ways at once (the tile), so the same prompt at
-//! temperature 0 answered differently in a crowd. Measured on an M1 Max over
-//! qwen35-d0.8b-bf16: 0.45 of a logit at the prefill readout, and a different
-//! sentence by the ninth token. `test_curated.py`'s
-//! `greedy-decoding-is-the-same-alone-and-in-a-crowd` is the gate that says
-//! so at the serving door; `engine-metal`'s own
-//! `a_lane_answers_the_same_in_a_crowd` is the same claim with the feedback
-//! loop cut.
-//!
-//! The fix is `engine-cuda`'s, in this plane's terms: the narrow rung is now
-//! the SAME kernel at an 8-row block. `BM`, `BK`, `WM` and `WN` decide who
-//! holds which element, never the order k is walked in, so the two rungs are
-//! bit-identical and the threshold between them is invisible in the answer.
-//! The vector kernel is gone rather than demoted — an arm nobody may take is
-//! not an arm.
-//!
-//! **WHAT IT COST, STATED.** The matrix unit multiplies 8x8 fragments, so the
-//! narrow rung's floor is eight rows and a one-row decode pays for eight.
-//! One decode fire of qwen35-d0.8b on an M1 Max, before against after:
+//! Measured on an M1 Max over qwen35-d0.8b, one decode fire, the vector rung
+//! against the 8-row tile at every width:
 //!
 //! ```text
 //!   lanes    1      2      4      8     16     31
-//!   before  10.3   12.9   22.1   40.3   76.9  145.1  ms  (the vector rung)
-//!   after   13.5   13.8   16.7   22.2   37.7   66.7  ms  (the 8-row block)
+//!   vector  10.3   12.9   22.1   40.3   76.9  145.1  ms
+//!   tile    13.5   13.8   16.7   22.2   37.7   66.7  ms
 //! ```
 //!
-//! One lane is 24% slower, two are 6% slower, and every width above that is
-//! 1.3x to 2.2x FASTER — because the vector rung gave each output column one
-//! simdgroup and no reuse of the weight across the rows sharing it, so a
-//! fleet of decodes walked the whole weight table once per ROW. The correctness
-//! this was done for is not paid for out of throughput; it is paid for out of
-//! one-lane latency, and only there.
+//! The vector rung gives each output column one simdgroup and no reuse of the
+//! weight across the rows sharing it, so a fleet of decodes walks the whole
+//! weight table once per ROW — it climbs with the batch. The tile reads the
+//! table once for eight rows of arithmetic and is nearly flat in it. The lines
+//! cross between two rows and four, which is [`VECTOR_MAX_ROWS`], and the
+//! third rung is what keeps BOTH ends: the vector point's one-lane latency and
+//! the 8-row block's 1.3-2.2x from four lanes up.
+//!
+//! # THE ARM MOVES WITH THE COMPOSITION, AND THAT IS THE RULING
+//!
+//! A fire's rows are however many rows the composition put in it, so the arm
+//! this entry picks — and a lane's low-order bits with it — is a function of
+//! who else was being served at that instant. The two arms round differently:
+//! `dense_gemv_t` splits K across a simdgroup's 32 lanes and folds the pieces
+//! with `simd_sum`, the tiles walk K in ascending 8-wide chunks on the matrix
+//! unit. Measured on qwen35-d0.8b-bf16, a 20-row prompt alone against the same
+//! prompt in a crowd: 0.45 of a logit at the prefill readout, which a greedy
+//! continuation can turn into a different sentence several tokens later.
+//!
+//! That drift is ACCEPTED:
+//!
+//! > We do NOT need bit-level identity. If a much faster path has small
+//! > numerical drift from nondeterminism, that is obviously acceptable.
+//!
+//! A release deleted the vector rung to buy bit-identity across compositions,
+//! at 24% of a one-lane decode; this is that decision reversed on the owner's
+//! ruling, with the 8-row rung that release introduced KEPT, because it wins
+//! on its own merits at the widths between. `a_lane_answers_the_same_in_a_crowd`
+//! is the gate that holds what is still promised: the same TOKEN at every step
+//! the model actually decided, with near-ties excused by a stated margin.
 
 use crate::error::Error;
 
@@ -72,6 +74,30 @@ const NARROW_ENTRY: &str = "dense_gemm_t_bfloat16_bm_8_bk_64_bn_32";
 
 const NARROW_GROUP: [u32; 3] = [32, 1, 2];
 
+/// The floor: one simdgroup per output column, the contraction split across
+/// its thirty-two lanes and folded with `simd_sum`. The fold IS where the
+/// parallelism at one row comes from, and is also why this rung's bits are
+/// not the tiles' — see this module's header.
+const VECTOR_ENTRY: &str = "dense_gemv_t_bfloat16";
+
+const VECTOR_GROUP: u32 = 128;
+
+const LANES_PER_COLUMN: u32 = 32;
+
+/// The fire width at which the 8-row tile overtakes the vector point, from
+/// the table in this module's header: the vector rung wins at one and two
+/// rows (10.3 against 13.5, 12.9 against 13.8) and loses at four (22.1
+/// against 16.7). Four is the first measured width where it loses, so four is
+/// where the ladder leaves it.
+///
+/// **IT IS A DENSE NUMBER AND NOT [`crate::tuning`]'s.**
+/// `DeviceTuning::qmm_min_batch` is the same crossover for the QUANTIZED
+/// ladder and reads five; the two GEMMs are different kernels over different
+/// operands and there is no measurement saying they cross at the same width.
+/// A device sweep that re-draws this curve is what would earn it a tuned
+/// field, and none has been taken.
+pub const VECTOR_MAX_ROWS: u32 = 4;
+
 const FILE: &str = "linear/gemm_dense.metal";
 
 const LANES_PER_TILE: u32 = 32;
@@ -84,12 +110,12 @@ pub fn lm_head(ctx: &Ctx<'_>, act: Tensor, w: Tensor, y: Tensor) -> Result<(), E
     act_x_wt(ctx, "linear.lm_head", act, w, y)
 }
 
-/// `y = act x w^T`. Skinny fires (fewer than [`TILE_M`] rows — the decode
-/// path) take the 8-row block; everything else takes the 32x32 tile. The two
-/// are one kernel at two row blocks and land the same bits, which is what
-/// makes a threshold on a number the composition owns legal at all — see this
-/// module's header. A fire with no rows lands nothing and encodes nothing: see
-/// [`extent`] for which of the three extents is allowed to be zero and why.
+/// `y = act x w^T`. The vector point under [`VECTOR_MAX_ROWS`] rows, the
+/// 8-row block under [`TILE_M`], the 32x32 tile at or above it — see this
+/// module's header for the measurement behind each threshold.
+///
+/// A fire with no rows lands nothing and encodes nothing: see [`extent`] for
+/// which of the three extents is allowed to be zero and why.
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
     op: &'static str,
@@ -102,7 +128,9 @@ pub fn act_x_wt(
     if rows == 0 {
         return Ok(());
     }
-    let (entry, grid) = if rows < TILE_M {
+    let (entry, grid) = if rows < VECTOR_MAX_ROWS {
+        (VECTOR_ENTRY, vector_grid(op, rows, columns)?)
+    } else if rows < TILE_M {
         (
             NARROW_ENTRY,
             tile_grid(op, rows, columns, NARROW_M, NARROW_GROUP)?,
@@ -175,4 +203,22 @@ fn tile_grid(
         ],
         group,
     ))
+}
+
+/// The grid the vector rung launches: one simdgroup per output column, packed
+/// [`VECTOR_GROUP`] lanes to a threadgroup, and one row of the grid's `y` per
+/// row of the fire. The kernel guards both `n >= N` and `m >= M`, so a
+/// column count the threadgroup does not divide is launched over and
+/// discarded rather than refused.
+fn vector_grid(op: &'static str, rows: u32, columns: u32) -> Result<Grid, Error> {
+    let lanes = columns
+        .div_ceil(VECTOR_GROUP / LANES_PER_COLUMN)
+        .checked_mul(VECTOR_GROUP)
+        .ok_or_else(|| {
+            refuse(
+                op,
+                format!("the {columns} columns, one simdgroup each, will not launch"),
+            )
+        })?;
+    Ok(Grid::of([lanes, rows, 1], [VECTOR_GROUP, 1, 1]))
 }

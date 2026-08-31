@@ -198,6 +198,22 @@ pub enum Layout {
         y: ValueId,
         y_out: ValueId,
     },
+    /// **THE GATHER THAT CONCATENATES**: `y[r] = table[ids[r, 0]] ‖ … ‖
+    /// table[ids[r, heads−1]]` — one row assembled from `heads` table rows,
+    /// each landing in its own `width`-wide slice of the output.
+    ///
+    /// The PLE n-gram embedding's read (qwen4): sixteen hashed heads share
+    /// one table whose rows are `embed_dim / heads` wide, and a token's
+    /// enrichment is their concatenation. [`Embed`](Layout::Embed) gathers
+    /// one row per row and [`EmbedWeighted`](Layout::EmbedWeighted) SUMS its
+    /// taps; this one keeps every tap, side by side, which neither can say.
+    /// `heads` is read off `ids`' width, for `EmbedWeighted`'s reason.
+    EmbedConcat {
+        ids: ValueId,
+        table: ValueId,
+        vocab: u32,
+        y: ValueId,
+    },
 }
 
 impl Operands for Layout {
@@ -215,6 +231,7 @@ impl Operands for Layout {
             Self::PoolRows { x, .. } => sink.push(*x),
             Self::MergeRows { x, .. } => sink.push(*x),
             Self::ScatterLiveRows { src, routes, y, .. } => sink.extend([*src, *routes, *y]),
+            Self::EmbedConcat { ids, table, .. } => sink.extend([*ids, *table]),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -229,6 +246,7 @@ impl Operands for Layout {
             Self::PoolRows { y, .. } => sink.push(*y),
             Self::MergeRows { y, .. } => sink.push(*y),
             Self::ScatterLiveRows { y_out, .. } => sink.push(*y_out),
+            Self::EmbedConcat { y, .. } => sink.push(*y),
         }
     }
     /// The one aliasing row this family has, and it is the scatter's: every
@@ -246,7 +264,8 @@ impl Operands for Layout {
             // The pool writes a FRESH rectangle: `y` is not `x` narrowed in
             // place, it is a different number of rows of different numbers.
             | Self::PoolRows { .. }
-            | Self::MergeRows { .. } => {}
+            | Self::MergeRows { .. }
+            | Self::EmbedConcat { .. } => {}
             Self::ScatterRows { y_out, y, .. }
             | Self::ScatterLiveRows { y_out, y, .. } => sink.push((*y_out, *y)),
         }
@@ -263,6 +282,7 @@ impl Operands for Layout {
             Self::PoolRows { .. } => "layout.pool_rows",
             Self::MergeRows { .. } => "layout.merge_rows",
             Self::ScatterLiveRows { .. } => "layout.scatter_live_rows",
+            Self::EmbedConcat { .. } => "layout.embed_concat",
         }
     }
 }

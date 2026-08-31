@@ -91,6 +91,9 @@ __device__ inline void block_argmax(
 
 }
 
+// `per_expert_scale` is gemma 4's learned per-expert gain, applied to the
+// selected weights after the softmax and gathered by the ids this body just
+// chose. `nullptr` on every other family, which is the whole of the branch.
 template <class T, bool FusedGemv>
 __device__ __forceinline__ void moe_topk_softmax_body(
     const T* __restrict__ logits,
@@ -98,7 +101,8 @@ __device__ __forceinline__ void moe_topk_softmax_body(
     const T* __restrict__ bias,
     i32* __restrict__ topk_idx,
     float* __restrict__ topk_w,
-    int num_experts, int K, int hidden)
+    int num_experts, int K, int hidden,
+    const T* __restrict__ per_expert_scale = nullptr)
 {
     const int n = blockIdx.x;
     const int tid = threadIdx.x;
@@ -188,7 +192,13 @@ __device__ __forceinline__ void moe_topk_softmax_body(
     }
     if (tid == 0) {
         const float inv_w = 1.f / w_sum;
-        for (int k = 0; k < K; ++k) out_w[k] *= inv_w;
+        for (int k = 0; k < K; ++k) {
+            float w = out_w[k] * inv_w;
+            if (per_expert_scale != nullptr && out_idx[k] >= 0) {
+                w *= Logit<T>::to_f32(per_expert_scale[out_idx[k]]);
+            }
+            out_w[k] = w;
+        }
     }
 }
 
@@ -203,6 +213,22 @@ __global__ void moe_topk_softmax(
 {
     moe_topk_softmax_body<T, false>(logits, act, bias, topk_idx, topk_w,
                                 num_experts, K, hidden);
+}
+
+// **ADDITIVE, FOR GEMMA 4's MIXTURE.** The same softmax-then-renormalize the
+// point above takes -- which is a softmax over the SELECTED k -- and then the
+// learned gain of the expert each slot chose.
+template <class T>
+__global__ void moe_topk_softmax_scaled(
+    const T* __restrict__ logits,
+    const T* __restrict__ act,
+    const T* __restrict__ per_expert_scale,
+    i32* __restrict__ topk_idx,
+    float* __restrict__ topk_w,
+    int num_experts, int K, int hidden)
+{
+    moe_topk_softmax_body<T, false>(logits, act, nullptr, topk_idx, topk_w,
+                                num_experts, K, hidden, per_expert_scale);
 }
 
 template <class T>

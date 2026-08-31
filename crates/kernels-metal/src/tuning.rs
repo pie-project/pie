@@ -100,6 +100,27 @@ pub struct DeviceTuning {
     ///
     /// M1 Max: 5.
     ///
+    /// # IT IS ASKED OF THE FIRE'S ROWS, WHICH IS WHAT THE SWEEP MEASURED
+    ///
+    /// `linear::quant::act_x_wt` reads this against the row count the fire
+    /// brought, so the table below is read exactly as it was taken: at width
+    /// `N`, which arm is faster. A fire's rows are the COMPOSITION's, so the
+    /// arm — and a lane's low-order bits with it — moves with the neighbours.
+    /// That is the owner's ruling and not an oversight:
+    ///
+    /// > We do NOT need bit-level identity. If a much faster path has small
+    /// > numerical drift from nondeterminism, that is obviously acceptable.
+    ///
+    /// A release read it against the SLOT's row capacity instead, to make the
+    /// pick a load-time constant. It bought bit-stability across compositions
+    /// and cost 76% of a one-lane decode on the small vehicle and 3.2x on the
+    /// giant, because a shell wide enough to cross took the tile's eight-row
+    /// floor at every width including one. That trade is the one the ruling
+    /// reverses.
+    ///
+    /// **THE CURVE IS THE THING TO RE-SWEEP** when the GEMM moves — a wrong
+    /// value here puts whole rungs on the slower arm.
+    ///
     /// **WHAT THIS CROSSOVER ACTUALLY SEPARATES**, because the two arms are
     /// not two speeds of one kernel. `quant_qmv.metal`'s fast point walks one
     /// threadgroup per ROW (`x += tid.x * in_vec_size`), so an N-row fire
@@ -365,6 +386,49 @@ pub struct DeviceTuning {
     /// floats a lane beats both 8 and 32 at every lane count, because too few
     /// rows do not amortize the reads and too many spend the occupancy that
     /// hides them.
+    ///
+    /// # THESE TWO REACHED NO LAUNCH AT ALL UNTIL `ssm_gdn_scan.metal`
+    ///
+    /// The table above is the reference's, taken on the reference's kernel,
+    /// and for a while this tree carried it beside a scan that read neither
+    /// field: `attn::ssm` launched `gated_delta_chunked` at a hardcoded
+    /// `[128, v_heads, requests]` and never called `current()`. A knob wired
+    /// to nothing is the exact failure this module's own header spends four
+    /// paragraphs on, and what it cost was not the tuning — it was that
+    /// nobody was looking at the kernel the constants described.
+    ///
+    /// `ssm_gdn_scan.metal` is that kernel's shape, ported onto this tree's
+    /// operands, and [`crate::attn::ssm::gdn_scan_launch`] is where the two
+    /// fields now compose an entry name and a grid. **ZERO ROWS IS A VALUE**
+    /// and it is the control: no fold is stamped at zero, so the selection
+    /// declines and `gated_delta_chunked` runs. Standalone, qwen3.6-27B's
+    /// gated-delta shape, ms per layer
+    /// (`what_the_gated_delta_scan_costs`):
+    ///
+    /// ```text
+    ///   tokens          128     256     512
+    ///   threadgroup    33.70   67.24  134.36
+    ///   register        0.93    1.81    3.55
+    /// ```
+    ///
+    /// Thirty-eight times, and it is a shape difference rather than a tuning
+    /// one: 384 threadgroups against 48, the recurrent cell in registers
+    /// rather than read-modify-written twice a token in device memory, and
+    /// `simd_shuffle_xor` rather than ten threadgroup barriers a token. On a
+    /// whole 512-token prefill (`throughput_probe`), tok/s:
+    ///
+    /// ```text
+    ///                  rows = 0   rows = 4
+    ///   qwen36-27b        48.0      116.9
+    ///   qwen35-0.8b      385.9     2921.3
+    /// ```
+    ///
+    /// **THE SWEEP ABOVE HAS NOT BEEN RE-RUN ON THIS KERNEL.** `(32, 4)` is
+    /// taken on the reference's authority and on the shape argument being the
+    /// same one; what has been measured here is `(32, 4)` against not
+    /// folding, which is the comparison that was worth 2.4x. A re-sweep is
+    /// the obvious next measurement and it is worth at most the few percent
+    /// the reference's own table spans.
     pub gdn_scan_rows: u32,
 
     /// Rows an expert's run must hold before the mixture sorts and batches at
@@ -423,6 +487,86 @@ pub struct DeviceTuning {
     /// bug in that kernel gets bisected — and it is how the sorted column
     /// above was taken.
     pub moe_batch_min_per_expert: u32,
+
+    /// **THE WIDEST ROW GROUP THE VECTOR POINT FOLDS INTO ONE WEIGHT FETCH.**
+    ///
+    /// M1 Max: 2. **ONE DISABLES THE ARM** and restores `quant_qmv.metal`'s
+    /// one-row point at every width, which is the control every number below
+    /// was taken against.
+    ///
+    /// # What the fold is, and what it is not
+    ///
+    /// `quant_qmv.metal`'s point walks one threadgroup per ROW, so an N-row
+    /// fire fetches the whole bank N times; `quant_qmv_rows.metal` fetches it
+    /// once per group of R. It was built to collapse the two-to-four-lane
+    /// band toward the cost of one lane, and **it does not, because the fetch
+    /// was never the bill.** `what_the_vector_point_is_bound_by` fires both
+    /// points over a 72 MiB bank and then over a 4 MiB slice of it, so the
+    /// second run's weights are in the 48 MiB system cache and its reads are
+    /// nearly free; per row, scaled to the same bank, ms:
+    ///
+    /// ```text
+    ///   rows            1      2      4      8     16
+    ///   one-row DRAM  0.359  0.215  0.211  0.208  0.207
+    ///   one-row cache 0.472  0.321  0.266  0.237  0.223
+    /// ```
+    ///
+    /// Taking the memory away does not make it faster. The vector point is
+    /// ARITHMETIC-bound — a mask, an integer convert and an FMA per four-bit
+    /// code — and 365 GB/s at sixteen rows is a coincidence of this machine's
+    /// balance rather than the ceiling it is running into.
+    ///
+    /// # What the fold IS worth
+    ///
+    /// The load INSTRUCTIONS and the address and scale arithmetic beside
+    /// them: one pack fetch, one scale, one zero point per two rows instead
+    /// of per row. `throughput_probe`, production ladder, aggregate tok/s,
+    /// `qmv_rows_max` 1 against 2:
+    ///
+    /// ```text
+    ///                       N=1    N=2    N=3    N=4    N=5..8
+    ///   qwen36-27b  off     16.1   18.6   18.8   19.3   unchanged
+    ///               on      16.1   20.5   18.8   21.5   unchanged
+    ///   gemma4-31b  off     16.9   18.9   19.3   19.5   unchanged
+    ///               on      16.9   22.0   19.3   23.3   unchanged
+    /// ```
+    ///
+    /// N=1 and N=3 are the CONTROLS — neither folds, and both reproduce to
+    /// the third digit.
+    ///
+    /// # WHY TWO AND NOT FOUR, WHICH IS THE PART THAT COST A SWEEP
+    ///
+    /// A wider fold holds more accumulators and fewer threadgroups, and both
+    /// go the wrong way. On the giant, ms/fire at four lanes: one-row 207.70,
+    /// R=2 **185.91**, R=4 229.02. R=4 is WORSE than not folding at all. The
+    /// standalone bench agrees and says why — per row over the 72 MiB bank,
+    /// R=2 runs 0.177 ms and R=4 runs 0.217 against the one-row 0.207 — so
+    /// the arithmetic the fold cannot remove starts costing more, in
+    /// occupancy, than the instructions it does remove.
+    ///
+    /// The 8 rung is stamped and is on the same slope (0.245 ms/row): it is
+    /// kept reachable so the next machine can be asked, not because this one
+    /// wants it.
+    ///
+    /// A machine with a wider register file or a cheaper unpack wants this
+    /// HIGHER; a machine that fills on fewer threadgroups wants it higher
+    /// too. Neither has been measured, so no family names a value.
+    pub qmv_rows_max: u32,
+
+    /// Weight packs one thread of the multi-row vector point reads per k
+    /// step.
+    ///
+    /// M1 Max: 1, against the one-row point's 2. A thread of
+    /// `quant_qmv_rows.metal` holds four output rows' packs and their factors
+    /// live across the row loop, so the pack width multiplies the part of the
+    /// live set the fold added. Over the 72 MiB bank at two rows, per row:
+    /// **0.177 ms at one pack against 0.207 at two** — which is the whole of
+    /// the fold's win, spent and recovered on one constant.
+    ///
+    /// It is a knob and not a constant in the shader because which side wins
+    /// is a property of the machine's register file rather than of the
+    /// checkpoint.
+    pub qmv_rows_packs: u32,
 }
 
 impl Default for DeviceTuning {
@@ -440,6 +584,8 @@ impl Default for DeviceTuning {
             gdn_scan_lanes: 32,
             gdn_scan_rows: 4,
             moe_batch_min_per_expert: 2,
+            qmv_rows_max: 2,
+            qmv_rows_packs: 1,
         }
     }
 }
@@ -532,6 +678,8 @@ impl DeviceTuning {
             gdn_scan_lanes,
             gdn_scan_rows,
             moe_batch_min_per_expert,
+            qmv_rows_max,
+            qmv_rows_packs,
         );
         self
     }
@@ -575,6 +723,8 @@ pub struct Overrides {
     pub gdn_scan_lanes: Option<u32>,
     pub gdn_scan_rows: Option<u32>,
     pub moe_batch_min_per_expert: Option<u32>,
+    pub qmv_rows_max: Option<u32>,
+    pub qmv_rows_packs: Option<u32>,
 }
 
 static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();

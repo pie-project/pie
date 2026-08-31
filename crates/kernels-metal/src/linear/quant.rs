@@ -34,9 +34,17 @@ use crate::error::Error;
 use crate::encode::{Arg, Ctx, Fire, Grid, dtype_dispatch, refuse, stated};
 use crate::tensor::{Bank, Tensor};
 
-/// The two source files the points live in.
+/// The three source files the points live in.
 const QMM_FILE: &str = "linear/quant_qmm_t.metal";
 const QMV_FILE: &str = "linear/quant_qmv.metal";
+
+/// The MULTI-ROW vector point, which shares one weight read across R rows.
+/// Its own file for the reason its header states: the one-row file spells
+/// thirty-odd points out in source, and this one is stamped.
+const QMV_ROWS_FILE: &str = "linear/quant_qmv_rows.metal";
+
+/// The macro `quant_qmv_rows.metal` publishes.
+const QMV_ROWS_STAMP: &str = "PIE_STAMP_qmv_rows";
 
 /// The macro `quant_qmm_t.metal` publishes for the epilogue-free tiled point,
 /// and the one this plane selects: the IR's dense projections
@@ -181,33 +189,27 @@ const BM_RUNGS: [i32; 4] = [8, 16, 32, 64];
 /// that divides.
 const BN_RUNGS: [i32; 3] = [16, 32, 64];
 
-/// Threadgroups the split-K dispatch aims to land near.
+/// **THE ROW GROUPS THE VECTOR POINT MAY BE FOLDED AT, NARROWEST FIRST.**
 ///
-/// MLX picks its split to reach 512 and sends every transposed non-batched
-/// decode down this path; a roofline probe finds the same saturation point
-/// independently. An earlier sweep here preferred 256 and was measuring a
-/// split path that never dispatched its reduce — timing a kernel that
-/// computed the wrong answer, so the curve it drew was not this GEMM's.
-/// Re-swept on llama-1B at 32 lanes with the reduce in place: 741 tok/s at
-/// 128, 873 at 256, 887 at 512, 886 at 1024, 876 at 2048. Flat from 512 on,
-/// so take its near edge.
-const SPLIT_TARGET_TGS: i32 = 512;
+/// `quant_qmv_rows.metal` reads a weight block once and applies it to `R`
+/// activation rows, so a fire of `m` rows costs `ceil(m / R)` reads of the
+/// bank instead of `m`. The rungs are powers of two because the fold's only
+/// cost is registers and the register budget halves that way; they stop at
+/// eight because that is where the tiled point's own row block begins and a
+/// band both arms can serve wants measuring, not guessing.
+///
+/// [`qmv_rows_fold`] is the walk, and
+/// [`crate::tuning::DeviceTuning::qmv_rows_max`] is the ceiling it stops at.
+const QMV_ROW_RUNGS: [i32; 3] = [2, 4, 8];
 
-/// The column tile the split dispatch is stamped at.
-const SPLIT_BN: i32 = 32;
-
-/// Past this the partials buffer costs more than the threadgroups buy.
-const SPLIT_MAX: i32 = 16;
-
-/// The widest projection that takes the split path. A vocabulary head has
-/// enough output tiles of its own to never need one, which is what keeps the
-/// partials to a few MB instead of hundreds.
-const SPLIT_MAX_OUT: i32 = 8192;
-
-/// Each partition must be a whole number of `BK`-wide tiles AND whole
-/// quantization groups, or it reads into the next group's scales. 64 is the
-/// widest group the points are stamped for and a multiple of [`QMM_BK`].
-const SPLIT_K_ALIGN: i32 = 64;
+/// The pack widths the multi-row point is stamped at — one weight pack per
+/// thread per k step, or two.
+///
+/// Two is the one-row point's (`packs_per_thread = 2` in `quant_qmv.metal`)
+/// and is what a fold of one or two rows can afford; a wider fold holds more
+/// activation slices live and may want one. See
+/// [`crate::tuning::DeviceTuning::qmv_rows_packs`].
+const QMV_PACK_RUNGS: [i32; 2] = [1, 2];
 
 /// Every point this plane may fire, ready to compile — the driver's warm-up
 /// census and the gate that the stamps still name entries the compiler will
@@ -223,6 +225,13 @@ pub fn composed() -> Vec<Fire> {
         for &b in &WIDTHS {
             let point = qmv_point("quant.qmv", "fast", gs, b).expect("an axis point");
             out.push(Fire::at(QMV_FILE, point.entry));
+            for &r in &QMV_ROW_RUNGS {
+                for &p in &QMV_PACK_RUNGS {
+                    let point =
+                        qmv_rows_point("quant.qmv_rows", gs, b, r, p).expect("an axis point");
+                    out.push(Fire::at(QMV_ROWS_FILE, point.entry).stamp(point.stamp));
+                }
+            }
             for &bm in &ROW_TILES {
                 for &bn in &TILES {
                     let point = qmm_point("quant.qmm_t", "", QMM_STAMP, gs, b, bm, bn)
@@ -317,6 +326,150 @@ pub fn qmv_name(
     Ok(qmv_point(op, form, group, bits)?.entry)
 }
 
+/// One multi-row qmv instantiation — the entry symbol and the stamp that
+/// conjures it.
+///
+/// Stamped rather than spelled in source for `quant_qmm_t.metal`'s reason:
+/// the axis is `(group, bits) x fold x pack`, thirty-six points, of which a
+/// checkpoint fires one.
+pub fn qmv_rows_point(
+    op: &'static str,
+    group: i32,
+    bits: i32,
+    rows: i32,
+    packs: i32,
+) -> Result<Point, Error> {
+    check(op, &GROUPS, group, "group size")?;
+    check(op, &WIDTHS, bits, "bit width")?;
+    check(op, &QMV_ROW_RUNGS, rows, "row group")?;
+    check(op, &QMV_PACK_RUNGS, packs, "pack width")?;
+    let entry = symbol(&format!(
+        "affine_qmv_rows_bfloat16_gs_{group}_b_{bits}_r_{rows}_p_{packs}"
+    ));
+    Ok(Point {
+        entry,
+        stamp: symbol(&format!(
+            "{QMV_ROWS_STAMP}(\"{entry}\", {group}, {bits}, {rows}, {packs})"
+        )),
+    })
+}
+
+/// Output rows one threadgroup of either vector point lands — two
+/// simdgroups, four results each, which is where `QMV_GROUP`'s `y` extent
+/// and this divisor both come from.
+const QMV_OUT_PER_GROUP: u32 = 8;
+
+/// **THE FOLD A FIRE OF `rows` TAKES, OR `None` FOR THE ONE-ROW POINT.**
+///
+/// The widest stamped rung that (a) the machine's table allows, (b) DIVIDES
+/// the batch, and (c) leaves the launch enough threadgroups to fill the
+/// machine. Each clause is a measurement and none of them is symmetry.
+///
+/// # (b) It must DIVIDE, because a half-empty group costs a full one
+///
+/// The fold's saving is per GROUP, and a group is paid for whether or not
+/// its rows exist. `throughput_probe` on qwen3.6-27B, vector arm forced at
+/// every width (`qmm_min_batch = 999`), ms/fire — and read the ODD columns:
+///
+/// ```text
+///   lanes        1       2       3       4       5       6       7       8
+///   one-row  62.12  107.51  159.33  207.70       —       —       —  266.63
+///   R = 2    62.12   97.64  176.77  185.69  263.86  270.66  352.69  360.14
+/// ```
+///
+/// The folded row is a staircase on the GROUP count — 97.6 at one group,
+/// ~180 at two, ~267 at three, ~356 at four — so three rows cost what four
+/// cost and lose to the one-row point by 11%, while two and four rows win by
+/// 9% and 11%. A rule that folded whatever it was handed would buy the even
+/// widths and sell the odd ones.
+///
+/// # (c) It must still FILL THE MACHINE
+///
+/// Folding R rows into one threadgroup divides the launch by R, which is the
+/// point when the launch had threadgroups to spare and a defect when it did
+/// not — the giant and the vehicle:
+///
+/// ```text
+///   qwen36-27b   a projection is 5120 wide   640 threadgroups at one row
+///   qwen35-0.8b  the attention four are      128 threadgroups at one row
+///                1024 wide
+/// ```
+///
+/// `crossover_tg` is [`crate::tuning::DeviceTuning::qmm_bn_crossover_tg`],
+/// BORROWED — that constant's own sweep is the threadgroup count at which
+/// this machine stops rewarding a smaller grid, which is the same physical
+/// question asked of a different kernel. The borrow is CHECKED rather than
+/// assumed: `throughput_probe` on the vehicle, 64 warm fires, the clause
+/// disabled by pinning the constant to zero (which reaches nothing else
+/// below the crossover, since the vector arm consults no column tile):
+///
+/// ```text
+///   lanes            1      2      3      4
+///   guard on      5.65   6.51  10.63  11.63   ms/fire
+///   guard off     5.86   6.80  10.98  11.63
+/// ```
+///
+/// Two lanes is the case the clause exists for and the only one it changes:
+/// one group of the 0.8B's 1024-wide projections is 128 threadgroups, under
+/// the 160 this machine fills at, so the fold declines and is 4.3% better
+/// for declining. Four lanes is the CONTROL — two groups is 256
+/// threadgroups, the clause passes either way, and the two columns are the
+/// same number.
+///
+/// The step-down is monotone and so the walk is a `find`: a narrower rung is
+/// always MORE threadgroups, never fewer.
+///
+/// # One row is not a fold
+///
+/// It is the one-row point exactly — already stamped, already compiled, and
+/// identical in every operand.
+#[must_use]
+pub fn qmv_rows_fold(rows: i32, out_width: i32, max: i32, crossover_tg: i32) -> Option<i32> {
+    if rows < 2 {
+        return None;
+    }
+    let tiles = out_width.max(1).unsigned_abs().div_ceil(QMV_OUT_PER_GROUP);
+    let fills = |rung: i32| {
+        let groups = rows.unsigned_abs() / rung.unsigned_abs();
+        groups.saturating_mul(tiles) >= crossover_tg.max(0).unsigned_abs()
+    };
+    QMV_ROW_RUNGS
+        .iter()
+        .copied()
+        .rev()
+        .filter(|rung| *rung <= max && *rung <= rows && rows % *rung == 0)
+        .find(|rung| fills(*rung))
+}
+
+/// The multi-row vector point's geometry: one threadgroup per row GROUP down
+/// x, the one-row point's output split down y.
+///
+/// The x extent is `div_ceil` even though [`qmv_rows_fold`] only ever hands
+/// back a rung that divides: the shader guards its stores on the row count
+/// either way, so a caller that selected its own fold cannot fall off the
+/// end of the batch here.
+pub fn qmv_rows_grid(
+    op: &'static str,
+    vecs: i32,
+    rows_per_group: i32,
+    out_vec_size: i32,
+) -> Result<[u32; 3], Error> {
+    if vecs <= 0 {
+        return Err(refuse(op, "the vectors are zero"));
+    }
+    if rows_per_group <= 0 {
+        return Err(refuse(op, "the row group is zero"));
+    }
+    if out_vec_size <= 0 {
+        return Err(refuse(op, "the output vector is zero"));
+    }
+    let groups = vecs.unsigned_abs().div_ceil(rows_per_group.unsigned_abs());
+    let x = groups
+        .checked_mul(32)
+        .ok_or_else(|| refuse(op, format!("{vecs} vectors will not launch")))?;
+    Ok([x, out_vec_size.unsigned_abs().div_ceil(4), 1])
+}
+
 fn check(
     op: &'static str,
     points: &[i32],
@@ -348,7 +501,9 @@ pub fn bm_rung(rows: i32) -> i32 {
     best
 }
 
-/// Rows the batched fire launches its GEMM over, for a fire of `rows`.
+/// The row block a fire of `rows` launches its GEMM at, and the row count it
+/// launches over — or `None` when the slot cannot hold a padded launch at
+/// even the narrowest block.
 ///
 /// **THE KERNEL TAKES NO `M`.** It is written for full tiles only, so a
 /// driver may select it only when `M % BM == 0`, and the row count reaches it
@@ -359,64 +514,65 @@ pub fn bm_rung(rows: i32) -> i32 {
 /// and 24 — a flat curve with one spike, because 16 was the only width that
 /// divided a rung. Six times the lanes bought nothing.
 ///
-/// So pad the fire up to its rung. The padding is free of consequence when
-/// the rows land in slots the fire does not read: a GEMM row's output depends
+/// So pad the fire up to a rung. The padding is free of consequence when the
+/// rows land in slots the fire does not read: a GEMM row's output depends
 /// only on its own input row, so garbage in the tail cannot reach a real one.
 /// `capacity` is what makes that true and is the caller's to state — the rows
 /// its activation and result rectangles actually hold, not the rows this fire
 /// uses.
 ///
-/// Two guards, both falling back to the unpadded width (and so to the matvec,
-/// since it will not divide a rung):
+/// **IT WALKS DOWN THE RUNGS RATHER THAN DECLINING AT THE FIRST ONE THAT WILL
+/// NOT FIT.** It used to ask [`bm_rung`] for one rung and answer the UNPADDED
+/// width when the slot could not hold it, which dropped the fire to the
+/// vector point: a 20-row fire in a 24-row slot declined while a 16-row fire
+/// in the same slot did not, so a batch over the crossover could still land
+/// on the arm meant for batches under it. Stepping down means a slot that
+/// holds any padded launch at all gets one, and which rung it lands on does
+/// not reach the answer, because every rung of this template is bit-identical
+/// to every other (`the_fingerprint_matrix`).
 ///
-///   * `rows < min_batch` — padding must not be able to talk the dispatch
-///     past the measured crossover. A 2-row fire padded to 16 would launch
-///     eight times the arithmetic it needs.
-///   * `padded > capacity` — a wider write would run into the next
-///     activation's slot. **THE FLOOR THIS IMPOSES MOVED WITH THE 8 RUNG.**
-///     It used to be sixteen: any fire at or above the crossover needed a
-///     slot sixteen rows deep or it fell straight back to the vector point.
-///     `bm_rung` now answers 8 below sixteen rows, so a 2-15 row fire needs
-///     EIGHT and a slot of 8-15 rows — which used to decline every time —
-///     reaches the GEMM.
+/// # The corner this cannot reach, stated
+///
+/// A fire in the last seven rows of its own slot — `rows > capacity - 8` with
+/// `rows % 8 != 0` — has nowhere to pad to and takes the vector point even
+/// over the crossover, which at those widths is the slower arm. Closing it
+/// wants the arena to carve its `Dim::Tokens` slots at a multiple of
+/// [`BM_RUNGS`]`[0]` rows, which is `engine_metal::arena`'s to do and not
+/// this plane's. Until then: a shell whose budget ceiling is a multiple of
+/// eight has no such corner, because the only fire that could reach it is one
+/// that fills the budget exactly and is therefore already padded.
 #[must_use]
-pub fn mb_rows(rows: i32, capacity: i32, min_batch: i32) -> i32 {
+pub fn mb_block(rows: i32, capacity: i32) -> Option<(i32, i32)> {
     let rows = rows.max(1);
-    if rows < min_batch {
-        return rows;
-    }
-    let bm = bm_rung(rows);
-    let padded = ((rows + bm - 1) / bm) * bm;
-    if padded <= capacity.max(1) { padded } else { rows }
-}
-
-/// The column tile for a GEMM that has split-K behind it: the WIDEST that
-/// divides the output, full stop.
-///
-/// This used to gate on a threadgroup count, and that was right when the GEMM
-/// had nothing else supplying parallelism. Split-K changed the premise — the
-/// split now supplies the threadgroups, so the only thing BN still decides is
-/// how many times each weight tile is dequantized, and wider is strictly
-/// fewer. Interleaved A/B on a decode step, widest against the old
-/// 192-threadgroup rule: 16 lanes 31.57 ms against 37.02, 32 lanes 141.18
-/// against 158.45. The old rule is a pessimization once the split exists.
-///
-/// BN partitions output columns only — every element's K sum is unchanged —
-/// so the choice is bit-exact whichever way it goes.
-#[must_use]
-pub fn bn(out_width: i32) -> Option<i32> {
-    BN_RUNGS
+    let capacity = capacity.max(1);
+    let fits = |rung: i32| {
+        // `div_ceil` is stable on the unsigned integers only, and every
+        // value here is positive by the two clamps above.
+        let padded = i32::try_from(rows.unsigned_abs().div_ceil(rung.unsigned_abs()))
+            .ok()?
+            .saturating_mul(rung);
+        (padded <= capacity).then_some((rung, padded))
+    };
+    // Widest first, and a rung the batch cannot COVER is not offered: a
+    // one-row decode padded to sixty-four would launch sixty-four rows of
+    // arithmetic to compute one. Below the narrowest rung the floor is the
+    // floor, which is what makes a 1-7 row fire reach the tile at all.
+    BM_RUNGS
         .iter()
         .rev()
         .copied()
-        .find(|rung| out_width % rung == 0)
+        .filter(|rung| rows >= *rung)
+        .find_map(fits)
+        .or_else(|| fits(BM_RUNGS[0]))
 }
 
-/// [`bn`] for a family whose GEMM has NO split-K behind it.
+/// The column tile for a tiled fire, and the ONLY such rule left.
 ///
-/// The rule above is correct *because* the split supplies threadgroups when
-/// the output tiles do not. A family that dispatches no split has no such
-/// supply, and taking the widest tile then starves the machine: at M=128 with
+/// There used to be a second — the widest tile that divides, for a family
+/// with split-K behind it — and it was correct *because* the split supplied
+/// threadgroups when the output tiles did not. Nothing supplies threadgroups
+/// that way any more (see [`act_x_wt`]), and taking the widest tile with no
+/// such supply starves the machine: at M=128 with
 /// BM=64 a projection to 1024 columns gets 32 threadgroups, which the curve
 /// prices at a third of what the same work does at 200.
 ///
@@ -439,35 +595,6 @@ pub fn bn_unsplit(out_width: i32, row_tiles: i32, crossover_tg: i32) -> Option<i
         return Some(32);
     }
     Some(BN_RUNGS[0])
-}
-
-/// How deep to split the contraction when the output tiles alone leave the
-/// machine short, or 1 for no split.
-///
-/// Counts the tiles the SPLIT dispatch will actually launch — [`SPLIT_BN`]
-/// wide and `bm` tall. It used to count rows in units of the NARROWEST block,
-/// on the theory that a wide block is twice as parallel and should be split
-/// half as deep. That is backwards: a wide block covers twice the rows in ONE
-/// threadgroup, so it produces half the tiles and needs MORE split, not less
-/// — and the numbers that appeared to support it were measured on a split
-/// path that never dispatched its reduce. Counting honestly is worth
-/// 741 → 870 tok/s at 32 lanes on llama-1B.
-#[must_use]
-pub fn split_k(out_width: i32, rows: i32, contraction: i32, bm: i32) -> i32 {
-    if out_width % SPLIT_BN != 0 || out_width > SPLIT_MAX_OUT || bm <= 0 {
-        return 1;
-    }
-    let tiles = (out_width / SPLIT_BN) * ((rows + bm - 1) / bm);
-    if tiles <= 0 {
-        return 1;
-    }
-    let mut split = (SPLIT_TARGET_TGS / tiles)
-        .min(SPLIT_MAX)
-        .min(contraction / SPLIT_K_ALIGN);
-    while split > 1 && contraction % (split * SPLIT_K_ALIGN) != 0 {
-        split -= 1;
-    }
-    if split < 2 { 1 } else { split }
 }
 
 /// The staged-input point: the FP16 pre-cast GEMM, and the largest single win
@@ -523,73 +650,6 @@ pub fn precast_stage(op: &'static str, rows: i32, contraction: i32) -> Result<Gr
         .filter(|n| *n > 0)
         .ok_or_else(|| refuse(op, format!("{rows} x {contraction} will not stage")))?;
     Ok(Grid::of([count.unsigned_abs(), 1, 1], [256, 1, 1]))
-}
-
-/// The split-K point, and its partials dtype. `f32` partials are the accurate
-/// arm; `bfloat16` is the one that keeps the partials buffer to half the
-/// bytes.
-pub fn splitk_point(
-    op: &'static str,
-    partials: &str,
-    group: i32,
-    bits: i32,
-    bm: i32,
-) -> Result<&'static str, Error> {
-    check(op, &GROUPS, group, "group size")?;
-    check(op, &WIDTHS, bits, "bit width")?;
-    check(op, &ROW_TILES, bm, "row tile")?;
-    Ok(symbol(&format!(
-        "affine_qmm_t_splitk_{partials}_gs_{group}_b_{bits}_bm_{bm}_bn_{SPLIT_BN}"
-    )))
-}
-
-/// The fold that turns the split's partials back into one result.
-///
-/// **DISPATCHING THE SPLIT WITHOUT THIS IS NOT A SLOW ANSWER, IT IS A WRONG
-/// ONE**, and the reference spent a sweep discovering that: the curve that
-/// preferred a 256-threadgroup target was drawn by timing a kernel whose
-/// partials were never summed.
-pub fn splitk_reduce_point(partials: &str) -> &'static str {
-    match partials {
-        "f32_bfloat16" => "qmm_splitk_reduce_f32_bfloat16",
-        _ => "qmm_splitk_reduce_bfloat16",
-    }
-}
-
-/// The split dispatch's grid: `out/BN` column tiles, `ceil(M/BM)` row tiles,
-/// and one z-plane per split, at [`qmm_group`]'s threadgroup for the row
-/// block — `32x2x2 = 128` threads from the 16 rung up and `32x2x1 = 64` at
-/// the 8.
-///
-/// The z axis carries BOTH the split index and the `WM` lanes, which is why
-/// its multiplier is the group's own z extent and not a literal 2: the shader
-/// reads `tid.z` as the partition and `simd_gid` as the row split, and a grid
-/// that doubled z at a point compiled for one row simdgroup would run every
-/// partition twice.
-pub fn splitk_grid(op: &'static str, out_width: i32, rows: i32, bm: i32, split: i32) -> Result<Grid, Error> {
-    if out_width <= 0 || rows <= 0 || bm <= 0 || split <= 0 {
-        return Err(refuse(op, "the split dispatch has a zero extent"));
-    }
-    let group = qmm_group(bm);
-    Ok(Grid::of(
-        [
-            32 * (out_width.unsigned_abs() / SPLIT_BN.unsigned_abs()),
-            group[1] * rows.unsigned_abs().div_ceil(bm.unsigned_abs()),
-            group[2] * split.unsigned_abs(),
-        ],
-        group,
-    ))
-}
-
-/// The reduce's grid: one thread per element of the result.
-pub fn splitk_reduce_grid(op: &'static str, out_width: i32, rows: i32) -> Result<Grid, Error> {
-    if out_width <= 0 || rows <= 0 {
-        return Err(refuse(op, "the reduce has a zero extent"));
-    }
-    Ok(Grid::of(
-        [out_width.unsigned_abs(), rows.unsigned_abs(), 1],
-        [256, 1, 1],
-    ))
 }
 
 pub fn qmm_grid(
@@ -684,18 +744,22 @@ fn symbol(name: &str) -> &'static str {
     leaked
 }
 
-/// The two working planes [`act_x_wt`]'s fast rungs need, seated as MINTS
-/// rather than as rectangles.
+/// The working plane [`act_x_wt`]'s pre-cast rung needs, seated as a MINT
+/// rather than as a rectangle.
 ///
-/// **THE SHAPE IS A FIRE-TIME SELECTION, WHICH IS WHY THIS IS NOT A PAIR OF
-/// `Option<Tensor>`.** How many rows the staging covers is [`mb_rows`]'s
-/// answer and how deep the partials go is [`split_k`]'s, and both are reached
-/// several guards inside the entry. What holds the two planes is ONE
-/// load-time reservation in the shell, so the shell is the only thing that
-/// can say whether a given rectangle is inside it — and the way it says so is
-/// `None`, which every rung here answers by falling to the rung that needs no
+/// **THE SHAPE IS A FIRE-TIME SELECTION, WHICH IS WHY THIS IS NOT AN
+/// `Option<Tensor>`.** How many rows the staging covers is [`mb_block`]'s
+/// answer, reached several guards inside the entry. What holds the plane is
+/// ONE load-time reservation in the shell, so the shell is the only thing
+/// that can say whether a given rectangle is inside it — and the way it says
+/// so is `None`, which the rung answers by falling to the one that needs no
 /// plane. A rectangle handed over before the selection ran would be the
 /// caller guessing at the answer this entry exists to give.
+///
+/// **IT USED TO CARRY A SECOND MINT AND THE SECOND IS GONE.** The split-K
+/// partials plane went out with the split arm: nothing wrote it, and a
+/// reservation nothing writes is not free on a checkpoint that reaches no
+/// pre-cast, where nothing larger aliases it.
 ///
 /// Erased behind `dyn` for [`Ctx`]'s reason: this crate names no driver type.
 pub struct Scratch<'a> {
@@ -703,14 +767,6 @@ pub struct Scratch<'a> {
     /// [`precast_point`] GEMM reads.
     pub precast: &'a dyn Fn(u32, u32) -> Option<Tensor>,
 
-    /// `split * rows x width` — what the [`splitk_point`] GEMM writes and
-    /// [`splitk_reduce_point`] folds back.
-    ///
-    /// **THE PLANE'S DTYPE NAMES THE POINT**, and is read off it rather than
-    /// chosen here: `f32` partials are the accurate arm and `bfloat16` the
-    /// one that costs half the bytes, which is a question about the
-    /// RESERVATION and is answered by whoever sized it.
-    pub partials: &'a dyn Fn(u32, u32, u32) -> Option<Tensor>,
 }
 
 /// `y = act x w^T` where `w` is a quantized bank — the quantized twin of
@@ -729,12 +785,11 @@ pub fn matmul(
 
 /// The same product at the vocabulary head.
 ///
-/// **THE SAME LADDER, AND THE HEAD DECLINES TWO OF ITS RUNGS BY ARITHMETIC.**
-/// [`split_k`] refuses any output past [`SPLIT_MAX_OUT`], so a vocabulary
-/// projection never reaches the split — that refusal is what keeps the
-/// partials plane a few MB instead of a function of the vocabulary. The row
-/// rung and the pre-cast are NOT declined: a head is the widest GEMM in the
-/// stack and stages its activation exactly as the projections do.
+/// **THE SAME LADDER, WITH NOTHING DECLINED.** A head is the widest GEMM in
+/// the stack: it takes the row rung, it stages its activation for the
+/// pre-cast exactly as the projections do, and below the crossover it takes
+/// the vector point like every other projection. This entry stays separate
+/// from [`matmul`] because the op is, not because the ladder is.
 pub fn lm_head(
     ctx: &Ctx<'_>,
     act: Tensor,
@@ -746,47 +801,149 @@ pub fn lm_head(
     act_x_wt(ctx, "linear.lm_head", act, w, y, scratch, capacity_rows)
 }
 
-/// `y = act x w^T` against a bank, tiled where the rectangle allows and
+/// `y = act x w^T` against a bank, tiled wherever the rectangle allows it and
 /// vectorized where it does not.
 ///
-/// **THE TILED POINT IS NOT A FALLBACK-FREE CHOICE, AND THAT IS THE WHOLE
-/// SELECTION.** `quant_qmm_t.metal`'s hot loop is `load_unsafe` on both
-/// operands — it reads a whole `BM x BK` block with no edge predicate — so
-/// the shader's own header states `M % BM == 0, N % BN == 0, K % BK == 0` as
-/// the condition under which a driver may select it AT ALL. The dense gemm
-/// beside this one tiles with `div_ceil` because its tile kernel guards its
-/// own edges; this one cannot, so a rectangle whose rows or columns no
-/// stamped tile divides takes the vector point, which guards every one of
-/// its own reads. That is a correctness rule wearing a performance rule's
-/// clothes, and the ragged case is common: a prefill's row count is however
-/// many tokens the composition happened to carry.
+/// # THE LADDER, KEYED ON THE FIRE'S ROWS
 ///
-/// # The ladder, three rungs and a floor
+/// ```text
+///   m < qmm_min_batch (5)          the vector point, folded where it may be
+///   a rectangle no tile divides    the vector point, folded where it may be
+///   otherwise, fp16 and staged     the pre-cast tile at mb_block's row rung
+///   otherwise                      the plain stamped tile at that rung
+/// ```
 ///
-/// Each rung is a measured helper above and this entry only walks them in
-/// order; the numbers live on the helpers, so nothing is restated here.
+/// where "folded where it may be" is [`qmv_rows_fold`]: `affine_qmv_rows` at
+/// a row group that divides the batch and still fills the machine, and
+/// `affine_qmv_fast` — one row per threadgroup — everywhere else. The two
+/// are BIT-IDENTICAL (`affine_floor`'s
+/// `the_folded_vector_point_lands_the_one_row_bits`), so the fold is a pure
+/// performance selection and not a second numerical policy beside the
+/// crossover below.
 ///
-///   1. **[`mb_rows`]** pads the launch up to the row rung the batch can
-///      cover, bounded by `capacity_rows`. It is not an arm — it is what
-///      makes the three arms below REACHABLE at a batch that is not already
-///      an exact multiple of a rung, which for a decode is almost never.
+///   1. **[`mb_block`]** picks the row block and pads the launch up to it,
+///      bounded by `capacity_rows`. It is not an arm — it is what makes the
+///      arms below REACHABLE at a batch that is not already an exact multiple
+///      of a rung, which for a decode is almost never. Its walk DOWN the
+///      rungs is what keeps a fire in a slot with no room to spare on the
+///      tile rather than dropping it to the vector point.
 ///   2. **[`precast_point`]**, when the machine emulates bfloat and the bank
 ///      is the one format the staged loader is stamped for. The largest
-///      single win recorded, ~40% on the GEMM at every shape measured.
-///   3. **[`splitk_point`] + [`splitk_reduce_point`]**, when the output tiles
-///      alone leave the machine short. 741 → 887 tok/s on llama-1B at 32
-///      lanes.
-///   4. The plain stamped point at [`bn_unsplit`]'s column tile, and below
-///      the crossover the vector point.
+///      single win recorded on the wide shapes, ~40% on the GEMM at every one
+///      measured — and bit-identical to rung 3, which is what makes it legal
+///      for the staging plane to decline for a rectangle it cannot hold.
+///   3. The plain stamped point at [`bn_unsplit`]'s column tile.
+///   4. The vector point, both as the arm below the crossover and as the
+///      floor for a rectangle no stamped tile divides.
 ///
-/// **RUNGS 2 AND 3 DO NOT COMPOSE, AND THE ORDER IS WHAT MAKES THAT
-/// STRUCTURAL** rather than a rule someone has to remember. The split arm is
-/// only reachable when the pre-cast arm declined, because the two planes are
-/// ONE reservation: `engine_metal::scratch` colors the staging rectangle and
-/// the partials rectangle onto the same bytes, on the stated ground that no
-/// dense projection is ever inside both. A chain that staged its activation
-/// and then wrote partials would overwrite the very halves the GEMM was
-/// about to read — a wrong answer, not a slow one.
+/// # The crossover, and the arm moving with the composition
+///
+/// [`crate::tuning::DeviceTuning::qmm_min_batch`] is read against `m`, the
+/// rows the fire brought, which is the number the sweep behind it measured.
+/// A dense projection is ONE matmul over the whole fire — `engine_metal`'s
+/// `window` puts embed, norm and every projection in the region that stands
+/// over all of a fire's rows — so `m` is the COMPOSITION's and the arm moves
+/// with the neighbours. **THAT IS THE RULING AND NOT AN OVERSIGHT:**
+///
+/// > We do NOT need bit-level identity. If a much faster path has small
+/// > numerical drift from nondeterminism, that is obviously acceptable.
+///
+/// The drift is real and its size is known. The two arms are not two speeds
+/// of one kernel: `qdot` computes `scale * Σ code_i x_i + bias * Σ x_i` over
+/// a lane's slice of k and folds thirty-two lanes with `simd_sum`, while the
+/// tile dequantizes to `bf16(code * scale + bias)` and multiplies. Different
+/// arithmetic, not merely a different order. Measured at one or two bf16 ulp
+/// a step, which `throughput_probe`'s correctness arm saw as two lanes of
+/// eight on the vehicle taking a different token at a step decided by 0.0625
+/// — under its `TIE` line, which is where the gate is drawn.
+///
+/// **WHAT THE CROSSOVER IS WORTH.** ms/fire over 32 warm decode fires (16 for
+/// the giant), the vector arm forced with `qmm_min_batch = 999` against the
+/// tile arm forced with `= 2`:
+///
+/// ```text
+///   qwen35-d0.8b-mlxu4, 32 warm decode fires
+///   lanes        1      2      3      4      5      6      7      8     16     32
+///   vector    5.76   7.11  10.96  12.31  16.00  15.66  17.95  18.21  29.75  53.65
+///   tile     10.14  10.18  12.68  12.54  15.65  15.75  17.92  17.86  29.78  53.20
+///
+///   qwen36-27b-mlxu4, 16 warm decode fires
+///   lanes        1      2             4                    8     16
+///   vector   61.99 107.32        207.50               266.63 355.11
+///   tile    197.45 206.16        227.90               266.66 355.10
+/// ```
+///
+/// Five is where the lines cross on all four checkpoints the sweep took, and
+/// from eight lanes up the two columns are the same to the third digit —
+/// which is the CONTROL that says the rest of the table is the arm and not
+/// drift. Below five the vector point is worth 76% of a one-lane decode on
+/// the small vehicle and 3.2x on the giant.
+///
+/// # The tile family is one fingerprint, and that part is not a policy
+///
+/// Everything the ladder picks among ABOVE the crossover lands the same bits.
+/// Measured over a synthetic 4-bit bank at K = 1024, every stamped point
+/// fired at the same rows and compared bit for bit (`engine-metal`'s
+/// `affine_floor`, `the_fingerprint_matrix`):
+///
+/// ```text
+///   plain tile     bm 8/16/32/64 x bn 16/32/64   one fingerprint, all twelve
+///   pre-cast tile  bm 8/16/32/64 x bn 16/32/64   the SAME fingerprint
+///   vector point                                 parts from it
+/// ```
+///
+/// The tile's row block, its column tile and whether its operands were staged
+/// to `half` first are all invisible in the answer: `BM`, `BN`, `WM` and `WN`
+/// decide who holds which element, `BK` is 32 throughout, and every output
+/// element accumulates over k in one ascending order into an `f32`
+/// accumulator. So [`mb_block`]'s rung walk and the pre-cast rung's decline
+/// are free of consequence, and the fingerprint matrix is the regression that
+/// keeps them so — an accidental change to one rung's k-order would show up
+/// there rather than as a mystery at a checkpoint.
+///
+/// # The rectangle can still refuse the tile
+///
+/// `quant_qmm_t.metal`'s hot loop is `load_unsafe` on both operands — it
+/// reads a whole `BM x BK` block with no edge predicate — so the shader's own
+/// header states `M % BM == 0, N % BN == 0, K % BK == 0` as the condition
+/// under which a driver may select it AT ALL. The dense gemm beside this one
+/// tiles with `div_ceil` because its tile kernel guards its own edges; this
+/// one cannot. `N` and `K` are the WEIGHT's and so a refusal on either is a
+/// property of the checkpoint, the same for every fire. `M` is padded up by
+/// [`mb_block`], and a rectangle it cannot pad takes the vector point.
+///
+/// # Two arms that are NOT here
+///
+/// **THE SPLIT-K ARM IS GONE, AND SO ARE ITS HELPERS.** It partitions k and
+/// folds the pieces at a depth that was a function of the fire's rows, and
+/// the fold is a third summation order on top of the two above. Nothing sizes
+/// a partials plane and nothing binds `affine_qmm_t_splitk`; those
+/// instantiations sit in `quant_qmm_t.metal` unminted. What the removal costs
+/// is on the formats that do not reach FP16 — 8-bit, and group 32 or 128 —
+/// where the reference's own sweep prices it at 741 → 887 tok/s on llama-1B
+/// at 32 lanes. It comes back if a measured shape wants it.
+///
+/// **AND `quant_narrow.metal` IS GONE.** It was a one-thread-per-column point
+/// written to land the tile's bits at one and two rows, and it did — but the
+/// vector point beats it across its whole range (107.8 against 61.99 ms on
+/// the giant at one lane; 142 GB/s against 230), so on this ladder there is
+/// no width at which it would be selected. An arm nobody may take is not an
+/// arm.
+///
+/// # The two-to-four band, and the hypothesis that did not survive it
+///
+/// Between one lane and the crossover, the vector arm's cost is very nearly
+/// linear in the rows — 62.19 / 107.51 / 159.33 / 207.70 ms on the giant —
+/// which is what a kernel repeating a read it could share looks like, and
+/// `quant_qmv_rows.metal` was written to share it. **The read was never the
+/// bill.** Fired standalone over a bank past the system cache and then over a
+/// slice inside it, the one-row point costs the SAME per row either way: it
+/// is arithmetic-bound, and the 365 GB/s it reaches at sixteen rows is a
+/// coincidence of this machine's balance. The fold survives on a smaller
+/// argument — it removes the load instructions and the scale arithmetic
+/// beside them, about a tenth — and that tenth is where the band's numbers
+/// moved. Both measurements are on
+/// [`crate::tuning::DeviceTuning::qmv_rows_max`].
 #[allow(clippy::too_many_arguments)]
 pub fn act_x_wt(
     ctx: &Ctx<'_>,
@@ -837,44 +994,34 @@ pub fn act_x_wt(
         stated(op, contraction)?,
     );
     // **THE CROSSOVER IS THE MACHINE'S AND THE FORMAT'S, NOT A CONSTANT.**
-    // Which side of it a batch falls on moved by 40% on this very GEMM when
+    // Which side of it a SHELL falls on moved by 40% on this very GEMM when
     // the FP16 matrix path arrived, and it moves again per Apple family —
     // hence [`crate::tuning`] rather than a number here.
     //
     // The DENSE arm, always: whether the checkpoint's FFN is routed is a fact
-    // about the MODEL, and no operand of `linear.matmul` carries it. On the
-    // M1 Max the two agree at 8 and only Apple8 separates them, so the
-    // difference this cannot see is one family's mixtures' attention
-    // projections. Naming it needs a fact at this seam that the IR does not
-    // state.
+    // about the MODEL, and no operand of `linear.matmul` carries it.
     let tuned = crate::tuning::current();
     let fp16 = tuned.fp16_gemm_format(w.bits, w.group);
     let min_batch = i32::try_from(tuned.qmm_min_batch(false, fp16)).unwrap_or(i32::MAX);
     let crossover = i32::try_from(tuned.qmm_bn_crossover_tg).unwrap_or(i32::MAX);
     let capacity = i32::try_from(capacity_rows).unwrap_or(i32::MAX);
-    // **RUNG 1, AND IT IS NOT AN ARM.** The rung is chosen off the fire's OWN
-    // width — [`bm_rung`] answers the widest block the batch can cover, not
-    // the widest that divides the padded result — and [`mb_rows`] is what
-    // pads up to it, or declines to when the batch is under the crossover or
-    // the slot has no rows to spare. A decline leaves `padded == m`, which no
-    // rung need divide, so the tile falls back to the widest that DOES and
-    // otherwise to the vector point below.
-    let rung = bm_rung(m);
-    let padded = mb_rows(m, capacity, min_batch);
-    let block = if padded % rung == 0 {
-        Some(rung)
-    } else {
-        tile(padded)
-    };
+    // **THE CROSSOVER IS ASKED OF `m`** — the rows this fire brought, which
+    // is the number the sweep behind `qmm_min_batch` measured. See this
+    // entry's header for the table and for what moves with the composition.
+    //
+    // **RUNG 1, AND IT IS NOT AN ARM.** [`mb_block`] answers the widest row
+    // block the batch can cover whose padded launch the slot can hold, and
+    // the row count to launch over. `None` is a rectangle that cannot be
+    // padded at all, which takes the vector point below.
     if m >= min_batch
         && k % QMM_BK == 0
-        && let Some(bm) = block
+        && let Some((bm, padded)) = mb_block(m, capacity)
     {
         // **RUNG 2: the staged input.** Two dispatches and one plane — the
         // cast writes `padded x k` halves, the GEMM reads them at buffer 12
         // and leaves the bf16 activation seat null. The padding is what makes
         // the staging cover rows the fire does not use, and it is the same
-        // guarantee `mb_rows` states: those rows are inside the activation
+        // guarantee `mb_block` states: those rows are inside the activation
         // slot's own capacity, so the cast reads garbage rather than somebody
         // else's operand and the GEMM lands the product of it in slots
         // nothing reads.
@@ -918,71 +1065,9 @@ pub fn act_x_wt(
                 &gemm,
             );
         }
-        // **RUNG 3: the split contraction.** Reachable only because the
-        // pre-cast arm declined — see the entry's header for why that is the
-        // structure and not a convention. The split's own column tile is
-        // fixed by what is stamped, so [`bn`] does not appear here; what the
-        // grid needs is the partition width and the stride from one split's
-        // plane of partials to the next.
-        let split = split_k(n, padded, k, bm);
-        if split > 1
-            && let Some(plane) = (scratch.partials)(
-                split.unsigned_abs(),
-                padded.unsigned_abs(),
-                n.unsigned_abs(),
-            )
-        {
-            let stride = padded
-                .checked_mul(n)
-                .ok_or_else(|| refuse(op, format!("{padded} x {n} partials will not launch")))?;
-            let form = dtype_dispatch!(op, plane.dtype, {
-                F32 => "f32_bfloat16",
-                Bf16 => "bfloat16",
-            });
-            ctx.fire(
-                Fire::at(QMM_FILE, splitk_point(op, form, group, bits, bm)?)
-                    .apply(splitk_grid(op, n, padded, bm, split)?),
-                &[
-                    w.codes.arg(),
-                    w.scales.arg(),
-                    biases.arg(),
-                    act.arg(),
-                    // The result seat: a split lands partials at 8 and
-                    // nothing at 4 until the fold below.
-                    ctx.absent()?,
-                    k.arg(),
-                    n.arg(),
-                    ctx.absent()?,
-                    plane.arg_mut(),
-                    (k / split).arg(),
-                    stride.arg(),
-                ],
-            )?;
-            // **THE FOLD IS NOT OPTIONAL** — see [`splitk_reduce_point`]. It
-            // walks the fire's OWN rows and not the padded ones: the rows the
-            // pad added hold a product of garbage, and folding them would
-            // write it where a later op could read it.
-            return ctx.fire(
-                Fire::at(QMM_FILE, splitk_reduce_point(form)).apply(splitk_reduce_grid(op, n, m)?),
-                &[
-                    ctx.absent()?,
-                    ctx.absent()?,
-                    ctx.absent()?,
-                    ctx.absent()?,
-                    y.arg_mut(),
-                    ctx.absent()?,
-                    n.arg(),
-                    ctx.absent()?,
-                    plane.arg(),
-                    ctx.absent()?,
-                    stride.arg(),
-                    split.arg(),
-                ],
-            );
-        }
-        // **RUNG 4: the plain stamped point**, at the column tile measured
+        // **RUNG 3: the plain stamped point**, at the column tile measured
         // for a family with no split behind it ([`bn_unsplit`]) — which is
-        // what this arm is, having just declined one.
+        // what every tiled arm here is, now that the split is gone.
         if let Some(bn) = bn_unsplit(n, padded / bm, crossover) {
             let point = qmm_point(op, "", QMM_STAMP, group, bits, bm, bn)?;
             return ctx.fire(
@@ -1001,6 +1086,32 @@ pub fn act_x_wt(
             );
         }
     }
+    // **RUNG 4: the vector point, FOLDED.** The one-row point walks one
+    // threadgroup per row, so a fire of `m` rows reads the bank `m` times;
+    // `quant_qmv_rows.metal` reads it once per group of `R`. The fold is the
+    // narrowest rung that covers the batch ([`qmv_rows_fold`]), and at one
+    // row there is nothing to fold and the one-row point is fired unchanged.
+    let rows_max = i32::try_from(tuned.qmv_rows_max).unwrap_or(1);
+    let packs = i32::try_from(tuned.qmv_rows_packs).unwrap_or(QMV_PACK_RUNGS[1]);
+    if let Some(fold) = qmv_rows_fold(m, n, rows_max, crossover) {
+        let point = qmv_rows_point(op, group, bits, fold, packs)?;
+        return ctx.fire(
+            Fire::at(QMV_ROWS_FILE, point.entry)
+                .stamp(point.stamp)
+                .apply(Grid::of(qmv_rows_grid(op, m, fold, n)?, QMV_GROUP)),
+            &[
+                w.codes.arg(),
+                w.scales.arg(),
+                biases.arg(),
+                act.arg(),
+                y.arg_mut(),
+                k.arg(),
+                n.arg(),
+                // The batch, which is where a padded group's stores stop.
+                m.arg(),
+            ],
+        );
+    }
     let point = qmv_point(op, "fast", group, bits)?;
     ctx.fire(
         Fire::at(QMV_FILE, point.entry).apply(Grid::of(qmv_grid(op, m, n)?, QMV_GROUP)),
@@ -1014,15 +1125,6 @@ pub fn act_x_wt(
             n.arg(),
         ],
     )
-}
-
-/// The widest stamped ROW tile that divides `extent`, or `None` when none
-/// does. [`ROW_TILES`] and not [`TILES`], because the one caller is choosing
-/// a row block for a launch `mb_rows` declined to pad — and the 8 rung is
-/// what lets an odd multiple of eight take the GEMM at all instead of falling
-/// to the vector point.
-fn tile(extent: i32) -> Option<i32> {
-    ROW_TILES.iter().copied().find(|t| extent % t == 0)
 }
 
 /// The three extents, of which exactly one may be zero.
@@ -1064,24 +1166,30 @@ mod tests {
     }
 
     #[test]
-    fn padding_never_talks_a_fire_past_its_crossover() {
-        // Below the crossover the fire keeps its own width, which will not
-        // divide a rung, which is how it reaches the matvec.
-        assert_eq!(mb_rows(2, 4096, 8), 2);
-        assert_eq!(mb_rows(7, 4096, 8), 7);
-        // At and above it, up to the rung the batch can cover — and the
-        // rung a batch of eight to fifteen covers is the 8.
-        assert_eq!(mb_rows(8, 4096, 8), 8);
-        assert_eq!(mb_rows(15, 4096, 8), 16);
-        assert_eq!(mb_rows(20, 4096, 8), 32);
-        assert_eq!(mb_rows(65, 4096, 8), 128);
-        // And never past the rows the caller says it holds.
-        assert_eq!(mb_rows(20, 24, 8), 20);
-        // The capacity floor the 8 rung moved: a three-row fire at a
-        // crossover of two pads to eight, which a slot of eight holds and a
-        // slot of seven does not.
-        assert_eq!(mb_rows(3, 8, 2), 8);
-        assert_eq!(mb_rows(3, 7, 2), 3);
+    fn a_launch_pads_to_the_widest_rung_the_slot_can_hold() {
+        // The rung the batch can cover, padded up, whenever the slot has the
+        // rows to spare — and a 1-7 row fire reaches the floor rung, which is
+        // what a decode needs now that the crossover is not asked of `m`.
+        assert_eq!(mb_block(1, 4096), Some((8, 8)));
+        assert_eq!(mb_block(2, 4096), Some((8, 8)));
+        assert_eq!(mb_block(7, 4096), Some((8, 8)));
+        assert_eq!(mb_block(8, 4096), Some((8, 8)));
+        assert_eq!(mb_block(15, 4096), Some((8, 16)));
+        assert_eq!(mb_block(20, 4096), Some((16, 32)));
+        assert_eq!(mb_block(65, 4096), Some((64, 128)));
+        // **THE STEP DOWN.** A 20-row fire in a 24-row slot cannot pad to the
+        // 16 rung's 32, so it takes the 8 rung's 24 rather than declining to
+        // the vector point — which is the arm whose bits are not the tile's.
+        assert_eq!(mb_block(20, 24), Some((8, 24)));
+        // A 3-row fire needs eight rows of slot and gets them at seven
+        // nowhere: this is the corner stated on `mb_block`.
+        assert_eq!(mb_block(3, 8), Some((8, 8)));
+        assert_eq!(mb_block(3, 7), None);
+        // The corner at the top of a budget, which is the same corner.
+        assert_eq!(mb_block(100, 100), None);
+        // 96 rows cover the 64 rung but pad to 128, which a 100-row slot
+        // will not hold; the 32 rung's 96 is exact and fits, so it is taken.
+        assert_eq!(mb_block(96, 100), Some((32, 96)));
     }
 
     #[test]
@@ -1102,6 +1210,69 @@ mod tests {
     }
 
     #[test]
+    fn a_fold_divides_the_batch_and_still_fills_the_machine() {
+        // A projection wide enough that the fill clause never bites: 5120
+        // columns is 640 tiles, so even one group is far past 160.
+        let wide = |rows| qmv_rows_fold(rows, 5120, 2, 160);
+        // One row is not a fold.
+        assert_eq!(wide(1), None);
+        assert_eq!(wide(2), Some(2));
+        // Three rows: no stamped rung divides three, and a half-empty group
+        // costs a full one — 176.77 ms against the one-row point's 159.33 on
+        // the giant, which is the measurement `qmv_rows_fold` carries.
+        assert_eq!(wide(3), None);
+        assert_eq!(wide(4), Some(2));
+        assert_eq!(wide(5), None);
+        assert_eq!(wide(6), Some(2));
+        // The ceiling is the machine's and is obeyed: the 4 rung divides
+        // four rows and is still not offered at a ceiling of two.
+        assert_eq!(qmv_rows_fold(4, 5120, 4, 160), Some(4));
+        assert_eq!(qmv_rows_fold(8, 5120, 8, 160), Some(8));
+        // Widest first among the rungs that divide.
+        assert_eq!(qmv_rows_fold(8, 5120, 4, 160), Some(4));
+    }
+
+    #[test]
+    fn a_fold_that_would_empty_the_machine_declines() {
+        // The vehicle's attention four are 1024 wide — 128 tiles, and one
+        // group of them is under the 160 this machine fills at. So a
+        // two-row fire folds on the wide projections and not on the narrow
+        // ones, which is the whole reason the clause is here.
+        assert_eq!(qmv_rows_fold(2, 1024, 2, 160), None);
+        assert_eq!(qmv_rows_fold(2, 3584, 2, 160), Some(2));
+        // Four rows over the narrow projection: two groups of 128 tiles is
+        // 256, which fills, so the fold is back.
+        assert_eq!(qmv_rows_fold(4, 1024, 2, 160), Some(2));
+        // A machine that fills at nothing folds everything.
+        assert_eq!(qmv_rows_fold(2, 1024, 2, 0), Some(2));
+    }
+
+    #[test]
+    fn the_folded_point_launches_one_threadgroup_per_group() {
+        // Two rows folded two ways is ONE group down x, and the output split
+        // down y is the one-row point's exactly.
+        assert_eq!(qmv_rows_grid("t", 2, 2, 5120).unwrap(), [32, 1280, 1]);
+        assert_eq!(qmv_grid("t", 2, 5120).unwrap(), [64, 1280, 1]);
+        assert_eq!(qmv_rows_grid("t", 8, 2, 5120).unwrap(), [4 * 32, 1280, 1]);
+        assert!(qmv_rows_grid("t", 0, 2, 5120).is_err());
+        assert!(qmv_rows_grid("t", 2, 0, 5120).is_err());
+    }
+
+    #[test]
+    fn the_folded_points_are_stamped_on_five_axes() {
+        let point = qmv_rows_point("t", 64, 4, 2, 1).unwrap();
+        assert_eq!(point.entry, "affine_qmv_rows_bfloat16_gs_64_b_4_r_2_p_1");
+        assert_eq!(
+            point.stamp,
+            "PIE_STAMP_qmv_rows(\"affine_qmv_rows_bfloat16_gs_64_b_4_r_2_p_1\", 64, 4, 2, 1)"
+        );
+        // Every axis is checked against what the macro will mint.
+        assert!(qmv_rows_point("t", 64, 4, 3, 1).is_err());
+        assert!(qmv_rows_point("t", 64, 4, 2, 4).is_err());
+        assert!(qmv_rows_point("t", 48, 4, 2, 1).is_err());
+    }
+
+    #[test]
     fn the_unsplit_column_tile_is_sixteen_until_the_machine_is_full() {
         // 144 threadgroups still wants 16, 192 already wants 32 — the M1
         // Max's 160 sits in that gap.
@@ -1111,32 +1282,6 @@ mod tests {
         assert_eq!(bn_unsplit(6144, 64, 160), Some(32));
         // A width no tile divides takes no tiled point at all.
         assert_eq!(bn_unsplit(1000, 8, 160), None);
-    }
-
-    #[test]
-    fn the_split_arm_takes_the_widest_tile_that_divides() {
-        assert_eq!(bn(1024), Some(64));
-        assert_eq!(bn(3584), Some(64));
-        assert_eq!(bn(48), Some(16));
-        assert_eq!(bn(1000), None);
-    }
-
-    #[test]
-    fn a_split_is_whole_groups_capped_and_off_at_the_head() {
-        // A projection to hidden: 32 column tiles at one row tile, so the
-        // target divides to 16 and the cap holds it there.
-        assert_eq!(split_k(1024, 16, 2048, 16), 16);
-        // gate/up: 112 column tiles leave room for 4.
-        assert_eq!(split_k(3584, 16, 2048, 16), 4);
-        // A vocabulary head has tiles of its own and is over the width cap.
-        assert_eq!(split_k(151936, 16, 2048, 16), 1);
-        // A wide row block produces HALF the tiles and so needs more split,
-        // which is the correction worth 741 -> 870 tok/s.
-        assert!(split_k(1024, 64, 2048, 64) >= split_k(1024, 64, 2048, 16));
-        // Every partition a whole number of 64-code groups.
-        let k = 2048;
-        let s = split_k(1024, 16, k, 16);
-        assert_eq!(k % (s * 64), 0);
     }
 
     #[test]
@@ -1156,24 +1301,7 @@ mod tests {
             "affine_qmm_t_fp16_precast_bfloat16_gs_64_b_4_bm_8_bn_16"
         );
         // Eight is a ROW tile and not a column one: no point is stamped 8
-        // wide, and `bn`/`bn_unsplit` never answer it.
+        // wide, and `bn_unsplit` never answers it.
         assert!(precast_point("t", "", 16, 8).is_err());
-    }
-
-    #[test]
-    fn the_split_points_name_their_partials() {
-        assert_eq!(
-            splitk_point("t", "bfloat16", 64, 4, 16).unwrap(),
-            "affine_qmm_t_splitk_bfloat16_gs_64_b_4_bm_16_bn_32"
-        );
-        assert_eq!(
-            splitk_point("t", "f32_bfloat16", 64, 4, 32).unwrap(),
-            "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_32_bn_32"
-        );
-        assert_eq!(
-            splitk_point("t", "f32_bfloat16", 64, 4, 8).unwrap(),
-            "affine_qmm_t_splitk_f32_bfloat16_gs_64_b_4_bm_8_bn_32"
-        );
-        assert_eq!(splitk_reduce_point("f32_bfloat16"), "qmm_splitk_reduce_f32_bfloat16");
     }
 }

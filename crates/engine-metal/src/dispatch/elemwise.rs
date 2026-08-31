@@ -88,15 +88,26 @@ impl Run<'_> {
             Elementwise::LayernormNoScale { .. }
             | Elementwise::Layernorm { .. }
             | Elementwise::Clamp { .. }
-            | Elementwise::ClampLearned { .. } => {
+            | Elementwise::ClampLearned { .. }
+            // qwen4's gated-residual family: not on this plane yet.
+            | Elementwise::RmsnormGroupedPlusOne { .. }
+            | Elementwise::SiluScaled { .. }
+            | Elementwise::HcMix { .. }
+            | Elementwise::HcInject { .. }
+            | Elementwise::PleGate { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
+            Elementwise::RmsnormGated {
+                act: model_ir::GateActivation::Sigmoid,
+                ..
+            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Elementwise::RmsnormGated {
                 x,
                 gate,
                 weight,
                 head_dim,
                 eps,
+                act: _,
                 y,
             } => elemwise::norm::rmsnorm_gated(
                 self.ctx(),

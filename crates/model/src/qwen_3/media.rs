@@ -1,4 +1,5 @@
-//! **QWEN3.5 / QWEN3.6 VISION PREPROCESSING — the pinned transcription, PROMOTED.**
+//! **QWEN3.5 / QWEN3.6 VISION PREPROCESSING — the pinned transcription, in the
+//! family's own house.**
 //!
 //! Every number and every loop order below already existed in this tree, in two
 //! places the campaign built them for the vision gates, and this module is those
@@ -10,14 +11,22 @@
 //!   executable form, and `engine-cuda`'s `a_vision_sku_loads_and_fires_an_image`
 //!   transcribed its loop order a second time to build its own streams. One
 //!   order serves the pos-embed gather, the merge and the pool.
-//! * `kernels-cuda/tests/tower_pos_embed.rs` — `axis_taps` / `interp`, which is
-//!   `transformers`' `_interpolation_axis_taps_weights` plus the 2-D separable
-//!   outer product from `get_vision_interpolation_indices_and_weights`
-//!   (`vision_utils.py`, v5.15.1). That file gates the arithmetic against a
-//!   TEXTBOOK `align_corners` bilinear resample written independently of it, so
+//! * `kernels-cuda/tests/tower_pos_embed.rs` — [`axis_taps`] / [`interp`], which
+//!   is `transformers`' `_interpolation_axis_taps_weights` plus the 2-D
+//!   separable outer product from
+//!   `get_vision_interpolation_indices_and_weights` (`vision_utils.py`,
+//!   v5.15.1). That file gates the arithmetic against a TEXTBOOK
+//!   `align_corners` bilinear resample written independently of it, so
 //!   promoting the helper carries a golden that pins the formula and not just
-//!   the kernel. This module's own tests carry the same two claims down here,
-//!   where they run without a GPU.
+//!   the kernel.
+//!
+//! It lives beside [`forward`](super::forward), [`import`](super::import) and
+//! [`template`](super::template) because it is the same kind of fact — how
+//! THIS family does a thing every family does its own way — and the one step
+//! that is not the family's own arithmetic, the resample, arrives lent
+//! ([`Resample`], the codec staying with the host per `model::media`'s rule).
+//! The bytes-in whole-pipe gate rides in `runtime`'s tests, where the codec
+//! is; the arithmetic's own goldens ride in this crate's.
 //!
 //! **THE CHECKPOINT'S OWN NUMBERS**, read off `Qwen3_5VisionConfig` and the
 //! Qwen3.5-0.8B preprocessor config (snapshot `2fc06364`):
@@ -38,8 +47,8 @@
 //! gemma4 gets from rounding down to `pool · patch`, reached by rounding to
 //! nearest with a floor.
 
-use crate::decode;
-use crate::{Budget, Delimiters, EncodedSpan, Fault, Grid, Result, VisionFrontEnd};
+use crate::media::{Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8,
+    VisionFrontEnd};
 
 /// The `ROWS.arch` this front-end answers for.
 ///
@@ -209,8 +218,8 @@ impl QwenVisionConfig {
     /// order [`EncodedSpan::positions`] documents.
     ///
     /// `rgb` is `h · w · 3` bytes, row-major HWC — a decoder's own layout, and
-    /// a plain slice rather than this crate's decoded type so a golden can
-    /// feed pixels it wrote by hand.
+    /// a plain slice rather than [`Rgb8`] so a golden can feed pixels it wrote
+    /// by hand.
     ///
     /// # Panics
     ///
@@ -388,9 +397,9 @@ impl VisionFrontEnd for Qwen35Vision {
     /// correct answers from one front-end.
     fn delimiters(&self) -> Delimiters {
         Delimiters {
-            prefix: "<|vision_start|>",
-            placeholder: "<|image_pad|>",
-            suffix: "<|vision_end|>",
+            prefix: super::tokenizer::VISION_START,
+            placeholder: super::tokenizer::IMAGE_PAD,
+            suffix: super::tokenizer::VISION_END,
         }
     }
 
@@ -399,31 +408,7 @@ impl VisionFrontEnd for Qwen35Vision {
     /// by PIXELS, and `Processor::for_arch_video` already answered the same
     /// `QwenVisionConfig` for a frame as for a still. A frame of a clip is the
     /// same preprocessing at the same ceiling here.
-    fn encode_image(&self, bytes: &[u8], _budget: Budget) -> Result<EncodedSpan> {
-        self.encode(&decode::decode(bytes)?)
-    }
-
-    /// **A FRAME THAT IS ALREADY DECODED, THROUGH THE SAME ARITHMETIC.**
-    ///
-    /// A clip is demuxed once, above this crate, and its frames arrive as
-    /// pixels; re-encoding one to PNG so it could go back through
-    /// [`encode_image`](Qwen35Vision::encode_image) would be work done to
-    /// satisfy a signature. Everything past the decode is shared, so the two
-    /// doors cannot answer two different spans for one picture.
-    fn encode_rgb8(
-        &self,
-        rgb8: &[u8],
-        width: u32,
-        height: u32,
-        _budget: Budget,
-    ) -> Result<EncodedSpan> {
-        self.encode(&decode::from_rgb8(rgb8, width, height)?)
-    }
-}
-
-impl Qwen35Vision {
-    /// The whole encode past the decode — see [`VisionFrontEnd::encode_rgb8`].
-    pub(crate) fn encode(&self, src: &decode::Rgb8) -> Result<EncodedSpan> {
+    fn encode(&self, src: &Rgb8, _budget: Budget, resample: Resample) -> Result<EncodedSpan> {
         let c = self.config;
         let (h_bar, w_bar) = c.smart_resize(src.h, src.w)?;
         let (gh, gw) = (h_bar / c.patch_size, w_bar / c.patch_size);
@@ -438,7 +423,7 @@ impl Qwen35Vision {
             )));
         }
 
-        let resized = decode::resize_exact(src, h_bar, w_bar);
+        let resized = resample(src, h_bar, w_bar);
         let (payload, positions) = c.patchify(&resized.data, resized.h, resized.w);
         let (embed_rows, embed_weights) = c.pos_embed_taps(gh, gw);
 

@@ -738,6 +738,11 @@ __global__ void mxfp4_moe_down_decode(
 struct alignas(16) MoeGroupBases {
     const u8* codes;
     const u8* scales;
+    // The affine planes' third base — null for the two-plane mxfp4 pair,
+    // whose kernel never reads it. The pad keeps the cell a whole number of
+    // 16-byte words so a cell write is two aligned stores.
+    const u8* biases;
+    const u8* pad;
 };
 
 // **THE ONE STATISTIC THE PACKED PATH PUBLISHES** — one `atomicAdd` per ROUTE
@@ -864,6 +869,240 @@ __global__ void moe_matmul_select_mxfp4(
             float v = acc[r];
             if (b != nullptr) v += Elem<T>::to_f32(b[row]);
             out[static_cast<long long>(route) * n + row] = Elem<T>::from_f32(v);
+        }
+    }
+}
+
+// **THE AFFINE TWIN** — MLX's 4-bit codes, eight to a `u32` word, sixty-four
+// under one bf16 scale and one bf16 zero point (`code * scale + bias`). The
+// zero point folds through the group's activation sum, so each activation is
+// read once: `Σ (c·s + b)·x = s·Σ c·x + b·Σ x`.
+//
+// Same grid as the mxfp4 select: one route per block-x, `kRowsT` bank rows
+// per warp, a lane per group striding the row's groups. `bases` and
+// `group_hits` are the streamed seat, both `nullptr` for a resident bank —
+// and the base cell's THIRD pointer is this kernel's, see `MoeGroupBases`.
+template <class T, int kRowsT>
+__global__ void moe_matmul_select_mlxu4(
+    const T* __restrict__ act,
+    const i32* __restrict__ routes,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const u8* __restrict__ biases,
+    T* __restrict__ out,
+    int act_div,
+    int n,
+    int k,
+    const MoeGroupBases* __restrict__ bases,
+    unsigned int* __restrict__ group_hits)
+{
+    constexpr int kRows = kRowsT;
+    const int route = blockIdx.x;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
+    if (row0 >= n) return;
+    const int expert = routes[route];
+
+    moe_note_group(group_hits);
+
+    const int groups_per_row = k / 64;
+    const int words_per_row = k / 8;
+
+    const u8* codes_at = codes;
+    const u8* scales_at = scales;
+    const u8* biases_at = biases;
+    if (bases != nullptr) {
+        const MoeGroupBases seat = *bases;
+        codes_at = seat.codes;
+        scales_at = seat.scales;
+        biases_at = seat.biases;
+    }
+
+    const unsigned* w32 = reinterpret_cast<const unsigned*>(
+        codes_at + static_cast<long long>(expert) * n * (k / 2));
+    const bf16* s16 = reinterpret_cast<const bf16*>(
+        scales_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+    const bf16* b16 = reinterpret_cast<const bf16*>(
+        biases_at + static_cast<long long>(expert) * n * groups_per_row * 2);
+    const T* x = act + static_cast<long long>(route / act_div) * k;
+
+    int row_of[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) row_of[r] = min(row0 + r, n - 1);
+
+    float acc[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
+
+    for (int g = lane_id; g < groups_per_row; g += 32) {
+
+        float part[kRows];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) part[r] = 0.f;
+        float xsum = 0.f;
+
+#pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            float xv[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                xv[j] = Elem<T>::to_f32(x[g * 64 + q * 8 + j]);
+                xsum += xv[j];
+            }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                const unsigned word =
+                    w32[static_cast<long long>(row_of[r]) * words_per_row + g * 8 + q];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float code = static_cast<float>((word >> (4 * j)) & 0xFu);
+                    part[r] = fmaf(code, xv[j], part[r]);
+                }
+            }
+        }
+        // xsum accumulated once per q-pass above counts every activation of
+        // the group exactly once across the eight words.
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const long long fx =
+                static_cast<long long>(row_of[r]) * groups_per_row + g;
+            const float sv = Elem<bf16>::to_f32(s16[fx]);
+            const float bv = Elem<bf16>::to_f32(b16[fx]);
+            acc[r] = fmaf(part[r], sv, acc[r]);
+            acc[r] = fmaf(xsum, bv, acc[r]);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
+    }
+    if (lane_id == 0) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const int row = row0 + r;
+            if (row < n)
+                out[static_cast<long long>(route) * n + row] =
+                    Elem<T>::from_f32(acc[r]);
+        }
+    }
+}
+
+// **THE DENSE AFFINE PROJECTION** (qwen4 stored-form wave): `linear.matmul`
+// and `linear.lm_head` over a weight the store seats as an MLX affine
+// triplet — codes at four or eight bits, sixty-four to one bf16 (scale,
+// zero point) pair. The identity is `moe_matmul_select_mlxu4`'s on an
+// unrouted rectangle: `Σ (c·s + b)·x = s·Σ c·x + b·Σ x`, so each
+// activation is read once and the factors land once per group.
+//
+// One block column per ACTIVATION ROW (`blockIdx.x`), which is the decode
+// shape: a step's row count is small and the weight is read once per row.
+// A long prefill re-reads the weight per row through this grid — the tiled
+// point that amortises it is deliberately not here yet; it arrives with a
+// caller that measures it (the first-light prefills are single-digit rows).
+//
+// `bases` is the streamed seat, `nullptr` for a resident plane — see
+// `MoeGroupBases`. No hit counter: a dense plane is not a routed group,
+// and the tier does not note it (`engine_cuda::experts` D2b).
+template <class T, int kBits, int kRowsT>
+__global__ void matmul_mlx_affine(
+    const T* __restrict__ act,
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const u8* __restrict__ biases,
+    T* __restrict__ out,
+    int n,
+    int k,
+    const MoeGroupBases* __restrict__ bases)
+{
+    constexpr int kRows = kRowsT;
+    constexpr int kPerWord = 32 / kBits;
+    constexpr int kWords = 64 / kPerWord;
+    constexpr unsigned kMask = (1u << kBits) - 1u;
+    const int token = blockIdx.x;
+    const int warp_in_block = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
+    if (row0 >= n) return;
+
+    const u8* codes_at = codes;
+    const u8* scales_at = scales;
+    const u8* biases_at = biases;
+    if (bases != nullptr) {
+        const MoeGroupBases seat = *bases;
+        codes_at = seat.codes;
+        scales_at = seat.scales;
+        biases_at = seat.biases;
+    }
+
+    const int groups_per_row = k / 64;
+    const int words_per_row = k / kPerWord;
+    const unsigned* w32 = reinterpret_cast<const unsigned*>(codes_at);
+    const bf16* s16 = reinterpret_cast<const bf16*>(scales_at);
+    const bf16* b16 = reinterpret_cast<const bf16*>(biases_at);
+    const T* x = act + static_cast<long long>(token) * k;
+
+    int row_of[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) row_of[r] = min(row0 + r, n - 1);
+
+    float acc[kRows];
+#pragma unroll
+    for (int r = 0; r < kRows; ++r) acc[r] = 0.f;
+
+    for (int g = lane_id; g < groups_per_row; g += 32) {
+
+        float part[kRows];
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) part[r] = 0.f;
+        float xsum = 0.f;
+
+#pragma unroll
+        for (int q = 0; q < kWords; ++q) {
+            float xv[kPerWord];
+#pragma unroll
+            for (int j = 0; j < kPerWord; ++j) {
+                xv[j] = Elem<T>::to_f32(x[g * 64 + q * kPerWord + j]);
+                xsum += xv[j];
+            }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                const unsigned word =
+                    w32[static_cast<long long>(row_of[r]) * words_per_row
+                        + g * kWords + q];
+#pragma unroll
+                for (int j = 0; j < kPerWord; ++j) {
+                    const float code =
+                        static_cast<float>((word >> (kBits * j)) & kMask);
+                    part[r] = fmaf(code, xv[j], part[r]);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const long long fx =
+                static_cast<long long>(row_of[r]) * groups_per_row + g;
+            const float sv = Elem<bf16>::to_f32(s16[fx]);
+            const float bv = Elem<bf16>::to_f32(b16[fx]);
+            acc[r] = fmaf(part[r], sv, acc[r]);
+            acc[r] = fmaf(xsum, bv, acc[r]);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r)
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], off);
+    }
+    if (lane_id == 0) {
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+            const int row = row0 + r;
+            if (row < n)
+                out[static_cast<long long>(token) * n + row] =
+                    Elem<T>::from_f32(acc[r]);
         }
     }
 }

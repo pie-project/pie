@@ -43,3 +43,28 @@ pub fn mlx_affine_group_params(values: &[f64]) -> (f32, f32) {
     }
     (scale, bias)
 }
+
+/// Unpack MLX affine codes as the plain unsigned numbers they are, low code
+/// first within each byte and byte order within the `u32` words the
+/// checkpoint packs them into. The caller states the width — four bits, two
+/// codes a byte, or eight, one — because the bytes do not: both widths are
+/// one scheme (`QuantScheme::MlxAffineU4`) and the width is the plane's own
+/// `bits_per_element`.
+///
+/// The numbers are CODES, `0..=15` or `0..=255`, not values: what makes them
+/// values is the per-group scale and zero point beside them, which is the
+/// per-block `Scale` and `Bias` a contract composes around this decode.
+pub fn decode_mlx_affine_codes(bytes: &[u8], bits: u32) -> Vec<f64> {
+    match bits {
+        4 => {
+            let mut values = Vec::with_capacity(bytes.len() * 2);
+            for byte in bytes {
+                values.push(f64::from(byte & 0xF));
+                values.push(f64::from(byte >> 4));
+            }
+            values
+        }
+        8 => bytes.iter().map(|byte| f64::from(*byte)).collect(),
+        other => unreachable!("an MLX affine code is 4 or 8 bits, not {other}"),
+    }
+}

@@ -94,14 +94,6 @@ impl From<model_exec::store::Fault> for Fault {
     }
 }
 
-/// The element the ssm entries instantiate their recurrent state at.
-///
-/// Stated, not declared: `CacheRow::State` carries a slab shape and no dtype,
-/// and `kernels/attn/ssm.cuh` fixes the type at `__nv_bfloat16` in every
-/// state-taking instantiation. A shell that guessed wider would allocate
-/// twice the bytes and read every scan's history at half stride.
-const STATE_DTYPE: Dtype = Dtype::Bf16;
-
 /// The page layout enumerator this shell writes and the entries read: NHD,
 /// `[page][token][head][dim]`.
 ///
@@ -268,9 +260,9 @@ pub fn one_slot_bytes(trace: &Trace, paging: Paging) -> Result<u64> {
                     bytes = bytes.saturating_add(cells * width * element);
                 }
             }
-            CacheRow::State { name, slab } => {
+            CacheRow::State { name, slab, dtype } => {
                 let stride: u64 = slab.iter().product();
-                bytes = bytes.saturating_add(stride * elem_bytes(name, STATE_DTYPE)?);
+                bytes = bytes.saturating_add(stride * elem_bytes(name, *dtype)?);
             }
         }
     }
@@ -362,7 +354,7 @@ enum Shape {
         head_stride: u64,
     },
     /// A recurrent slab: elements per slot.
-    State { stride: u64 },
+    State { stride: u64, dtype: Dtype },
 }
 
 /// The per-fire handles a pool row borrows: the geometry vectors this fire
@@ -657,9 +649,9 @@ impl Pools {
                         head_stride: restated.map_or(keys_width, |seat| u64::from(seat.head_dim)),
                     });
                 }
-                CacheRow::State { name, slab } => {
+                CacheRow::State { name, slab, dtype } => {
                     let stride: u64 = slab.iter().product();
-                    let bytes = stride * u64::from(paging.slots) * elem_bytes(name, STATE_DTYPE)?;
+                    let bytes = stride * u64::from(paging.slots) * elem_bytes(name, *dtype)?;
                     // Slot `s` at `s * stride * element`: the slot watermark
                     // is a prefix here too.
                     rows.push(vec![Arena::reserve(
@@ -667,7 +659,7 @@ impl Pools {
                         bytes,
                         "bytes of a recurrent slab",
                     )?]);
-                    shapes.push(Shape::State { stride });
+                    shapes.push(Shape::State { stride, dtype: *dtype });
                 }
             }
             debug_assert_eq!(rows.len(), index + 1, "one arena set per cache row");
@@ -845,7 +837,7 @@ impl Pools {
                     },
                     }
                 }
-                Shape::State { stride } => CachePool::Recurrent(RecurrentPool {
+                Shape::State { stride, dtype } => CachePool::Recurrent(RecurrentPool {
                     write_state: seats.write_state,
                     write_state_mask: seats.write_state_mask,
                     commit_len: seats.commit_len,
@@ -866,7 +858,7 @@ impl Pools {
                         planes.first().map_or(0, elastic::Arena::base),
                         self.paging.slots,
                         narrow(stride) as u32,
-                        STATE_DTYPE,
+                        dtype,
                     ),
                     slot_ids: seats.slot_ids,
                     slot_stride_elems: stride as i64,
@@ -874,7 +866,7 @@ impl Pools {
                         planes.first().map_or(0, elastic::Arena::base),
                         self.paging.slots,
                         narrow(stride) as u32,
-                        STATE_DTYPE,
+                        dtype,
                     ),
                     conv_stride: stride as i64,
                 }),
@@ -962,15 +954,14 @@ impl Pools {
         // may name a slot no frame has admitted yet, so the copy commits the
         // watermark it needs before it reads or writes a byte.
         self.ensure_state(src.max(dst) + 1)?;
-        let element = u64::from(elem_size(STATE_DTYPE));
         for (planes, shape) in self.rows.iter().zip(&self.shapes) {
-            let Shape::State { stride } = *shape else {
+            let Shape::State { stride, dtype } = *shape else {
                 continue;
             };
             let Some(arena) = planes.first() else {
                 continue;
             };
-            let bytes = stride * element;
+            let bytes = stride * u64::from(elem_size(dtype));
             crate::device::copy_d2d(
                 stream,
                 arena.span(u64::from(dst) * bytes, bytes)?,
@@ -1123,16 +1114,15 @@ impl Pools {
             });
         }
         self.ensure_state(slot + 1)?;
-        let element = u64::from(elem_size(STATE_DTYPE));
         let mut out = Vec::new();
         for (planes, shape) in self.rows.iter().zip(&self.shapes) {
-            let Shape::State { stride } = *shape else {
+            let Shape::State { stride, dtype } = *shape else {
                 continue;
             };
             let Some(arena) = planes.first() else {
                 continue;
             };
-            let bytes = stride * element;
+            let bytes = stride * u64::from(elem_size(dtype));
             let at = out.len();
             out.resize(at + usize::try_from(bytes).unwrap_or(0), 0);
             crate::device::copy_d2h(
@@ -1155,15 +1145,14 @@ impl Pools {
         // on the control plane and reaches a slot no frame has admitted, so
         // the commit belongs here rather than in the caller.
         self.ensure_state(slot + 1)?;
-        let element = u64::from(elem_size(STATE_DTYPE));
         for (planes, shape) in self.rows.iter().zip(&self.shapes) {
-            let Shape::State { stride } = *shape else {
+            let Shape::State { stride, dtype } = *shape else {
                 continue;
             };
             let Some(arena) = planes.first() else {
                 continue;
             };
-            let bytes = stride * element;
+            let bytes = stride * u64::from(elem_size(dtype));
             let at = arena.span(u64::from(slot) * bytes, bytes)?;
             let len = usize::try_from(bytes).unwrap_or(0);
             match stream {
@@ -1286,8 +1275,8 @@ fn watermark_bytes(
             let width = if plane == 0 { keys_width } else { values_width };
             u64::from(kv_pages) * u64::from(page_size) * width * u64::from(elem_size(dtype))
         }
-        Shape::State { stride } => {
-            u64::from(state_slots) * stride * u64::from(elem_size(STATE_DTYPE))
+        Shape::State { stride, dtype } => {
+            u64::from(state_slots) * stride * u64::from(elem_size(dtype))
         }
     }
 }

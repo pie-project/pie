@@ -422,6 +422,9 @@ fn found(
             Linear::MoeTopkSoftmax {
                 routes, experts, ..
             }
+            | Linear::MoeTopkSoftmaxScaled {
+                routes, experts, ..
+            }
             | Linear::MoeTopkSigmoid {
                 routes, experts, ..
             }
@@ -603,6 +606,7 @@ pub fn cuts(
             };
             let routes = match op {
                 Linear::MoeTopkSoftmax { routes, .. }
+                | Linear::MoeTopkSoftmaxScaled { routes, .. }
                 | Linear::MoeTopkSigmoid { routes, .. }
                 | Linear::MoeTopkSqrtSoftplus { routes, .. } => *routes,
                 _ => continue,

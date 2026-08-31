@@ -105,9 +105,61 @@
 //! for every fire the composition can build; stating it per row is what
 //! makes them agree by construction rather than by coincidence.
 
-use engine::fire::Masking;
+use engine::fire::{Mask, Masking};
 
 use crate::error::{Fault, Result};
+
+/// **A DEVICE-RESOLVED DENSE RECTANGLE, AS THE RESTRICTIONS THIS FILE ALREADY
+/// EXPANDS.**
+///
+/// A guest whose ancestry mask is device data states it as a `[rows, keys]`
+/// rectangle of bools on a channel, and the descriptor-port plane reads that
+/// cell (`program::ports`). What the attention arm reads is the dense plane
+/// [`stage`] builds, and the ONE thing that must be true of a device mask is
+/// that it expands into the very same plane a host-stated mask of the same
+/// bools expands into — otherwise a guest that moved its mask onto the device
+/// would silently change which keys its beams reach.
+///
+/// So the dense form is not given a second walk. It is run-length encoded
+/// here, one [`Mask`] per row over the rectangle's own key width, and handed
+/// to [`stage`] — which is the host path, cell for cell, and is why the gate
+/// for this is an EQUALITY against a host-stated control rather than a smoke
+/// test.
+///
+/// `stride` is the rectangle's own key width and not the lane's extent, which
+/// is deliberate: a guest builds its rectangle at the width of the POOL it
+/// reserved and the pool does not shrink as the extent grows, so the surplus
+/// is exactly the "a mask may be LONGER" case the module doc argues and it
+/// takes the same clip.
+#[must_use]
+pub fn from_dense(cells: &[bool], stride: usize) -> Masking {
+    let rows = cells.len().checked_div(stride).unwrap_or(0);
+    Masking::Rows(
+        (0..rows)
+            .map(|row| {
+                let mut runs: Vec<u32> = Vec::new();
+                // Alternating lengths, MASKED-OUT FIRST — `Mask`'s own
+                // encoding, so a row that opens with a kept key opens with a
+                // zero-length dropped run.
+                let mut keeping = false;
+                let mut run = 0u32;
+                for &kept in &cells[row * stride..(row + 1) * stride] {
+                    if kept == keeping {
+                        run += 1;
+                        continue;
+                    }
+                    runs.push(run);
+                    keeping = kept;
+                    run = 1;
+                }
+                if run != 0 {
+                    runs.push(run);
+                }
+                Mask::new(runs, stride as u64)
+            })
+            .collect(),
+    )
+}
 
 /// One lane's mask, with the geometry that says what shape it expands to.
 #[derive(Debug, Clone, Copy)]
@@ -319,8 +371,6 @@ fn keep(bytes: &mut [u8], stride: u32, row: u64, key: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use engine::fire::Mask;
 
     /// Is `(row, k)` kept, read the way the shader reads it?
     fn keeps(staged: &Staged, row: u64, k: u64) -> bool {

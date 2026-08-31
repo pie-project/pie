@@ -92,6 +92,44 @@ __global__ void rmsnorm_plus_one(
         x, weight, y, hidden, x_row_stride, y_row_stride, eps);
 }
 
+// The hyper-connection norm: moments per `group`-wide slice, scale by
+// `weight + 1` over the row's FULL width — the weight is indexed by the
+// slice, where the per-head norms share one plane across every head. One
+// block per (row, group), laid out as `rows x groups` consecutive blocks,
+// which is the same flattening `rows_per_head` launches.
+template <class T, int BLOCK = 256>
+__global__ void rmsnorm_grouped_plus_one(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    T* __restrict__ y,
+    int group,
+    int groups,
+    float eps)
+{
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const T* xr = x + static_cast<long long>(b) * group;
+    const T* wr = weight + static_cast<long long>(b % groups) * group;
+    T* yr = y + static_cast<long long>(b) * group;
+
+    float local = 0.f;
+    for (int i = tid; i < group; i += BLOCK) {
+        const float v = Elem<T>::to_f32(xr[i]);
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(group) + eps);
+
+    for (int i = tid; i < group; i += BLOCK) {
+        const float xv = Elem<T>::to_f32(xr[i]);
+        const float wv = Elem<T>::to_f32(wr[i]) + 1.f;
+        yr[i] = Elem<T>::from_f32(xv * inv_rms * wv);
+    }
+}
+
 template <int BLOCK, bool WEIGHT_PLUS_ONE, bool EMIT_FP16 = false>
 __global__ void rmsnorm_vec8(
     const bf16* __restrict__ x,
@@ -526,7 +564,8 @@ __global__ void rmsnorm_gated_f32_in(
     const float* __restrict__ weight,
     T* __restrict__ y,
     int hidden,
-    float eps)
+    float eps,
+    int sigmoid_gate)
 {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -549,7 +588,9 @@ __global__ void rmsnorm_gated_f32_in(
         const float xv = xr[i] * inv_rms;
         const float wv = weight[i];
         const float gv = Elem<T>::to_f32(gr[i]);
-        const float sg = gv / (1.f + __expf(-gv));
+        const float sg = sigmoid_gate
+            ? 1.f / (1.f + __expf(-gv))
+            : gv / (1.f + __expf(-gv));
         yr[i] = Elem<T>::from_f32(wv * xv * sg);
     }
 }
@@ -569,6 +610,16 @@ __global__ void mul_scalar(T* __restrict__ x, float s, usize n) {
     if (i >= n) return;
     const float s_rounded = Elem<T>::to_f32(Elem<T>::from_f32(s));
     x[i] = Elem<T>::from_f32(Elem<T>::to_f32(x[i]) * s_rounded);
+}
+
+// silu(s * x), in place: the scalar sits INSIDE the activation, which is
+// what keeps this from being `mul_scalar` composed with anything.
+template <class T>
+__global__ void silu_scaled(T* __restrict__ x, float s, usize n) {
+    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = Elem<T>::to_f32(x[i]) * s;
+    x[i] = Elem<T>::from_f32(v / (1.f + __expf(-v)));
 }
 
 template <class T>

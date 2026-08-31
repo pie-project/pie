@@ -5,10 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use ::engine::{ChannelRegistration, ProgramRegistration, StateCopy};
+
 use crate::engine::{
-    BoundInstance, ChannelJoin, ChannelRegistration, EngineBox, EngineId,
-    InstanceBindingPlan, ProgramRegistration, RegisteredChannel, SchedulerLimits,
-    StateCopy, SubmissionCompletion, WorkItemAttemptOutcome, WorkItemCompletion,
+    BoundInstance, ChannelJoin, EngineBox, EngineId, InstanceBindingPlan,
+    RegisteredChannel, SchedulerLimits, SubmissionCompletion, WorkItemAttemptOutcome,
+    WorkItemCompletion,
 };
 use crate::scheduler::ProcessId;
 use anyhow::{Result, anyhow};
@@ -261,7 +263,7 @@ pub(crate) struct PendingRequest {
     /// for an untracked/prebuilt fire. This is the wait-set key: the frame
     /// lane (and at k = 1 the synthesized single-slot stamp's lane).
     pub(crate) pipeline_id: Option<ProcessId>,
-    pub(crate) prelaunch_copy: Option<crate::engine::KvCopy>,
+    pub(crate) prelaunch_copy: Option<::engine::KvCopy>,
     pub(crate) prelaunch_state_copy: Option<StateCopy>,
     /// Vesuvius frame identity: which lane/frame/slot this fire belongs to.
     /// At k = 1 the worker synthesizes a single-slot stamp at admission for
@@ -292,7 +294,7 @@ impl PendingRequest {
         completion: WorkItemCompletion,
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
-        prelaunch_copy: Option<crate::engine::KvCopy>,
+        prelaunch_copy: Option<::engine::KvCopy>,
         prelaunch_state_copy: Option<StateCopy>,
         frame: Option<FrameStamp>,
         hook_program: bool,
@@ -383,11 +385,11 @@ enum SchedulerItem {
             tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
     },
     CopyKv {
-        plan: crate::engine::KvCopy,
+        plan: ::engine::KvCopy,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CopyKvTracked {
-        plan: crate::engine::KvCopy,
+        plan: ::engine::KvCopy,
         completion: ControlCompletion,
     },
     // Only reached via `SchedulerHandle::copy_state`, which the mock-engine
@@ -526,7 +528,7 @@ fn arm_completion_nudge(completion: &SubmissionCompletion, waker: &std::task::Wa
 
 #[derive(Clone)]
 enum PreLaunchCopy {
-    Kv(crate::engine::KvCopy),
+    Kv(::engine::KvCopy),
     State(StateCopy),
 }
 
@@ -1332,7 +1334,7 @@ impl EngineLoop {
         //    than inside it. So a frame reaches the engine without a single
         //    token vector being cloned, and the retry below re-submits the
         //    same value rather than rebuilding it.
-        let submitted = crate::engine::FrameSubmission {
+        let submitted = ::engine::FrameSubmission {
             steps: frame
                 .steps
                 .iter_mut()
@@ -2074,11 +2076,11 @@ enum QueuedItem {
             tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
     },
     CopyKv {
-        plan: crate::engine::KvCopy,
+        plan: ::engine::KvCopy,
         response: tokio::sync::oneshot::Sender<Result<SubmissionCompletion>>,
     },
     CopyKvTracked {
-        plan: crate::engine::KvCopy,
+        plan: ::engine::KvCopy,
         completion: ControlCompletion,
     },
     CopyState {
@@ -2553,7 +2555,7 @@ impl SchedulerHandle {
         instance_id: u64,
         completion: WorkItemCompletion,
         pipeline_id: Option<ProcessId>,
-        prelaunch_copy: Option<crate::engine::KvCopy>,
+        prelaunch_copy: Option<::engine::KvCopy>,
         prelaunch_state_copy: Option<StateCopy>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
@@ -2577,7 +2579,7 @@ impl SchedulerHandle {
         request: crate::engine::FireRequest,
         instance_id: u64,
         completion: WorkItemCompletion,
-        prelaunch_copy: Option<crate::engine::KvCopy>,
+        prelaunch_copy: Option<::engine::KvCopy>,
         prelaunch_state_copy: Option<StateCopy>,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
@@ -2604,7 +2606,7 @@ impl SchedulerHandle {
         completion: WorkItemCompletion,
         process_id: ProcessId,
         pipeline_id: ProcessId,
-        prelaunch_copy: Option<crate::engine::KvCopy>,
+        prelaunch_copy: Option<::engine::KvCopy>,
         prelaunch_state_copy: Option<StateCopy>,
         frame: Option<FrameStamp>,
         hook_program: bool,
@@ -2751,14 +2753,14 @@ impl SchedulerHandle {
         Ok((registered, bound))
     }
 
-    pub async fn copy_kv(&self, plan: crate::engine::KvCopy) -> Result<SubmissionCompletion> {
+    pub async fn copy_kv(&self, plan: ::engine::KvCopy) -> Result<SubmissionCompletion> {
         self.request(|response| SchedulerItem::CopyKv { plan, response })
             .await?
     }
 
     pub(crate) fn copy_kv_tracked(
         &self,
-        plan: crate::engine::KvCopy,
+        plan: ::engine::KvCopy,
     ) -> Result<ControlCompletion> {
         let completion = ControlCompletion::new();
         self.send(SchedulerItem::CopyKvTracked {
@@ -5059,8 +5061,8 @@ mod tests {
                 // frame.
                 submission: LaneLaunch(crate::engine::FrameFire {
                     steps: vec![crate::engine::StepFire {
-                        submission: crate::engine::Step {
-                            lanes: vec![crate::engine::Lane::decode(0, 0, 1, 0)],
+                        submission: ::engine::Step {
+                            lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                             attachments: Vec::new(),
                             media: Vec::new(),
                         },
@@ -5168,8 +5170,8 @@ mod tests {
             token: 42,
             submission: LaneLaunch(crate::engine::FrameFire {
                 steps: vec![crate::engine::StepFire {
-                    submission: crate::engine::Step {
-                        lanes: vec![crate::engine::Lane::decode(0, 0, 1, 0)],
+                    submission: ::engine::Step {
+                        lanes: vec![::engine::Lane::decode(0, 0, 1, 0)],
                         attachments: Vec::new(),
                         media: Vec::new(),
                     },
@@ -5286,8 +5288,8 @@ mod tests {
                 steps: words
                     .iter()
                     .map(|&word| crate::engine::StepFire {
-                        submission: crate::engine::Step {
-                            lanes: vec![crate::engine::Lane::decode(0, word, 1, 0)],
+                        submission: ::engine::Step {
+                            lanes: vec![::engine::Lane::decode(0, word, 1, 0)],
                             attachments: Vec::new(),
                             media: Vec::new(),
                         },

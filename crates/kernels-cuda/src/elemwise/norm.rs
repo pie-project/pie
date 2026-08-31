@@ -235,6 +235,7 @@ pub fn rmsnorm_gated(
     weight: Tensor,
     head_dim: u32,
     eps: f32,
+    sigmoid_gate: bool,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "elementwise.rmsnorm_gated";
@@ -263,6 +264,53 @@ pub fn rmsnorm_gated(
             weight.arg(),
             y.arg(),
             hidden.arg(),
+            eps.arg(),
+            i32::from(sigmoid_gate).arg(),
+        ],
+    )
+}
+
+/// The hyper-connection norm: moments per `group`-wide slice, `weight + 1`
+/// over the row's full width. The launch is [`rows_per_head`]'s flattening —
+/// one block per (row, group) — and the kernel recovers the group from the
+/// block index to read its own slice of the weight.
+pub fn rmsnorm_grouped_plus_one(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    group: u32,
+    eps: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let group = nonzero(OP, "the group width", group)?;
+    if y.width == 0 || y.width % group != 0 {
+        return Err(refuse(
+            OP,
+            format!("the {}-wide row is not a whole number of {group}-wide groups", y.width),
+        ));
+    }
+    debug_assert_eq!(
+        weight.width * weight.rows.max(1),
+        y.width,
+        "the weight spans the row's full width"
+    );
+    let groups = y.width / group;
+    let launch = rows_per_head(OP, y.rows, y.width, group)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::elemwise::rmsnorm_grouped_plus_one<{t}, 256>")),
+        )
+        .apply(launch),
+        &[
+            x.arg(),
+            weight.arg(),
+            y.arg(),
+            stated(OP, group)?.arg(),
+            stated(OP, groups)?.arg(),
             eps.arg(),
         ],
     )
@@ -349,6 +397,18 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> 
 }
 
 /// `x *= s` for a plan-stated scalar, in place on `x`.
+/// `silu(s * x)`, in place.
+pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "elementwise.silu_scaled";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let (launch, n) = elementwise(OP, *x)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::silu_scaled<{t}>"))).apply(launch),
+        &[x.arg(), s.arg(), n.arg()],
+    )
+}
+
 pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.mul_scalar";
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });

@@ -530,7 +530,7 @@ impl ReqGeometry {
     /// A lane that names no page keeps an empty page list, which is the
     /// contract's way of saying the SHELL owns this slot's page table.
     #[must_use]
-    pub fn lanes(&self) -> Vec<crate::engine::Lane> {
+    pub fn lanes(&self) -> Vec<::engine::Lane> {
         let cut = |values: &[u32], indptr: &[u32], lane: usize| -> Vec<u32> {
             let (Some(&start), Some(&end)) = (indptr.get(lane), indptr.get(lane + 1)) else {
                 return Vec::new();
@@ -558,7 +558,7 @@ impl ReqGeometry {
                     .unwrap_or(rows)
                     .saturating_sub(rows);
                 let readout = cut(&self.sampling_indices, &self.sampling_indptr, lane);
-                crate::engine::Lane {
+                ::engine::Lane {
                     // The runtime keeps the page table, so a lane's SLOT is
                     // its working set — see `crate::engine::fire`. An ETA
                     // fire's geometry ports carry no slot of their own, so
@@ -594,7 +594,7 @@ impl ReqGeometry {
                     } else {
                         positions
                     },
-                    kv: crate::engine::KvDelta {
+                    kv: ::engine::KvDelta {
                         held,
                         pages,
                         translation: Vec::new(),
@@ -625,7 +625,7 @@ impl ReqGeometry {
                     // out rather than left to `..Default::default()` for the
                     // reason every other axis here is: the day a caller has a
                     // ticket to mint, this is the line it mints it at.
-                    rs: crate::engine::RsVerb::Fold,
+                    rs: ::engine::RsVerb::Fold,
                     // **AND THE RESET FACT IS `Inferred` ON PURPOSE** (alto
                     // survey §9's gap list, wave F3). The engine's old rule
                     // — `kv.held == 0` is a sequence beginning — is what
@@ -633,12 +633,12 @@ impl ReqGeometry {
                     // while the KV side was the only store that spoke. The
                     // RS store's own classification is what replaces it, and
                     // this is the line it lands on.
-                    rs_reset: crate::engine::RsReset::Inferred,
+                    rs_reset: ::engine::RsReset::Inferred,
                     channels: Vec::new(),
                     readout: match readout.as_slice() {
-                        [] => crate::engine::Readout::None,
-                        [only] if *only + 1 == rows => crate::engine::Readout::Last,
-                        rows => crate::engine::Readout::Rows(rows.to_vec()),
+                        [] => ::engine::Readout::None,
+                        [only] if *only + 1 == rows => ::engine::Readout::Last,
+                        rows => ::engine::Readout::Rows(rows.to_vec()),
                     },
                 }
             })
@@ -664,7 +664,7 @@ impl ReqGeometry {
 pub(crate) enum FireAttnMask {
     Omitted,
     Host {
-        masks: Vec<crate::engine::Mask>,
+        masks: Vec<::engine::Mask>,
         mask_indptr: Vec<u32>,
     },
     Device,
@@ -727,10 +727,10 @@ impl FireAttnMask {
                         // is the shape a decode-shaped mask, a prefix drop and
                         // an attention sink all have, and it is the shape both
                         // shells expand in one walk over the runs.
-                        [only] => Some(crate::engine::Masking::Extent(only.clone())),
+                        [only] => Some(::engine::Masking::Extent(only.clone())),
                         // Several, parallel to the lane's query rows in the
                         // CSR's own order.
-                        rows => Some(crate::engine::Masking::Rows(rows.to_vec())),
+                        rows => Some(::engine::Masking::Rows(rows.to_vec())),
                     };
                 }
                 request.has_user_mask = true;
@@ -804,7 +804,7 @@ pub(crate) fn lower_attn_mask_evaluated(
         .chunks_exact(stride)
         .map(|row| {
             let mask = RunMask::from_slice(row);
-            crate::engine::Mask::new(mask.buffer, mask.total_size)
+            ::engine::Mask::new(mask.buffer, mask.total_size)
         })
         .collect();
     Ok(FireAttnMask::Host {
@@ -1639,7 +1639,7 @@ mod tests {
         container
     }
 
-    fn expand_mask(mask: &crate::engine::Mask) -> Vec<bool> {
+    fn expand_mask(mask: &::engine::Mask) -> Vec<bool> {
         let mut values = Vec::new();
         for (run, &len) in mask.runs.iter().enumerate() {
             values.extend(std::iter::repeat_n(run % 2 == 1, len as usize));
@@ -1652,7 +1652,7 @@ mod tests {
         let lowered = lower_attn_mask_evaluated(&section3_container(), &[0, 1], &[]).unwrap();
         assert_eq!(lowered, FireAttnMask::Omitted);
         let mut plan = crate::engine::FireRequest {
-            lanes: vec![crate::engine::Lane::default()],
+            lanes: vec![::engine::Lane::default()],
             single_token_mode: true,
             ..Default::default()
         };
@@ -1681,7 +1681,7 @@ mod tests {
         // TWO LANES, ONE MASK EACH. The wire form put both rows in a flat
         // vector and cut it with `mask_indptr`; a lane holds its own.
         let mut plan = crate::engine::FireRequest {
-            lanes: vec![crate::engine::Lane::default(), crate::engine::Lane::default()],
+            lanes: vec![::engine::Lane::default(), ::engine::Lane::default()],
             single_token_mode: true,
             ..Default::default()
         };
@@ -1689,11 +1689,11 @@ mod tests {
         assert!(plan.has_user_mask);
         assert_eq!(
             plan.lanes[0].mask,
-            Some(crate::engine::Masking::Extent(masks[0].clone()))
+            Some(::engine::Masking::Extent(masks[0].clone()))
         );
         assert_eq!(
             plan.lanes[1].mask,
-            Some(crate::engine::Masking::Extent(masks[1].clone()))
+            Some(::engine::Masking::Extent(masks[1].clone()))
         );
         assert!(
             !plan.single_token_mode,
@@ -1728,7 +1728,7 @@ mod tests {
         };
 
         let mut plan = crate::engine::FireRequest {
-            lanes: vec![crate::engine::Lane {
+            lanes: vec![::engine::Lane {
                 tokens: vec![1, 2, 3],
                 ..Default::default()
             }],
@@ -1740,7 +1740,7 @@ mod tests {
             .expect("a multi-row mask lowers rather than refusing");
         assert_eq!(
             plan.lanes[0].mask,
-            Some(crate::engine::Masking::Rows(masks.clone())),
+            Some(::engine::Masking::Rows(masks.clone())),
             "the lane carries all three rows, in the CSR's order"
         );
         for row in 0..3 {
@@ -1772,7 +1772,7 @@ mod tests {
             FireAttnMask::Device
         );
         let mut plan = crate::engine::FireRequest {
-            lanes: vec![crate::engine::Lane::default()],
+            lanes: vec![::engine::Lane::default()],
             ..Default::default()
         };
         FireAttnMask::Device

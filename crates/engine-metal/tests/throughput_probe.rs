@@ -59,7 +59,7 @@
 //!
 //! | variable | what it moves |
 //! |---|---|
-//! | `PIE_PROBE_SKUS` | which rows run — `u4`, `gptoss`, `qwen36`, `gemma4`, comma separated |
+//! | `PIE_PROBE_SKUS` | which rows run — `u4`, `gptoss`, `qwen36`, `gemma4`, `a3b`, `a4b`, comma separated |
 //! | `PIE_PROBE_LANES` | the ladder, comma separated |
 //! | `PIE_PROBE_STEPS` | decode fires in one warm window |
 //! | `PIE_PROBE_TUNING` | `[metal.tuning]` keys, `key=value` comma separated, for A/B-ing a crossover |
@@ -172,6 +172,26 @@ const QWEN36: Sku = Sku {
     routed: None,
 };
 
+/// **QWEN3.6-35B-A3B.** Forty layers, thirty of them gated-delta, each
+/// routing eight of 256 experts beside a shared one — the widest mixture this
+/// file measures and the reason [`Sku::routed`]'s mixture column matters most
+/// here. `experts × moe_batch_min_per_expert` scales with the expert COUNT,
+/// so a 256-expert stack needs far more rows before the batched arm wins than
+/// gpt-oss's 32-expert one does, and this row's ladder is where that shows.
+/// See `session_c_first_light::QWEN_A3B` for the checkpoint audit. Opt-in:
+/// its weights are ~18 GiB.
+const QWEN_A3B: Sku = Sku {
+    name: "a3b",
+    sku: "qwen36-35b-a3b-mlxu4-kv-bf16",
+    env: "PIE_QWEN36_A3B_SNAPSHOT",
+    repo: "models--mlx-community--Qwen3.6-35B-A3B-4bit",
+    word: |query_len| model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word(),
+    bos: None,
+    by_default: false,
+    ceiling: 16,
+    routed: Some((256, 8)),
+};
+
 /// **GEMMA-4-31B.** Sixty layers over two attention shapes. Opt-in.
 const GEMMA4: Sku = Sku {
     name: "gemma4",
@@ -184,6 +204,26 @@ const GEMMA4: Sku = Sku {
     by_default: false,
     ceiling: 16,
     routed: None,
+};
+
+/// **GEMMA-4-26B-A4B.** Thirty layers, each running a dense GeGLU MLP and 128
+/// routed GeGLU experts side by side. The mixture column is what this row is
+/// for: its fan-out is eight of 128, so a lane's eight pairs sit against 128
+/// experts and the sort does not pay for itself until the batch is wide — the
+/// same crossing [`QWEN_A3B`] shows at 256. See
+/// `session_c_first_light::GEMMA_A4B` for the checkpoint audit. Opt-in: its
+/// weights are ~13.3 GiB.
+const GEMMA4_A4B: Sku = Sku {
+    name: "a4b",
+    sku: "gemma4-26b-a4b-mlxu4-kv-bf16",
+    env: "PIE_GEMMA4_A4B_SNAPSHOT",
+    repo: "models--mlx-community--gemma-4-26b-a4b-it-4bit",
+    word: |query_len| model::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word(),
+    // `<bos>`, id 2 — `session_c_first_light::Family::bos` is the measurement.
+    bos: Some(2),
+    by_default: false,
+    ceiling: 16,
+    routed: Some((128, 8)),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +267,23 @@ const STEPS: usize = 32;
 /// compiles its shader points and grows its slabs, and none of that is decode
 /// throughput.
 const WARMUP: usize = 8;
+
+/// **THE PROMPT ONE PREFILL FIRE CARRIES**, in tokens.
+///
+/// Five hundred and twelve because that is the length the cross-engine table
+/// this file feeds is quoted at, and because it is long enough that the fire
+/// is the model rather than the launch: at 512 rows every dense projection
+/// takes the widest row block the tile is stamped at (`BM = 64`) and the
+/// arena is cut once, so a second fire measures the same rectangle.
+const PREFILL: u32 = 512;
+
+/// Prefill fires one timed window measures, and the throwaways before it.
+///
+/// Fewer than a decode window's because each one is two orders of magnitude
+/// more work: on the giant a single 512-row fire is most of a second, so five
+/// of them is a measurement and thirty-two would be a coffee break.
+const PREFILLS: usize = 5;
+const PREFILL_WARMUP: usize = 2;
 
 /// The ladder, unless `PIE_PROBE_LANES` says otherwise. Clipped per row by
 /// [`Sku::ceiling`].
@@ -344,8 +401,13 @@ fn steps() -> usize {
 ///     purpose can only ever be read as a coincidence. `should_batch` fires at
 ///     `pairs >= experts × min`, so `0` batches at every width and a number
 ///     past `lanes × top_k / experts` batches at none.
-///   * `qmm_min_batch` — the dense GEMV/GEMM crossover, which decides whether
-///     a rung of this ladder reads every weight once or once per lane.
+///   * `qmm_min_batch` — the dense GEMV/GEMM crossover, which
+///     `linear::quant::act_x_wt` asks of the FIRE's rows. At its measured
+///     value the column below STEPS between the two arms partway up the
+///     ladder, which is what it is for; to read a whole curve on one arm,
+///     pin it — `999` takes the vector point at every rung and `2` takes the
+///     tile at every rung. That is the A/B the before/after tables on
+///     `act_x_wt` and on `BM_RUNGS` were measured with.
 ///
 /// **ONE ANSWER PER PROCESS, WHICH IS WHY THIS IS A RUN AND NOT AN ARM.**
 /// `kernels_metal::tuning` folds the device row and the document at the first
@@ -359,9 +421,9 @@ fn steps() -> usize {
 /// the trap `qmm_min_batch = 2` walks into, and it is worth a paragraph
 /// because it costs a whole sweep. [`ready`] sizes the load at the WIDEST
 /// rung this run asks for, and that ceiling reaches
-/// `kernels_metal::linear::quant::mb_rows` as its `capacity` — so a run told
+/// `kernels_metal::linear::quant::mb_block` as its `capacity` — so a run told
 /// `PIE_PROBE_LANES=2,3,4` loads a shell whose activation slot holds four
-/// rows, `mb_rows` declines to pad a four-row fire up to a row block it
+/// rows, `mb_block` declines to pad a four-row fire up to a row block it
 /// cannot write, and every rung of the "GEMM" column is silently the GEMV.
 /// The column looks plausible and is a copy of the other arm. **Name a rung
 /// at or above the row block under test** — the sweep behind
@@ -511,6 +573,27 @@ fn finite(logits: &[f32], what: &str) {
 /// prompt — a decode fire is one row per lane and a prefill fire is one lane's
 /// whole prompt, and the arena is cut once at the maximum of the two.
 fn ready(row: &Sku, rungs: &[u32]) -> Option<(Shell, Vec<Vec<u32>>)> {
+    let &widest = rungs.last()?;
+    ready_at(row, widest, CONTEXT, None)
+}
+
+/// The same load, at a shape the caller states: `slots` lanes, `context`
+/// tokens apiece, and a row ceiling that is the larger of the lanes and
+/// whatever `tokens` asks for.
+///
+/// **A SECOND ENTRY AND NOT A SECOND DEFAULT.** [`ready`] serves the decode
+/// ladder, whose fires are one row per lane; [`prefill`] serves a single lane
+/// carrying [`PREFILL`] rows at once, and the two want opposite shapes — the
+/// ladder wants sixteen slots of short context and the prefill wants one slot
+/// long enough to hold the prompt. Sizing one load for both would carve a kv
+/// pool of `16 x 640` on a box that is already holding fifteen gibibytes of
+/// weights, which is a load that does not happen rather than a measurement.
+fn ready_at(
+    row: &Sku,
+    slots: u32,
+    context: u32,
+    tokens: Option<u32>,
+) -> Option<(Shell, Vec<Vec<u32>>)> {
     let sku = row.sku;
     if !engine_metal::device::present() {
         eprintln!("skipping {sku}: this machine publishes no Metal device");
@@ -535,7 +618,7 @@ fn ready(row: &Sku, rungs: &[u32]) -> Option<(Shell, Vec<Vec<u32>>)> {
         eprintln!("skipping {sku}: {snapshot:?} ships no tokenizer beside its tensors");
         return None;
     }
-    let &widest = rungs.last()?;
+    let widest = slots;
 
     let tokenizer = tokenizer::Tokenizer::from_file(&snapshot.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
@@ -574,10 +657,10 @@ fn ready(row: &Sku, rungs: &[u32]) -> Option<(Shell, Vec<Vec<u32>>)> {
         trace: trace(Platform::Metal),
         contract: &contract,
         checkpoint: &snapshot,
-        budget: Budget::new(widest, widest.max(longest)),
+        budget: Budget::new(widest, widest.max(longest).max(tokens.unwrap_or(0))),
         profile: None,
         page_size: 16,
-        context: CONTEXT,
+        context,
         slots: widest,
         // **THE DEPTH THE RUNTIME RUNS AT** (article 1's floor): one step
         // executing while the next is already committed behind it. Every
@@ -1062,6 +1145,157 @@ fn qwen35_0p8b_four_bit_decodes_on_many_lanes_at_once() {
     probe(&U4);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The prefill rate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **ONE LANE, [`PREFILL`] TOKENS, TIMED — the half of the race this file did
+/// not measure.**
+///
+/// Everything above is decode: one row per lane, weight-read bound, and the
+/// number that moves is the batch. A prefill is the opposite rectangle — one
+/// lane, five hundred and twelve rows, every projection on the tile's widest
+/// row block — and the engine's standing against another was being quoted
+/// from a figure no run in this tree produces. This arm produces it.
+///
+/// # What is timed, and what is not
+///
+/// `Shell::fire` is synchronous: it prepares, encodes, commits and reads the
+/// last row back. So the window is one whole prefill, host decisions
+/// included, which is the number a caller waiting on a prompt actually
+/// experiences. The slot is re-opened before every fire — `open` clears the
+/// recurrent banks and resets the extent — so each fire prefills a fresh
+/// sequence over the same rows rather than continuing the last one, which
+/// for a gated-delta stack is the difference between measuring a scan and
+/// measuring a scan that has already run.
+///
+/// # The prompt
+///
+/// The ladder's sixteen prompts, tokenized and concatenated until there are
+/// [`PREFILL`] ids, then truncated. Real vocabulary rather than a constant
+/// id: an embedding gather over one row repeated is a different cache
+/// pattern from an embedding gather over a prompt, and a prefill probe that
+/// wanted the second should not measure the first.
+fn prefill(row: &Sku) {
+    let _serial = serialized();
+    let sku = row.sku;
+    if !selected(row) {
+        eprintln!(
+            "skipping {sku} prefill: PIE_PROBE_SKUS does not name `{}`",
+            row.name
+        );
+        return;
+    }
+    // One slot, and a context with room for the prompt plus the row the fire
+    // lands. `Budget::max_tokens` is the prompt itself, which is what makes
+    // this a 512-row fire rather than a 512-step decode.
+    let Some((mut shell, prompts)) = ready_at(row, 1, PREFILL + 64, Some(PREFILL)) else {
+        return;
+    };
+    let mut tokens: Vec<u32> = Vec::with_capacity(PREFILL as usize);
+    tokens.extend(row.bos);
+    'fill: loop {
+        for prompt in &prompts {
+            for &id in prompt.iter().skip(usize::from(row.bos.is_some())) {
+                tokens.push(id);
+                if tokens.len() == PREFILL as usize {
+                    break 'fill;
+                }
+            }
+        }
+        // `ready_at` builds one prompt per slot and this arm asks for one
+        // slot, so the cycle above is short; guard against a row whose
+        // tokenizer answers nothing rather than spinning.
+        if prompts.iter().all(Vec::is_empty) {
+            eprintln!("skipping {sku} prefill: the tokenizer encoded nothing");
+            return;
+        }
+    }
+
+    let mut fire = || {
+        shell.open(0).expect("the slot opens");
+        let landed = shell
+            .fire(&[Lane {
+                slot: 0,
+                word: (row.word)(PREFILL),
+                tokens: &tokens,
+            }])
+            .unwrap_or_else(|why| panic!("{sku}'s prefill fires: {why}"));
+        finite(&landed[0], "the prefill");
+    };
+    for _ in 0..PREFILL_WARMUP {
+        fire();
+    }
+    let mut each = Vec::with_capacity(PREFILLS);
+    for _ in 0..PREFILLS {
+        let at = Instant::now();
+        fire();
+        each.push(at.elapsed().as_secs_f64());
+    }
+    let mean = each.iter().sum::<f64>() / each.len() as f64;
+    let best = each.iter().copied().fold(f64::INFINITY, f64::min);
+    let worst = each.iter().copied().fold(0.0f64, f64::max);
+    eprintln!(
+        "\n{sku} — prefill of {PREFILL} tokens, one lane, {PREFILLS} fires: {:.1} tok/s \
+         ({:.1} ms mean, {:.1} best, {:.1} worst, {:.1}% spread), {} encodes",
+        f64::from(PREFILL) / mean,
+        mean * 1000.0,
+        best * 1000.0,
+        worst * 1000.0,
+        100.0 * (worst - best) / mean,
+        shell.last_fire().launches,
+    );
+    // The only claim: a prefill of five hundred rows is not a decode. If it
+    // ever came back at a decode's rate the number above would be measuring
+    // a fire that fell to the vector point at every projection, which is the
+    // one failure a printed table cannot show on its own.
+    assert!(
+        f64::from(PREFILL) / mean > 1.0,
+        "{sku}: a {PREFILL}-token prefill turned in {:.2} tok/s",
+        f64::from(PREFILL) / mean
+    );
+}
+
+/// **THE VEHICLE'S PREFILL.**
+#[test]
+fn qwen35_0p8b_four_bit_prefills_five_hundred_tokens() {
+    prefill(&U4);
+}
+
+/// **THE MIXTURE'S PREFILL.**
+#[test]
+fn gpt_oss_20b_prefills_five_hundred_tokens() {
+    prefill(&GPT_OSS);
+}
+
+/// **QWEN3.6-27B'S PREFILL**, opt-in — the row the cross-engine gap is
+/// quoted on, and the one whose stack is three-quarters gated-delta.
+#[test]
+fn qwen36_27b_prefills_five_hundred_tokens() {
+    prefill(&QWEN36);
+}
+
+/// **GEMMA-4-31B'S PREFILL**, opt-in.
+#[test]
+fn gemma4_31b_prefills_five_hundred_tokens() {
+    prefill(&GEMMA4);
+}
+
+/// **QWEN3.6-35B-A3B'S PREFILL**, opt-in.
+#[test]
+fn qwen36_35b_a3b_prefills_five_hundred_tokens() {
+    prefill(&QWEN_A3B);
+}
+
+/// **GEMMA-4-26B-A4B'S PREFILL**, opt-in.
+///
+/// Not `#[ignore]`d beside its ladder: what that row is held back for is
+/// [`batching_is_polymorphic`] at eight lanes, and this arm fires one.
+#[test]
+fn gemma4_26b_a4b_prefills_five_hundred_tokens() {
+    prefill(&GEMMA4_A4B);
+}
+
 /// **THE MIXTURE.** gpt-oss-20b, whose routed FFN changes arm partway up this
 /// ladder — see [`Sku::routed`] and the mixture column.
 #[test]
@@ -1079,4 +1313,77 @@ fn qwen36_27b_decodes_on_many_lanes_at_once() {
 #[test]
 fn gemma4_31b_decodes_on_many_lanes_at_once() {
     probe(&GEMMA4);
+}
+
+/// **GEMMA-4-26B-A4B**, opt-in: `PIE_PROBE_SKUS=a4b`.
+///
+/// # Why this row is `#[ignore]` and the other four are not
+///
+/// **THE LADDER AND ARTICLE 1 ARE GREEN; [`batching_is_polymorphic`] IS
+/// NOT — AND WHAT IT CATCHES IS NOT THIS MODEL.** Measured on an M1 Max at
+/// eight lanes, first decode step, batched logits against the same lane's
+/// logits alone:
+///
+/// ```text
+///                              max |Δ| logit   cosine        token gate
+///   a4b, fp16_qmm = false        0.00000       1.000000000   8 of 8
+///   gemma4-31b, fp16_qmm on      0.39 – 1.38   0.99866 …     8 of 8
+///   a4b,        fp16_qmm on      0.84 – 6.59   0.99825 …     2 of 8
+/// ```
+///
+/// The first row is the finding: with the FP16 staged GEMM off, a batched
+/// fire and a solo fire of this model agree **BIT FOR BIT**, every logit of
+/// every lane. So nothing about eight lanes is wrong — the window, the page
+/// table, the mask and the kv extents are all exact, which is the list
+/// [`batching_is_polymorphic`] exists to separate.
+///
+/// What differs is which GEMM ran. A solo decode is one row and takes the
+/// GEMV; eight lanes is eight rows, which is past
+/// [`DeviceTuning::qmm_min_batch`] — and the arm it crosses into
+/// dequantizes the 4-bit affine bank to `half` (11 mantissa bits) where the
+/// GEMV and the plain stamped GEMM dequantize it to `bfloat` (8). Those are
+/// different functions of the same weights at the third decimal place, and
+/// the second row above says the shell ALREADY carries that difference on a
+/// model in the catalog: gemma4-31b's batched logits sit up to 1.38 away
+/// from its own solo logits and clear the gate on the width of its margins
+/// rather than on agreement.
+///
+/// **THIS MODEL IS THE FIRST ONE HERE THAT AMPLIFIES IT.** Its router picks
+/// eight of 128 experts by top-k, which is a DISCONTINUOUS function of the
+/// residual stream: a difference too small to see in a logit is enough to
+/// swap the eighth expert, and that layer's routed branch is then a
+/// different computation rather than a slightly different one. Thirty layers
+/// of that turns a 1-logit arm difference into a 6.6-logit one and a
+/// different token. Every other routed row here routes on a wider margin —
+/// gpt-oss picks four of 32, qwen35-a3b eight of 256 beside a shared expert
+/// that carries most of the FFN — and both clear the gate.
+///
+/// So the red is a `kernels-metal` numerics finding about
+/// `affine_qmm_t_fp16_precast` and the `qmm_min_batch` default, not a fact
+/// about `gemma_4`, and fixing it is a decision that moves every model's
+/// numbers (the honest fix is to make ONE dequantization width serve every
+/// arm). Behind `#[ignore]` rather than left failing so the ladder stays
+/// runnable by name:
+///
+/// ```text
+/// PIE_PROBE_SKUS=a4b cargo test -p engine-metal --release \
+///     --test throughput_probe gemma4_26b_a4b -- --ignored --nocapture
+/// ```
+///
+/// and it passes whole under
+/// `PIE_PROBE_TUNING=fp16_qmm=false`.
+///
+/// [`DeviceTuning::qmm_min_batch`]: kernels_metal::tuning::DeviceTuning::qmm_min_batch
+#[test]
+#[ignore = "the FP16 staged GEMM's dequantization width, amplified by a \
+            128-expert top-k router — see this test's own doc for the \
+            measurement and the reproduction"]
+fn gemma4_26b_a4b_decodes_on_many_lanes_at_once() {
+    probe(&GEMMA4_A4B);
+}
+
+/// **QWEN3.6-35B-A3B**, opt-in: `PIE_PROBE_SKUS=a3b`.
+#[test]
+fn qwen36_35b_a3b_decodes_on_many_lanes_at_once() {
+    probe(&QWEN_A3B);
 }

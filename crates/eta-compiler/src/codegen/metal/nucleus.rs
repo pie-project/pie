@@ -31,7 +31,13 @@ inline uint m3_nucleus_order_digit(float value, uint pass) {
 
 kernel void "#;
 
-const SIGNATURE: &str = r#"(
+/// The eleven bindings and three ids every grouped library sampler takes.
+///
+/// Published so the engine that binds them can be held to them: `engine-metal`
+/// writes eleven `setBuffer:` calls in this order and dispatches at the one
+/// width the first line refuses every other value of, and neither of those is
+/// derivable from anything else this crate exports.
+pub const SIGNATURE: &str = r#"(
     const device uchar* lane_bytes [[buffer(0)]],
     const device M1ValueDesc* all_descriptors [[buffer(1)]],
     const device M1OpParams* params [[buffer(2)]],

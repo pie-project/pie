@@ -11,9 +11,10 @@ pub fn instruct(tokenizer: Arc<Tokenizer>) -> Arc<dyn Instruct> {
         tokenizer,
         ChatML {
             thinking: true,
+            preserve_thinking: false,
             tools: true,
             generation_suffix: "",
-            stop_tokens: &["<|im_end|>", "<|endoftext|>", "<|user|>", "<|assistant|>"],
+            stop_tokens: super::tokenizer::STOP_TOKENS,
         },
     ))
 }

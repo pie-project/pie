@@ -719,7 +719,7 @@ fn suppress_defaulted_readout_for_fold(
     // and could not tell that apart from a lane whose readout was empty for
     // some other reason.
     for lane in &mut req.lanes {
-        lane.readout = crate::engine::Readout::None;
+        lane.readout = ::engine::Readout::None;
     }
 }
 
@@ -1205,7 +1205,7 @@ pub(crate) fn stamp_lane_slots(
 /// alternative is addressing a pool page belonging to somebody else, which is
 /// the failure this function exists to end.
 ///
-/// [`KvDelta::pages`]: crate::engine::KvDelta::pages
+/// [`KvDelta::pages`]: ::engine::KvDelta::pages
 pub(crate) fn map_lane_pages(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
@@ -1710,7 +1710,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .collect();
             req.media = crate::pipeline::media::lane_media(&matched, &lane_rows);
         }
-        crate::pipeline::offload::try_encode(&mut req).await;
+        crate::offload::try_encode(&mut req).await;
         // Resource preparation is independent of token position: realize the
         // declaration once, back only its missing frontier, then snapshot the
         // WorkingSet translation.
@@ -2390,7 +2390,7 @@ pub async fn copy_into_inner<C: FireContext>(
         .zip(kv_move_src_pages.into_iter().zip(src_tok_idx))
         .map(
             |((dst_page_id, dst_token_offset), (src_page_id, src_token_offset))| {
-                crate::engine::KvMove {
+                ::engine::KvMove {
                     dst_page_id,
                     dst_token_offset,
                     src_page_id,
@@ -3180,9 +3180,9 @@ async fn fire_device_geometry<C: FireContext>(
         // of one beam are B sequences that each need one.
         lanes: resolved_qo_indptr
             .windows(2)
-            .map(|span| crate::engine::Lane {
+            .map(|span| ::engine::Lane {
                 tokens: vec![0; (span[1] - span[0]) as usize],
-                ..crate::engine::Lane::default()
+                ..::engine::Lane::default()
             })
             .collect(),
         ..crate::engine::FireRequest::default()

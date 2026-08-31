@@ -140,6 +140,18 @@
 //!   an instance attached twice, an attachment naming a lane this fire does
 //!   not have, an instance whose rings are not ready, and a readout row list
 //!   that is not one ascending run.
+//! * **A GUEST WITH MORE THAN TWELVE CHANNELS is NOT in this list any more.**
+//!   It never crossed the contract as a refusal — it crossed as a COMPILE
+//!   failure, because the M2 fused kernel binds each channel's two cells as
+//!   argument indices (`7 + 2k`, `8 + 2k`) against Metal's last index of 30,
+//!   the emitter declined a wider region by name, and this shell had no other
+//!   form to run it in. `engine_metal::program::compile::Form::Grouped` is
+//!   that form: the channels move into a lane table of device addresses
+//!   ([`crate::device::Buffer::address_at`]), so the ceiling that applies is
+//!   the lane table's twenty-nine and no guest in the corpus is near it. The
+//!   same form is what runs the emitted grouped nucleus and top-k samplers
+//!   and what splits a vocabulary-wide gather across a threadgroup instead of
+//!   walking it on one thread.
 //! * `LoadRequest::ordinal` — see [`DeviceBoot`]. `MTLCreateSystemDefaultDevice`
 //!   takes no ordinal, so a request that names one is refused rather than
 //!   quietly given the default device.
@@ -166,7 +178,7 @@ use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 use engine::transfer::MemoryDomain;
-use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
+use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
 use model_compiler::{Budget, DeviceProfile};
 use model_ir::Trace;
@@ -824,39 +836,60 @@ impl Engine for Metal {
                 max_context: paging.context(),
             },
             profile,
-            // **THIS SHELL RESOLVES A DECODE ENVELOPE ON THE DEVICE, AND
-            // THREE PORTS ARE THE WHOLE OF THAT SENTENCE.** `serve::stage`
-            // resolves `embed_tokens`, `positions` and `kv_len` off an
-            // attached instance's own device rings at step 0b — before
-            // `compose`, behind the fence `admit_attachments` takes — and the
-            // lane loop then takes its token ids from the port instead of
-            // from `Seated::lane.tokens`. That is the guest telling the model
-            // what to run rather than the model handing the guest its answer,
-            // and what it buys is the one thing a host cannot buy: the
-            // sampled token stops travelling out through `take_channel`,
-            // through a guest await, and back in through `publish_channel`,
-            // so a second decode step can be submitted behind the first
-            // inside one frame.
+            // **THIS SHELL RESOLVES THE WHOLE FIRE GEOMETRY ON THE DEVICE,
+            // AND NINE PORTS ARE THE WHOLE OF THAT SENTENCE.** `serve::stage`
+            // reads every one of them off an attached instance's own device
+            // rings at step 0b — before `compose`, behind the fence
+            // `admit_attachments` takes — and steps 0c and 3b are where the
+            // answers replace what a seat would have derived:
             //
-            // **AND `DEVICE_GEOMETRY` IS STILL REFUSED, BY NAME AND FOR A
-            // REASON.** The other four ports of that mask — `pages`,
-            // `page_indptr`, `w_slot`, `w_off` — describe a page table this
-            // shell OWNS: `store::kv::geometry_with` derives all four from
-            // the seat, and reading the guest's copy would be reading a
-            // second opinion about a table the guest does not hold. A load
-            // that wanted to claim them would have to let the guest's page
-            // ids reach the pool, which is the pooled device-geometry class
-            // and a different piece of work. `crate::program::ports`'s own
-            // header is where that line is drawn.
+            // ```text
+            // embed_indptr  the member's lane CSR  which lanes, which rows
+            // embed_tokens  the sampled id         the device DECIDED it
+            // positions     what reaches RoPE      the guest may renumber
+            // kv_len        the extent AFTER       `have` is derived back
+            //                                     from it; the page count and
+            //                                     the last page's fill follow
+            // pages         the lane's page run    cut out of one flat run by
+            // page_indptr   the run's bounds       the CSR beside it
+            // w_slot        where a row lands      `have + row` cannot spell
+            // w_off         and at what offset     B lanes into one pool
+            // attn_mask     a dense bool rectangle run-length encoded and
+            //                                     expanded by `crate::mask`
+            //                                     into the same plane a
+            //                                     host-stated mask expands to
+            // ```
             //
-            // The consequence is the one `Capabilities::admits` is written
-            // for, and it stays a BIND-TIME refusal rather than a fire-time
-            // surprise: a program bound in `GeometryClass::DeviceGeometry` is
-            // refused at `bind_instance`, by name, while `Host` — the class
-            // that asks the model for nothing and is handed its logits — and
-            // `DecodeEnvelope` are both served.
-            ports: PortMask::DECODE_ENVELOPE,
-            geometry: GeometryClass::DecodeEnvelope,
+            // The narrow claim — `embed_tokens`, `positions`, `kv_len` — is
+            // the guest telling the model what to run rather than the model
+            // handing the guest its answer, and what it buys is the one thing
+            // a host cannot buy: the sampled token stops travelling out
+            // through `take_channel`, through a guest await, and back in
+            // through `publish_channel`, so a second decode step can be
+            // submitted behind the first inside one frame.
+            //
+            // **THE FOUR BEYOND IT WERE WITHHELD WHILE THE PAGE IDS WERE THIS
+            // SHELL'S ALONE.** `store::kv::geometry_with` derived all four
+            // from the seat, and reading the guest's copy would have been
+            // reading a second opinion about a table the guest did not hold.
+            // They are claimed now because that same call already took a
+            // caller-stated table per lane (`KvDelta::pages` non-empty), and a
+            // guest that states its pages on a CHANNEL is that same caller
+            // reaching the pool one phase later — through
+            // `KvDelta::translation`, which is what keeps the guest's
+            // working-set-relative indexes out of the pool's space. The mask
+            // is claimed with them because a fire whose ancestry is device
+            // data — a beam search's `gather(mask, parent)`, a sliding
+            // window's rebuilt row — has nowhere else to state it, and the
+            // runtime's bind-time classifier asks for exactly this union
+            // before it will admit one (`inferlet::host::forward`'s
+            // `devgeo_capable`).
+            //
+            // What `Capabilities::admits` still buys is the BIND-TIME refusal
+            // rather than a fire-time surprise, for whatever a later load
+            // cannot serve.
+            ports: PortMask::DEVICE_GEOMETRY.with(Port::AttnMask),
+            geometry: GeometryClass::DeviceGeometry,
             // **NO DIRECTION IS SERVED, AND UNIFIED MEMORY DOES NOT CHANGE
             // THAT.** It is tempting to claim the host directions on a plane
             // where `contents()` makes host and device the same bytes — a
@@ -1186,15 +1219,16 @@ impl Engine for Metal {
 
     fn bind_instance(&mut self, binding: &InstanceBinding) -> EngineResult<BoundInstance> {
         // REFUSED AT BIND, WHICH IS THE CONTRACT'S OWN READING: a class is a
-        // claim about which descriptor ports the device resolves, and the
-        // caps this load answered say which those are — the decode envelope
-        // and no more, on this plane (see `load`), so `DeviceGeometry` is what
-        // this refuses. Asked through `Capabilities::admits` rather than by
-        // re-deriving the subset test here, because the contract wrote that
-        // negotiation down once and a second spelling of it is a second thing
-        // to keep in step. A program bound in a class this load does not
+        // claim about which descriptor ports the device resolves, and the caps
+        // this load answered say which those are (see `load`, where this plane
+        // now claims all nine). Asked through `Capabilities::admits` rather
+        // than by re-deriving the subset test here, because the contract wrote
+        // that negotiation down once and a second spelling of it is a second
+        // thing to keep in step. A program bound in a class this load does not
         // serve would otherwise fail at its first fire, against a descriptor
-        // nobody wrote.
+        // nobody wrote — which is what the check is for even now that the
+        // widest class passes it: the answer is the LOAD's, and a load whose
+        // artifact cannot carry a class is refused here rather than there.
         let caps = self
             .caps
             .as_ref()
@@ -1498,6 +1532,14 @@ impl Metal {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
+                    // **THE WORKING SET'S TABLE, QUOTED AND NOT INTERPRETED.**
+                    // Empty for every lane whose page references the runtime
+                    // already resolved, which is every lane of every class but
+                    // `DeviceGeometry`; for that one it is the only thing that
+                    // maps the guest's relative indexes onto pool page ids,
+                    // and the shell may index it and nothing else
+                    // (`Seated::translation` argues both spaces).
+                    translation: &lane.kv.translation,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

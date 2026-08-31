@@ -1,6 +1,6 @@
 use model_dsl::{
-    Classify, ForwardHybrid, HybridSpec, Input, MropeForm, Platform, Predicate, Request, Value,
-    ValueId, Weight, ops, seam,
+    Classify, Dtype, ForwardHybrid, HybridSpec, Input, MropeForm, Platform, Predicate, Request,
+    Value, ValueId, Weight, ops, seam,
 };
 
 use super::model::{Attn, AttnBanks, Clipped, Draft, Model, Reading, Tower};
@@ -370,6 +370,78 @@ impl ForwardHybrid for Model {
                 ops::collective::all_reduce(&f)
             } else {
                 f
+            };
+            // **THE SECOND BRANCH, WHERE THE CHECKPOINT SHIPS ONE**
+            // (`model::Moe`). `None` on every dense row, and then this whole
+            // block is not written: `f` reaches the sandwich's closing norm
+            // exactly as it did, one statement and the same one.
+            let f = match &w.moe {
+                None => f,
+                Some(x) => {
+                    // The dense branch's own exit norm. It exists only here —
+                    // a dense layer's FFN output goes straight into
+                    // `post_ffw_norm`, and this one has a sibling to be added
+                    // to first.
+                    let h1 = ops::elemwise::rmsnorm(
+                        &f,
+                        &x.post_ffw_norm_1,
+                        x.post_ffw_norm_1_eps,
+                    );
+                    // **BOTH BRANCHES AND THE ROUTER READ `y`**, the
+                    // post-attention residual, and NOT the dense branch's
+                    // norm. `mlx_lm` routes on `h` and norms `h` twice more;
+                    // reading `mlp_in` here would chain what the checkpoint
+                    // states as siblings.
+                    let (routes, weights) = ops::linear::moe_topk_softmax_scaled(
+                        &ops::linear::matmul(
+                            &ops::elemwise::rmsnorm(
+                                &y,
+                                &x.router_norm,
+                                x.router_norm_eps,
+                            ),
+                            &x.router,
+                        ),
+                        &x.per_expert_scale,
+                        x.experts,
+                        x.top_k,
+                    );
+                    let moe_in =
+                        ops::elemwise::rmsnorm(&y, &x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps);
+                    // **THE EXPERTS ARE GeGLU, NOT SwiGLU**, and that costs no
+                    // op: `mlp_geglu_tanh_packed` reads a `[rows, 2·inter]`
+                    // block and the routed matmul writes one — the rows are
+                    // `tokens × top_k` rather than `tokens`, which the
+                    // activation does not ask about. `SwitchGLU`'s activation
+                    // is `GeGLU()`, which is `gelu_approx(gate) * up` — the
+                    // dense `mlp`'s own `geglu`, on the routed stack.
+                    let select = |act: &Value, bank: &Weight| match bank.dtype {
+                        Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 => {
+                            ops::linear::moe_matmul_select_quant(act, bank, &routes, x.top_k)
+                        }
+                        _ => ops::linear::moe_matmul_select(act, bank, &routes, x.top_k),
+                    };
+                    let hidden =
+                        ops::linear::mlp_geglu_tanh_packed(&select(&moe_in, &x.gate_up), x.inter);
+                    let routed =
+                        ops::linear::moe_weighted_sum(&select(&hidden, &x.down), &weights);
+                    // After the fold and before the branch norm, for
+                    // `o_proj`'s reason: `down` is rows-cut, so each rank holds
+                    // a partial product, and the mixture's weights are
+                    // replicated — so the weighted sum of the partials is the
+                    // partial of the weighted sum, and one reduce here answers
+                    // both.
+                    let routed = if m.tp > 1 {
+                        ops::collective::all_reduce(&routed)
+                    } else {
+                        routed
+                    };
+                    let h2 = ops::elemwise::rmsnorm(
+                        &routed,
+                        &x.post_ffw_norm_2,
+                        x.post_ffw_norm_2_eps,
+                    );
+                    ops::elemwise::residual_add(&h1, &h2)
+                }
             };
             y = ops::elemwise::residual_add(
                 &ops::elemwise::rmsnorm(&f, &w.post_ffw_norm, w.post_ffw_norm_eps),

@@ -1,4 +1,6 @@
-use model_dsl::{Classify, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam};
+use model_dsl::{
+    Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam,
+};
 
 use super::model::{Kda, Mixer, Mla, Mlp, Model};
 
@@ -59,10 +61,11 @@ impl ForwardHybrid for Model {
 
                 Mixer::Kda(k) => {
                     let width = (k.heads * k.head_dim) as u64;
-                    c.state(k.conv_state.clone(), [k.conv_kernel as u64, 3 * width]);
+                    c.state(k.conv_state.clone(), [k.conv_kernel as u64, 3 * width], Dtype::Bf16);
                     c.state(
                         k.delta_state.clone(),
                         [k.heads as u64, k.head_dim as u64, k.head_dim as u64],
+                        Dtype::Bf16,
                     );
                 }
             }

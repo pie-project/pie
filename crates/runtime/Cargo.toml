@@ -176,22 +176,19 @@ model = { path = "../model" }
 checkpoint = { path = "../checkpoint", default-features = false }
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
-# Host-side media decode for the model-agnostic multimodal API
-# (`inferlet::host::media::multimodal`). It rode `model`'s `serve` feature
-# while that module lived over there -- a flag whose whole purpose was to keep
-# twenty image crates out of an engine's link. The module is here now, where
-# every build decodes media, so the dependency is plain.
+# THE CODEC (`inferlet::host::media::decode`): container decode and the lent
+# resample. It rode `model`'s `serve` feature while multimodal lived over
+# there -- a flag whose whole purpose was to keep image crates out of an
+# engine's link. The catalog now carries only the front-end ARITHMETIC
+# (`model::media` and the family modules), and this crate -- where every build
+# decodes media -- carries the codec, so the dependency is plain and the
+# catalog's own "every consumer needs every dependency" rule stands.
 image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
     "gif",
 ] }
 blake3 = "1.8.5"
-# The media door's front-end contract (.wiki/alto/media-door.md §4): the trait
-# `image.from-bytes` dispatches to on `ROWS.arch`, and the `EncodedSpan` the
-# submission carries toward the contract. The runtime names the seam; the
-# per-architecture preprocessing behind it names nothing here.
-media-frontend = { path = "../media-frontend" }
 fancy-regex = "0.18.0"
 async-trait = "0.1.91"
 wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }

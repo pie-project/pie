@@ -4,7 +4,7 @@
 
 use kernels_metal::attn;
 use model_exec::{DispatchAttention, KernelError};
-use model_ir::{Attention, StructKind};
+use model_ir::{Attention, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
 
@@ -635,11 +635,25 @@ impl Run<'_> {
 
             // The absorbed `ssm` family (`attention.ssm_*`), calling into
             // `kernels_metal::attn::ssm`.
+            // qwen4's n-gram hasher and its dilated convolution: not on
+            // this plane yet.
+            Attention::PleNgramIds { .. } | Attention::PleNgramIdsChunked { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
+            Attention::SsmCausalConv1d {
+                dilation: 2..,
+                ..
+            }
+            | Attention::SsmCausalConv1dChunked {
+                dilation: 2..,
+                ..
+            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
             Attention::SsmCausalConv1d {
                 x,
                 weight,
                 state,
                 conv_width,
+                dilation: _,
                 y,
             } => attn::ssm::causal_conv1d(
                 self.ctx(),
@@ -654,6 +668,7 @@ impl Run<'_> {
                 weight,
                 state,
                 conv_width,
+                dilation: _,
                 y,
             } => attn::ssm::causal_conv1d_chunked(
                 self.ctx(),

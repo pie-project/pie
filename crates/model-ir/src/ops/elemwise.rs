@@ -101,6 +101,21 @@ pub enum Elementwise {
         eps: f32,
         y: ValueId,
     },
+    /// **THE HYPER-CONNECTION NORM** (qwen4's gated residual): moments per
+    /// `group`-wide slice, scale by `weight + 1` over the row's FULL width.
+    ///
+    /// [`RmsnormPerHeadPlusOne`](Elementwise::RmsnormPerHeadPlusOne) is the
+    /// near-miss, and the difference is the weight's width: a q/k norm shares
+    /// one `[head_dim]` plane across every head, while a residual stream's
+    /// scale is its own — `hc_norm.weight` is `[streams · hidden]` and no
+    /// two streams agree. So the moments group and the scale does not.
+    RmsnormGroupedPlusOne {
+        x: ValueId,
+        weight: ValueId,
+        group: u32,
+        eps: f32,
+        y: ValueId,
+    },
     /// **THE CLIPPED LINEAR'S HALF THAT IS NOT A GEMM** (multimodal §6.5).
     ///
     /// `x = min(max(x, lo), hi)`, in place, with both bounds TRACE CONSTANTS.
@@ -154,13 +169,19 @@ pub enum Elementwise {
         hi: ValueId,
         x_out: ValueId,
     },
-    /// `x` is f32; the norm is gated by `gate`, per group of `head_dim`.
+    /// `x` is f32; the norm is gated by `act(gate)`, per group of `head_dim`.
+    ///
+    /// `act` is the checkpoint's `output_gate_type`: qwen3.5's GDN gates by
+    /// `silu`, qwen4's by `sigmoid`, and everything else about the site — the
+    /// f32 SSM output, the per-`v_dim` grouping, the ungated `weight` — is
+    /// identical, so the activation is a field and not a second variant.
     RmsnormGated {
         x: ValueId,
         gate: ValueId,
         weight: ValueId,
         head_dim: u32,
         eps: f32,
+        act: GateActivation,
         y: ValueId,
     },
     /// Like `RmsnormGated`, but grouped by head count instead of head width.
@@ -183,6 +204,15 @@ pub enum Elementwise {
         out_out: ValueId,
     },
     MulScalar {
+        s: f32,
+        x: ValueId,
+        x_out: ValueId,
+    },
+    /// `silu(s · x)`, in place. The scalar sits INSIDE the activation — this
+    /// is the hyper-connection mixer's `silu(down(x) / streams)`, and
+    /// `silu(s·x) ≠ s·silu(x)`, so [`MulScalar`](Elementwise::MulScalar)
+    /// before a bare silu would have been two launches and this is one.
+    SiluScaled {
         s: f32,
         x: ValueId,
         x_out: ValueId,
@@ -325,6 +355,56 @@ pub enum Elementwise {
         y: ValueId,
     },
     // `Hc::Collapse` was deleted: no platform can fire it honestly (review R5).
+
+    // The GATED-RESIDUAL flavor (qwen4). Same residual-stream algebra, a
+    // different gate: where `HcGates`/`HcFold` mix M streams through a
+    // sinkhorn-normalized M×M matrix, this pair mixes through per-element
+    // sigmoid gates a low-rank GEMM chain produces — so the GEMMs stay
+    // `linear.matmul` nodes (they are quantized banks) and the two ops here
+    // are only the arithmetic no existing op says: the gated mean in, the
+    // gated broadcast out.
+    /// `y[h] = meanₛ(σ(gates[s·H + h]) · normed[s·H + h])` — one
+    /// `hidden`-wide layer input mixed out of `streams` normed residual
+    /// streams under per-element sigmoid gates.
+    HcMix {
+        gates: ValueId,
+        normed: ValueId,
+        streams: u32,
+        y: ValueId,
+    },
+    /// `hyper[s·H + h] += 2·σ(gates[s] / streams) · o[h]` — the layer output
+    /// injected back into every stream under its own scalar gate. In place on
+    /// `hyper`; the `1/streams` damping and the doubling are the reference's
+    /// own constants, stated here once rather than as two more launches.
+    HcInject {
+        o: ValueId,
+        gates: ValueId,
+        streams: u32,
+        hyper: ValueId,
+        hyper_out: ValueId,
+    },
+    /// The PLE gate (qwen4): per stream, the n-gram key row is dotted with
+    /// the normed residual stream, damped by a signed square root, squashed,
+    /// and the shared value row is scaled by the result —
+    /// `y[s·H+h] = σ(sgn(d)·√|d|) · value[h]` where
+    /// `d = Σⱼ key[s·H+j] · query[s·H+j] / √H`. One op because the IR has no
+    /// row-broadcast multiply and no free-standing reduction, and composing
+    /// this from ops it does have would have needed both.
+    PleGate {
+        key: ValueId,
+        query: ValueId,
+        value: ValueId,
+        streams: u32,
+        y: ValueId,
+    },
+}
+
+/// Which activation gates a [`RmsnormGated`](Elementwise::RmsnormGated) —
+/// the checkpoint's `output_gate_type`, as a form rather than a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GateActivation {
+    Silu,
+    Sigmoid,
 }
 
 /// **WHICH SECTION LAYOUT A [`RopeMrope`](Elementwise::RopeMrope) TURNS BY**
@@ -375,6 +455,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHead { x, weight, .. } => sink.extend([*x, *weight]),
             Self::RmsnormPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
             Self::RmsnormPerHeadPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
+            Self::RmsnormGroupedPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
             Self::RmsnormNoScale { x, .. } => sink.push(*x),
             Self::LayernormNoScale { x, .. } => sink.push(*x),
             Self::Layernorm { x, weight, bias, .. } => sink.extend([*x, *weight, *bias]),
@@ -385,6 +466,7 @@ impl Operands for Elementwise {
             Self::ResidualAdd { x, y, .. } => sink.extend([*x, *y]),
             Self::AddBias { bias, out, .. } => sink.extend([*bias, *out]),
             Self::MulScalar { x, .. } => sink.push(*x),
+            Self::SiluScaled { x, .. } => sink.push(*x),
             Self::Scale { s, x, .. } => sink.extend([*s, *x]),
             Self::ResBlend { prefix, blocks, weight, proj, .. } => {
                 sink.push(*prefix);
@@ -407,6 +489,9 @@ impl Operands for Elementwise {
             Self::HcFold { x, streams, post_mix, comb_mix, .. } => {
                 sink.extend([*x, *streams, *post_mix, *comb_mix]);
             }
+            Self::HcMix { gates, normed, .. } => sink.extend([*gates, *normed]),
+            Self::HcInject { o, gates, hyper, .. } => sink.extend([*o, *gates, *hyper]),
+            Self::PleGate { key, query, value, .. } => sink.extend([*key, *query, *value]),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -415,6 +500,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHead { y, .. } => sink.push(*y),
             Self::RmsnormPlusOne { y, .. } => sink.push(*y),
             Self::RmsnormPerHeadPlusOne { y, .. } => sink.push(*y),
+            Self::RmsnormGroupedPlusOne { y, .. } => sink.push(*y),
             Self::RmsnormNoScale { y, .. } => sink.push(*y),
             Self::LayernormNoScale { y, .. } => sink.push(*y),
             Self::Layernorm { y, .. } => sink.push(*y),
@@ -425,6 +511,7 @@ impl Operands for Elementwise {
             Self::ResidualAdd { y_out, .. } => sink.push(*y_out),
             Self::AddBias { out_out, .. } => sink.push(*out_out),
             Self::MulScalar { x_out, .. } => sink.push(*x_out),
+            Self::SiluScaled { x_out, .. } => sink.push(*x_out),
             Self::Scale { x_out, .. } => sink.push(*x_out),
             Self::ResBlend { y, .. } => sink.push(*y),
             Self::RopeFull { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
@@ -438,6 +525,9 @@ impl Operands for Elementwise {
             Self::HcRmsnormF32 { y, .. } => sink.push(*y),
             Self::HcGates { x, post_mix, comb_mix, .. } => sink.extend([*x, *post_mix, *comb_mix]),
             Self::HcFold { y, .. } => sink.push(*y),
+            Self::HcMix { y, .. } => sink.push(*y),
+            Self::HcInject { hyper_out, .. } => sink.push(*hyper_out),
+            Self::PleGate { y, .. } => sink.push(*y),
         }
     }
     fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
@@ -446,6 +536,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHead { .. } => {}
             Self::RmsnormPlusOne { .. } => {}
             Self::RmsnormPerHeadPlusOne { .. } => {}
+            Self::RmsnormGroupedPlusOne { .. } => {}
             Self::RmsnormNoScale { .. } => {}
             Self::LayernormNoScale { .. } => {}
             Self::Layernorm { .. } => {}
@@ -456,6 +547,7 @@ impl Operands for Elementwise {
             Self::ResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::AddBias { out_out, out, .. } => sink.push((*out_out, *out)),
             Self::MulScalar { x_out, x, .. } => sink.push((*x_out, *x)),
+            Self::SiluScaled { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::Scale { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::ResBlend { .. } => {}
             Self::RopeFull { q_out, q, k_out, k, .. } => sink.extend([(*q_out, *q), (*k_out, *k)]),
@@ -473,6 +565,9 @@ impl Operands for Elementwise {
             Self::HcRmsnormF32 { .. } => {}
             Self::HcGates { .. } => {}
             Self::HcFold { .. } => {}
+            Self::HcMix { .. } => {}
+            Self::HcInject { hyper_out, hyper, .. } => sink.push((*hyper_out, *hyper)),
+            Self::PleGate { .. } => {}
         }
     }
     fn name(&self) -> &'static str {
@@ -481,6 +576,7 @@ impl Operands for Elementwise {
             Self::RmsnormPerHead { .. } => "elementwise.rmsnorm_per_head",
             Self::RmsnormPlusOne { .. } => "elementwise.rmsnorm_plus_one",
             Self::RmsnormPerHeadPlusOne { .. } => "elementwise.rmsnorm_per_head_plus_one",
+            Self::RmsnormGroupedPlusOne { .. } => "elementwise.rmsnorm_grouped_plus_one",
             Self::RmsnormNoScale { .. } => "elementwise.rmsnorm_no_scale",
             Self::LayernormNoScale { .. } => "elementwise.layernorm_no_scale",
             Self::Layernorm { .. } => "elementwise.layernorm",
@@ -491,6 +587,7 @@ impl Operands for Elementwise {
             Self::ResidualAdd { .. } => "elementwise.residual_add",
             Self::AddBias { .. } => "elementwise.add_bias",
             Self::MulScalar { .. } => "elementwise.mul_scalar",
+            Self::SiluScaled { .. } => "elementwise.silu_scaled",
             Self::Scale { .. } => "elementwise.scale",
             Self::ResBlend { .. } => "elementwise.res_blend",
             Self::RopeFull { .. } => "elementwise.rope_full",
@@ -504,6 +601,9 @@ impl Operands for Elementwise {
             Self::HcRmsnormF32 { .. } => "elementwise.hc_rmsnorm_f32",
             Self::HcGates { .. } => "elementwise.hc_gates",
             Self::HcFold { .. } => "elementwise.hc_fold",
+            Self::HcMix { .. } => "elementwise.hc_mix",
+            Self::HcInject { .. } => "elementwise.hc_inject",
+            Self::PleGate { .. } => "elementwise.ple_gate",
         }
     }
 }

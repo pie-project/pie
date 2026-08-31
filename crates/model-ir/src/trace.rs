@@ -83,8 +83,11 @@ pub enum CacheRow {
     /// belong to — kv caches of all layers share one space; pool/index spaces
     /// are their own.
     Kv { name: String, planes: Vec<u64>, dtype: Dtype, space: u32 },
-    /// Recurrent state: per-lane slab shape.
-    State { name: String, slab: Vec<u64> },
+    /// Recurrent state: per-lane slab shape. `dtype` is declared by the
+    /// model for `Kv`'s reason — it was a shell-side constant (`Bf16`, stated
+    /// beside the ssm kernels' instantiations) until qwen4's PLE kept token
+    /// IDS as state, which an 8-bit mantissa cannot hold past 256.
+    State { name: String, slab: Vec<u64>, dtype: Dtype },
 }
 
 /// A named seam a declaration states, carried through for the tools that read

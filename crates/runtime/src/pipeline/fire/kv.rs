@@ -5,7 +5,7 @@
 //! threads the returned [`KvTxn`] across the async fire, and
 //! [`finalize`]s it (commit publishes the mapping; abort releases the
 //! pending slots and leaves the committed mapping authoritative);
-//! `pipeline::offload` drives the non-reserved [`prepare`] path.
+//! `crate::offload` drives the non-reserved [`prepare`] path.
 //!
 //! Hash lifecycle (increment 1): canonical fires — bind-time shape gate
 //! [`canonical_kv_shape`], fire-time evidence check

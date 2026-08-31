@@ -321,6 +321,19 @@ pub fn kv_append_shared(plane: &Value, pages: ValueId, write_page: &Value, write
 }
 
 pub fn ssm_causal_conv1d(x: &Value, weight: &Weight, state: ValueId, conv_width: u32) -> Value {
+    ssm_causal_conv1d_dilated(x, weight, state, conv_width, 1)
+}
+
+/// The dilated form: tap `j` reads `dilation · j` positions back (qwen4's
+/// PLE convolution, `dilation = ngram_size`). The undilated spelling above
+/// stays because a dilation of one is what the bare name means.
+pub fn ssm_causal_conv1d_dilated(
+    x: &Value,
+    weight: &Weight,
+    state: ValueId,
+    conv_width: u32,
+    dilation: u32,
+) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
@@ -329,6 +342,7 @@ pub fn ssm_causal_conv1d(x: &Value, weight: &Weight, state: ValueId, conv_width:
             weight: r.weight(weight),
             state,
             conv_width,
+            dilation,
             y: y.id(),
         },
         &[x],
@@ -342,6 +356,16 @@ pub fn ssm_causal_conv1d_chunked(
     state: ValueId,
     conv_width: u32,
 ) -> Value {
+    ssm_causal_conv1d_chunked_dilated(x, weight, state, conv_width, 1)
+}
+
+pub fn ssm_causal_conv1d_chunked_dilated(
+    x: &Value,
+    weight: &Weight,
+    state: ValueId,
+    conv_width: u32,
+    dilation: u32,
+) -> Value {
     let r = x.rec();
     let y = r.fresh(x.ty().clone());
     r.push(
@@ -350,11 +374,73 @@ pub fn ssm_causal_conv1d_chunked(
             weight: r.weight(weight),
             state,
             conv_width,
+            dilation,
             y: y.id(),
         },
         &[x],
     );
     y
+}
+
+/// The PLE n-gram hasher ([`Attention::PleNgramIds`]): every token's hashed
+/// n-gram table rows, one column per head. `state` is the lane's window of
+/// trailing token ids; `mults`, `primes` and `offsets` are the seed-derived
+/// hash constants the text computes — no checkpoint plane is read to know
+/// them. The answer is `[rows, primes.len()]` `i32`.
+pub fn ple_ngram_ids(
+    ids: &Value,
+    state: ValueId,
+    eos: u32,
+    mults: &[u64],
+    primes: &[u64],
+    offsets: &[u64],
+    heads_per_ngram: u32,
+) -> Value {
+    let r = ids.rec();
+    let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
+    r.push(
+        Attention::PleNgramIds {
+            ids: ids.id(),
+            state,
+            eos,
+            mults: mults.to_vec(),
+            primes: primes.to_vec(),
+            offsets: offsets.to_vec(),
+            heads_per_ngram,
+            ngram_ids: ngram_ids.id(),
+        },
+        &[ids],
+    );
+    ngram_ids
+}
+
+/// Prefill form of [`ple_ngram_ids`]: walks the fire's ambient request
+/// boundaries, as the chunked convolution does.
+pub fn ple_ngram_ids_chunked(
+    ids: &Value,
+    state: ValueId,
+    eos: u32,
+    mults: &[u64],
+    primes: &[u64],
+    offsets: &[u64],
+    heads_per_ngram: u32,
+) -> Value {
+    let r = ids.rec();
+    let ngram_ids = r.fresh(tensor(ids.rows(), primes.len() as u64, Dtype::I32));
+    r.push(
+        Attention::PleNgramIdsChunked {
+            ids: ids.id(),
+            state,
+            eos,
+            mults: mults.to_vec(),
+            primes: primes.to_vec(),
+            offsets: offsets.to_vec(),
+            heads_per_ngram,
+            ngram_ids: ngram_ids.id(),
+        },
+        &[ids],
+    );
+    ngram_ids
 }
 
 pub fn ssm_gdn_prep(ba: &Value, dt_bias: &Weight, a_log: &Weight) -> Value {

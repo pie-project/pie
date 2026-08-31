@@ -1013,7 +1013,7 @@ pub fn elem_bytes(dtype: Dtype) -> Option<u64> {
         // scale and offset. An arena rectangle of them would be an op that
         // declared its output in a storage element, which is what this refusal
         // is for.
-        Dtype::Fp4 | Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 => None,
+        Dtype::Fp4 | Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => None,
     }
 }
 

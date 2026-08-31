@@ -8,7 +8,7 @@ use tokenizer::Tokenizer;
 use crate::decode::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
 use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, special, specials};
 
-const STOP_TOKENS: &[&str] = &["<turn|>", "<eos>"];
+pub const STOP_TOKENS: &[&str] = &["<turn|>", "<eos>"];
 
 pub struct Gemma {
     tokenizer: Arc<Tokenizer>,

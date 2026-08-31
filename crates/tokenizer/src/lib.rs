@@ -8,6 +8,7 @@
 
 mod bpe;
 pub mod canonical;
+pub mod contract;
 pub mod loader;
 
 use std::borrow::Cow;

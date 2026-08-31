@@ -89,7 +89,7 @@ template <typename T, int BM, int BK, int BN, int WM = 2, int WN = 2>
   }
 }
 
-// ── the two rungs, and why they answer the same numbers ─────────────────────
+// ── the two TILE rungs, and why they answer the same numbers ────────────────
 //
 // **THE ROW BLOCK IS A PERFORMANCE CHOICE AND NOT A NUMERICAL ONE.** Every
 // output element of this kernel accumulates over k in ONE order — ascending,
@@ -99,13 +99,13 @@ template <typename T, int BM, int BK, int BN, int WM = 2, int WN = 2>
 // `BK` and a zero product adds exactly nothing, so a tail does not move the
 // order either. Two instantiations of this template therefore land the SAME
 // BITS for the same row, and that is what lets `act_x_wt` pick between them
-// on the fire's row count without the pick being visible in the answer.
+// on the fire's row count with the pick invisible in the answer.
 //
-// It is the property the vector kernel that used to serve the narrow rung
-// could not have. That one split K across a simdgroup's 32 lanes and folded
-// the pieces with `simd_sum` — a different order, therefore different
-// rounding, therefore a lane's logits depended on how many lanes rode with
-// it. See `linear/gemm.rs`.
+// The VECTOR point below has no such property, and it is on this ladder
+// anyway. See `linear/gemm.rs`: the two rungs above are the deterministic
+// ladder's whole selection set, and the fast ladder — which this plane ships
+// — puts the vector point under them at the widths it wins, on the owner's
+// ruling that a small drift is worth 1.7x of a one-lane decode.
 
 #define instantiate_dense_gemm_t(name, itype, bm, bk, bn, wm, wn)            \
   template [[host_name(                                                      \
@@ -125,3 +125,59 @@ instantiate_dense_gemm_t(bfloat16, bfloat, 32, 32, 32, 2, 2)
 // spent under. Measured on an M1 Max over qwen35-d0.8b, one decode fire:
 // 13.4 ms at one lane and 22.2 at eight, against 15.0/23.0 at BK = 32.
 instantiate_dense_gemm_t(bfloat16, bfloat, 8, 64, 32, 1, 2)
+
+// ── the vector point ────────────────────────────────────────────────────────
+//
+// One simdgroup per output column, the contraction split across its
+// thirty-two lanes and folded with `simd_sum`. **THAT FOLD IS THE WHOLE
+// POINT AND THE WHOLE COST**: it is where the parallelism comes from at one
+// row — 32 lanes a column against the tile's eight-row fragment floor — and
+// it is a different summation order from the tile's ascending walk, so the
+// two do not land the same bits and no amount of care makes them.
+//
+// It is therefore an arm of the FAST ladder only. Measured on an M1 Max over
+// qwen35-d0.8b, one decode fire, against the 8-row tile rung above:
+//
+//   lanes      1      2      4      8     16     31
+//   vector  10.3   12.9   22.1   40.3   76.9  145.1  ms
+//   tile    13.5   13.8   16.7   22.2   37.7   66.7  ms
+//
+// The lines cross between two rows and four, which is `gemm.rs`'s
+// `VECTOR_MAX_ROWS`. Above it the tile wins because it reads the weight table
+// once for eight rows where this reads it once per ROW; below it the tile is
+// paying for eight rows to compute one.
+template <typename T>
+[[kernel]] void dense_gemv_t(
+    const device T* act      [[buffer(0)]],
+    const device T* w        [[buffer(1)]],
+    device T* y              [[buffer(2)]],
+    const constant int& M    [[buffer(3)]],
+    const constant int& N    [[buffer(4)]],
+    const constant int& K    [[buffer(5)]],
+    uint2 gid  [[thread_position_in_grid]],
+    uint lane  [[thread_index_in_simdgroup]]) {
+  const int n = int(gid.x) / SIMD_SIZE;
+  const int m = int(gid.y);
+  if (n >= N || m >= M) {
+    return;
+  }
+  const device T* act_row = act + size_t(m) * size_t(K);
+  const device T* w_row = w + size_t(n) * size_t(K);
+  float acc = 0.0f;
+  for (int k = int(lane); k < K; k += SIMD_SIZE) {
+    acc += float(act_row[k]) * float(w_row[k]);
+  }
+  acc = simd_sum(acc);
+  if (lane == 0) {
+    y[size_t(m) * size_t(N) + size_t(n)] = static_cast<T>(acc);
+  }
+}
+
+#define instantiate_dense_gemv_t(name, itype)                                \
+  template [[host_name("dense_gemv_t_" #name)]]                              \
+  [[kernel]] void dense_gemv_t<itype>(                                       \
+      const device itype*, const device itype*, device itype*,               \
+      const constant int&, const constant int&, const constant int&,         \
+      uint2, uint);
+
+instantiate_dense_gemv_t(bfloat16, bfloat)

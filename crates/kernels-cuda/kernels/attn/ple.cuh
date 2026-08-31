@@ -1,0 +1,175 @@
+#pragma once
+
+#include "prelude/device.cuh"
+
+namespace pie::attn {
+
+// The PLE n-gram hasher (qwen4): every token's hashed n-gram table rows,
+// one column per head. The hash is the reference's own — token ids
+// multiplied by seed-derived odd constants, xor-folded, reduced modulo a
+// per-head prime plus a per-head offset — and its constants arrive by value
+// in one aggregate parameter, because no checkpoint plane needs to be read
+// to know them.
+//
+// The window cache is a per-lane state slab of `ngram - 1` i32 cells storing
+// PREVIOUS token ids as `id + 1`, so a zeroed slot reads as "no history" and
+// the reference's eos padding falls out of the sentinel rather than out of a
+// separate reset. The eos-segmentation rule reduces, for a window of two,
+// to: the id one back is itself; the id two back is eos when the id one
+// back is eos.
+
+constexpr int PLE_MAX_NGRAM = 4;
+constexpr int PLE_MAX_HEADS = 32;
+
+struct PleHash {
+    unsigned long long mults[PLE_MAX_NGRAM];
+    unsigned long long primes[PLE_MAX_HEADS];
+    unsigned long long offsets[PLE_MAX_HEADS];
+    int ngram;
+    int heads;
+    int heads_per_ngram;
+    int eos;
+};
+
+// Hash the window [t, p1, p2, ...] (newest first) for every head.
+__device__ __forceinline__ void ple_hash_row(
+    const PleHash& h, const int* window, int* out)
+{
+    for (int order = 2; order <= h.ngram; ++order) {
+        unsigned long long mixed = (unsigned long long)window[0] * h.mults[0];
+        for (int p = 1; p < order; ++p) {
+            mixed ^= (unsigned long long)window[p] * h.mults[p];
+        }
+        const int base = (order - 2) * h.heads_per_ngram;
+        for (int k = 0; k < h.heads_per_ngram; ++k) {
+            const int head = base + k;
+            const unsigned long long id = mixed % h.primes[head] + h.offsets[head];
+            out[head] = (int)id;
+        }
+    }
+}
+
+// Apply the eos-segmentation rule to the raw window: a previous id is
+// replaced by eos when a NEARER previous id is eos (the window crossed a
+// sequence boundary).
+__device__ __forceinline__ void ple_mask_window(
+    const PleHash& h, int* window)
+{
+    bool crossed = false;
+    for (int p = 1; p < h.ngram; ++p) {
+        if (crossed) window[p] = h.eos;
+        if (window[p] == h.eos) crossed = true;
+    }
+}
+
+// Decode form: one thread per lane row. Reads the lane's state, hashes the
+// one new token, shifts the window.
+__global__ void ple_ngram_ids_update(
+    const int* __restrict__ ids,
+    int* __restrict__ state_base,
+    const int* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    int* __restrict__ ngram_ids,
+    int rows,
+    PleHash h)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    int* state = state_base + (long long)slot * slot_stride_elems;
+
+    const int span = h.ngram - 1;
+    int window[PLE_MAX_NGRAM];
+    window[0] = ids[r];
+    for (int p = 1; p <= span; ++p) {
+        const int cell = state[span - p];
+        window[p] = cell == 0 ? h.eos : cell - 1;
+    }
+    ple_mask_window(h, window);
+
+    int out[PLE_MAX_HEADS];
+    ple_hash_row(h, window, out);
+    for (int k = 0; k < h.heads; ++k) {
+        ngram_ids[(long long)r * h.heads + k] = out[k];
+    }
+
+    for (int p = 0; p < span - 1; ++p) state[p] = state[p + 1];
+    state[span - 1] = ids[r] + 1;
+}
+
+// Prefill form: one thread block per request; walks the request's tokens in
+// order (the window is tiny, so every thread rebuilds its own token's
+// window from the fire's rows and the state fills only the first `span`).
+__global__ void ple_ngram_ids_chunked(
+    const int* __restrict__ ids,
+    int* __restrict__ state_base,
+    const int* __restrict__ slot_ids,
+    const u32* __restrict__ qo_indptr,
+    long long slot_stride_elems,
+    int* __restrict__ ngram_ids,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    const int* commit_len,
+    const int* begin_at,
+    PleHash h)
+{
+    const int r = blockIdx.x;
+    int t0 = (int)qo_indptr[r];
+    int Nr = (int)qo_indptr[r + 1] - t0;
+
+    // The segment this launch owns (the 2R split) — the causal conv's own
+    // trimming, read for the same reason: state may only advance over the
+    // committed prefix, and the tail launch re-covers the rest.
+    if (begin_at != nullptr) {
+        int b = begin_at[r];
+        if (b > Nr) b = Nr;
+        if (b > 0) { t0 += b; Nr -= b; }
+    }
+    if (commit_len != nullptr) {
+        const int c = commit_len[r];
+        if (c < Nr) Nr = c;
+    }
+    if (Nr <= 0) return;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    int* state = state_base + (long long)slot * slot_stride_elems;
+
+    const int span = h.ngram - 1;
+    const int tid = threadIdx.x;
+
+    for (int t = tid; t < Nr; t += blockDim.x) {
+        int window[PLE_MAX_NGRAM];
+        window[0] = ids[t0 + t];
+        for (int p = 1; p <= span; ++p) {
+            if (t - p >= 0) {
+                window[p] = ids[t0 + t - p];
+            } else {
+                const int cell = state[span - (p - t)];
+                window[p] = cell == 0 ? h.eos : cell - 1;
+            }
+        }
+        ple_mask_window(h, window);
+        int out[PLE_MAX_HEADS];
+        ple_hash_row(h, window, out);
+        for (int k = 0; k < h.heads; ++k) {
+            ngram_ids[(long long)(t0 + t) * h.heads + k] = out[k];
+        }
+    }
+
+    __syncthreads();
+
+    if (write_state &&
+        (write_state_mask == nullptr || write_state_mask[r] != 0) &&
+        tid == 0) {
+        // The new window: the last `span` ids of (state ++ segment).
+        int next[PLE_MAX_NGRAM];
+        for (int p = 0; p < span; ++p) {
+            const int src_t = Nr - span + p;
+            next[p] = src_t >= 0 ? ids[t0 + src_t] + 1 : state[p + Nr];
+        }
+        for (int p = 0; p < span; ++p) state[p] = next[p];
+    }
+}
+
+} // namespace pie::attn

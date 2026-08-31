@@ -26,10 +26,11 @@ use anyhow::Result;
 use eta_ir::registry::GeometryClass;
 
 use ::engine::program::BindExtents;
+use ::engine::{ChannelRegistration, KvCopy, ProgramRegistration, StateCopy};
 
 use crate::engine::{
-    BoundInstance, ChannelEndpoint, ChannelRegistration, ChannelValue, EngineId, InstanceBindingPlan,
-    InstanceId, KvCopy, ProgramId, ProgramRegistration, StateCopy, SubmissionCompletion,
+    BoundInstance, ChannelEndpoint, ChannelValue, EngineId, InstanceBindingPlan,
+    InstanceId, ProgramId, SubmissionCompletion,
 };
 
 use super::{ProcessId, scheduler_handle};

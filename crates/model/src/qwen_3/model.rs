@@ -1,7 +1,7 @@
 use checkpoint::contract::ModelContract;
 use model_dsl::{Dtype, Weight};
 
-use crate::contract::{Claim, ModelError, claim, elaborate};
+use checkpoint_dsl::{Builder, Error};
 
 pub struct Model {
     pub hidden: u32,
@@ -848,6 +848,29 @@ impl Model {
         // adapter planes the host writes. See `crate::dense` for why they are
         // asked for rather than assumed to be `w`.
         let dense = crate::dense(w);
+        // **THE TWO ROUTING GATES, AT THEIR OWN WIDTH** (campaign M-5) — the
+        // rule `gpt_oss::model` states for its single gate, in this family's
+        // spelling of it. That comment names this family as carrying the same
+        // predicate and it does: `mlx_lm`'s `qwen3_5_moe.py` raises every
+        // `mlp.gate` AND every `mlp.shared_expert_gate` to eight bits whatever
+        // the rest of the stack is at, and
+        // `mlx-community/Qwen3.6-35B-A3B-4bit`'s `config.json` lists all
+        // EIGHTY of them — forty of each, one pair per layer — under
+        // `bits: 8` beside the affine-U4 entries.
+        //
+        // The shapes say it too, and they are what was checked. A `[256,
+        // 2048]` router stored four bits to a code would ship `2048 / 64 = 32`
+        // scales per row in a `[256, 512]` `u32` plane; the file ships `[256,
+        // 512]` codes with `[256, 32]` scales, which is `512 * 4 = 2048`
+        // codes to a row and thirty-two groups of sixty-four — eight bits, not
+        // four. `shared_expert_gate` reads the same way at `[1, 2048]`.
+        //
+        // A bf16 stack's gates stay bf16: the raise is from four bits to
+        // eight, not to eight from anywhere.
+        let gate = match w {
+            Dtype::MlxU4 => Dtype::MlxU8,
+            other => other,
+        };
         let q_heads = d.q_heads / tp;
         let kv_heads = d.kv_heads / tp;
         let k_heads = d.k_heads / tp;
@@ -908,7 +931,7 @@ impl Model {
                         let inter = m.inter / tp;
                         let shared_inter = m.shared_inter / tp;
                         Mlp::Routed {
-                            router: Weight::sym(n("router"), [m.experts as u64, hidden], w),
+                            router: Weight::sym(n("router"), [m.experts as u64, hidden], gate),
 
                             gate_up: Weight::sym(
                                 n("experts_gate_up"),
@@ -934,7 +957,7 @@ impl Model {
                                 w,
                             )
                             .rows(),
-                            shared_gate: Weight::sym(n("shared_gate"), [1, hidden], w),
+                            shared_gate: Weight::sym(n("shared_gate"), [1, hidden], gate),
                             experts: m.experts,
                             top_k: m.top_k,
                             inter,
@@ -1160,45 +1183,44 @@ fn dense_mlp(w: Dtype, hidden: u64, inter: u32, prefix: &str) -> Mlp {
 }
 
 impl Model {
-    pub fn load(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
-        let mut claims: Vec<Claim> = vec![
-            claim(&self.embed, self.tp),
-            claim(&self.final_norm, self.tp),
-        ];
+    pub fn load(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
+        let mut b = Builder::new(src, self.tp);
+        b.read_own(&self.embed)?;
+        b.read_own(&self.final_norm)?;
 
         match &self.head {
             Head::Tied => {}
-            Head::Bank(head) => claims.push(claim(head, self.tp)),
+            Head::Bank(head) => b.read_own(head)?,
         }
 
         for layer in &self.layers {
-            claims.push(claim(&layer.mixer_norm, self.tp));
-            claims.push(claim(&layer.mlp_norm, self.tp));
+            b.read_own(&layer.mixer_norm)?;
+            b.read_own(&layer.mlp_norm)?;
 
             match &layer.mixer {
                 Mixer::Attn(a) => {
-                    claims.push(claim(&a.qg_proj, self.tp));
-                    claims.push(claim(&a.k_proj, self.tp));
-                    claims.push(claim(&a.v_proj, self.tp));
-                    claims.push(claim(&a.o_proj, self.tp));
-                    claims.push(claim(&a.q_norm, self.tp));
-                    claims.push(claim(&a.k_norm, self.tp));
+                    b.read_own(&a.qg_proj)?;
+                    b.read_own(&a.k_proj)?;
+                    b.read_own(&a.v_proj)?;
+                    b.read_own(&a.o_proj)?;
+                    b.read_own(&a.q_norm)?;
+                    b.read_own(&a.k_norm)?;
                 }
                 Mixer::Gdn(g) => {
-                    claims.push(claim(&g.in_qkvz, self.tp));
-                    claims.push(claim(&g.in_ba, self.tp));
-                    claims.push(claim(&g.conv, self.tp));
-                    claims.push(claim(&g.dt_bias, self.tp));
-                    claims.push(claim(&g.a_log, self.tp));
-                    claims.push(claim(&g.norm, self.tp));
-                    claims.push(claim(&g.out_proj, self.tp));
+                    b.read_own(&g.in_qkvz)?;
+                    b.read_own(&g.in_ba)?;
+                    b.read_own(&g.conv)?;
+                    b.read_own(&g.dt_bias)?;
+                    b.read_own(&g.a_log)?;
+                    b.read_own(&g.norm)?;
+                    b.read_own(&g.out_proj)?;
                 }
             }
 
             match &layer.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    claims.push(claim(gate_up, self.tp));
-                    claims.push(claim(down, self.tp));
+                    b.read_own(gate_up)?;
+                    b.read_own(down)?;
                 }
                 Mlp::Routed {
                     router,
@@ -1209,12 +1231,12 @@ impl Model {
                     shared_gate,
                     ..
                 } => {
-                    claims.push(claim(router, self.tp));
-                    claims.push(claim(gate_up, self.tp));
-                    claims.push(claim(down, self.tp));
-                    claims.push(claim(shared_gate_up, self.tp));
-                    claims.push(claim(shared_down, self.tp));
-                    claims.push(claim(shared_gate, self.tp));
+                    b.read_own(router)?;
+                    b.read_own(gate_up)?;
+                    b.read_own(down)?;
+                    b.read_own(shared_gate_up)?;
+                    b.read_own(shared_down)?;
+                    b.read_own(shared_gate)?;
                 }
             }
         }
@@ -1223,25 +1245,25 @@ impl Model {
         // layer loop above because they are a different row space's weights:
         // nothing here is cut by `tp`, and nothing here has an adapter bank.
         if let Some(t) = &self.tower {
-            claims.push(claim(&t.patch_embed, self.tp));
-            claims.push(claim(&t.patch_embed_bias, self.tp));
-            claims.push(claim(&t.pos_embed, self.tp));
-            for b in &t.blocks {
+            b.read_own(&t.patch_embed)?;
+            b.read_own(&t.patch_embed_bias)?;
+            b.read_own(&t.pos_embed)?;
+            for blk in &t.blocks {
                 for w in [
-                    &b.norm1,
-                    &b.norm1_bias,
-                    &b.qkv,
-                    &b.qkv_bias,
-                    &b.proj,
-                    &b.proj_bias,
-                    &b.norm2,
-                    &b.norm2_bias,
-                    &b.fc1,
-                    &b.fc1_bias,
-                    &b.fc2,
-                    &b.fc2_bias,
+                    &blk.norm1,
+                    &blk.norm1_bias,
+                    &blk.qkv,
+                    &blk.qkv_bias,
+                    &blk.proj,
+                    &blk.proj_bias,
+                    &blk.norm2,
+                    &blk.norm2_bias,
+                    &blk.fc1,
+                    &blk.fc1_bias,
+                    &blk.fc2,
+                    &blk.fc2_bias,
                 ] {
-                    claims.push(claim(w, self.tp));
+                    b.read_own(w)?;
                 }
             }
             let m = &t.merger;
@@ -1253,7 +1275,7 @@ impl Model {
                 &m.fc2,
                 &m.fc2_bias,
             ] {
-                claims.push(claim(w, self.tp));
+                b.read_own(w)?;
             }
         }
 
@@ -1264,23 +1286,23 @@ impl Model {
         // slicing is said, and this is where the shapes are demanded.
         if let Some(mtp) = &self.mtp {
             if let Some(pre) = &mtp.pre_fc {
-                claims.push(claim(&pre.embedding, self.tp));
-                claims.push(claim(&pre.hidden, self.tp));
+                b.read_own(&pre.embedding)?;
+                b.read_own(&pre.hidden)?;
             }
-            claims.push(claim(&mtp.fc_embed, self.tp));
-            claims.push(claim(&mtp.fc_hidden, self.tp));
-            claims.push(claim(&mtp.mixer_norm, self.tp));
-            claims.push(claim(&mtp.attn.qg_proj, self.tp));
-            claims.push(claim(&mtp.attn.k_proj, self.tp));
-            claims.push(claim(&mtp.attn.v_proj, self.tp));
-            claims.push(claim(&mtp.attn.o_proj, self.tp));
-            claims.push(claim(&mtp.attn.q_norm, self.tp));
-            claims.push(claim(&mtp.attn.k_norm, self.tp));
-            claims.push(claim(&mtp.mlp_norm, self.tp));
+            b.read_own(&mtp.fc_embed)?;
+            b.read_own(&mtp.fc_hidden)?;
+            b.read_own(&mtp.mixer_norm)?;
+            b.read_own(&mtp.attn.qg_proj)?;
+            b.read_own(&mtp.attn.k_proj)?;
+            b.read_own(&mtp.attn.v_proj)?;
+            b.read_own(&mtp.attn.o_proj)?;
+            b.read_own(&mtp.attn.q_norm)?;
+            b.read_own(&mtp.attn.k_norm)?;
+            b.read_own(&mtp.mlp_norm)?;
             match &mtp.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    claims.push(claim(gate_up, self.tp));
-                    claims.push(claim(down, self.tp));
+                    b.read_own(gate_up)?;
+                    b.read_own(down)?;
                 }
                 Mlp::Routed { .. } => panic!(
                     "`{}`: a draft head is one block and routes to no experts",
@@ -1288,10 +1310,10 @@ impl Model {
                 ),
             }
             if let Some(norm) = &mtp.norm {
-                claims.push(claim(norm, self.tp));
+                b.read_own(norm)?;
             }
         }
 
-        elaborate(src, claims)
+        Ok(b.build())
     }
 }

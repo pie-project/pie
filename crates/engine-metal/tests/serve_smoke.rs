@@ -464,6 +464,7 @@ fn a_mask_the_word_does_not_admit_is_refused_by_name() {
             positions: &[],
             readout: None,
             captures_scores: false,
+            translation: &[],
         }])
         .expect_err("a mask beside a word that skips the masked arm");
     let said = fault.to_string();
@@ -519,6 +520,7 @@ fn an_all_keeping_mask_answers_what_the_unmasked_prefill_did() {
             positions: &[],
             readout: None,
             captures_scores: false,
+            translation: &[],
         }])
         .expect("the masked prefill fires");
     finite(&masked[0], "masked prefill");
@@ -576,6 +578,7 @@ fn a_per_row_mask_that_keeps_everything_is_the_same_identity() {
             positions: &[],
             readout: None,
             captures_scores: false,
+            translation: &[],
         }])
         .expect("the per-row masked prefill fires");
     finite(&masked[0], "per-row masked prefill");
@@ -620,6 +623,7 @@ fn a_per_row_mask_of_the_wrong_height_is_refused_by_name() {
             positions: &[],
             readout: None,
             captures_scores: false,
+            translation: &[],
         }])
         .expect_err("a per-row mask one row short of its lane");
     let said = fault.to_string();
@@ -670,6 +674,7 @@ fn stated_positions_that_are_the_derived_run_change_nothing() {
             positions: &stated,
             readout: None,
             captures_scores: false,
+            translation: &[],
         }])
         .expect("the stated-position prefill fires");
     assert_eq!(
@@ -694,6 +699,7 @@ fn stated_positions_that_are_the_derived_run_change_nothing() {
             positions: &short,
             readout: None,
             captures_scores: false,
+            translation: &[],
         }])
         .expect_err("a position run one short of its lane");
     let said = fault.to_string();
@@ -1217,6 +1223,7 @@ fn an_attached_epilogue_argmaxes_the_row_the_host_reads() {
                 positions: &[],
                 readout: None,
                 captures_scores: false,
+                translation: &[],
             }],
             &[engine_metal::Attached {
                 lane: 0,
@@ -1291,6 +1298,7 @@ fn a_stated_readout_row_is_the_row_the_epilogue_is_handed() {
                 positions: &[],
                 readout: Some(&[want]),
                 captures_scores: false,
+                translation: &[],
             }],
             &[engine_metal::Attached {
                 lane: 0,
@@ -1340,6 +1348,7 @@ fn an_attachment_naming_an_absent_lane_is_refused_by_name() {
                 positions: &[],
                 readout: None,
                 captures_scores: false,
+                translation: &[],
             }],
             &[engine_metal::Attached {
                 lane: 3,
@@ -1384,6 +1393,7 @@ fn an_instance_attached_twice_to_one_fire_is_refused_by_name() {
             positions: &[],
             readout: None,
             captures_scores: false,
+            translation: &[],
         })
         .collect();
     let fault = shell
@@ -1443,6 +1453,7 @@ fn a_prologue_attachment_is_refused_by_name() {
                 positions: &[],
                 readout: None,
                 captures_scores: false,
+                translation: &[],
             }],
             &[engine_metal::Attached {
                 lane: 0,
@@ -1493,6 +1504,7 @@ fn a_readout_list_that_is_not_one_run_is_refused_by_name() {
                 positions: &[],
                 readout: Some(&[0, 2]),
                 captures_scores: false,
+                translation: &[],
             }],
             &[engine_metal::Attached {
                 lane: 0,
@@ -1859,5 +1871,668 @@ fn a_device_class_lane_that_also_states_positions_is_refused_by_name() {
     assert!(
         said.contains("also states"),
         "the refusal does not say what the submission did: {said}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The pooled device geometry: a fire whose PAGE TABLE comes off a guest's ring
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// **THE DECODE ENVELOPE MOVED THE TOKEN; THIS CLASS MOVES THE WRITE.** A
+// `GeometryClass::DecodeEnvelope` lane's page table is the SHELL's — the seat's
+// `have .. have + rows` is what the page CSR, the write descriptor and the
+// attention schedules are all carved from — and only the ids it embeds are the
+// guest's. A `GeometryClass::DeviceGeometry` lane states all of it: how many
+// lanes the instance carries (`embed_indptr`), which pages each may address
+// (`pages`/`page_indptr`), how long each is (`kv_len`), which cell THIS row
+// lands in (`w_slot`/`w_off`) and which keys it may reach (`attn_mask`). That
+// is the class every attention-shaped fixture in `tests/inferlets` needs —
+// beam search, sliding window, attention sink, snapkv, consensus decoding —
+// because each of them owns a pool the runtime only leases it.
+//
+// **THE SUBJECT IS `beam_epilogue`, WHICH IS THE CORPUS'S ONLY MEMBER THAT
+// BINDS THE WHOLE CLASS.** Nine ports, two lanes through one instance, a dense
+// `[B, P * PAGE_T]` bool mask on a channel. It is also the corpus's widest
+// program at sixteen channels, which `program_parity`'s ceiling test already
+// says compiles and fires here; what is new below is that a MODEL fire takes
+// its geometry from it.
+//
+// **AND THE GEOMETRY IS SEEDED RATHER THAN GROWN.** The port values a fire
+// reads are the committed cells of the instance's rings, and a bind states
+// those directly — so the test states the geometry it wants to be fired
+// against instead of running the beam loop far enough to produce one. That is
+// the same lever `guest_instance_in` pulls for the envelope tests one section
+// up, widened from one port to nine.
+
+/// **THE SUBJECT IS AUTHORED HERE AND NOT QUOTED, AND THE REASON IS A
+/// MEASURED REFUSAL.** The golden corpus's only member that binds the whole
+/// port class is `beam_epilogue`, and it reads `intrinsics::logits()` as
+/// `[B, V]` — two rows. This plane's emitted intrinsic handler walks a
+/// rectangle's rows consecutively and has no row stride to be told, so
+/// `program::launch` refuses a multi-row read by name ("every row after the
+/// first would land 248312 elements short"), which makes `beam_epilogue`
+/// unattachable to a MODEL fire here however well its geometry resolves. That
+/// is a real residual blocker for beam search on this plane and it is a
+/// different piece of work from this one.
+///
+/// So the fixture below is a ONE-lane pooled device-geometry epilogue — the
+/// shape every other member of the class has (`sliding-window-attention`,
+/// `attention-sink`, `snapkv-eviction`: one sequence, one row, a pool the
+/// guest owns) — authored through the same `eta-dsl` builder the goldens were
+/// authored through. It binds all nine ports and it re-publishes each one, so
+/// it is also what `lease::detect_pooled_device_geometry` calls a pooled pass.
+const GUEST_LANES: usize = 1;
+
+/// How wide the fixture's mask rectangle is. The POOL's width, which is what a
+/// guest builds a mask at — larger than any extent this test fires, so the
+/// surplus takes `crate::mask`'s clip.
+const GUEST_MASK_KEYS: usize = 32;
+
+/// How many pages the fixture's page run holds, and how many keys one holds.
+///
+/// The second is the SHELL's, quoted: `ready`'s boot states `page_size: 16`,
+/// and the write descriptor a guest publishes is a page of the run plus an
+/// offset inside it, so a fixture that guessed a different size would state a
+/// cell the attention does not read. `GUEST_MASK_KEYS` is the two multiplied
+/// out, which is what makes the rectangle cover the run.
+const GUEST_PAGE_RUN: u32 = 2;
+const GUEST_PAGE_SIZE: u32 = 16;
+
+/// The fixture, traced.
+fn device_geometry_registration() -> engine::program::ProgramRegistration {
+    device_geometry_registration_with(true)
+}
+
+/// The same, with the page run's channel declared UNSEEDED when
+/// `seeded_pages` is false — the instance that never published, which is what
+/// the empty-ring refusal is about.
+fn device_geometry_registration_with(seeded_pages: bool) -> engine::program::ProgramRegistration {
+    use eta_dsl::builder::Builder;
+    use eta_dsl::prelude::*;
+    use eta_dsl::{Channel, dtype};
+
+    fn leak<T>(value: T) -> &'static T {
+        Box::leak(Box::new(value))
+    }
+
+    // THE NINE PORTS, ONE CHANNEL APIECE. The four the wide class adds to the
+    // envelope — `pages`, `page_indptr`, `w_slot`, `w_off` — plus the row
+    // split and the mask, which is what makes this the whole class rather
+    // than the trio.
+    let toks: &'static Channel = leak(Channel::from([1i32]).named("toks"));
+    let qo: &'static Channel = leak(Channel::from([0u32, 1]).named("qo"));
+    let pos: &'static Channel = leak(Channel::from([0u32]).named("pos"));
+    let klen: &'static Channel = leak(Channel::from([1u32]).named("klen"));
+    let pages: &'static Channel = leak(
+        if seeded_pages {
+            Channel::seeded([GUEST_PAGE_RUN], dtype::u32)
+        } else {
+            Channel::new([GUEST_PAGE_RUN], dtype::u32)
+        }
+        .named("pages"),
+    );
+    let page_indptr: &'static Channel =
+        leak(Channel::from([0u32, GUEST_PAGE_RUN]).named("page_indptr"));
+    let w_slot: &'static Channel = leak(Channel::from([0u32]).named("w_slot"));
+    let w_off: &'static Channel = leak(Channel::from([0u32]).named("w_off"));
+    let mask: &'static Channel = leak(
+        Channel::seeded([1u32, GUEST_MASK_KEYS as u32], dtype::bool).named("mask"),
+    );
+    let out: &'static Channel = leak(Channel::new([1], dtype::i32).named("out"));
+
+    let mut builder = Builder::new(GUEST_VOCAB, 16);
+    builder.bind_port(Port::EmbedTokens, toks);
+    builder.bind_port(Port::EmbedIndptr, qo);
+    builder.bind_port(Port::Positions, pos);
+    builder.bind_port(Port::KvLen, klen);
+    builder.bind_port(Port::Pages, pages);
+    builder.bind_port(Port::PageIndptr, page_indptr);
+    builder.bind_port(Port::WSlot, w_slot);
+    builder.bind_port(Port::WOff, w_off);
+    builder.bind_port(Port::AttnMask, mask);
+    // THE PASS: argmax the row this fire computed, publish it as the next
+    // fire's token, and ADVANCE the geometry the way a real pooled guest
+    // does. The four peeked ports (`embed_indptr`, `kv_len`... no: `kv_len`
+    // is peeked and re-put, while `embed_indptr`, `pages`, `page_indptr` and
+    // `attn_mask` are peeked and left alone) keep their seeded cells; the
+    // four consuming ones (`embed_tokens`, `positions`, `w_slot`, `w_off`)
+    // are re-published, because a consumed cell is gone after the pass.
+    builder.stage(Stage::Epilogue, move || {
+        let next = reduce_argmax(intrinsics::logits());
+        toks.put(&next);
+        out.put(next);
+        pos.put(add(pos.take(), 1u32));
+        klen.put(add(klen.take(), 1u32));
+        w_slot.put(w_slot.take());
+        w_off.put(add(w_off.take(), 1u32));
+        // THE PAGE RUN IS RE-PUBLISHED TOO, and not because it moved: `pages`
+        // is a PEEK port, so its cell would stand untouched forever. What the
+        // explicit drain-and-refill buys is the loop-carried shape a real
+        // pooled guest has — `lease::detect_pooled_device_geometry` requires
+        // every descriptor channel to be re-published before it will call a
+        // pass pooled — and it is what makes the UNSEEDED variant below a
+        // legal program at all: a channel a port consumes and nothing
+        // produces is a trace-time lint, so "nothing has published one" has
+        // to be a first-fire fact rather than a declaration.
+        pages.put(pages.take());
+    });
+    let traced = builder
+        .build()
+        .expect("the one-lane device-geometry epilogue traces");
+    registration_of(traced.container().clone(), "the device-geometry fixture")
+}
+
+/// One bound, compiled trace, as `Shell::register_program` takes it.
+///
+/// The tail of [`guest_registration`], lifted so that a trace this file
+/// AUTHORS reaches the shell down the same path a golden does — same profile,
+/// same bind, same backend, same emitter.
+fn registration_of(
+    container: eta_ir::container::TraceContainer,
+    what: &str,
+) -> engine::program::ProgramRegistration {
+    let mut profile = eta_ir::registry::ModelProfile::dummy();
+    profile.vocab = GUEST_VOCAB;
+    let bound = eta_ir::validate::bind(container, profile)
+        .unwrap_or_else(|why| panic!("{what} does not bind: {why:?}"));
+    let stages = eta_compiler::plan::compile_bound(&bound);
+    let launch = eta_compiler::codegen::launch::build(&bound, &stages);
+    let backend = eta_compiler::codegen::program::Backend::Metal;
+    let emitted = eta_compiler::codegen::program::emit_program(backend, &stages, &bound);
+
+    engine::program::ProgramRegistration {
+        program_hash: bound.hash,
+        emitted_kernels: emitted,
+        emitter_version: backend.emitter_version(),
+        region_analysis: Vec::new(),
+        launch,
+        reference_ptir: Vec::new(),
+    }
+}
+
+/// One instance of [`DEVICE_GEOMETRY_GUEST`], bound in the wide class with
+/// every descriptor port seeded to `geometry`.
+///
+/// **THE SEEDS ARE FOUND BY PORT AND NOT BY CHANNEL NUMBER.** A golden's
+/// channel order is an artefact of the trace that authored it; what this test
+/// is about is which PORT carries which fact, and `port_channel` reads that
+/// off the launch package's own bindings. A port the golden folded as a
+/// trace-time constant has no channel and needs no seed — its value reaches
+/// `program::ports::resolve` out of `ExecPlan::const_ports` — so a `None` here
+/// is a port that already says what it should.
+fn device_geometry_instance(
+    shell: &mut Shell,
+    geometry: &[(eta_ir::registry::Port, Vec<u8>)],
+) -> u64 {
+    bind_device_geometry(shell, device_geometry_registration(), geometry)
+}
+
+/// The same over a registration the caller states, so that a fixture variant
+/// (an unseeded page channel, say) reaches the shell down this same path.
+fn bind_device_geometry(
+    shell: &mut Shell,
+    registration: engine::program::ProgramRegistration,
+    geometry: &[(eta_ir::registry::Port, Vec<u8>)],
+) -> u64 {
+    let mut seeds = guest_seeds(&registration);
+    for (port, cell) in geometry {
+        let Some(channel) = port_channel(&registration, *port) else {
+            continue;
+        };
+        // A channel the fixture declared UNSEEDED takes no seed here either:
+        // stating one would be publishing the very cell the caller withheld.
+        if !seeds.iter().any(|(at, _)| *at == channel) {
+            continue;
+        }
+        let seat = seeds
+            .iter_mut()
+            .find(|(at, _)| *at == channel)
+            .map(|(_, cell)| cell)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the fixture's `{}` port reads channel {channel}, which declares no \
+                     seed",
+                    port.name()
+                )
+            });
+        assert_eq!(
+            seat.len(),
+            cell.len(),
+            "the `{}` port's channel {channel} holds {} wire byte(s) and this test \
+             stated {}",
+            port.name(),
+            seat.len(),
+            cell.len()
+        );
+        seat.copy_from_slice(cell);
+    }
+    let program = shell
+        .register_program(&registration)
+        .unwrap_or_else(|error| {
+            panic!("the device-geometry fixture does not compile on this device: {error}")
+        });
+    let instance = shell
+        .bind_program(
+            program,
+            &seeds,
+            eta_exec::Extents {
+                // Two rows, because the epilogue reads `[B, V]` of the logits
+                // rectangle: a seat carved for one would leave the second
+                // beam's row zero-filled.
+                sampled_rows: GUEST_LANES as u32,
+                ..eta_exec::Extents::default()
+            },
+            eta_ir::registry::GeometryClass::DeviceGeometry,
+        )
+        .unwrap_or_else(|error| panic!("the device-geometry fixture does not bind: {error}"));
+    // ANY CHANNEL A BIND CANNOT SEAT. A pooled pass declares none today — its
+    // whole geometry is loop-carried — but the Track B lease's `fresh` arm is
+    // a host-writer channel declared `NeedsFull`, and a fixture that grew one
+    // would wedge at the readiness gate rather than fire. Zeros, because
+    // nothing here consumes the value.
+    let package = registration.launch.clone();
+    for (at, declared) in package.channels.iter().enumerate() {
+        if declared.host_role != eta_ir::container::HostRole::Writer {
+            continue;
+        }
+        let lanes = declared
+            .shape
+            .iter()
+            .map(|&dim| dim as usize)
+            .product::<usize>()
+            .max(1);
+        let dtype = eta_exec::concrete_dtype(declared.dtype);
+        let cell = vec![0u8; eta_exec::wire_cell_bytes(dtype, lanes)];
+        shell
+            .program_instance(instance)
+            .expect("the bind landed")
+            .expect("the instance is bound")
+            .publish(at as u32, &cell)
+            .unwrap_or_else(|error| panic!("publishing the host-writer channel {at}: {error}"));
+    }
+    instance
+}
+
+/// `lanes` little-endian `u32` words, as a wire cell.
+fn u32_cell(lanes: &[u32]) -> Vec<u8> {
+    lanes.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+/// `lanes` little-endian `i32` words, as a wire cell.
+fn i32_cell(lanes: &[i32]) -> Vec<u8> {
+    lanes.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+/// A `Bool` wire cell: one BIT per lane, LSB-first inside each byte.
+///
+/// The packing this plane's rings hold, which is `eta_exec`'s `encode_wire`
+/// and is the thing `program::ports::read_bool_cell` has to undo. Spelled here
+/// too, on purpose: a test that shared the shell's own unpacking could not
+/// tell a wrong order from a consistent one.
+fn bool_cell(lanes: &[bool]) -> Vec<u8> {
+    let mut packed = vec![0u8; lanes.len().div_ceil(8)];
+    for (at, &kept) in lanes.iter().enumerate() {
+        if kept {
+            packed[at / 8] |= 1u8 << (at % 8);
+        }
+    }
+    packed
+}
+
+/// The geometry cells for a one-lane instance whose sequence holds `have`
+/// tokens, embeds `token` as its next row, and addresses its own page run.
+///
+/// **EVERY NUMBER HERE IS THE ONE THE SEAT WOULD HAVE DERIVED**, which is the
+/// whole design of the parity claim below: the host twin's page CSR, write
+/// descriptor and causal reach are computed by `store::kv::geometry_with` from
+/// `have + 1`, and these state the same thing through nine ports instead. A
+/// test whose device geometry described a DIFFERENT fire would prove that the
+/// ports were read and nothing about whether they were read correctly.
+fn guest_geometry(have: u32, token: u32) -> Vec<(eta_ir::registry::Port, Vec<u8>)> {
+    use eta_ir::registry::Port;
+    let kv = have + 1;
+    // The row keeps exactly the keys the append leaves readable, and drops the
+    // pool's surplus — the "a mask may be LONGER" shape `crate::mask` clips.
+    let mask: Vec<bool> = (0..GUEST_MASK_KEYS)
+        .map(|key| (key as u32) < kv)
+        .collect();
+    vec![
+        // One lane, one row: `[0, 1]`.
+        (Port::EmbedIndptr, u32_cell(&[0, 1])),
+        // The id this fire embeds — the one value no host could have known,
+        // and on this fixture an `I32` channel rather than a `U32` one.
+        (Port::EmbedTokens, i32_cell(&[token as i32])),
+        (Port::KvLen, u32_cell(&[kv])),
+        (Port::Positions, u32_cell(&[have])),
+        // The page run in WORKING-SET space: `0 .. GUEST_PAGE_RUN`, which is
+        // what `ws.reserve` hands a guest and what it holds forever. Only the
+        // live prefix is read (`ceil(kv / page_size)` of them); the rest is
+        // the headroom a guest keeps ahead of itself.
+        (
+            Port::Pages,
+            u32_cell(&(0..GUEST_PAGE_RUN).collect::<Vec<_>>()),
+        ),
+        (Port::PageIndptr, u32_cell(&[0, GUEST_PAGE_RUN])),
+        // The write descriptor: which page of the run this row lands in and
+        // where inside it. Derivable for one lane appending to its own tail —
+        // which is exactly why the parity claim below can be an EQUALITY —
+        // and not derivable at all for the `B` lanes of a beam sharing a pool,
+        // which is why the ports exist.
+        (Port::WSlot, u32_cell(&[have / GUEST_PAGE_SIZE])),
+        (Port::WOff, u32_cell(&[have % GUEST_PAGE_SIZE])),
+        (Port::AttnMask, bool_cell(&mask)),
+    ]
+}
+
+/// **A DEVICE-GEOMETRY LANE ANSWERS WHAT ITS HOST-GEOMETRY TWIN ANSWERS.**
+///
+/// Two slots hold the same prefix and two lanes take one step over it. Lane 0
+/// is bound in `GeometryClass::DeviceGeometry`: its row split, token, position,
+/// extent, page run, write descriptor and mask are all cells on that
+/// instance's rings, translated out of working-set space through
+/// `Seated::translation` and used INSTEAD of the seat's arithmetic. Lane 1 is
+/// the same step with the same token and the same mask stated on the
+/// submission and the page table left to the shell.
+///
+/// Every number the guest states is the number the seat would have derived, so
+/// the two rows must agree bit for bit. What that pins is the whole derivation
+/// swap at once: a shell that ignored `pages` would attend another slot's
+/// cache, one that ignored `w_slot`/`w_off` would append the row somewhere the
+/// attention does not look, one that ignored `kv_len` would carve the CSR at
+/// the wrong extent, and one that ignored `embed_indptr` would place zero rows
+/// for a lane whose submission states none.
+///
+/// **AND THE SUBMISSION SIDE OF LANE 0 IS EMPTY ON PURPOSE**, because that is
+/// what the runtime ships for this class: `Lane::tokens` is `vec![0; 0]` for
+/// every lane of a pooled pass (`pipeline::fire::fire_device_geometry` builds
+/// them off an all-zero `qo_indptr`), `KvDelta::pages` is empty because the
+/// pages are in a channel, and `KvDelta::held` is zero because the runtime
+/// could not know the extent either. A shell that read any of the three would
+/// fire a zero-row lane.
+#[test]
+fn a_device_geometry_lane_answers_what_its_host_geometry_twin_answers() {
+    let _guard = serialized();
+    let Some((mut shell, tokenizer)) = ready("the device-geometry smoke") else {
+        return;
+    };
+    // The prefix is cut to the guest's own mask width: a mask SHORTER than the
+    // extent it rides on is refused by name (`Fault::Mask`), so the fire this
+    // test wants is one whose post-append extent the rectangle covers.
+    let prompt: Vec<u32> = tokenizer.encode(PROMPT);
+    let have = prompt.len().min(GUEST_MASK_KEYS - 1) as u32;
+    let prefix = &prompt[..have as usize];
+    assert!(have >= 2, "the prefix is too short to be a sequence");
+
+    for slot in 0..2u32 {
+        shell.open(slot).expect("the slot opens");
+        let rows = shell
+            .fire_seated(&[Seated::of(Lane {
+                slot,
+                word: word(have),
+                tokens: prefix,
+            })])
+            .expect("the prefill fires");
+        finite(&rows[0], "the prefill");
+    }
+
+    let next = prompt.get(have as usize).copied().unwrap_or(prompt[0]);
+    let instance = device_geometry_instance(&mut shell, &guest_geometry(have, next));
+    // THE TABLE THAT CROSSES THE TWO PAGE SPACES. Entry `i` is the pool page
+    // backing the guest's relative index `i`, and the guest states relative
+    // page 0 — so this is the shell's own block base for slot 0, quoted. The
+    // runtime mints one per working set (`KvDelta::translation`); a test that
+    // handed the identity would be testing nothing, because the identity is
+    // exactly the bug the field exists to end.
+    let paging = shell.paging();
+    let translation: Vec<u32> = (0..GUEST_PAGE_RUN)
+        .map(|page| {
+            u32::try_from(paging.base(0) + u64::from(page)).expect("a pool page id")
+        })
+        .collect();
+    // The step the twin takes on the submission, stated as the restriction the
+    // guest's rectangle encodes: everything the append leaves readable.
+    let kv = u64::from(have) + 1;
+    let twin_mask = engine::fire::Masking::Extent(engine::fire::Mask::new(vec![0, kv as u32], kv));
+    let stated = [next];
+
+    let before = engine_metal::program::ports::resolved();
+    let rows = shell
+        .fire_attached(
+            &[
+                // The device lane. Its submission carries NO rows at all — the
+                // split is `embed_indptr`'s — and no page table, no held count
+                // and no positions, which is what the runtime ships for this
+                // class.
+                Seated {
+                    translation: &translation,
+                    mask: None,
+                    ..Seated::of(Lane {
+                        slot: 0,
+                        word: masked_word(1),
+                        tokens: &[],
+                    })
+                },
+                // The twin: the same step, the same mask, the shell's table.
+                Seated {
+                    mask: Some(&twin_mask),
+                    ..Seated::of(Lane {
+                        slot: 1,
+                        word: masked_word(1),
+                        tokens: &stated,
+                    })
+                },
+            ],
+            &[engine_metal::Attached {
+                lane: 0,
+                instance,
+                at: engine::fire::Boundary::Epilogue,
+            }],
+        )
+        .expect("the device-geometry fire fires");
+    let resolved = engine_metal::program::ports::resolved() - before;
+
+    finite(&rows[0], "the device-geometry lane");
+    finite(&rows[1], "the host-geometry twin");
+    eprintln!(
+        "prefix {have} token(s), extent {kv} — device argmax {}, twin {}; \
+         envelopes resolved this fire: {resolved}",
+        argmax(&rows[0]),
+        argmax(&rows[1]),
+    );
+    assert_eq!(
+        rows[0], rows[1],
+        "the device-geometry lane did not answer what its host-geometry twin \
+         answered over the same prefix, the same token and the same mask: the \
+         geometry this fire ran was not the one the guest published"
+    );
+    assert_eq!(
+        resolved, 1,
+        "one attached instance is one envelope resolved: the host twin beside it \
+         must cost no ring read at all"
+    );
+}
+
+/// **A GUEST PAGE ID ITS TRANSLATION TABLE DOES NOT COVER IS REFUSED BY
+/// NAME.**
+///
+/// The two page spaces are the whole hazard of this class. A guest holds
+/// working-set-RELATIVE indexes — `reserve` hands back `0 .. n`, and an O(1)
+/// fork is possible precisely because a relative index survives the copy that
+/// moves the physical page under it — while everything past `serve::prepare`
+/// is in the POOL's space. The runtime crosses between them for every other
+/// class before it submits; for this one it ships the table and the crossing
+/// happens in the engine. "Translate by identity" is the bug, and it is the
+/// quiet one: every lane in the process would address pages `0, 1, ...` and
+/// read back somebody else's cache, which is invisible under one guest and
+/// wrong the moment two share a device.
+///
+/// So a table the index runs past is a refusal on the fire, before anything
+/// launches, naming the index and the table's own size. An EMPTY table is the
+/// same refusal, which is the point: a lane that states page references and
+/// carries no table has not been given the crossing at all.
+#[test]
+fn a_device_page_id_past_its_translation_table_is_refused_by_name() {
+    let _guard = serialized();
+    let Some((mut shell, tokenizer)) = ready("the untranslatable-page refusal") else {
+        return;
+    };
+    let prompt: Vec<u32> = tokenizer.encode(PROMPT);
+    let have = prompt.len().min(GUEST_MASK_KEYS - 1) as u32;
+    shell.open(0).expect("the slot opens");
+    let instance = device_geometry_instance(&mut shell, &guest_geometry(have, prompt[0]));
+
+    let fault = shell
+        .fire_attached(
+            &[Seated {
+                translation: &[],
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: masked_word(1),
+                    tokens: &[],
+                })
+            }],
+            &[engine_metal::Attached {
+                lane: 0,
+                instance,
+                at: engine::fire::Boundary::Epilogue,
+            }],
+        )
+        .expect_err("a relative page index no table maps");
+    let said = fault.to_string();
+    eprintln!("refusal: {said}");
+    assert!(
+        said.contains("working-set page 0"),
+        "the refusal does not name the index that could not be translated: {said}"
+    );
+    assert!(
+        said.contains("0 page(s)"),
+        "the refusal does not name how much of a table this fire was handed: {said}"
+    );
+}
+
+/// **AN EXTENT SHORTER THAN THE APPEND IT DESCRIBES IS REFUSED BY BOTH
+/// NUMBERS.**
+///
+/// `kv_len` is a CHECK against the seat for a decode-envelope lane and a
+/// SOURCE for this one: there is no seat here, so `have` is derived back from
+/// the guest's extent as `kv_len - rows`, and every number the fire needs —
+/// the page count, the last page's fill, the causal reach the mask is
+/// intersected with — follows from it. An extent shorter than the rows this
+/// fire adds has no such reading: the extent is AFTER the append, so a
+/// subtraction would wrap and the lane would attend a length no cache holds.
+#[test]
+fn a_device_extent_shorter_than_its_own_append_is_refused_by_both_numbers() {
+    let _guard = serialized();
+    let Some((mut shell, _tokenizer)) = ready("the short-extent refusal") else {
+        return;
+    };
+    shell.open(0).expect("the slot opens");
+    // Every other port as it should be, and `kv_len` at zero: one row is
+    // appended and the guest says nothing is readable afterwards.
+    let mut geometry = guest_geometry(4, 1);
+    for (port, cell) in &mut geometry {
+        if *port == eta_ir::registry::Port::KvLen {
+            *cell = u32_cell(&[0u32; GUEST_LANES]);
+        }
+    }
+    let instance = device_geometry_instance(&mut shell, &geometry);
+    let paging = shell.paging();
+    let translation: Vec<u32> = (0..GUEST_PAGE_RUN)
+        .map(|page| {
+            u32::try_from(paging.base(0) + u64::from(page)).expect("a pool page id")
+        })
+        .collect();
+
+    let fault = shell
+        .fire_attached(
+            &[Seated {
+                translation: &translation,
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: masked_word(1),
+                    tokens: &[],
+                })
+            }],
+            &[engine_metal::Attached {
+                lane: 0,
+                instance,
+                at: engine::fire::Boundary::Epilogue,
+            }],
+        )
+        .expect_err("an extent of zero over a fire that appends a row");
+    let said = fault.to_string();
+    eprintln!("refusal: {said}");
+    assert!(
+        said.contains("extent of 0"),
+        "the refusal does not name what the port stated: {said}"
+    );
+    assert!(
+        said.contains("1 row(s)"),
+        "the refusal does not name what this fire adds: {said}"
+    );
+}
+
+/// **AN UNPUBLISHED GEOMETRY IS A REFUSAL AND NOT A ZERO.**
+///
+/// A port's value for a fire is the committed front of its ring — the cell the
+/// guest's own pass takes — so an instance whose page channel nothing has
+/// published into has no such cell, and the cell at `head` then holds whatever
+/// the allocation came with. A shell that read it would attend page zero, or
+/// garbage, and never say so.
+///
+/// Two gates stand in front of it and either is a correct answer:
+/// `Shell::admit_attachments` asks `Session::blocked_channel`, which reads the
+/// `NeedsFull` requirement the program declares, and
+/// `program::ports::cell_of`'s own `head == tail` catches a program that
+/// declares no readiness on a channel it binds a port to. What must not happen
+/// is a fire, and the subject is the one fact this class adds to the envelope:
+/// the page run.
+#[test]
+fn a_device_geometry_the_guest_has_not_published_is_refused_by_name() {
+    let _guard = serialized();
+    let Some((mut shell, tokenizer)) = ready("the unpublished-geometry refusal") else {
+        return;
+    };
+    let prompt: Vec<u32> = tokenizer.encode(PROMPT);
+    let have = prompt.len().min(GUEST_MASK_KEYS - 1) as u32;
+    shell.open(0).expect("the slot opens");
+    // Every port stated, and the PAGE run's channel declared with no seed at
+    // all — so nothing has ever committed into it and nothing in the pass
+    // publishes one either.
+    let registration = device_geometry_registration_with(false);
+    let pages = port_channel(&registration, eta_ir::registry::Port::Pages)
+        .expect("the fixture binds `pages` to a channel");
+    let instance = bind_device_geometry(
+        &mut shell,
+        registration,
+        &guest_geometry(have, prompt[0]),
+    );
+    let paging = shell.paging();
+    let translation: Vec<u32> = (0..GUEST_PAGE_RUN)
+        .map(|page| u32::try_from(paging.base(0) + u64::from(page)).expect("a pool page id"))
+        .collect();
+
+    let fault = shell
+        .fire_attached(
+            &[Seated {
+                translation: &translation,
+                ..Seated::of(Lane {
+                    slot: 0,
+                    word: masked_word(1),
+                    tokens: &[],
+                })
+            }],
+            &[engine_metal::Attached {
+                lane: 0,
+                instance,
+                at: engine::fire::Boundary::Epilogue,
+            }],
+        )
+        .expect_err("a page run over a ring nothing has published into");
+    let said = fault.to_string();
+    eprintln!("refusal: {said}");
+    assert!(
+        said.contains(&format!("channel {pages}")),
+        "the refusal does not name the channel the page run reads: {said}"
     );
 }

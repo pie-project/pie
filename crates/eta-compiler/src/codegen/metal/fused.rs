@@ -546,10 +546,20 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
         "    const uint am_row_base = row_meta.offset + {};",
         if mtp { "row_meta.mtp_offset" } else { "0u" }
     );
+    // **THE ROW WIDTH IS THE READER'S AND THE PITCH IS THE RECTANGLE'S**,
+    // the same parting as in the gather below. This asked for equality —
+    // `am_in.last != am_vocab` — which was exactly right while `vocab` held
+    // the reader's own declared width, and becomes a refusal of every narrow
+    // read now that it holds the rectangle's. The relation that survives is
+    // the CUDA handler's: a declared row is a CEILING on the row it is
+    // pointed at, so more than the rectangle holds is the fault and less is
+    // an argmax over the first `am_width` columns.
     source.push_str("    const uint am_vocab = layout->vocab;\n");
+    source.push_str("    const uint am_width = am_in.last == 0u ? am_vocab : am_in.last;\n");
     let _ = writeln!(
         source,
-        "    if (am_vocab == 0u || am_in.last != am_vocab || am_in.rows > row_meta.count) \
+        "    if (am_vocab == 0u || am_width == 0u || am_width > am_vocab || \
+         am_in.rows > row_meta.count) \
          {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     let _ = writeln!(
@@ -564,12 +574,27 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     // splitting the fold changes nothing, and it breaks the dependency chain
     // that otherwise serialises one device load per iteration in each thread.
     source.push_str("      M1ArgmaxCandidate am_b1 = am_best, am_b2 = am_best, am_b3 = am_best;\n");
-    let _ = writeln!(
-        source,
-        "      constexpr uint am_w = {METAL_M3_REGION_THREADS}u;"
-    );
+    // **THE STRIDE IS THE LAUNCH'S WIDTH AND IT USED TO BE THE BUFFER'S.**
+    // This was `constexpr uint am_w = METAL_M3_REGION_THREADS`, on the
+    // reading that the engine always launches that many threads. It cannot:
+    // a threadgroup's width is capped by the PIPELINE's
+    // `maxTotalThreadsPerThreadgroup`, which falls with register pressure —
+    // `beam_epilogue`'s 67-op region measures 384 on an M1 Max — so a launch
+    // narrower than the constant is the normal case for a large region, and
+    // with a constant stride every column class the missing threads owned was
+    // never visited. The argmax answered confidently and wrongly.
+    //
+    // `m3_threads` is the number of threads that actually exist, so thread
+    // `t` covers `t, t + w, t + 2w, …` and the classes partition the row
+    // exactly. Nothing else moves: the four accumulators and the tree
+    // reduction below already fold over `m3_threads`, and `m1_argmax_combine`
+    // is a strict total order, so the answer does not depend on how the
+    // columns were split. The threadgroup BUFFER stays sized for
+    // `METAL_M3_REGION_THREADS` and the `0xB3` guard still refuses a launch
+    // wider than it — this loosens the narrow direction only.
+    source.push_str("      const uint am_w = m3_threads;\n");
     source.push_str("      uint am_c = m3_tid;\n");
-    source.push_str("      for (; am_c + 3u * am_w < am_vocab; am_c += 4u * am_w) {\n");
+    source.push_str("      for (; am_c + 3u * am_w < am_width; am_c += 4u * am_w) {\n");
     source.push_str("        const float v0 = float(am_src[am_c]);\n");
     source.push_str("        const float v1 = float(am_src[am_c + am_w]);\n");
     source.push_str("        const float v2 = float(am_src[am_c + 2u * am_w]);\n");
@@ -579,7 +604,7 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     source.push_str("        am_b2 = m1_argmax_combine(am_b2, M1ArgmaxCandidate{v2, am_c + 2u * am_w, isnan(v2) ? 0u : 1u, 0u});\n");
     source.push_str("        am_b3 = m1_argmax_combine(am_b3, M1ArgmaxCandidate{v3, am_c + 3u * am_w, isnan(v3) ? 0u : 1u, 0u});\n");
     source.push_str("      }\n");
-    source.push_str("      for (; am_c < am_vocab; am_c += am_w) {\n");
+    source.push_str("      for (; am_c < am_width; am_c += am_w) {\n");
     source.push_str("        const float am_v = float(am_src[am_c]);\n");
     source.push_str("        am_best = m1_argmax_combine(am_best, M1ArgmaxCandidate{am_v, am_c, isnan(am_v) ? 0u : 1u, 0u});\n");
     source.push_str("      }\n");
@@ -615,11 +640,37 @@ fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
         "    const uint intrinsic_row_base = {};",
         if mtp { "row_meta.mtp_offset" } else { "0u" }
     );
+    // ── **THE STRIDE AND THE WIDTH ARE TWO NUMBERS, AND THIS USED TO SPEND
+    //    ONE ON BOTH JOBS.** `layout->vocab` is the row pitch of the
+    //    rectangle `lane.logits_base` points at; `intrinsic_desc.last` is
+    //    how many of each row THIS reader asked for. While the host wrote
+    //    the reader's own width into `vocab` the two were the same number
+    //    and the conflation was invisible — but it is what made a narrow
+    //    multi-row read inexpressible on this form too, because row `r`
+    //    started `last` elements in rather than a whole rectangle row.
+    //
+    //    So the relation checked here is the CUDA handler's and not a
+    //    stricter one: `ptir_m1_runtime_body.cuh`'s `0xA0` arm faults on
+    //    `stride < logical_width` and on nothing else about the two. A
+    //    reader declaring `[2, 8]` against a 248320-wide rectangle is
+    //    SERVED, with the first eight columns of each of two rows.
+    //
+    //    `last == 0` is a rank-zero descriptor, which has no row to be a
+    //    ceiling on; the CUDA twin falls back to `p.imm` there and this
+    //    form's equivalent fallback is the rectangle's own pitch.
+    let _ = writeln!(source, "    const uint gather_stride = layout->vocab;");
     let _ = writeln!(
         source,
-        "    if (layout->vocab == 0u || intrinsic_desc.len % layout->vocab != 0u || \
+        "    const uint gather_width = \
+         intrinsic_desc.last == 0u ? gather_stride : intrinsic_desc.last;"
+    );
+    let _ = writeln!(
+        source,
+        "    if (gather_stride == 0u || gather_width == 0u || \
+         gather_stride < gather_width || \
+         intrinsic_desc.len % gather_width != 0u || \
          intrinsic_row_base > row_meta.count || \
-         intrinsic_desc.len / layout->vocab > row_meta.count - intrinsic_row_base) \
+         intrinsic_desc.len / gather_width > row_meta.count - intrinsic_row_base) \
          {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     let _ = writeln!(
@@ -631,18 +682,21 @@ fn emit_logits_gather(source: &mut String, base: u32, mtp: bool, o0: &str) {
     // it, so a flat loop reloaded `layout->vocab` three times per element and
     // paid a runtime div and mod on top -- a vocabulary-sized row cost ~85ms of
     // an ~89ms decode step. Hoisting the extent turns it into a coalesced copy.
-    source.push_str("    const uint gather_vocab = layout->vocab;\n");
-    source.push_str("    const uint gather_rows = intrinsic_desc.len / gather_vocab;\n");
+    source.push_str("    const uint gather_rows = intrinsic_desc.len / gather_width;\n");
     source.push_str("    const uint gather_row_base = row_meta.offset + intrinsic_row_base;\n");
     source.push_str("    for (uint gr = 0u; gr < gather_rows; ++gr) {\n");
     source.push_str("      const uint source_row = row_indices[gather_row_base + gr];\n");
+    // The source steps a whole rectangle row and the destination steps only
+    // what the reader asked for. Where the two agree this is the coalesced
+    // copy it has always been; where they do not, this is the whole of the
+    // freedom `intrinsic_row_stride` buys the CUDA handler.
     source.push_str(
         "      const device bfloat* gather_src = logits + \
-         ulong(source_row) * gather_vocab;\n",
+         ulong(source_row) * gather_stride;\n",
     );
-    source.push_str("      device float* gather_dst = intrinsic_out + ulong(gr) * gather_vocab;\n");
+    source.push_str("      device float* gather_dst = intrinsic_out + ulong(gr) * gather_width;\n");
     source.push_str(
-        "      for (uint column = gather_begin; column < gather_vocab; \
+        "      for (uint column = gather_begin; column < gather_width; \
          column += gather_step) {\n",
     );
     source.push_str("        gather_dst[column] = float(gather_src[column]);\n");

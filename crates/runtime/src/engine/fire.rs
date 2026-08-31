@@ -111,8 +111,8 @@ pub struct FireRequest {
     ///
     /// Which BOUNDARY it runs at is not a field: a program's stages are one
     /// pass with one commit, and a pass that reads the fire's logits can only
-    /// be the epilogue ([`Attachment`]'s own doc). `batch` stamps
-    /// [`Boundary::Epilogue`].
+    /// be the epilogue ([`Attachment`](engine::fire::Attachment)'s own doc).
+    /// `batch` stamps [`Boundary::Epilogue`](engine::fire::Boundary::Epilogue).
     pub boundary_program: bool,
     /// **THE MEDIA SPANS THIS REQUEST'S PASS ATTACHED** (media-door §6, wave
     /// MD-C), keyed by lane and empty for every text-only request — which is
@@ -121,7 +121,7 @@ pub struct FireRequest {
     /// `lane` is an index into THIS REQUEST's [`lanes`](FireRequest::lanes),
     /// because a submission cannot know which step it co-batches into;
     /// `scheduler::batch` rebases it by the member's own lane offset when it
-    /// concatenates, exactly as it stamps an [`Attachment`]'s lane.
+    /// concatenates, exactly as it stamps an [`Attachment`](engine::fire::Attachment)'s lane.
     ///
     /// **IT IS THE CONTRACT'S OWN RECORD AND NOT A RUNTIME COPY OF IT.**
     /// `pipeline::media::lane_media` derives the rows from the run scan and
@@ -341,6 +341,6 @@ pub fn lane_of(slot: u32, tokens: Vec<u32>, held: u32, pages: Vec<u32>) -> Lane 
     }
 }
 
-/// Re-exported so a reader of this module does not have to reach two crates
-/// deep for the nouns its own signatures are written in.
-pub use engine::fire::{Attachment, Boundary, FireTicket, LaneReadout};
+// `pub use engine::fire::{Attachment, Boundary, FireTicket, LaneReadout}`
+// STOOD HERE — the same aliasing the parent module dropped: a contract noun
+// is spelled at its owner (`::engine::fire::…`) now, one name per type.

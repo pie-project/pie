@@ -7,6 +7,10 @@
 //! patchifier emits POOL-BLOCK-MAJOR rows so `layout.pool_rows` reads no
 //! geometry, and the placeholder run is one token per block.
 //!
+//! Like [`qwen_3::media`](crate::qwen_3::media), this lives in the family's
+//! own house, does only arithmetic, and takes the resample lent
+//! (`model::media`'s rule: the codec is the host's).
+//!
 //! **THE CHECKPOINT'S OWN NUMBERS**, read off `Gemma4VisionConfig` and
 //! `Gemma4ImageProcessor` (transformers v5.15.1) and the E4B snapshot:
 //!
@@ -36,8 +40,8 @@
 //! block it tolerates is the RUNG TAIL, which is padding by construction". So
 //! this front-end ships `gh · gw` real rows and no zeros.
 
-use crate::decode;
-use crate::{Budget, Delimiters, EncodedSpan, Fault, Grid, Result, VisionFrontEnd};
+use crate::media::{Budget, Delimiters, EncodedSpan, Fault, Grid, Resample, Result, Rgb8,
+    VisionFrontEnd};
 
 /// The `ROWS.arch` this front-end answers for.
 pub const ARCH: &str = "gemma4";
@@ -202,7 +206,7 @@ impl GemmaVisionConfig {
     /// Answers the payload and each row's `(y, x)` in the patch grid.
     ///
     /// `rgb` is `h · w · 3` bytes, row-major HWC — a plain slice rather than
-    /// this crate's decoded type so a golden can feed pixels it wrote by hand.
+    /// [`Rgb8`] so a golden can feed pixels it wrote by hand.
     ///
     /// # Panics
     ///
@@ -329,38 +333,20 @@ impl VisionFrontEnd for Gemma4Vision {
     /// span by), `<image|>` closes. `<start_of_image>` is gemma-3's spelling
     /// and is not in this checkpoint's vocabulary.
     ///
-    /// The multimodal helper this crate promotes answered `("", "")` for
+    /// The multimodal helper this module promotes answered `("", "")` for
     /// gemma's delimiters — a gap left when only qwen had a served tower, and
     /// closed here.
     fn delimiters(&self) -> Delimiters {
         Delimiters {
-            prefix: "<|image>",
-            placeholder: "<|image|>",
-            suffix: "<image|>",
+            prefix: super::tokenizer::IMAGE_PREFIX,
+            placeholder: super::tokenizer::IMAGE_PAD,
+            suffix: super::tokenizer::IMAGE_SUFFIX,
         }
     }
 
-    fn encode_image(&self, bytes: &[u8], budget: Budget) -> Result<EncodedSpan> {
-        self.encode(&decode::decode(bytes)?, budget)
-    }
-
-    /// **A FRAME THAT IS ALREADY DECODED, THROUGH THE SAME ARITHMETIC** — see
-    /// [`Qwen35Vision::encode_rgb8`](crate::qwen3_5::Qwen35Vision). Gemma DOES
-    /// read the budget here: a video frame gets the smaller soft-token cap.
-    fn encode_rgb8(
-        &self,
-        rgb8: &[u8],
-        width: u32,
-        height: u32,
-        budget: Budget,
-    ) -> Result<EncodedSpan> {
-        self.encode(&decode::from_rgb8(rgb8, width, height)?, budget)
-    }
-}
-
-impl Gemma4Vision {
-    /// The whole encode past the decode — see [`VisionFrontEnd::encode_rgb8`].
-    pub(crate) fn encode(&self, src: &decode::Rgb8, budget: Budget) -> Result<EncodedSpan> {
+    /// Gemma DOES read the budget: a video frame gets the smaller soft-token
+    /// cap, which is the whole reason [`Budget`] is an argument.
+    fn encode(&self, src: &Rgb8, budget: Budget, resample: Resample) -> Result<EncodedSpan> {
         let c = self.config;
         let (target_h, target_w) = c.aspect_ratio_preserving_size(src.h, src.w, budget)?;
         let (gh, gw) = (target_h / c.patch_size, target_w / c.patch_size);
@@ -376,7 +362,7 @@ impl Gemma4Vision {
             )));
         }
 
-        let resized = decode::resize_exact(src, target_h, target_w);
+        let resized = resample(src, target_h, target_w);
         let (payload, positions) = c.patchify(&resized.data, resized.h, resized.w);
         let (embed_rows, embed_weights) = c.pos_embed_taps(&positions);
 

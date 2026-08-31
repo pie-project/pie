@@ -20,7 +20,7 @@
 //! fluent text about an image the model half-saw. There is no test downstream
 //! of here that catches that, so the check is here and it is total.
 
-use media_frontend::EncodedSpan;
+use ::model::media::EncodedSpan;
 use std::sync::Arc;
 
 /// **A NAMED REFUSAL, WITH THE DOOR'S OWN SENTENCE.**
@@ -385,7 +385,7 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32]) -> Vec<LaneMedia> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use media_frontend::Grid;
+    use ::model::media::Grid;
 
     const PAD: u32 = 151_655;
 

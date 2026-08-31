@@ -76,13 +76,55 @@ use objc2::runtime::ProtocolObject;
 #[cfg(target_vendor = "apple")]
 use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary};
 
-/// The only kernel kind this shell runs. The Metal emitter also produces
-/// singleton, grouped, readiness and commit kernels into the same table;
-/// this plane binds none of them (readiness and commit are host-side by
-/// ruling — build log 15 and 18 — and the grouped forms need device
-/// addresses this shell does not hand out), so the lookup names one kind and
-/// the extras are ignored rather than half-bound.
+/// The single-lane kernel kind, whose channels are argument slots.
 const KERNEL_FUSED: KernelKind = KernelKind::Fused;
+
+/// The grouped kernel kind, whose channels are rows of a lane table.
+///
+/// **THIS SHELL RUNS TWO KINDS NOW, AND THE SECOND ONE IS NOT AN
+/// OPTIMISATION.** The ruling this constant replaces said the plane binds
+/// only [`KERNEL_FUSED`], because "the grouped forms need device addresses
+/// this shell does not hand out". It hands them out now
+/// (`device::alloc::Buffer::address_at`), and what that buys is two things
+/// the single-lane form cannot do at all rather than two it does slowly:
+///
+/// * a region with more than twelve channels. The M2 kernel binds each
+///   channel's committed and pending cells at `7 + 2k` and `8 + 2k`, and
+///   Metal's last argument index is 30 — so the emitter REFUSES a wider
+///   region, and this shell used to turn that refusal into a compile
+///   failure for the whole program. `beam_epilogue` (sixteen channels) and
+///   `pentathlon_iter` (thirteen) are the corpus's own examples.
+/// * a region that walks the vocabulary. The M2 kernel is one thread
+///   (`if (gid != 0) return;`), so a 248k-wide gather is 248k serial
+///   iterations; the grouped kernel gets a threadgroup, splits the gather
+///   across it, and elides it entirely where its only consumer is an
+///   argmax.
+///
+/// Readiness and commit stay host-side, unchanged: that ruling was about
+/// where a ring is gated, not about which kernel computes.
+const KERNEL_GROUPED: KernelKind = KernelKind::Grouped;
+
+/// Which emitted form a compiled region is, and therefore what
+/// [`Prepared::encode_into`](super::launch::Prepared::encode_into) binds and
+/// how wide it dispatches.
+///
+/// The three are three kernel SIGNATURES, not three speeds. A region's form
+/// is decided once at compile — where the emitter's refusals can be read —
+/// and never re-decided at fire time, because the pipeline was built for one
+/// of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Form {
+    /// The M2 single-lane kernel: status at buffer 0, each channel's two
+    /// cells bound at `7 + 2k` / `8 + 2k`, one thread.
+    Fused,
+    /// The M3 grouped kernel over the lane table, a threadgroup per lane at
+    /// `METAL_M3_REGION_THREADS`.
+    Grouped,
+    /// The M3 grouped LIBRARY sampler — nucleus or top-k — which takes the
+    /// same eleven bindings but decomposes its grid one threadgroup per
+    /// (lane, row) and demands exactly 256 threads.
+    GroupedLibrary,
+}
 
 /// The include line every emitted kernel carries, and the source that
 /// answers it.
@@ -174,6 +216,17 @@ impl Module {
     #[cfg(target_vendor = "apple")]
     pub(crate) fn pipeline(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
         &self.pipeline
+    }
+
+    /// The widest threadgroup this pipeline will accept.
+    ///
+    /// Read once, at compile: the grouped forms need an EXACT width and this
+    /// is what says whether the device can give it. A pipeline's limit falls
+    /// with its register pressure, so it is a property of the compiled
+    /// kernel rather than of the device.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn max_threads(&self) -> usize {
+        self.pipeline.maxTotalThreadsPerThreadgroup()
     }
 
     /// Compile one owned MSL source and build the pipeline for `entry`.
@@ -321,8 +374,14 @@ fn expand(source: &str) -> std::result::Result<String, Failure> {
 /// One compiled region: the module that holds it, and which region it is.
 #[derive(Debug)]
 pub struct Region {
-    /// Which region of its stage this is.
+    /// Which region of its stage this is — an index into the plan's FUSED
+    /// partition, whichever form the kernel took. The grouped emitter names
+    /// its fused-region kernels at `singleton.len() + region_index`, and
+    /// that offset is a fact about the emitted TABLE rather than about the
+    /// region, so it lives at the lookup and nowhere else.
     pub region_index: u32,
+    /// Which emitted form this region's pipeline was built from.
+    pub form: Form,
     /// The compiled library and its pipeline.
     pub module: Arc<Module>,
 }
@@ -576,12 +635,23 @@ impl Cache {
             }) {
                 continue;
             }
+            // ── **THE GROUPED FORM IS TRIED FIRST WHERE IT BUYS SOMETHING**,
+            //    and "something" is one of two things the single-lane form
+            //    cannot do rather than a speed it does badly. See
+            //    [`KERNEL_GROUPED`]. Everything else stays on the M2 kernel
+            //    byte for byte: an existing green region is not moved onto a
+            //    second ABI to buy nothing.
+            if let Some(region) = self.grouped_region(context, stage_index, region_index, plan, index)?
+            {
+                regions.push(region);
+                continue;
+            }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
                 Slot::Kernel { source, entry } => (source, entry),
                 // NOT a `continue`. "The host declined on purpose" presumes a
                 // shell with its own path for the region, and this one has
-                // none — every region it runs is a compiled
-                // `KernelKind::Fused`. Skipping a refusal drops the region's
+                // none — every region it runs is a compiled kernel, in one of
+                // the two forms above. Skipping a refusal drops the region's
                 // ops from the fire while the plan still budgets their
                 // scratch, so they read back as the zeros the fire memset and
                 // publish a confident wrong answer. A reason nobody can act
@@ -590,8 +660,9 @@ impl Cache {
                     return Err(Failure::Deterministic {
                         reason: format!(
                             "stage {stage_index} region {region_index} was declined by the \
-                             emitter ({why}); this shell runs only compiled regions, so a \
-                             declined one would silently not run at all"
+                             emitter ({why}), and the grouped form could not serve it \
+                             either; this shell runs only compiled regions, so a declined \
+                             one would silently not run at all"
                         ),
                     });
                 }
@@ -617,6 +688,7 @@ impl Cache {
             let module = self.region_module(context, entry, source)?;
             regions.push(Region {
                 region_index,
+                form: Form::Fused,
                 module,
             });
         }
@@ -624,6 +696,114 @@ impl Cache {
             signature_hash: plan.signature_hash,
             regions: Arc::new(regions),
         })
+    }
+
+    /// The grouped kernel for one fused region, when that is the form to run
+    /// it in; `None` to fall through to the single-lane one.
+    ///
+    /// **THE CHOICE IS MADE ON WHAT THE OTHER FORM CANNOT DO, NOT ON WHICH
+    /// IS FASTER.** Three things move a region here and nothing else does:
+    ///
+    /// * the M2 emitter REFUSED it. Above twelve channels there is no
+    ///   single-lane kernel at all, and until the grouped form was bound that
+    ///   refusal failed the whole program's compile.
+    /// * it is a library sampler. The nucleus and top-k library ops have a
+    ///   grouped kernel of their own — a radix ordering across 256 threads —
+    ///   and the single-lane path lowers the same region to the generic op
+    ///   switch on one thread.
+    /// * it walks the vocabulary through a `logits` gather. That gather is
+    ///   the entire cost of a decode step's guest half (the emitter measured
+    ///   85ms of an 89ms step), it splits across the threadgroup, and where
+    ///   its only consumer is an argmax the grouped emitter removes it
+    ///   outright.
+    ///
+    /// A region that is none of the three keeps the M2 kernel it has always
+    /// had. That is deliberate: the two forms agree byte for byte — the
+    /// grouped runtime partitions only argmax and copies, everything else
+    /// runs on thread 0 through the same `ptir_m1_execute` — so moving a
+    /// green region would be a second ABI bought for nothing.
+    ///
+    /// **A LIBRARY SAMPLER NEEDS AN EXACT WIDTH AND THIS IS WHERE THE DEVICE
+    /// IS ASKED FOR IT.** The nucleus and top-k kernels open with
+    /// `if (threads != 256u …) return;` — they size threadgroup arrays as
+    /// `256 * 16` and decline any other width rather than adapting, so a
+    /// pipeline whose register pressure caps it lower has no way to run one
+    /// and the region goes back to the M2 form. A grouped FUSED region has no
+    /// such requirement: it strides by `m3_threads` and is correct at any
+    /// width up to the reduction buffer's, which is why this check is the
+    /// library one alone. It used to be both, and that cost `beam_epilogue`
+    /// its widest region — a 67-op kernel measures 384 on an M1 Max.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the compile said. A REFUSAL is not an error: it answers
+    /// `None` and the caller takes the single-lane path, which is what a
+    /// region reading the F32 score rectangle does (`m3_intrinsic_bindable`
+    /// declines it, and the M2 slot table has an index for it).
+    fn grouped_region(
+        &mut self,
+        context: &Context,
+        stage_index: u32,
+        region_index: u32,
+        plan: &LaunchStagePlan,
+        index: &Emitted<'_>,
+    ) -> std::result::Result<Option<Region>, Failure> {
+        if !plan.needs.grouped_valid {
+            return Ok(None);
+        }
+        let region = plan.fused.get(region_index as usize);
+        let library = matches!(
+            region.map(|region| region.kind),
+            Some(RegionKind::Library(LibraryOp::NucleusSample | LibraryOp::TopK))
+        );
+        let refused = matches!(
+            index.get(KERNEL_FUSED, stage_index, region_index),
+            Slot::Refused(_)
+        );
+        let gathers = region.is_some_and(|region| {
+            region.nodes.iter().any(|&node| {
+                plan.ops
+                    .get(node as usize)
+                    .is_some_and(|op| op.intrinsic.is_some())
+            })
+        });
+        if !(library || refused || gathers) {
+            return Ok(None);
+        }
+        // The grouped table names a fused region at `singleton.len() + i`,
+        // because the singleton partition's regions take the low indices of
+        // the same `KernelKind::Grouped` slot space. Read off
+        // `eta_compiler::codegen::program::emit_metal_stage` rather than
+        // guessed; `program_parity`'s
+        // `the_grouped_table_names_a_fused_region_where_this_shell_looks`
+        // holds the two against each other over the whole corpus.
+        let slot = match u32::try_from(plan.singleton.len())
+            .ok()
+            .and_then(|offset| offset.checked_add(region_index))
+        {
+            Some(slot) => slot,
+            None => return Ok(None),
+        };
+        let Slot::Kernel { source, entry } = index.get(KERNEL_GROUPED, stage_index, slot) else {
+            return Ok(None);
+        };
+        let module = self.region_module(context, entry, source)?;
+        #[cfg(target_vendor = "apple")]
+        if library && module.max_threads() < super::launch::LIBRARY_SAMPLER_THREADS {
+            // Compiled and dropped. A rare enough answer that carrying a
+            // second cache tier for it would be a table nobody reads, and the
+            // caller's fallback compiles the M2 kernel this pipeline can run.
+            return Ok(None);
+        }
+        Ok(Some(Region {
+            region_index,
+            form: if library {
+                Form::GroupedLibrary
+            } else {
+                Form::Grouped
+            },
+            module,
+        }))
     }
 
     /// One region: expand its include, compile it, build its pipeline.

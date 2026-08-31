@@ -28,26 +28,29 @@ impl Run<'_> {
             // weight table and never a second IR variant. `Run::banked`
             // answers `None` for a dense row, which is why this reads as a
             // choice rather than as a rescue.
-            // The quantized arm's own selection — the GEMV/GEMM crossover,
-            // the row rung and the column tile — is `linear::quant`'s and
-            // reads `kernels_metal::tuning`. Nothing is chosen here.
+            // The quantized arm's own selection — the GEMV/GEMM crossover on
+            // the fire's rows, the row rung and the column tile — is
+            // `linear::quant`'s and reads `kernels_metal::tuning`. The dense
+            // arm's three-rung ladder is `linear::gemm`'s. Nothing is chosen
+            // here.
             //
             // **THE PLANE IS SEATED NOW, AND STILL NOTHING IS CHOSEN HERE.**
-            // `crate::scratch` reserves the FP16 staging rectangle and the
-            // split-K partials at the budget's ceiling; what these two arms
-            // hand over is the two MINTS ([`Run::precast`](crate::run::Run),
-            // [`Run::partials`](crate::run::Run)) and one number
+            // `crate::scratch` reserves the FP16 staging rectangle at the
+            // budget's ceiling; what these two arms hand over is one MINT
+            // ([`Run::precast`](crate::run::Run)) and one number
             // ([`Run::capacity`](crate::run::Run)) — never a rectangle,
-            // because how many rows the staging covers and how deep the
-            // partials go are `quant`'s own selection, several guards inside
-            // that entry. **THE CLOSURES ARE WHAT CARRIES THE QUESTION RATHER
-            // THAN AN ANSWER**, and a `None` out of one is this shell saying
-            // the reservation does not hold that shape — which the ladder
-            // answers by taking the rung that needs no plane.
+            // because how many rows the staging covers is `quant`'s own
+            // selection, several guards inside that entry. **THE CLOSURE IS
+            // WHAT CARRIES THE QUESTION RATHER THAN AN ANSWER**, and a `None`
+            // out of it is this shell saying the reservation does not hold
+            // that shape — which the ladder answers by taking the rung that
+            // needs no plane.
             //
             // The capacity is the MINIMUM of the two slots a padded launch
             // touches: it reads `act` and writes `y` at the padded row count,
             // so a rung either rectangle cannot hold is a rung neither takes.
+            // It bounds `mb_block`'s pad and nothing else — the crossover
+            // itself is asked of the fire's own rows.
             Linear::Matmul { act, w, y } => match self.banked(*w) {
                 Some(bank) => linear::quant::matmul(
                     self.ctx(),
@@ -56,7 +59,6 @@ impl Run<'_> {
                     self.tensor(*y),
                     linear::quant::Scratch {
                         precast: &|rows, contraction| self.precast(rows, contraction),
-                        partials: &|split, rows, width| self.partials(split, rows, width),
                     },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),
@@ -75,7 +77,6 @@ impl Run<'_> {
                     self.tensor(*y),
                     linear::quant::Scratch {
                         precast: &|rows, contraction| self.precast(rows, contraction),
-                        partials: &|split, rows, width| self.partials(split, rows, width),
                     },
                     self.capacity(*act).min(self.capacity(*y)),
                 ),
@@ -173,6 +174,22 @@ impl Run<'_> {
             } => linear::moe::topk_softmax(
                 self.ctx(),
                 self.tensor(*logits),
+                *experts,
+                *top_k,
+                self.tensor(*routes),
+                self.tensor(*weights),
+            ),
+            Linear::MoeTopkSoftmaxScaled {
+                logits,
+                scale,
+                experts,
+                top_k,
+                routes,
+                weights,
+            } => linear::moe::topk_softmax_scaled(
+                self.ctx(),
+                self.tensor(*logits),
+                self.tensor(*scale),
                 *experts,
                 *top_k,
                 self.tensor(*routes),

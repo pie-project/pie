@@ -15,6 +15,11 @@ use crate::{
 const END_OF_SENTENCE: &str = "<｜end▁of▁sentence｜>";
 const END_OF_TURN: &str = "<|EOT|>";
 
+/// The two markers a turn stops on, as one citable list — what a serving
+/// row's tokenizer contract reads, and what `new` resolves its `stop_ids`
+/// from, so the demand and the use cannot drift apart.
+pub const STOP_TOKENS: &[&str] = &[END_OF_SENTENCE, END_OF_TURN];
+
 const TOOL_CALL_BEGIN: &str = "<｜tool▁call▁begin｜>";
 const TOOL_CALL_END: &str = "<｜tool▁call▁end｜>";
 const TOOL_SEP: &str = "<｜tool▁sep｜>";
@@ -47,7 +52,10 @@ impl DeepSeek {
             user_prefix: special(&tokenizer, "<｜User｜>"),
             assistant_prefix: special(&tokenizer, "<｜Assistant｜>"),
             end_of_sentence,
-            stop_ids: vec![end_of_sentence, special(&tokenizer, END_OF_TURN)],
+            stop_ids: STOP_TOKENS
+                .iter()
+                .map(|marker| special(&tokenizer, marker))
+                .collect(),
             think_open,
             think_close: special(&tokenizer, "</think>"),
             tool_outputs_begin: special(&tokenizer, "<｜tool▁outputs▁begin｜>"),

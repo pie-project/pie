@@ -4,12 +4,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use checkpoint::contract::{Expr, ModelContract, TensorContract, Visibility};
-use model::contract::ModelError;
+use checkpoint_dsl::Error;
 use model_dsl::{Dtype, Param, ParamSource, Platform, Shard};
 
 const GROUP: u64 = 32;
 
-type Load = fn(&ztensor::Source) -> Result<ModelContract, ModelError>;
+type Load = fn(&ztensor::Source) -> Result<ModelContract, Error>;
 
 struct Sku {
     name: &'static str,
@@ -81,8 +81,17 @@ fn skus() -> Vec<Sku> {
         sku("qwen36-27b-bf16-kv-bf16", |src| {
             model::qwen_3::model::Model::d27b(Dtype::Bf16, Dtype::Bf16, 1).load(src)
         }),
+        // The shadowed twin (see `qwen_3::IMPORTS`): the same text as the
+        // qwen36 row, so the same landing — what tells the two apart is the
+        // tokenizer contract, which no `.zt` bijection can see.
+        sku("qwen38-27b-bf16-kv-bf16", |src| {
+            model::qwen_3::model::Model::d27b(Dtype::Bf16, Dtype::Bf16, 1).load(src)
+        }),
         sku("qwen35-a3b-bf16-kv-bf16", |src| {
             model::qwen_3::model::Model::a3b(Dtype::Bf16, Dtype::Bf16, 1).load(src)
+        }),
+        sku("qwen38-flash-bf16-kv-bf16", |src| {
+            model::qwen_4::model::Model::flash(Dtype::Bf16, Dtype::Bf16, 1).load(src)
         }),
         sku("qwen35-d3b-bf16-kv-bf16", |src| {
             model::qwen_3::model::Model::d3b(Dtype::Bf16, Dtype::Bf16, 1).load(src)
@@ -103,6 +112,9 @@ fn skus() -> Vec<Sku> {
             model::qwen_3::model::Model::d0_8b_vision_eagle(Dtype::Bf16, Dtype::Bf16, 1).load(src)
         }),
         sku("qwen36-27b-vision-bf16-kv-bf16", |src| {
+            model::qwen_3::model::Model::d27b_vision(Dtype::Bf16, Dtype::Bf16, 1).load(src)
+        }),
+        sku("qwen38-27b-vision-bf16-kv-bf16", |src| {
             model::qwen_3::model::Model::d27b_vision(Dtype::Bf16, Dtype::Bf16, 1).load(src)
         }),
         // The M-4 row: the same trunk with an EAGLE head overlaid, so the one
@@ -168,7 +180,7 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         // above reaches this arm, and stating an affine bank here would mean
         // inventing a canonical layout for the codes plus a `.scales` and a
         // `.biases` — a claim about bytes no load in this file reads.
-        Dtype::MlxU4 | Dtype::MlxU8 => panic!(
+        Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => panic!(
             "`{}` is declared {:?}, which this fixture does not state; the \
              affine rows are exercised through `Model::import`, not `load`",
             param.name,

@@ -255,15 +255,18 @@ const MOVES: usize = 2;
 /// the same doctrine [`MOVES`] rides, at the size the unit actually is.
 const GROUP_MOVES: usize = 1;
 
-/// One base cell: two device addresses, sixteen bytes, sixteen-byte aligned —
-/// the `(codes, scales)` pair the packed select loads with one
-/// `ld.global.v2.u64`. See `MoeGroupBases` in `linear/quant.cuh`.
-const CELL: u64 = 16;
+/// One base cell: up to three device addresses and a pad, thirty-two bytes,
+/// sixteen-byte aligned — the `(codes, scales[, biases])` bases the packed
+/// select reads as one aggregate. See `MoeGroupBases` in `linear/quant.cuh`.
+/// It was two addresses in sixteen bytes until the affine banks arrived,
+/// whose element is `code * scale + bias` and whose zero points are a plane
+/// of their own.
+const CELL: u64 = 32;
 
-/// How many planes a cell can name. A split-plane bank is codes AND factors
-/// and nothing else has ever been seated here; a group that declared a third
-/// plane is refused by name rather than seated with one plane unaddressed.
-const CELL_PLANES: usize = 2;
+/// How many planes a cell can name. Two for mxfp4 (codes beside exponents),
+/// three for an affine bank (codes, scales, zero points); a fourth plane is
+/// refused by name rather than seated with a plane unaddressed.
+const CELL_PLANES: usize = 3;
 
 /// **A quantized bank's OTHER device planes**, by `Trace::params` index — the
 /// pairing [`weights::pairings`](crate::weights) reads off the load plan, in
@@ -1583,9 +1586,13 @@ impl Tier {
         roster.sort_by_key(|group| group.param);
         let mut groups = Vec::with_capacity(roster.len());
         for (cell_at, group) in roster.into_iter().enumerate() {
-            if group.planes.len() != CELL_PLANES {
+            if group.planes.len() < 2 || group.planes.len() > CELL_PLANES {
                 return Err(Fault::Residency(format!(
-                    "`{}` is a routed packed bank of {} planes and a base cell names                      {CELL_PLANES}. The cell IS the pair — codes beside factors, one                      sixteen-byte word, written together so that no state of it can                      name one group's codes and another's exponents — and a third                      plane would be an address the select never loads. Refused rather                      than seated with a plane unaddressed.",
+                    "`{}` is a routed packed bank of {} planes and a base cell seats \
+                     two or three — codes beside factors, and an affine bank's zero \
+                     points beside those, written as one word so that no state of the \
+                     cell can name one group's codes and another's factors. Refused \
+                     rather than seated with a plane unaddressed.",
                     group.name,
                     group.planes.len(),
                 )));

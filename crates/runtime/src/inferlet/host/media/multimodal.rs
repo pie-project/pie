@@ -18,14 +18,15 @@
 //! about images — `GemmaImageConfig`, `QwenVisionConfig`, `Processor`,
 //! `ProcessedImage`, the patchifiers, the delimiter and placeholder tables —
 //! was the campaign's transcription written where a test helper could reach
-//! it, and `crates/media-frontend` is that arithmetic again with goldens
+//! it, and `model::media` (the family modules `model::qwen_3::media`,
+//! `model::gemma_4::media`) is that arithmetic again with goldens
 //! pinning it against the reference processors (wave MD-B). Two spellings of
 //! one preprocessing is what article 8 forbids, and the surviving copy is the
 //! one a golden holds to its answer. What is left here is the two things
-//! media-frontend does not do: GIF demuxing, and gemma's audio front-end.
+//! the front-ends do not do: GIF demuxing, and gemma's audio front-end.
 //!
 //! Dispatch is off the served model's `arch_name` —
-//! `host::media::front_end_for` and [`audio_arch_supported`] — which is a
+//! `model::media::vision_front_end` and [`audio_arch_supported`] — which is a
 //! serving row's column, so the processor and the chat template are chosen
 //! from the same fact.
 

@@ -206,7 +206,7 @@ pub struct ForwardBindings {
     /// so a submission that carries no media constructs nothing, scans
     /// nothing, and is the submission it always was. `Arc` because a decoded
     /// image submitted to two passes is decoded once and copied never.
-    pub media: Vec<std::sync::Arc<media_frontend::EncodedSpan>>,
+    pub media: Vec<std::sync::Arc<::model::media::EncodedSpan>>,
 }
 
 /// Where a fire's folded boundary lands — the host mirror of WIT
@@ -448,7 +448,7 @@ impl BoundForwardPass {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
-        crate::pipeline::offload::close_home_instance(self.bound_instance.instance_id);
+        crate::offload::close_home_instance(self.bound_instance.instance_id);
         if let Err(error) = self.scheduler.close_instance(
             self.bound_instance.instance_id,
             self.bound_instance.pacing_wait_id,
@@ -885,7 +885,7 @@ mod tests {
         assert_eq!(req.lanes.len(), 1);
         assert_eq!(req.lanes[0].tokens, vec![42]);
         assert_eq!(req.lanes[0].positions, Vec::<u32>::new());
-        assert_eq!(req.lanes[0].readout, crate::engine::Readout::Last);
+        assert_eq!(req.lanes[0].readout, ::engine::Readout::Last);
     }
 
     /// P2/P3 exit gate: register → instantiate → run on echo's reference

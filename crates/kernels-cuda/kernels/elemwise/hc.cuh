@@ -1,6 +1,7 @@
 #pragma once
 
 #include "prelude/device.cuh"
+#include "elemwise/norm.cuh"
 
 namespace pie::elemwise {
 
@@ -301,4 +302,111 @@ __global__ void per_head_rmsnorm(
     }
 }
 
+
+// ---- The GATED-RESIDUAL flavor (qwen4) ----------------------------------
+// Same residual-stream algebra as the sinkhorn family above, a different
+// gate: per-element sigmoid gates a low-rank GEMM chain produced. The GEMMs
+// are ordinary linear nodes; these two say only the arithmetic no other op
+// says.
+
+// y[h] = mean_s( sigmoid(gates[s*H + h]) * normed[s*H + h] ). One block per
+// row; gates and normed are [N, M*H], y is [N, H].
+template <class T, int BLOCK = 256>
+__global__ void hc_mix(
+    const T* __restrict__ gates,
+    const T* __restrict__ normed,
+    T* __restrict__ y,
+    int M,
+    int H)
+{
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const T* gr = gates + static_cast<long long>(n) * M * H;
+    const T* nr = normed + static_cast<long long>(n) * M * H;
+    T* yr = y + static_cast<long long>(n) * H;
+
+    for (int h = tid; h < H; h += BLOCK) {
+        float acc = 0.f;
+        for (int s = 0; s < M; ++s) {
+            const float g = Elem<T>::to_f32(gr[s * H + h]);
+            const float v = Elem<T>::to_f32(nr[s * H + h]);
+            acc += v / (1.f + __expf(-g));
+        }
+        yr[h] = Elem<T>::from_f32(acc / static_cast<float>(M));
+    }
 }
+
+// hyper[s*H + h] += 2 * sigmoid(gates[s] / M) * o[h], in place. One block
+// per row; o is [N, H], gates is [N, M] of raw logits.
+template <class T, int BLOCK = 256>
+__global__ void hc_inject(
+    const T* __restrict__ o,
+    const T* __restrict__ gates,
+    T* __restrict__ hyper,
+    int M,
+    int H)
+{
+    const int n = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const T* orow = o + static_cast<long long>(n) * H;
+    const T* gr = gates + static_cast<long long>(n) * M;
+    T* hr = hyper + static_cast<long long>(n) * M * H;
+
+    __shared__ float g[MAX_HC_MULT];
+    if (tid < M) {
+        const float logit = Elem<T>::to_f32(gr[tid]) / static_cast<float>(M);
+        g[tid] = 2.f / (1.f + __expf(-logit));
+    }
+    __syncthreads();
+
+    const int total = M * H;
+    for (int i = tid; i < total; i += BLOCK) {
+        const int s = i / H;
+        const int h = i - s * H;
+        const float v = Elem<T>::to_f32(hr[i]) + g[s] * Elem<T>::to_f32(orow[h]);
+        hr[i] = Elem<T>::from_f32(v);
+    }
+}
+
+// The PLE gate (qwen4): one block per (row, stream), flattened the way the
+// grouped norms flatten — block b is row b / M, stream b % M. The dot over H
+// is a block reduction; the gate is sigmoid of its signed square root.
+template <class T, int BLOCK = 256>
+__global__ void ple_gate(
+    const T* __restrict__ key,
+    const T* __restrict__ query,
+    const T* __restrict__ value,
+    T* __restrict__ y,
+    int M,
+    int H)
+{
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int n = b / M;
+    const int s = b - n * M;
+
+    const T* kr = key + (static_cast<long long>(n) * M + s) * H;
+    const T* qr = query + (static_cast<long long>(n) * M + s) * H;
+    const T* vr = value + static_cast<long long>(n) * H;
+    T* yr = y + (static_cast<long long>(n) * M + s) * H;
+
+    float local = 0.f;
+    for (int i = tid; i < H; i += BLOCK) {
+        local += Elem<T>::to_f32(kr[i]) * Elem<T>::to_f32(qr[i]);
+    }
+    __shared__ float buf[BLOCK];
+    const float dot = block_reduce_sum_exact<BLOCK>(local, buf) * rsqrtf((float)H);
+    // The reference's own damping: sqrt of the clamped magnitude, times
+    // the SIGN — and sign(0) is 0, not the clamp floor.
+    float damped = sqrtf(fmaxf(fabsf(dot), 1e-6f));
+    damped = dot > 0.f ? damped : (dot < 0.f ? -damped : 0.f);
+    const float gate = 1.f / (1.f + __expf(-damped));
+
+    for (int i = tid; i < H; i += BLOCK) {
+        yr[i] = Elem<T>::from_f32(gate * Elem<T>::to_f32(vr[i]));
+    }
+}
+
+} // namespace pie::elemwise

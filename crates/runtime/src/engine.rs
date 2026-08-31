@@ -1,6 +1,8 @@
 //! L0: engine selection and the registry — the `EngineSpec`/`EngineBox`
 //! store (`backend`), the concrete seams behind it, channel endpoint lifecycle
-//! (`channel`), and the launch-side re-exports the rest of the runtime reads.
+//! (`channel`), and the launch-side machinery the rest of the runtime reads —
+//! all of it runtime-owned; contract types are spelled `::engine::…` at
+//! their owner.
 //!
 //! This is the RUNTIME's half of the engine boundary and nothing else. The
 //! contract — [`Engine`](engine::Engine) and the fourteen verbs, the
@@ -56,19 +58,12 @@ pub use fire::{
     FireRequest, FrameFire, MaskWords, StepFire, bitmask_words,
 };
 
-// The contract, re-exported at the path the runtime already reads it from.
-pub use ::engine::adapter::{AdapterPlane, AdapterRegistration};
-pub use ::engine::caps::Capabilities;
-pub use ::engine::channel::ChannelRegistration;
-pub use ::engine::error::{Error, Result as EngineResult};
-pub use ::engine::fire::{
-    Attachment, Boundary, FireTicket, FrameSubmission, FrameTicket, KvDelta, Lane, LaneReadout,
-    Mask, Masking, MediaEncode, Readout, RsReset, RsVerb, Step,
-};
-pub use ::engine::load::{Budgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
-pub use ::engine::program::ProgramRegistration;
-pub use ::engine::transfer::{KvCopy, KvMove, MemoryDomain, StateCopy, StateMove};
-pub use ::engine::Engine;
+// THE CONTRACT RE-EXPORTS STOOD HERE: some thirty `::engine` types aliased
+// under this module, so each of them answered to two names. One type with
+// two paths makes the boundary unmeasurable, so the aliases are gone; a
+// contract type is spelled at its owner (`::engine::…`) now, which is the
+// same rule the manifest states — a crate that spells a type depends on the
+// crate that owns it.
 
 /// The four recurrent-state verbs, as a slot's flag byte spells them.
 ///
@@ -105,9 +100,9 @@ pub type EngineId = usize;
 pub mod verbs {
     use anyhow::Result;
 
-    use super::{
-        ChannelRegistration, EngineBox, EngineId, RegisteredChannel, SubmissionCompletion,
-    };
+    use ::engine::ChannelRegistration;
+
+    use super::{EngineBox, EngineId, RegisteredChannel, SubmissionCompletion};
 
     /// Which backend an engine's guest-program codegen emits for.
     ///

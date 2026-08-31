@@ -20,7 +20,8 @@ pub use check::{Fault, check, checked};
 pub use guard::Guard;
 pub use operands::Operands;
 pub use ops::{
-    Attention, Collective, CustomCuda, Elementwise, Layout, Linear, MropeForm, Operation,
+    Attention, Collective, CustomCuda, Elementwise, GateActivation, Layout, Linear, MropeForm,
+    Operation,
 };
 pub use trace::{CacheRow, Node, Param, ParamSource, Platform, Seam, Shard, Trace};
 pub use value::{

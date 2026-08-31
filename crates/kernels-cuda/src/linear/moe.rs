@@ -121,6 +121,49 @@ pub fn topk_softmax(
     )
 }
 
+/// The same router, times the learned per-expert gain.
+pub fn topk_softmax_scaled(
+    ctx: &Ctx,
+    logits: Tensor,
+    scale: Tensor,
+    experts: u32,
+    top_k: u32,
+    routes: &mut Tensor,
+    weights: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_topk_softmax_scaled";
+    let t = dtype_dispatch!(OP, logits.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(
+        scale.dtype, logits.dtype,
+        "the gain is read at the router's own width"
+    );
+    debug_assert_eq!(
+        scale.rows * scale.width,
+        experts,
+        "the gain is indexed by expert, so it holds one entry per expert"
+    );
+    ranked_planes(OP, logits, top_k, routes, weights);
+    let (e, k) = router_extents(OP, logits, experts, top_k)?;
+    ctx.fire(
+        OP,
+        Fire::at(
+            FILE,
+            symbol(&format!("::pie::linear::moe_topk_softmax_scaled<{t}>")),
+        )
+        .apply(router_lane(logits.rows)),
+        &[
+            logits.arg(),
+            ArgValue::ABSENT, // the activation seat the fused router form fills
+            scale.arg(),
+            routes.arg(),
+            weights.arg(),
+            e.arg(),
+            k.arg(),
+            0_i32.arg(), // `hidden`, read only by the fused form
+        ],
+    )
+}
+
 /// The ranked routers' shared launch: sigmoid scoring, optionally biased.
 #[allow(clippy::too_many_arguments)]
 fn ranked_router(
@@ -541,12 +584,89 @@ pub fn matmul_select_quant(
     x: Tensor,
     codes: Tensor,
     scales: Tensor,
+    biases: Option<Tensor>,
     routes: Tensor,
     y: &mut Tensor,
     seat: GroupSeat,
 ) -> Result<(), Error> {
     const OP: &str = "linear.moe_matmul_select_quant";
-    matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat)
+    // The companion shape IS the scheme: mxfp4 centres its own blocks and
+    // ships one plane beside the codes, an affine bank ships two. The plane
+    // resolution recorded which this bank is when the loader recorded the
+    // pairing, so the presence of the zero points is the discriminant and a
+    // second statement of the scheme here would be a chance to disagree.
+    match biases {
+        None => matmul_select_mxfp4(ctx, OP, x, codes, scales, None, routes, y, seat),
+        Some(biases) => matmul_select_mlxu4(ctx, OP, x, codes, scales, biases, routes, y, seat),
+    }
+}
+
+/// The MLX affine-U4 select: 4-bit codes, eight to a `u32` word, sixty-four
+/// under one bf16 scale and one bf16 zero point. The dot folds the zero
+/// point through the group's activation sum — `Σ (c·s + b)·x` is
+/// `s·Σ c·x + b·Σ x` — so the kernel reads each activation once.
+#[allow(clippy::too_many_arguments)]
+fn matmul_select_mlxu4(
+    ctx: &Ctx,
+    op: &'static str,
+    x: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    biases: Tensor,
+    routes: Tensor,
+    y: &mut Tensor,
+    seat: GroupSeat,
+) -> Result<(), Error> {
+    const MLX_GROUP: u32 = 64;
+
+    const ROWS_PER_WARP: u32 = 4;
+
+    const DECODE_BLOCK: u32 = 128;
+
+    let t = dtype_dispatch!(op, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(codes.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
+    debug_assert_eq!(scales.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
+    debug_assert_eq!(biases.dtype, Dtype::U8, "a packed bank's planes bind as bytes");
+    let fan = selected(op, x, routes, y)?;
+    if x.width == 0 || !x.width.is_multiple_of(MLX_GROUP) {
+        return Err(refuse(
+            op,
+            format!(
+                "K is {}, not a whole number of {MLX_GROUP}-code affine groups",
+                x.width
+            ),
+        ));
+    }
+    let k = stated(op, x.width)?;
+    let n = stated(op, nonzero(op, "N, the bank's output width", y.width)?)?;
+    let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
+    let act_div = if fan.by_token { fan.top_k } else { 1 };
+    ctx.fire(
+        op,
+        Fire::at(
+            "linear/quant.cuh",
+            symbol(&format!(
+                "::pie::linear::moe_matmul_select_mlxu4<{t}, ::pie::i32({ROWS_PER_WARP})>"
+            )),
+        )
+        .apply(Launch::grid(
+            [fan.route_count, y.width.div_ceil(tile), 1],
+            [DECODE_BLOCK, 1, 1],
+        )),
+        &[
+            x.arg(),
+            routes.arg(),
+            codes.arg(),
+            scales.arg(),
+            biases.arg(),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            ArgValue::Ptr(seat.cell),
+            ArgValue::Ptr(seat.hits),
+        ],
+    )
 }
 
 /// Folds the `top_k` routed rows back to one row per token, weighted.

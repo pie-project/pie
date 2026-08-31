@@ -25,13 +25,60 @@ impl Run<'_> {
                 table,
                 vocab,
                 y,
-            } => layout::embed(
-                self.ctx(),
-                self.tensor(*ids),
-                self.tensor(*table),
-                *vocab,
-                &mut self.tensor(*y),
-            ),
+            } => match self.maybe_planes(*table) {
+                // A token embedding stored as its affine triplet (qwen4's
+                // eight-bit table) reads through the concatenating gather at
+                // one head — dequantized for exactly the rows the step
+                // touches, never landed dense.
+                Some((codes, scales, biases, seat)) => {
+                    kernels_cuda::layout_embed_concat::embed_mlx_affine(
+                        self.ctx(),
+                        self.tensor(*ids),
+                        codes,
+                        scales,
+                        biases,
+                        *vocab,
+                        seat,
+                        &mut self.tensor(*y),
+                    )
+                }
+                None => layout::embed(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    self.tensor(*table),
+                    *vocab,
+                    &mut self.tensor(*y),
+                ),
+            },
+            Layout::EmbedConcat {
+                ids,
+                table,
+                vocab,
+                y,
+            } => match self.maybe_planes(*table) {
+                // The 51-billion-row table lands as its affine triplet — the
+                // one rectangle a dense landing could not afford — and the
+                // gather dequantizes the sixteen rows it touches per token.
+                Some((codes, scales, biases, seat)) => {
+                    kernels_cuda::layout_embed_concat::embed_concat_mlxu4(
+                        self.ctx(),
+                        self.tensor(*ids),
+                        codes,
+                        scales,
+                        biases,
+                        *vocab,
+                        seat,
+                        &mut self.tensor(*y),
+                    )
+                }
+                None => kernels_cuda::layout_embed_concat::embed_concat(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    self.tensor(*table),
+                    *vocab,
+                    &mut self.tensor(*y),
+                ),
+            },
             Layout::SplitQkv {
                 packed,
                 q_width,

@@ -312,6 +312,223 @@ const GEMMA: Family = Family {
     mlx: Some(" Paris. Paris is known as the \"City"),
 };
 
+/// **QWEN3.6-35B-A3B — `mlx-community/Qwen3.6-35B-A3B-4bit`.**
+///
+/// The first ROUTED model this family serves, and the first checkpoint here
+/// whose experts are affine-U4 rather than MXFP4. Forty layers: thirty
+/// gated-delta and ten full attention at `full_attention_interval` 4, each
+/// with 256 experts routed eight ways beside one shared expert.
+///
+/// # The sanitize audit
+///
+/// `config.json` says `model_type: qwen3_5_moe`, so the module that wrote
+/// this file is `mlx_lm/models/qwen3_5_moe.py` — whose `Model` SUBCLASSES
+/// `qwen3_5.Model` and whose `sanitize` delegates to it. So [`QWEN`]'s audit
+/// is the base of this one, and what is added is the MoE repack.
+///
+/// 1. **The re-rooted trunk**, the same rewrite in the same words:
+///    `model.language_model.*` becomes `language_model.model.*`. Confirmed
+///    against the index — all 2090 tensors are spelled that way, and the
+///    readout is `language_model.lm_head.*`. `Layout::Mlx` already said so.
+///
+/// 2. **The folded rmsnorm one, AND BOTH WITNESSES SAY IT FIRED.**
+///    `should_shift_norm_weights` is `has_mtp_weights or
+///    has_unsanitized_conv1d`, and this SOURCE model publishes both: the
+///    config declares `mtp_num_hidden_layers: 1`, and the converted file's
+///    `linear_attn.conv1d.weight` is `[8192, 4, 1]` — ending in `1`, so the
+///    `moveaxis(2, 1)` under the same predicate ran, so the shift ran.
+///    `folds_the_norm_one` is right about this file for the 27B's reason and
+///    one more.
+///
+///    **AND `linear_attn.norm.weight` IS NOT IN `norm_keys`**, so the gated
+///    norm is not shifted and this import must not unshift it — which is what
+///    `Layout::folds_the_norm_one`'s doc already says and what `import` already
+///    does.
+///
+/// 3. **THE MoE REPACK, WHICH IS THIS SKU'S OWN GAP.** `sanitize` splits the
+///    fused `mlp.experts.gate_up_proj` in half on its middle axis and writes
+///    the halves as `mlp.switch_mlp.gate_proj` and `mlp.switch_mlp.up_proj`,
+///    and `mlx_lm.convert` writes the SPLIT form. The index agrees: two
+///    `[256, 512, 2048]` banks per layer where a transformers file holds one
+///    `[256, 1024, 2048]`. Before this SKU, `qwen_3::import`'s `Layout` re-rooted
+///    the trunk and spelled the experts transformers' way in both arms, so no
+///    MLX artifact of a ROUTED qwen could be read at all. See the `match
+///    layout` in `import`'s `Mlp::Routed` arm.
+///
+/// 4. **THE TWO ROUTING GATES ARE EIGHT BITS AND THE REST IS FOUR.**
+///    `qwen3_5.py`'s `quant_predicate` returns `{group_size: 64, bits: 8}` for
+///    every path ending `mlp.gate` or `shared_expert_gate`, and this
+///    `config.json` lists all eighty — forty of each — under `bits: 8` beside
+///    the affine-U4 entries. The shapes are the check that was actually run: a
+///    `[256, 2048]` router at four bits would ship `[256, 64]` scales and this
+///    file ships `[256, 32]`, which is thirty-two groups of sixty-four codes
+///    over 2048 — eight bits. See `Model::new`'s `gate`.
+///
+/// 5. **No MTP planes.** `sanitize` drops every key holding `mtp.` before it
+///    does anything else, and the index holds none — so `Model::a3b`'s
+///    `draft: None` is what the artifact supports, whatever the config
+///    declares.
+///
+/// 6. **`vision_tower.*` is present and is not read** — 81 tensors of a
+///    27-block encoder this text SKU declares nothing for.
+///
+/// # The dims were already right
+///
+/// `Model::a3b` predates this row and every number in it checks out against
+/// this checkpoint's own `text_config`, leaf for leaf: hidden 2048, 40 layers
+/// at `full_attention_interval` 4, 16 q heads over 2 kv, head_dim 256 at
+/// `partial_rotary_factor` 0.25 (= rotary_dim 64), theta 1e7, 16 key and 32
+/// value linear heads at dim 128, conv kernel 4, 256 experts routed 8 ways at
+/// `moe_intermediate_size` 512 beside a 512-wide shared expert, vocab 248320,
+/// untied. The row added here is a DTYPE and not a shape.
+///
+/// # What first light found, and it was one sentence in the model text
+///
+/// **THE ROUTED EXPERT BANKS WERE READ AS DENSE HANDLES.**
+/// `Linear::MoeMatmulSelect` takes its bank as ONE tensor and
+/// `Linear::MoeMatmulSelectQuant` resolves the planes a packed bank is; they
+/// are two IR ops, so the model text picks, and `qwen_3::forward` said the
+/// dense one for both expert banks unconditionally — correct for
+/// `qwen35-a3b-bf16`, which is the only routed qwen that had ever run, and
+/// wrong for every packed one. The engine refused it by name at
+/// `Run::resolve` — *"value 51 is weight 23, a split-plane bank; it resolves
+/// through `Run::planes`, never as one dense handle"* — before a kernel could
+/// read a scales plane as codes. See the `select` closure in
+/// `qwen_3::forward`'s `Mlp::Routed` arm. Nothing below the model text moved.
+///
+/// # The parity bar, and why the one divergence is PRINTED
+///
+/// Nine greedy tokens against `mlx_lm` over this snapshot and this prompt,
+/// `--temp 0 --ignore-chat-template`. mlx says
+/// `" Paris. It is the largest city in France"` and this shell says
+/// `" Paris, which is also the largest city in"`. They part at step ONE and
+/// nowhere else.
+///
+/// **EIGHT OF THE NINE STEPS ARE IDENTICAL, AND THE NINTH IS A TIE.** Fed
+/// this shell's own chain so every step is judged on the same prefix, mlx's
+/// full-forward logits are:
+///
+/// ```text
+/// step  ours        mlx top-1      top-2          margin
+///  0    ' Paris'    ' Paris'       '\n'            3.7500
+///  1    ','         '.'   20.1250  ','   20.0000   0.1250  <- the only split
+///  2    ' which'    ' which'       ' located'      0.3750
+///  3    ' is'       ' is'          ' has'          1.6250
+///  4    ' also'     ' also'        ' located'      0.1250
+///  5    ' the'      ' the'         ' its'          0.8750
+///  6    ' largest'  ' largest'     ' country'      0.3750
+///  7    ' city'     ' city'        ' and'          3.6250
+///  8    ' in'       ' in'          ' and'          2.6250
+/// ```
+///
+/// Step one's two candidates are 0.125 apart in bf16 — at the two-
+/// implementation noise floor this family of checkpoints measures at 0.103
+/// rms (`GPT_OSS`'s doc records the measurement), and a fifth of the smallest
+/// margin that decides any other step here. Step four is the same 0.125 and
+/// this shell lands on mlx's side of it, which is what a coin looks like from
+/// both faces.
+///
+/// Unlike gpt-oss, mlx does NOT contradict itself here — its cached
+/// `generate_step` and its full-forward path both say `'.'` — so the record
+/// below is one string and not two, the print will read `DIVERGES`, and this
+/// table is why that word does not mean broken. [`EXPECTED`] is what is
+/// asserted, and every step above the noise floor is unanimous.
+///
+/// # A note on the name
+///
+/// The architecture is `qwen3_5_moe` and the SKU is Qwen3.6-35B-A3B, which is
+/// why `qwen35-a3b-bf16-kv-bf16` and `qwen36-35b-a3b-mlxu4-kv-bf16` are one
+/// `Model::a3b` under two names. The bf16 row was written from this
+/// architecture and never had a checkpoint in the cache to read; this one has.
+const QWEN_A3B: Family = Family {
+    sku: "qwen36-35b-a3b-mlxu4-kv-bf16",
+    env: "PIE_QWEN36_A3B_SNAPSHOT",
+    repo: "models--mlx-community--Qwen3.6-35B-A3B-4bit",
+    word: |query_len| {
+        model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    },
+    bos: None,
+    // Both of mlx's paths, cached and full-forward, say this. The split at
+    // step one is a 0.125-logit tie — see the table above.
+    mlx: Some(" Paris. It is the largest city in France"),
+};
+
+/// **GEMMA-4-26B-A4B — `mlx-community/gemma-4-26b-a4b-it-4bit`.**
+///
+/// The mixture of the gemma family, and the first model here whose
+/// feedforward is TWO branches summed rather than one. Thirty layers of
+/// hidden 2816 over the same two attention shapes [`GEMMA`] reads — 512-wide
+/// global at layers 5, 11, 17, 23, 29 and 256-wide sliding between them —
+/// with 128 affine-U4 experts routed eight ways beside the dense MLP at every
+/// one of them.
+///
+/// # The sanitize audit
+///
+/// `config.json` says `model_type: gemma4`, so `Gemma4Model.sanitize` runs
+/// first and `Gemma4TextModel.sanitize` after it. Four findings:
+///
+/// 1. **The re-rooted trunk**, unchanged from [`GEMMA`]: `model.` stripped
+///    and `language_model.` re-spelled `language_model.model.`. Confirmed
+///    against this file's index — every trunk tensor is
+///    `language_model.model.layers.*`. `gemma_4::import`'s `Layout::Mlx`
+///    already says so.
+///
+/// 2. **THE NORM ONE IS STILL NOT FOLDED**, verified for THIS file rather
+///    than inherited. `gemma4_text.py` builds every norm from the stock
+///    `nn.RMSNorm` — `x_norm * w`, no constant — and neither sanitize touches
+///    a norm plane. The two new gains agree: `Router.scale` and
+///    `Router.per_expert_scale` are both `mx.ones(...)` at init and used
+///    directly, so neither is an offset from one either.
+///
+/// 3. **THE EXPERT BANKS ARE SPLIT IN THIS LAYOUT.**
+///    `Gemma4TextModel.sanitize` cuts a transformers
+///    `experts.gate_up_proj` on `axis=-2` into `experts.switch_glu.gate_proj`
+///    and `.up_proj`, and `mlx_lm.convert` writes the split form: this file
+///    holds two `[128, 704, 352]` `U32` banks per layer, gate and up, plus a
+///    `[128, 2816, 88]` down. `read_concat` joins the pair on the axis
+///    `.bank([inter, inter])` cut. See `gemma_4::import`'s `Moe` block.
+///
+/// 4. **AND THE ROUTER IS EIGHT BITS WHERE EVERYTHING ELSE IS FOUR.**
+///    `quant_predicate` spares exactly `router.proj`, and `config.json` lists
+///    all thirty of them at `{group_size: 64, bits: 8}`. The shapes are the
+///    second witness: a `[128, 2816]` router at four bits would ship a
+///    `[128, 352]` code plane and this file holds `[128, 704]`.
+///    `gemma_4::model`'s `gate` dtype is what reads it.
+///
+/// # What the run is checking that no other row here does
+///
+/// The router's last line. `linear.moe_topk_softmax_scaled` is the shared
+/// top-k, the softmax over the SELECTED eight, and then
+/// `per_expert_scale[id]` — and the gain is not near one: it is a learned
+/// plane per layer, so a run that dropped it would still route to the right
+/// experts and weight them wrongly, which reads as fluent drift rather than
+/// as garbage.
+///
+/// **AND THAT SAME ROUTER IS WHY THIS MODEL READS THE SHELL'S GEMM
+/// CROSSOVER OUT LOUD.** Top-k over 128 experts is discontinuous in the
+/// residual stream, so an arithmetic difference too small to see in a logit
+/// swaps the eighth expert and changes that layer's routed branch outright.
+/// `throughput_probe::gemma4_26b_a4b_decodes_on_many_lanes_at_once` carries
+/// the measurement and what it says about
+/// `affine_qmm_t_fp16_precast`. Nothing here is affected: this row fires one
+/// lane, and one lane's decode is one row.
+const GEMMA_A4B: Family = Family {
+    sku: "gemma4-26b-a4b-mlxu4-kv-bf16",
+    env: "PIE_GEMMA4_A4B_SNAPSHOT",
+    repo: "models--mlx-community--gemma-4-26b-a4b-it-4bit",
+    word: |query_len| {
+        model::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word()
+    },
+    // `<bos>`, id 2 — the same prepend [`GEMMA`] needs, for the same reason.
+    bos: Some(2),
+    // Nine greedy tokens from `mlx_lm` over this snapshot, this prompt and
+    // the same prepended `<bos>`:
+    // `[9079, 236761, 109, 138, 109, 138, 109, 138, 107]`. An
+    // instruction-tuned model on a bare completion prompt answers and then
+    // wanders into whitespace, which is what those trailing pairs are.
+    mlx: Some(" Paris.\n\n\n  \n\n\n  \n"),
+};
+
 /// One shell at a time per process — see the module doc.
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -581,4 +798,21 @@ fn gpt_oss_20b_mxfp4_prefills_decodes_and_says_something_true() {
 #[test]
 fn gemma4_31b_four_bit_prefills_decodes_and_says_something_true() {
     first_light(&GEMMA);
+}
+
+/// **GEMMA-4-26B-A4B, FIRST LIGHT.** Thirty layers over the same two
+/// attention shapes the 31B reads, each running a dense GeGLU MLP and a bank
+/// of 128 routed GeGLU experts side by side and summing the two under three
+/// extra norms. See [`GEMMA_A4B`].
+#[test]
+fn gemma4_26b_a4b_four_bit_prefills_decodes_and_says_something_true() {
+    first_light(&GEMMA_A4B);
+}
+
+/// **QWEN3.6-35B-A3B, FIRST LIGHT.** Forty layers, thirty of them
+/// gated-delta, each routing eight of 256 affine-U4 experts beside a shared
+/// one, with both routing gates at eight bits. See [`QWEN_A3B`].
+#[test]
+fn qwen36_35b_a3b_four_bit_prefills_decodes_and_says_something_true() {
+    first_light(&QWEN_A3B);
 }

@@ -1,6 +1,6 @@
 //! **A REAL PNG, WRITTEN BY HAND, INSIDE THE GUEST.**
 //!
-//! Lifted from `crates/media-frontend/tests/common/mod.rs` (wave MD-B), which
+//! Lifted from the MD-B goldens' PNG writer (now `crates/runtime/tests/media_pipe_is_the_pinned_preprocessing.rs`), which
 //! argues the idiom: PNG emitted from the SPECIFICATION — IHDR, one IDAT of
 //! STORED (uncompressed) deflate blocks under a zlib wrapper, IEND, CRC-32 per
 //! chunk and Adler-32 over the raw stream. Stored blocks rather than a

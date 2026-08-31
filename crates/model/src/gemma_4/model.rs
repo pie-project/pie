@@ -270,6 +270,94 @@ pub struct Layer {
     /// the trunk.
     pub lora_a: Weight,
     pub lora_b: Weight,
+
+    /// **THE SECOND FEEDFORWARD BRANCH, WHEN THE CHECKPOINT SHIPS ONE**
+    /// (`text_config.enable_moe_block`).
+    ///
+    /// `None` on every dense member of this family, and the `None` is what
+    /// keeps those rows byte-for-byte what they were: the branch declares its
+    /// own weights, states its own norms and adds nothing to a stack that has
+    /// no mixture.
+    pub moe: Option<Moe>,
+}
+
+/// **THE ROUTED BRANCH OF gemma-4-26B-A4B, AND IT SITS BESIDE THE DENSE MLP
+/// RATHER THAN REPLACING IT.**
+///
+/// `mlx_lm/models/gemma4_text.py`'s decoder layer, verbatim, at
+/// `enable_moe = True`:
+///
+/// ```python
+/// h1 = self.pre_feedforward_layernorm(h)
+/// h1 = self.mlp(h1)
+/// h1 = self.post_feedforward_layernorm_1(h1)
+///
+/// top_k_indices, top_k_weights = self.router(h)
+/// h2 = self.pre_feedforward_layernorm_2(h)
+/// h2 = self.experts(h2, top_k_indices, top_k_weights)
+/// h2 = self.post_feedforward_layernorm_2(h2)
+///
+/// h = h1 + h2
+/// ```
+///
+/// followed by the sandwich's own `post_feedforward_layernorm` and the
+/// residual add, exactly as on a dense layer. So the mixture adds THREE norm
+/// planes per layer to a family that already carries four around two
+/// sublayers — `mlx-community/gemma-4-26b-a4b-it-4bit` publishes thirty of
+/// each of `post_feedforward_layernorm_1`, `post_feedforward_layernorm_2` and
+/// `pre_feedforward_layernorm_2` — and both branches read the SAME `h`, the
+/// post-attention residual, so they are siblings rather than a chain.
+///
+/// **AND THE ROUTER IS THIS FAMILY'S OWN.** `Router.__call__`:
+///
+/// ```python
+/// x = mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)
+/// expert_scores = self.proj(x)
+/// top_k_indices = argpartition(expert_scores, -top_k)[..., -top_k:]
+/// top_k_weights = mx.softmax(take_along_axis(expert_scores, top_k_indices))
+/// top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
+/// ```
+///
+/// Two learned planes no other router here has: `scale`, a hidden-wide RMS
+/// gain, and `per_expert_scale`, a gain per EXPERT gathered by the ids the
+/// top-k just chose. The softmax is over the SELECTED k — `take_along_axis`
+/// first, `softmax` after — which is `linear.moe_topk_softmax`'s own
+/// denominator, so the only new arithmetic is the last line and
+/// `linear.moe_topk_softmax_scaled` is that line.
+pub struct Moe {
+    /// `router.scale`, TIMES `hidden**-0.5`.
+    ///
+    /// The constant is folded into the plane at import rather than said in the
+    /// forward, because mlx folds it into the gain too — `self.scale *
+    /// self._root_size` is one array handed to one `rms_norm` — and because a
+    /// scalar on a norm's OUTPUT is not free here: it feeds a softmax, so it
+    /// does not cancel and a separate elementwise pass over `[tokens, hidden]`
+    /// would be thirty more of them a step.
+    pub router_norm: Weight,
+    pub router_norm_eps: f32,
+    /// `router.proj`, `[experts, hidden]`, no bias.
+    pub router: Weight,
+    /// `router.per_expert_scale`, `[experts]`, indexed by expert.
+    pub per_expert_scale: Weight,
+    /// `pre_feedforward_layernorm_2` — the routed branch's entry norm.
+    pub pre_ffw_norm_2: Weight,
+    pub pre_ffw_norm_2_eps: f32,
+    /// `post_feedforward_layernorm_1` — the DENSE branch's exit norm, which
+    /// exists only where there is a second branch to be added to.
+    pub post_ffw_norm_1: Weight,
+    pub post_ffw_norm_1_eps: f32,
+    /// `post_feedforward_layernorm_2` — the routed branch's exit norm.
+    pub post_ffw_norm_2: Weight,
+    pub post_ffw_norm_2_eps: f32,
+    /// `[experts, 2 · inter, hidden]`, gate first, cut at axis 1.
+    pub gate_up: Weight,
+    /// `[experts, hidden, inter]`.
+    pub down: Weight,
+    pub experts: u32,
+    pub top_k: u32,
+    /// `moe_intermediate_size` — a SECOND width, much narrower than the dense
+    /// `Layer::inter`: 704 against 2112 on the 26B.
+    pub inter: u32,
 }
 
 pub struct Attn {
@@ -389,6 +477,16 @@ struct Dims {
     softcap: Option<f32>,
     window: u32,
     norm_eps: f32,
+    moe: Option<MoeDims>,
+}
+
+/// `text_config`'s mixture: `num_experts`, `top_k_experts` and
+/// `moe_intermediate_size`.
+#[derive(Clone, Copy)]
+struct MoeDims {
+    experts: u32,
+    top_k: u32,
+    inter: u32,
 }
 
 impl Model {
@@ -419,6 +517,7 @@ impl Model {
                 softcap: Some(30.0),
                 window: 512,
                 norm_eps: 1e-6,
+                moe: None,
         }
     }
 
@@ -483,6 +582,61 @@ impl Model {
                 // are separate models.
                 window: 1024,
                 norm_eps: 1e-6,
+                moe: None,
+            },
+        )
+    }
+
+    /// **THE MIXTURE OF THE FAMILY** (`mlx-community/gemma-4-26b-a4b-it-4bit`),
+    /// every number `config.json`'s `text_config` and every one of them
+    /// different from `b31`'s.
+    ///
+    /// Thirty layers of hidden 2816; sixteen query heads reading 256-wide
+    /// sliding heads with eight kv heads, and 512-wide global heads with two —
+    /// the same two-shape attention `b31` carries, at its own widths. The
+    /// global layers are `layer_types`' `full_attention` entries, which are
+    /// indices 5, 11, 17, 23 and 29: `l % 6 == 5`. `attention_k_eq_v: true`,
+    /// so exactly those five publish no `v_proj` — twenty-five of the thirty
+    /// hold one, which is what the checkpoint's index says.
+    ///
+    /// `num_kv_shared_layers: 0` and `hidden_size_per_layer_input: 0`: no
+    /// shared tail and NO per-layer embeddings, so the thirty `layer_scalar`
+    /// planes are claimed by [`Layer::scalar`] the way `b31`'s sixty are.
+    /// `use_double_wide_mlp: false`, so `intermediate_size: 2112` is every
+    /// layer's dense width, and `moe_intermediate_size: 704` is the routed
+    /// one — a third of it, over 128 experts at a fan-out of 8.
+    pub fn a4b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                tower: None,
+                draft: false,
+                hidden: 2816,
+                layers: 30,
+                full_every: 6,
+                q_heads: 16,
+                kv_heads: 8,
+                head_dim: 256,
+                global_head_dim: 512,
+                global_kv_heads: 2,
+                global_rotary_dim: 128,
+                theta_local: 10_000.0,
+                theta_global: 1_000_000.0,
+                sm_scale: 1.0,
+                intermediate: 2112,
+                vocab: 262_144,
+                shared_tail: None,
+                ple_dim: None,
+                softcap: Some(30.0),
+                window: 1024,
+                norm_eps: 1e-6,
+                moe: Some(MoeDims {
+                    experts: 128,
+                    top_k: 8,
+                    inter: 704,
+                }),
             },
         )
     }
@@ -496,6 +650,18 @@ impl Model {
         // — of which this family has more per layer than any other here — and
         // the per-layer-embedding scalar. See `crate::dense`.
         let dense = crate::dense(w);
+        // **THE ROUTER'S PROJECTION IS EIGHT BITS WHERE THE STACK IS FOUR**,
+        // and the checkpoint says so before its shapes do: `quantization`
+        // names every one of the thirty `router.proj` entries at
+        // `{group_size: 64, bits: 8}` and nothing else. The shapes agree — a
+        // `[128, 2816]` router stored four bits to a code would ship a
+        // `[128, 352]` `u32` plane and the file holds `[128, 704]`, which is
+        // four codes to a word rather than eight. `qwen_3::Model::new` reads
+        // its own gates the same way and for the same reason.
+        let gate = match w {
+            Dtype::MlxU4 => Dtype::MlxU8,
+            other => other,
+        };
         let q_heads = d.q_heads / tp;
         let kv_heads = d.kv_heads / tp;
         let global_kv_heads = d.global_kv_heads / tp;
@@ -592,6 +758,45 @@ impl Model {
                         .then(|| Weight::sym(n("scalar"), [1], dense)),
                     lora_a,
                     lora_b,
+                    moe: d.moe.map(|m| {
+                        let mi = (m.inter / tp) as u64;
+                        Moe {
+                            router_norm: norm("router_norm", hidden),
+                            router_norm_eps: d.norm_eps,
+                            router: Weight::sym(
+                                n("router"),
+                                [m.experts as u64, hidden],
+                                gate,
+                            ),
+                            per_expert_scale: Weight::sym(
+                                n("per_expert_scale"),
+                                [m.experts as u64],
+                                dense,
+                            )
+                            .columns(),
+                            pre_ffw_norm_2: norm("pre_ffw_norm_2", hidden),
+                            pre_ffw_norm_2_eps: d.norm_eps,
+                            post_ffw_norm_1: norm("post_ffw_norm_1", hidden),
+                            post_ffw_norm_1_eps: d.norm_eps,
+                            post_ffw_norm_2: norm("post_ffw_norm_2", hidden),
+                            post_ffw_norm_2_eps: d.norm_eps,
+                            gate_up: Weight::sym(
+                                n("experts_gate_up"),
+                                [m.experts as u64, 2 * mi, hidden],
+                                w,
+                            )
+                            .bank([mi, mi]),
+                            down: Weight::sym(
+                                n("experts_down"),
+                                [m.experts as u64, hidden, mi],
+                                w,
+                            )
+                            .rows(),
+                            experts: m.experts,
+                            top_k: m.top_k,
+                            inter: m.inter / tp,
+                        }
+                    }),
                 }
             })
             .collect();
@@ -761,41 +966,41 @@ impl Model {
     pub fn load(
         &self,
         src: &ztensor::Source,
-    ) -> Result<ModelContract, crate::contract::ModelError> {
-        let mut claims = Vec::new();
-        let mut claim = |w: &Weight| claims.push(crate::contract::claim(w, self.tp));
+    ) -> Result<ModelContract, checkpoint_dsl::Error> {
+        let mut b = checkpoint_dsl::Builder::new(src, self.tp);
+        let mut claim = |w: &Weight| b.read_own(w);
 
-        claim(&self.embed);
-        claim(&self.final_norm);
+        claim(&self.embed)?;
+        claim(&self.final_norm)?;
 
         for layer in &self.layers {
-            claim(&layer.attn_norm);
-            claim(&layer.post_attn_norm);
-            claim(&layer.pre_ffw_norm);
-            claim(&layer.post_ffw_norm);
-            claim(&layer.attn.q_norm);
+            claim(&layer.attn_norm)?;
+            claim(&layer.post_attn_norm)?;
+            claim(&layer.pre_ffw_norm)?;
+            claim(&layer.post_ffw_norm)?;
+            claim(&layer.attn.q_norm)?;
             match &layer.attn.banks {
                 AttnBanks::Owned { qkv, k_norm, .. } => {
-                    claim(k_norm);
-                    claim(qkv);
+                    claim(k_norm)?;
+                    claim(qkv)?;
                 }
 
                 AttnBanks::Shared { q_proj } => {
-                    claim(q_proj);
+                    claim(q_proj)?;
                 }
             }
-            claim(&layer.o_proj);
-            claim(&layer.gate_up);
-            claim(&layer.down);
+            claim(&layer.o_proj)?;
+            claim(&layer.gate_up)?;
+            claim(&layer.down)?;
             if let Some(scalar) = &layer.scalar {
-                claim(scalar);
+                claim(scalar)?;
             }
         }
 
         if let Some(t) = &self.tower {
-            claim(&t.patch_embed);
-            claim(&t.pos_embed);
-            claim(&t.projection);
+            claim(&t.patch_embed)?;
+            claim(&t.pos_embed)?;
+            claim(&t.projection)?;
             for b in &t.blocks {
                 for w in [
                     &b.attn_norm,
@@ -805,11 +1010,11 @@ impl Model {
                     &b.q_norm,
                     &b.k_norm,
                 ] {
-                    claim(w);
+                    claim(w)?;
                 }
                 for c in [&b.q, &b.k, &b.v, &b.o, &b.gate, &b.up, &b.down] {
                     for w in [&c.bank, &c.in_lo, &c.in_hi, &c.out_lo, &c.out_hi] {
-                        claim(w);
+                        claim(w)?;
                     }
                 }
             }
@@ -828,26 +1033,26 @@ impl Model {
                 &a.gate_up,
                 &a.down,
             ] {
-                claim(w);
+                claim(w)?;
             }
             if let AttnBanks::Owned { qkv, k_norm, .. } = &a.attn.banks {
-                claim(qkv);
-                claim(k_norm);
+                claim(qkv)?;
+                claim(k_norm)?;
             }
         }
 
         if let Some(ple) = &self.ple {
-            claim(&ple.model_proj);
-            claim(&ple.model_norm);
+            claim(&ple.model_proj)?;
+            claim(&ple.model_norm)?;
             for per in &ple.per_layer {
-                claim(&per.table);
-                claim(&per.gate);
-                claim(&per.proj);
-                claim(&per.norm);
-                claim(&per.scalar);
+                claim(&per.table)?;
+                claim(&per.gate)?;
+                claim(&per.proj)?;
+                claim(&per.norm)?;
+                claim(&per.scalar)?;
             }
         }
 
-        crate::contract::elaborate(src, claims)
+        Ok(b.build())
     }
 }

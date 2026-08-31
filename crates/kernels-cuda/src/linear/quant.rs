@@ -14,7 +14,8 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/quant.cuh";
@@ -52,6 +53,130 @@ fn extent(op: &'static str, n: u64) -> Result<u32, Error> {
             format!("{n} elements do not fit a 32-bit launch extent"),
         )
     })
+}
+
+/// `linear.matmul` over a weight the store seats as an MLX affine triplet —
+/// the dense twin of `moe_matmul_select_quant`, and this shell's spelling of
+/// `kernels_metal::linear::quant::matmul`. The bit width is the codes
+/// plane's own: a `[n, k]` weight stores `k` bytes a row at eight bits and
+/// `k / 2` at four, so the rectangle already says which.
+pub fn matmul(
+    ctx: &Ctx,
+    act: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    biases: Option<Tensor>,
+    y: &mut Tensor,
+    seat: GroupSeat,
+) -> Result<(), Error> {
+    dense_affine(ctx, "linear.matmul", act, codes, scales, biases, y, seat)
+}
+
+/// [`matmul`] under the head's own op name, `linear::gemm`'s pairing kept.
+pub fn lm_head(
+    ctx: &Ctx,
+    act: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    biases: Option<Tensor>,
+    y: &mut Tensor,
+    seat: GroupSeat,
+) -> Result<(), Error> {
+    dense_affine(ctx, "linear.lm_head", act, codes, scales, biases, y, seat)
+}
+
+/// The one launch behind both dense entries. `Σ (c·s + b)·x` folds as
+/// `s·Σ c·x + b·Σ x` (the select kernel's identity), sixty-four codes to a
+/// factor pair; a fire with no rows is the same silent no-op the dense gemm
+/// keeps, and for the same capture reason.
+#[allow(clippy::too_many_arguments)]
+fn dense_affine(
+    ctx: &Ctx,
+    op: &'static str,
+    act: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    biases: Option<Tensor>,
+    y: &mut Tensor,
+    seat: GroupSeat,
+) -> Result<(), Error> {
+    const MLX_GROUP: u32 = 64;
+    const ROWS_PER_WARP: u32 = 4;
+    const BLOCK_LANES: u32 = 128;
+
+    let t = dtype_dispatch!(op, act.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(codes.dtype, Dtype::U8, "a packed plane binds as bytes");
+    debug_assert_eq!(scales.dtype, Dtype::U8, "a packed plane binds as bytes");
+    let Some(biases) = biases else {
+        return Err(refuse(
+            op,
+            "an mxfp4 dense projection has no gemm point on this plane; the \
+             affine triplet is the packed landing this entry reads",
+        ));
+    };
+    debug_assert_eq!(biases.dtype, Dtype::U8, "a packed plane binds as bytes");
+    debug_assert_eq!(
+        act.rows, y.rows,
+        "the activation's rows are the rows the result lands"
+    );
+    let n = nonzero(op, "N, the columns this projection lands", y.width)?;
+    let k = nonzero(op, "K, the contraction this projection walks", act.width)?;
+    if !k.is_multiple_of(MLX_GROUP) {
+        return Err(refuse(
+            op,
+            format!("K is {k}, not a whole number of {MLX_GROUP}-code affine groups"),
+        ));
+    }
+    // The factor plane is `[n, k / group]` bf16 bound as its byte rectangle,
+    // and the kernel walks groups of sixty-four; a plane grouped otherwise
+    // is refused rather than mis-scaled.
+    if scales.width != (k / MLX_GROUP) * 2 {
+        return Err(refuse(
+            op,
+            format!(
+                "a {}-byte factor row does not group a {k}-wide row by {MLX_GROUP}",
+                scales.width
+            ),
+        ));
+    }
+    let bits: u32 = if codes.width == k {
+        8
+    } else if codes.width * 2 == k {
+        4
+    } else {
+        return Err(refuse(
+            op,
+            format!("a {}-byte code row stores a {k}-wide row at neither four nor eight bits", codes.width),
+        ));
+    };
+    if y.rows == 0 {
+        return Ok(());
+    }
+    let tile = (BLOCK_LANES / WARP) * ROWS_PER_WARP;
+    ctx.fire(
+        op,
+        Fire::at(
+            FILE,
+            symbol(&format!(
+                "::pie::linear::matmul_mlx_affine<{t}, ::pie::i32({bits}), \
+                 ::pie::i32({ROWS_PER_WARP})>"
+            )),
+        )
+        .apply(Launch::grid(
+            [y.rows, n.div_ceil(tile), 1],
+            [BLOCK_LANES, 1, 1],
+        )),
+        &[
+            act.arg(),
+            codes.arg(),
+            scales.arg(),
+            biases.arg(),
+            y.arg(),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+            ArgValue::Ptr(seat.cell),
+        ],
+    )
 }
 
 pub fn cast_fp32_to(ctx: &Ctx, src: Tensor, dst: &mut Tensor) -> Result<(), Error> {

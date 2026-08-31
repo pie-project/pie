@@ -27,12 +27,13 @@
 //! `container:` line, bound against the profile each was authored for, planned
 //! by `compile_bound`, and emitted for Metal by `emit_program`. That is
 //! exactly the path a registration takes in production, so what this test
-//! exercises is the path and not a mock of it. The five chosen are the
+//! exercises is the path and not a mock of it. The six chosen are the
 //! corpus's programs whose two halves must agree EXACTLY rather than nearly:
-//! every op integral or boolean, no RNG to seed, and where a `logits` row is
-//! read it is a buffer this test resident-ises itself and points BOTH halves
-//! at — which is also the only exercise the runtime's attachment seam gets
-//! until the runtime builds it.
+//! every op integral or boolean, no AMBIENT RNG (`nucleus_sample`'s draw is
+//! keyed off a channel both halves are seeded with, which is a different
+//! thing), and where a `logits` row is read it is a buffer this test
+//! resident-ises itself and points BOTH halves at — which is also the only
+//! exercise the runtime's attachment seam gets until the runtime builds it.
 //!
 //! **THERE IS NO DRAFT-COLUMN SUBJECT HERE, AND THE REASON IS THE EMITTED
 //! ABI RATHER THAN THE CORPUS.** The CUDA sibling carries a sixth subject,
@@ -51,17 +52,25 @@
 //! NOT UNTESTED, IT IS UNREACHABLE, and writing it here would assert a
 //! property of a kernel nobody emits.
 //!
-//! The shape that fixes it is the M3 grouped form, which is already emitted
-//! and not yet driven: there the intrinsic is not a bound buffer at all but a
-//! raw address per lane (`lane.logits_base`), and the draft column is that
-//! same address plus a per-row displacement the side table states
-//! (`M3RowMeta::mtp_offset`) — two rectangles, one binding, exactly the split
-//! the CUDA side gets from its five side tables. Reaching it needs
-//! `MTLBuffer.gpuAddress` plumbed through `device/alloc.rs`, because the
-//! grouped kernels dereference raw `ulong`s rather than encoder bindings, and
-//! that is not this wave's. Until it is, the draft column has no device half
-//! on Metal and this file states so instead of pretending otherwise: every
-//! subject below asserts `!plan.needs_mtp_logits`.
+//! **THE M3 GROUPED FORM IS BOUND NOW, AND IT IS WHY THE PARAGRAPH ABOVE
+//! DESCRIBES A CEILING RATHER THAN A WALL — BUT NOT WHY A DRAFT SUBJECT
+//! APPEARS.** `MTLBuffer.gpuAddress` reaches the shell (`device::alloc::
+//! Buffer::address_at`), the grouped kernels dereference the lane table
+//! instead of an argument slot, and four of the six subjects below compile on
+//! that form: `Subject::rows != 0` is the rule, and [`parity`] asserts it, so
+//! the grouped ABI is one of the things this diff is about rather than a path
+//! driven only by [`the_channel_ceiling_is_an_escape_and_not_a_wall`]. One of
+//! the four — `nucleus_sample` — is the grouped LIBRARY sampler, a kernel
+//! this plane had never dispatched at all.
+//!
+//! What the grouped form does NOT give the draft column is a second base. It
+//! hands every `INTRINSIC_VAL` op ONE address — `lane.logits_base` — and
+//! reaches the draft rows by counting rows off it
+//! (`M3RowMeta::mtp_offset`), which serves a guest whose two columns are one
+//! reservation at a row-aligned displacement and cannot serve one whose are
+//! two allocations. The CUDA sibling's `mtp_two_columns` is the second shape.
+//! So this stays a ceiling that has moved rather than one that is gone, and
+//! every subject below still asserts `!plan.needs_mtp_logits`.
 //!
 //! **THE READOUT IS STAGED AS bf16, WHICH IS WHY THE HOST IS FED THE WIDENED
 //! NUMBERS AND NOT THE ORIGINALS.** The M1 runtime reads the intrinsic buffer
@@ -92,6 +101,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use engine::program::ProgramRegistration;
 use engine_metal::device::{Buffer, Context, present};
+use engine_metal::program::compile::Form;
 use engine_metal::program::{Fired, Plane};
 use eta_compiler::codegen::launch::{LaunchChannel, LaunchPackage, ValueOrigin};
 use eta_compiler::codegen::program::KernelKind;
@@ -199,7 +209,34 @@ const SUBJECTS: &[Subject] = &[
         rows: 2,
         why: "no channel inputs; blocks on its own full output",
     },
+    // **THE GROUPED LIBRARY SAMPLER**, which is a whole kernel rather than a
+    // width: `nucleus_sample`'s region lowers to `emit_grouped_nucleus` — a
+    // radix ordering of the row, a stable prefix sum over the softmax and the
+    // cutoff draw, 256 threads to a row — where the M2 form lowers the same
+    // region to the generic op switch on ONE thread. It is a legal subject
+    // for the same reason `dfa_ingraph` is: the RNG here is KEYED (the state
+    // is a channel both halves are seeded with, not an ambient draw), and
+    // what comes out is an I32 token index rather than a probability.
+    Subject {
+        name: "nucleus_sample",
+        rows: 1,
+        why: "the grouped nucleus library kernel, 256 threads to a row",
+    },
 ];
+
+/// The program above the argument-slot ceiling, which only the grouped form
+/// can serve.
+///
+/// **NOT A [`SUBJECTS`] ENTRY, AND THE REASON IS ITS ARITHMETIC RATHER THAN
+/// ITS WIDTH.** `beam_epilogue` accumulates beam scores through a
+/// log-softmax, so its `F32` score channel is a `log` and an `exp` — and this
+/// file's whole contract is that a disagreement means the emitted arithmetic
+/// is wrong, which it cannot mean when the two halves are Metal's
+/// `precise::log` and the host's libm one ULP apart. So it is driven by
+/// [`the_channel_ceiling_is_an_escape_and_not_a_wall`], which asserts the
+/// thing that used to be false — that it compiles and fires at all — and
+/// leaves the byte-for-byte diff to the five programs that can carry it.
+const OVER_THE_CEILING: &str = "beam_epilogue";
 
 /// The vocabulary every corpus program that reads `logits` was bound at.
 ///
@@ -513,6 +550,29 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
     let program = plane
         .register(context, &registration)
         .unwrap_or_else(|error| panic!("{name} does not compile: {error}"));
+    // **WHICH FORM SERVED IT, HELD AGAINST THE STATED RULE.** A region that
+    // gathers the readout is compiled on the grouped kernel and one that does
+    // not is left on the M2 one, so `rows != 0` predicts the answer — and the
+    // three subjects that read `logits` are what makes the grouped path a
+    // SUBJECT of this diff rather than a thing driven only by the ceiling
+    // test. A silent flip either way would move the ABI under every byte
+    // compared below.
+    let grouped = plane
+        .program(program)
+        .expect("registered")
+        .compiled
+        .stages
+        .iter()
+        .flat_map(|stage| stage.regions.iter().map(|region| region.form))
+        .any(|form| form != Form::Fused);
+    assert_eq!(
+        grouped,
+        rows != 0,
+        "{name}: this program {} the readout, so it should have compiled {} the \
+         grouped form",
+        if rows == 0 { "does not read" } else { "reads" },
+        if rows == 0 { "without" } else { "on" }
+    );
     let extents = Extents {
         sampled_rows: rows.max(1),
         ..Extents::default()
@@ -812,6 +872,405 @@ fn the_device_half_and_the_host_half_agree_byte_for_byte() {
         stats.compilations > 0,
         "every program answered from a cache, so the Metal compiler was never exercised"
     );
+}
+
+/// **THE TWELVE-CHANNEL CEILING IS A CHOICE OF FORM NOW, NOT A REFUSAL.**
+///
+/// A fused M2 region binds each channel's committed and pending cell at
+/// `7 + 2k` and `8 + 2k`, and Metal's last argument index is 30 — so a
+/// thirteenth channel has nowhere to go, the emitter says so by name, and
+/// `Plane::register` used to turn that into a whole-program compile failure.
+/// `beam_epilogue` is the corpus's own example at sixteen channels: not slow
+/// on this plane, absent from it.
+///
+/// The grouped kernel reads its channels out of the lane table, where a
+/// channel is a row rather than an argument index, so the ceiling stops
+/// applying — and this test states all three halves of that: the M2 emitter
+/// still refuses every region (the ceiling is real), every compiled region is
+/// a grouped form (the escape is what served it), and the program fires and
+/// gates against the host interpreter (it is served correctly rather than
+/// merely compiled).
+/// **WHERE THE GROUPED TABLE NAMES A FUSED REGION**, over every program the
+/// corpus has.
+///
+/// `emit_metal_stage` writes the singleton partition's grouped kernels first
+/// and the fused partition's after them, so a fused region's grouped entry is
+/// at `singleton.len() + i` while its M2 entry is at `i`. Nothing but that
+/// walk states the offset, and `compile::grouped_region` has to reproduce it:
+/// a shell that looked at `i` would find the grouped kernel of a SINGLETON
+/// region — a real kernel for a different set of ops — and compile it without
+/// complaint. That is a wrong program, not a missing one, which is why this
+/// is checked rather than trusted.
+#[test]
+fn the_grouped_table_names_a_fused_region_where_this_shell_looks() {
+    let mut seen = 0usize;
+    for name in SUBJECTS
+        .iter()
+        .map(|subject| subject.name)
+        .chain([OVER_THE_CEILING])
+    {
+        let registration = registration(name);
+        for (stage, plan) in registration.launch.plans.iter().enumerate() {
+            let stage = stage as u32;
+            let grouped: Vec<u32> = registration
+                .emitted_kernels
+                .iter()
+                .filter(|kernel| kernel.kind == KernelKind::Grouped && kernel.stage_index == stage)
+                .map(|kernel| kernel.region_index)
+                .collect();
+            if grouped.is_empty() {
+                continue;
+            }
+            // The singleton partition's entries, then the fused partition's,
+            // contiguous and in that order.
+            let expected: Vec<u32> =
+                (0..(plan.singleton.len() + plan.fused.len()) as u32).collect();
+            let mut sorted = grouped.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted, expected,
+                "{name} stage {stage}: the grouped kernel table is not \
+                 `singleton` then `fused`, so the offset this shell adds is wrong"
+            );
+            seen += 1;
+        }
+    }
+    assert!(seen > 0, "no stage emitted a grouped kernel at all");
+}
+
+#[test]
+fn the_channel_ceiling_is_an_escape_and_not_a_wall() {
+    let _guard = serialized();
+    let Some(context) = device_or_skip("the channel ceiling") else {
+        return;
+    };
+    let registration = registration(OVER_THE_CEILING);
+    let package = registration.launch.clone();
+    assert!(
+        package
+            .plans
+            .iter()
+            .any(|plan| plan.channel_bindings.len() > 12),
+        "{OVER_THE_CEILING} no longer binds more channels than the M2 form has \
+         argument indices, so it is not the subject this test needs"
+    );
+    // The refusal this test exists to route around, read off the emitted
+    // table rather than assumed. Every fused region of the wide stage has to
+    // be declined, or the grouped form is not what served it.
+    let wide: Vec<&eta_exec::EmittedKernel> = registration
+        .emitted_kernels
+        .iter()
+        .filter(|kernel| kernel.kind == KernelKind::Fused)
+        .collect();
+    assert!(
+        !wide.is_empty() && wide.iter().all(|kernel| !kernel.error.is_empty()),
+        "the M2 emitter served {OVER_THE_CEILING} after all, so the ceiling this \
+         test is about is not the one in the way"
+    );
+
+    let plan: ExecPlan = adopt_launch_package(package.clone())
+        .unwrap_or_else(|error| panic!("{OVER_THE_CEILING} does not adopt: {error}"));
+    let seeds = seeds(&package);
+    let mut interp: InterpInstance = make_host_instance(&plan, &BTreeMap::new(), &seeds.host);
+
+    let mut plane = Plane::new();
+    let program = plane
+        .register(&context, &registration)
+        .unwrap_or_else(|error| {
+            panic!(
+                "{OVER_THE_CEILING} does not compile, which is the wall this test says \
+                 is gone: {error}"
+            )
+        });
+
+    // Every region on a grouped form. A region that quietly fell back to the
+    // M2 kernel could not have compiled at all at this width, so this is the
+    // assertion that the escape is the thing being exercised.
+    let compiled = &plane.program(program).expect("registered").compiled;
+    let forms: Vec<Form> = compiled
+        .stages
+        .iter()
+        .flat_map(|stage| stage.regions.iter().map(|region| region.form))
+        .collect();
+    assert!(
+        !forms.is_empty() && forms.iter().all(|form| *form != Form::Fused),
+        "{OVER_THE_CEILING} compiled a single-lane region at sixteen channels, which \
+         the emitter cannot have written: {forms:?}"
+    );
+
+    let rows = 2;
+    let extents = Extents {
+        sampled_rows: rows,
+        ..Extents::default()
+    };
+    let instance = plane
+        .bind(&context, program, &seeds.device, extents, GeometryClass::Host)
+        .unwrap_or_else(|error| panic!("{OVER_THE_CEILING} does not bind: {error}"));
+
+    let readout = logits(rows, OVER_THE_CEILING);
+    let seen: Vec<f32> = readout.iter().copied().map(widen).collect();
+    let bytes: Vec<u8> = readout
+        .iter()
+        .map(|value| to_bf16(*value))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut buffer = Buffer::zeroed(&context, bytes.len() as u64).expect("the readout fits");
+    buffer.write(0, &bytes).expect("staging the readout");
+    plane
+        .bind_intrinsic(instance, IntrinsicId::Logits, &buffer, 0, VOCAB, Dtype::Bf16)
+        .expect("binding the readout");
+    let inputs = PassInputs {
+        logits: Some(&seen),
+        mtp_logits: None,
+        rows,
+        vocab: VOCAB,
+        mtp_draft_row: None,
+        attn_score: None,
+    };
+
+    // **THE GATE, NOT THE ARITHMETIC.** What is compared over four fires is
+    // the OUTCOME — committed, or blocked and on which channel — because that
+    // is what a sixteen-channel program's readiness is about and it is
+    // integral on both halves. The numbers themselves are the five subjects'
+    // job.
+    let mut committed = 0usize;
+    for round in 0..4 {
+        for (index, declared) in package.channels.iter().enumerate() {
+            if !host_writes(declared) && !seeded(declared) {
+                continue;
+            }
+            let channel = index as u32;
+            let dtype = concrete_dtype(declared.dtype);
+            let lanes = numel(declared);
+            let value = cell(dtype, lanes, channel, round + 1);
+            let host = if host_writes(declared) {
+                host_put(&interp, &plan, channel, &value) == HostOp::Ok
+            } else {
+                interp.channels[index].push(&value)
+            };
+            let device = plane
+                .instance_mut(instance)
+                .expect("bound")
+                .publish(channel, &wire(&value, dtype, lanes))
+                .unwrap_or_else(|error| panic!("publishing channel {channel}: {error}"));
+            assert_eq!(
+                host, device,
+                "{OVER_THE_CEILING} fire {round}: back-pressure on channel {channel} \
+                 differs between the halves"
+            );
+        }
+        let host = step(&mut interp, &plan, &inputs);
+        let device = plane
+            .fire(&context, instance)
+            .unwrap_or_else(|error| panic!("{OVER_THE_CEILING} fire {round}: {error}"));
+        assert!(
+            same_outcome(&host, &device),
+            "{OVER_THE_CEILING} fire {round}: the host said {host:?} and the device \
+             said {device:?}"
+        );
+        if matches!(host, StepOutcome::Committed) {
+            committed += 1;
+        }
+        for (index, declared) in package.channels.iter().enumerate() {
+            if !host_reads(declared) {
+                continue;
+            }
+            let channel = index as u32;
+            let _ = host_take(&interp, &plan, channel);
+            let _ = plane
+                .instance_mut(instance)
+                .expect("bound")
+                .take(channel)
+                .unwrap_or_else(|error| panic!("taking channel {channel}: {error}"));
+        }
+    }
+    assert!(
+        committed > 0,
+        "{OVER_THE_CEILING} never committed, so nothing above the ceiling actually ran"
+    );
+    println!("  {OVER_THE_CEILING}: {} region(s), {committed} committed", forms.len());
+}
+
+/// The pitch the wide staging lays [`OVER_THE_CEILING`]'s two rows out at.
+///
+/// **NOT A MULTIPLE OF [`VOCAB`], ON PURPOSE.** A gather that strode by the
+/// reader's declared width instead of the rectangle's would start row 1 at
+/// element `VOCAB` of the flat buffer. At a pitch that is a whole number of
+/// declared rows that lands on a row boundary and reads plausible numbers out
+/// of the wrong row; at thirteen it lands five columns into the padding and
+/// cannot be mistaken for an answer.
+const WIDE_PITCH: u32 = 13;
+
+/// The pitch a real readout rectangle has, and the one the refusal this test
+/// retires quoted by name.
+///
+/// Qwen3.5's vocabulary. `program::launch` answered a `[2, 8]` read of it with
+/// "every row after the first would land 248312 elements short", so running
+/// the same two rows at exactly this pitch is the difference between a stride
+/// that works and a stride that works at the scale it is for.
+const REAL_VOCAB_PITCH: u32 = 248_320;
+
+/// What the columns past the reader's declared width hold.
+///
+/// Outside the range [`logits`] produces (which is `[-8, 7.75]`) and exactly
+/// representable as `bfloat`, so a read that wandered into the padding changes
+/// the log-softmax it lands in rather than perturbing it.
+const PADDING: f32 = 64.0;
+
+/// Drive [`OVER_THE_CEILING`] with its two readout rows laid into a rectangle
+/// `pitch` elements wide, and answer everything the device said.
+///
+/// **THE HOST INTERPRETER IS NOT HERE, AND THAT IS THE POINT.** `eta_exec`'s
+/// own `bind_intrinsic` requires the reader's extent to be a whole multiple of
+/// the vocabulary it was handed and then gathers CONTIGUOUSLY
+/// (`crates/eta-exec/src/step.rs`), so it cannot express a narrow read of a
+/// wide rectangle at all and there is no host golden to diff against. What
+/// there is instead is the device against ITSELF at two pitches, which is a
+/// sharper question than parity anyway: the rows are the same rows, so the
+/// answers must be the same answers, and only the stride differs.
+fn beam_at_pitch(context: &Context, pitch: u32) -> Vec<Option<Vec<u8>>> {
+    let registration = registration(OVER_THE_CEILING);
+    let package = registration.launch.clone();
+    let seeds = seeds(&package);
+    let mut plane = Plane::new();
+    let program = plane
+        .register(context, &registration)
+        .unwrap_or_else(|error| panic!("{OVER_THE_CEILING} does not compile: {error}"));
+    let rows = 2;
+    let extents = Extents {
+        sampled_rows: rows,
+        ..Extents::default()
+    };
+    let instance = plane
+        .bind(context, program, &seeds.device, extents, GeometryClass::Host)
+        .unwrap_or_else(|error| panic!("{OVER_THE_CEILING} does not bind: {error}"));
+
+    // The same two rows every time, moved apart by the pitch, and the gaps
+    // filled with something no row holds.
+    let readout = logits(rows, OVER_THE_CEILING);
+    let mut rectangle = vec![PADDING; (rows * pitch) as usize];
+    for row in 0..rows {
+        for column in 0..VOCAB {
+            rectangle[(row * pitch + column) as usize] = readout[(row * VOCAB + column) as usize];
+        }
+    }
+    let bytes: Vec<u8> = rectangle
+        .iter()
+        .map(|value| to_bf16(*value))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut buffer = Buffer::zeroed(context, bytes.len() as u64).expect("the rectangle fits");
+    buffer.write(0, &bytes).expect("staging the rectangle");
+    plane
+        .bind_intrinsic(instance, IntrinsicId::Logits, &buffer, 0, pitch, Dtype::Bf16)
+        .unwrap_or_else(|error| {
+            panic!(
+                "binding {OVER_THE_CEILING}'s {rows}-row read of {VOCAB} elements out of \
+                 a rectangle {pitch} wide: {error}"
+            )
+        });
+
+    let mut said: Vec<Option<Vec<u8>>> = Vec::new();
+    for round in 0..4 {
+        for (index, declared) in package.channels.iter().enumerate() {
+            if !host_writes(declared) && !seeded(declared) {
+                continue;
+            }
+            let channel = index as u32;
+            let dtype = concrete_dtype(declared.dtype);
+            let lanes = numel(declared);
+            let value = cell(dtype, lanes, channel, round + 1);
+            plane
+                .instance_mut(instance)
+                .expect("bound")
+                .publish(channel, &wire(&value, dtype, lanes))
+                .unwrap_or_else(|error| panic!("publishing channel {channel}: {error}"));
+        }
+        let fired = plane
+            .fire(context, instance)
+            .unwrap_or_else(|error| panic!("{OVER_THE_CEILING} fire {round}: {error}"));
+        said.push(Some(format!("{fired:?}").into_bytes()));
+        for (index, declared) in package.channels.iter().enumerate() {
+            if !host_reads(declared) {
+                continue;
+            }
+            let channel = index as u32;
+            said.push(
+                plane
+                    .instance_mut(instance)
+                    .expect("bound")
+                    .take(channel)
+                    .unwrap_or_else(|error| panic!("taking channel {channel}: {error}")),
+            );
+        }
+    }
+    said
+}
+
+/// **A NARROW READ OF MANY ROWS LANDS ON THE RECTANGLE'S OWN ROWS**, which is
+/// the shape this plane refused by name until the grouped form was given a row
+/// pitch of its own.
+///
+/// `beam_epilogue` reads `logits` as `[2, 8]`. Bound against a rectangle
+/// exactly eight wide, consecutive IS the stride and the read has always
+/// worked. Bound against a WIDER one — which is what a real vocabulary is, and
+/// what beam search and consensus decoding hand it — every row after the first
+/// has to start a whole rectangle row in, and `program::launch` said so and
+/// refused rather than returning a plausible wrong answer:
+///
+/// > every row after the first would land 248312 elements short
+///
+/// `M3GroupLayout::vocab` is now the RECTANGLE's pitch and the emitted gather
+/// takes its row width from `intrinsic_desc.last`, so the two numbers are two.
+/// This asserts the consequence rather than the mechanism: the same two rows,
+/// staged at three different pitches, must produce the same fires and the same
+/// cells. A gather still striding by the declared width would read row 1 out
+/// of [`PADDING`] and could not.
+#[test]
+fn a_narrow_read_of_many_rows_lands_on_the_rectangles_own_rows() {
+    let _guard = serialized();
+    let Some(context) = device_or_skip("a narrow multi-row read") else {
+        return;
+    };
+    assert!(
+        WIDE_PITCH > VOCAB && !WIDE_PITCH.is_multiple_of(VOCAB),
+        "the wide staging has to be wider than the declared row and not a whole \
+         number of them, or it does not distinguish the two strides"
+    );
+
+    let tight = beam_at_pitch(&context, VOCAB);
+
+    // A pair of empty transcripts would agree about nothing.
+    assert!(
+        tight
+            .iter()
+            .any(|cell| cell.as_ref().is_some_and(|bytes| !bytes.is_empty())),
+        "{OVER_THE_CEILING} said nothing at all at the tight pitch, so this test \
+         compared two silences"
+    );
+
+    for pitch in [WIDE_PITCH, REAL_VOCAB_PITCH] {
+        let wide = beam_at_pitch(&context, pitch);
+        assert_eq!(
+            tight.len(),
+            wide.len(),
+            "{OVER_THE_CEILING} produced a different number of answers at pitch \
+             {VOCAB} and pitch {pitch}, so the two runs are not the same run"
+        );
+        for (index, (tight, wide)) in tight.iter().zip(&wide).enumerate() {
+            assert_eq!(
+                tight, wide,
+                "{OVER_THE_CEILING} answer {index} differs between a rectangle {VOCAB} \
+                 wide and one {pitch} wide, holding the same two rows. The gather is \
+                 striding by the reader's declared width rather than the rectangle's, \
+                 so row 1 is being read out of the padding"
+            );
+        }
+        println!(
+            "  {OVER_THE_CEILING}: {} answer(s) identical at pitch {VOCAB} and {pitch}",
+            tight.len()
+        );
+    }
 }
 
 #[test]

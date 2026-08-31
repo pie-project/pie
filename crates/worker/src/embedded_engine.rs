@@ -618,12 +618,12 @@ fn register_operator_adapters(
                     adapter.id
                 )
             })?;
-            planes.push(::runtime::engine::AdapterPlane {
+            planes.push(engine::AdapterPlane {
                 bank: bank.clone(),
                 bytes,
             });
         }
-        let registration = ::runtime::engine::AdapterRegistration {
+        let registration = engine::AdapterRegistration {
             id: adapter.id,
             planes,
         };

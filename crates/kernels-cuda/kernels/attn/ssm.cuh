@@ -113,7 +113,7 @@ __global__ void ssm_causal_conv1d_chunked_batched(
     const int* __restrict__ slot_ids,
     const u32* __restrict__ qo_indptr,
     long long slot_stride_elems,
-    int C, int K, bool write_state,
+    int C, int K, int dil, bool write_state,
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
     const int* begin_at)
@@ -156,10 +156,10 @@ __global__ void ssm_causal_conv1d_chunked_batched(
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
             if (k >= K) break;
-            const int src_t = t - (K - 1) + k;
+            const int src_t = t - (K - 1 - k) * dil;
             float xv = 0.f;
             if (src_t < 0) {
-                xv = Elem<T>::to_f32(state[(K + src_t) * C + c]);
+                xv = Elem<T>::to_f32(state[((K - 1) * dil + 1 + src_t) * C + c]);
             } else {
                 xv = Elem<T>::to_f32(x_r[src_t * C + c]);
             }
@@ -174,10 +174,11 @@ __global__ void ssm_causal_conv1d_chunked_batched(
     if (state_out_base && write_state &&
         (write_state_mask == nullptr || write_state_mask[r] != 0) &&
         tid == 0) {
-        for (int s = 0; s < K; ++s) {
-            const int src_t = Nr - K + s;
+        const int span = (K - 1) * dil + 1;
+        for (int s = 0; s < span; ++s) {
+            const int src_t = Nr - span + s;
             const float v = (src_t < 0)
-                ? Elem<T>::to_f32(state[(K + src_t) * C + c])
+                ? Elem<T>::to_f32(state[(span + src_t) * C + c])
                 : Elem<T>::to_f32(x_r[src_t * C + c]);
             state[s * C + c] = Elem<T>::from_f32(v);
         }
@@ -194,7 +195,7 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
     const int* __restrict__ slot_ids,
     const u32* __restrict__ qo_indptr,
     long long slot_stride_elems,
-    int C, int K, bool write_state,
+    int C, int K, int dil, bool write_state,
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
     const int* begin_at)
@@ -236,10 +237,10 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
             if (k >= K) break;
-            const int src_t = t - (K - 1) + k;
+            const int src_t = t - (K - 1 - k) * dil;
             float xv = 0.f;
             if (src_t < 0) {
-                xv = Elem<T>::to_f32(state[(K + src_t) * C + c]);
+                xv = Elem<T>::to_f32(state[((K - 1) * dil + 1 + src_t) * C + c]);
             } else {
                 xv = Elem<T>::to_f32(x_r[src_t * C + c]);
             }
@@ -250,12 +251,11 @@ __global__ void ssm_causal_conv1d_chunked_batched_channel_tile(
 
     if (state_out_base && write_state &&
         (write_state_mask == nullptr || write_state_mask[r] != 0)) {
-        #pragma unroll
-        for (int s = 0; s < 8; ++s) {
-            if (s >= K) break;
-            const int src_t = Nr - K + s;
+        const int span = (K - 1) * dil + 1;
+        for (int s = 0; s < span; ++s) {
+            const int src_t = Nr - span + s;
             const float v = (src_t < 0)
-                ? Elem<T>::to_f32(state[(K + src_t) * C + c])
+                ? Elem<T>::to_f32(state[(span + src_t) * C + c])
                 : Elem<T>::to_f32(x_r[src_t * C + c]);
             state[s * C + c] = Elem<T>::from_f32(v);
         }
@@ -271,7 +271,7 @@ __global__ void ssm_causal_conv1d_update_batched(
     const int* __restrict__ slot_ids,
     long long slot_stride_elems,
     T* __restrict__ y,
-    int R, int C, int K)
+    int R, int C, int K, int dil)
 {
     const int r = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -292,7 +292,7 @@ __global__ void ssm_causal_conv1d_update_batched(
         if (k >= K) break;
         float xv;
         if (k < K - 1) {
-            xv = Elem<T>::to_f32(state[(k + 1) * C + c]);
+            xv = Elem<T>::to_f32(state[(k * dil + 1) * C + c]);
         } else {
             xv = new_x;
         }
@@ -301,12 +301,11 @@ __global__ void ssm_causal_conv1d_update_batched(
     }
     y_r[c] = Elem<T>::from_f32(silu_f(acc));
 
-    #pragma unroll
-    for (int k = 0; k < 8; ++k) {
-        if (k >= K - 1) break;
+    const int span = (K - 1) * dil;
+    for (int k = 0; k < span; ++k) {
         state[k * C + c] = state[(k + 1) * C + c];
     }
-    state[(K - 1) * C + c] = Elem<T>::from_f32(new_x);
+    state[span * C + c] = Elem<T>::from_f32(new_x);
 }
 
 template <class T>

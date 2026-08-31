@@ -1,8 +1,9 @@
-//! **QWEN3.5'S PREPROCESSING, PINNED** — the campaign's goldens carried down to
-//! where they run without a GPU.
+//! **QWEN3.5'S PREPROCESSING ARITHMETIC, PINNED** — the campaign's goldens
+//! carried down to where they run without a GPU, beside the arithmetic they
+//! pin (`model::qwen_3::media`).
 //!
 //! ```text
-//! cargo test -p media-frontend --test qwen3_5_is_the_pinned_preprocessing
+//! cargo test -p model --test qwen3_5_media_is_the_pinned_arithmetic
 //! ```
 //!
 //! Three of these claims already existed in this tree and are carried rather
@@ -22,13 +23,29 @@
 //!   order written out independently below.
 //!
 //! The rest is new and pinned against `transformers` v5.15.1 directly:
-//! `smart_resize`'s own table, the per-patch vector layout, the grid
-//! arithmetic, and one real PNG through the whole pipe.
+//! `smart_resize`'s own table, the per-patch vector layout and the grid
+//! arithmetic. Every claim here is arithmetic on pixels the test wrote by
+//! hand; the WHOLE-PIPE gate — a real PNG through decode, the Catmull-Rom
+//! resample and this same arithmetic — rides in `runtime`'s
+//! `media_pipe_is_the_pinned_preprocessing`, because the codec is the host's
+//! (`model::media`'s own dependency rule).
 
-mod common;
+use model::qwen_3::media::{QwenVisionConfig, axis_taps, interp};
 
-use media_frontend::qwen3_5::{QwenVisionConfig, Qwen35Vision, axis_taps, interp};
-use media_frontend::{Budget, EncodedSpan, Fault, VisionFrontEnd};
+/// A ramp that makes every pixel of a small image distinct, so a golden can
+/// name which source pixel it expects in which patch lane. The same rule the
+/// whole-pipe gate's hand-written PNG uses in `runtime`'s
+/// `media_pipe_is_the_pinned_preprocessing`.
+mod common {
+    #[must_use]
+    pub fn ramp(x: u32, y: u32) -> [u8; 3] {
+        [
+            ((x * 7 + y * 13) % 251) as u8,
+            ((x * 31 + y * 3) % 251) as u8,
+            ((x + y * 97) % 251) as u8,
+        ]
+    }
+}
 
 /// `int(2304 ** 0.5)` — `Qwen3_5VisionModel.__init__`'s `num_grid_per_side`.
 const SIDE: usize = 48;
@@ -401,164 +418,4 @@ fn every_tap_is_in_range_and_every_rows_weights_sum_to_one() {
     }
     // `axis_taps`' size == 1 guard: index 0 of a length-1 axis maps to source 0.
     assert_eq!(axis_taps(0, 1, SIDE).1[0], 1.0);
-}
-
-/// **THE WHOLE PIPE, ON A REAL PNG.** Bytes this test wrote from the PNG
-/// specification (not from `image`'s encoder — see `common`), decoded,
-/// resized, patchified, and every stream's length checked against the geometry
-/// the same span reports.
-#[test]
-fn a_real_png_goes_through_the_whole_pipe() {
-    let fe = Qwen35Vision::new();
-    let c = fe.config;
-    let bytes = common::png_rgb(200, 120, common::ramp);
-    let span = fe
-        .encode_image(&bytes, Budget::Still)
-        .expect("a well-formed PNG encodes");
-
-    let (gh, gw) = c.patch_grid(120, 200).expect("servable");
-    assert_eq!(
-        c.smart_resize(120, 200).expect("servable"),
-        (224, 352),
-        "the resize policy"
-    );
-    assert_eq!((gh, gw), (14, 22));
-
-    assert_eq!(span.rows, gh * gw, "one payload row per pre-merge patch");
-    assert_eq!(span.patch_grid, media_frontend::Grid::still(gh, gw));
-    assert_eq!(
-        span.grid,
-        media_frontend::Grid::still(gh / 2, gw / 2),
-        "the merged grid is what the token rectangle sees"
-    );
-    assert_eq!(span.token_count, gh * gw / 4);
-    assert_eq!(span.position_span, (gw / 2).max(gh / 2));
-    assert!(span.uses_mrope, "qwen's trunk rotates on the triple");
-
-    assert_eq!(
-        span.payload.len(),
-        span.rows as usize * c.patch_width(),
-        "the payload is `rows · C·T·P²`"
-    );
-    assert_eq!(span.positions.len(), span.rows as usize * 2);
-    assert_eq!(span.embed_rows.len(), span.rows as usize * 4);
-    assert_eq!(span.embed_weights.len(), span.rows as usize * 4);
-    assert!(
-        span.payload.iter().all(|v| (-1.0..=1.0).contains(v)),
-        "normalized pixels live in [-1, 1]"
-    );
-    // Not a flat image: the ramp survived decode and resize.
-    let first = span.payload[0];
-    assert!(
-        span.payload.iter().any(|v| (v - first).abs() > 1e-3),
-        "the decoded image is uniform, so nothing downstream was exercised"
-    );
-}
-
-/// The delimiters are NAMED, not numbered, and `tokens()` is
-/// prefix + pad × token_count + suffix in whatever ids the bound tokenizer
-/// hands back (media-door §0, §2).
-#[test]
-fn the_span_spells_itself_out_of_the_tokenizers_own_ids() {
-    let fe = Qwen35Vision::new();
-    let d = fe.delimiters();
-    assert_eq!(d.prefix, "<|vision_start|>");
-    assert_eq!(d.placeholder, "<|image_pad|>");
-    assert_eq!(d.suffix, "<|vision_end|>");
-
-    let bytes = common::png_rgb(64, 64, common::ramp);
-    let mut span = fe.encode_image(&bytes, Budget::Still).expect("encodes");
-    // What the runtime does with `tokenizer.token_to_id` — two arbitrary
-    // checkpoint numberings, one of which is not the other.
-    span.spell_with(vec![151_652], 151_655, vec![151_653]);
-    let toks = span.tokens();
-    assert_eq!(toks.len(), 1 + span.token_count as usize + 1);
-    assert_eq!(toks[0], 151_652);
-    assert_eq!(*toks.last().expect("non-empty"), 151_653);
-    assert!(toks[1..toks.len() - 1].iter().all(|&t| t == 151_655));
-
-    let mut renumbered = span.clone();
-    renumbered.spell_with(vec![7], 8, vec![9]);
-    assert_ne!(span.tokens(), renumbered.tokens(), "the ids moved");
-    assert_eq!(
-        span.digest(),
-        renumbered.digest(),
-        "and the span did not — a digest is over the preprocessed span, never over its spelling"
-    );
-}
-
-/// **THE CACHE STATUTE'S KEY** (media-door §5). Two different images produce
-/// identical token lists; the digest is what tells them apart, and it is
-/// stable across runs because everything it hashes is deterministic
-/// arithmetic over deterministic bytes in a fixed byte order.
-#[test]
-fn the_digest_is_stable_and_separates_two_images_one_run_cannot() {
-    let fe = Qwen35Vision::new();
-    let one = fe
-        .encode_image(&common::png_rgb(96, 96, common::ramp), Budget::Still)
-        .expect("one");
-    let again = fe
-        .encode_image(&common::png_rgb(96, 96, common::ramp), Budget::Still)
-        .expect("again");
-    let other = fe
-        .encode_image(
-            &common::png_rgb(96, 96, |x, y| {
-                let mut p = common::ramp(x, y);
-                // One pixel of one channel, moved by one.
-                if x == 5 && y == 7 {
-                    p[1] = p[1].wrapping_add(1);
-                }
-                p
-            }),
-            Budget::Still,
-        )
-        .expect("other");
-
-    assert_eq!(one.digest().len(), 32, "blake3, the workspace's own hash");
-    assert_eq!(
-        one.digest(),
-        again.digest(),
-        "two encodings of one image must collide, or a correct cache hit looks like a bug"
-    );
-    assert_eq!(one.token_count, other.token_count);
-    let mut a = one.clone();
-    let mut b = other.clone();
-    a.spell_with(vec![1], 2, vec![3]);
-    b.spell_with(vec![1], 2, vec![3]);
-    assert_eq!(
-        a.tokens(),
-        b.tokens(),
-        "the ledger cannot tell two images apart"
-    );
-    assert_ne!(a.digest(), b.digest(), "and the statute's key must");
-}
-
-/// The refusals, by name.
-#[test]
-fn the_refusals_fire_by_name() {
-    let fe = Qwen35Vision::new();
-    let empty = fe
-        .encode_image(&[], Budget::Still)
-        .expect_err("zero bytes are refused");
-    assert_eq!(empty.name(), "Decode", "{empty}");
-
-    let garbage = fe
-        .encode_image(b"this is not a picture, it is a sentence", Budget::Still)
-        .expect_err("prose is refused");
-    assert_eq!(garbage.name(), "Decode", "{garbage}");
-    assert!(matches!(garbage, Fault::Decode(_)));
-}
-
-/// `budget` is ignored here, and that is a fact about qwen rather than an
-/// omission: its ceiling is `max_pixels`, and `Processor::for_arch_video`
-/// already answered one config for both.
-#[test]
-fn a_video_frame_is_the_same_preprocessing_as_a_still() {
-    let fe = Qwen35Vision::new();
-    let bytes = common::png_rgb(80, 60, common::ramp);
-    let still: EncodedSpan = fe.encode_image(&bytes, Budget::Still).expect("still");
-    let frame: EncodedSpan = fe
-        .encode_image(&bytes, Budget::VideoFrame)
-        .expect("a frame");
-    assert_eq!(still, frame);
 }

@@ -129,6 +129,7 @@ impl Run<'_> {
                 weight,
                 head_dim,
                 eps,
+                act,
                 y,
             } => elemwise::norm::rmsnorm_gated(
                 self.ctx(),
@@ -137,6 +138,7 @@ impl Run<'_> {
                 self.tensor(*weight),
                 *head_dim,
                 *eps,
+                matches!(act, model_ir::GateActivation::Sigmoid),
                 &mut self.tensor(*y),
             ),
             Elementwise::RmsnormGatedBy {
@@ -320,6 +322,62 @@ impl Run<'_> {
                 elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), &mut self.tensor(*x))
             }
             // ---- hc ----
+            Elementwise::RmsnormGroupedPlusOne {
+                x,
+                weight,
+                group,
+                eps,
+                y,
+            } => elemwise::norm::rmsnorm_grouped_plus_one(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*weight),
+                *group,
+                *eps,
+                &mut self.tensor(*y),
+            ),
+            Elementwise::SiluScaled { s, x, x_out: _ } => {
+                elemwise::norm::silu_scaled(self.ctx(), *s, &mut self.tensor(*x))
+            }
+            Elementwise::HcMix {
+                gates,
+                normed,
+                streams,
+                y,
+            } => elemwise::hc::mix(
+                self.ctx(),
+                self.tensor(*gates),
+                self.tensor(*normed),
+                *streams,
+                &mut self.tensor(*y),
+            ),
+            Elementwise::HcInject {
+                o,
+                gates,
+                streams,
+                hyper,
+                hyper_out: _,
+            } => elemwise::hc::inject(
+                self.ctx(),
+                self.tensor(*o),
+                self.tensor(*gates),
+                *streams,
+                &mut self.tensor(*hyper),
+            ),
+            Elementwise::PleGate {
+                key,
+                query,
+                value,
+                streams,
+                y,
+            } => elemwise::hc::ple_gate(
+                self.ctx(),
+                self.tensor(*key),
+                self.tensor(*query),
+                self.tensor(*value),
+                *streams,
+                &mut self.tensor(*y),
+            ),
             Elementwise::HcExpand { x, streams, y } => {
                 elemwise::hc::expand(self.ctx(), self.tensor(*x), *streams, &mut self.tensor(*y))
             }

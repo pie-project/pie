@@ -128,3 +128,12 @@ tokenizer = { path = "../tokenizer" }
 # projection that lets a stock safetensors snapshot BE one.
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
+# The guest-authoring surface, for ONE fixture `eta-compiler`'s golden corpus
+# does not hold: a single-lane pooled device-geometry epilogue. The corpus's
+# only member that binds the whole port class is `beam_epilogue`, which reads
+# its logits as `[B, V]` — two rows — and this plane's emitted intrinsic
+# handler has no row stride to be told (`program::launch` refuses it by name).
+# So `serve_smoke`'s device-geometry gate authors its subject rather than
+# quoting one, which is the same builder `eta-compiler`'s own goldens were
+# authored through.
+eta-dsl = { path = "../eta-dsl" }

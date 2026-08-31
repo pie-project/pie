@@ -3,7 +3,7 @@
 //!
 //! The contract declares every tensor the engine will bind and where its bytes
 //! come from; the compiler decides how to move them, and no part of it needs
-//! to know the model family. The declarer is `model::contract`, on this side
+//! to know the model family. The declarer is `checkpoint_dsl`, on this side
 //! of the ABI, so the contract is internal IR now, not an input a caller hands
 //! over. See `loader/spec.md` for the design rationale.
 //!
@@ -322,10 +322,28 @@ pub enum Expr {
     /// check both to know what it is holding. Composing the two nodes says
     /// the same thing and each one still denotes exactly one operation.
     ///
-    /// No per-block form. A per-block *scale* is dequantization, a real thing
-    /// a scheme defines; a per-block bias is not a thing any format publishes,
-    /// and a node with no caller is a claim nobody has checked.
-    Bias { src: Box<Expr>, by: u32 },
+    /// The per-block form arrived with its caller. This node's doc used to
+    /// close "a per-block bias is not a thing any format publishes" — and
+    /// then MLX's affine schemes were read on a plane whose kernels want
+    /// bf16: their dequantization is `code · scale + zero` with BOTH factors
+    /// per group, `.scales` and `.biases` beside every projection. So `Bias`
+    /// now ranks the way [`Expr::Scale`] does, one node at two ranks, and a
+    /// per-block `Scale` followed by a per-block `Bias` is how a contract
+    /// states an affine decode whose result LANDS dense.
+    Bias { src: Box<Expr>, by: BiasBy },
+}
+
+/// What [`Expr::Bias`] adds — [`ScaleFactor`]'s shape, for its reason: the
+/// two cases are one operation at two ranks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BiasBy {
+    /// One compile-time constant for every element, as [`f32::to_bits`].
+    Uniform(u32),
+    /// One addend per block, read from a declared tensor — the zero-point
+    /// half of an affine decode, as the per-block [`ScaleFactor`] is the
+    /// scale half. The same declaration rule holds: the addends must be a
+    /// tensor that exists ([`Expr::Out`]).
+    PerBlock { by: Box<Expr> },
 }
 
 /// What [`Expr::Scale`] multiplies by.
@@ -805,8 +823,14 @@ impl Expr {
             | Expr::Select { src, .. }
             | Expr::Transmute { src, .. }
             | Expr::Repack { src, .. }
-            | Expr::Cast { src, .. }
-            | Expr::Bias { src, .. } => src.is_sharded(),
+            | Expr::Cast { src, .. } => src.is_sharded(),
+            Expr::Bias { src, by } => {
+                src.is_sharded()
+                    || match by {
+                        BiasBy::Uniform(_) => false,
+                        BiasBy::PerBlock { by } => by.is_sharded(),
+                    }
+            }
             Expr::Scale { src, factor } => {
                 src.is_sharded()
                     || match factor {
@@ -927,7 +951,16 @@ impl Expr {
     pub fn bias(self, by: f32) -> Self {
         Expr::Bias {
             src: Box::new(self),
-            by: by.to_bits(),
+            by: BiasBy::Uniform(by.to_bits()),
+        }
+    }
+
+    /// Add `by`, one addend per block, blocked by the shape ratio — the
+    /// zero-point half of an affine decode.
+    pub fn bias_per_block(self, by: Expr) -> Self {
+        Expr::Bias {
+            src: Box::new(self),
+            by: BiasBy::PerBlock { by: Box::new(by) },
         }
     }
 
@@ -1009,8 +1042,13 @@ impl Expr {
             | Expr::Repack { src, .. }
             | Expr::Shard { src, .. }
             | Expr::Select { src, .. }
-            | Expr::Cast { src, .. }
-            | Expr::Bias { src, .. } => src.visit(seen),
+            | Expr::Cast { src, .. } => src.visit(seen),
+            Expr::Bias { src, by } => {
+                src.visit(seen);
+                if let BiasBy::PerBlock { by } = by {
+                    by.visit(seen);
+                }
+            }
             Expr::Scale { src, factor } => {
                 src.visit(seen);
                 if let ScaleFactor::PerBlock { by } = factor {
@@ -1107,7 +1145,10 @@ impl Expr {
             },
             Expr::Bias { src, by } => Expr::Bias {
                 src: boxed(src)?,
-                by,
+                by: match by {
+                    BiasBy::PerBlock { by } => BiasBy::PerBlock { by: boxed(by)? },
+                    uniform => uniform,
+                },
             },
             Expr::Shard { src, axis } => Expr::Shard {
                 src: boxed(src)?,

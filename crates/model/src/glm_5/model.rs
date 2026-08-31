@@ -334,34 +334,33 @@ impl Model {
     pub fn load(
         &self,
         src: &ztensor::Source,
-    ) -> Result<ModelContract, crate::contract::ModelError> {
-        let tp = self.tp;
-        let claim = |w: &Weight| crate::contract::claim(w, tp);
-        let mut claims = Vec::new();
-        claims.push(claim(&self.embed));
-        claims.push(claim(&self.final_norm));
-        claims.push(claim(&self.head));
+    ) -> Result<ModelContract, checkpoint_dsl::Error> {
+        let mut b = checkpoint_dsl::Builder::new(src, self.tp);
+        let mut claim = |w: &Weight| b.read_own(w);
+        claim(&self.embed)?;
+        claim(&self.final_norm)?;
+        claim(&self.head)?;
         for layer in &self.layers {
             let attn = &layer.attn;
             let index = &attn.indexer;
-            claims.push(claim(&layer.attn_norm));
-            claims.push(claim(&layer.mlp_norm));
-            claims.push(claim(&attn.q_a_proj));
-            claims.push(claim(&attn.q_a_norm));
-            claims.push(claim(&attn.q_b_proj));
-            claims.push(claim(&attn.kv_a_proj));
-            claims.push(claim(&attn.kv_a_norm));
-            claims.push(claim(&attn.kv_b_proj));
-            claims.push(claim(&attn.o_proj));
-            claims.push(claim(&index.q_proj));
-            claims.push(claim(&index.k_proj));
-            claims.push(claim(&index.weights_proj));
-            claims.push(claim(&index.k_norm));
-            claims.push(claim(&index.k_norm_bias));
+            claim(&layer.attn_norm)?;
+            claim(&layer.mlp_norm)?;
+            claim(&attn.q_a_proj)?;
+            claim(&attn.q_a_norm)?;
+            claim(&attn.q_b_proj)?;
+            claim(&attn.kv_a_proj)?;
+            claim(&attn.kv_a_norm)?;
+            claim(&attn.kv_b_proj)?;
+            claim(&attn.o_proj)?;
+            claim(&index.q_proj)?;
+            claim(&index.k_proj)?;
+            claim(&index.weights_proj)?;
+            claim(&index.k_norm)?;
+            claim(&index.k_norm_bias)?;
             match &layer.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    claims.push(claim(gate_up));
-                    claims.push(claim(down));
+                    claim(gate_up)?;
+                    claim(down)?;
                 }
                 Mlp::Routed {
                     router,
@@ -370,16 +369,16 @@ impl Model {
                     shared,
                     ..
                 } => {
-                    claims.push(claim(router));
-                    claims.push(claim(gate_up));
-                    claims.push(claim(down));
+                    claim(router)?;
+                    claim(gate_up)?;
+                    claim(down)?;
                     if let Some(shared) = shared {
-                        claims.push(claim(&shared.gate_up));
-                        claims.push(claim(&shared.down));
+                        claim(&shared.gate_up)?;
+                        claim(&shared.down)?;
                     }
                 }
             }
         }
-        crate::contract::elaborate(src, claims)
+        Ok(b.build())
     }
 }

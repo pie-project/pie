@@ -660,6 +660,7 @@ impl Run<'_> {
                 weight,
                 state,
                 conv_width,
+                dilation,
                 y,
             } => attn::ssm::causal_conv1d(
                 self.ctx(),
@@ -667,6 +668,7 @@ impl Run<'_> {
                 self.tensor(*weight),
                 &self.recurrent(*state),
                 *conv_width,
+                *dilation,
                 &mut self.tensor(*y),
             ),
             // **WHERE THE BUFFER TOUCHES THE FORWARD, HALF OF TWO** (alto
@@ -696,6 +698,7 @@ impl Run<'_> {
                 weight,
                 state,
                 conv_width,
+                dilation,
                 y,
             } => {
                 self.rs_move("attention.ssm_causal_conv1d_chunked", *x, self.tensor(*x))?;
@@ -706,6 +709,7 @@ impl Run<'_> {
                     self.tensor(*weight),
                     &self.recurrent(*state),
                     *conv_width,
+                    *dilation,
                     &mut self.tensor(*y),
                 )?;
                 let Some(tail) = tail else { return Ok(()) };
@@ -715,7 +719,67 @@ impl Run<'_> {
                     self.tensor(*weight),
                     &tail,
                     *conv_width,
+                    *dilation,
                     &mut self.tensor(*y),
+                )
+            }
+            // The n-gram hasher: token ids against the lane's trailing
+            // window, the same state discipline the convolution above keeps
+            // — decode shifts unconditionally, chunked advances only over
+            // the committed prefix and re-covers the tail.
+            Attention::PleNgramIds {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                ngram_ids,
+            } => kernels_cuda::attn_ple::ngram_ids(
+                self.ctx(),
+                self.tensor(*ids),
+                &self.recurrent(*state),
+                *eos,
+                mults,
+                primes,
+                offsets,
+                *heads_per_ngram,
+                &mut self.tensor(*ngram_ids),
+            ),
+            Attention::PleNgramIdsChunked {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                ngram_ids,
+            } => {
+                let tail = self.recurrent_tail(*state);
+                kernels_cuda::attn_ple::ngram_ids_chunked(
+                    self.ctx(),
+                    self.ragged(*ids),
+                    &self.recurrent(*state),
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    &mut self.tensor(*ngram_ids),
+                )?;
+                let Some(tail) = tail else { return Ok(()) };
+                kernels_cuda::attn_ple::ngram_ids_chunked(
+                    self.ctx(),
+                    self.ragged(*ids),
+                    &tail,
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    &mut self.tensor(*ngram_ids),
                 )
             }
             // The other half: `ba` is the `[b | a]` projection — dev's `a`

@@ -425,6 +425,33 @@ pub struct Seated<'a> {
     /// Beside [`mask`](Seated::mask) and [`adapter`](Seated::adapter) for
     /// their reason, and checked in both directions like theirs.
     pub captures_scores: bool,
+    /// **THE WORKING SET'S FLAT TABLE: entry `i` is the pool page backing this
+    /// lane's guest-relative index `i`** ([`engine::KvDelta::translation`]).
+    ///
+    /// Empty for every lane whose page references the runtime has already
+    /// resolved, which is every lane of every class but one. A guest never
+    /// holds a pool page id — `kv-working-set`'s whole surface is
+    /// working-set-RELATIVE indexes, and an O(1) fork is possible precisely
+    /// because a relative index survives the copy that moves the physical page
+    /// under it — so somebody has to cross between the two spaces, and for
+    /// every host-resolved geometry that somebody is the runtime
+    /// (`pipeline::fire::map_lane_pages` rewrites the folded `Pages` port into
+    /// [`pages`](Seated::pages) before it submits).
+    ///
+    /// [`GeometryClass::DeviceGeometry`](eta_ir::registry::GeometryClass) is
+    /// the one class where it cannot be: the lane's page ids and its write
+    /// descriptor are computed by the guest's own epilogue and live in a
+    /// channel cell no host reads. So the runtime ships the TABLE instead of
+    /// the result and the crossing happens here, once, on the two ports that
+    /// carry page references (`pages` and `w_slot`).
+    ///
+    /// **THE MAPPING HAS ONE OWNER** (article 8): the KV store mints it and
+    /// this shell may only INDEX it. An index the table does not cover is a
+    /// refusal by name, and an EMPTY table beside device-resolved page
+    /// references is that same refusal — "translate by identity" is the bug
+    /// this field exists to end, and a lane addressing pool pages `0, 1, ...`
+    /// is a lane reading somebody else's cache.
+    pub translation: &'a [u32],
 }
 
 impl<'a> Seated<'a> {
@@ -441,6 +468,7 @@ impl<'a> Seated<'a> {
             positions: &[],
             readout: None,
             captures_scores: false,
+            translation: &[],
         }
     }
 
@@ -2444,16 +2472,18 @@ impl Shell {
         //     apart. `drive` stages with no attachments at all, so the
         //     recorder, the builder and the replay pay nothing here.
         //
-        //     **AND ONE ATTACHMENT IS ONE LANE ON THIS PLANE.** This shell
-        //     claims [`PortMask::DECODE_ENVELOPE`] and not
-        //     `DEVICE_GEOMETRY`: the row split is the submission's (a
-        //     decode-envelope lane carries placeholder ids and therefore
-        //     carries its own count) and the page table is the SHELL's, so
-        //     there is no `embed_indptr` to widen an attachment across lanes
-        //     the way the CUDA twin's beam search does. An instance names the
-        //     lane it was attached at and no other.
+        //     **AND AN ATTACHMENT NAMES A MEMBER, NOT A LANE.** The runtime
+        //     attaches one instance per MEMBER and points it at the member's
+        //     FIRST lane, because a program's stages are one pass with one
+        //     commit however many row groups it fires. A decode-envelope
+        //     member is one lane and the two readings coincided; a
+        //     device-geometry one need not be — a beam search binds `B` lanes
+        //     through one program — and the instance's own `embed_indptr` port
+        //     is what says how many and where each one's rows lie. So the map
+        //     below is per lane and carries the lane's INDEX WITHIN ITS MEMBER
+        //     beside the envelope.
         let mut resolved: Vec<crate::program::Envelope> = Vec::new();
-        let mut envelope_of: Vec<Option<usize>> = vec![None; lanes.len()];
+        let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         if !attachments.is_empty() {
             let instances: Vec<u64> = attachments.iter().map(|a| a.instance).collect();
             self.fence_instances(&instances)?;
@@ -2461,39 +2491,183 @@ impl Shell {
                 let Some(envelope) = self.programs.envelope(attached.instance)? else {
                     continue;
                 };
-                let at = attached.lane as usize;
-                let Some(slot) = envelope_of.get_mut(at) else {
+                let first = attached.lane as usize;
+                let carried = envelope.lanes();
+                if first + carried > lanes.len() {
                     return Err(Fault::program(
                         "serve::prepare",
                         format!(
-                            "instance {} is attached at lane {at} and this fire carries \
-                             {} lane(s); its descriptor ports have no rows to describe",
+                            "instance {} is attached at lane {first} and its \
+                             `embed_indptr` port describes {carried} lane(s), which runs \
+                             past the {} this fire carries; its descriptor ports have no \
+                             rows to describe",
                             attached.instance,
                             lanes.len()
                         ),
                     ));
-                };
-                if slot.is_some() {
-                    return Err(Fault::program(
-                        "serve::prepare",
-                        format!(
-                            "lane {at} is claimed by two attached instances, the second \
-                             being {}; a lane's descriptor ports have one author, and \
-                             two would decide the same rows twice",
-                            attached.instance
-                        ),
-                    ));
                 }
-                *slot = Some(resolved.len());
+                let held = resolved.len();
+                for lane in 0..carried {
+                    if envelope_of[first + lane].is_some() {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "lane {} is claimed by two attached instances, the second \
+                                 being {}; a lane's descriptor ports have one author, and \
+                                 two would decide the same rows twice",
+                                first + lane,
+                                attached.instance
+                            ),
+                        ));
+                    }
+                    envelope_of[first + lane] = Some((held, lane));
+                }
                 resolved.push(envelope);
             }
         }
 
+        // 0c. **THE TWO DEVICE-RESOLVED PAYLOADS, LIFTED OUT OF THE RINGS AND
+        //     OWNED HERE.** A page table and a masking are the only two things
+        //     a port resolves that the fire path holds by REFERENCE — `tables`
+        //     borrows the submission's page list, `mask::LaneMask` borrows the
+        //     submission's `Masking` — and a device-resolved one is in neither
+        //     submission nor rings by the time the lane loop and
+        //     `kv::geometry_with` want it. So they are built once, here,
+        //     indexed by SUBMISSION lane, and the loop below borrows out of
+        //     these vectors exactly as it borrows out of the submission.
+        //
+        //     **THE MASK IS RUN-LENGTH ENCODED AND NOT SEPARATELY EXPANDED**
+        //     (`crate::mask::from_dense`): the whole claim a device mask has
+        //     to answer is that it reaches the attention arm as the same dense
+        //     plane a host-stated mask of the same bools reaches it as, and
+        //     sharing the expansion is how that stops being a thing to test
+        //     and starts being a thing that is true.
+        //
+        //     **AND THE ROW COUNT COMES WITH THEM, FOR THIS CLASS ONLY.** A
+        //     decode-envelope lane's submission carries placeholder ids and
+        //     therefore carries its own row count, which is why nothing about
+        //     that class changes. A pooled device-GEOMETRY submission carries
+        //     no row split at all — the runtime ships `Lane::tokens` empty for
+        //     every lane, because the split is the instance's own
+        //     `embed_indptr` port and the runtime has no more claim on it than
+        //     it has on the page table beside it. So the count is read off the
+        //     port HERE, before `compose`, because `compose` is what turns
+        //     counts into windows and row offsets and there is no later
+        //     instant at which a row can appear.
+        //
+        //     **AND THIS IS WHERE THE TWO PAGE SPACES MEET.** A guest holds
+        //     WORKING-SET-RELATIVE indexes and never a pool page id — that is
+        //     `kv-working-set`'s whole surface, and it is what makes an O(1)
+        //     copy-on-write fork possible, because a relative index survives
+        //     the copy that moves the physical page under it. Everything below
+        //     this line is in the POOL's space: `store::kv::geometry_with`
+        //     pushes a table entry straight into the page CSR and the append
+        //     writes through `write_page` with no lookup. For every
+        //     host-resolved geometry the runtime crosses between them before
+        //     it submits (`pipeline::fire::map_lane_pages`); for THIS class it
+        //     cannot, because the values are in a cell no host read, so it
+        //     ships the table ([`Seated::translation`]) and the crossing
+        //     happens here — once, on the two ports that carry page
+        //     references.
+        let mut device_pages: Vec<Option<Vec<u32>>> = vec![None; lanes.len()];
+        let mut device_writes: Vec<Option<(Vec<u32>, Vec<u32>)>> = vec![None; lanes.len()];
+        let mut device_masks: Vec<Option<Masking>> = vec![None; lanes.len()];
+        let mut lane_rows: Vec<u32> = lanes
+            .iter()
+            .map(|seated| seated.lane.tokens.len() as u32)
+            .collect();
+        for source in 0..lanes.len() {
+            let Some((held, at)) = envelope_of[source] else {
+                continue;
+            };
+            let ports = resolved[held].lane(at, source)?;
+            let table = lanes[source].translation;
+            // A RELATIVE INDEX THE TABLE DOES NOT COVER IS A REFUSAL, and so
+            // is a lane with page references and no table at all: "translate
+            // by identity" is the bug this crossing exists to end, and an
+            // empty table would spell it silently.
+            let translate = |page: u32, port: &str| -> Result<u32> {
+                table.get(page as usize).copied().ok_or_else(|| {
+                    Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source}'s `{port}` port names working-set page {page} \
+                             and the table this fire was handed maps {} page(s); a guest \
+                             holds relative indexes and the pool's ids are the runtime's, \
+                             so an index past the table addresses somebody else's cache",
+                            table.len()
+                        ),
+                    )
+                })
+            };
+            device_pages[source] = ports
+                .pages()?
+                .map(|relative| {
+                    relative
+                        .iter()
+                        .map(|&page| translate(page, "pages"))
+                        .collect::<Result<Vec<u32>>>()
+                })
+                .transpose()?;
+            if ports.owns_pages() {
+                lane_rows[source] = ports.rows();
+            }
+            let rows = lane_rows[source] as usize;
+            // The write descriptor crosses with them: `w_slot` is a page
+            // reference like `pages` is — a beam search builds it as
+            // `gather(pool_ids, wpos / page_size)` out of the same
+            // `ws.reserve` grant — while `w_off` is an offset inside a page
+            // and is in no space at all.
+            device_writes[source] = ports
+                .writes(rows)?
+                .map(|(slots, offsets)| {
+                    Ok::<(Vec<u32>, Vec<u32>), Fault>((
+                        slots
+                            .iter()
+                            .map(|&page| translate(page, "w_slot"))
+                            .collect::<Result<Vec<u32>>>()?,
+                        offsets.to_vec(),
+                    ))
+                })
+                .transpose()?;
+            if let Some((cells, stride)) = ports.mask(rows)? {
+                // **ONE ROW A LANE, AND THE REFUSAL IS THE CAUSAL BOUND.**
+                // `mask::stage` intersects every restriction with
+                // `k <= have + q`, which is the order the cache is written in
+                // — and a device-geometry lane's write order is the guest's
+                // (`w_slot`/`w_off`), so for `q > 0` this shell has no bound
+                // it can honestly derive. On a ONE-row lane the term is
+                // vacuous (`have + 0` is the whole extent, because `have` is
+                // `kv_len - 1`). Every device-geometry shape this tree admits
+                // is one row a lane (`lease::detect_pooled_device_geometry`
+                // requires a rank-1 `[lanes]` token channel), so the wider
+                // case is refused by name rather than served with a bound
+                // nobody stated.
+                if rows != 1 {
+                    return Err(Fault::program(
+                        "serve::prepare",
+                        format!(
+                            "lane {source} resolves its attention mask from a channel and \
+                             carries {rows} query rows; the expansion intersects each row \
+                             with the order the cache is written in, and a lane whose \
+                             write descriptor is the guest's has no such order this shell \
+                             can derive"
+                        ),
+                    ));
+                }
+                device_masks[source] = Some(crate::mask::from_dense(cells, stride));
+            }
+        }
+
         // 1. Lane words in. `compose` is arithmetic over a `Vec` of them:
-        //    words to classes, classes to an order, counts to prefix sums.
+        //    words to classes, classes to an order, counts to prefix sums. The
+        //    count is the submission's for every lane but a device-geometry
+        //    one, whose row split was read off its own `embed_indptr` port a
+        //    few lines up.
         let submitted: Vec<FireLane> = lanes
             .iter()
-            .map(|seated| FireLane::new(seated.lane.word, seated.lane.tokens.len() as u32))
+            .zip(&lane_rows)
+            .map(|(seated, &rows)| FireLane::new(seated.lane.word, rows))
             .collect();
         let composition = compose(&self.compiled, &self.budget, &submitted)?;
         let descriptor = FireDescriptor::of(&composition);
@@ -2503,7 +2677,12 @@ impl Shell {
         // 2. The fire's own vectors, in fire order — which is the seriated
         //    order the composition chose, not the order the runtime submitted.
         let mut seats: Vec<Seat> = Vec::with_capacity(lanes.len());
-        let mut tables: Vec<&[u32]> = Vec::with_capacity(lanes.len());
+        // THE PAGE TABLES, BORROWED OR OWNED. Every lane before the
+        // device-geometry class borrowed the submission's list; a lane whose
+        // pages came off its own rings has a translated vector of its own and
+        // nothing to borrow it from, so the axis is a `Cow` and every other
+        // lane still costs an allocation of nothing.
+        let mut tables: Vec<std::borrow::Cow<'_, [u32]>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         let mut slot_ids: Vec<i32> = Vec::with_capacity(lanes.len());
@@ -2537,25 +2716,81 @@ impl Shell {
         // acted on: zeroing a slot's recurrent banks is a side effect, and
         // article 4 says nothing may happen before admission has passed.
         let mut beginning: Vec<u32> = Vec::new();
+        // THE EXPLICIT WRITE DESCRIPTOR, ONE ENTRY PER TOKEN ROW IN FIRE
+        // ORDER: `Some((page, offset))` for a row whose lane resolved
+        // `w_slot`/`w_off` off its rings, `None` for every row whose landing
+        // place `store::kv::geometry_with` derives. All `None` is every fire
+        // this shell fired before the device-geometry class.
+        let mut writes: Vec<Option<(i32, i32)>> = Vec::with_capacity(rows as usize);
         for row in composition.lanes() {
-            let seated = &lanes[row.source as usize];
+            let source = row.source as usize;
+            let seated = &lanes[source];
             let lane = &seated.lane;
+            // THIS LANE'S RESOLVED PORTS, CUT TO ITS OWN ROWS — `None` for a
+            // lane whose instance was bound `GeometryClass::Host` and for one
+            // with no attachment at all, and then every line below reads the
+            // submission exactly as it always did, byte for byte.
+            let ports = match envelope_of[source] {
+                Some((held, at)) => Some(resolved[held].lane(at, source)?),
+                None => None,
+            };
             // WHO KNOWS HOW LONG THE SEQUENCE IS depends on who owns its
             // pages. A shell-owned slot is one the shell opened and has been
             // counting ever since; a caller-owned one is a page table the
             // caller forked, trimmed or restored between fires, and its own
             // count is the only one that is right.
-            let have = match seated.held {
-                Some(held) => held,
-                None => self
-                    .held
-                    .get(lane.slot as usize)
-                    .copied()
-                    .ok_or(Fault::Ceiling {
-                        what: "slots",
-                        need: u64::from(lane.slot) + 1,
-                        have: self.held.len() as u64,
-                    })?,
+            //
+            // **AND A DEVICE-GEOMETRY LANE'S IS ITS OWN `kv_len` PORT, MINUS
+            // THIS FIRE'S ROWS.** `have` is not a fact this shell can hold for
+            // such a lane: `self.held` counts the slots whose page table is
+            // the shell's, and the runtime's `KvDelta::held` is zero because
+            // the runtime could not know it either — the extent is device
+            // data, computed by the epilogue that decided where the rows land.
+            // What the fire actually needs `have` for is `after = have + rows`
+            // (the page count, the last page's fill, the stated kv length), so
+            // the honest reading is to take the extent the guest states and
+            // derive `have` back from it. `store::kv::geometry_with` then
+            // computes exactly the same three numbers it computes for every
+            // other lane.
+            let have = match ports.as_ref().filter(|ports| ports.owns_pages()) {
+                Some(ports) => {
+                    let after = ports.extent().ok_or_else(|| {
+                        Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "lane {source} states its own page table and binds no \
+                                 `kv_len` port; the page count, the last page's fill and \
+                                 the attention schedules are all carved from the extent, \
+                                 and no seat in this shell knows it"
+                            ),
+                        )
+                    })?;
+                    if after < row.rows {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "lane {source} states a readable KV extent of {after} on \
+                                 its `kv_len` port and this fire writes {} row(s) into \
+                                 it; the extent is AFTER the append, so it can never be \
+                                 shorter than what the append adds",
+                                row.rows
+                            ),
+                        ));
+                    }
+                    after - row.rows
+                }
+                None => match seated.held {
+                    Some(held) => held,
+                    None => self
+                        .held
+                        .get(lane.slot as usize)
+                        .copied()
+                        .ok_or(Fault::Ceiling {
+                            what: "slots",
+                            need: u64::from(lane.slot) + 1,
+                            have: self.held.len() as u64,
+                        })?,
+                },
             };
             debug_assert_eq!(
                 row.row_offset as usize,
@@ -2582,20 +2817,39 @@ impl Shell {
                 have,
                 rows: row.rows,
             });
-            tables.push(seated.pages);
+            // THE PAGE TABLE, FROM WHICHEVER AUTHOR HAS ONE. A
+            // device-geometry lane's is the cell its `pages`/`page_indptr`
+            // ports resolved to, translated into pool ids at step 0c, and its
+            // submission's is empty; every other lane's is the submission's,
+            // unchanged, and an empty table is still the shell's own
+            // block-per-slot paging.
+            tables.push(match &device_pages[source] {
+                Some(pages) => std::borrow::Cow::Owned(pages.clone()),
+                None => std::borrow::Cow::Borrowed(seated.pages),
+            });
             // THE WORD AND THE MASK, CHECKED AGAINST EACH OTHER, ONCE.
             // `compose` already refused a word this artifact has no class
             // for; what it cannot know is whether the class it resolved to
             // reads a mask. Both directions are a wrong answer that looks
             // like a right one, so both are refused.
+            //
+            // **AND THE MASK IT ASKS ABOUT IS THE EFFECTIVE ONE.** A
+            // device-resolved mask reaches this shell on a channel and NOT on
+            // `Seated::mask`, while the lane's word says `masked` all the same
+            // — the runtime stamps it from the same lowering that decided the
+            // mask was device-carried (`stamp_lane_words`'s `fire_wide_mask`).
+            // Asking `seated.mask` alone would refuse every such fire by name
+            // for the one reason that is not true of it: that nobody stated a
+            // mask.
+            let masking = device_masks[source].as_ref().or(seated.mask);
             let runs_masked_arm = self.masked.contains(row.class as usize);
-            if seated.mask.is_some() && self.masked.is_empty() {
+            if masking.is_some() && self.masked.is_empty() {
                 // The ARTIFACT's refusal and not the plane's: there is
                 // nowhere for a masked lane's rows to run, whatever the word
                 // says, so this names the bake rather than the class.
                 return Err(Fault::Maskless { lane: row.source });
             }
-            if seated.mask.is_some() != runs_masked_arm {
+            if masking.is_some() != runs_masked_arm {
                 return Err(Fault::MaskWord {
                     lane: row.source,
                     word: lane.word,
@@ -2603,7 +2857,7 @@ impl Shell {
                 });
             }
             masks.push(crate::mask::LaneMask {
-                mask: seated.mask,
+                mask: masking,
                 have,
                 rows: row.rows,
             });
@@ -2688,9 +2942,8 @@ impl Shell {
             // rectangles and its page CSR at `row.rows`, so a port that hands
             // back a different count is refused rather than fitted.
             let rows_here = row.rows as usize;
-            let ports = envelope_of[row.source as usize].map(|held| &resolved[held]);
-            match ports {
-                Some(envelope) => {
+            match ports.as_ref() {
+                Some(ports) => {
                     // TWO AUTHORS FOR ONE VECTOR IS A REFUSAL, NOT A
                     // PRECEDENCE RULE. `positions_for` answers the port's run
                     // or the derived one, and a submission that also states
@@ -2702,32 +2955,52 @@ impl Shell {
                         return Err(Fault::program(
                             "serve::prepare",
                             format!(
-                                "lane {} is bound in a device-resolved geometry class \
-                                 and its submission also states {} position(s); the \
+                                "lane {source} is bound in a device-resolved geometry \
+                                 class and its submission also states {} position(s); the \
                                  class says the device resolves them, so honouring the \
                                  submission would drop what the guest wrote and \
                                  honouring the port would drop what the caller stated",
-                                row.source,
                                 seated.positions.len()
                             ),
                         ));
                     }
-                    // THE EXTENT IS A CHECK AND NOT A SOURCE: this shell owns
-                    // a decode-envelope lane's page table, so `have + rows` —
-                    // the seat's own arithmetic — is what the page CSR, the
-                    // write descriptor and the attention schedules are all
-                    // carved from. Taking the guest's number instead would
-                    // let one port disagree with the four the shell derives.
-                    envelope.check_extent(row.source as usize, have.saturating_add(row.rows))?;
-                    for &token in envelope.tokens_for(row.source as usize, rows_here)? {
+                    // THE EXTENT IS A CHECK WHERE THE SEAT OWNS IT AND THE
+                    // SOURCE `have` WAS DERIVED FROM WHERE THE GUEST DOES:
+                    // this shell owns a decode-envelope lane's page table, so
+                    // `have + rows` — the seat's own arithmetic — is what the
+                    // page CSR, the write descriptor and the attention
+                    // schedules are all carved from, and taking the guest's
+                    // number instead would let one port disagree with the four
+                    // the shell derives. On a device-geometry lane the check
+                    // is an identity and is made anyway, because an identity
+                    // that stopped holding is the first thing anybody would
+                    // want to hear about.
+                    ports.check_extent(have.saturating_add(row.rows))?;
+                    for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
                     }
-                    match envelope.positions_for(row.source as usize, have, rows_here)? {
+                    match ports.positions_for(have, rows_here)? {
                         Some(stated) => {
                             positions.extend(stated.iter().map(|&at| narrow(u64::from(at))));
                         }
                         None => positions
                             .extend((0..rows_here).map(|at| narrow(u64::from(have) + at as u64))),
+                    }
+                    // THE WRITE DESCRIPTOR, KEPT IN FIRE ROW ORDER FOR THE
+                    // PATCH BELOW — already translated into pool pages at step
+                    // 0c, which is the one place a page reference crosses
+                    // spaces. It cannot be applied here: the vectors it
+                    // overwrites are `kv::geometry_with`'s, and that call wants
+                    // the whole seat list. `None` for a lane that binds no
+                    // `w_slot`/`w_off`, and then the seat's own `have + row`
+                    // arithmetic stands for its rows.
+                    match &device_writes[source] {
+                        Some((slots, offsets)) => {
+                            writes.extend(slots.iter().zip(offsets).map(|(&page, &off)| {
+                                Some((narrow(u64::from(page)), narrow(u64::from(off))))
+                            }));
+                        }
+                        None => writes.extend(std::iter::repeat_n(None, rows_here)),
                     }
                     for _ in 0..rows_here {
                         request_of_token.push(at_lane);
@@ -2744,6 +3017,7 @@ impl Shell {
                         request_of_token.push(at_lane);
                         slot_of_row.push(lane.slot as i32);
                     }
+                    writes.extend(std::iter::repeat_n(None, rows_here));
                 }
             }
         }
@@ -2763,8 +3037,24 @@ impl Shell {
         //     The refusals are the ones `kv::geometry_with` raises a dozen
         //     lines below, to the variant and to the string; what moving them
         //     here buys is the INSTANT, which is before the first `memset`.
+        //     **AND THE WRITE DESCRIPTOR IS A THIRD SOURCE OF PAGE IDS**, so
+        //     it is watermarked with the other two. A device-geometry lane's
+        //     `w_slot` is a page reference the guest computed, and while every
+        //     shape this tree admits states one that is already in that lane's
+        //     page run, "already in the run" is not something this loop can
+        //     see: `geometry_with` reads only `table[..pages]`, and a
+        //     descriptor naming a page past that prefix would be an append
+        //     into address space with nothing behind it — the one failure a
+        //     watermark exists to make impossible, and one no kernel would
+        //     fault on.
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         let paging = self.pools.paging();
+        let written = writes
+            .iter()
+            .flatten()
+            .map(|&(page, _)| u64::from(page.max(0) as u32).saturating_add(1))
+            .max()
+            .unwrap_or(0);
         let demand = Demand {
             kv_pages: seats
                 .iter()
@@ -2783,6 +3073,7 @@ impl Shell {
                             .map_or(0, |page| u64::from(page).saturating_add(1))
                     }
                 })
+                .chain(std::iter::once(written))
                 .max()
                 .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
             state_slots: seats
@@ -2824,9 +3115,55 @@ impl Shell {
         //    vectors coincide; the loop is per space because the geometry
         //    seat is.
         let indptr_host = kv::indptr(&seats);
-        let geometries = (0..self.spaces)
-            .map(|_| kv::geometry_with(&paging, &seats, &tables))
+        let table_refs: Vec<&[u32]> = tables.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut geometries = (0..self.spaces)
+            .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
             .collect::<Result<Vec<_>>>()?;
+        // 3b. **THE EXPLICIT WRITE DESCRIPTOR, OVER THE DERIVED ONE.**
+        //
+        //     `geometry_with` lands row `r` of a lane at flat position
+        //     `have + r` of that lane's page run, which is right for every
+        //     sequence that appends to its own tail and WRONG the moment
+        //     several lanes append into one shared pool: a beam search's `B`
+        //     lanes all state the same extent, so `have + 0` names one cell
+        //     for all of them and `B - 1` beams would overwrite the first. The
+        //     guest computes `w_slot`/`w_off` in its own epilogue for exactly
+        //     that reason, and this is where its answer replaces the derived
+        //     one — after the page CSR and the last-page fill, which are still
+        //     the extent's and are still carved the same way, and before
+        //     anything reads them. The metal append entries take
+        //     `write_page`/`write_offset` as declared buffers and derive
+        //     nothing (`store::kv`'s header), so this is the only place such a
+        //     row could be moved at all.
+        //
+        //     The rows are parallel: `writes` was filled in the composition's
+        //     own lane order, one entry per token row, which is the order
+        //     `geometry_with` fills `write_page`/`write_offset` in.
+        if writes.iter().any(Option::is_some) {
+            for geometry in &mut geometries {
+                for (row, stated) in writes.iter().enumerate() {
+                    let Some((page, offset)) = *stated else {
+                        continue;
+                    };
+                    let (Some(write_page), Some(write_offset)) = (
+                        geometry.write_page.get_mut(row),
+                        geometry.write_offset.get_mut(row),
+                    ) else {
+                        return Err(Fault::program(
+                            "serve::prepare",
+                            format!(
+                                "row {row} states an explicit write descriptor and the \
+                                 page arithmetic placed {} row(s)",
+                                geometry.write_page.len()
+                            ),
+                        ));
+                    };
+                    *write_page = page;
+                    *write_offset = offset;
+                }
+            }
+        }
+        let geometries = geometries;
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
@@ -3469,7 +3806,11 @@ pub struct Prepared<'a> {
     composition: Composition,
     descriptor: FireDescriptor,
     seats: Vec<Seat>,
-    tables: Vec<&'a [u32]>,
+    /// Each lane's page table, in fire order: the submission's list borrowed,
+    /// or a device-geometry lane's own resolved-and-translated run owned. Held
+    /// past `stage` for [`Shell::advance`]'s one question — whether the SHELL
+    /// counts this slot — which an empty table is the answer to.
+    tables: Vec<std::borrow::Cow<'a, [u32]>>,
     windows: Windows,
     slots: SlotTable,
     caches: CacheTable,

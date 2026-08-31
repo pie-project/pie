@@ -217,3 +217,100 @@ pub fn fold(
 // `hc.collapse` was deleted with its IR variant (review R5): no plane could
 // fire it honestly — `elemwise::hc_head_postprocess` still waits in the device
 // text for a producer of its `[N, M]` f32 mix plane.
+
+// ---- The gated-residual flavor (qwen4) ----------------------------------
+
+/// `y[h] = meanₛ(σ(gates[s·H+h]) · normed[s·H+h])`: one `hidden`-wide layer
+/// input mixed out of the stream fan under per-element sigmoid gates.
+pub fn mix(ctx: &Ctx, gates: Tensor, normed: Tensor, streams: u32, y: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "elementwise.hc_mix";
+    let t = dtype_dispatch!(OP, normed.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let fan = stream_fan(OP, normed.width, y.width)?;
+    debug_assert_eq!(fan, streams, "the row's stream fan is the count the statement states");
+    debug_assert!(
+        gates.rows == normed.rows && gates.width == normed.width,
+        "the gate rectangle is the stream rectangle"
+    );
+    debug_assert_eq!(y.rows, normed.rows, "the mix lands one narrow row per row");
+    nonzero(OP, "rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_mix<{t}, 256>")))
+            .apply(Launch::per_row(y.rows, BLOCK)),
+        &[
+            gates.arg(),
+            normed.arg(),
+            y.arg(),
+            stated(OP, fan)?.arg(),
+            stated(OP, y.width)?.arg(),
+        ],
+    )
+}
+
+/// `hyper[s·H+h] += 2·σ(gates[s]/streams)·o[h]`, in place on the wide
+/// residual: the layer output injected back into every stream under its own
+/// scalar gate.
+pub fn inject(ctx: &Ctx, o: Tensor, gates: Tensor, streams: u32, hyper: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "elementwise.hc_inject";
+    let t = dtype_dispatch!(OP, o.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let fan = stream_fan(OP, hyper.width, o.width)?;
+    debug_assert_eq!(fan, streams, "the row's stream fan is the count the statement states");
+    debug_assert!(
+        gates.rows == o.rows && gates.width == fan && hyper.rows == o.rows,
+        "one gate logit per stream per row, one wide row per row"
+    );
+    nonzero(OP, "rows", o.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::hc_inject<{t}, 256>")))
+            .apply(Launch::per_row(o.rows, BLOCK)),
+        &[
+            o.arg(),
+            gates.arg(),
+            hyper.arg(),
+            stated(OP, fan)?.arg(),
+            stated(OP, o.width)?.arg(),
+        ],
+    )
+}
+
+/// The PLE gate: per stream, `σ(signed_sqrt(key·query / √H)) · value`. One
+/// block per (row, stream), the grouped norms' own flattening.
+pub fn ple_gate(
+    ctx: &Ctx,
+    key: Tensor,
+    query: Tensor,
+    value: Tensor,
+    streams: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.ple_gate";
+    let t = dtype_dispatch!(OP, key.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let fan = stream_fan(OP, key.width, value.width)?;
+    debug_assert_eq!(fan, streams, "the row's stream fan is the count the statement states");
+    debug_assert!(
+        query.rows == key.rows && query.width == key.width,
+        "the query rectangle is the key rectangle"
+    );
+    debug_assert!(
+        value.rows == key.rows && y.rows == key.rows && y.width == key.width,
+        "one value row and one wide answer per key row"
+    );
+    let rows = nonzero(OP, "rows", key.rows)?;
+    let blocks = rows.checked_mul(fan).ok_or_else(|| {
+        refuse(OP, format!("the grid will not launch: {rows} rows x {fan} streams"))
+    })?;
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::ple_gate<{t}, 256>")))
+            .apply(Launch::per_row(blocks, BLOCK)),
+        &[
+            key.arg(),
+            query.arg(),
+            value.arg(),
+            y.arg(),
+            stated(OP, fan)?.arg(),
+            stated(OP, value.width)?.arg(),
+        ],
+    )
+}

@@ -1,5 +1,6 @@
 use model_dsl::{
-    Classify, ForwardHybrid, HybridSpec, Input, MropeForm, Predicate, Request, Value, ops, seam,
+    Classify, Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Predicate,
+    Request, Value, Weight, ops, seam,
 };
 
 use super::model::{Attn, Gdn, Head, Mixer, Mlp, Model, Tower};
@@ -183,10 +184,11 @@ impl ForwardHybrid for Model {
 
                 Mixer::Gdn(g) => {
                     let conv_ch = u64::from(Gdn::qkv_width(g.k_heads, g.v_heads, g.k_dim, g.v_dim));
-                    c.state(g.conv_state.clone(), [g.conv_kernel as u64, conv_ch]);
+                    c.state(g.conv_state.clone(), [g.conv_kernel as u64, conv_ch], Dtype::Bf16);
                     c.state(
                         g.delta_state.clone(),
                         [g.v_heads as u64, g.k_dim as u64, g.v_dim as u64],
+                        Dtype::Bf16,
                     );
                 }
             }
@@ -342,14 +344,33 @@ impl ForwardHybrid for Model {
                         *experts,
                         *top_k,
                     );
-                    let hidden = ops::linear::mlp_swiglu(
-                        &ops::linear::moe_matmul_select(&x, gate_up, &routes, *top_k),
-                        *inter,
-                    );
-                    let routed = ops::linear::moe_weighted_sum(
-                        &ops::linear::moe_matmul_select(&hidden, down, &routes, *top_k),
-                        &weights,
-                    );
+                    // **A PACKED EXPERT BANK RESOLVES THROUGH ITS PLANES,
+                    // AND THE MODEL TEXT IS WHAT PICKS THE POINT.**
+                    // `Linear::MoeMatmulSelect` reads its bank as ONE dense
+                    // handle; `Linear::MoeMatmulSelectQuant` resolves the two
+                    // or three device planes a packed bank actually is and
+                    // picks its arm off the row's own `(affine?, group,
+                    // bits)`. They are separate IR ops rather than one op that
+                    // asks, so the choice is stated here — and it has to be
+                    // stated rather than hardcoded because this family ships
+                    // the SAME forty layers both ways: `qwen35-a3b-bf16` is a
+                    // dense handle and `qwen36-35b-a3b-mlxu4` is three planes.
+                    // (`gpt_oss::forward` is packed in every row it has and
+                    // says `_quant` outright; it never had to ask.)
+                    //
+                    // This was the whole of the A3B's first light. The engine
+                    // caught it exactly where it should have — `Run::resolve`
+                    // refusing to hand a split-plane bank over as one handle,
+                    // by name, before a kernel could read a scales plane as
+                    // codes — and the sentence that was wrong was this one.
+                    let select = |act: &Value, bank: &Weight| match bank.dtype {
+                        Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 => {
+                            ops::linear::moe_matmul_select_quant(act, bank, &routes, *top_k)
+                        }
+                        _ => ops::linear::moe_matmul_select(act, bank, &routes, *top_k),
+                    };
+                    let hidden = ops::linear::mlp_swiglu(&select(&x, gate_up), *inter);
+                    let routed = ops::linear::moe_weighted_sum(&select(&hidden, down), &weights);
                     let shared = ops::linear::matmul(
                         &ops::linear::mlp_swiglu(
                             &ops::linear::matmul(&x, shared_gate_up),
@@ -828,6 +849,7 @@ fn gdn_mixer(x: &Value, inputs: &Input<Facts>, g: &Gdn) -> Value {
     let o = Value::merge(vec![core_d, core_p]);
     let z = Value::merge(vec![z_d, z_p]);
 
-    let o = ops::elemwise::rmsnorm_gated(&o, &z, &g.norm, g.v_dim, g.norm_eps);
+    let o =
+        ops::elemwise::rmsnorm_gated(&o, &z, &g.norm, g.v_dim, g.norm_eps, GateActivation::Silu);
     ops::linear::matmul(&o, &g.out_proj)
 }

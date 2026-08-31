@@ -501,7 +501,8 @@ impl DecodeGeometry {
                 format!("fa2 decode head_dim {head_dim} needs bdx > 32 (decode.cuh:765)"),
             ));
         }
-        if !matches!(group_size, 1 | 2 | 3 | 4 | 8) {
+        // 12 joined the lattice with qwen4 (24 query heads over 2 kv).
+        if !matches!(group_size, 1 | 2 | 3 | 4 | 8 | 12) {
             return Err(refuse(
                 op,
                 format!(

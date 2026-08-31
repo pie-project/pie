@@ -257,7 +257,7 @@ pub fn carve(
 /// has no byte size, which is the answer that makes a caller fall back to the
 /// unpadded width rather than pad into somebody else's bytes.
 ///
-/// The consumer is `kernels_metal::linear::quant::mb_rows`, whose `capacity`
+/// The consumer is `kernels_metal::linear::quant::mb_block`, whose `capacity`
 /// argument is exactly this: "the rows its activation and result rectangles
 /// actually hold, not the rows this fire uses".
 #[must_use]

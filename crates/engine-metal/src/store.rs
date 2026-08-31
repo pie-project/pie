@@ -147,6 +147,19 @@ impl From<model_exec::store::Fault> for Fault {
 /// determinism and launch-isolation gates are what caught it.
 const STATE_DTYPE: Dtype = Dtype::F32;
 
+/// The element one state row lands at ON THIS PLANE. The shaders instantiate
+/// their recurrent scans at f32 whatever float element the row declares —
+/// the CUDA plane narrows the same declarations to bf16, and each shell's
+/// kernels read what its own store allocates — but an INTEGER state is
+/// semantic (qwen4's n-gram window holds token ids) and is honored as
+/// declared.
+fn state_dtype(declared: Dtype) -> Dtype {
+    match declared {
+        Dtype::I32 => Dtype::I32,
+        _ => STATE_DTYPE,
+    }
+}
+
 /// How one cache row is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
@@ -163,7 +176,7 @@ enum Shape {
         values_at: u64,
     },
     /// A recurrent slab: elements per slot.
-    State { stride: u64 },
+    State { stride: u64, dtype: Dtype },
 }
 
 /// The per-fire handles a pool row borrows: the geometry vectors this fire
@@ -297,11 +310,12 @@ impl Pools {
                         values_at: plane,
                     });
                 }
-                CacheRow::State { name, slab } => {
+                CacheRow::State { name, slab, dtype } => {
                     let stride: u64 = slab.iter().product();
-                    let bytes = stride * u64::from(paging.slots) * elem_bytes(name, STATE_DTYPE)?;
+                    let dtype = state_dtype(*dtype);
+                    let bytes = stride * u64::from(paging.slots) * elem_bytes(name, dtype)?;
                     slabs.push(Buffer::zeroed(device, bytes)?);
-                    shapes.push(Shape::State { stride });
+                    shapes.push(Shape::State { stride, dtype });
                 }
             }
             debug_assert_eq!(slabs.len(), index + 1, "one allocation per cache row");
@@ -410,9 +424,9 @@ impl Pools {
                         head_stride: u64::from(head_dim),
                     })
                 }
-                Shape::State { stride } => {
+                Shape::State { stride, dtype } => {
                     let bytes =
-                        stride * u64::from(self.paging.slots) * u64::from(elem_size(STATE_DTYPE));
+                        stride * u64::from(self.paging.slots) * u64::from(elem_size(dtype));
                     // ONE HANDLE, READ THREE TIMES. A `CacheRow::State` is
                     // one slab and the ops that read it name it once — the
                     // gated-delta scan through the state bank, the causal
@@ -427,7 +441,7 @@ impl Pools {
                         handles.bind(slab, 0, bytes)?,
                         self.paging.slots,
                         u32::try_from(stride).unwrap_or(u32::MAX),
-                        STATE_DTYPE,
+                        dtype,
                     );
                     CachePool::Recurrent(RecurrentPool {
                         state: bank,
@@ -469,12 +483,11 @@ impl Pools {
                 have: u64::from(self.paging.slots),
             });
         }
-        let element = u64::from(elem_size(STATE_DTYPE));
         for (slab, shape) in self.slabs.iter_mut().zip(&self.shapes) {
-            let Shape::State { stride } = *shape else {
+            let Shape::State { stride, dtype } = *shape else {
                 continue;
             };
-            let bytes = stride * element;
+            let bytes = stride * u64::from(elem_size(dtype));
             slab.zero_span(u64::from(slot) * bytes, bytes)?;
         }
         Ok(())

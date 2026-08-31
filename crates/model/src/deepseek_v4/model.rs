@@ -321,31 +321,32 @@ impl Model {
     pub fn load(
         &self,
         src: &ztensor::Source,
-    ) -> Result<ModelContract, crate::contract::ModelError> {
-        let tp = self.tp;
-        let stated = |w: &Weight| crate::contract::claim(w, tp);
-        let mut claims = vec![stated(&self.embed), stated(&self.final_norm)];
+    ) -> Result<ModelContract, checkpoint_dsl::Error> {
+        let mut b = checkpoint_dsl::Builder::new(src, self.tp);
+        let mut stated = |w: &Weight| b.read_own(w);
+        stated(&self.embed)?;
+        stated(&self.final_norm)?;
 
         for layer in &self.layers {
-            claims.push(stated(&layer.attn_mix.scale));
-            claims.push(stated(&layer.attn_mix.base));
-            claims.push(stated(&layer.mlp_mix.scale));
-            claims.push(stated(&layer.mlp_mix.base));
+            stated(&layer.attn_mix.scale)?;
+            stated(&layer.attn_mix.base)?;
+            stated(&layer.mlp_mix.scale)?;
+            stated(&layer.mlp_mix.base)?;
 
             let at = &layer.attn;
-            claims.push(stated(&at.q_down));
-            claims.push(stated(&at.q_norm));
-            claims.push(stated(&at.q_up));
-            claims.push(stated(&at.kv_down));
-            claims.push(stated(&at.kv_norm));
-            claims.push(stated(&at.o_down));
-            claims.push(stated(&at.o_up));
-            claims.push(stated(&at.sink));
+            stated(&at.q_down)?;
+            stated(&at.q_norm)?;
+            stated(&at.q_up)?;
+            stated(&at.kv_down)?;
+            stated(&at.kv_norm)?;
+            stated(&at.o_down)?;
+            stated(&at.o_up)?;
+            stated(&at.sink)?;
 
             match &layer.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    claims.push(stated(gate_up));
-                    claims.push(stated(down));
+                    stated(gate_up)?;
+                    stated(down)?;
                 }
                 Mlp::Routed {
                     router,
@@ -354,14 +355,14 @@ impl Model {
                     down,
                     ..
                 } => {
-                    claims.push(stated(router));
-                    claims.push(stated(bias));
-                    claims.push(stated(gate_up));
-                    claims.push(stated(down));
+                    stated(router)?;
+                    stated(bias)?;
+                    stated(gate_up)?;
+                    stated(down)?;
                 }
             }
         }
 
-        crate::contract::elaborate(src, claims)
+        Ok(b.build())
     }
 }

@@ -317,7 +317,7 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                 // The shape is logical and the element is a nibble: two codes
                 // to a byte, and an odd row rounds up rather than overlapping
                 // the next one.
-                Dtype::MlxU4 => rows.saturating_mul(width).div_ceil(2),
+                Dtype::MlxU4 | Dtype::MlxU4G32 => rows.saturating_mul(width).div_ceil(2),
                 // The same bank at eight bits: one whole byte a code, so the
                 // logical rectangle IS the byte count and nothing rounds.
                 Dtype::MlxU8 => rows.saturating_mul(width),
@@ -406,7 +406,9 @@ pub fn prospect(trace: &Trace, contract: &ModelContract, path: &Path) -> Result<
         let Some(&at) = index.get(name) else {
             continue;
         };
-        planes.insert(at, vec![pairing.scales]);
+        let mut companions = vec![pairing.scales];
+        companions.extend(pairing.biases);
+        planes.insert(at, companions);
     }
     Ok(Prospect {
         planes,
@@ -474,10 +476,153 @@ pub fn spill_source(cache_dir: Option<&Path>, key: u64) -> Option<crate::weight_
     (artifact.key() == key).then_some(artifact)
 }
 
-/// One quantized weight's other plane, as a row of [`places`].
+/// The transform arena's backing: RAM when it fits beside the tiers this
+/// load is about to pin, a file-backed map when it would not — see the
+/// construction site in [`Weights::resident`] for the argument.
+enum Scratch {
+    Ram(Vec<u8>),
+    Disk(SpillArena),
+}
+
+impl Scratch {
+    /// `arena` bytes of scratch, spilled to disk when RAM will not hold the
+    /// arena AND the `pinned` bytes the tiers are about to lock, with a
+    /// safety share left for the rest of the load.
+    fn fitting(arena: usize, pinned: u64) -> Result<Scratch> {
+        let need = arena as u64 + pinned + (2 << 30);
+        if need <= available_memory() {
+            return Ok(Scratch::Ram(vec![0u8; arena]));
+        }
+        eprintln!(
+            "engine-cuda: the load's {arena}-byte transform arena will not fit \
+             beside its {pinned} pinned bytes; spilling the arena to disk"
+        );
+        SpillArena::new(arena).map(Scratch::Disk)
+    }
+
+    fn as_mut(&mut self) -> &mut [u8] {
+        match self {
+            Scratch::Ram(vec) => vec.as_mut_slice(),
+            Scratch::Disk(map) => map.as_mut(),
+        }
+    }
+}
+
+/// What the machine will actually give this process: the tighter of the
+/// kernel's `MemAvailable` and this cgroup's remaining allowance. Zero is
+/// never answered — a machine whose accounting cannot be read gets the RAM
+/// arena and the failure mode that has always existed.
+fn available_memory() -> u64 {
+    let meminfo = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemAvailable:")?;
+                let kb: u64 = rest.trim().trim_end_matches(" kB").trim().parse().ok()?;
+                Some(kb * 1024)
+            })
+        });
+    let cgroup = || -> Option<u64> {
+        let max: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        let current: u64 = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(max.saturating_sub(current))
+    }();
+    match (meminfo, cgroup) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => u64::MAX,
+    }
+}
+
+/// A writable file-backed map, sized once and unlinked on drop — the
+/// transform arena's disk spelling. `MAP_SHARED` over a temporary file is
+/// what makes the dirty pages the KERNEL's problem: it writes them back and
+/// reclaims under memory pressure, where an anonymous map of the same size
+/// is unreclaimable and dies by OOM instead.
+struct SpillArena {
+    at: *mut u8,
+    len: usize,
+}
+
+// SAFETY: `at` is a private MAP_SHARED mapping this struct alone owns; the
+// file behind it is unlinked at creation, so no other process can reach it.
+unsafe impl Send for SpillArena {}
+
+impl SpillArena {
+    fn new(len: usize) -> Result<SpillArena> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("pie-arena-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|why| Fault::Load(checkpoint::error::Error::Checkpoint(format!(
+                "the arena spill file {} does not open: {why}",
+                path.display()
+            ))))?;
+        // Unlinked immediately: the mapping keeps the storage alive, and a
+        // crashed load leaves no 100 GiB file behind.
+        let _ = std::fs::remove_file(&path);
+        file.set_len(len as u64).map_err(|why| {
+            Fault::Load(checkpoint::error::Error::Checkpoint(format!(
+                "the arena spill file does not grow to {len} bytes: {why}"
+            )))
+        })?;
+        // SAFETY: a fresh shared mapping over a file this fn just created and
+        // sized; length and protections are stated, fd may close after mmap.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len.max(1),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return Err(Fault::Load(checkpoint::error::Error::Checkpoint(
+                "the arena spill file does not map".to_string(),
+            )));
+        }
+        Ok(SpillArena {
+            at: at.cast(),
+            len,
+        })
+    }
+
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the mapping is `len` writable bytes this struct owns.
+        unsafe { std::slice::from_raw_parts_mut(self.at, self.len) }
+    }
+}
+
+impl Drop for SpillArena {
+    fn drop(&mut self) {
+        // SAFETY: unmapping the mapping this struct created.
+        unsafe {
+            libc::munmap(self.at.cast(), self.len.max(1));
+        }
+    }
+}
+
+/// One quantized weight's other planes, as rows of [`places`]: the scales
+/// always, and — for an affine scheme, whose codes centre on a stored zero
+/// point — the biases beside them.
 #[derive(Debug, Clone, Copy)]
 struct Pairing {
     scales: usize,
+    biases: Option<usize>,
 }
 
 /// **THE SPLIT-PLANE PAIRINGS THIS LOAD PLAN STATES**, by the code plane's own
@@ -533,20 +678,30 @@ fn pairings<'a>(
                     why: what,
                 })
         };
-        match attachment.scale_form {
-            ScaleForm::RawE8M0 => {}
-            ScaleForm::Bf16AffineFactors | ScaleForm::F32Factors => {
+        let biases = match attachment.scale_form {
+            ScaleForm::RawE8M0 => None,
+            // The affine bank: `code * scale + zero`, so the pairing is a
+            // TRIPLE and seating it without the zero points would be the
+            // right spread around the wrong centre — a model that computes
+            // and is wrong. Required, not optional.
+            ScaleForm::Bf16AffineFactors => Some(row(
+                attachment.zero_point_tensor.ok_or_else(|| Fault::Param {
+                    name: (*name).to_string(),
+                    why: "is an affine bank whose attachment names no zero-point \
+                          tensor; `code * scale` alone is the wrong centre",
+                })?,
+                "is an affine bank whose zero points this plan does not publish as a \
+                 param of their own",
+            )?),
+            ScaleForm::F32Factors => {
                 return Err(Fault::Param {
                     name: (*name).to_string(),
-                    why: "carries a scale form no point this shell stamps reads. The \
-                          cuda plane has one split-plane bank: mxfp4 e2m1 codes under \
-                          raw e8m0 exponents. An affine bank is `code * scale + zero` \
-                          and seating it without its zero points is the right spread \
-                          around the wrong centre — a model that computes and is wrong \
-                          — so it is refused here instead",
+                    why: "carries a scale form no point this shell stamps reads: the \
+                          cuda plane's split-plane banks are mxfp4 codes under raw \
+                          e8m0 exponents and MLX affine codes under bf16 factor pairs",
                 });
             }
-        }
+        };
         out.insert(
             *name,
             Pairing {
@@ -555,6 +710,7 @@ fn pairings<'a>(
                     "is a quantized weight whose scales this plan does not publish as a \
                      param of their own",
                 )?,
+                biases,
             },
         );
     }
@@ -699,8 +855,20 @@ impl Weights {
             // while it runs. Host memory, because the transforms run host-side;
             // it is dropped the moment the load is over, and only the finalized
             // tensors the sink took survive.
-            let mut scratch = vec![0u8; usize::try_from(landing.memory.arena_bytes()).unwrap_or(0)];
-            let mut backing: &mut [u8] = &mut scratch;
+            //
+            // **AND HOST MEMORY HAS A SECOND SPELLING NOW** (qwen4 flash).
+            // The arena is planned at the image's own size, and an image can
+            // outgrow the RAM the machine will actually give this process —
+            // the 4-bit flash load plans a 102 GiB arena inside a 125 GiB
+            // cgroup, with a ~64 GiB pinned tier still to come. So an arena
+            // that will not fit beside the tiers goes to a FILE-BACKED map
+            // instead: dirty file pages are the kernel's to write back and
+            // reclaim under pressure, which turns an OOM kill into a slower
+            // load. Asking the machine how much room it has is the same
+            // class of question as asking the card its memory.
+            let bytes = usize::try_from(landing.memory.arena_bytes()).unwrap_or(0);
+            let mut scratch = Scratch::fitting(bytes, plan.spill_demand())?;
+            let mut backing: &mut [u8] = scratch.as_mut();
 
             let mut sink = Landing {
                 store: &mut store,
@@ -717,6 +885,7 @@ impl Weights {
 
             let landed = sink.landed;
             drop(scratch);
+
             // **THE ARTIFACT IS WRITTEN FROM THE STORE, NOT FROM THE
             // TRANSFORMS.** What is cached is what is resident, which is the
             // only thing the digest can be a claim about. Best-effort in every
@@ -810,6 +979,12 @@ impl Weights {
                 Some(pairing) => WeightRow::Planes {
                     codes: packed(experts.as_ref(), &store, &places, at)?,
                     scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
+                    biases: match pairing.biases {
+                        Some(biases) => {
+                            Some(packed(experts.as_ref(), &store, &places, biases)?)
+                        }
+                        None => None,
+                    },
                     seat: experts
                         .as_ref()
                         .and_then(|tier| tier.group_handles(at))
@@ -1212,10 +1387,36 @@ fn packed(
     param: usize,
 ) -> Result<Tensor> {
     let place = places[param];
+    // **THE HANDLE'S RECTANGLE IS THE BYTE RECTANGLE**, made true rather
+    // than assumed. The plan declares a plane in its own elements — a bf16
+    // factor plane in factors, a four-bit code plane in codes — and the two
+    // entries that read a plane's width back (the affine gather's group
+    // recovery, the dense affine point's bit-width and grouping guards)
+    // read it as bytes, because bytes are what a `U8`-bound handle can
+    // honestly mean. Handing the element count through was the qwen4 first
+    // light's one silent wrong number: the n-gram gather recovered group
+    // eighty from a five-factor row and scaled forty-eight of every sixty
+    // table columns by the wrong pair.
+    let width = match place.dtype {
+        // The shape already folds a 32-code block into sixteen bytes.
+        Dtype::Mxfp4 => place.width,
+        // Two codes to a byte; `plane_bytes` rounds the TOTAL up, and a
+        // row's width is even for every whole-group bank this arm serves.
+        Dtype::MlxU4 | Dtype::MlxU4G32 => place.width.div_ceil(2),
+        // One byte a code.
+        Dtype::MlxU8 => place.width,
+        other => model_compiler::arena::elem_bytes(other)
+            .and_then(|element| u32::try_from(element).ok())
+            .map(|element| place.width.saturating_mul(element))
+            .ok_or_else(|| Fault::Param {
+                name: format!("param {param}"),
+                why: "is a packed plane in a storage element that has no element size",
+            })?,
+    };
     Ok(Tensor::new(
         address(tier, store, place.offset, param)?,
         place.rows,
-        place.width,
+        width,
         Dtype::U8,
     ))
 }

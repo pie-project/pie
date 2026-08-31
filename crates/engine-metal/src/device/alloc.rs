@@ -149,6 +149,42 @@ impl Buffer {
         &self.slab
     }
 
+    /// Where `offset` lands in the GPU's own address space, as a number a
+    /// kernel can dereference.
+    ///
+    /// **THE ONE THING A GROUPED LAUNCH NEEDS THAT A SINGLE-LANE ONE DOES
+    /// NOT.** The M2 fused kernel takes every rectangle and every channel
+    /// cell as `setBuffer:offset:atIndex:`, so a cell IS a binding and this
+    /// number never has to exist; the M3 grouped kernel takes ONE lane table
+    /// and dereferences the `ulong`s inside it (`lane.commit_slot`,
+    /// `lane.logits_base`, `slot.committed_cell`), which is what lifts the
+    /// twelve-channel argument-slot ceiling. So the address is the ABI, and
+    /// it is published here rather than recomputed by the caller — the same
+    /// argument [`slab_address`] makes for the argument-buffer path.
+    ///
+    /// **THE CALLER OWES RESIDENCY.** An address handed to a kernel is not a
+    /// binding, so Metal does not learn the reservation is used: every buffer
+    /// an address escapes to must be declared on the encoder with
+    /// `useResource:usage:` or the page it names may not be resident when the
+    /// kernel reads it. `program::launch` declares them; `icb.rs` and
+    /// `rebind.rs` are the older precedent for the same bookkeeping.
+    ///
+    /// Answers `None` for an offset outside the reservation, because an
+    /// address past the end is the one thing a bounds check can still catch
+    /// before the device has it.
+    #[must_use]
+    pub fn address_at(&self, offset: u64) -> Option<u64> {
+        self.span(offset, 0).ok()?;
+        #[cfg(target_vendor = "apple")]
+        {
+            slab_address(&self.slab).checked_add(offset)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            None
+        }
+    }
+
     /// Copy `bytes` in at `offset`.
     ///
     /// # Errors

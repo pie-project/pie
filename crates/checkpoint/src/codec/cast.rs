@@ -47,7 +47,7 @@ pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 // Sub-byte codes have no element to chunk on: `width` above
                 // rounded them up to a byte, and a byte holds two of them.
                 // Packing and unpacking them is `codec::mxfp4`'s, not a cast's.
-                DType::Fp4 | DType::Mxfp4 | DType::MlxU4 => {
+                DType::Fp4 | DType::Mxfp4 | DType::MlxU4 | DType::MlxU4G32 => {
                     return Err(invalid("host Cast does not implement the sub-byte codes"));
                 }
                 // Byte-wide, and no more castable for it: an `MlxU8` byte is
@@ -91,7 +91,7 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
                 return Err(invalid("host Cast does not implement FP8"));
             }
             // See `decode_values`: a sub-byte code is packed, not cast.
-            DType::Fp4 | DType::Mxfp4 | DType::MlxU4 => {
+            DType::Fp4 | DType::Mxfp4 | DType::MlxU4 | DType::MlxU4G32 => {
                 return Err(invalid("host Cast does not implement the sub-byte codes"));
             }
             // And an affine code is quantized, not cast — see `decode_values`.

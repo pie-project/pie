@@ -1,7 +1,9 @@
 pub mod forward;
 pub mod import;
+pub mod media;
 pub mod model;
 pub mod template;
+pub mod tokenizer;
 
 use model::Model;
 use model_dsl::Dtype;
@@ -24,6 +26,12 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
         1,
         model_dsl::trace_hybrid,
         Model::e4b(Dtype::Bf16, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-26b-a4b-mlxu4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::a4b(Dtype::MlxU4, Dtype::Bf16, 1)
     ),
     (
         "gemma4-31b-bf16-kv-bf16",
@@ -60,6 +68,16 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
 /// arithmetics this import does not state. `gemma4-31b` declares no PLE at
 /// all, so nothing about it is sliced and the triplet reading is whole.
 pub const IMPORTS: &[crate::ImportRow] = &[
+    // **BEFORE THE 31B's 4-BIT ROW, AND THE ORDER IS THE SAME ARGUMENT.**
+    // `identify` returns the first row whose contract the file satisfies, and
+    // this one is strictly the more demanding of the two: every plane the 31B
+    // asks for plus the mixture's six a layer. A 31B checkpoint misses on
+    // `router.proj.weight` at layer 0 and falls through; an A4B checkpoint
+    // would otherwise be claimed by the 31B row, which asks for sixty layers
+    // and finds thirty.
+    ("gemma4-26b-a4b-mlxu4-kv-bf16", |src| {
+        Model::a4b(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
+    }),
     ("gemma4-31b-mlxu4-kv-bf16", |src| {
         Model::b31(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
     }),
@@ -90,7 +108,18 @@ pub const TEMPLATES: &[crate::template::TemplateRow] = &[
     ("gemma4-e4b-bf16-kv-bf16", template::gemma4),
     ("gemma4-e4b-vision-bf16-kv-bf16", template::gemma4),
     ("gemma4-e4b-eagle-bf16-kv-bf16", template::gemma4),
+    ("gemma4-26b-a4b-mlxu4-kv-bf16", template::gemma4),
     ("gemma4-31b-bf16-kv-bf16", template::gemma4),
     ("gemma4-31b-mlxu4-kv-bf16", template::gemma4),
     ("gemma4-31b-bf16-kv-bf16-tp2", template::gemma4),
+];
+
+pub const TOKENIZERS: &[crate::tokenizer::ContractRow] = &[
+    ("gemma4-e4b-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-e4b-vision-bf16-kv-bf16", &tokenizer::CONTRACT_VISION),
+    ("gemma4-e4b-eagle-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-26b-a4b-mlxu4-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-31b-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-31b-mlxu4-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-31b-bf16-kv-bf16-tp2", &tokenizer::CONTRACT),
 ];

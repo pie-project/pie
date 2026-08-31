@@ -2,6 +2,7 @@ pub mod forward;
 pub mod import;
 pub mod model;
 pub mod template;
+pub mod tokenizer;
 
 use model::Model;
 use model_dsl::Dtype;
@@ -33,4 +34,9 @@ pub const IMPORTS: &[crate::ImportRow] = &[
 pub const TEMPLATES: &[crate::template::TemplateRow] = &[
     ("dsv4-base-bf16-kv-bf16", template::r1),
     ("dsv4-base-bf16-kv-bf16-tp2", template::r1),
+];
+
+pub const TOKENIZERS: &[crate::tokenizer::ContractRow] = &[
+    ("dsv4-base-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("dsv4-base-bf16-kv-bf16-tp2", &tokenizer::CONTRACT),
 ];

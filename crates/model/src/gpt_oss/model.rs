@@ -352,36 +352,35 @@ impl Model {
     pub fn load(
         &self,
         src: &ztensor::Source,
-    ) -> Result<ModelContract, crate::contract::ModelError> {
-        let mut claims = vec![
-            crate::contract::claim(&self.embed, self.tp),
-            crate::contract::claim(&self.final_norm, self.tp),
-            crate::contract::claim(&self.head, self.tp),
-        ];
+    ) -> Result<ModelContract, checkpoint_dsl::Error> {
+        let mut b = checkpoint_dsl::Builder::new(src, self.tp);
+        b.read_own(&self.embed)?;
+        b.read_own(&self.final_norm)?;
+        b.read_own(&self.head)?;
 
         for layer in &self.layers {
             let attn = &layer.attn;
             let mlp = &layer.mlp;
 
-            claims.push(crate::contract::claim(&layer.attn_norm, self.tp));
-            claims.push(crate::contract::claim(&layer.mlp_norm, self.tp));
-            claims.push(crate::contract::claim(&attn.q_proj, self.tp));
-            claims.push(crate::contract::claim(&attn.q_bias, self.tp));
-            claims.push(crate::contract::claim(&attn.k_proj, self.tp));
-            claims.push(crate::contract::claim(&attn.k_bias, self.tp));
-            claims.push(crate::contract::claim(&attn.v_proj, self.tp));
-            claims.push(crate::contract::claim(&attn.v_bias, self.tp));
-            claims.push(crate::contract::claim(&attn.o_proj, self.tp));
-            claims.push(crate::contract::claim(&attn.o_bias, self.tp));
-            claims.push(crate::contract::claim(&attn.sinks, self.tp));
-            claims.push(crate::contract::claim(&mlp.router, self.tp));
-            claims.push(crate::contract::claim(&mlp.router_bias, self.tp));
-            claims.push(crate::contract::claim(&mlp.gate_up, self.tp));
-            claims.push(crate::contract::claim(&mlp.gate_up_bias, self.tp));
-            claims.push(crate::contract::claim(&mlp.down, self.tp));
-            claims.push(crate::contract::claim(&mlp.down_bias, self.tp));
+            b.read_own(&layer.attn_norm)?;
+            b.read_own(&layer.mlp_norm)?;
+            b.read_own(&attn.q_proj)?;
+            b.read_own(&attn.q_bias)?;
+            b.read_own(&attn.k_proj)?;
+            b.read_own(&attn.k_bias)?;
+            b.read_own(&attn.v_proj)?;
+            b.read_own(&attn.v_bias)?;
+            b.read_own(&attn.o_proj)?;
+            b.read_own(&attn.o_bias)?;
+            b.read_own(&attn.sinks)?;
+            b.read_own(&mlp.router)?;
+            b.read_own(&mlp.router_bias)?;
+            b.read_own(&mlp.gate_up)?;
+            b.read_own(&mlp.gate_up_bias)?;
+            b.read_own(&mlp.down)?;
+            b.read_own(&mlp.down_bias)?;
         }
 
-        crate::contract::elaborate(src, claims)
+        Ok(b.build())
     }
 }

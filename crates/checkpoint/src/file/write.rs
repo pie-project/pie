@@ -102,7 +102,7 @@ fn storage_of(
         // spec, which the `Encoding::Quant` arm above already answered. A
         // *declaration* naming one of them is a plane with no element width
         // to store, and there is no zTensor dtype for it.
-        DType::Fp4 | DType::Mxfp4 | DType::MlxU4 | DType::MlxU8 => {
+        DType::Fp4 | DType::Mxfp4 | DType::MlxU4 | DType::MlxU8 | DType::MlxU4G32 => {
             return Err(Error::Checkpoint(format!(
                 "cannot store a raw {decl_dtype:?} tensor: the packed codes \
                  are written as packed U8 under a quant encoding"

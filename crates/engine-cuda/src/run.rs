@@ -36,8 +36,9 @@ pub enum WeightRow {
     /// One dense handle, resolved by [`Run::tensor`].
     Dense(Tensor),
 
-    /// A split-plane quantized bank — e2m1 `codes` beside e8m0 `scales` —
-    /// resolved by [`Run::planes`], never as one tensor.
+    /// A split-plane quantized bank — e2m1 codes beside e8m0 exponents, or
+    /// MLX affine codes beside bf16 scales AND zero points — resolved by
+    /// [`Run::planes`], never as one tensor.
     ///
     /// **`seat` IS WHICH TIER THE GROUP IS ON RIGHT NOW** (alto streaming §3
     /// item 3, wave B7). The two handles carry the addresses the group was
@@ -50,6 +51,10 @@ pub enum WeightRow {
     Planes {
         codes: Tensor,
         scales: Tensor,
+        /// The zero points, for an affine bank whose element is
+        /// `code * scale + bias`; `None` for a scheme whose block centres
+        /// itself (mxfp4).
+        biases: Option<Tensor>,
         seat: GroupSeat,
     },
 
@@ -1451,14 +1456,42 @@ impl<'c> Run<'c> {
     ///
     /// The seat is [`GroupSeat::RESIDENT`] — two zeros — for every group the
     /// store holds whole; see [`WeightRow::Planes`].
-    pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor, GroupSeat) {
+    /// The split-plane resolution a DENSE-reading op asks first: `Some` for
+    /// a bank the loader landed as planes (the n-gram table under its affine
+    /// triplet), `None` for an ordinary handle — so a gather can serve both
+    /// landings without a second op.
+    pub(crate) fn maybe_planes(
+        &self,
+        id: ValueId,
+    ) -> Option<(Tensor, Tensor, Option<Tensor>, GroupSeat)> {
+        let at = id.0 as usize;
+        let Def::Weight(w) = &self.values[at].def else {
+            return None;
+        };
+        match self.weights.0.get(*w as usize).copied().flatten() {
+            Some(WeightRow::Planes {
+                codes,
+                scales,
+                biases,
+                seat,
+            }) => Some((codes, scales, biases, seat)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor, Option<Tensor>, GroupSeat) {
         let at = id.0 as usize;
         let Def::Weight(w) = &self.values[at].def else {
             panic!("value {at} is not a weight, and split-plane banks live in the weight table");
         };
         let row = *w as usize;
         match self.weights.0.get(row).copied().flatten() {
-            Some(WeightRow::Planes { codes, scales, seat }) => (codes, scales, seat),
+            Some(WeightRow::Planes {
+                codes,
+                scales,
+                biases,
+                seat,
+            }) => (codes, scales, biases, seat),
             Some(WeightRow::Dense(_) | WeightRow::Streamed { .. }) => panic!(
                 "value {at} is weight {row}, bound as one dense handle, and this op reads \
                  a split-plane bank"

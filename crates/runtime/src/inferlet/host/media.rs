@@ -1,14 +1,16 @@
 //! pie:inferlet/media — Image / Video / Audio resources for multimodal input.
 //!
-//! **Model-agnostic by construction, and the dispatch is the whole of what
-//! this file knows.** The inferlet hands the host raw encoded bytes (a
-//! PNG/JPEG, an animated GIF, a WAV); this file reads the bound model's
-//! `ROWS.arch`, picks a [`media_frontend::VisionFrontEnd`] /
-//! [`media_frontend::AudioFrontEnd`] for it or refuses by name, and hands the
-//! bytes over. Everything after that — decode, resize, patchify, normalize,
+//! **Model-agnostic by construction, and the split is the whole of what this
+//! file knows.** The inferlet hands the host raw encoded bytes (a PNG/JPEG, an
+//! animated GIF, a WAV); this file DECODES them ([`decode`], the codec being
+//! the host's — `model::media`'s own dependency rule), reads the bound model's
+//! `ROWS.arch`, asks [`::model::media::vision_front_end`] for that family's
+//! front-end or refuses by name, and hands the pixels over with the resample
+//! lent. Everything after that — the resize target, patchify, normalize,
 //! log-mel, the interpolation taps of a resampled position table — is the
-//! front-end's, behind the trait (media-door.md §4). An inferlet never branches
-//! on the model, and neither, past the `match` below, does the runtime.
+//! family's own arithmetic, in the family's own module beside its forward pass
+//! and template (media-door.md §4). An inferlet never branches on the model,
+//! and neither does the runtime: the arch match lives in the catalog.
 //!
 //! **ONE LEDGER** (media-door.md §0). A span enters the sequence as the token
 //! run `tokens()` answers — prefix + pad × `token-count` + suffix, in the bound
@@ -24,14 +26,15 @@
 //! `tokens()` right across two checkpoints of one architecture that renumbered
 //! their specials.
 
+pub mod decode;
 pub mod multimodal;
 
+use ::model::media::{
+    AudioFrontEnd, Budget, Delimiters, EncodedSpan, Fault, Grid, Rgb8, VisionFrontEnd,
+};
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
-use media_frontend::{
-    AudioFrontEnd, Budget, Delimiters, EncodedSpan, Fault, Grid, VisionFrontEnd,
-};
 use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -67,23 +70,6 @@ pub struct Audio {
     pub span: Arc<EncodedSpan>,
 }
 
-/// Lift the local processor's answer into the front-end contract's span.
-///
-/// **A SEAM WITH NOTHING BEHIND IT ANY MORE** (wave MD-C, the second of MD-B's
-/// two pinned seams). `VisionAdapter` stood here — a wrapper that put
-/// `multimodal::Processor`, the campaign's test-helper preprocessing, behind
-/// [`VisionFrontEnd`] so MD-A's dispatch could be the real dispatch before the
-/// real front-ends existed. They exist ([`media_frontend::qwen3_5`],
-/// [`media_frontend::gemma4`], wave MD-B), and each is a pinned transcription
-/// of its reference processor with goldens; the adapter's `span_of` left
-/// `embed_rows` and `embed_weights` EMPTY under a note saying the native grid
-/// needs none, which is true of the helper's fixed resize and false of a
-/// front-end that resamples the learned position table. Keeping the wrapper
-/// would have served every image through the preprocessing that has no golden.
-///
-/// [`media_frontend::qwen3_5`]: media_frontend::qwen3_5
-/// [`media_frontend::gemma4`]: media_frontend::gemma4
-
 /// The bound model's audio processor, behind the front-end trait.
 struct AudioAdapter {
     arch_name: &'static str,
@@ -103,7 +89,7 @@ impl AudioFrontEnd for AudioAdapter {
         }
     }
 
-    fn encode_audio(&self, bytes: &[u8]) -> media_frontend::Result<EncodedSpan> {
+    fn encode_audio(&self, bytes: &[u8]) -> ::model::media::Result<EncodedSpan> {
         let (mel, n_frames) = multimodal::audio::process_wav_bytes(bytes).map_err(Fault::Decode)?;
         if n_frames == 0 {
             return Err(Fault::Empty("audio: clip decoded to zero frames".into()));
@@ -135,41 +121,27 @@ impl AudioFrontEnd for AudioAdapter {
 }
 
 /// **THE DISPATCH** (media-door §4): the bound model's `ROWS.arch` to a vision
-/// front-end, or the one refusal this layer knows how to say.
+/// front-end, or the one refusal this layer knows how to say. The arch match
+/// itself is [`::model::media::vision_front_end`] — a catalog fact, beside the
+/// families it names; this layer only knows the bound model, which the catalog
+/// does not.
 ///
 /// # Errors
 ///
 /// [`Fault::NoVisionFrontEnd`], naming the model and the arch it was asked
 /// about — a text model has no tower and never will, and saying so here is
 /// what keeps every layer below this one free of the question.
-fn vision_front_end() -> media_frontend::Result<Box<dyn VisionFrontEnd>> {
+fn vision_front_end() -> ::model::media::Result<Box<dyn VisionFrontEnd>> {
     let m = crate::model::model();
     let arch = m.arch_name();
-    front_end_for(arch).ok_or_else(|| Fault::NoVisionFrontEnd {
+    ::model::media::vision_front_end(arch).ok_or_else(|| Fault::NoVisionFrontEnd {
         model: m.name().to_string(),
         arch: arch.to_string(),
     })
 }
 
-/// **THE MATCH IS THE WHOLE OF WHAT THIS LAYER KNOWS ABOUT ARCHITECTURES**
-/// (media-door §4). Past it the runtime names none: it asked for a front-end
-/// and got one, or got the one sentence it has to know how to say.
-///
-/// Boxed because the two arms are two types and every caller wants a
-/// `dyn VisionFrontEnd` — the seam itself, in both directions. Split from
-/// [`vision_front_end`] so a test can ask the question without a booted model:
-/// the dispatch is a property of the ARCH STRING, and the global is only where
-/// the string comes from.
-pub(crate) fn front_end_for(arch: &str) -> Option<Box<dyn VisionFrontEnd>> {
-    match arch {
-        media_frontend::qwen3_5::ARCH => Some(Box::new(media_frontend::qwen3_5::Qwen35Vision::new())),
-        media_frontend::gemma4::ARCH => Some(Box::new(media_frontend::gemma4::Gemma4Vision::new())),
-        _ => None,
-    }
-}
-
 /// The same, for audio.
-fn audio_front_end() -> media_frontend::Result<AudioAdapter> {
+fn audio_front_end() -> ::model::media::Result<AudioAdapter> {
     let m = crate::model::model();
     let arch = m.arch_name();
     if multimodal::audio_arch_supported(arch) {
@@ -212,6 +184,58 @@ fn spell(span: &mut EncodedSpan, delims: Delimiters) -> Result<(), String> {
     Ok(())
 }
 
+/// **A STABLE CONTENT HASH OF THE PREPROCESSED SPAN** (media-door §5, the
+/// cache statute) — what the WIT's `digest()` answers for image and audio
+/// both.
+///
+/// Over the PAYLOAD and its layout, deliberately not over the source bytes:
+/// two encodings of one photograph — a re-JPEG, a re-crop that resizes back to
+/// the same grid — are the same span to the model, and a digest that separated
+/// them would make a correct cache miss look like a correctness bug. The
+/// tokens are NOT folded in, because folding them would make the digest
+/// useless for the thing it exists for: two different images produce identical
+/// token lists, and this is what tells them apart.
+///
+/// Here and not on [`EncodedSpan`] for the same dependency rule that keeps the
+/// codec here: the statute needs a hasher, and the catalog's consumers do not.
+/// blake3 is already this workspace's content addresser (`worker`, `gateway`,
+/// `client`, this crate), so a span's digest and a blob's are the same 32
+/// bytes computed the same way.
+#[must_use]
+pub fn span_digest(span: &EncodedSpan) -> Vec<u8> {
+    let mut h = blake3::Hasher::new();
+    // Domain separation, so a future audio/vision payload of identical bytes
+    // and identical extent cannot collide across modalities.
+    h.update(b"pie:media-span:v1");
+    for n in [
+        span.token_count,
+        span.position_span,
+        span.rows,
+        span.grid.t,
+        span.grid.h,
+        span.grid.w,
+        span.patch_grid.t,
+        span.patch_grid.h,
+        span.patch_grid.w,
+    ] {
+        h.update(&n.to_le_bytes());
+    }
+    h.update(&[u8::from(span.uses_mrope)]);
+    for f in &span.payload {
+        h.update(&f.to_le_bytes());
+    }
+    for p in &span.positions {
+        h.update(&p.to_le_bytes());
+    }
+    for r in &span.embed_rows {
+        h.update(&r.to_le_bytes());
+    }
+    for w in &span.embed_weights {
+        h.update(&w.to_le_bytes());
+    }
+    h.finalize().as_bytes().to_vec()
+}
+
 /// Uniformly sample up to `max_frames` indices from `0..n` (inclusive of the
 /// first and last frame). Returns all indices when `n <= max_frames`.
 fn sample_indices(n: usize, max_frames: usize) -> Vec<usize> {
@@ -237,10 +261,15 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
             Ok(fe) => fe,
             Err(fault) => return Ok(Err(fault.to_string())),
         };
-        // Through the TRAIT and nothing else: this call site is the seam
+        // Decode is the host's (the codec, [`decode`]); everything after goes
+        // through the TRAIT and nothing else — this call site is the seam
         // media-door §4 draws, and it must not be able to reach anything an
         // arbitrary front-end does not offer.
-        let mut span = match front_end.encode_image(&bytes, Budget::Still) {
+        let rgb = match decode::decode(&bytes) {
+            Ok(rgb) => rgb,
+            Err(fault) => return Ok(Err(fault.to_string())),
+        };
+        let mut span = match front_end.encode(&rgb, Budget::Still, decode::resize_exact) {
             Ok(span) => span,
             Err(fault) => return Ok(Err(fault.to_string())),
         };
@@ -260,7 +289,7 @@ impl pie::inferlet::media::HostImage for ProcessCtx {
 
     /// The cache statute's key material (media-door §5).
     async fn digest(&mut self, this: Resource<Image>) -> Result<Vec<u8>> {
-        Ok(self.ctx().table.get(&this)?.span.digest())
+        Ok(span_digest(&self.ctx().table.get(&this)?.span))
     }
 
     async fn token_count(&mut self, this: Resource<Image>) -> Result<u32> {
@@ -317,17 +346,19 @@ impl pie::inferlet::media::HostVideo for ProcessCtx {
         for &i in &sel {
             let (img, ts) = &decoded[i];
             // **A DEMUXED FRAME CROSSES AS PIXELS**, which is the one
-            // interchange form `encode_rgb8` states and the one that needs no
-            // image library on either side of the seam. `to_rgb8` is the
-            // decoder's own `do_convert_rgb`: the alpha channel is dropped.
+            // interchange form the trait states and the one that needs no
+            // image library on the catalog's side of the seam. `to_rgb8` is
+            // the decoder's own `do_convert_rgb`: the alpha channel is
+            // dropped. Past this line a frame and a still are the same
+            // pixels through the same verb.
             let rgb = img.to_rgb8();
             let (fw, fh) = (rgb.width(), rgb.height());
-            let mut span = match front_end.encode_rgb8(
-                rgb.as_raw(),
-                fw,
-                fh,
-                Budget::VideoFrame,
-            ) {
+            let frame = match Rgb8::new(fh, fw, rgb.into_raw()) {
+                Ok(frame) => frame,
+                Err(fault) => return Ok(Err(fault.to_string())),
+            };
+            let mut span = match front_end.encode(&frame, Budget::VideoFrame, decode::resize_exact)
+            {
                 Ok(span) => span,
                 Err(fault) => return Ok(Err(fault.to_string())),
             };
@@ -411,7 +442,7 @@ impl pie::inferlet::media::HostAudio for ProcessCtx {
     }
 
     async fn digest(&mut self, this: Resource<Audio>) -> Result<Vec<u8>> {
-        Ok(self.ctx().table.get(&this)?.span.digest())
+        Ok(span_digest(&self.ctx().table.get(&this)?.span))
     }
 
     async fn token_count(&mut self, this: Resource<Audio>) -> Result<u32> {
@@ -450,7 +481,7 @@ mod tests {
         archs.dedup();
         assert!(!archs.is_empty(), "the catalog names no architectures");
         for arch in archs {
-            match front_end_for(arch) {
+            match ::model::media::vision_front_end(arch) {
                 Some(fe) => {
                     assert_eq!(fe.arch(), arch, "a front-end answered for another arch");
                     let d = fe.delimiters();
@@ -475,8 +506,8 @@ mod tests {
     /// each spells its run with its own reserved pad.
     #[test]
     fn the_two_vision_archs_spell_their_runs_differently() {
-        let qwen = front_end_for("qwen3_5").expect("qwen has a tower").delimiters();
-        let gemma = front_end_for("gemma4").expect("gemma has a tower").delimiters();
+        let qwen = ::model::media::vision_front_end("qwen3_5").expect("qwen has a tower").delimiters();
+        let gemma = ::model::media::vision_front_end("gemma4").expect("gemma has a tower").delimiters();
         assert_eq!(qwen.placeholder, "<|image_pad|>");
         assert_eq!(qwen.prefix, "<|vision_start|>");
         // MD-B's own reading of THIS checkpoint's vocabulary: gemma-4 spells
@@ -521,11 +552,42 @@ mod tests {
         ));
     }
 
+    /// media-door §5: the run is the same tokens whatever the picture was, so
+    /// the digest is the only thing that tells two spans apart. The statute's
+    /// tests ride beside [`span_digest`] because the digest does — the span's
+    /// identity is computed where the hasher lives.
+    #[test]
+    fn two_spans_share_a_token_list_and_not_a_digest() {
+        use ::model::media::{Resample, Rgb8, StubFrontEnd};
+        let identity: Resample = |src, _, _| src.clone();
+        let fe = StubFrontEnd::new("stub", 4);
+        let pixels = |bytes: [u8; 3]| Rgb8::new(1, 1, bytes.to_vec()).expect("one pixel");
+        let mut a = fe
+            .encode(&pixels([1, 2, 3]), Budget::Still, identity)
+            .expect("a");
+        let mut b = fe
+            .encode(&pixels([4, 5, 6]), Budget::Still, identity)
+            .expect("b");
+        a.spell_with(vec![7], 99, vec![8]);
+        b.spell_with(vec![7], 99, vec![8]);
+        assert_eq!(a.tokens(), b.tokens(), "the ledger cannot tell them apart");
+        assert_ne!(span_digest(&a), span_digest(&b), "the statute's key must");
+        assert_eq!(span_digest(&a).len(), 32);
+        // Stable across two readings, and the spelling is NOT folded in: the
+        // same span under two checkpoints' special ids answers two token lists
+        // and ONE digest.
+        assert_eq!(span_digest(&a), span_digest(&a.clone()));
+        let mut respelled = a.clone();
+        respelled.spell_with(vec![70], 111, vec![80]);
+        assert_ne!(a.tokens(), respelled.tokens());
+        assert_eq!(span_digest(&a), span_digest(&respelled));
+    }
+
     /// An arch with no vision front-end is refused BY NAME, and the sentence
     /// carries both the model and the arch it was asked about.
     #[test]
     fn an_unknown_arch_is_refused_as_no_vision_front_end() {
-        assert!(front_end_for("deepseek_v4").is_none());
+        assert!(::model::media::vision_front_end("deepseek_v4").is_none());
         let fault = Fault::NoVisionFrontEnd {
             model: "ds-v4".into(),
             arch: "deepseek_v4".into(),

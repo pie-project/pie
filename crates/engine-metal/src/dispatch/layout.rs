@@ -49,6 +49,10 @@ impl Run<'_> {
                     self.tensor(*y),
                 ),
             },
+            // qwen4's concatenating gather: not on this plane yet.
+            Layout::EmbedConcat { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
             Layout::SplitQkv {
                 packed,
                 q_width,

@@ -48,17 +48,25 @@
 //!
 //! # Arms: a slot is one ENTRY and not one PIPELINE
 //!
-//! `kernels_metal::linear::gemm::act_x_wt` takes
-//! `dense_gemm_t_bfloat16_bm_8_bk_64_bn_32` below `TILE_M = 32` rows and
-//! `dense_gemm_t_bfloat16_bm_32_bk_32_bn_32` at or above it — one kernel at
-//! two row blocks, which is what makes the pick invisible in the ANSWER
-//! (that entry's header) and still two shader points here. 127 of
+//! `kernels_metal::linear::gemm::act_x_wt` picks among THREE shader points on
+//! the window's rows — `dense_gemv_t_bfloat16` below `VECTOR_MAX_ROWS = 4`,
+//! `dense_gemm_t_bfloat16_bm_8_bk_64_bn_32` below `TILE_M = 32`, and
+//! `dense_gemm_t_bfloat16_bm_32_bk_32_bn_32` at or above it. 127 of
 //! qwen35-d0.8b's 465 slots do that. Build log 30 named them and left them
-//! out of the fit; here they are fitted ONE TABLE PER ARM, and which arm
-//! runs is [`Pick::Rows`] — a threshold on the window's rows,
-//! bracketed to the row by the ladder that crosses it. That is the form the
-//! rebind shader can evaluate, which is the whole reason it is a threshold
-//! and not a lookup.
+//! out of the fit; here a slot that showed TWO points is fitted ONE TABLE PER
+//! ARM, and which arm runs is [`Pick::Rows`] — a threshold on the window's
+//! rows, bracketed to the row by the ladder that crosses it. That is the form
+//! the rebind shader can evaluate, which is the whole reason it is a
+//! threshold and not a lookup.
+//!
+//! **A SLOT THAT SHOWS ALL THREE IS REPORTED AND NOT FITTED.** [`bracket`]
+//! solves a threshold between two points and says so; a third makes it a
+//! lookup, which the rebind shader has no form for. Such a slot lands in
+//! [`Survey::unaffine`] naming the points it could not separate, and
+//! `descriptor_abi` excludes it from the re-derivation the same way it
+//! excludes a two-arm one. Whether a given probe ladder sees two points or
+//! three is a property of the row counts it stood at — a sweep that never
+//! goes below four rows never sees the vector point at all.
 //!
 //! # The coordinates, and how a live fire finds them
 //!
@@ -842,11 +850,12 @@ fn bracket(
 ///   one.** No single indirect command buffer serves both compositions and
 ///   the exec key has not collapsed — refused.
 /// - **The same slot at a different shader POINT.** A kernel entry that picks
-///   its arm off the window (`linear`'s gemv/gemm split is the live one) hands
-///   one slot two pipelines. That is survivable — a compute ICB slot's
-///   pipeline state is rebindable from the GPU, measured — so it is REPORTED
-///   rather than refused, fitted one table per arm, and picked between by a
-///   threshold on the window's rows.
+///   its arm off the window (`linear::gemm`'s three-rung ladder is the live
+///   one) hands one slot several pipelines. That is survivable — a compute
+///   ICB slot's pipeline state is rebindable from the GPU, measured — so it
+///   is REPORTED rather than refused, fitted one table per arm, and picked
+///   between by a threshold on the window's rows. Two points bracket to a
+///   threshold; three do not, and are reported as unaffine instead.
 fn structure(every: &[&Recording]) -> Result<Vec<Armed>> {
     let first = every[0];
     let mut armed: Vec<Armed> = Vec::new();

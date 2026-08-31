@@ -3,8 +3,7 @@ use checkpoint::types::{DType, Encoding};
 use model_dsl::{Dtype, Weight};
 
 use super::model::Model;
-use crate::contract::{self, ModelError};
-use crate::encoding;
+use checkpoint_dsl::{Builder, Error, divided, encoding, extents, grouped, scaling, stored_encoding};
 
 const BANK_ROWS: u8 = 1;
 
@@ -89,17 +88,13 @@ impl Layout {
 }
 
 impl Model {
-    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
-        assert!(
-            self.tp == 1,
-            "an import states the whole checkpoint; build the model at tp = 1"
-        );
+    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
         for layout in [Layout::Transformers, Layout::Mlx] {
             if src.get(layout.witness()).is_some() {
                 return self.import_from(src, layout);
             }
         }
-        Err(ModelError::Illegible {
+        Err(Error::Illegible {
             name: "gpt_oss".to_string(),
             detail: format!(
                 "it holds neither `{}` nor `{}`, so its expert banks are \
@@ -114,91 +109,48 @@ impl Model {
         &self,
         src: &ztensor::Source,
         layout: Layout,
-    ) -> Result<ModelContract, ModelError> {
-        // **`planes` AND NOT `copy`, AT EVERY MATMUL BANK.** These names are
-        // the same in both spellings; what differs is how many TENSORS each
-        // one is, and that is a fact about the weight's declared dtype rather
-        // than about the layout. A bf16 SKU reads one `.weight` here exactly
-        // as it always did; an `mlxu4` SKU reads the `.weight`/`.scales`/
-        // `.biases` triplet MLX ships beside it. `planes` is the call that
-        // says the logical name once and lets the dtype answer.
-        let mut tensors = contract::planes(src, &self.embed, "model.embed_tokens.weight")?;
-        tensors.push(contract::copy(src, &self.final_norm, "model.norm.weight")?);
-        tensors.extend(contract::planes(src, &self.head, "lm_head.weight")?);
+    ) -> Result<ModelContract, Error> {
+        // **ONE `read` PER BANK, HOWEVER MANY TENSORS THAT IS.** These
+        // names are the same in both spellings; what differs is how many
+        // TENSORS each one is, and that is a fact about the weight's declared
+        // dtype rather than about the layout. A bf16 SKU reads one `.weight`
+        // here exactly as it always did; an `mlxu4` SKU reads the
+        // `.weight`/`.scales`/`.biases` triplet MLX ships beside it —
+        // `read` says the logical name once and lets the dtype answer.
+        let mut b = Builder::new(src, self.tp);
+        b.read(&self.embed, "model.embed_tokens.weight")?;
+        b.read(&self.final_norm, "model.norm.weight")?;
+        b.read(&self.head, "lm_head.weight")?;
         for (l, layer) in self.layers.iter().enumerate() {
             let ck = |what: &str| format!("model.layers.{l}.{what}");
             let attn = &layer.attn;
             let mlp = &layer.mlp;
 
-            tensors.push(contract::copy(
-                src,
-                &layer.attn_norm,
-                ck("input_layernorm.weight"),
-            )?);
-            tensors.push(contract::copy(
-                src,
-                &layer.mlp_norm,
-                ck("post_attention_layernorm.weight"),
-            )?);
-            tensors.extend(contract::planes(
-                src,
-                &attn.q_proj,
-                ck("self_attn.q_proj.weight"),
-            )?);
-            tensors.push(contract::copy(
-                src,
-                &attn.q_bias,
-                ck("self_attn.q_proj.bias"),
-            )?);
-            tensors.extend(contract::planes(
-                src,
-                &attn.k_proj,
-                ck("self_attn.k_proj.weight"),
-            )?);
-            tensors.push(contract::copy(
-                src,
-                &attn.k_bias,
-                ck("self_attn.k_proj.bias"),
-            )?);
-            tensors.extend(contract::planes(
-                src,
-                &attn.v_proj,
-                ck("self_attn.v_proj.weight"),
-            )?);
-            tensors.push(contract::copy(
-                src,
-                &attn.v_bias,
-                ck("self_attn.v_proj.bias"),
-            )?);
-            tensors.extend(contract::planes(
-                src,
-                &attn.o_proj,
-                ck("self_attn.o_proj.weight"),
-            )?);
-            tensors.push(contract::copy(
-                src,
-                &attn.o_bias,
-                ck("self_attn.o_proj.bias"),
-            )?);
-            tensors.push(contract::copy(src, &attn.sinks, ck("self_attn.sinks"))?);
+            b.read(&layer.attn_norm, ck("input_layernorm.weight"))?;
+            b.read(&layer.mlp_norm, ck("post_attention_layernorm.weight"))?;
+            b.read(&attn.q_proj, ck("self_attn.q_proj.weight"))?;
+            b.read(&attn.q_bias, ck("self_attn.q_proj.bias"))?;
+            b.read(&attn.k_proj, ck("self_attn.k_proj.weight"))?;
+            b.read(&attn.k_bias, ck("self_attn.k_proj.bias"))?;
+            b.read(&attn.v_proj, ck("self_attn.v_proj.weight"))?;
+            b.read(&attn.v_bias, ck("self_attn.v_proj.bias"))?;
+            b.read(&attn.o_proj, ck("self_attn.o_proj.weight"))?;
+            b.read(&attn.o_bias, ck("self_attn.o_proj.bias"))?;
+            b.read(&attn.sinks, ck("self_attn.sinks"))?;
             // **THE ROUTER GATE, AT ITS OWN WIDTH.** `Moe::router` is declared
             // `MlxU8` wherever the stack is `MlxU4` — `gpt_oss.py`'s
-            // `quant_predicate`, read at `Model::new` — and `planes` asks the
+            // `quant_predicate`, read at `Model::new` — and `read` asks the
             // weight rather than the file, so the same call reads a bf16
             // tensor here from a transformers checkpoint and an eight-bit
             // affine triplet from an MLX one.
-            tensors.extend(contract::planes(src, &mlp.router, ck("mlp.router.weight"))?);
-            tensors.push(contract::copy(
-                src,
-                &mlp.router_bias,
-                ck("mlp.router.bias"),
-            )?);
+            b.read(&mlp.router, ck("mlp.router.weight"))?;
+            b.read(&mlp.router_bias, ck("mlp.router.bias"))?;
 
             // The one place the two spellings part — see [`Layout`].
             match layout {
                 Layout::Transformers => {
                     let rows = i64::from(mlp.inter);
-                    tensors.extend(banked_interleaved(
+                    b.extend(banked_interleaved(
                         src,
                         &mlp.gate_up,
                         ck("mlp.experts.gate_up_proj_blocks"),
@@ -206,27 +158,22 @@ impl Model {
                         rows,
                         layout,
                     )?);
-                    tensors.push(contract::declare(
-                        src,
+                    b.read_expr(
                         &mlp.gate_up_bias,
                         deinterleaved(Expr::src(ck("mlp.experts.gate_up_proj_bias")), rows),
-                    )?);
+                    )?;
 
-                    tensors.extend(banked(
+                    b.extend(banked(
                         src,
                         &mlp.down,
                         ck("mlp.experts.down_proj_blocks"),
                         ck("mlp.experts.down_proj_scales"),
                         layout,
                     )?);
-                    tensors.push(contract::copy(
-                        src,
-                        &mlp.down_bias,
-                        ck("mlp.experts.down_proj_bias"),
-                    )?);
+                    b.read(&mlp.down_bias, ck("mlp.experts.down_proj_bias"))?;
                 }
                 Layout::Mlx => {
-                    tensors.extend(banked_split(
+                    b.extend(banked_split(
                         src,
                         &mlp.gate_up,
                         &[
@@ -239,35 +186,22 @@ impl Model {
                     // 2*inter]` bias, joined on the bank's own seam — the same
                     // axis and the same gate-first order `deinterleaved`
                     // produces above.
-                    tensors.push(contract::fused(
-                        src,
+                    b.read_concat(
                         &mlp.gate_up_bias,
-                        [
-                            ck("mlp.experts.gate_proj.bias"),
-                            ck("mlp.experts.up_proj.bias"),
-                        ],
-                    )?);
+                        [ck("mlp.experts.gate_proj.bias"), ck("mlp.experts.up_proj.bias")],
+                    )?;
 
-                    tensors.extend(banked_split(
+                    b.extend(banked_split(
                         src,
                         &mlp.down,
                         &[ck("mlp.experts.down_proj")],
                         layout,
                     )?);
-                    tensors.push(contract::copy(
-                        src,
-                        &mlp.down_bias,
-                        ck("mlp.experts.down_proj.bias"),
-                    )?);
+                    b.read(&mlp.down_bias, ck("mlp.experts.down_proj.bias"))?;
                 }
             }
         }
-        Ok(ModelContract {
-            alignment: contract::ALIGNMENT,
-            tensors,
-
-            groups: Vec::new(),
-        })
+        Ok(b.build())
     }
 }
 
@@ -277,7 +211,7 @@ fn banked(
     blocks: String,
     scales: String,
     layout: Layout,
-) -> Result<Vec<TensorContract>, ModelError> {
+) -> Result<Vec<TensorContract>, Error> {
     bank_planes(src, w, blocks, scales, layout, |expr| expr)
 }
 
@@ -288,7 +222,7 @@ fn banked_interleaved(
     scales: String,
     rows: i64,
     layout: Layout,
-) -> Result<Vec<TensorContract>, ModelError> {
+) -> Result<Vec<TensorContract>, Error> {
     bank_planes(src, w, blocks, scales, layout, |expr| {
         deinterleaved(expr, rows)
     })
@@ -315,7 +249,7 @@ fn banked_split(
     w: &Weight,
     stems: &[String],
     layout: Layout,
-) -> Result<Vec<TensorContract>, ModelError> {
+) -> Result<Vec<TensorContract>, Error> {
     let legs = i64::try_from(stems.len()).expect("a stem count inside i64");
     let axis = usize::from(BANK_ROWS);
     let leg = |whole: &[i64]| -> Vec<i64> {
@@ -353,7 +287,7 @@ fn banked_split(
             scaled.shape,
             scaled.encoding,
         )
-        .scaling(contract::scaling(w)),
+        .scaling(scaling(w)),
     ])
 }
 
@@ -364,12 +298,12 @@ fn stored_as(
     w: &Weight,
     plane: &str,
     want: DType,
-) -> Result<(), ModelError> {
-    let stored = contract::stored_encoding(src, plane)?;
+) -> Result<(), Error> {
+    let stored = stored_encoding(src, plane)?;
     if stored == Encoding::Raw(want) {
         return Ok(());
     }
-    Err(ModelError::Illegible {
+    Err(Error::Illegible {
         name: w.name.clone(),
         detail: format!(
             "`{plane}` is stored {stored:?}, and this spelling of the bank \
@@ -385,7 +319,7 @@ fn bank_planes(
     scales: String,
     layout: Layout,
     lay: impl Fn(Expr) -> Expr,
-) -> Result<Vec<TensorContract>, ModelError> {
+) -> Result<Vec<TensorContract>, Error> {
     stored_as(src, w, &blocks, layout.codes())?;
     stored_as(src, w, &scales, DType::U8)?;
     let codes = bank_codes(w);
@@ -402,7 +336,7 @@ fn bank_planes(
             scaled.shape,
             scaled.encoding,
         )
-        .scaling(contract::scaling(w)),
+        .scaling(scaling(w)),
     ])
 }
 
@@ -417,14 +351,14 @@ fn deinterleaved(src: Expr, rows: i64) -> Expr {
 }
 
 fn bank_codes(w: &Weight) -> TensorType {
-    TensorType::new(contract::extents(w), contract::grouped(w))
+    TensorType::new(extents(w), grouped(w))
 }
 
 fn bank_scales(w: &Weight) -> TensorType {
-    let shape = contract::extents(w);
-    let pairing = contract::scaling(w);
+    let shape = extents(w);
+    let pairing = scaling(w);
     TensorType::new(
-        contract::divided(&shape, pairing.channel_axis, pairing.group_size, &w.name),
+        divided(&shape, pairing.channel_axis, pairing.group_size, &w.name),
         encoding(Dtype::E8m0),
     )
 }

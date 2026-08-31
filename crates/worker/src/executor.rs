@@ -36,7 +36,7 @@
 //!   which was used.
 //!
 //! `crate::link::partner` carries the same marker on the client half, and
-//! `::runtime::pipeline::offload` on the admission half.
+//! `::runtime::offload` on the admission half.
 
 use std::net::IpAddr;
 use std::sync::Arc;

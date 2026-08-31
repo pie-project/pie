@@ -19,6 +19,7 @@ pub fn templates() -> Vec<TemplateRow> {
         crate::gpt_oss::TEMPLATES,
         crate::kimi_k3::TEMPLATES,
         crate::qwen_3::TEMPLATES,
+        crate::qwen_4::TEMPLATES,
     ]
     .concat()
 }

@@ -178,7 +178,14 @@ pub fn clamp(x: &Value, lo: f32, hi: f32) -> Value {
     x_out
 }
 
-pub fn rmsnorm_gated(x: &Value, gate: &Value, weight: &Weight, head_dim: u32, eps: f32) -> Value {
+pub fn rmsnorm_gated(
+    x: &Value,
+    gate: &Value,
+    weight: &Weight,
+    head_dim: u32,
+    eps: f32,
+    act: GateActivation,
+) -> Value {
     let r = x.rec();
     let y = r.fresh(gate.ty().clone());
     r.push(
@@ -188,6 +195,7 @@ pub fn rmsnorm_gated(x: &Value, gate: &Value, weight: &Weight, head_dim: u32, ep
             weight: r.weight(weight),
             head_dim,
             eps,
+            act,
             y: y.id(),
         },
         &[x, gate],
@@ -208,6 +216,24 @@ pub fn rmsnorm_gated_by(x: &Value, gate: &Value, weight: &Weight, heads: u32, ep
             y: y.id(),
         },
         &[x, gate],
+    );
+    y
+}
+
+/// The hyper-connection norm: moments per `group`-wide slice, `weight + 1`
+/// over the row's full width ([`Elementwise::RmsnormGroupedPlusOne`]).
+pub fn rmsnorm_grouped_plus_one(x: &Value, weight: &Weight, group: u32, eps: f32) -> Value {
+    let r = x.rec();
+    let y = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::RmsnormGroupedPlusOne {
+            x: x.id(),
+            weight: r.weight(weight),
+            group,
+            eps,
+            y: y.id(),
+        },
+        &[x],
     );
     y
 }
@@ -245,6 +271,22 @@ pub fn mul_scalar(s: f32, x: &Value) -> Value {
     let x_out = r.fresh(x.ty().clone());
     r.push(
         Elementwise::MulScalar {
+            s,
+            x: x.id(),
+            x_out: x_out.id(),
+        },
+        &[x],
+    );
+    x_out
+}
+
+/// `silu(s · x)`, in place — the scalar sits inside the activation, which is
+/// why this is not [`mul_scalar`] followed by anything.
+pub fn silu_scaled(s: f32, x: &Value) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::SiluScaled {
             s,
             x: x.id(),
             x_out: x_out.id(),
@@ -525,6 +567,67 @@ pub fn hc_fold(x: &Value, streams: &Value, post_mix: &Value, comb_mix: &Value) -
             y: y.id(),
         },
         &[x, streams, post_mix, comb_mix],
+    );
+    y
+}
+
+/// The gated-residual mix ([`Elementwise::HcMix`]): one `hidden`-wide layer
+/// input averaged out of `streams` normed residual streams under per-element
+/// sigmoid gates. `gates` and `normed` are both `[rows, streams · hidden]`.
+pub fn hc_mix(gates: &Value, normed: &Value, streams: u32) -> Value {
+    let r = gates.rec();
+    let y = r.fresh(tensor(
+        normed.rows(),
+        normed.width() / u64::from(streams),
+        normed.dtype(),
+    ));
+    r.push(
+        Elementwise::HcMix {
+            gates: gates.id(),
+            normed: normed.id(),
+            streams,
+            y: y.id(),
+        },
+        &[gates, normed],
+    );
+    y
+}
+
+/// The gated-residual injection ([`Elementwise::HcInject`]): `hyper[s·H+h] +=
+/// 2·σ(gates[s]/streams)·o[h]`, in place on the wide residual. `gates` is
+/// `[rows, streams]` of raw logits.
+pub fn hc_inject(o: &Value, gates: &Value, streams: u32, hyper: &Value) -> Value {
+    let r = o.rec();
+    let hyper_out = r.fresh(hyper.ty().clone());
+    r.push(
+        Elementwise::HcInject {
+            o: o.id(),
+            gates: gates.id(),
+            streams,
+            hyper: hyper.id(),
+            hyper_out: hyper_out.id(),
+        },
+        &[o, gates, hyper],
+    );
+    hyper_out
+}
+
+/// The PLE gate ([`Elementwise::PleGate`]): per stream, the n-gram key row
+/// dotted with the normed residual stream, signed-square-root damped,
+/// squashed, scaling the shared value row. `key` and `query` are
+/// `[rows, streams · hidden]`, `value` is `[rows, hidden]`.
+pub fn ple_gate(key: &Value, query: &Value, value: &Value, streams: u32) -> Value {
+    let r = key.rec();
+    let y = r.fresh(key.ty().clone());
+    r.push(
+        Elementwise::PleGate {
+            key: key.id(),
+            query: query.id(),
+            value: value.id(),
+            streams,
+            y: y.id(),
+        },
+        &[key, query, value],
     );
     y
 }

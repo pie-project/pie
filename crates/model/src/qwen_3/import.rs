@@ -1,7 +1,7 @@
-use checkpoint::contract::{Expr, ModelContract, TensorContract, TensorType};
+use checkpoint::contract::{Expr, ModelContract, TensorType};
 
 use super::model::{Head, Mixer, Mlp, Model};
-use crate::contract::{ALIGNMENT, ModelError, copy, declare, extents, fused, planes, planes_fused};
+use checkpoint_dsl::{Builder, Error, extents};
 
 /// **WHERE A SAFETENSORS CHECKPOINT OF THIS FAMILY PUTS ITS TRUNK.** Two
 /// spellings, and the difference is one swapped pair of path components.
@@ -101,11 +101,7 @@ impl Layout {
 }
 
 impl Model {
-    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
-        assert!(
-            self.tp == 1,
-            "an import states the whole checkpoint; build the model at tp = 1"
-        );
+    pub fn import(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
         let gguf = "token_embd.weight";
         for layout in [Layout::Transformers, Layout::Mlx] {
             if src.get(layout.embed()).is_some() {
@@ -115,7 +111,7 @@ impl Model {
         if src.get(gguf).is_some() {
             return self.import_from_gguf(src);
         }
-        Err(ModelError::Illegible {
+        Err(Error::Illegible {
             name: "qwen_3".to_string(),
             detail: format!(
                 "it holds none of `{}`, `{}` or `{gguf}`, so it is written \
@@ -129,7 +125,7 @@ impl Model {
     pub fn import_from_huggingface(
         &self,
         src: &ztensor::Source,
-    ) -> Result<ModelContract, ModelError> {
+    ) -> Result<ModelContract, Error> {
         self.import_from_safetensors(src, Layout::Transformers)
     }
 
@@ -137,84 +133,68 @@ impl Model {
         &self,
         src: &ztensor::Source,
         layout: Layout,
-    ) -> Result<ModelContract, ModelError> {
+    ) -> Result<ModelContract, Error> {
         // One plain-RMSNorm plane, with the fold `mlx_lm` baked in taken
         // back out where the file carries one — see
-        // [`Layout::folds_the_norm_one`]. Every `copy` below that names a
-        // NORM goes through this; the gated one does not, and the projections
-        // never could.
-        let norm = |w: &_, from: String| -> Result<TensorContract, ModelError> {
+        // [`Layout::folds_the_norm_one`]. Every read below that names a
+        // plain-RMSNorm plane goes through this; the gated one does not, and
+        // the projections never could.
+        let norm = |from: String| -> Expr {
             let read = Expr::src(from);
-            let read = if layout.folds_the_norm_one() {
+            if layout.folds_the_norm_one() {
                 read.bias(-1.0)
             } else {
                 read
-            };
-            declare(src, w, read)
+            }
         };
 
-        let mut tensors = planes(src, &self.embed, layout.embed())?;
-        tensors.push(norm(&self.final_norm, layout.norm().to_string())?);
+        let mut b = Builder::new(src, self.tp);
+        b.read(&self.embed, layout.embed())?;
+        b.read_expr(&self.final_norm, norm(layout.norm().to_string()))?;
 
         if let Head::Bank(head) = &self.head {
-            tensors.extend(planes(src, head, layout.head())?);
+            b.read(head, layout.head())?;
         }
 
         for (l, w) in self.layers.iter().enumerate() {
             let n = |s: &str| layout.layer(l, s);
 
-            tensors.push(norm(&w.mixer_norm, n("input_layernorm.weight"))?);
-            tensors.push(norm(&w.mlp_norm, n("post_attention_layernorm.weight"))?);
+            b.read_expr(&w.mixer_norm, norm(n("input_layernorm.weight")))?;
+            b.read_expr(&w.mlp_norm, norm(n("post_attention_layernorm.weight")))?;
 
             match &w.mixer {
                 Mixer::Attn(a) => {
-                    tensors.extend(planes(src, &a.qg_proj, n("self_attn.q_proj.weight"))?);
-                    tensors.extend(planes(src, &a.k_proj, n("self_attn.k_proj.weight"))?);
-                    tensors.extend(planes(src, &a.v_proj, n("self_attn.v_proj.weight"))?);
-                    tensors.extend(planes(src, &a.o_proj, n("self_attn.o_proj.weight"))?);
-                    tensors.push(norm(&a.q_norm, n("self_attn.q_norm.weight"))?);
-                    tensors.push(norm(&a.k_norm, n("self_attn.k_norm.weight"))?);
+                    b.read(&a.qg_proj, n("self_attn.q_proj.weight"))?;
+                    b.read(&a.k_proj, n("self_attn.k_proj.weight"))?;
+                    b.read(&a.v_proj, n("self_attn.v_proj.weight"))?;
+                    b.read(&a.o_proj, n("self_attn.o_proj.weight"))?;
+                    b.read_expr(&a.q_norm, norm(n("self_attn.q_norm.weight")))?;
+                    b.read_expr(&a.k_norm, norm(n("self_attn.k_norm.weight")))?;
                 }
                 Mixer::Gdn(g) => {
-                    tensors.extend(planes_fused(
-                        src,
+                    b.read_concat(
                         &g.in_qkvz,
-                        [
-                            n("linear_attn.in_proj_qkv.weight"),
-                            n("linear_attn.in_proj_z.weight"),
-                        ],
-                    )?);
+                        [n("linear_attn.in_proj_qkv.weight"), n("linear_attn.in_proj_z.weight")],
+                    )?;
 
-                    tensors.extend(planes_fused(
-                        src,
+                    b.read_concat(
                         &g.in_ba,
-                        [
-                            n("linear_attn.in_proj_b.weight"),
-                            n("linear_attn.in_proj_a.weight"),
-                        ],
-                    )?);
+                        [n("linear_attn.in_proj_b.weight"), n("linear_attn.in_proj_a.weight")],
+                    )?;
 
-                    tensors.push(declare(
-                        src,
-                        &g.conv,
-                        squeezed(src, n("linear_attn.conv1d.weight"))?,
-                    )?);
+                    b.read_expr(&g.conv, squeezed(src, n("linear_attn.conv1d.weight"))?)?;
 
-                    tensors.push(copy(src, &g.dt_bias, n("linear_attn.dt_bias"))?);
-                    tensors.push(copy(src, &g.a_log, n("linear_attn.A_log"))?);
-                    tensors.push(copy(src, &g.norm, n("linear_attn.norm.weight"))?);
-                    tensors.extend(planes(src, &g.out_proj, n("linear_attn.out_proj.weight"))?);
+                    b.read(&g.dt_bias, n("linear_attn.dt_bias"))?;
+                    b.read(&g.a_log, n("linear_attn.A_log"))?;
+                    b.read(&g.norm, n("linear_attn.norm.weight"))?;
+                    b.read(&g.out_proj, n("linear_attn.out_proj.weight"))?;
                 }
             }
 
             match &w.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    tensors.extend(planes_fused(
-                        src,
-                        gate_up,
-                        [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
-                    )?);
-                    tensors.extend(planes(src, down, n("mlp.down_proj.weight"))?);
+                    b.read_concat(gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+                    b.read(down, n("mlp.down_proj.weight"))?;
                 }
                 Mlp::Routed {
                     router,
@@ -225,28 +205,63 @@ impl Model {
                     shared_gate,
                     ..
                 } => {
-                    tensors.extend(planes(src, router, n("mlp.gate.weight"))?);
+                    // The routing gates are named the same in both spellings;
+                    // what differs is how many TENSORS each is and how wide
+                    // its codes are, and both of those are facts about the
+                    // weight's declared dtype rather than about the layout.
+                    // `Model::new` declares them `MlxU8` wherever the stack is
+                    // `MlxU4`, and `read` asks the weight rather than the file.
+                    b.read(router, n("mlp.gate.weight"))?;
 
-                    tensors.extend(planes(src, gate_up, n("mlp.experts.gate_up_proj"))?);
-                    tensors.extend(planes(src, down, n("mlp.experts.down_proj"))?);
-                    tensors.extend(planes_fused(
-                        src,
+                    // **THE ONE PLACE THE TWO SPELLINGS PART** — `gpt_oss::
+                    // import`'s `Layout` match, in this family's names.
+                    //
+                    // transformers ships the routed gate and up FUSED, one
+                    // `mlp.experts.gate_up_proj` of `[experts, 2 * inter,
+                    // hidden]`. `mlx_lm`'s `Qwen3_5MoeModel.sanitize` splits
+                    // that pair — `gate_up[..., :mid, :]` and `gate_up[...,
+                    // mid:, :]` — into `switch_mlp.gate_proj` and
+                    // `switch_mlp.up_proj`, and `mlx_lm.convert` runs
+                    // `sanitize` on the way in and writes the SPLIT form, so
+                    // the split is a permanent property of every MLX-layout
+                    // artifact of this family. `mlx-community/Qwen3.6-35B-A3B
+                    // -4bit` holds two `[256, 512, 2048]` banks per layer where
+                    // a transformers file holds one `[256, 1024, 2048]`.
+                    //
+                    // `read_concat` joins them on the weight's own cut axis,
+                    // which `.bank([inter, inter])` put at axis 1 — the axis
+                    // `sanitize` split and in the gate-first order it split
+                    // them into — and carries each part's `.scales` and
+                    // `.biases` to the same seams, a group belonging to the row
+                    // it scales.
+                    //
+                    // `down_proj` is one tensor in both spellings and parts
+                    // only in its name.
+                    match layout {
+                        Layout::Transformers => {
+                            b.read(gate_up, n("mlp.experts.gate_up_proj"))?;
+                            b.read(down, n("mlp.experts.down_proj"))?;
+                        }
+                        Layout::Mlx => {
+                            b.read_concat(
+                                gate_up,
+                                [
+                                    n("mlp.switch_mlp.gate_proj.weight"),
+                                    n("mlp.switch_mlp.up_proj.weight"),
+                                ],
+                            )?;
+                            b.read(down, n("mlp.switch_mlp.down_proj.weight"))?;
+                        }
+                    }
+                    b.read_concat(
                         shared_gate_up,
                         [
                             n("mlp.shared_expert.gate_proj.weight"),
                             n("mlp.shared_expert.up_proj.weight"),
                         ],
-                    )?);
-                    tensors.extend(planes(
-                        src,
-                        shared_down,
-                        n("mlp.shared_expert.down_proj.weight"),
-                    )?);
-                    tensors.extend(planes(
-                        src,
-                        shared_gate,
-                        n("mlp.shared_expert_gate.weight"),
-                    )?);
+                    )?;
+                    b.read(shared_down, n("mlp.shared_expert.down_proj.weight"))?;
+                    b.read(shared_gate, n("mlp.shared_expert_gate.weight"))?;
                 }
             }
         }
@@ -287,7 +302,7 @@ impl Model {
         // read by both heads.
         // **THE TOWER, PLANE FOR PLANE** (multimodal §2, campaign M-1/M-2).
         //
-        // Every entry is a `copy`: the norms' scale and bias are applied by
+        // Every entry is a plain `read`: the norms' scale and bias are applied by
         // ops rather than folded into the GEMMs behind them (§9.1 — half the
         // fold is expressible and the halves do not compose), and the position
         // table is gathered rather than baked (§11.3). So this contract states
@@ -302,30 +317,29 @@ impl Model {
         // is a `transmute` and not a transform.
         if let Some(t) = &self.tower {
             let v = |s: &str| format!("model.visual.{s}");
-            tensors.push(declare(
-                src,
+            b.read_expr(
                 &t.patch_embed,
                 flattened(src, v("patch_embed.proj.weight"), extents(&t.patch_embed))?,
-            )?);
-            tensors.push(copy(src, &t.patch_embed_bias, v("patch_embed.proj.bias"))?);
-            tensors.push(copy(src, &t.pos_embed, v("pos_embed.weight"))?);
-            for (l, b) in t.blocks.iter().enumerate() {
+            )?;
+            b.read(&t.patch_embed_bias, v("patch_embed.proj.bias"))?;
+            b.read(&t.pos_embed, v("pos_embed.weight"))?;
+            for (l, blk) in t.blocks.iter().enumerate() {
                 let n = |s: &str| v(&format!("blocks.{l}.{s}"));
                 for (weight, from) in [
-                    (&b.norm1, n("norm1.weight")),
-                    (&b.norm1_bias, n("norm1.bias")),
-                    (&b.qkv, n("attn.qkv.weight")),
-                    (&b.qkv_bias, n("attn.qkv.bias")),
-                    (&b.proj, n("attn.proj.weight")),
-                    (&b.proj_bias, n("attn.proj.bias")),
-                    (&b.norm2, n("norm2.weight")),
-                    (&b.norm2_bias, n("norm2.bias")),
-                    (&b.fc1, n("mlp.linear_fc1.weight")),
-                    (&b.fc1_bias, n("mlp.linear_fc1.bias")),
-                    (&b.fc2, n("mlp.linear_fc2.weight")),
-                    (&b.fc2_bias, n("mlp.linear_fc2.bias")),
+                    (&blk.norm1, n("norm1.weight")),
+                    (&blk.norm1_bias, n("norm1.bias")),
+                    (&blk.qkv, n("attn.qkv.weight")),
+                    (&blk.qkv_bias, n("attn.qkv.bias")),
+                    (&blk.proj, n("attn.proj.weight")),
+                    (&blk.proj_bias, n("attn.proj.bias")),
+                    (&blk.norm2, n("norm2.weight")),
+                    (&blk.norm2_bias, n("norm2.bias")),
+                    (&blk.fc1, n("mlp.linear_fc1.weight")),
+                    (&blk.fc1_bias, n("mlp.linear_fc1.bias")),
+                    (&blk.fc2, n("mlp.linear_fc2.weight")),
+                    (&blk.fc2_bias, n("mlp.linear_fc2.bias")),
                 ] {
-                    tensors.push(copy(src, weight, from)?);
+                    b.read(weight, from)?;
                 }
             }
             let m = &t.merger;
@@ -337,7 +351,7 @@ impl Model {
                 (&m.fc2, v("merger.linear_fc2.weight")),
                 (&m.fc2_bias, v("merger.linear_fc2.bias")),
             ] {
-                tensors.push(copy(src, weight, from)?);
+                b.read(weight, from)?;
             }
         }
 
@@ -360,16 +374,8 @@ impl Model {
             // publishes the same block, and `--aux` gives it the prefix.
             let n = |s: &str| format!("{p}.layers.0.{s}");
             if let Some(pre) = &mtp.pre_fc {
-                tensors.push(copy(
-                    src,
-                    &pre.embedding,
-                    format!("{p}.pre_fc_norm_embedding.weight"),
-                )?);
-                tensors.push(copy(
-                    src,
-                    &pre.hidden,
-                    format!("{p}.pre_fc_norm_hidden.weight"),
-                )?);
+                b.read(&pre.embedding, format!("{p}.pre_fc_norm_embedding.weight"))?;
+                b.read(&pre.hidden, format!("{p}.pre_fc_norm_hidden.weight"))?;
             }
 
             // THE ONE STORED BANK, CUT AT ITS OWN SEAM. `mtp.fc.weight` is
@@ -382,60 +388,39 @@ impl Model {
             // column bands of one tensor.
             let half = extents(&mtp.fc_embed)[1];
             let fc = format!("{p}.fc.weight");
-            tensors.push(declare(
-                src,
-                &mtp.fc_embed,
-                Expr::src(fc.clone()).slice(1, 0, half),
-            )?);
-            tensors.push(declare(
-                src,
-                &mtp.fc_hidden,
-                Expr::src(fc).slice(1, half, half),
-            )?);
+            b.read_expr(&mtp.fc_embed, Expr::src(fc.clone()).slice(1, 0, half))?;
+            b.read_expr(&mtp.fc_hidden, Expr::src(fc).slice(1, half, half))?;
 
             let a = &mtp.attn;
-            tensors.push(copy(src, &mtp.mixer_norm, n("input_layernorm.weight"))?);
-            tensors.push(copy(src, &a.qg_proj, n("self_attn.q_proj.weight"))?);
-            tensors.push(copy(src, &a.k_proj, n("self_attn.k_proj.weight"))?);
-            tensors.push(copy(src, &a.v_proj, n("self_attn.v_proj.weight"))?);
-            tensors.push(copy(src, &a.o_proj, n("self_attn.o_proj.weight"))?);
-            tensors.push(copy(src, &a.q_norm, n("self_attn.q_norm.weight"))?);
-            tensors.push(copy(src, &a.k_norm, n("self_attn.k_norm.weight"))?);
-            tensors.push(copy(
-                src,
-                &mtp.mlp_norm,
-                n("post_attention_layernorm.weight"),
-            )?);
+            b.read(&mtp.mixer_norm, n("input_layernorm.weight"))?;
+            b.read(&a.qg_proj, n("self_attn.q_proj.weight"))?;
+            b.read(&a.k_proj, n("self_attn.k_proj.weight"))?;
+            b.read(&a.v_proj, n("self_attn.v_proj.weight"))?;
+            b.read(&a.o_proj, n("self_attn.o_proj.weight"))?;
+            b.read(&a.q_norm, n("self_attn.q_norm.weight"))?;
+            b.read(&a.k_norm, n("self_attn.k_norm.weight"))?;
+            b.read(&mtp.mlp_norm, n("post_attention_layernorm.weight"))?;
             match &mtp.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    tensors.push(fused(
-                        src,
-                        gate_up,
-                        [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
-                    )?);
-                    tensors.push(copy(src, down, n("mlp.down_proj.weight"))?);
+                    b.read_concat(gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+                    b.read(down, n("mlp.down_proj.weight"))?;
                 }
                 Mlp::Routed { .. } => {
-                    return Err(ModelError::Illegible {
+                    return Err(Error::Illegible {
                         name: n("mlp"),
                         detail: "a draft head is one block and routes to no experts".to_string(),
                     });
                 }
             }
             if let Some(norm) = &mtp.norm {
-                tensors.push(copy(src, norm, format!("{p}.norm.weight"))?);
+                b.read(norm, format!("{p}.norm.weight"))?;
             }
         }
 
-        Ok(ModelContract {
-            alignment: ALIGNMENT,
-            tensors,
-
-            groups: Vec::new(),
-        })
+        Ok(b.build())
     }
 
-    pub fn import_from_gguf(&self, src: &ztensor::Source) -> Result<ModelContract, ModelError> {
+    pub fn import_from_gguf(&self, src: &ztensor::Source) -> Result<ModelContract, Error> {
         // **A NAMED REFUSAL, NOT A SILENT HALF-LOAD.** GGUF has no settled
         // spelling for this family's draft head — nothing in the cached
         // artifacts states one, and inventing `blk.*.nextn.*` here would
@@ -448,7 +433,7 @@ impl Model {
         // inventing one here would publish a contract whose first symptom is a
         // load that lands the trunk and zeroes a hundred and fifty planes.
         if self.tower.is_some() {
-            return Err(ModelError::Illegible {
+            return Err(Error::Illegible {
                 name: "visual".to_string(),
                 detail: "this SKU declares a vision tower and no GGUF spelling \
                          of one is settled; import it from the safetensors \
@@ -457,7 +442,7 @@ impl Model {
             });
         }
         if self.mtp.is_some() {
-            return Err(ModelError::Illegible {
+            return Err(Error::Illegible {
                 name: "mtp".to_string(),
                 detail: "this SKU declares an MTP draft head and no GGUF \
                          spelling of one is settled; import it from the \
@@ -465,49 +450,44 @@ impl Model {
                     .to_string(),
             });
         }
-        let mut tensors = vec![
-            copy(src, &self.embed, "token_embd.weight")?,
-            copy(src, &self.final_norm, "output_norm.weight")?,
-        ];
+        let mut b = Builder::new(src, self.tp);
+        b.read(&self.embed, "token_embd.weight")?;
+        b.read(&self.final_norm, "output_norm.weight")?;
 
         if let Head::Bank(head) = &self.head {
-            tensors.push(copy(src, head, "output.weight")?);
+            b.read(head, "output.weight")?;
         }
 
         for (l, w) in self.layers.iter().enumerate() {
             let n = |s: &str| format!("blk.{l}.{s}");
 
-            tensors.push(copy(src, &w.mixer_norm, n("attn_norm.weight"))?);
-            tensors.push(copy(src, &w.mlp_norm, n("ffn_norm.weight"))?);
+            b.read(&w.mixer_norm, n("attn_norm.weight"))?;
+            b.read(&w.mlp_norm, n("ffn_norm.weight"))?;
 
             match &w.mixer {
                 Mixer::Attn(a) => {
-                    tensors.push(copy(src, &a.qg_proj, n("attn_q.weight"))?);
-                    tensors.push(copy(src, &a.k_proj, n("attn_k.weight"))?);
-                    tensors.push(copy(src, &a.v_proj, n("attn_v.weight"))?);
-                    tensors.push(copy(src, &a.o_proj, n("attn_output.weight"))?);
-                    tensors.push(copy(src, &a.q_norm, n("attn_q_norm.weight"))?);
-                    tensors.push(copy(src, &a.k_norm, n("attn_k_norm.weight"))?);
+                    b.read(&a.qg_proj, n("attn_q.weight"))?;
+                    b.read(&a.k_proj, n("attn_k.weight"))?;
+                    b.read(&a.v_proj, n("attn_v.weight"))?;
+                    b.read(&a.o_proj, n("attn_output.weight"))?;
+                    b.read(&a.q_norm, n("attn_q_norm.weight"))?;
+                    b.read(&a.k_norm, n("attn_k_norm.weight"))?;
                 }
                 Mixer::Gdn(g) => {
-                    tensors.push(copy(src, &g.in_qkvz, n("ssm_in.weight"))?);
-                    tensors.push(copy(src, &g.in_ba, n("ssm_beta_alpha.weight"))?);
-                    tensors.push(copy(src, &g.conv, n("ssm_conv1d.weight"))?);
-                    tensors.push(copy(src, &g.dt_bias, n("ssm_dt.bias"))?);
-                    tensors.push(copy(src, &g.a_log, n("ssm_a"))?);
-                    tensors.push(copy(src, &g.norm, n("ssm_norm.weight"))?);
-                    tensors.push(copy(src, &g.out_proj, n("ssm_out.weight"))?);
+                    b.read(&g.in_qkvz, n("ssm_in.weight"))?;
+                    b.read(&g.in_ba, n("ssm_beta_alpha.weight"))?;
+                    b.read(&g.conv, n("ssm_conv1d.weight"))?;
+                    b.read(&g.dt_bias, n("ssm_dt.bias"))?;
+                    b.read(&g.a_log, n("ssm_a"))?;
+                    b.read(&g.norm, n("ssm_norm.weight"))?;
+                    b.read(&g.out_proj, n("ssm_out.weight"))?;
                 }
             }
 
             match &w.mlp {
                 Mlp::Dense { gate_up, down, .. } => {
-                    tensors.push(fused(
-                        src,
-                        gate_up,
-                        [n("ffn_gate.weight"), n("ffn_up.weight")],
-                    )?);
-                    tensors.push(copy(src, down, n("ffn_down.weight"))?);
+                    b.read_concat(gate_up, [n("ffn_gate.weight"), n("ffn_up.weight")])?;
+                    b.read(down, n("ffn_down.weight"))?;
                 }
                 Mlp::Routed {
                     router,
@@ -518,31 +498,21 @@ impl Model {
                     shared_gate,
                     ..
                 } => {
-                    tensors.push(copy(src, router, n("ffn_gate_inp.weight"))?);
+                    b.read(router, n("ffn_gate_inp.weight"))?;
 
-                    tensors.push(fused(
-                        src,
-                        gate_up,
-                        [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")],
-                    )?);
-                    tensors.push(copy(src, down, n("ffn_down_exps.weight"))?);
-                    tensors.push(fused(
-                        src,
+                    b.read_concat(gate_up, [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")])?;
+                    b.read(down, n("ffn_down_exps.weight"))?;
+                    b.read_concat(
                         shared_gate_up,
                         [n("ffn_gate_shexp.weight"), n("ffn_up_shexp.weight")],
-                    )?);
-                    tensors.push(copy(src, shared_down, n("ffn_down_shexp.weight"))?);
-                    tensors.push(copy(src, shared_gate, n("ffn_gate_inp_shexp.weight"))?);
+                    )?;
+                    b.read(shared_down, n("ffn_down_shexp.weight"))?;
+                    b.read(shared_gate, n("ffn_gate_inp_shexp.weight"))?;
                 }
             }
         }
 
-        Ok(ModelContract {
-            alignment: ALIGNMENT,
-            tensors,
-
-            groups: Vec::new(),
-        })
+        Ok(b.build())
     }
 }
 
@@ -553,11 +523,11 @@ impl Model {
 /// `[hidden, C·T·P²]` in the plan are the same bytes in the same order, so
 /// this checks the element count and re-states the type. A mismatch is a
 /// refusal here rather than a silently short read four stages later.
-fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, ModelError> {
+fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
-        return Err(ModelError::Missing(from));
+        return Err(Error::Missing(from));
     };
-    let illegible = |why: &dyn std::fmt::Display| ModelError::Illegible {
+    let illegible = |why: &dyn std::fmt::Display| Error::Illegible {
         name: from.clone(),
         detail: why.to_string(),
     };
@@ -585,11 +555,13 @@ fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr
     Ok(Expr::src(from).transmute(TensorType::new(want, encoding)))
 }
 
-fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, ModelError> {
+/// `pub(crate)` for `qwen_4`, whose depthwise banks — the GDN convolutions
+/// and the PLE's dilated one — are published in the same two spellings.
+pub(crate) fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
-        return Err(ModelError::Missing(from));
+        return Err(Error::Missing(from));
     };
-    let illegible = |why: &dyn std::fmt::Display| ModelError::Illegible {
+    let illegible = |why: &dyn std::fmt::Display| Error::Illegible {
         name: from.clone(),
         detail: why.to_string(),
     };

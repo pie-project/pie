@@ -421,3 +421,83 @@ fn names_of(file: &Path) -> std::io::Result<Vec<String>> {
         })
         .unwrap_or_default())
 }
+
+/// **THE QWEN4 IMPORT, HELD AGAINST THE SHIPPED 4-BIT ARTIFACT ITSELF.**
+///
+/// Not a rank census: this row's every projection is a
+/// `.weight`/`.scales`/`.biases` triplet whose group widths (64 for the
+/// stack, 32 for the n-gram table's 160-wide rows) and code widths (4-bit
+/// experts under 8-bit projections) are all facts the import validates
+/// against STORED dtypes and shapes — which a `[1, 1]` bf16 dummy cannot
+/// carry. So the test opens the real safetensors shards (headers only; no
+/// payload is read to build a contract) and asks for the whole bijection.
+#[test]
+fn the_qwen4_import_covers_the_shipped_artifact() {
+    let repo = "models--pipenetwork--Qwen3.8-Flash-Next-MLX-mixed-4_8bit";
+    let Some(hub) = hub() else {
+        eprintln!("not asked: no HuggingFace cache on this machine");
+        return;
+    };
+    let snapshots = hub.join(repo).join("snapshots");
+    let Some(snapshot) = std::fs::read_dir(&snapshots).ok().and_then(|dir| {
+        dir.filter_map(|entry| Some(entry.ok()?.path()))
+            .find(|p| p.join("model.safetensors.index.json").exists())
+    }) else {
+        eprintln!("not asked: no Qwen3.8-Flash-Next 4-bit snapshot on this machine");
+        return;
+    };
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&snapshot)
+        .expect("the snapshot lists")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            name.ends_with(".safetensors").then_some(path)
+        })
+        .collect();
+    files.sort();
+    let source = ztensor_compat::index_all(&files).expect("the shards open as one source");
+
+    let sku = "qwen38-flash-mlxu4-kv-bf16";
+    let import = model::import_of(sku).expect("this build ships the row");
+    let contract = import(&source).unwrap_or_else(|why| {
+        panic!("`{sku}` refuses the artifact it was written for: {why}")
+    });
+
+    let trace = model::trace_of(sku).expect("and its trace");
+    let trace = trace(Platform::Cuda);
+    let demand: BTreeSet<&str> = trace
+        .params
+        .iter()
+        .filter(|p| p.source == ParamSource::Checkpoint)
+        .map(|p| p.name.as_str())
+        .collect();
+    let supply: BTreeSet<&str> = contract
+        .tensors
+        .iter()
+        .filter(|t| t.visibility == checkpoint::contract::Visibility::Public)
+        .map(|t| t.name.as_str())
+        .collect();
+
+    let mut faults = Vec::new();
+    for name in demand.symmetric_difference(&supply) {
+        faults.push(format!(
+            "`{name}` is in one of the qwen4 plan and its import contract and \
+             not the other"
+        ));
+    }
+
+    // And no earlier row claims the artifact: the flash text is the one
+    // reading whose shapes fit these planes.
+    match model::identify(&source) {
+        Ok("qwen38-flash-mlxu4-kv-bf16") => {}
+        Ok(other) => faults.push(format!(
+            "the Qwen3.8-Flash-Next artifact identifies as `{other}`"
+        )),
+        Err(why) => faults.push(format!(
+            "the Qwen3.8-Flash-Next artifact matches no SKU: {why}"
+        )),
+    }
+
+    assert!(faults.is_empty(), "\n{}\n", faults.join("\n"));
+}

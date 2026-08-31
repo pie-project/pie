@@ -11,7 +11,7 @@ use tokenizer::{Tokenizer, TokenizerDecoder};
 use crate::decode::{GenericChatDecoder, ThinkingDecoder};
 use crate::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, special, specials};
 
-const STOP_TOKENS: &[&str] = &["<|endoftext|>", "<|return|>", "<|call|>"];
+pub const STOP_TOKENS: &[&str] = &["<|endoftext|>", "<|return|>", "<|call|>"];
 
 const CALL_HEADER: &str = "<|channel|>commentary to=functions.";
 const MESSAGE: &str = "<|message|>";

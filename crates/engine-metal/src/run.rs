@@ -941,7 +941,7 @@ impl<'c> Run<'c> {
     /// reservation at the budget's ceiling, not this fire's extent.
     ///
     /// **READ AT THE DENSE QUANTIZED ARMS, AND THE READER IS NAMED.**
-    /// `kernels_metal::linear::quant::mb_rows` takes exactly this as its
+    /// `kernels_metal::linear::quant::mb_block` takes exactly this as its
     /// `capacity`: the rows a launch may write into before it runs into the
     /// next value's slot, which is what makes padding a fire up to its row
     /// rung free of consequence. `dispatch::linear` hands it the MINIMUM over
@@ -952,41 +952,31 @@ impl<'c> Run<'c> {
         self.scratch.capacity(id)
     }
 
-    /// The FP16 staging plane at `rows x contraction`, and the split-K
-    /// partials plane at `split * rows x width`.
+    /// The FP16 staging plane at `rows x contraction`.
     ///
-    /// **BOTH ARE SEATED AT `quant::Scratch`, AND AS MINTS RATHER THAN AS
-    /// RECTANGLES.** `quant::precast_stage`/`quant::precast_point` and
-    /// `quant::splitk_point`/`quant::splitk_reduce_point` are the consumers,
-    /// and the shape each one wants is `quant::mb_rows`' and
-    /// `quant::split_k`' answer — decided inside `quant::act_x_wt`, several
-    /// guards past the call. So `dispatch::linear` hands the entry a closure
-    /// over each of these and the entry asks with the numbers it selected;
-    /// `None` is this shell saying the load-time reservation does not hold
-    /// that shape, and the ladder answers it by taking the rung that needs no
-    /// plane.
+    /// **SEATED AT `quant::Scratch`, AND AS A MINT RATHER THAN AS A
+    /// RECTANGLE.** `quant::precast_stage`/`quant::precast_point` are the
+    /// consumers and the shape they want is `quant::mb_block`'s answer,
+    /// decided inside `quant::act_x_wt` several guards past the call. So
+    /// `dispatch::linear` hands the entry a closure over this and the entry
+    /// asks with the number it selected; `None` is this shell saying the
+    /// load-time reservation does not hold that shape, and the ladder answers
+    /// it by taking the rung that needs no plane.
     ///
-    /// The reservation costs nothing besides: the three roles alias, so on
-    /// any artifact with a mixture these two are inside the routed plane's
-    /// bytes — which is also why a chain may be inside ONE of them and never
-    /// both.
+    /// **IT USED TO BE A PAIR AND THE SECOND IS GONE.** The split-K partials
+    /// plane went out with the split arm — nothing wrote it — and a
+    /// reservation nothing writes is not free on a checkpoint that reaches no
+    /// pre-cast, where no routed plane aliases it.
+    ///
+    /// The reservation costs nothing besides on a mixture: the roles alias,
+    /// so this is inside the routed plane's bytes there, which is also why a
+    /// chain may be inside ONE of them and never both.
     pub(crate) fn precast(&self, rows: u32, contraction: u32) -> Option<Tensor> {
         Some(
             self.scratch
                 .precast(self.handles, rows, contraction)?
                 .unwrap_or_else(|fault| {
                     panic!("the precast plane this load reserved does not mint: {fault}")
-                }),
-        )
-    }
-
-    /// See [`Run::precast`].
-    pub(crate) fn partials(&self, split: u32, rows: u32, width: u32) -> Option<Tensor> {
-        Some(
-            self.scratch
-                .partials(self.handles, split, rows, width)?
-                .unwrap_or_else(|fault| {
-                    panic!("the partials plane this load reserved does not mint: {fault}")
                 }),
         )
     }

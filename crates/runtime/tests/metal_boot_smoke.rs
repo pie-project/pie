@@ -147,6 +147,11 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
         page_size: 16,
         max_context: 512,
         slots: 4,
+        // THE SECOND ROW AXIS, UNASKED FOR. `None` on both is a text-only
+        // load — no patch rectangle, no image indptr — which is what this
+        // smoke's SKU is and what every caller had before the towers.
+        max_patches: None,
+        max_images: None,
     };
     let request = runtime::engine::load::request(
             &checkpoint,
@@ -159,14 +164,15 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
             1,
         )
         .expect("the checkpoint identifies and its SKU traces");
+    // **WHAT CROSSES IS THE TRACE, AND ONLY THE TRACE** (decision 18). The
+    // request used to carry a `plan` and this pair asked it its name and its
+    // platform; `LoadRequest` has no such field any more — `CompiledModel` is
+    // the engine's to build and never travels — so the same two facts are
+    // asked of the trace that does cross, and the load's own answer
+    // (`facts.trace_name`, checked at step 3) is what closes the loop.
     assert_eq!(
-        request.plan.name, SKU,
+        request.trace.name, SKU,
         "the checkpoint identifies as the row this smoke is about"
-    );
-    assert_eq!(
-        request.plan.platform,
-        Platform::Metal,
-        "the plan that crosses the boundary was traced for the plane behind it"
     );
 
     // 3. THE LOAD, and what it answers about itself.
@@ -187,18 +193,34 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
         "the profile is carried, not reconstructed: {:?}",
         caps.profile
     );
-    // **THIS PLANE RESOLVES THE DECODE ENVELOPE ON THE DEVICE**, so it
-    // admits that class and the HOST class beneath it, and nothing wider.
-    // `serve::stage` reads `embed_tokens`, `positions` and `kv_len` off an
-    // attached instance's own ring at step 0b — the same read the CUDA shell
-    // has always made — so a decode loop's sampled token never leaves the
-    // device. What stays refused is `DeviceGeometry`: its other four ports
-    // describe a page table this shell owns and derives from the seat, and
-    // the refusal arrives through the contract's own negotiation at
-    // `bind_instance` rather than through a fire that discovers it.
+    // **THIS PLANE RESOLVES THE WHOLE FIRE GEOMETRY ON THE DEVICE**, so it
+    // admits every class the contract has. `serve::stage` reads all nine
+    // ports off an attached instance's own rings at step 0b — the same read
+    // the CUDA shell makes — so a decode loop's sampled token never leaves the
+    // device, and a guest that owns its page table has its `pages`,
+    // `page_indptr`, `w_slot` and `w_off` translated through
+    // `KvDelta::translation` and used instead of the seat's derivation.
+    //
+    // **THE ASSERTION IS THE ADMISSION AND NOT THE MASK**, because the mask is
+    // what the runtime's own classifier reads: `inferlet::host::forward`'s
+    // `devgeo_capable` asks for `DEVICE_GEOMETRY` plus `AttnMask` before it
+    // will route a masked device-carried decode to the pooled class, and an
+    // engine that fell short of either takes the loud Host fallback and dies
+    // on the first value the host cannot know ("EmbedTokens is not
+    // host-derivable"). So the mask is asserted beside the classes: it is the
+    // thing nine curated fixtures turn on.
     assert!(caps.admits(eta_ir::registry::GeometryClass::Host));
     assert!(caps.admits(eta_ir::registry::GeometryClass::DecodeEnvelope));
-    assert!(!caps.admits(eta_ir::registry::GeometryClass::DeviceGeometry));
+    assert!(caps.admits(eta_ir::registry::GeometryClass::DeviceGeometry));
+    assert!(
+        caps.ports
+            .covers(eta_ir::registry::PortMask::of(&[
+                eta_ir::registry::Port::AttnMask
+            ])),
+        "a pooled device-geometry guest states its ancestry mask on a channel, and \
+         an engine that does not claim the port cannot resolve it: {:?}",
+        caps.ports
+    );
 
     // 4. THE FIRE. One lane, the prompt, the shell's own page table.
     let prompt = tokenizer.encode(PROMPT);

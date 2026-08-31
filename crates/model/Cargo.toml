@@ -28,12 +28,13 @@ chat-template = { path = "../chat-template" }
 # `Plan`, `Param`, `Shard`) arrive through the dsl's re-exports, so `model-ir`
 # is never named directly.
 model-dsl = { path = "../model-dsl" }
-# The vocabulary a family's checkpoint provenance is written in. `contract::Expr`
-# and `ModelContract` are the load contract's own algebra, and this crate is the
-# declarer that module's doc names — so a `<model>/import.rs` states where its
-# bytes come from in the language the loader checks and runs, rather than in a
-# second one beside it.
+# The load contract's own algebra: `contract::Expr` and `ModelContract` are
+# what an import adds up to, and the loader checks and runs them.
 checkpoint = { path = "../checkpoint" }
+# The vocabulary a family's checkpoint provenance is written in: the `Builder`
+# whose four verbs a `<model>/import.rs` and a `Model::load` state their bytes'
+# origins in, checked against the open source line by line.
+checkpoint-dsl = { path = "../checkpoint-dsl" }
 # The tool arguments a family's chat template renders, and the plan `bin/trace`
 # prints.
 serde_json = "1"
@@ -57,3 +58,7 @@ ztensor = { workspace = true }
 # name `model-ir` and nothing else — its edge back to `model` is a dev edge
 # too, and two dev edges never meet in one build graph.
 model-compiler = { path = "../model-compiler" }
+# The provenance gate's door onto a REAL cached artifact: qwen4's 4-bit
+# import is a triplet-and-groups contract no rank-census fixture can state,
+# so its test opens the shipped safetensors themselves (headers only).
+ztensor-compat = { workspace = true }
