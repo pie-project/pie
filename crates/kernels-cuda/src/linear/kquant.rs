@@ -1,16 +1,28 @@
-//! GGUF K-quant gemm points: `q4_k`/`q6_k` super-blocks read as stored,
-//! dequantized inside the dot. The mandatory pair — Q4_K_M mixes are the
-//! most-distributed quant artifacts there are, and their `output.weight`
-//! is q6_k. Filled by the QNF wave (wiki alto/next.md §J2, priority 3).
+//! GGUF K-quant gemm points: the whole K family — `q2_k`, `q3_k`, `q4_k`,
+//! `q5_k`, `q6_k` — read as stored, dequantized inside the dot. `q4_k` and
+//! `q6_k` were the mandatory pair (Q4_K_M mixes are the most-distributed
+//! quant artifacts there are, and their `output.weight` is q6_k); `q3_k`
+//! has a real user in this tree's own import history, `q5_k` is a
+//! top-distributed mix in Q5_K_M, and `q2_k` is the family's floor. Filled
+//! by the QNF wave (wiki alto/next.md §J2, priority 3), which asked for the
+//! pair first and these three after.
 //!
 //! **THE WEIGHT ARRIVES AS ONE BYTE PLANE, AND THE ROW'S BYTE WIDTH NAMES
 //! THE SCHEME.** A K-quant carries its scales INSIDE the super-block, so
 //! there is no second plane to bind and no dtype to dispatch on: a `[n, k]`
 //! weight is `n` rows of `k / 256` consecutive super-blocks, and a
-//! super-block is 144 bytes at `q4_k` and 210 at `q6_k`. The two products
-//! `144·k/256` and `210·k/256` are distinct for every legal `k`, so the
-//! discrimination is total — [`scheme`] answers one of the two or refuses,
-//! and no width is ever ambiguous between them.
+//! super-block is 84 bytes at `q2_k`, 110 at `q3_k`, 144 at `q4_k`, 176 at
+//! `q5_k` and 210 at `q6_k`.
+//!
+//! **THE DISCRIMINATION IS TOTAL, AND THE ARGUMENT IS ONE LINE.** `k` is
+//! checked to be a whole number of super-blocks BEFORE any width is looked
+//! at, so `blocks = k / 256` is a fixed positive integer and the five
+//! candidate row widths are `blocks·{84, 110, 144, 176, 210}` — one common
+//! positive factor against five pairwise-distinct widths. A common positive
+//! factor preserves distinctness, so the five candidates are pairwise
+//! distinct for every `blocks ≥ 1`, which is every legal `k`. [`scheme`]
+//! answers one of the five or refuses by name, and no width is ever
+//! ambiguous between two schemes.
 //!
 //! **A PLANE-FORM VARIANT MAY SUPERSEDE THESE ENTRY SHAPES.** Serving AS
 //! STORED is the ruling these entries answer (§J); the canonical `.zt`
@@ -29,17 +41,28 @@ const FILE: &str = "linear/kquant.cuh";
 
 const WARP: u32 = 32;
 
-/// Elements in one K-quant super-block, both schemes.
+/// Elements in one K-quant super-block, all five schemes.
 const SUPER: u32 = 256;
+
+/// `block_q2_K`: sixteen packed scale/min bytes, 64 of 2-bit codes, then
+/// `d` and `dmin` — the super-scales after the payload, not before it.
+const Q2K_BYTES: u32 = 84;
+
+/// `block_q3_K`: 32 bytes of third-bit mask, 64 of 2-bit codes, twelve
+/// packed six-bit scale bytes, `d`. Symmetric, so no `dmin`.
+const Q3K_BYTES: u32 = 110;
 
 /// `block_q4_K`: `d`, `dmin`, twelve packed scale/min bytes, 128 of nibbles.
 const Q4K_BYTES: u32 = 144;
+
+/// `block_q5_K`: `q4_k`'s head, 32 bytes of fifth-bit plane, 128 of nibbles.
+const Q5K_BYTES: u32 = 176;
 
 /// `block_q6_K`: 128 low nibbles, 64 high pairs, sixteen i8 scales, `d`.
 const Q6K_BYTES: u32 = 210;
 
 /// Weight rows one warp folds at a time, and the lanes a block carries —
-/// `quant.rs`' dense affine geometry, kept so the two decode-in-dot points
+/// `quant.rs`' dense affine geometry, kept so the five decode-in-dot points
 /// have one grid shape between them.
 const ROWS_PER_WARP: u32 = 4;
 const BLOCK_LANES: u32 = 128;
@@ -47,40 +70,75 @@ const BLOCK_LANES: u32 = 128;
 /// Which K-quant a weight row's byte width names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scheme {
+    Q2K,
+    Q3K,
     Q4K,
+    Q5K,
     Q6K,
 }
 
 impl Scheme {
-    /// The kernel this scheme's super-block decode lives in.
+    /// The kernel this scheme's super-block decode lives in. One per scheme:
+    /// the five agree on the super-block size and on nothing else, so there
+    /// is no shared body to select an arm inside.
     const fn point(self) -> &'static str {
         match self {
+            Self::Q2K => "matmul_q2k",
+            Self::Q3K => "matmul_q3k",
             Self::Q4K => "matmul_q4k",
+            Self::Q5K => "matmul_q5k",
             Self::Q6K => "matmul_q6k",
+        }
+    }
+
+    /// How a refusal spells this scheme — GGUF's own name for it.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Q2K => "q2_k",
+            Self::Q3K => "q3_k",
+            Self::Q4K => "q4_k",
+            Self::Q5K => "q5_k",
+            Self::Q6K => "q6_k",
         }
     }
 }
 
+/// The family, ascending by super-block width — the ladder [`scheme`] walks
+/// and the order a refusal names them in.
+const FAMILY: [(u32, Scheme); 5] = [
+    (Q2K_BYTES, Scheme::Q2K),
+    (Q3K_BYTES, Scheme::Q3K),
+    (Q4K_BYTES, Scheme::Q4K),
+    (Q5K_BYTES, Scheme::Q5K),
+    (Q6K_BYTES, Scheme::Q6K),
+];
+
 /// **HOW A STORED K-QUANT ROW SAYS WHAT IT IS.** `k` fixes the super-block
-/// count; the row's byte width then divides out to 144 or 210 and to nothing
-/// else. A row that is neither is refused rather than read at a guess — the
-/// two schemes disagree about every byte after the first, so a misread would
-/// decode to plausible garbage instead of failing.
+/// count; the row's byte width then divides out to exactly one of [`FAMILY`]
+/// and to nothing else (the module doc carries the argument). A row that
+/// matches none of the five is refused rather than read at a guess — the
+/// schemes disagree about every byte after the first, so a misread would
+/// decode to plausible garbage instead of failing, and the refusal names all
+/// five widths so the caller can see which conversion its artifact wants.
 fn scheme(op: &'static str, k: u32, row_bytes: u32) -> Result<Scheme, Error> {
     let blocks = k / SUPER;
-    if row_bytes == blocks * Q4K_BYTES {
-        return Ok(Scheme::Q4K);
+    for (width, scheme) in FAMILY {
+        if row_bytes == blocks * width {
+            return Ok(scheme);
+        }
     }
-    if row_bytes == blocks * Q6K_BYTES {
-        return Ok(Scheme::Q6K);
+    let mut ladder = String::new();
+    for (at, (width, scheme)) in FAMILY.iter().enumerate() {
+        if at > 0 {
+            ladder.push_str(", ");
+        }
+        ladder.push_str(&format!("{} ({})", blocks * width, scheme.name()));
     }
     Err(refuse(
         op,
         format!(
-            "a {row_bytes}-byte weight row is neither {} bytes of q4_k nor {} of q6_k \
-             over a {k}-wide contraction ({blocks} super-blocks)",
-            blocks * Q4K_BYTES,
-            blocks * Q6K_BYTES
+            "a {row_bytes}-byte weight row is none of the five K-quant widths over a \
+             {k}-wide contraction ({blocks} super-blocks): {ladder}"
         ),
     ))
 }
@@ -146,9 +204,9 @@ fn kquant(
             y.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
-            // The staged-geometry seat: the region's live-rows word when a
-            // body replay armed one, and the null seat (`ABSENT`) otherwise.
-            ctx.stage(),
+            // The staged-geometry seat, null until `Ctx::stage()` lands with
+            // the staged-rows wave; the kernel's guard no-ops on nullptr.
+            crate::jit::ArgValue::Ptr(0),
         ],
     )
 }

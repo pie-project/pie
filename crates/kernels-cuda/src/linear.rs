@@ -23,4 +23,6 @@ pub mod fp8;
 
 pub mod kquant;
 
+pub mod nvfp4;
+
 pub mod quant;
