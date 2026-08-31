@@ -19,4 +19,8 @@ pub mod mlp;
 
 pub mod moe;
 
+pub mod fp8;
+
+pub mod kquant;
+
 pub mod quant;

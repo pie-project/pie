@@ -22,6 +22,11 @@ path = "src/lib.rs"
 [features]
 default = ["serde"]
 serde = ["dep:serde"]
+# `quant::Term`, the canonicalizer's recursive working type, and nothing else.
+# Off by default because the rest of the crate -- `Dtype`, and all three faces
+# of a quant format except the boxed one -- is alloc-free, and a `no_std` guest
+# that only wants to name an element should not link an allocator to do it.
+alloc = []
 
 [dependencies]
 serde = { version = "1.0", default-features = false, features = [

@@ -28,6 +28,16 @@
 #[cfg(test)]
 extern crate std;
 
+// `quant`'s [`Term`](quant::Term) is a recursive tree and has to box itself.
+// Nothing else in the crate allocates, so the box lives behind a feature that
+// is OFF by default: a wasm guest that imports this crate for `Dtype` gets no
+// allocator dependency it did not ask for, and the canonicalizer -- the one
+// consumer that needs the unprojected term -- turns it on.
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+pub mod quant;
+
 /// Element type as data, not a generic: monomorphization's guarantee moved to
 /// the trace-time validator plus a launch-site match. The one such enum in the
 /// stack — it names storage representations as well as compute elements, so a
