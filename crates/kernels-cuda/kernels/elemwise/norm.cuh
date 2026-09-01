@@ -775,6 +775,25 @@ __global__ void add_bias(
 }
 
 template <class T>
+__global__ void standardize(
+    T* __restrict__ out,
+    const T* __restrict__ bias,
+    const T* __restrict__ scale,
+    int dim)
+{
+    T* __restrict__ row = out + static_cast<long long>(blockIdx.x) * dim;
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        // Centred and scaled in f32, as the reference is: the pooler's
+        // sqrt(hidden) scaling has already expanded the magnitude and the
+        // bias subtraction is what brings it back, so the difference is
+        // taken before anything is rounded to T.
+        const float v = (Elem<T>::to_f32(row[d]) - Elem<T>::to_f32(bias[d]))
+                      * Elem<T>::to_f32(scale[d]);
+        row[d] = Elem<T>::from_f32(v);
+    }
+}
+
+template <class T>
 __global__ void add_bias_strided(
     T* __restrict__ out,
     const T* __restrict__ bias,

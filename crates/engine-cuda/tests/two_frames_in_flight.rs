@@ -137,7 +137,7 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -178,11 +178,12 @@ fn ready(what: &str, runahead: Runahead) -> Option<(Shell, tokenizer::Tokenizer)
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships this gate's SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships this gate's SKU");
     let trace = trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the SKU's import contract fits its own checkpoint");
+    let contract =
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+            .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {
@@ -203,7 +204,7 @@ fn ready(what: &str, runahead: Runahead) -> Option<(Shell, tokenizer::Tokenizer)
         // replay would be measuring the recorder rather than the run-ahead.
         graphs: engine_cuda::Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead,
         // The warm-boot weight artifact cache is off for a gate: a test
         // that shared one would be asserting about the last run.

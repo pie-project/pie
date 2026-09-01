@@ -218,7 +218,7 @@ fn ready(what: &str) -> Option<(Shell, model_compiler::PatchLadder)> {
         eprintln!("skipping {what}: no Qwen3.5-0.8B artifact in $PIE_HOME/models");
         return None;
     };
-    let trace = model::trace_of(SKU).expect("the catalog ships the vision row")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the vision row")(Platform::Cuda);
 
     // **(a) THE LADDER THE ENGINE WOULD DERIVE**, from the same function the
     // engine door calls and the contract's own default budgets.
@@ -232,7 +232,7 @@ fn ready(what: &str) -> Option<(Shell, model_compiler::PatchLadder)> {
 
     let container = checkpoint.join("archive.zt");
     let source = ztensor_compat::index(&container).expect("the artifact opens");
-    let Ok(contract_probe) = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let Ok(contract_probe) = models::import_of(SKU).expect("the catalog ships an import")(&source)
     else {
         eprintln!(
             "skipping {what}: {container:?} holds no `model.visual.*` planes — the stored \
@@ -259,10 +259,18 @@ fn ready(what: &str) -> Option<(Shell, model_compiler::PatchLadder)> {
         slots: 4,
         ordinal: 0,
         // Eager: this gate is about the load and the launches, and a recorded
-        // fire is a different subject with its own file.
+        // fire is a different subject with its own file —
+        // `a_tower_body_replays_at_another_image_split.rs`, which takes this
+        // load as given and asks whether a two-unit artifact ARMS and REPLAYS.
+        // It could not, until the multi-unit bodies wave gave
+        // `record::BodyKey` a lattice point per capture unit; the sentence
+        // that used to stand in this suite — "a vision SKU is refused the
+        // bodies path outright" — is retired, and every fire below is eager
+        // because THIS file chose eager, not because the router had no other
+        // arm.
         graphs: engine_cuda::Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         weight_cache_dir: None,
     })
@@ -309,7 +317,7 @@ fn a_fire_with_one_image_answers_and_a_fire_without_one_answers_differently() {
     // nothing resolves `PatchRoutes` on a text-only fire. The tower itself
     // needs no bit — its rectangles are `Dim::Patches` and an axis-empty fire
     // has zero patch rows.
-    let classify = model::classify_of(SKU).expect("the catalog ships a classify");
+    let classify = models::classify_of(SKU).expect("the catalog ships a classify");
     let word_with_media =
         classify(&model_dsl::Request::new(rows as u32, false).with_media(true));
     let word_text_only = classify(&model_dsl::Request::new(rows as u32, false));
@@ -395,7 +403,7 @@ const TEXT_SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 /// returned; a gate that compares two readings of one artifact needs both.
 fn ready_as(sku: &str, what: &str) -> Option<Shell> {
     let checkpoint = snapshot()?;
-    let trace = model::trace_of(sku).expect("the catalog ships the row")(Platform::Cuda);
+    let trace = models::trace_of(sku).expect("the catalog ships the row")(Platform::Cuda);
     let budgets = engine::load::Budgets {
         max_tokens: 256,
         max_lanes: 4,
@@ -404,7 +412,7 @@ fn ready_as(sku: &str, what: &str) -> Option<Shell> {
     let patches = engine_cuda::api::patch_ladder(&trace, &budgets);
     let container = checkpoint.join("archive.zt");
     let source = ztensor_compat::index(&container).expect("the artifact opens");
-    let Ok(contract) = model::import_of(sku).expect("the catalog ships an import")(&source) else {
+    let Ok(contract) = models::import_of(sku).expect("the catalog ships an import")(&source) else {
         eprintln!("skipping {what}: {container:?} does not satisfy `{sku}`");
         return None;
     };
@@ -428,7 +436,7 @@ fn ready_as(sku: &str, what: &str) -> Option<Shell> {
             ordinal: 0,
             graphs: engine_cuda::Graphs::Off,
             knobs: engine_cuda::Knobs::default(),
-            program_cache_dir: None,
+            cache_dir: None,
             runahead: engine::runahead::Runahead::F1,
             weight_cache_dir: None,
         })
@@ -442,11 +450,13 @@ fn bits(logits: &[f32]) -> Vec<u32> {
 }
 
 fn text_word(sku: &str, rows: u32) -> u64 {
-    model::classify_of(sku).expect("a classify")(&model_dsl::Request::new(rows, false))
+    models::classify_of(sku).expect("a classify")(&model_dsl::Request::new(rows, false))
 }
 
 fn media_word(sku: &str, rows: u32) -> u64 {
-    model::classify_of(sku).expect("a classify")(&model_dsl::Request::new(rows, false).with_media(true))
+    models::classify_of(sku).expect("a classify")(
+        &model_dsl::Request::new(rows, false).with_media(true),
+    )
 }
 
 /// **GATE (a): A FIRE WITH NO IMAGE LANE IS THE FIRE THIS ENGINE ALWAYS
@@ -611,7 +621,9 @@ fn a_mixed_fire_leaves_its_text_lanes_bit_identical() {
         .count();
     assert_eq!(
         moved, 0,
-        "the IMAGE lane moved {moved} of {} logits when two text lanes joined its fire;          its rows and its patch rectangle are unchanged, so what moved is the route          rebase or the seriated offset",
+        "the IMAGE lane moved {moved} of {} logits when two text lanes joined its fire; its rows \
+         and its patch rectangle are unchanged, so what moved is the route rebase or the \
+         seriated offset",
         image_solo[0].len(),
     );
     for (at, want) in solo.iter().enumerate() {

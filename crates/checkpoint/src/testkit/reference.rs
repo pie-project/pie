@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use crate::contract::TensorType;
-use crate::contract::compile::Lowering;
+use crate::contract::compile::{Leaf, Lowering};
 use crate::error::{Error, OrOverflow, Result};
 use crate::extent::Rect;
 use crate::types::{TensorDecl, encoding_dense_element_bytes};
@@ -68,19 +68,27 @@ pub fn replay(
         ))
     })?;
     let elements =
-        usize::try_from(lowering.elements).or_overflow("reference output element count")?;
+        usize::try_from(lowering.elements()).or_overflow("reference output element count")?;
     let bytes = elements
         .checked_mul(width as usize)
         .or_overflow("reference output byte size")?;
 
+    // The two lowerings say the same kind of thing — where each destination
+    // byte comes from — so the oracle asks each for it in the vocabulary it
+    // has and replays one scatter. A gather states its rectangles rather than
+    // folding runs into them, which is the whole difference.
     let mut from: Vec<Option<Provenance>> = vec![None; bytes];
-    for rect in lowering.byte_pieces(&ty.encoding)? {
+    let rects = match lowering {
+        Lowering::Copy(copies) => copies.byte_pieces(&ty.encoding)?,
+        Lowering::Gather(gather) => gather.byte_rects(&ty.encoding)?,
+    };
+    for rect in rects {
         scatter(&rect, &mut from)?;
     }
 
-    let zero_fill = lowering.needs_zero_fill();
+    let zero_fill = matches!(lowering, Lowering::Copy(copies) if copies.needs_zero_fill());
     (0..elements)
-        .map(|at| element(at, width, &from, lowering, leaves, zero_fill))
+        .map(|at| element(at, width, &from, lowering.leaves(), leaves, zero_fill))
         .collect()
 }
 
@@ -119,7 +127,7 @@ fn element(
     at: usize,
     width: u64,
     from: &[Option<Provenance>],
-    lowering: &Lowering,
+    named: &[Leaf],
     leaves: &HashMap<String, TensorValue>,
     zero_fill: bool,
 ) -> Result<i64> {
@@ -145,8 +153,7 @@ fn element(
             "output element {at} reads from byte {src}, which is not a {width}-byte boundary"
         )));
     }
-    let name = lowering
-        .leaves
+    let name = named
         .get(leaf)
         .ok_or_else(|| Error::Internal(format!("the lowering names leaf {leaf}, which it has no")))?
         .name();

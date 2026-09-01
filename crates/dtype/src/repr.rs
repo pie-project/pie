@@ -568,6 +568,24 @@ impl Fmt<'_> {
         Some(out)
     }
 
+    /// The bytes one row of `k` elements occupies — every plane of the term,
+    /// summed.
+    ///
+    /// `None` for a `k` that is not a whole number of [`quantum`](Fmt::quantum):
+    /// a row cut mid-group owns a factor it does not fill.
+    #[must_use]
+    pub fn row_bytes(&self, k: u32) -> Option<u64> {
+        if k == 0 || !k.is_multiple_of(self.quantum().elems(k)) {
+            return None;
+        }
+        let widths = self.plane_widths(k)?;
+        let mut total: u64 = 0;
+        for bytes in widths.as_slice() {
+            total += u64::from(*bytes);
+        }
+        Some(total)
+    }
+
     /// The minimal unit a row splits into along k, as the lcm of every group's extent in elements.
     #[must_use]
     pub fn quantum(&self) -> Quantum {

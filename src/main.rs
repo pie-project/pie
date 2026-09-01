@@ -159,7 +159,12 @@ async fn run() -> anyhow::Result<ExitCode> {
 
         // Blocking: HF downloads and multi-gigabyte checkpoint rewrites.
         Command::Model { cmd } => {
-            tokio::task::spawn_blocking(move || ops::model::run(cmd)).await??
+            // The globals travel because `import` reads the SERVING config to
+            // decide whether it can prepare the weight tiers it just made
+            // importable (§M wave M-1), and `--config` has to name the same
+            // file every other command resolves.
+            let global = cli.global.clone();
+            tokio::task::spawn_blocking(move || ops::model::run(cmd, &global)).await??
         }
 
         // Blocking: `cache list` walks the whole of `$PIE_HOME`, and `doctor`

@@ -890,13 +890,13 @@ impl Inputs {
         //   intervals any mask breaks into, so the ceiling holds for every
         //   fire this load can be handed; an artifact P4 seated whole answers
         //   `1` and pays two ints per slot for a list it never fills.
-        // - `per_gathered` for what a GATHERED window carries beside them
-        //   (`window::Gathered`, `Fallback::Copy`): the row map the gather and
-        //   the scatter read, and per kv space the page bounds, the compacted
-        //   page-id list and the two per-lane vectors. `gathered` is
-        //   `model_exec::fire::fragmentable` — how many distinct masks this
-        //   artifact can ever find in pieces, which is 0 for every artifact P4
-        //   seated whole and 1 for today's qwen texts.
+        // - `Slots::gathered_at`'s stride for what a GATHERED window carries
+        //   beside them (`window::Gathered`, `Fallback::Copy`): the row map
+        //   the gather and the scatter read, and per kv space the page bounds,
+        //   the compacted page-id list and the two per-lane vectors.
+        //   `gathered` is `model_exec::fire::fragmentable` — how many distinct
+        //   masks this artifact can ever find in pieces, which is 0 for every
+        //   artifact P4 seated whole and 1 for today's qwen texts.
         //
         // **AND THE SLOTS ARE FIXED-WIDTH, WHICH IS WHAT THE CARVE ALWAYS
         // SAID AND WHAT THE LAYOUT NOW ALSO SAYS.** This product has always
@@ -908,14 +908,24 @@ impl Inputs {
         // It now lays slot `i` at `i * stride`. The padding is bytes this
         // expression was already buying; the arithmetic is shared rather than
         // restated, so neither half can drift.
-        let per_gathered = rows + spaces as u64 * (3 * lanes + 1 + pages);
+        //
+        // **AND THE GATHERED CEILING IS THAT SAME OBJECT'S NOW TOO.** This
+        // function used to spell `rows + spaces * (3 * lanes + 1 + pages)`
+        // itself and hand the product over as a total; the tail behind the
+        // slots is ADDRESSED at that stride since this wave
+        // (`Slots::gathered_at`), so the expression moved to the type that
+        // owns the addresses and what is left here are the ceilings it is
+        // computed FROM. One expression, one owner, and a carve that cannot
+        // become a layout the blob disagrees with.
+        //
         // A gathered window is a slot BEYOND the `k(k+1)/2 + 1` runs — `seat`
         // deliberately does not dedupe a gathered window against a plain one
         // of the same span (they mean two different things by that rectangle)
         // — so it takes a slot of its own for its boundary vector, and its
-        // payload rides behind every slot at `Slots::tail`.
-        let window_slots = crate::window::Slots::new(classes, lanes, runs, gathered);
-        let window_ints = window_slots.tail() + gathered as u64 * per_gathered;
+        // payload rides behind every slot at `Slots::gathered_at`.
+        let window_slots =
+            crate::window::Slots::new(classes, lanes, runs, gathered, rows, spaces, pages);
+        let window_ints = window_slots.words();
 
         let mut at = 0u64;
         let mut take = |bytes: u64| {
@@ -966,7 +976,17 @@ impl Inputs {
         // the words are filled. The row pair is first because every guard
         // shipped before the lane pair existed reads `win[0]` and every shift
         // `win[1]`; the lane pair is what a request-gridded kernel reads.
-        let live_ints = regions as u64 * u64::from(runs.max(1)) * 4;
+        //
+        // **AND THE WORD COUNT IS THE SEAT'S OWN ARITHMETIC**
+        // (`window::Seat`), for the reason `window::Slots` is one object here:
+        // this carve's bytes and `Windows::live_at`'s addresses have to be the
+        // same multiplication or an address is a launch reading another
+        // region's geometry. Two INSTANCES rather than one shared object —
+        // this is the LOAD's rectangle and a fire's is its own, never wider
+        // (`window::Seat`'s header states the ceiling) — because a reserve
+        // cannot measure a fire it has not seen.
+        let live_seat = crate::window::Seat::new(regions as u64, u64::from(runs.max(1)));
+        let live_ints = live_seat.words();
         let live_rows = take(live_ints * 4);
         let row_valid = take(rows);
         let slot_ids = take(lanes * 4);

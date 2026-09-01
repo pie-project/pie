@@ -122,6 +122,40 @@ pub fn swiglu_clamp_alpha(
     )
 }
 
+/// **`linear.mlp_swiglu_clamp` OVER AN UNFUSED PAIR, AND THIS PLANE REFUSES
+/// IT BY NAME.**
+///
+/// The op exists because a per-tensor quantization can give one artifact's
+/// `gate_proj` and `up_proj` different affine points, which no single bank can
+/// state (`model_ir::ops::Linear::MlpSwigluClampSplit`). The only artifact
+/// that spends it is 2-bit MLX, and `glu.cuh` has no `swiglu_clamp_split`
+/// unit — there is no 2-bit MLX serving on this plane at all, so a kernel here
+/// would be a unit nothing could reach a bank through.
+///
+/// **A NAMED REFUSAL AND NOT A MISSING ARM**: the dispatch is exhaustive over
+/// the IR, so the arm has to exist; what it must not do is claim a shape it
+/// would compute wrong. The day this plane serves an MLX affine bank, this is
+/// the body that changes.
+pub fn swiglu_clamp_split(
+    _ctx: &Ctx,
+    gate: Tensor,
+    _up: Tensor,
+    _limit: f32,
+    _y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_swiglu_clamp_split";
+    Err(refuse(
+        OP,
+        format!(
+            "the unfused swiglu-clamp pair is the 2-bit MLX expert path's combine, and \
+             `{FILE}` instantiates no `swiglu_clamp_split` unit — this plane serves the \
+             packed `linear.mlp_swiglu_clamp` row (halves of {} at {:?}) and no MLX \
+             affine bank",
+            gate.width, gate.dtype,
+        ),
+    ))
+}
+
 pub fn geglu_tanh(ctx: &Ctx, gate: Tensor, up: Tensor, y: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_geglu_tanh";
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });

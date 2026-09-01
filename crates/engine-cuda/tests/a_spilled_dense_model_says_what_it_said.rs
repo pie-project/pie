@@ -43,6 +43,29 @@
 //! the PCIe floor plus a ramp. Still measured, still printed, still gated on
 //! nothing.
 //!
+//! # (a) is a WARM capability now, and the prepare is part of it
+//!
+//! §M wave M-3 made the streamed serve warm-only: under `Intent::Serve` a plan
+//! that streams reads a prepared serving artifact — `<key>.tiers` under the
+//! weight cache directory — or it is REFUSED before the pinned tier is
+//! allocated, and `Shell::prepare` is the only door in the process that writes
+//! one. A spilled dense plan streams, so (a) now reads "a dense model under a
+//! budget below its table, PREPARED, serves" — and the gate prepares into a
+//! scratch directory at the SAME plan and the SAME `Boot` document, because
+//! the artifact's key is a function of the whole document and two documents
+//! would name two files.
+//!
+//! The field used to read `weight_cache_dir: None` with nothing said about it,
+//! on the understanding — true of §K's engine — that a streamed load formed no
+//! key anyway. It forms one now. At this SKU the file is the 0.8B table's
+//! worth of images, under two gibibytes, which is why the gate states no disk
+//! condition: the snapshot it already requires is the same order of bytes.
+//!
+//! The uncapped golden is untouched and is given no directory: a
+//! fully-resident load lands out of the checkpoint exactly as it did before
+//! any of this, which is what keeps (b) a comparison and not two readings of
+//! one file.
+//!
 //! ```text
 //! cargo test -p engine-cuda --features cuda-13 \
 //!     --test a_spilled_dense_model_says_what_it_said -- --ignored --nocapture
@@ -80,7 +103,27 @@ fn serialized() -> MutexGuard<'static, ()> {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+}
+
+/// A temporary directory that removes itself, however the test leaves —
+/// including the serving artifact the prepare puts in it, which at this SKU
+/// is under two gibibytes.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(what: &str) -> Scratch {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let dir = std::env::temp_dir().join(format!("pie-{what}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temporary directory");
+    Scratch(dir)
 }
 
 fn snapshot() -> Option<PathBuf> {
@@ -135,9 +178,9 @@ fn rig(what: &str) -> Option<Rig> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index_all(&[one]).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
     Some(Rig {
@@ -148,8 +191,11 @@ fn rig(what: &str) -> Option<Rig> {
     })
 }
 
-fn load(rig: &Rig, residency: Plan) -> engine_cuda::Result<Shell> {
-    Shell::load(Boot {
+/// **ONE DOCUMENT, TWO DOORS** (§M-3). The prepare and the boot that reads
+/// what it wrote have to state the same deployment in every field or they name
+/// two different files, so the document is written once and handed to both.
+fn doc<'a>(rig: &'a Rig, residency: Plan, cache: Option<&'a Path>) -> Boot<'a> {
+    Boot {
         trace: rig.trace.clone(),
         contract: &rig.contract,
         checkpoint: &rig.checkpoint,
@@ -162,11 +208,24 @@ fn load(rig: &Rig, residency: Plan) -> engine_cuda::Result<Shell> {
         ordinal: 0,
         graphs: Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
-        weight_cache_dir: None,
+        // A fresh directory per run for the spilled load — sharing one between
+        // runs would be asserting about the last one — and `None` for the
+        // uncapped golden, which looks for no file and is refused for nothing.
+        weight_cache_dir: cache,
         residency,
-    })
+    }
+}
+
+fn load(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result<Shell> {
+    Shell::load(doc(rig, residency, cache))
+}
+
+/// **THE WRITER**, and since §M-3 the only one in the process — `pie model
+/// import --prepare-only` reaches the same call through `Cuda::prepare`.
+fn prepare(rig: &Rig, residency: Plan, cache: &Path) -> engine_cuda::Result<()> {
+    Shell::prepare(doc(rig, residency, Some(cache)))
 }
 
 /// A prefill and `STEPS` greedy decodes. Answers the tokens, the logit rows,
@@ -230,8 +289,9 @@ fn finite(logits: &[f32], what: &str) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "real-hardware: needs a CUDA device and a local Qwen3.5-0.8B snapshot; \
-            run it with `-- --ignored`"]
+#[ignore = "real-hardware: needs a CUDA device, a local Qwen3.5-0.8B snapshot \
+            and room under TMPDIR for one serving artifact; run it with \
+            `-- --ignored`"]
 fn a_spilled_dense_model_says_what_it_said() {
     let _one = serialized();
     let Some(rig) = rig("W-2's dense-spill mix") else {
@@ -289,19 +349,33 @@ fn a_spilled_dense_model_says_what_it_said() {
         earliest_spilled.0, earliest_spilled.1
     );
 
-    // ── THE GOLDEN, UNCAPPED.
-    let mut resident = load(&rig, Plan::default()).expect("the uncapped shell loads");
+    // ── THE GOLDEN, UNCAPPED, AND OUT OF THE CHECKPOINT.
+    let mut resident = load(&rig, Plan::default(), None).expect("the uncapped shell loads");
     assert!(resident.weights_resident());
     let (golden, golden_rows, resident_step) = run(&mut resident, &prompt);
     let says = rig.tokenizer.decode(&golden, false);
     eprintln!("uncapped answers: {says:?} at {:.2} ms/step", resident_step * 1e3);
     drop(resident);
 
+    // ── THE PREPARE. A spilled plan streams, and since §M-3 a streamed serve
+    //    has one road to its weights: this file, written here, or a refusal
+    //    naming `pie model import --prepare-only`. The spill is the SCHEDULE's
+    //    and the artifact is the RANKING's, and neither is the other's — what
+    //    the boot below does with it is cut it at this budget, which is why
+    //    (c) above is still read off the plan and not off the file.
+    let cache = scratch("dense-spill");
+    prepare(&rig, plan.clone(), &cache.0).expect("the prepare writes this seat's artifact");
+
     // ── (a) THE CAPABILITY.
-    let mut streamed = load(&rig, plan).expect("a spilled dense model serves");
+    let mut streamed = load(&rig, plan, Some(&cache.0)).expect("a spilled dense model serves");
     assert!(
         !streamed.weights_resident(),
         "a spilled load says so rather than claiming the table"
+    );
+    assert!(
+        streamed.weights_from_cache(),
+        "and it came off the prepared artifact — the host-side transform \
+         pipeline runs in a prepare now, never in a serve"
     );
     let (tokens, rows, spilled_step) = run(&mut streamed, &prompt);
     let also = rig.tokenizer.decode(&tokens, false);

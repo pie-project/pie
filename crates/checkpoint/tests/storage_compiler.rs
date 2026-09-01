@@ -373,6 +373,12 @@ fn target_support_rejects_cuda_decode_at_compile_time() {
 /// The decode here is a per-group `Scale`, which is what decodes a block-scaled
 /// scheme; `TileMapKind::Decode` is in the plan vocabulary but no backend
 /// implements it yet.
+///
+/// **COMPILED AS A CONVERSION AND NOT FOR A DEVICE** (§M-3). The route this
+/// pins ends in an encode, and no device target carries one any more — the
+/// stored form is the served form, and re-encoding is `pie model import`'s
+/// work. Which target the algebra is checked against was never the subject
+/// here; that it can be SPELLED is.
 #[test]
 fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
     let int8 = Encoding::Quant(QuantSpec {
@@ -394,8 +400,7 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
     ));
 
     let target = StorageTarget {
-        backend: BackendKind::Cuda,
-        tile_map_mask: checkpoint::plan::CUDA_TILE_MAP_MASK,
+        tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,
         ..StorageTarget::default()
     };
     let plan = compile_load_plan(&block_scaled_metadata(), &contract, target)
@@ -437,6 +442,85 @@ fn a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate() {
         // intermediate, is the one name missing, which is the point.
         vec!["scales", "w_int8_scale_inv", "w_int8"],
         "the intermediate is not bound"
+    );
+}
+
+/// **A SERVING TARGET REFUSES THE ENCODE A CONVERSION TARGET RUNS** (§M-3).
+///
+/// The same contract the test above compiles, asked of a device. Serve-as-
+/// stored says the stored form IS the served form; an encode in a serving
+/// plan says the opposite, and one shipped SKU — kimi's mxfp4 expert banks
+/// over a bf16 checkpoint — was the whole of why the bit was ever set. It is
+/// clear now, so a load that would quantize on the way in is refused before
+/// it reads a byte, and the refusal names the command that fixes it.
+///
+/// Both halves, because a refusal alone would be satisfied by deleting the
+/// transform: it did not die, it MOVED. `CONVERT_TILE_MAP_MASK` still carries
+/// the bit, and `pie model import` compiles against it.
+#[test]
+fn a_serving_target_refuses_the_encode_a_conversion_target_runs() {
+    let int8 = Encoding::Quant(QuantSpec {
+        scheme: QuantScheme::Int8Symmetric,
+        logical_dtype: DType::Bf16,
+        bits_per_element: 8,
+        group_size: 32,
+        channel_axis: Some(Axis(1)),
+    });
+    let mut contract = block_scaled_contract("scales", "s", vec![4, 1]);
+    contract.tensors[1] = contract.tensors[1].clone().internal();
+    contract.tensors.push(TensorContract::new(
+        "w_int8",
+        Expr::out("w").cast(int8.clone()),
+        vec![4, 32],
+        int8,
+    ));
+
+    for backend in [
+        BackendKind::Cuda,
+        BackendKind::Metal,
+        BackendKind::Vulkan,
+        BackendKind::Unknown,
+    ] {
+        let refused = compile_load_plan(
+            &block_scaled_metadata(),
+            &contract,
+            StorageTarget::for_backend(backend, 0, 1),
+        )
+        .expect_err("a serving plan does not convert");
+        let said = refused.to_string();
+        assert!(
+            said.contains("pie model import"),
+            "{backend:?} refuses the encode without naming the command that \
+             runs it: {said}"
+        );
+    }
+
+    let converting = compile_load_plan(
+        &block_scaled_metadata(),
+        &contract,
+        StorageTarget {
+            tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,
+            ..StorageTarget::default()
+        },
+    )
+    .expect("conversion still runs it");
+    let encodes = converting
+        .instrs
+        .iter()
+        .filter(|instr| {
+            matches!(
+                instr,
+                StorageInstr::TileMap {
+                    kind: TileMapKind::Encode,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        encodes, 1,
+        "the conversion plan carries the encode, so `pie model import` writes \
+         the codes the load now insists on"
     );
 }
 
@@ -1732,6 +1816,7 @@ fn instr_id(instr: &StorageInstr) -> checkpoint::types::InstrId {
         | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
+        | StorageInstr::GatherWrite { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,

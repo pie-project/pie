@@ -171,6 +171,24 @@ pub struct Window {
     /// rectangle, whose rows start at its own zero, and the map back to fire
     /// coordinates is [`Gathered::rows_host`], which is where it belongs.
     pub gathered: Option<Gathered>,
+    /// **THE SAME MASK'S INTERVAL ON THE SECOND ROW AXIS** — patch rows where
+    /// [`span`](Window::span) has token rows, and IMAGES where it has lanes
+    /// (multimodal §5.1).
+    ///
+    /// **CARRIED ON EVERY WINDOW RATHER THAN CHOSEN BETWEEN**, which is the
+    /// CUDA sibling's own line and holds here for the same reason: the embed
+    /// merge is a TOKEN region that reads a patch column, so one resolution
+    /// needs both pairs. A tower region's own rows come out of the patch
+    /// table and land in `span` (its capture unit's axis is
+    /// [`RowAxis::Patches`](model_ir::RowAxis::Patches)); `patch` then holds
+    /// the same interval, which is what makes `span == patch` the tower's
+    /// signature and their disagreement the trunk's.
+    ///
+    /// All-zero for every window of a fire whose lanes carried no image, and
+    /// that is the property the text-lane invariance gate rests on: a
+    /// patch-axis rectangle cut at `(0, 0)` has no rows, and the walk skips a
+    /// zero-row region before it dispatches a node.
+    pub patch: MaskSpan,
 }
 
 /// A `Fallback::Copy`'s window: which fire rows the compacted rectangle is
@@ -482,12 +500,16 @@ pub(crate) fn copyable(trace: &Trace, region: &Region) -> bool {
                     // row space entirely (multimodal §5.1 — patches and tokens
                     // do not break at the same places). Copying one under a
                     // token map would move the wrong bytes, so a region that
-                    // reads a patch rectangle does not copy — and this mirror
-                    // binds no patch seat at all, so it cannot arrive. The
-                    // patch axis's lane space (`Images`, `ImagesPlus`) answers
-                    // the same `false` for the same reason: `Dim::axis` calls
-                    // all three `RowAxis::Patches`, and a token-row map may
-                    // not cut any of them.
+                    // reads a patch rectangle does not copy. The patch axis's
+                    // lane space (`Images`, `ImagesPlus`) answers the same
+                    // `false` for the same reason: `Dim::axis` calls all three
+                    // `RowAxis::Patches`, and a token-row map may not cut any
+                    // of them.
+                    //
+                    // **THIS ARM IS REACHABLE NOW**, where it used to be
+                    // argued unreachable ("this mirror binds no patch seat at
+                    // all"). The seat is bound; the exclusion is the one the
+                    // CUDA twin has always carried, and it stands on its own.
                     Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => false,
                 },
             },
@@ -672,6 +694,11 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
             request_of_token_host,
             spaces,
         }),
+        // Filled by the caller, which is the only party that holds the patch
+        // table — a gathered window's patch interval is the region's, not the
+        // union's, because the copy path never gathers a patch rectangle
+        // (`copyable` declines every `Dim::Patches` operand).
+        patch: MaskSpan::default(),
     }
 }
 
@@ -692,6 +719,7 @@ impl Windows {
         trace: &Trace,
         compiled: &CompiledModel,
         classes: &WindowTable,
+        patches: &WindowTable,
         indptr_host: &[i32],
         copies: Copies<'_>,
     ) -> Result<Windows> {
@@ -701,7 +729,42 @@ impl Windows {
         let mut spans: Vec<MaskSpan> = Vec::new();
 
         for (at, region) in compiled.template().iter().enumerate() {
-            classes.spans_into(&region.mask, &mut spans);
+            // **WHICH TABLE THIS REGION'S OWN ROWS COME OUT OF** is its
+            // capture unit's axis, exactly as `model_exec::fire::walk` reads
+            // it — the two have to agree about the run count, or the walk's
+            // launch loop and this table's window list are cut at different
+            // places. A single-unit artifact answers `RowAxis::PRIMARY` for
+            // every region and this is the line it always was.
+            let axis = compiled.axis_of(at);
+            match axis {
+                model_ir::RowAxis::Tokens => classes.spans_into(&region.mask, &mut spans),
+                model_ir::RowAxis::Patches => patches.spans_into(&region.mask, &mut spans),
+            }
+            // **AND THE OTHER AXIS'S INTERVAL, COMPUTED FOR EVERY REGION** —
+            // because the embed merge is a token region reading a patch
+            // rectangle and one resolution needs both. A FRAGMENTED patch
+            // window is refused rather than resolved to its first piece: P4's
+            // fallback menu is the token axis's, so there is no split to fall
+            // back to here and a silent first-run answer would move the wrong
+            // rows.
+            let patch = match patches.span(&region.mask) {
+                Ok(span) => span.unwrap_or_default(),
+                Err(runs) => {
+                    return Err(Fault::Fragmented {
+                        region: at as u32,
+                        runs,
+                        promised: None,
+                    });
+                }
+            };
+            // P4's menu is asked with the region's own `axis`: the table
+            // answers per axis now (`model_exec::fire::fallback`'s header),
+            // where this used to hold a hand-written `menu` word in front of
+            // every call to keep the token seriation's answers off a patch
+            // region. The rebased qo boundaries below are still the token
+            // rectangle's alone — a patch region's `indptr_host` stays empty,
+            // because that axis's bounds vector is
+            // `RuntimeInput::PatchSegments` and not this one.
             if spans.len() > 1 {
                 // The two integrity questions, asked of the artifact
                 // rather than of the fire. Did P4 PROMISE this window
@@ -711,12 +774,12 @@ impl Windows {
                 // is that order with the absent classes dropped, and dropping
                 // a class can only close a gap, so neither can happen to a
                 // `CompiledModel` and a `WindowTable` built from each other.
-                let bound = fallback::bound(compiled, &region.mask);
-                if fallback::promised(compiled, region) || spans.len() > bound as usize {
+                let bound = fallback::bound(compiled, axis, &region.mask);
+                if fallback::promised(compiled, axis, region) || spans.len() > bound as usize {
                     return Err(Fault::Fragmented {
                         region: at as u32,
                         runs: spans.len(),
-                        promised: fallback::promised(compiled, region).then_some(bound),
+                        promised: fallback::promised(compiled, axis, region).then_some(bound),
                     });
                 }
                 // **THIS PLANE SERVES `Fallback::Split` AND `Fallback::Copy`,
@@ -745,10 +808,11 @@ impl Windows {
             // encode, which is the whole point.
             if spans.len() > 1
                 && copies.enabled
-                && fallback::copies(compiled, &region.mask, copies.bucket)
+                && fallback::copies(compiled, axis, &region.mask, copies.bucket)
                 && copyable_mask(trace, compiled, &region.mask)
             {
-                let gathered = gather_of(&spans, indptr_host, copies);
+                let mut gathered = gather_of(&spans, indptr_host, copies);
+                gathered.patch = patch;
                 of_region.push((runs.len() as u32, 1));
                 runs.push(seat(&mut windows, gathered));
                 continue;
@@ -758,9 +822,13 @@ impl Windows {
             for &span in &spans {
                 let window = Window {
                     span,
-                    indptr_host: rebase(indptr_host, span),
+                    indptr_host: match axis {
+                        model_ir::RowAxis::Tokens => rebase(indptr_host, span),
+                        model_ir::RowAxis::Patches => Vec::new(),
+                    },
                     indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
                     gathered: None,
+                    patch,
                 };
                 runs.push(seat(&mut windows, window));
             }

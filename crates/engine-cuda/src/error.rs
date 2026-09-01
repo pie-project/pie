@@ -681,7 +681,9 @@ impl fmt::Display for Fault {
             ),
             Self::Draftless { lane } => write!(
                 f,
-                "lane {lane} asks for the model's draft head and this load's artifact                  declares none: an MTP axis is a fact the MODEL states (design §8) and                  this plan carries no `mtp` export for the readout to come from"
+                "lane {lane} asks for the model's draft head and this load's artifact declares \
+                 none: an MTP axis is a fact the MODEL states (design §8) and this plan carries \
+                 no `mtp` export for the readout to come from"
             ),
             Self::DraftWord {
                 lane,
@@ -691,18 +693,25 @@ impl fmt::Display for Fault {
                 if *runs_draft_arm {
                     write!(
                         f,
-                        "lane {lane}'s word {word:#x} puts it in a class that runs the                          draft head, and it asked for no draft, so a transformer block                          and a vocabulary-wide readout would run over its rows into a                          column nobody collects"
+                        "lane {lane}'s word {word:#x} puts it in a class that runs the draft \
+                         head, and it asked for no draft, so a transformer block and a \
+                         vocabulary-wide readout would run over its rows into a column nobody \
+                         collects"
                     )
                 } else {
                     write!(
                         f,
-                        "lane {lane} asks for a draft and its word {word:#x} puts it in                          a class outside the draft window, so no draft would be computed                          and the empty readout would be indistinguishable from a draft                          of zeros"
+                        "lane {lane} asks for a draft and its word {word:#x} puts it in a class \
+                         outside the draft window, so no draft would be computed and the empty \
+                         readout would be indistinguishable from a draft of zeros"
                     )
                 }
             }
             Self::Scoreless { lane } => write!(
                 f,
-                "lane {lane} asks to capture its attention mass and this load's artifact                  declares no capture arm: a score axis is a fact the MODEL states                  (design §9) and this plan carries no `attn.scores` export to read"
+                "lane {lane} asks to capture its attention mass and this load's artifact \
+                 declares no capture arm: a score axis is a fact the MODEL states (design §9) \
+                 and this plan carries no `attn.scores` export to read"
             ),
             Self::ScoreWord {
                 lane,
@@ -712,12 +721,16 @@ impl fmt::Display for Fault {
                 if *runs_capture_arm {
                     write!(
                         f,
-                        "lane {lane}'s word {word:#x} puts it in a class that runs                          `attention.prefill_lse`, and it asked for no capture, so the                          mass column would be written and never read"
+                        "lane {lane}'s word {word:#x} puts it in a class that runs \
+                         `attention.prefill_lse`, and it asked for no capture, so the mass \
+                         column would be written and never read"
                     )
                 } else {
                     write!(
                         f,
-                        "lane {lane} asks to capture its attention mass and its word                          {word:#x} puts it on the plain arm, which produces none — the                          empty capture cannot be told from a captured nothing"
+                        "lane {lane} asks to capture its attention mass and its word {word:#x} \
+                         puts it on the plain arm, which produces none — the empty capture \
+                         cannot be told from a captured nothing"
                     )
                 }
             }

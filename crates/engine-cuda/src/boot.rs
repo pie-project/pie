@@ -125,7 +125,7 @@ pub fn read(config_bytes: &[u8]) -> Result<DeviceBoot, String> {
         graphs: graphs(&doc),
         knobs: knobs(&doc)?,
         weight_cache_dir: weight_cache_dir(&doc),
-        program_cache_dir: program_cache_dir(&doc),
+        cache_dir: cache_dir(&doc),
         adapter_dir: adapter_dir(&doc),
     })
 }
@@ -174,11 +174,15 @@ fn graphs(doc: &toml::Table) -> Graphs {
 /// document that still states one of the three is read exactly as a document
 /// that states any other unknown key: ignored.
 ///
-/// **AND ONE KEY BELOW WAS NEVER A VARIABLE AT ALL.** `[engine] bodies` landed
-/// after article 9 did, so it has no environment ancestor to be the round trip
-/// OF — it is simply a knob, read here, the way every knob should have been.
-/// It is stated in the same closure as the rest because "how a boolean is
-/// spelled in this document" is one answer and not a per-key one.
+/// **AND TWO KEYS BELOW WERE NEVER VARIABLES AT ALL.** `[engine] bodies`
+/// landed after article 9 did and `[engine] bodies_mem` after that, so neither
+/// has an environment ancestor to be the round trip OF — they are simply
+/// knobs, read here, the way every knob should have been. The boolean is
+/// stated in the same closure as the rest because "how a boolean is spelled in
+/// this document" is one answer and not a per-key one; the megabyte figure has
+/// its own arm below, for the reason [`gpu_mem_utilization`] has one — a
+/// number out of range is an operator's mistake and not a spelling this reader
+/// declines to understand.
 ///
 /// Absent means the shell's own default, which is what the absent variable
 /// meant, so this function states nothing it was not told. A key spelled with
@@ -233,6 +237,18 @@ fn knobs(doc: &toml::Table) -> Result<Knobs, String> {
         // that would not fit their workspace grant. Nothing else reports a
         // partial arm.
         bodies: flag("bodies", stock.bodies),
+        // **HOW MUCH OF THE CARD THE ARMING PASS MAY SPEND ON GRAPH EXECS**,
+        // in megabytes (the capacity wave). The one number that bounds
+        // `Shell::arm_bodies` — a count used to, and `record::MAX_BODIES`
+        // argues why that was never a bound anybody could derive.
+        //
+        // AN INTEGER AND NOTHING ELSE, unlike the flags above: there is no
+        // second spelling of a megabyte count, so a document that writes one
+        // as a string or a float has said something this reader has no honest
+        // reading of, and the default stands. `0` is a legal statement and
+        // means "enumerate but arm nothing", which is the diagnostic arm
+        // between `bodies = true` and `bodies = false`.
+        bodies_mem: bodies_mem(table, stock.bodies_mem)?,
         copies: flag("fallback_copy", stock.copies),
         grouped: flag("grouped", stock.grouped),
         // `off` is P6's off arm and bakes an artifact with no fork group at
@@ -248,6 +264,39 @@ fn knobs(doc: &toml::Table) -> Result<Knobs, String> {
             _ => stock.side_streams,
         },
     })
+}
+
+/// **How many megabytes of graph exec `[engine] bodies_mem` lets the arming
+/// pass take** (the capacity wave).
+///
+/// Absent is `default`, which is
+/// [`DEFAULT_BODIES_MEGABYTES`](crate::serve::DEFAULT_BODIES_MEGABYTES) and
+/// carries the arithmetic behind the figure.
+///
+/// **OUT OF RANGE REFUSES AT BOOT, BY THE KEY'S NAME**, on
+/// [`gpu_mem_utilization`]'s reasoning and not on a milder one: this is a
+/// capacity statement about a card, a boot document may be written by hand or
+/// by another launcher, and a negative megabyte count is a deployment nobody
+/// meant. Clamping it would arm a map the operator did not ask for and say
+/// nothing.
+///
+/// # Errors
+///
+/// A value that is not a non-negative integer of megabytes, as a sentence.
+fn bodies_mem(table: Option<&toml::Table>, default: u32) -> Result<u32, String> {
+    match table.and_then(|engine| engine.get("bodies_mem")) {
+        None => Ok(default),
+        Some(toml::Value::Integer(megabytes)) => u32::try_from(*megabytes).map_err(|_| {
+            format!(
+                "[engine] bodies_mem is how many megabytes of graph exec the arming \
+                 pass may take off this card, and this document says {megabytes}"
+            )
+        }),
+        Some(other) => Err(format!(
+            "[engine] bodies_mem is a whole number of megabytes, and this document \
+             spells it {other}"
+        )),
+    }
 }
 
 /// **What fraction of the card `[engine] gpu_mem_utilization` lets pie hold**,
@@ -284,7 +333,8 @@ fn gpu_mem_utilization(table: Option<&toml::Table>, default: f64) -> Result<f64,
         Some(toml::Value::Integer(fraction)) => *fraction as f64,
         Some(other) => {
             return Err(format!(
-                "[engine] gpu_mem_utilization is a fraction of this card in (0.0, 1.0],                  and this document spells it {other}"
+                "[engine] gpu_mem_utilization is a fraction of this card in (0.0, 1.0], and this \
+                 document spells it {other}"
             ));
         }
     };
@@ -327,27 +377,32 @@ fn weight_cache_dir(doc: &toml::Table) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// Where `[cache] dir` says this deployment keeps its caches, plus the guest
-/// program plane's own subdirectory.
+/// Where `[cache] dir` says this deployment keeps its caches — the ROOT, and
+/// not one subdirectory of it.
 ///
 /// **THE SECOND KEY THE WORKER HAS BEEN WRITING ALL ALONG.** `[cache] dir` is
 /// `$PIE_HOME/cache`, emitted into every boot document since the palo rewrite;
 /// the shell resolved the same path for itself with three `env::var_os` calls
 /// (`PIE_HOME`, then `XDG_CACHE_HOME`, then `HOME`), which was the last
-/// environment read in `engine-cuda` and is what article 9 forbids. The
-/// subdirectory name is the one those calls produced, so a deployment that
-/// booted through the worker finds the cubins it already wrote.
+/// environment read in `engine-cuda` and is what article 9 forbids.
 ///
-/// Absent or empty is `None`: no cubin is stored and every program compiles
+/// **THE `ptir-cuda` JOIN LEFT THIS FUNCTION** when the NVRTC artifacts came
+/// together. There are three consumers of this root now — the guest-program
+/// plane's cubins, `kernels-cuda`'s cubins, and its measured cuBLASLt table —
+/// so the root is what a boot document states and the subdirectory name is
+/// each consumer's, which is the only arrangement where a reader of one cannot
+/// spell another's directory wrong.
+///
+/// Absent or empty is `None`: nothing is stored and every kernel compiles
 /// through NVRTC, which costs time and never an answer.
-fn program_cache_dir(doc: &toml::Table) -> Option<std::path::PathBuf> {
+fn cache_dir(doc: &toml::Table) -> Option<std::path::PathBuf> {
     doc.get("cache")
         .and_then(toml::Value::as_table)
         .and_then(|cache| cache.get("dir"))
         .and_then(toml::Value::as_str)
         .map(str::trim)
         .filter(|dir| !dir.is_empty())
-        .map(|dir| std::path::Path::new(dir).join("ptir-cuda"))
+        .map(std::path::PathBuf::from)
 }
 
 /// Where `[model] adapter_dir` says this deployment keeps its shared adapters
@@ -466,6 +521,40 @@ graphs = "shaped""#), Graphs::Shaped);
             Knobs { pad: true, ..one } == Knobs::default(),
             "stating `pad` moved something else"
         );
+        // **AND THE BUDGET THAT REPLACED A CONSTANT** (the capacity wave,
+        // `record::MAX_BODIES`). A megabyte count has one spelling, so the
+        // arms below are: absent is the shell's own figure, an integer is the
+        // operator's, and anything else is a document this reader has no
+        // honest reading of.
+        assert_eq!(
+            read("").bodies_mem,
+            crate::serve::DEFAULT_BODIES_MEGABYTES,
+            "absent is the shell's own default"
+        );
+        assert_eq!(read("[engine]\nbodies_mem = 256").bodies_mem, 256);
+        assert_eq!(
+            read("[engine]\nbodies_mem = 0").bodies_mem,
+            0,
+            "zero is a legal statement: enumerate, arm nothing, walk"
+        );
+        let one = read("[engine]\nbodies_mem = 256");
+        assert!(
+            Knobs { bodies_mem: crate::serve::DEFAULT_BODIES_MEGABYTES, ..one }
+                == Knobs::default(),
+            "stating `bodies_mem` moved something else"
+        );
+        let out_of_range = |text: &str| {
+            knobs(&text.parse::<toml::Table>().expect("valid TOML")).expect_err("refused")
+        };
+        assert!(
+            out_of_range("[engine]\nbodies_mem = -1").contains("bodies_mem"),
+            "a negative budget is refused by the key's name"
+        );
+        assert!(
+            out_of_range("[engine]\nbodies_mem = \"512\"").contains("bodies_mem"),
+            "a megabyte count has one spelling and a string is not it"
+        );
+
         // **AND A RETIRED KEY IS AN UNKNOWN KEY.** `fold`, `pipeline` and
         // `fold_disable` named the graph fold, which died with the keyed
         // capture path; a document that still states one is read exactly as a
@@ -477,14 +566,15 @@ graphs = "shaped""#), Graphs::Shaped);
         );
     }
 
-    /// `[cache] dir` and the subdirectory the shell used to derive itself.
+    /// `[cache] dir`, which is the ROOT: the consumers join their own names.
     #[test]
-    fn the_program_cache_directory_is_read_and_an_empty_one_is_off() {
-        let read =
-            |text: &str| program_cache_dir(&text.parse::<toml::Table>().expect("valid TOML"));
+    fn the_cache_directory_is_read_and_an_empty_one_is_off() {
+        let read = |text: &str| cache_dir(&text.parse::<toml::Table>().expect("valid TOML"));
         assert_eq!(
             read("[cache]\ndir = \"/pie-home/cache\""),
-            Some(std::path::PathBuf::from("/pie-home/cache/ptir-cuda"))
+            Some(std::path::PathBuf::from("/pie-home/cache")),
+            "the root arrives whole — a join here would be a second speller of \
+             a subdirectory name"
         );
         assert_eq!(read("[cache]\ndir = \"\""), None, "empty is off");
         assert_eq!(read(""), None, "and so is absent");

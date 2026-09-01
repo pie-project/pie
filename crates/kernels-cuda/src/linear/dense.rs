@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::Error;
@@ -1745,22 +1745,16 @@ impl DiskCache {
     }
 }
 
+/// The measured table, under the deployment's stated cache root.
+///
+/// **THE TWO `env::var` CALLS STOOD HERE** and resolved
+/// `$XDG_CACHE_HOME/pie/dense_gemm.txt`, else `$HOME/.cache/pie/dense_gemm.txt`
+/// — which is why `worker::state`'s claim to cover "GEMM autotuning results"
+/// under `$PIE_HOME/cache` was false. The root arrives through [`crate::disk`]
+/// now; `None` is a process that stated none, and the disk half is then off
+/// while the in-memory half still works.
 fn cache_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var("XDG_CACHE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        return Some(Path::new(&xdg).join("pie").join("dense_gemm.txt"));
-    }
-    if let Some(home) = std::env::var("HOME").ok().filter(|s| !s.is_empty()) {
-        return Some(
-            Path::new(&home)
-                .join(".cache")
-                .join("pie")
-                .join("dense_gemm.txt"),
-        );
-    }
-    None
+    Some(crate::disk::dir(crate::disk::GEMM_ALGOS)?.join("dense.txt"))
 }
 
 /// An empty answer disables the disk half of the cache.

@@ -411,7 +411,7 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
@@ -423,11 +423,12 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     let container = container(&checkpoint)?;
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let trace = trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the SKU's import contract fits its own checkpoint");
+    let contract =
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+            .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
     let shell = Shell::load(Boot {
         // Full residency: the whole weight table on the device, which is what
@@ -458,7 +459,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
             bodies: false,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.

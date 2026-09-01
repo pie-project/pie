@@ -20,7 +20,7 @@
 //! fluent text about an image the model half-saw. There is no test downstream
 //! of here that catches that, so the check is here and it is total.
 
-use ::model::media::EncodedSpan;
+use models::media::EncodedSpan;
 use std::sync::Arc;
 
 /// **A NAMED REFUSAL, WITH THE DOOR'S OWN SENTENCE.**
@@ -290,16 +290,32 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32]) -> Vec<LaneMedia> {
         m.patches.extend_from_slice(&span.payload);
         m.embed_rows.extend_from_slice(&span.embed_rows);
         m.embed_weights.extend_from_slice(&span.embed_weights);
-        // **THE ROUTES: PAYLOAD ROW k OF THIS SPAN LANDS AT ITS RUN'S k-TH
-        // TOKEN ROW.** A span whose payload is longer than its run — a merge
-        // that folds four patches into one token — spends the surplus on the
-        // fold-space tail, which the contract spells `-1`.
-        for k in 0..span.rows {
-            m.routes.push(if k < run.rows {
-                (run.anchor + k) as i32
-            } else {
-                PATCH_ROUTE_DROP
-            });
+        // **THE ROUTES ARE THE LANE'S FOLD-SPACE PREFIX, AND THE `-1` TAIL IS
+        // ONE TAIL AT THE END OF THE LANE** (multimodal §17; `place_routes`'
+        // own doc in both engines).
+        //
+        // A route is read at the FOLD's OUTPUT row, not at a patch row: both
+        // shells take `patches / fold` entries starting at `patch_offset /
+        // fold`, where `patches` is the LANE's total. So output row `j` of the
+        // lane is `routes[j]`, and the lane's spans contribute their soft
+        // tokens BACK TO BACK — span 0's `token_count` entries, then span 1's,
+        // with nothing between them.
+        //
+        // **THIS IS THE TWO-IMAGES-ONE-LANE BUG, AND IT WAS SILENT.** What
+        // stood here wrote `span.rows` entries per span — `run.rows` addresses
+        // then that SPAN's own `-1` padding — which is the same vector as this
+        // one for exactly one span, because then the padding is already at the
+        // end. With two spans the reader's live prefix walked span 0's
+        // addresses, ran into span 0's padding, and stopped before span 1's
+        // addresses were ever reached: image 1's soft tokens were all dropped
+        // and the pass answered fluently about the image it half-saw.
+        //
+        // The vector still owes ONE ENTRY PER PAYLOAD ROW — `StepMedia::
+        // validate` and both shells' `Fault::PatchPayload` check that length —
+        // so the surplus a compacting fold spends is padded on at the end of
+        // the lane, below, once every span has laid down its prefix.
+        for k in 0..run.rows {
+            m.routes.push((run.anchor + k) as i32);
         }
         // **THE TOWER'S ROTATION STREAM IS READ OFF THE SPAN, NOT DERIVED
         // FROM ITS GRID** (wave MD-C, the first of MD-B's two pinned seams).
@@ -339,6 +355,20 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32]) -> Vec<LaneMedia> {
             }
         }
     }
+    // **AND THE FOLD-SPACE TAIL, ONCE PER LANE** (see the routes push above).
+    // Every span of the lane has laid its addresses down back to back; the
+    // rest of the `[Dim::Patches]` rectangle is rows the fold spends and the
+    // contract spells them `-1`. Written as a `while` and not a `resize` so a
+    // lane whose spans somehow claim more token rows than payload rows keeps
+    // its over-long vector and is refused by length downstream rather than
+    // silently truncated here.
+    for m in &mut out {
+        let owed = m.rows.iter().copied().fold(0usize, |a, r| a + r as usize);
+        while m.routes.len() < owed {
+            m.routes.push(PATCH_ROUTE_DROP);
+        }
+    }
+
     // **THE TRUNK'S STREAM IS PER LANE AND ONLY WHEN M-ROPE ASKS FOR IT.**
     // Empty means scalar `(p, p, p)`, which is the right and cheap answer for
     // every 1-D-RoPE model; a lane under M-RoPE owes one triple per token row.
@@ -350,31 +380,70 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32]) -> Vec<LaneMedia> {
             continue;
         }
         let rows = lane_rows.get(m.lane as usize).copied().unwrap_or(0);
+        // This lane's runs in token order. `scan` already emits them that way
+        // — it sorts each lane's runs by anchor — and the walk below reads
+        // them once, in step with the cursor, so the order is stated here
+        // rather than assumed.
+        let mut runs: Vec<&MatchedRun> =
+            matched.iter().filter(|r| r.lane == m.lane).collect();
+        runs.sort_by_key(|r| r.anchor);
+
+        // **THE CURSOR IS NOT THE TOKEN ROW, AND THAT IS THE WHOLE POINT**
+        // (`get_rope_index`, qwen3.5's own; transcribed in the pinned test).
+        //
+        // Upstream walks a sequence in modality groups carrying one
+        // `current_pos`:
+        //
+        // * a text group of length `L` takes `current_pos + 0..L` on all three
+        //   axes and advances the cursor by `L`;
+        // * an image takes `get_vision_position_ids(current_pos, grid)`, which
+        //   is `(current_pos + t, current_pos + h, current_pos + w)` over the
+        //   MERGED grid in `ij` meshgrid order — the RUN-START OFFSET on every
+        //   axis, `t` included — and advances the cursor by
+        //   `max(llm_grid_h, llm_grid_w)`, which is `EncodedSpan::position_span`.
+        //
+        // **THE OFFSET USED TO BE MISSING AND THE BUG WAS LATENT.** The raw
+        // merged-grid triple starts at `(0, 0, 0)` however deep into the
+        // context its run lands, so an image's positions ran BACKWARD past
+        // everything before it. A caption prompt is short enough that the
+        // rotation barely notices; a long context rotates the image as though
+        // it sat at the start of the sequence.
+        //
+        // **AND THE TEXT AFTER AN IMAGE DOES NOT RESUME AT ITS TOKEN ROW.** An
+        // image spends `t·h·w` token rows and only `max(h, w)` positions, so
+        // the cursor and the row index part company at the first image and
+        // never meet again — which is exactly what upstream's
+        // `mrope_position_deltas` records.
         m.token_positions = Vec::with_capacity(3 * rows as usize);
-        for p in 0..rows {
-            // A text row takes `(p, p, p)`; a row inside a run takes its
-            // patch's merged-grid coordinate. MD-B's front-ends carry the
-            // merged grid, so the second case is filled from the span rather
-            // than guessed here.
-            let inside = matched.iter().find(|r| {
-                r.lane == m.lane && p >= r.anchor && p < r.anchor + r.rows
-            });
-            match inside {
+        let mut cursor: u32 = 0;
+        let mut p: u32 = 0;
+        let mut next = 0usize;
+        while p < rows {
+            match runs.get(next).filter(|r| r.anchor == p) {
                 Some(run) => {
-                    let k = p - run.anchor;
+                    let start = cursor;
                     let g = run.span.grid;
-                    let hw = g.h.max(1) * g.w.max(1);
-                    let t = k / hw.max(1);
-                    let rem = k % hw.max(1);
-                    m.token_positions.push(i32::try_from(t).unwrap_or(i32::MAX));
-                    m.token_positions
-                        .push(i32::try_from(rem / g.w.max(1)).unwrap_or(i32::MAX));
-                    m.token_positions
-                        .push(i32::try_from(rem % g.w.max(1)).unwrap_or(i32::MAX));
+                    let (gh, gw) = (g.h.max(1), g.w.max(1));
+                    let hw = gh * gw;
+                    for k in 0..run.rows.min(rows - p) {
+                        let t = k / hw;
+                        let rem = k % hw;
+                        for axis in [t, rem / gw, rem % gw] {
+                            m.token_positions.push(
+                                i32::try_from(start.saturating_add(axis))
+                                    .unwrap_or(i32::MAX),
+                            );
+                        }
+                    }
+                    cursor = cursor.saturating_add(run.span.position_span);
+                    p = p.saturating_add(run.rows);
+                    next += 1;
                 }
                 None => {
-                    let p = i32::try_from(p).unwrap_or(i32::MAX);
-                    m.token_positions.extend_from_slice(&[p, p, p]);
+                    let at = i32::try_from(cursor).unwrap_or(i32::MAX);
+                    m.token_positions.extend_from_slice(&[at, at, at]);
+                    cursor = cursor.saturating_add(1);
+                    p += 1;
                 }
             }
         }
@@ -385,9 +454,74 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32]) -> Vec<LaneMedia> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::model::media::Grid;
+    use models::media::Grid;
 
     const PAD: u32 = 151_655;
+
+    /// **THE SHELLS' OWN READING OF `routes`, TRANSCRIBED** — `place_routes`
+    /// in `engine_metal::serve` and the identical loop in `engine_cuda::serve`,
+    /// written out here so this crate's gate reads the vector the way the two
+    /// consumers do rather than the way the producer wrote it.
+    ///
+    /// A lane owns `patches / fold` slots of the fire's route vector, starting
+    /// at `patch_offset / fold`, and reads the leading `patches / fold`
+    /// entries of the submission's own vector into them — `patches` being the
+    /// LANE's total across every span it carries. This answers that prefix,
+    /// rebased by `row_offset` the way a shell rebases it, with the sentinel
+    /// left alone.
+    fn as_a_shell_reads_it(routes: &[i32], patch_rows: u32, fold: u32, row_offset: i32) -> Vec<i32> {
+        let live = (patch_rows / fold.max(1)) as usize;
+        routes
+            .iter()
+            .take(live)
+            .map(|&route| if route < 0 { route } else { route + row_offset })
+            .collect()
+    }
+
+    /// A span that folds `fold` payload rows into one soft token — qwen's
+    /// 2 x 2 spatial merge is `fold == 4`, and the fold is the whole reason
+    /// `routes` is longer than the addresses in it.
+    fn folded_span(soft: u32, fold: u32) -> Arc<EncodedSpan> {
+        let rows = soft * fold;
+        Arc::new(EncodedSpan {
+            token_count: soft,
+            position_span: soft,
+            grid: Grid::still(1, soft),
+            patch_grid: Grid::still(1, rows),
+            uses_mrope: false,
+            payload: vec![0.5; rows as usize],
+            rows,
+            positions: Vec::new(),
+            embed_rows: Vec::new(),
+            embed_weights: Vec::new(),
+            prefix: vec![1],
+            placeholder: PAD,
+            suffix: vec![2],
+        })
+    }
+
+    /// An M-RoPE image span: a merged grid of `h x w`, so `h · w` soft tokens
+    /// over `4 · h · w` payload rows, and a cursor advance of `max(h, w)` —
+    /// `Qwen35Vision`'s own `position_span`.
+    fn image_span(h: u32, w: u32) -> Arc<EncodedSpan> {
+        let soft = h * w;
+        let rows = soft * 4;
+        Arc::new(EncodedSpan {
+            token_count: soft,
+            position_span: h.max(w),
+            grid: Grid::still(h, w),
+            patch_grid: Grid::still(2 * h, 2 * w),
+            uses_mrope: true,
+            payload: vec![0.5; rows as usize],
+            rows,
+            positions: Vec::new(),
+            embed_rows: Vec::new(),
+            embed_weights: Vec::new(),
+            prefix: vec![1],
+            placeholder: PAD,
+            suffix: vec![2],
+        })
+    }
 
     fn span(rows: u32) -> Arc<EncodedSpan> {
         Arc::new(EncodedSpan {
@@ -563,5 +697,227 @@ mod tests {
         rows[0]
             .validate(toks.len() as u32)
             .expect("the contract admits what the scan derived");
+    }
+
+    /// **ONE IMAGE IS THE CASE THE TWO READINGS AGREE ON**, which is why the
+    /// bug below stayed latent: with a single span, "each span padded to its
+    /// own payload rows" and "the lane's addresses then one tail" are the same
+    /// vector, because the only padding is already at the end.
+    #[test]
+    fn one_folded_image_is_its_addresses_then_the_tail() {
+        let a = folded_span(3, 4);
+        let toks: Vec<u32> = [&[7][..], &a.tokens()[..]].concat();
+        let matched = scan(&[&toks], &[Arc::clone(&a)]).expect("one run, one span");
+        let media = lane_media(&matched, &[toks.len() as u32]);
+        assert_eq!(media[0].routes.len(), 12, "one entry per payload row");
+        assert_eq!(media[0].routes[..3], [2, 3, 4], "the run starts at row 2");
+        assert!(media[0].routes[3..].iter().all(|&r| r == PATCH_ROUTE_DROP));
+        media[0]
+            .validate(toks.len() as u32)
+            .expect("the contract's own length rule is payload rows");
+    }
+
+    /// **TWO IMAGES IN ONE LANE, AND THE SECOND ONE'S SOFT TOKENS SURVIVE.**
+    ///
+    /// The bug this gate was written for: `routes` was built per span — each
+    /// span's addresses followed by that SPAN's `-1` padding — while both
+    /// shells read it as ONE fold-space prefix `patches / fold` long over the
+    /// LANE. With one span the two readings coincide; with two, the prefix
+    /// walked image 0's addresses, ran into image 0's padding, and stopped
+    /// before image 1's addresses were reached. Image 1's soft tokens were all
+    /// dropped, every length still agreed, and the pass answered fluently
+    /// about an image it never saw.
+    ///
+    /// So the gate is not on the vector alone — it reads it the way the
+    /// consumers do ([`as_a_shell_reads_it`]) and asks that every soft token
+    /// row of BOTH runs is named.
+    #[test]
+    fn two_images_in_one_lane_both_reach_their_soft_tokens() {
+        const FOLD: u32 = 4;
+        let a = folded_span(2, FOLD);
+        let b = folded_span(3, FOLD);
+        let toks: Vec<u32> =
+            [&[7][..], &a.tokens()[..], &[8][..], &b.tokens()[..]].concat();
+        // 7, <1 PAD PAD 2>, 8, <1 PAD PAD PAD 2> — image 0 at token row 2,
+        // image 1 at token row 7.
+        let matched = scan(&[&toks], &[Arc::clone(&a), Arc::clone(&b)])
+            .expect("two runs, two spans");
+        assert_eq!((matched[0].anchor, matched[1].anchor), (2, 7));
+
+        let media = lane_media(&matched, &[toks.len() as u32]);
+        assert_eq!(media.len(), 1, "one lane, two spans, one media row");
+        assert_eq!(media[0].rows, vec![8, 12]);
+        let patch_rows: u32 = media[0].rows.iter().sum();
+        assert_eq!(
+            media[0].routes.len(),
+            patch_rows as usize,
+            "the vector is over the FULL patch rectangle, however the live \
+             prefix is laid out inside it",
+        );
+
+        let read = as_a_shell_reads_it(&media[0].routes, patch_rows, FOLD, 0);
+        assert_eq!(
+            read,
+            vec![2, 3, 7, 8, 9],
+            "the lane's fold output rows are one interval, so its spans' \
+             addresses are back to back and image 1's are inside the prefix",
+        );
+        for run in &matched {
+            for k in 0..run.rows {
+                assert!(
+                    read.contains(&((run.anchor + k) as i32)),
+                    "token row {} of the run at {} is named by no route the \
+                     shell reads: {read:?}",
+                    k,
+                    run.anchor,
+                );
+            }
+        }
+        assert!(
+            media[0].routes[read.len()..]
+                .iter()
+                .all(|&r| r == PATCH_ROUTE_DROP),
+            "everything past the live prefix is the fold's own tail",
+        );
+        media[0]
+            .validate(toks.len() as u32)
+            .expect("the contract admits the lane's routes");
+    }
+
+    /// The shell's rebase does not disturb the prefix: a lane that lands at
+    /// fire row 20 moves every address by 20 and leaves the sentinel alone.
+    #[test]
+    fn the_rebase_moves_the_addresses_and_not_the_tail() {
+        const FOLD: u32 = 4;
+        let a = folded_span(1, FOLD);
+        let b = folded_span(1, FOLD);
+        let toks: Vec<u32> = [&a.tokens()[..], &b.tokens()[..]].concat();
+        let matched = scan(&[&toks], &[Arc::clone(&a), Arc::clone(&b)]).expect("two runs");
+        let media = lane_media(&matched, &[toks.len() as u32]);
+        let patch_rows: u32 = media[0].rows.iter().sum();
+        assert_eq!(
+            as_a_shell_reads_it(&media[0].routes, patch_rows, FOLD, 20),
+            vec![21, 24],
+            "row 1 and row 4 of the lane, at fire rows 21 and 24",
+        );
+        assert_eq!(
+            media[0].routes[2..]
+                .iter()
+                .copied()
+                .filter(|&r| r == PATCH_ROUTE_DROP)
+                .count(),
+            6,
+            "the tail is the fold's surplus, six rows of the eight",
+        );
+    }
+
+    /// **THE M-ROPE TRIPLES CARRY THE RUN'S START POSITION** — `get_rope_index`,
+    /// `transformers` v5.15.1 `models/qwen3_5/modeling_qwen3_5.py`, transcribed:
+    ///
+    /// ```text
+    /// current_pos = 0
+    /// for each modality group:
+    ///     text of length L:  positions = current_pos + arange(L) on all three
+    ///                        axes;  current_pos += L
+    ///     image:             positions = get_vision_position_ids(current_pos, grid)
+    ///                                  = (current_pos + t, current_pos + h,
+    ///                                     current_pos + w) over the MERGED grid
+    ///                                    in `meshgrid(..., indexing="ij")` order
+    ///                        current_pos += max(llm_grid_h, llm_grid_w)
+    /// ```
+    ///
+    /// Two facts fall out and both are asserted below:
+    ///
+    /// * **the offset is on every axis, `t` included** — `get_vision_position_ids`
+    ///   adds `start_position` to the height and width ranges and then does
+    ///   `vision_position_ids[0] += start_position` for the temporal one. What
+    ///   stood here emitted the RAW merged-grid triple `(0, 0..h, 0..w)`, so an
+    ///   image's positions ran backward past everything before it — invisible
+    ///   in a caption prompt, wrong in a long context;
+    /// * **the text after an image does not resume at its token row** — the
+    ///   cursor advances by `max(h, w)` (which is `EncodedSpan::position_span`,
+    ///   pinned against the reference processor in `model`'s own
+    ///   `qwen3_5_media_is_the_pinned_arithmetic`) while the run spent `h · w`
+    ///   token rows, so the two part company at the first image. That is
+    ///   exactly what upstream's `mrope_position_deltas` records.
+    #[test]
+    fn an_images_triples_start_at_the_position_its_run_begins_at() {
+        let img = image_span(2, 3);
+        // 10, 11, <1 PAD x 6 2>, 12, 13 — twelve token rows, the run at 3.
+        let toks: Vec<u32> =
+            [&[10, 11][..], &img.tokens()[..], &[12, 13][..]].concat();
+        assert_eq!(toks.len(), 12);
+        let matched = scan(&[&toks], &[Arc::clone(&img)]).expect("one run");
+        assert_eq!(matched[0].anchor, 3, "the pad run starts after the prefix");
+        let media = lane_media(&matched, &[toks.len() as u32]);
+
+        let want: Vec<i32> = vec![
+            // Two text tokens and the vision-start delimiter: the cursor is
+            // the token row while nothing has spent a position yet.
+            0, 0, 0, //
+            1, 1, 1, //
+            2, 2, 2, //
+            // The run begins at position 3, so every triple is 3 + the merged
+            // grid's own `(t, h, w)` over a 2 x 3 grid in `ij` order.
+            3, 3, 3, //
+            3, 3, 4, //
+            3, 3, 5, //
+            3, 4, 3, //
+            3, 4, 4, //
+            3, 4, 5, //
+            // `max(2, 3) == 3`, so the cursor is 3 + 3 = 6 and the suffix
+            // takes it — one past the largest component the image carried (5),
+            // which is upstream's `llm_positions.max() + 1`.
+            6, 6, 6, //
+            7, 7, 7, //
+            8, 8, 8, //
+        ];
+        assert_eq!(media[0].token_positions, want);
+        assert_eq!(media[0].token_positions.len(), 3 * toks.len());
+        media[0]
+            .validate(toks.len() as u32)
+            .expect("one triple per token row of the lane");
+    }
+
+    /// **AND THE OFFSET COMPOUNDS**: the second image starts where the first
+    /// one's cursor left off, not at its own token row and not at zero. This
+    /// is the long-context shape in miniature — the further into the sequence
+    /// an image sits, the larger the divergence the missing offset caused.
+    #[test]
+    fn a_second_image_starts_where_the_firsts_cursor_left_off() {
+        let a = image_span(1, 2);
+        let b = image_span(2, 1);
+        let toks: Vec<u32> = [&a.tokens()[..], &[9][..], &b.tokens()[..]].concat();
+        // <1 PAD PAD 2> 9 <1 PAD PAD 2> — nine token rows, runs at 1 and 6.
+        assert_eq!(toks.len(), 9);
+        let matched = scan(&[&toks], &[Arc::clone(&a), Arc::clone(&b)]).expect("two runs");
+        assert_eq!((matched[0].anchor, matched[1].anchor), (1, 6));
+        let media = lane_media(&matched, &[toks.len() as u32]);
+        assert_eq!(
+            media[0].token_positions,
+            vec![
+                0, 0, 0, // the first vision-start delimiter
+                1, 1, 1, // a's run begins at 1: (0, 0, 0) + 1
+                1, 1, 2, //                      (0, 0, 1) + 1
+                3, 3, 3, // a spends max(1, 2) = 2, so the cursor is 3
+                4, 4, 4, // the text between the images
+                5, 5, 5, // the second vision-start delimiter
+                6, 6, 6, // b's run begins at 6: (0, 0, 0) + 6
+                6, 7, 6, //                      (0, 1, 0) + 6
+                8, 8, 8, // b spends max(2, 1) = 2, so the cursor is 8
+            ],
+        );
+    }
+
+    /// A lane whose spans rotate scalar owes no trunk stream at all, and the
+    /// cursor walk above must not invent one — empty IS the answer, and it is
+    /// what every 1-D-RoPE model submits.
+    #[test]
+    fn a_scalar_lane_still_owes_no_trunk_stream() {
+        let a = folded_span(2, 4);
+        let toks: Vec<u32> = [&[5][..], &a.tokens()[..]].concat();
+        let matched = scan(&[&toks], &[Arc::clone(&a)]).expect("one run");
+        let media = lane_media(&matched, &[toks.len() as u32]);
+        assert!(media[0].token_positions.is_empty());
     }
 }

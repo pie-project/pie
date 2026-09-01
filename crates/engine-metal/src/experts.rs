@@ -4,8 +4,9 @@
 //!
 //! ```text
 //! T0 wired    `slots` expert seats of every streamed band, budgeted  `device_weight_budget`
-//! source      every expert of every streamed band, host bytes        (W-a: a `Vec<u8>`;
-//!                                                                     W-b: the mmap'd artifact)
+//! source      every expert of every streamed band, host bytes        a mapping the kernel
+//!                                                                    may reclaim
+//!                                                                    (`crate::host_source`)
 //! ```
 //!
 //! # There is no T1 here, and that is the platform rather than a shortcut
@@ -80,18 +81,26 @@
 //!
 //! # What this wave does NOT do, named so that the next one is not a surprise
 //!
-//! * **The source is a `Vec<u8>`, not the artifact.** Every streamed band is
-//!   held whole in host memory — which is honest about the DEVICE budget and
-//!   silent about the process's footprint. W-b replaces it with a mapping of
-//!   the checkpoint plus a `madvise` window walked ahead of the segments, and
-//!   the [`Tier`]'s own `host` field is the one thing that changes.
-//! * **The admission arithmetic is against the stated budget, not against
-//!   what is RECLAIMABLE.** `Context::working_set` is the number this shell
-//!   actually has, and origin/dev's rule for the transient window is "one
-//!   window, not one model" (`forward.cpp`). Plumbing it here means the
-//!   budget stops being a number the deployment states and starts being one
-//!   the machine answers, which is a load-path change rather than a tier
-//!   change — W-b's.
+//! * **The source is a mapping this shell writes, not the artifact itself.**
+//!   Every streamed band is still held whole on the host — what changed is
+//!   WHERE: [`crate::host_source`] backs it with an unlinked temporary file,
+//!   so the kernel may write the pages back and reclaim them instead of the
+//!   process pinning a whole routed bank in anonymous memory. That bounds the
+//!   term; it does not remove it, and it is not yet the artifact. Mapping the
+//!   `.zt` directly needs the load's own transforms out of the way — the
+//!   checkpoint's Metal tile mask admits `CAST|SCALE|DECODE|BIAS`
+//!   (`checkpoint`'s `plan::passes::tile`), so what a band LANDS as is not in
+//!   general what the file HOLDS, and a mapping of the artifact would be a
+//!   mapping of the wrong bytes. Hoisting the mmap door into `checkpoint` and
+//!   planning for an untransformed band is the rest of W-b.
+//! * **The admission arithmetic asks the machine, but the tier still does
+//!   not.** `Context::working_set` IS plumbed now — `api.rs` binds a
+//!   throwaway context at admission, prices the kv pool and the dense floor
+//!   against the card's own working set, and shrinks the budget this plan is
+//!   formed at when the stated one is over the ceiling. What is still open is
+//!   origin/dev's other half: its rule for the transient window is "one
+//!   window, not one model" (`forward.cpp`), and nothing here bounds a
+//!   segment's window against what is RECLAIMABLE at the instant it runs.
 //! * **One segment's tokens are not split.** Every distinct expert a segment
 //!   routes to is pinned at once, so a wide prefill over a small slab is
 //!   refused rather than served in pieces. dev's `expert_paging` splits the
@@ -119,6 +128,7 @@ use model_ir::{Def, Linear, Operands, Operation, Trace, ValueId};
 
 use crate::device::{Buffer, Handles};
 use crate::error::{Fault, Result};
+use crate::host_source::HostSource;
 
 /// A param's other device planes, by `Trace::params` index — the pairing
 /// `weights::pairings` reads off the load plan, in the one shape this module
@@ -377,9 +387,10 @@ impl Plan {
     /// Not "not measured" and not "not implemented" — zero is the true
     /// number on unified memory, and this module's header is where the
     /// sentence lives. The source bytes a seat is copied FROM are host bytes
-    /// the process would hold either way (in W-a a `Vec<u8>`, in W-b the
-    /// mapped artifact the checkpoint already occupies), and no byte of them
-    /// is a second copy the device reads through.
+    /// the process would hold either way — and since W-b they are a mapping
+    /// the kernel may take back ([`crate::host_source`]) rather than a
+    /// `Vec<u8>` it cannot — and no byte of them is a second copy the device
+    /// reads through.
     #[must_use]
     pub fn host_demand(&self) -> u64 {
         let _ = self.host_bytes;
@@ -387,7 +398,8 @@ impl Plan {
     }
 
     /// How many bytes the host band table holds — the source side of every
-    /// seat copy, and what W-b replaces with a mapping.
+    /// seat copy, and the size [`HostSource::open`](crate::host_source::HostSource::open)
+    /// backs with a file.
     #[must_use]
     pub fn source_bytes(&self) -> u64 {
         self.host_bytes
@@ -430,6 +442,16 @@ fn found(
             }
             | Linear::MoeTopkSqrtSoftplus {
                 routes, experts, ..
+            }
+            // **AND THE LOOKUP ROUTER IS ONE OF THEM.** It reads no logits, so
+            // it is not a `MoeTopk*` by name — but it lands the same `routes`
+            // vector the selects behind it are indexed by, and dsv4-flash's
+            // first `num_hash_layers` layers route ONLY this way. Omitted, its
+            // groups are routed reads whose router this scan does not state,
+            // and `Plan::of` refuses the whole model rather than the layer:
+            // no DeepSeek-V4-Flash load could stream at any budget.
+            | Linear::MoeHashRoute {
+                routes, experts, ..
             } => (*routes, *experts),
             _ => continue,
         };
@@ -459,10 +481,10 @@ fn found(
         };
         if !arity.contains_key(&routes.0) {
             return Err(Fault::Residency(format!(
-                "value {} is read as a routing vector by `{}` and no `Linear::MoeTopk*` \
-                 node of this plan writes it; the expert count a seat is divided out of \
-                 is the ROUTER's field, so a routed read whose router this plan does not \
-                 state cannot be seated at less than its declared size",
+                "value {} is read as a routing vector by `{}` and no router node of this \
+                 plan writes it; the expert count a seat is divided out of is the \
+                 ROUTER's field, so a routed read whose router this plan does not state \
+                 cannot be seated at less than its declared size",
                 routes.0,
                 op.name(),
             )));
@@ -608,7 +630,10 @@ pub fn cuts(
                 Linear::MoeTopkSoftmax { routes, .. }
                 | Linear::MoeTopkSoftmaxScaled { routes, .. }
                 | Linear::MoeTopkSigmoid { routes, .. }
-                | Linear::MoeTopkSqrtSoftplus { routes, .. } => *routes,
+                | Linear::MoeTopkSqrtSoftplus { routes, .. }
+                // The lookup router decides a mixture exactly as the ranked
+                // four do, so the cut falls after it for the same reason.
+                | Linear::MoeHashRoute { routes, .. } => *routes,
                 _ => continue,
             };
             if let Some(first) = here {
@@ -699,10 +724,17 @@ pub struct GroupResidency {
 pub struct Tier {
     /// A retain of the weight store — where seats live.
     store: Buffer,
-    /// Every expert of every streamed band. **W-a's source, and the one thing
-    /// wave W-b replaces**: a mapping of the artifact, with a `madvise` window
-    /// ahead of the walk, puts these bytes back on disk where they came from.
-    host: Vec<u8>,
+    /// Every expert of every streamed band, in a `MAP_SHARED` mapping of an
+    /// unlinked temporary file ([`HostSource`]) — bytes the kernel may write
+    /// back and reclaim, rather than the anonymous `Vec<u8>` W-a held that
+    /// only swap could take.
+    ///
+    /// **THE CPU IS THE ONLY THING THAT READS IT.** It is the `&[u8]` source
+    /// of the seat copies in [`Tier::copy`] and it is bound to no `MTLBuffer`
+    /// anywhere, because a mapped page the GPU touches WIRES and stops being
+    /// reclaimable at all (`.wiki/alto/streaming.md`, measured); the module
+    /// header of [`crate::host_source`] states the whole rule.
+    host: HostSource,
     slabs: Vec<Slab>,
     /// `routes value -> slab index`.
     of_routes: BTreeMap<u32, usize>,
@@ -727,7 +759,7 @@ impl Tier {
     ///
     /// [`Fault::Ceiling`] for a seat span that leaves the store or a source
     /// span that leaves the host table, [`Fault::Deviceless`] off Apple.
-    pub fn open(plan: &Plan, store: &Buffer, host: Vec<u8>, offsets: &[u64]) -> Result<Tier> {
+    pub fn open(plan: &Plan, store: &Buffer, host: HostSource, offsets: &[u64]) -> Result<Tier> {
         let mut tier = Tier {
             store: store.clone(),
             host,
@@ -772,6 +804,16 @@ impl Tier {
         // fill counted there would make that question answer yes on a load
         // that never routed outside its prefix.
         tier.swaps = 0;
+        // ── **AND THE SOURCE IS HANDED TO THE PAGER HERE**, at the one instant
+        //    where it is fully written and fully read: the landing filled it,
+        //    the prefix above has just copied out of it, and nothing will read
+        //    it again until a segment routes outside the prefix. Before this
+        //    point every page is DIRTY and a dirty page cannot be reclaimed
+        //    without a writeback the pager would have to schedule under
+        //    pressure; after it they are clean and deactivated, and a seat copy
+        //    that wants one faults it back from the file it already lives in.
+        //    [`HostSource::settle`] argues the two calls.
+        tier.host.settle();
         Ok(tier)
     }
 
@@ -923,6 +965,22 @@ impl Tier {
     /// Copy expert `expert` into seat `seat` of slab `at` — every band of it,
     /// which is what makes one seat number mean one expert across the codes,
     /// the factors, the zero points and the routed bias.
+    ///
+    /// **THE OVERWRITE IN PLACE IS WHAT BOUNDS WIRED RESIDENCY, AND IT IS LOAD-
+    /// BEARING.** The measurement in `.wiki/alto/streaming.md` proved that a
+    /// GPU-touched `StorageModeShared` page stays WIRED until its buffer is
+    /// released or explicitly `madvise(MADV_DONTNEED)`'d — the pager will not
+    /// evict it under pressure. This shell needs neither of those because it
+    /// never GROWS the wired set: the slab is one fixed reservation of `slots`
+    /// seats inside `self.store`, carved to the budget at load, and a segment's
+    /// eviction is a `write` OVER an existing seat's bytes (`band.at + seat *
+    /// stride`), not a new allocation and not a re-created buffer. The seat's
+    /// pages were wired on their first touch and are reused for every expert
+    /// that lands in that seat thereafter, so the wired footprint is exactly the
+    /// slab — the budget — and never the cumulative set of experts the load has
+    /// touched. A future change that reallocated or extended the slab per
+    /// segment would silently unbound this; the whole point of the seat clock
+    /// (`evict`) is to stay inside the fixed berths instead.
     fn copy(&mut self, at: usize, seat: u32, expert: u32) -> Result<()> {
         for band in 0..self.slabs[at].bands.len() {
             let (into, from, stride) = {
@@ -935,6 +993,14 @@ impl Tier {
             };
             let from = usize::try_from(from).unwrap_or(usize::MAX);
             let len = usize::try_from(stride).unwrap_or(usize::MAX);
+            // **ONE COPY, NOT TWO.** The band used to be `.to_vec()`'d out of
+            // the host table and the temporary handed to `write` — a whole
+            // expert band allocated, filled and freed per seat copy, for no
+            // reason but to end a borrow of `self.host` before `self.store`
+            // was borrowed mutably. The two fields are disjoint, so the
+            // reborrow below says that directly and the allocation is gone:
+            // what remains is exactly the copy that IS the mechanism, from
+            // the reclaimable mapping into the wired slab.
             let source = self
                 .host
                 .get(from..from + len)
@@ -942,9 +1008,8 @@ impl Tier {
                     what: "bytes of the host band table",
                     need: (from + len) as u64,
                     have: self.host.len() as u64,
-                })?
-                .to_vec();
-            self.store.write(into, &source)?;
+                })?;
+            self.store.write(into, source)?;
             self.swaps += 1;
         }
         self.slabs[at].in_seat[seat as usize] = Some(expert);
@@ -971,5 +1036,19 @@ impl Tier {
     #[must_use]
     pub fn motion(&self) -> (u64, u64) {
         (self.swaps, self.segments)
+    }
+
+    /// **What the source is actually made of**: `(the backing file's size, its
+    /// link count)`, or `None` when this tier has no file behind it at all.
+    ///
+    /// The observable half of [`crate::host_source`]'s claim, and the only one
+    /// a gate can hold honestly. `(source_bytes, 0)` says the streamed bands
+    /// live in a mapping of a real, unlinked file — which is what makes the
+    /// pages RECLAIMABLE, since the kernel has somewhere to put them. Whether
+    /// it takes them is the kernel's business under a pressure this box cannot
+    /// stage without measuring the box instead of the mechanism.
+    #[must_use]
+    pub fn source(&self) -> Option<(u64, u64)> {
+        self.host.backing()
     }
 }

@@ -131,7 +131,7 @@ jobs:
       #
       # A feature list written by hand rots at exactly the speed the manifest
       # changes, and nothing here reads the manifest. What is written below is
-      # the whole of `crates/model/Cargo.toml`'s `[features]` today:
+      # the whole of `crates/models/Cargo.toml`'s `[features]` today:
       #
       #     default = []
       #     serve   = ["dep:image"]
@@ -149,8 +149,8 @@ jobs:
       # layer down, and that shape has already been present here once.
       - name: cargo check (model, both feature configurations)
         run: |
-          cargo check -p model --all-targets
-          cargo check -p model --all-targets --features serve
+          cargo check -p models --all-targets
+          cargo check -p models --all-targets --features serve
 
       # The compiler crates are at zero clippy warnings, so they are the only
       # part of the workspace that can be gated. The rest still carries ~240
@@ -294,7 +294,7 @@ jobs:
       # `--all-features` asks the manifest rather than a list -- which is
       # exactly why the prose could rot without anything going red.
       - name: cargo clippy (model, deny warnings)
-        run: cargo clippy --no-deps --all-targets -p model --all-features -- -D warnings
+        run: cargo clippy --no-deps --all-targets -p models --all-features -- -D warnings
 
       # Same scope, same reason: these crates are rustfmt-clean, the rest of
       # the workspace is not.
@@ -353,7 +353,7 @@ jobs:
         run: |
           cargo fmt --check \
             -p eta-ir -p eta-compiler -p eta-dsl \
-            -p checkpoint -p model -p model-compiler \
+            -p checkpoint -p models -p model-compiler \
             -p worker-api -p client-api -p controller-api \
             -p ids -p waker -p transport \
             -p runtime -p worker \
@@ -557,7 +557,7 @@ jobs:
       # release artifact built with `--features engine-metal`. Every one of
       # them was a step that could not start, and none of them was caught,
       # because the file that claimed to catch them
-      # (`crates/model/tests/every_cfg_names_a_real_feature.rs`, cited in
+      # (`crates/models/tests/every_cfg_names_a_real_feature.rs`, cited in
       # this very workflow) had itself been deleted. The claim outlived the
       # check by some margin, which is the shape every comment here is about.
       #
@@ -618,14 +618,14 @@ jobs:
       # every source file with ZERO covered lines. Not a percentage floor --
       # zero is different in kind, because it means the file did not
       # participate in the test run at all. It earned its place once, on
-      # `crates/model`: three files at exactly 0.00% holding 2,208 uncovered
+      # `crates/models`: three files at exactly 0.00% holding 2,208 uncovered
       # lines, the `emit-cuda` machinery left behind when the commit that
       # retired its binary deleted only the binary. Every static gate here
       # was green on it -- `dead_code` does not fire on `pub` items, and the
       # module audit correctly called the files reachable, from a `pub mod`
       # nobody called.
       #
-      # It then self-retired on "`crates/model/tests` was deleted", printing
+      # It then self-retired on "`crates/models/tests` was deleted", printing
       # one line and exiting zero -- a green step measuring nothing, which is
       # the failure every comment in this file is about. R3 put that
       # directory back (`rows_are_the_traces.rs` and
@@ -659,8 +659,8 @@ jobs:
       # its own surface to point it at.
 
       # `kernel table (every symbol carries its family)` STOOD HERE. It ran
-      # `cargo test -p model --test kernels_table`, and that target went with
-      # the rest of `crates/model/tests` when the suite was retired. A
+      # `cargo test -p models --test kernels_table`, and that target went with
+      # the rest of `crates/models/tests` when the suite was retired. A
       # `--test` naming a target that does not exist is not a skip: cargo
       # fails the step outright, so this line would have turned the whole job
       # red for a file nobody deleted by mistake.
@@ -679,7 +679,7 @@ jobs:
       # run, so the step compiled nothing and the aspect it claimed to cover
       # was covered by no command at all.
       #
-      # `serve` is the surface that actually exists. `crates/model/Cargo.toml`
+      # `serve` is the surface that actually exists. `crates/models/Cargo.toml`
       # declares exactly `default = []` and `serve = ["dep:image"]`, and the
       # gate is one module: `serve::multimodal`, the host-side image and clip
       # decode. `cargo test --workspace` above runs `model` at its defaults,
@@ -691,7 +691,7 @@ jobs:
       # assertions, so what rots in an unrun test is the assertion. Running
       # the aspect is the only thing that reports that.
       - name: model serve aspect (host-side media decode)
-        run: cargo test -p model --features serve
+        run: cargo test -p models --features serve
 
       # engine-cuda is excluded from the two sweeps above because it has no
       # default feature and refuses to build until one of `cuda-12` / `cuda-13`
@@ -838,8 +838,8 @@ jobs:
       # deleted, so it examined five launchers against a 192-row table and
       # reported ZERO UNDECLARED for weeks. A check nobody runs is
       # indistinguishable from a check that passes. (It arrived here paired
-      # with a pure-Rust table test, `-p model --test kernels_table`, which
-      # went with `crates/model/tests` and is recorded higher up in this job.)
+      # with a pure-Rust table test, `-p models --test kernels_table`, which
+      # went with `crates/models/tests` and is recorded higher up in this job.)
       #
       # AND IT IS RED TODAY, on purpose, which the first run of this workflow
       # on a rewrite branch will discover. Not a rot: the host C++ tree the

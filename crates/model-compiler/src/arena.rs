@@ -1015,17 +1015,21 @@ pub fn elem_bytes(dtype: Dtype) -> Option<u64> {
         // is for.
         Dtype::E2m1
         | Dtype::Mxfp4
-        | Dtype::Nvfp4
         | Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32
+        | Dtype::U4g64tiled
+        | Dtype::U2g32
+        | Dtype::U2g64
+        | Dtype::Nvfp4
         | Dtype::U2g16k
         | Dtype::I3g16k
         | Dtype::U4g32k
         | Dtype::U5g32k
         | Dtype::I6g16k
         | Dtype::E4m3row
-        | Dtype::E4m3tile128 => None,
+        | Dtype::E4m3tile128
+        | Dtype::U2g128 => None,
     }
 }
 

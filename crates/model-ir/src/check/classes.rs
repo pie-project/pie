@@ -599,7 +599,12 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::KvAppendShared { .. }
             | Attention::MlaKvAppend { .. }
             | Attention::IndexKvAppend { .. }
-            | Attention::PoolKvAppend { .. } => true,
+            | Attention::PoolKvAppend { .. }
+            // The compressor's rolling state is a slab the shell owns and no
+            // value names — written here, read by the gather two lines down —
+            // so its write is invisible in `outputs` the way the appenders'
+            // and the recurrent mixers' are.
+            | Attention::PoolStateWrite { .. } => true,
             // The recurrent mixers: their sequence cache is a state slab
             // updated IN PLACE, so the fire's write is invisible in `outputs`.
             Attention::SsmCausalConv1d { .. }
@@ -645,7 +650,8 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::PoolBoundaryDecode { .. }
             | Attention::PoolBoundaryPrefill { .. }
             | Attention::PoolGather { .. }
-            | Attention::PoolLse { .. } => false,
+            | Attention::PoolLse { .. }
+            | Attention::PoolLseSelected { .. } => false,
         },
         // The one fused variant says so in its name: it lands k and v in the
         // pages on its way to returning q.

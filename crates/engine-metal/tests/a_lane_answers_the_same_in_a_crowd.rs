@@ -222,7 +222,7 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
 
 /// The lane word the model's own `Classify` computes.
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -327,19 +327,30 @@ fn ready(
         .map(|text| tokenizer.encode(text))
         .collect();
 
-    let trace = model::trace_of(vehicle.sku).expect("the catalog ships this gate's SKU");
+    let trace = models::trace_of(vehicle.sku).expect("the catalog ships this gate's SKU");
     let trace = trace(Platform::Metal);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(vehicle.sku)
-        .expect("the catalog ships an import for the SKU")(&source)
-        .expect("the SKU's import contract fits its own checkpoint");
+    // Read for this shell (§J4c): a family's text may state a `Dtype`
+    // PLACEMENT, and a contract read under a different setup than the trace
+    // above describes different planes. See `four_bit_first_light::ready`.
+    let contract = models::placing_for(Platform::Metal, || {
+        models::import_of(vehicle.sku).expect("the catalog ships an import for the SKU")(&source)
+    })
+    .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
+        // §M-4c, as `serve_smoke` states it: an unstamped snapshot proceeds,
+        // and the deployment's facts are stated honestly all the same.
+        tp_size: 1,
+        precision: models::precision_of(vehicle.sku)
+            .expect("the catalog states this row's precision")
+            .to_string(),
         budget: Budget::new(slots, slots * rows),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 256,
@@ -566,7 +577,8 @@ fn a_long_prefill_says_the_same_thing_beside_a_short_one() {
         .expect("the neighbours are not empty");
     assert!(
         long.len() > 32 && (long.len() + short.len()) / 2 < 32,
-        "this gate is only asking anything if the pair's rows-per-request          ({}) falls under the threshold the lone lane's ({}) is over",
+        "this gate is only asking anything if the pair's rows-per-request ({}) falls under the \
+         threshold the lone lane's ({}) is over",
         (long.len() + short.len()) / 2,
         long.len()
     );

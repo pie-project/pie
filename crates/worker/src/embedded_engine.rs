@@ -165,6 +165,79 @@ fn weight_cache_dir() -> String {
     WEIGHT_CACHE_DIR.get().cloned().unwrap_or_default()
 }
 
+/// **THIS DEPLOYMENT'S SHARED-ADAPTER MOUNT**, installed once before any
+/// engine is created and written into every bootstrap TOML from there
+/// (alto adapter §3.3).
+///
+/// Install-at-bootstrap for the reason [`WEIGHT_CACHE_DIR`] gives: the TOML
+/// writers sit five call layers below the only place holding a parsed
+/// `Config`. There is no derivation beside it — an operator who stated no
+/// `[model] adapter_dir` mounted nothing, and the engines read an absent key
+/// as the feature off rather than as a directory to guess at.
+static ADAPTER_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Install the shared-adapter mount. First writer wins, so a mount a live
+/// engine is already serving cannot move.
+pub fn set_adapter_dir(dir: String) {
+    let _ = ADAPTER_DIR.set(dir);
+}
+
+/// Read back by the two startup-TOML writers, and gated as they are.
+#[cfg(any(
+    feature = "_engine-cuda",
+    all(feature = "engine-metal", target_vendor = "apple"),
+    test
+))]
+fn adapter_dir() -> String {
+    ADAPTER_DIR.get().cloned().unwrap_or_default()
+}
+
+/// Emit `[model] adapter_dir` into an engine's bootstrap TOML, or nothing.
+///
+/// **OMITTED WHEN UNSET RATHER THAN WRITTEN EMPTY**, because the engines read
+/// an empty string as the feature off anyway and a key nobody stated should
+/// not appear in the record of what the launch actually asked for.
+#[cfg(any(
+    feature = "_engine-cuda",
+    all(feature = "engine-metal", target_vendor = "apple"),
+    test
+))]
+fn insert_adapter_dir(model: &mut toml::Table) {
+    let dir = adapter_dir();
+    if dir.is_empty() {
+        return;
+    }
+    insert_str(model, "adapter_dir", dir);
+}
+
+/// **WHERE THIS DEPLOYMENT'S MATERIALIZED WEIGHTS GO, DECIDED ONCE.**
+///
+/// `[model] weight_cache_dir` when the operator wrote one, and
+/// `$PIE_HOME/cache/weights` when they did not. `$PIE_HOME` is this layer's to
+/// know — the engine has never been told it, which is why the old env-var form
+/// fell back to XDG — so the derivation is here and not in the shell.
+///
+/// Under `cache/`, not `models/`. `models/` is the artifact store, and these
+/// are the opposite kind of thing: device bytes for one engine, one TP layout
+/// and one ABI version, rebuilt by a single cold load. Sharing a directory
+/// left `.weights` files sitting in a store that scans for `.zt`.
+///
+/// **TWO CALLERS, ONE ANSWER** (§M wave M-1). `::runtime::boot` installs it
+/// before any engine bootstrap TOML is written, and `pie model import` reads
+/// it to decide whether there is anywhere to prepare INTO. A second
+/// derivation would be a second chance for the two to disagree about where a
+/// hundred gigabytes live.
+#[must_use]
+pub fn resolved_weight_cache_dir(cfg: &crate::config::Config) -> String {
+    if cfg.model.weight_cache_dir.is_empty() {
+        crate::state::weight_cache_dir()
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        cfg.model.weight_cache_dir.clone()
+    }
+}
+
 /// The root every engine-side disk cache derives from: `$PIE_HOME/cache`.
 ///
 /// Location is convention, not configuration -- there is no config field for
@@ -514,6 +587,153 @@ fn cuda_budgets(
     }
 }
 
+/// **PREPARE ONE FRESHLY IMPORTED ARTIFACT'S WEIGHT TIERS** (§M wave M-1:
+/// `.wiki/alto/zt-as-serving-artifact.md`).
+///
+/// `pie model import` calls this once, after it has written a servable `.zt`,
+/// so that the tier artifact §K/§L reads on a warm boot is written HERE
+/// instead of by the first serve. Nothing is served and no engine survives the
+/// call: the whole product is the file left in the weight cache directory,
+/// which is returned so the command can name it.
+///
+/// # What it reads, and why none of it is new
+///
+/// Every number comes off the deployment's own `[model]` table, through the
+/// same doors the serving boot uses and in the same order:
+///
+/// ```text
+///   flavor + options   preflight::{resolve_flavor, build_embedded_options}
+///   the boot document  write_cuda_startup_toml — the file an operator reads
+///   the token budget   cuda_budgets, off the same `[engine] options`
+///   the two weight     ModelConfig::residency — `[model] device_weight_budget`
+///     budgets          and `[model] host_weight_budget`
+///   the cache dir      resolved_weight_cache_dir
+///   the run-ahead      `[runtime] frame_dispatch_depth` (article 8)
+/// ```
+///
+/// There is no second reader anywhere in this function. That matters more
+/// here than anywhere else in the tree: the tier artifact's KEY is a function
+/// of the residency plan the two weight budgets decide, so an import that read
+/// a budget differently from the serve would write a file under a name the
+/// serve never looks up — a hundred gigabytes of disk and no warm boot.
+///
+/// # What it is pointed at
+///
+/// `artifact`, the file the import just wrote — NOT `[model] model`. An
+/// operator importing a model the config does not name yet is the ordinary
+/// case, and preparing whatever the config happens to point at would be a
+/// command doing something nobody asked for.
+///
+/// `[model] sku` is honoured only when the config's model resolves to THIS
+/// file, for the same reason: the key names a row, and a row stated about
+/// another checkpoint is not a statement about this one. Otherwise the SKU is
+/// identified from the checkpoint, which is what an unconfigured serve does.
+///
+/// # Errors
+///
+/// A config whose engine is not the CUDA shell, an artifact that is neither a
+/// `.zt` nor a snapshot directory, a checkpoint no SKU claims, or whatever
+/// the bake and the landing refused. **Every one of them is survivable**: the
+/// import's own product is already on disk and is a good checkpoint.
+///
+/// **WHAT "SURVIVABLE" MEANS HAS NARROWED, THOUGH** (§M-3). It used to mean a
+/// boot with no tier artifact ran the cold path it had always run; there is no
+/// cold path, so a streamed SKU whose prepare failed will not boot at all until
+/// one succeeds. The call still returns an error rather than panicking and the
+/// ordinary post-import caller still exits zero — the artifact it was asked for
+/// exists — but `pie model import --prepare-only` propagates it, because
+/// preparing is the whole of what that invocation was asked to do.
+#[cfg(feature = "_engine-cuda")]
+pub fn prepare_weight_artifact(cfg: &crate::config::Config, artifact: &Path) -> Result<PathBuf> {
+    let m = &cfg.model;
+    validate_snapshot_dir(artifact)?;
+    let flavor = crate::preflight::resolve_flavor(m.engine.kind, &m.name)?;
+    let options = crate::preflight::build_embedded_options(m, flavor)?;
+    // THE `else` IS UNREACHABLE IN A CUDA-ONLY BUILD AND LOAD-BEARING IN ANY
+    // OTHER, exactly as it is in `create_engine_backend_group`.
+    #[allow(
+        irrefutable_let_patterns,
+        reason = "`EngineOptions` has one variant in a CUDA-only build"
+    )]
+    let EngineOptions::CudaNative(opts) = &options else {
+        return Err(anyhow!(
+            "this build prepares weight artifacts for the cuda shell only; \
+             `[model.engine] type` names {:?}",
+            m.engine.kind
+        ));
+    };
+
+    // Installed before the boot document is written, for `load_model_engines`'
+    // reason: the TOML writers read both back out of a `OnceLock`, and
+    // `$PIE_HOME` is this layer's to know.
+    set_cache_dir(
+        crate::state::engine_cache_dir()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let cache_dir = resolved_weight_cache_dir(cfg);
+    set_weight_cache_dir(cache_dir.clone());
+    let cache_dir = PathBuf::from(cache_dir);
+    std::fs::create_dir_all(&cache_dir)
+        .with_context(|| format!("create the weight cache directory {cache_dir:?}"))?;
+
+    // The checkpoint's own config, lifted in one open — what the boot document
+    // carries beside itself. The same call the serving path makes, so an
+    // artifact that cannot answer refuses here rather than at the first serve.
+    let lifted = crate::weights::resolve(&artifact.to_string_lossy())
+        .with_context(|| format!("resolving the artifact {artifact:?}"))?
+        .metadata()
+        .with_context(|| format!("reading the model metadata for {artifact:?}"))?;
+
+    let state_dir = local_engine_state_dir(0, None)?;
+    let toml_path = state_dir.join("engine.toml");
+    write_cuda_startup_toml(
+        &toml_path,
+        opts,
+        &m.weight_dtype,
+        artifact,
+        0,
+        None,
+        &lifted.config,
+    )?;
+    // THE DOCUMENT, not the path to it — see `create_engine_backend` for what
+    // handing over the path cost.
+    let boot_doc = std::fs::read(&toml_path)
+        .with_context(|| format!("read the engine boot config just written to {toml_path:?}"))?;
+
+    let request = ::runtime::engine::load::request_of(
+        stated_sku(m, artifact),
+        artifact,
+        model_ir::Platform::Cuda,
+        cuda_budgets(opts, m.adapters.seats(), m.patch_ceilings()),
+        m.residency(),
+        -1,
+        u8::try_from(cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
+    )?;
+    // The bootstrap directory goes whether the prepare worked or not: it holds
+    // one TOML and one config blob, and a command that exits leaves no engine
+    // behind to read them.
+    let prepared = ::runtime::engine::backend::open::prepare_cuda(&boot_doc, request);
+    remove_launch_state();
+    prepared?;
+    Ok(cache_dir)
+}
+
+/// `[model] sku`, but only when the config is talking about THIS checkpoint.
+///
+/// A row named in the config is a statement about `[model] model`. Applied to
+/// a different file it is not a hint, it is a wrong answer — and one that
+/// would be paid for in a full cold load. `None` identifies instead, which is
+/// what a serve with no `[model] sku` does.
+#[cfg(feature = "_engine-cuda")]
+fn stated_sku<'a>(m: &'a crate::config::ModelConfig, artifact: &Path) -> Option<&'a str> {
+    let sku = m.sku.as_deref()?;
+    let resolved = crate::weights::resolve(&m.model).ok()?;
+    let same = std::fs::canonicalize(resolved.path()).ok()?
+        == std::fs::canonicalize(artifact).ok()?;
+    same.then_some(sku)
+}
+
 /// Hand an engine its model: trace the plan runtime-side, state the ceilings,
 /// and land the checkpoint.
 ///
@@ -542,7 +762,8 @@ fn land(
         // `ModelComponent::Encode` did — it staged the whole 48 GiB
         // checkpoint and died in `cudaMalloc`.
         return Err(anyhow!(
-            "this build loads only the full model; {component:?} needs a traced              plan the catalog does not ship"
+            "this build loads only the full model; {component:?} needs a traced plan the catalog \
+             does not ship"
         ));
     }
     // **THE RUN-AHEAD DEPTH, CROSSING ONCE** (article 8). `[runtime]
@@ -668,6 +889,7 @@ pub(crate) fn write_cuda_startup_toml(
     let mut model = toml::Table::new();
     insert_str(&mut model, "snapshot_dir", path_string(snapshot_dir));
     insert_str(&mut model, "weight_cache_dir", weight_cache_dir());
+    insert_adapter_dir(&mut model);
     write_config_beside(out_path, config, &mut model)?;
     insert_model_id(&mut model, opts.model_id.as_deref());
     insert_str(&mut model, "device", &opts.device);
@@ -785,6 +1007,9 @@ pub(crate) fn write_cuda_startup_toml(
     if let Some(bodies) = opts.bodies {
         insert_bool(&mut engine, "bodies", bodies);
     }
+    if let Some(megabytes) = opts.bodies_mem {
+        insert_int(&mut engine, "bodies_mem", i64::from(megabytes));
+    }
     if let Some(copies) = opts.fallback_copy {
         insert_bool(&mut engine, "fallback_copy", copies);
     }
@@ -840,7 +1065,10 @@ pub(crate) fn write_metal_startup_toml(
 
     let mut model = toml::Table::new();
     insert_str(&mut model, "hf_path", path_string(snapshot_dir));
-    // Same arrangement as the CUDA engine.
+    // Same arrangement as the CUDA engine, and the same key: the mount is one
+    // deployment fact, read by `engine_metal::boot` out of the same
+    // `[model] adapter_dir` the CUDA door reads.
+    insert_adapter_dir(&mut model);
     write_config_beside(out_path, config, &mut model)?;
     insert_model_id(&mut model, options.model_id.as_deref());
     insert_str(&mut model, "backend", &options.device);
@@ -890,6 +1118,18 @@ pub(crate) fn write_metal_startup_toml(
     insert_bool(&mut runtime, "verbose", options.verbose);
     insert_table(&mut doc, "runtime", runtime);
     insert_cache_table(&mut doc);
+
+    // `[metal]`: the device-wide knobs the shell reads out of the boot document
+    // into its `DeviceBoot`, parallel to the CUDA engine's `[engine]` table.
+    // Today that is `gpu_mem_utilization` — the fraction of the wired ceiling
+    // (`recommendedMaxWorkingSetSize`) pie may hold resident, which
+    // `engine_metal::boot::open` reads and `store::accounting` admits against.
+    let mut metal = toml::Table::new();
+    metal.insert(
+        "gpu_mem_utilization".into(),
+        toml::Value::Float(options.gpu_mem_utilization),
+    );
+    insert_table(&mut doc, "metal", metal);
 
     write_toml_table(out_path, doc)
 }
@@ -1411,6 +1651,57 @@ mod tests {
         assert_eq!(val["cache"]["dir"].as_str().unwrap(), "/pie-home/cache");
     }
 
+    /// **THE SHARED-ADAPTER MOUNT REACHES THE ENGINE, OR NOTHING DOES**
+    /// (alto adapter §3.3).
+    ///
+    /// `[model] adapter_dir` is the one key the shells read to decide whether
+    /// a shared bind has a namespace to be in, and a key nobody writes is a
+    /// key nobody can set — the failure `[model] weight_cache_dir` had for a
+    /// whole rewrite, and the one this test exists to prevent for the mount.
+    ///
+    /// NOTE: as `the_startup_toml_carries_the_cache_root`, this installs a
+    /// process-global OnceLock that outlives the test, so every later test in
+    /// this binary sees `[model] adapter_dir` emitted. Nothing asserts its
+    /// absence.
+    #[test]
+    fn the_startup_toml_carries_the_shared_adapter_mount() {
+        set_adapter_dir("/srv/pie/shared".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("engine.toml");
+        let snap = dir.path().join("snapshot");
+        write_cuda_startup_toml(
+            &out,
+            &CudaNativeEngineOptions::default(),
+            DTYPE,
+            &snap,
+            0,
+            None,
+            CONFIG,
+        )
+        .unwrap();
+        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(
+            val["model"]["adapter_dir"].as_str().unwrap(),
+            "/srv/pie/shared",
+            "the mount the operator stated has to arrive at the engine that serves it"
+        );
+
+        // The Metal writer emits the SAME key, because it is one deployment
+        // fact and both shells read it out of `[model] adapter_dir`.
+        #[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
+        {
+            let out = dir.path().join("metal.toml");
+            write_metal_startup_toml(&out, &MetalEngineOptions::default(), &snap, 0, CONFIG)
+                .unwrap();
+            let val: toml::Value =
+                toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+            assert_eq!(
+                val["model"]["adapter_dir"].as_str().unwrap(),
+                "/srv/pie/shared"
+            );
+        }
+    }
+
     /// **THE `[engine]` TABLE, WRITTEN** (alto wave P, article 9). The nine
     /// `PIE_CUDA_*` words the shell used to read are `[engine]` keys now, and a
     /// key nobody writes is a key nobody can set — the same failure
@@ -1450,6 +1741,7 @@ mod tests {
             &CudaNativeEngineOptions {
                 graphs: Some("on".into()),
                 bodies: Some(false),
+                bodies_mem: Some(256),
                 pad: Some(false),
                 side_streams: Some(0),
                 ..CudaNativeEngineOptions::default()
@@ -1459,6 +1751,7 @@ mod tests {
         let engine = &stated["engine"];
         assert_eq!(engine["graphs"].as_str().unwrap(), "on");
         assert_eq!(engine["bodies"].as_bool().unwrap(), false);
+        assert_eq!(engine["bodies_mem"].as_integer().unwrap(), 256);
         assert_eq!(engine["pad"].as_bool().unwrap(), false);
         assert_eq!(engine["side_streams"].as_integer().unwrap(), 0);
         // **AND THE FRACTION IS THERE WITHOUT BEING ASKED FOR** — the one key

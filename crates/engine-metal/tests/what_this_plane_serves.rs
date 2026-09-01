@@ -32,6 +32,19 @@
 //! not to pay — and it would also make `Fault::AdapterWord` unsatisfiable,
 //! because every class would run the arm and no lane could stand outside it.
 //!
+//! **AND THE GUEST DOOR ON TO IT IS OPEN NOW** (lane J). What the paragraph
+//! above described was the MODEL's own correction class, reachable from a
+//! control plane calling `Engine::register_adapter` by id; a guest program
+//! carrying a `lora` sink was refused at bind, because `ModelProfile::has_lora`
+//! answered `false` and `eta_ir::validate` honours that. The sink is consumed
+//! now — read off the launch package at instance bind
+//! (`engine_metal::adapter`), converted into the banks' bf16, landed in a
+//! slot, and stamped on to every lane attached to the instance with the fact
+//! word moved into the correction's window beside it — so the bit is `true`
+//! and `tests/inferlets/lora-probe` runs. The arithmetic is pinned without a
+//! device in `engine_metal::adapter`'s own tests and with one by
+//! `device_floor::the_correction_adds_what_the_host_says_and_leaves_an_unrouted_row_alone`.
+//!
 //! **AND THE TABLE IS ABOUT THE BAKE, NOT ABOUT THE DEVICE.** A row that
 //! bakes with no fatal refusal has cleared the checks this file can make on
 //! a machine with no GPU — the kv probe, the compile, the straddle rule, the
@@ -63,40 +76,135 @@ use model_ir::{Operands, Operation, Platform};
 /// refusal, never to cause one: the refusal itself comes from the entry, at
 /// the node, with the entry's own name on it.
 const REFUSED: &[&str] = &[
-    // `kernels_metal::elemwise::hc` — every entry.
-    "elementwise.hc_expand",
-    "elementwise.hc_rmsnorm_f32",
-    "elementwise.hc_gates",
-    "elementwise.hc_fold",
+    // `kernels_metal::elemwise::hc` — NOTHING. The hyper-connection family is
+    // ported whole (`elemwise/hc.metal`): the expansion that tiles the
+    // embedding across the stream fan, the weightless RMS norm that widens the
+    // wide row to f32, the gate split whose combiner is projected onto the
+    // Birkhoff polytope by Sinkhorn-Knopp, and the fold that mixes the
+    // sublayer's output back into the streams. `engine-metal/tests/hc_on_device.rs`
+    // measures all four on the card against a host fp32 reference — the gate
+    // matrices at fp32 epsilon, the collapse and the fold at half a bf16
+    // quantum — and pins the Sinkhorn loop bound (`sinkhorn - 1` passes after
+    // the seed) at the low counts where it is still observable, since by the
+    // shipped twenty the iteration has converged and the off-by-one is
+    // invisible. What is still deferred is the DYNAMIC mix: the op hands
+    // `normed` where the reference hands `rmsnorm(streams) @ hc_fn`, and both
+    // shells read the leading `2M + M²` floats at that stride because no plane
+    // fires the projection. That is one interned organ, the same one on both
+    // backends, and not a kernel gap.
     // `kernels_metal::elemwise::norm`, one entry.
     "elementwise.res_blend",
     // `kernels_metal::collective` — every entry.
     "collective.all_reduce",
     "collective.all_gather",
     "collective.reduce_scatter",
-    // `kernels_metal::attn::mla` — every entry.
-    "attention.mla_plan",
-    "attention.mla_latents",
-    "attention.mla_latents_rope",
-    "attention.mla_split_q_b",
-    "attention.mla_absorb_q",
-    "attention.mla_absorb_out",
-    "attention.mla_kv_append",
-    "attention.mla_decode",
-    "attention.mla_prefill",
-    "attention.mla_decode_selected",
-    "attention.mla_prefill_selected",
-    // `kernels_metal::attn::index` — every entry.
-    "attention.index_layernorm_rope",
-    "attention.index_rope",
-    "attention.index_topk",
-    "attention.index_kv_append",
-    // `kernels_metal::attn::pool` — every entry.
-    "attention.pool_boundary_decode",
-    "attention.pool_boundary_prefill",
-    "attention.pool_gather",
-    "attention.pool_kv_append",
-    "attention.pool_lse",
+    // `kernels_metal::attn::mla` — NOTHING. The absorbed latent family is
+    // ported whole (`attn/mla.metal`): the plan (empty on this plane, by the
+    // seam the entry states), the latent split and its roped twin, the q
+    // split, the q-absorb, the paged latent appender, the naive simd flash
+    // engine — which serves BOTH the dense readers and the sparse ones, the
+    // same body handed the NSA index row instead of the causal range — and,
+    // last of the family, the output-absorb that maps the latent reading back
+    // to value space. That one was deferred over WHERE `kv_b`'s value planes
+    // begin; the answer is `nope·rank` elements in (the CUDA entry's
+    // `2·nope·rank` is a byte add), measured end to end against the
+    // unabsorbed attention by `engine-metal/tests/mla_on_device.rs`.
+    // `kernels_metal::attn::index` — NOTHING. The NSA lightning indexer is
+    // ported (`attn/index.metal`): the layernorm+rope, the per-head query
+    // rotation, the paged top-k selection, and the append that routes to the
+    // mla latent writer with a null rope plane. `attention.index_topk` can
+    // still answer `Unsupported`, but only for a load whose trace names no
+    // `attention.index_topk` and therefore reserved no score slab — which is
+    // not a state any plan naming the op can reach, so it is no census row.
+    //
+    // **AND THE SELECTION'S KEY STRIDE IS THIS PLANE'S ALONE.** The shader
+    // takes a `ratio`: `1` reads one key per token at its own cell, which is
+    // glm_5's indexer and is `index.cuh` unchanged; a compressor's ratio
+    // reads one key per COMPRESSED BLOCK at `(c+1)*ratio - 1`, which is
+    // dsv4-flash's, whose index keys are its own compressor's pooled
+    // entries. `index.cuh` has no such parameter, so the CUDA arm serves
+    // `ratio == 1` and refuses the rest by name — a refusal on the OTHER
+    // plane, and so no row of this census.
+    // `kernels_metal::attn::pool` — NOTHING. The compressor's pool is ported
+    // whole (`attn/pool.metal`): the two boundary marks, the gated softmax
+    // pool, the store into the compressed cache, and the flash lse over the
+    // compressed entries. The gather was the last of the five to come off
+    // this list, and it came off over its SLABS: `state_kv` and `state_score`
+    // are addressed by the source pool's paged slot rather than by a fire
+    // row, so `crate::scratch` reserves them at the paging's cell ceiling the
+    // way it reserves the indexer's score slab, and the dispatch arm binds
+    // them. `engine-metal/tests/pool_on_device.rs` measures the gate on the
+    // card against a host fp32 reference at both compressor widths and with
+    // the position plane on and off.
+    //
+    // **AND THE SEAM THAT WAS LEFT IS CLOSED.** This entry used to say that
+    // nothing WROTE either state slab — dsv4's model text interned the
+    // compressor, so the projections that fill the state had no IR seat and
+    // the plane the gather pooled was zero. `attention.pool_state_write` is
+    // that writer and `ape` took an operand of its own, so the compressor
+    // reads its own planes now; `pool_on_device`'s round-trip gate measures
+    // the pair from the other end. The pool grew a SELECTED reader beside
+    // the dense one (`pool_lse_selected_paged`, the NSA fine branch), served
+    // here and refused by name on CUDA, which `pool.cuh` has no twin of —
+    // again a refusal on the other plane and so no row of this census.
+    // `engine-metal/tests/nsa_selected_on_device.rs` runs the real ranking
+    // into the real reader and folds the result through `merge_lse` and
+    // `attention.sink`.
+    //
+    // **THE QWEN4 N-GRAM HASHER — NOTHING, AND THIS ENTRY IS WHERE THE PAIR
+    // USED TO BE.** `attention.ple_ngram_ids` and its chunked twin were on
+    // this list for exactly one wave: they were added when the census learned
+    // it had been calling every `qwen38-flash-*` row "clears the bake" while
+    // no fire of one could reach its second layer, and they came off when
+    // `attn/ple.metal` landed. Both arms are ported organ for organ off
+    // `kernels-cuda/kernels/attn/ple.cuh` — the seed-derived odd multipliers,
+    // the xor fold over the window newest-first, the per-head modulus and
+    // offset, and the eos-segmentation rule that masks every id behind a
+    // nearer eos. `engine-metal/tests/ple_conv_on_device.rs` measures both on
+    // the card against `kernels_metal::attn::ple::reference`, EXACTLY: a hash
+    // that is off by one is a different embedding row, so there is no band it
+    // could be inside.
+    //
+    // **THE ONE THING THAT MOVED TO GET THEM HERE IS WHERE THE CONSTANTS
+    // LIVE.** The CUDA entry hands its `PleHash` aggregate across the launch
+    // ABI by value (`ArgValue::Bytes`); this plane's `ArgValue` has no
+    // by-value blob seat, and growing one would have to cross `icb.rs`'s
+    // eight-byte scalar arena and `record.rs`'s `Copy` `Arg` for one op. So
+    // `crate::scratch` lays a `u64` plane per distinct hashing and writes it
+    // ONCE at load — the only role in that file the host touches, and it
+    // touches it before the first command buffer exists.
+    //
+    // **AND THE OTHER HALF OF THE SAME GAP IS GONE TOO, THOUGH IT WAS NEVER
+    // NAMEABLE HERE.** The PLE's local mix is a
+    // `attention.ssm_causal_conv1d` DILATED by `ngram_size` (3), and this
+    // plane refused that op for `dilation: 2..` while serving it at 1. A
+    // refusal by PARAMETER is not a name, so it could never have gone on this
+    // list; it is stated in `qwen4_two_bit_first_light.rs`, where a trace's
+    // own nodes can be asked for their dilation, and that is where the flip
+    // is recorded.
+    //
+    // **THE QWEN4 GATED-RESIDUAL FAMILY — NOTHING, AND THIS ENTRY IS THE
+    // CENSUS ADMITTING WHAT IT MISSED.** Opening the hasher's two doors did
+    // not make a `qwen38-flash-*` fire; SEVEN more points refused behind them,
+    // and this list named none of them while the row's line above read "clears
+    // the bake" — because a bake is a compile and every one of these refuses
+    // at the FIRE. Five were `dispatch/elemwise.rs`'s own block-refusal
+    // (`rmsnorm_grouped_plus_one`, `silu_scaled`, `hc_mix`, `hc_inject`,
+    // `ple_gate`), one was `dispatch/layout.rs`'s (`embed_concat`), and one —
+    // `elementwise.rmsnorm_gated` at `sigmoid` — refused by ENUM ARM, which
+    // like a dilation is not a name and could never have appeared here.
+    //
+    // All seven serve now, and the five that are new arithmetic are measured
+    // on the card by `engine-metal/tests/qwen4_gated_residual_on_device.rs`
+    // against `kernels_metal::elemwise::hc::reference`, each held apart from
+    // the plausible wrong port beside it. The gather is measured exactly.
+    //
+    // **WHAT THIS COSTS THE LIST IS NOT AN ENTRY BUT A CAVEAT**, and it is the
+    // one worth carrying: this table's "clears the bake" is a statement about
+    // what BAKES, and the only row on it whose fire is a claim is [`SERVED`].
+    // A refusal reachable only at the first fire of a model nobody has fired
+    // is invisible here by construction, and the file that catches it is a
+    // first light and not a census.
 ];
 
 /// The SKU this shell's device gates are written over, and the one row of
@@ -145,7 +253,7 @@ fn the_census_of_what_this_plane_can_bake() {
     };
     let mut clears = Vec::new();
     let mut report = String::new();
-    for (sku, _tp, trace, _classify) in model::catalog() {
+    for (sku, _tp, trace, _classify) in models::catalog() {
         let trace = trace(Platform::Metal);
         let probed = engine_metal::store::kv::probe(&trace);
         let (fatal, guarded) = refusals(&trace);
@@ -196,7 +304,7 @@ fn every_refused_name_is_one_the_ir_can_actually_spell() {
     // for a name no model text can produce is a stale entry — the list would
     // then be documenting a kernel plane that has moved on.
     let mut spoken: BTreeSet<&'static str> = BTreeSet::new();
-    for (_sku, _tp, trace, _classify) in model::catalog() {
+    for (_sku, _tp, trace, _classify) in models::catalog() {
         let trace = trace(Platform::Metal);
         for node in &trace.nodes {
             spoken.insert(op_name(&node.op));
@@ -213,10 +321,11 @@ fn every_refused_name_is_one_the_ir_can_actually_spell() {
         unreachable.len()
     );
     // Not an assertion that the list is empty: a stub may legitimately exist
-    // for an op no shipped model text uses yet (`elementwise.hc_*` is the standing
-    // example). The claim is the other one — that nothing in the list is a
-    // NAME the IR cannot spell, which would mean the entry was typed rather
-    // than read.
+    // for an op no shipped model text uses yet. (`elementwise.hc_*` was the
+    // standing example, and is now gone from the list entirely — the family is
+    // served, and dsv4's text names every one of its four ops.) The claim is
+    // the other one — that nothing in the list is a NAME the IR cannot spell,
+    // which would mean the entry was typed rather than read.
     for name in REFUSED {
         assert!(
             name.contains('.'),
@@ -243,7 +352,7 @@ fn every_refused_name_is_one_the_ir_can_actually_spell() {
 fn the_correction_is_guarded_and_never_always() {
     let mut seen = 0usize;
     let mut report = String::new();
-    for (sku, _tp, trace, _classify) in model::catalog() {
+    for (sku, _tp, trace, _classify) in models::catalog() {
         let trace = trace(Platform::Metal);
         let corrections: Vec<&model_ir::Guard> = trace
             .nodes
@@ -495,5 +604,124 @@ fn every_boundary_the_contract_has_is_answered_one_way_or_the_other() {
     assert_eq!(
         served, 1,
         "this plane serves exactly one boundary, and the ledger says otherwise"
+    );
+}
+
+/// **EVERY FIRST-PARTY SINK, AND WHY THIS PLANE HAS NOWHERE TO PUT IT.**
+///
+/// The sibling above writes down the BOUNDARIES this plane answers; this one
+/// writes down the SINKS the eta vocabulary reserves, and multiplies the two.
+/// The product is the whole finding: for a sink to be servable here there must
+/// be a stage that is both legal for its scope AND reachable at a boundary this
+/// plane serves, and for every name in [`eta_ir::registry::KNOWN_SINKS`] that
+/// intersection is EMPTY.
+///
+/// ```text
+/// scope                 legal stages (eta_ir::validate.rs:662-666)
+/// PassWide              Prologue
+/// Attention             Prologue, OnAttnProj
+///
+/// this plane's boundaries (the sibling test's ledger)
+/// Epilogue              SERVED   -> runs a program's ops at Stage::Epilogue
+/// Prologue              REFUSED by name at `serve::prepare` — the fire's
+///                                inputs are staged on the host, before a
+///                                command buffer exists
+/// OnAttnProj/OnAttn     NOT A BOUNDARY AT ALL — design.md §9 abolished the
+///                                third boundary; `eta_exec::plan` refuses a
+///                                per-layer tap by name
+/// ```
+///
+/// **SO `has_attn_page_mask: false` IS A STRUCTURAL FACT, NOT AN UNBUILT
+/// FEATURE** (`api.rs`'s own note beside the bit). `attn_page_mask` is
+/// `SinkScope::Attention`, which is legal at `Prologue | OnAttnProj` and
+/// ILLEGAL at `Epilogue` — the one stage this plane can run a guest program
+/// at. No amount of engine work inside the current boundary vocabulary opens
+/// it: what would have to move first is the constitution, and this test is
+/// where that shows up. A lane that flips the bit without adding a boundary
+/// fails here rather than shipping a sink nothing consumes.
+///
+/// The second, independent refusal is written down beside it:
+/// [`eta_exec::Boundaries::METAL`] does not carry the name either, so even a
+/// well-placed sink would be refused when the launch package is adopted
+/// (`engine_metal::program::Programs::register` -> `Fault::Fire`).
+///
+/// Host-only: reading two const tables and a match touches no device.
+#[test]
+fn no_first_party_sink_has_a_stage_this_plane_can_run_it_at() {
+    use eta_ir::registry::{KNOWN_SINKS, SinkScope, Stage};
+
+    // The one stage a guest program's ops run at here, straight off the
+    // boundary ledger the sibling test pins: `Epilogue` is served and it is
+    // the only one.
+    //
+    // **AND `lora` IS IN `Boundaries::METAL` WITHOUT CONTRADICTING THAT**
+    // (lane J). This ledger is about sinks a guest program's ops are RUN for,
+    // and a `sink_call` is never run by anybody: `eta_exec::op`'s arm for it
+    // is `Ok(())` on both planes. The adapter sink's effect is landed on the
+    // HOST at instance bind — `engine_metal::adapter::sink_of` reads its
+    // channels off the launch package and `planes_of` converts the seeded
+    // cells into the banks' bf16 — so admitting it is a claim about what this
+    // backend CONSUMES, which is the claim `ModelProfile::has_lora` makes at
+    // the other door. `servable` below stays empty because the question it
+    // asks is unchanged: no first-party sink has a stage this plane
+    // INTERPRETS it at, and `lora` does not need one.
+    const SERVED_STAGES: &[Stage] = &[Stage::Epilogue];
+
+    assert!(
+        !KNOWN_SINKS.is_empty(),
+        "the first-party sink table is empty, so this ledger is about nothing"
+    );
+
+    let mut report = String::new();
+    let mut servable = Vec::new();
+    for (name, scope) in KNOWN_SINKS {
+        // The precedence rule, restated from `eta_ir::validate`'s own match:
+        // a sink must PRECEDE the point that consumes its effect.
+        let legal: &[Stage] = match scope {
+            SinkScope::PassWide => &[Stage::Prologue],
+            SinkScope::Attention => &[Stage::Prologue, Stage::OnAttnProj],
+        };
+        let reachable: Vec<Stage> = legal
+            .iter()
+            .copied()
+            .filter(|s| SERVED_STAGES.contains(s))
+            .collect();
+        let admitted = eta_exec::Boundaries::METAL.sink_calls.contains(name);
+        if !reachable.is_empty() {
+            servable.push(*name);
+        }
+        report.push_str(&format!(
+            "  {name:<20} {:<10} legal at {legal:?}; reachable here {reachable:?}; \
+             in Boundaries::METAL {admitted}\n",
+            format!("{scope:?}")
+        ));
+    }
+    println!("the first-party sinks, against this plane's one boundary:\n{report}");
+
+    assert!(
+        servable.is_empty(),
+        "these first-party sinks now have a stage this plane can run them at, so the \
+         boundary ledger moved and the capability bits beside them must be revisited: \
+         {servable:?}"
+    );
+
+    // The named one, stated on its own so the failure reads as the finding
+    // rather than as an arithmetic surprise.
+    let page_mask = KNOWN_SINKS
+        .iter()
+        .find(|(n, _)| *n == "attn_page_mask")
+        .expect("`attn_page_mask` is a first-party sink name and left the table");
+    assert_eq!(
+        page_mask.1,
+        SinkScope::Attention,
+        "`attn_page_mask` changed scope; the reason this plane cannot serve it is that \
+         `Attention` excludes the epilogue, so a scope change reopens the question"
+    );
+    assert!(
+        !eta_exec::Boundaries::METAL
+            .sink_calls
+            .contains(&"attn_page_mask"),
+        "`Boundaries::METAL` admits `attn_page_mask`, but no stage this plane runs a \
+         guest program at is legal for an `Attention`-scoped sink"
     );
 }

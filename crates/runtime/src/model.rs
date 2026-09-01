@@ -10,11 +10,11 @@
 //!
 //! # What M18 sent over the wall
 //!
-//! `model::serve` was that crate's answer to four serving questions, and this
+//! `models::serve` was that crate's answer to four serving questions, and this
 //! runtime plus `worker` were its only readers. M18 deleted it whole. Two of
 //! the four are still `model`'s to answer and are asked through its own doors
-//! — [`::model::template::template_of`] writes a turn, and the decoders that
-//! read the tokens back are `model::template` re-exports. The other two are
+//! — [`models::template::template_of`] writes a turn, and the decoders that
+//! read the tokens back are `models::template` re-exports. The other two are
 //! HERE, because a serving fabric is the party that asks them:
 //!
 //! * [`ROWS`], the `(layers, vocab, arch)` a sampler, the ETA lowering and
@@ -28,7 +28,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 
-use ::model::template::Instruct;
+use models::template::Instruct;
 use tokenizer::Tokenizer;
 
 /// The single model this runtime serves. Set once at bootstrap.
@@ -44,7 +44,7 @@ static MODEL: OnceLock<Arc<Model>> = OnceLock::new();
 /// verbatim, and — for an artifact, absent for a snapshot — the compiled
 /// tokenizer as the named objects that make up a `pie.tokenizer/1`.
 ///
-/// It was `model::serve::ModelMetadata`, six lines with no method on it, and
+/// It was `models::serve::ModelMetadata`, six lines with no method on it, and
 /// it names nothing `model` knows: not a family, not a plan, not a load
 /// contract. It is the shape one process hands another across the boot
 /// bundle, so it is stated where that bundle is defined.
@@ -80,8 +80,8 @@ pub struct ModelMetadata {
 ///
 /// `model/tests/rows_are_the_traces.rs` held `layers` and `vocab` equal to
 /// what the row's own trace says, which is what made them a measurement
-/// rather than a claim. That test died with `model::serve` and with
-/// `model::deployment`, and this crate cannot restate it: reading a plan
+/// rather than a claim. That test died with `models::serve` and with
+/// `models::deployment`, and this crate cannot restate it: reading a plan
 /// means linking `model-dsl` and tracing at test time, which is a dependency
 /// this crate does not have and a port this milestone is not. So the numbers
 /// below are the ones the pin last held, and re-establishing the pin — here,
@@ -93,9 +93,9 @@ pub struct ModelMetadata {
 /// which is a different number from a different party. A column with no
 /// reader is a fact this table cannot be held to.
 pub struct Row {
-    /// The SKU — a `::model::catalog()` row name, and the id every part of
+    /// The SKU — a `models::catalog()` row name, and the id every part of
     /// the tree spells. The engine identifies a checkpoint against
-    /// `::model::imports()` and reports the SKU it matched; this is that
+    /// `models::imports()` and reports the SKU it matched; this is that
     /// string.
     pub id: &'static str,
     /// Transformer layers in the tower.
@@ -114,11 +114,11 @@ pub struct Row {
     pub arch: &'static str,
 }
 
-/// Every SKU this build can serve, in `::model::catalog()` order.
+/// Every SKU this build can serve, in `models::catalog()` order.
 ///
 /// One row per catalog entry, keyed by the SKU — which is the only id space
 /// in the tree. The chat template is NOT a column: it is
-/// [`::model::template::template_of`], keyed by the same string, so the two
+/// [`models::template::template_of`], keyed by the same string, so the two
 /// tables cannot disagree about which model a build is formatting turns for.
 pub const ROWS: &[Row] = &[
     Row {
@@ -130,6 +130,22 @@ pub const ROWS: &[Row] = &[
     Row {
         id: "dsv4-base-bf16-kv-bf16-tp2",
         layers: 6,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    Row {
+        id: "dsv4-flash-bf16-kv-bf16",
+        layers: 43,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    // The mini DQ snapshot: FIVE layers, because that is what the artifact
+    // ships (`num_hidden_layers: 5` — the original 0, 1, 2, 3 and 42,
+    // renumbered), over the same 129 280-token vocabulary and the same
+    // `model_type: deepseek_v4` a front-end dispatches on.
+    Row {
+        id: "dsv4-flash-mlxu2-kv-bf16",
+        layers: 5,
         vocab: 129_280,
         arch: "deepseek_v4",
     },
@@ -157,6 +173,21 @@ pub const ROWS: &[Row] = &[
         vocab: 262_144,
         arch: "gemma4",
     },
+    // **THE `-vision-` U4 ROWS, WHICH THE CATALOG HAS AND THIS TABLE DID NOT.**
+    // `the_catalog_and_the_serving_table_are_the_same_ids` was red before this
+    // landed: the vision lane added these SKUs to `::model`'s catalog and not
+    // here, so an engine could load one and this runtime could not name it —
+    // `pie serve` refused at bootstrap with "which this build's model catalog
+    // does not contain", which is a packaging gap wearing an engine's error.
+    // The numbers are not new measurements: a `-vision-mlxu4-` row is its
+    // already-listed twin's trunk, and neither the quantization nor the tower
+    // moves `layers`, `vocab` or `arch`.
+    Row {
+        id: "gemma4-26b-a4b-vision-mlxu4-kv-bf16",
+        layers: 30,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
     Row {
         id: "gemma4-31b-bf16-kv-bf16",
         layers: 60,
@@ -167,6 +198,12 @@ pub const ROWS: &[Row] = &[
     // mlxu4 rows below for the argument).
     Row {
         id: "gemma4-31b-mlxu4-kv-bf16",
+        layers: 60,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
+    Row {
+        id: "gemma4-31b-vision-mlxu4-kv-bf16",
         layers: 60,
         vocab: 262_144,
         arch: "gemma4",
@@ -228,7 +265,7 @@ pub const ROWS: &[Row] = &[
         arch: "kimi_k3",
     },
     // The one shipping SKU whose checkpoint publishes a draft head (palo C3).
-    // FIRST among the qwen rows, as it is first in `::model::catalog()` — this
+    // FIRST among the qwen rows, as it is first in `models::catalog()` — this
     // table is that one in order, and `the_catalog_and_the_serving_table_are_the_same_ids`
     // is what says so. `arch` is `qwen3_5` because that is what the SKU IS: a
     // qwen3_5 tower with fifteen `mtp.*` tensors on the end, not one trunk op
@@ -266,6 +303,17 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // **THE 35B MIXTURE, OFF ITS OWN CONFIG AND NOT A GUESS.** The last three
+    // catalog ids this table could not name. The 4-bit artifact's own
+    // `text_config` reads `num_hidden_layers: 40, vocab_size: 248320` — the
+    // qwen35-a3b geometry exactly, which is what the SKU is: the 3.6 mixture
+    // in the 3.5 shape, `architectures: Qwen3_5MoeForConditionalGeneration`.
+    Row {
+        id: "qwen36-35b-a3b-mlxu4-kv-bf16",
+        layers: 40,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
     Row {
         id: "qwen35-d0.8b-mlxu4-kv-bf16",
         layers: 24,
@@ -284,6 +332,32 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // The qwen4 hybrid: numbers read off `Model::flash`'s own Dims (the model
+    // text states its geometry; no checkpoint lives on this box to disagree),
+    // and the arch is the checkpoint's `model_type: qwen4_exp` — a new label
+    // because the family is one, not a 3.5 reading of a hybrid trace.
+    Row {
+        id: "qwen38-flash-mlxu4-kv-bf16",
+        layers: 48,
+        vocab: 248_320,
+        arch: "qwen4_exp",
+    },
+    Row {
+        id: "qwen38-flash-bf16-kv-bf16",
+        layers: 48,
+        vocab: 248_320,
+        arch: "qwen4_exp",
+    },
+    // The mini 2-bit snapshot: FOUR layers, because that is what the artifact
+    // ships (`num_hidden_layers: 4`, `layer_types` linear/linear/linear/full),
+    // over the same 248 320-token vocabulary and the same `model_type:
+    // qwen4_exp` a front-end dispatches on.
+    Row {
+        id: "qwen38-flash-mlxu2-kv-bf16",
+        layers: 4,
+        vocab: 248_320,
+        arch: "qwen4_exp",
+    },
     Row {
         id: "qwen35-d3b-bf16-kv-bf16",
         layers: 24,
@@ -301,7 +375,7 @@ pub const ROWS: &[Row] = &[
     // architecture a front-end dispatches on — and a draft head changes none
     // of them: it is a second readout of the same twenty-four layers, not a
     // second model. What makes the row necessary is the id space, which this
-    // table and `::model::catalog()` share by the test below: a catalog SKU
+    // table and `models::catalog()` share by the test below: a catalog SKU
     // with no serving row is a model an engine can load and this runtime
     // cannot name, and that is exactly the refusal an overlay artifact hit.
     // The M-1 and M-2 rows. Every number is the TRUNK's, for the eagle row's
@@ -322,13 +396,31 @@ pub const ROWS: &[Row] = &[
         arch: "qwen3_5",
     },
     Row {
+        id: "qwen35-d0.8b-vision-mlxu4-kv-bf16",
+        layers: 24,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
         id: "qwen36-27b-vision-bf16-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
     },
     Row {
+        id: "qwen36-27b-vision-mlxu4-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
         id: "qwen38-27b-vision-bf16-kv-bf16",
+        layers: 64,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    Row {
+        id: "qwen38-27b-vision-mlxu4-kv-bf16",
         layers: 64,
         vocab: 248_320,
         arch: "qwen3_5",
@@ -476,14 +568,14 @@ pub fn register(
     // `qwen38` row pins the seven audio specials only a 3.8 tokenizer holds,
     // so a 3.6 artifact deployed under the 3.8 SKU refuses at boot instead
     // of serving bytes under a reading they were never trained for.
-    match ::model::tokenizer::contract_of(row.id) {
+    match models::tokenizer::contract_of(row.id) {
         Some(contract) => contract.verify(&tokenizer).map_err(|fault| {
             anyhow!("`{}` refuses this artifact's tokenizer: {fault}", row.id)
         })?,
         None => {
             return Err(anyhow!(
                 "this build serves {:?} but ships no tokenizer contract for \
-                 it; `model::tokenizer::contracts()` has no row under that \
+                 it; `models::tokenizer::contracts()` has no row under that \
                  SKU",
                 row.id
             ));
@@ -506,18 +598,18 @@ pub fn register(
     // the first token rather than after a thousand plausible ones.
     //
     // The template is `model`'s to state and this crate's table does not
-    // restate it — `::model::template::templates()` is keyed by the SAME
+    // restate it — `models::template::templates()` is keyed by the SAME
     // string that answered the two numbers, which is the property worth
     // having: a build cannot size its sampler from one model and format its
     // prompts for another. A SKU with no template row is a coverage hole in
     // `model`'s own `every_sku_ships_whole`, and it is named here rather than
     // answered with ChatML.
-    let instruct = match ::model::template::template_of(row.id) {
+    let instruct = match models::template::template_of(row.id) {
         Some(make) => make(tokenizer.clone()),
         None => {
             return Err(anyhow!(
                 "this build serves {:?} but ships no chat template for it; \
-                 `model::template::templates()` has no row under that SKU",
+                 `models::template::templates()` has no row under that SKU",
                 row.id
             ));
         }
@@ -527,7 +619,7 @@ pub fn register(
     // fallback: word 0 is the all-false class, so a runtime that could not
     // find its SKU's classifier would not fail — it would fire every decode
     // lane through the prefill arm and return plausible garbage.
-    let classify = ::model::classify_of(row.id).ok_or_else(|| {
+    let classify = models::classify_of(row.id).ok_or_else(|| {
         anyhow!(
             "this build serves {:?} but its model catalog states no classifier \
              for it; a lane's fact word cannot be computed",
@@ -587,7 +679,7 @@ pub fn media_pad() -> Option<u32> {
         // article 8 forbids, and this is what a disagreement between them
         // costs — the orphan-run scan looking for a token no span is ever
         // written with, on the one model where it matters.
-        let spelling = ::model::media::vision_front_end(arch)
+        let spelling = models::media::vision_front_end(arch)
             .map(|fe| fe.delimiters().placeholder)
             .or_else(|| multimodal::audio_arch_supported(arch).then(multimodal::audio_placeholder))?;
         match m.tokenize(spelling)[..] {
@@ -622,7 +714,7 @@ pub struct Model {
     /// and a build that classified its lanes for one model while tracing
     /// another would compose every fire out of windows the plan does not
     /// have. See [`Model::word`].
-    classify: ::model::ClassifyFn,
+    classify: models::ClassifyFn,
     kv_page_size: u32,
     /// Recurrent-state (working-set) capabilities surfaced via model.wit
     /// (`rs-state-size`/`rs-buffer-page-size`/`rs-fold-granularity`). All
@@ -873,7 +965,7 @@ impl Model {
         media: bool,
     ) -> u64 {
         (self.classify)(
-            &::model::Request::new(query_len, custom_mask)
+            &models::Request::new(query_len, custom_mask)
                 .adapted(adapter)
                 .drafting(drafts)
                 .capturing_scores(captures_scores)
@@ -944,8 +1036,8 @@ mod tests {
             .collect();
         assert!(!tower_skus.is_empty(), "the catalog has no tower models");
         for sku in tower_skus {
-            let classify = ::model::classify_of(sku).expect("every row has a classify");
-            let plain = ::model::Request::new(7, false);
+            let classify = models::classify_of(sku).expect("every row has a classify");
+            let plain = models::Request::new(7, false);
             let text = classify(&plain);
             let imaged = classify(&plain.clone().with_media(true));
             assert_ne!(
@@ -961,8 +1053,8 @@ mod tests {
     #[test]
     fn a_text_only_lane_is_the_word_it_always_was() {
         for sku in ROWS.iter().map(|r| r.id) {
-            let classify = ::model::classify_of(sku).expect("every row has a classify");
-            let request = ::model::Request::new(3, false)
+            let classify = models::classify_of(sku).expect("every row has a classify");
+            let request = models::Request::new(3, false)
                 .adapted(false)
                 .drafting(false)
                 .capturing_scores(false);
@@ -1000,7 +1092,7 @@ mod tests {
     /// numbers for a model nothing traces.
     #[test]
     fn the_catalog_and_the_serving_table_are_the_same_ids() {
-        let mut catalog: Vec<&str> = ::model::catalog().into_iter().map(|(id, ..)| id).collect();
+        let mut catalog: Vec<&str> = models::catalog().into_iter().map(|(id, ..)| id).collect();
         let mut serving = ids();
         catalog.sort_unstable();
         serving.sort_unstable();
@@ -1016,7 +1108,7 @@ mod tests {
     fn every_serving_row_ships_a_chat_template() {
         for r in ROWS {
             assert!(
-                ::model::template::template_of(r.id).is_some(),
+                models::template::template_of(r.id).is_some(),
                 "`{}` is a serving row with no chat template",
                 r.id
             );
@@ -1027,7 +1119,7 @@ mod tests {
     fn every_serving_row_ships_a_tokenizer_contract() {
         for r in ROWS {
             assert!(
-                ::model::tokenizer::contract_of(r.id).is_some(),
+                models::tokenizer::contract_of(r.id).is_some(),
                 "`{}` is a serving row with no tokenizer contract",
                 r.id
             );

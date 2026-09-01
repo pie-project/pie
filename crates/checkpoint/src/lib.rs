@@ -45,7 +45,13 @@ pub mod executor;
 pub mod extent;
 pub mod file;
 pub mod plan;
+/// The `pie.serving/1` format layer: the definitions a serving artifact's
+/// reader and its writer both spell their agreement in. Deliberately outside
+/// [`file`], because it touches nothing.
+pub mod serving;
 mod term;
+
+pub use term::spec_of_term;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 pub mod types;

@@ -483,7 +483,7 @@ mod tests {
         // op that carves it, and the launches restate their share. Reading
         // both here is what keeps a pool's shape and a model's text from being
         // two opinions.
-        let trace = model::trace_of("qwen35-d0.8b-bf16-kv-bf16")
+        let trace = models::trace_of("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships the smoke's SKU");
         let plan = trace(model_dsl::Platform::Cuda);
         let facts = probe(&plan).expect("a hybrid SKU's caches read");

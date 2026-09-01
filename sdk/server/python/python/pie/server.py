@@ -30,6 +30,8 @@ import asyncio
 import copy
 import contextlib
 import os
+import sys
+import time
 import shutil
 import socket
 import tempfile
@@ -140,10 +142,24 @@ class Server:
 
         try:
             from pie import _engine  # the pyo3 module
-        except ImportError:
+        except ImportError as error:
             # No in-process engine for this build (e.g. the Metal driver is
             # linked into the `pie` binary and ships no maturin extension).
             # Drive the CLI instead so the same `Server` API keeps working.
+            #
+            # **AND SAY SO, LOUDLY.** This fallback is silent no longer: it
+            # changes WHICH BUILD serves every request, and a `maturin develop`
+            # that appears to succeed can leave an `_engine.so` that does not
+            # `dlopen` -- after which the suite runs against whatever `pie`
+            # binary is lying in `target/`, however old. That cost a whole
+            # curated census once: the wheel was rebuilt from a fixed tree, the
+            # extension failed to load, and a `target/release/pie` from an hour
+            # earlier answered every gate with the pre-fix engine.
+            print(
+                f"pie.server: the in-process engine did not load ({error}); "
+                "falling back to the `pie` CLI",
+                file=sys.stderr,
+            )
             await self._start_subprocess()
             return self
 
@@ -177,6 +193,16 @@ class Server:
         tmp_dir = Path(tempfile.mkdtemp(prefix="pie-server-"))
         self._cfg_path = tmp_dir / "config.toml"
         self._cfg_path.write_text(self._config.to_toml())
+
+        # WHICH binary, and HOW OLD -- the two facts that tell a caller whether
+        # what is about to serve is the tree they just built.
+        try:
+            built = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(pie_bin))
+            )
+        except OSError:
+            built = "unknown"
+        print(f"pie.server: serving via {pie_bin} (built {built})", file=sys.stderr)
 
         self._proc = await asyncio.create_subprocess_exec(
             pie_bin, "--config", str(self._cfg_path), "serve",

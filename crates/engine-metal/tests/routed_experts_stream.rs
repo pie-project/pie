@@ -14,6 +14,9 @@
 //!     logits are byte for byte the logits full residency produces
 //! (b) the mechanism actually moved — seats were copied, segments were cut,
 //!     and the occupancy after the run is not the identity prefix it began at
+//! (b') the source those seats were copied from is a mapping of an unlinked
+//!     file of exactly the planned size — the property that lets the kernel
+//!     page it out, held by `fstat` and not by a pressure test
 //! (c) the refusals: a budget under the dense planes, a budget that seats no
 //!     whole expert, and a capped budget over a plan with nothing routed
 //! ```
@@ -89,7 +92,7 @@ fn serialized() -> MutexGuard<'static, ()> {
 
 fn word(query_len: u32) -> u64 {
     use model_dsl::Classify;
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -116,8 +119,8 @@ fn finite(logits: &[f32], what: &str) {
 // ── the fixture ──────────────────────────────────────────────────────────
 
 /// The reduced routed text, traced for this shell.
-fn micro() -> (model::qwen_3::model::Model, Trace) {
-    let m = model::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16, 1);
+fn micro() -> (models::qwen_3::model::Model, Trace) {
+    let m = models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16, 1);
     let trace = model_dsl::trace_hybrid("qwen35-a3b-micro", &m, Platform::Metal);
     (m, trace)
 }
@@ -270,13 +273,60 @@ fn band_bytes(trace: &Trace) -> u64 {
         .sum()
 }
 
+/// **The host image the arena arm would have allocated, in bytes.**
+///
+/// Read off the same plan `Weights::resident` compiles — same reader, same
+/// contract, same `StorageTarget::for_backend(Metal, 0, 1)` — so this is the
+/// `vec![0u8; …]` that arm takes, and exactly what the streamed arm no longer
+/// takes now that it runs the executor's streaming residency instead. On
+/// unified memory that term is not staging beside a card's budget: it is
+/// bytes of the same pool the store and the band table come out of, and of
+/// the working set admission already shrank this plan to fit.
+fn arena_bytes(fixture: &Fixture) -> u64 {
+    let metadata = checkpoint::file::zt::parse(&fixture.container).expect("the fixture parses");
+    let target = checkpoint::plan::StorageTarget::for_backend(
+        checkpoint::types::BackendKind::Metal,
+        0,
+        1,
+    );
+    let arena = checkpoint::plan::compile(&metadata, &fixture.contract, target.clone())
+        .expect("the micro text compiles a load plan")
+        .memory
+        .arena_bytes();
+    // The ingredient the streamed branch actually uses: the same contract
+    // against the same target, minus the two passes that exist to serve an
+    // arena. Compiled here so a fixture the arenaless pipeline could not
+    // lower fails on this line rather than inside a load. Its own
+    // `arena_bytes` is NOT the saving and is not read: the memory pass runs
+    // in both pipelines and states a shape either way — what changes is that
+    // `Residency::Streaming` allocates none of it, buffer by buffer at each
+    // one's last use.
+    checkpoint::plan::compile_streaming(&metadata, &fixture.contract, target)
+        .expect("and compiles an arenaless one for the same target");
+    eprintln!(
+        "micro: the arena arm allocates {arena} bytes of host image; a streamed load \
+         allocates none of it"
+    );
+    arena
+}
+
 /// A shell over the fixture, at a stated residency.
 fn load(fixture: &Fixture, residency: Plan) -> engine_metal::Result<Shell> {
     Shell::load(Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
+        // §M-4c, and this is the one gate here that cannot ask the catalog:
+        // the fixture is a hand-built `a3b_micro`, not a row (see the header),
+        // so its precision is spelled rather than looked up. `bf16` is what
+        // the micro declares, the container it writes carries no
+        // `pie.serving/1` stamp, and the check therefore proceeds — the field
+        // is stated because an EMPTY one means "the runtime never assembled
+        // the facts" and is refused, which is not this fixture's situation.
+        tp_size: 1,
+        precision: "bf16".to_string(),
         budget: Budget::new(4, 64),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 128,
@@ -384,11 +434,24 @@ fn a_half_resident_load_says_what_a_fully_resident_one_says() {
         "a3b_micro routes at top-k 4 and the slab seats {seated}; one segment cannot \
          pin more seats than it has"
     );
+    let planned_source = planned.source_bytes();
     eprintln!(
         "micro: {full} bytes whole, {} planned ({seated} of {arity} experts per group, \
-         {} of source bytes behind them)",
+         {planned_source} of source bytes behind them)",
         planned.device_demand(),
-        planned.source_bytes(),
+    );
+
+    // **AND THE HOST IMAGE IS NOT ALLOCATED EITHER.** The golden above ran the
+    // arena arm and took this many bytes of host memory for the executor's
+    // intermediates; the streamed load below runs the same schedule under the
+    // streaming residency and takes none of them. Asserted non-zero because a
+    // fixture whose plan wanted no arena would make the comparison below true
+    // by saying nothing.
+    let saved = arena_bytes(&fixture);
+    assert!(
+        saved > 0,
+        "the arena arm plans no host image at all, so the streamed arm's saving is \
+         unmeasurable and this fixture is not the one that measures it"
     );
 
     let mut streamed = load(&fixture, planned).expect("the streamed shell loads");
@@ -414,12 +477,44 @@ fn a_half_resident_load_says_what_a_fully_resident_one_says() {
         );
     }
 
+    // **AND THE SOURCE THOSE SEATS ARE COPIED FROM IS ON DISK.** Not "could
+    // be": the tier's host table is a `MAP_SHARED` mapping of a temporary file
+    // this load created and unlinked, so the two numbers below are the file's
+    // own `fstat` — its size, which must be exactly the source the plan
+    // planned, and its link count, which must be zero because the path was
+    // removed the instant it was opened.
+    //
+    // This is the honest half of W-b's claim and deliberately not more. A
+    // file-backed page is one the kernel MAY write back and reclaim under
+    // pressure, where the `Vec<u8>` this replaced could only go to swap; that
+    // the kernel does reclaim it is the kernel's, and a pressure test on a
+    // 32 GiB box would measure the box. What is asserted is the property that
+    // makes reclaim possible, plus — through the 25 fires below, every one of
+    // whose seat copies reads this mapping after `HostSource::settle` has
+    // msync'd and deactivated it — that the bytes come back identical.
+    assert_eq!(
+        streamed.expert_source(),
+        Some((planned_source, 0)),
+        "the streamed source is not a mapping of an unlinked file of the planned size; \
+         a source the kernel cannot page out is the term W-b exists to bound"
+    );
+
     let streamed_logits = run(&mut streamed);
 
     // ── (a) THE PARITY. Byte for byte: the arithmetic is the same kernel over
     //    the same bytes in the same order, and only the seat each expert's
     //    weights were copied into differs. A tolerance here would be a
     //    tolerance for the machinery having moved the wrong bytes.
+    //
+    //    **AND IT NOW COVERS THE LOAD'S OWN RESIDENCY TOO.** The golden was
+    //    landed through the executor's arena and the streamed load through
+    //    its streaming residency, off a second plan compiled without the two
+    //    arena passes — so these logits agreeing is also the statement that
+    //    the arenaless lowering landed the same weights the arena one did.
+    //    `checkpoint`'s own
+    //    `a_device_plan_compiled_for_streaming_runs_without_an_arena` proves
+    //    that byte for byte at the executor; this proves it through a Metal
+    //    load, a device store and 25 fires.
     assert_eq!(golden.len(), streamed_logits.len());
     for (step, (want, got)) in golden.iter().zip(&streamed_logits).enumerate() {
         assert_eq!(
@@ -523,7 +618,7 @@ fn a_capped_budget_over_a_plan_with_nothing_routed_is_refused_by_name() {
     // A dense SKU: nothing in it is a routed bank, so a budget under its
     // table has no tier to hold less of. `attachments` would be this trace's
     // quantized pairing and this SKU is bf16, so the empty map is honest.
-    let trace = model::trace_of("qwen35-d0.8b-bf16-kv-bf16")
+    let trace = models::trace_of("qwen35-d0.8b-bf16-kv-bf16")
         .expect("the catalog ships the dense SKU")(Platform::Metal);
     let why = Plan::of(&trace, &dense_planes(), Some(1 << 20))
         .expect_err("1 MiB holds no dense model");

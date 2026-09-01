@@ -95,8 +95,10 @@ use model_ir::ops::Elementwise;
 
 /// A slot table generously above every hand-built fire below — the tests ask
 /// about window semantics, not the carve, so the ceiling only has to hold.
+/// The last three are what one GATHERED payload is bounded by (rows, kv
+/// spaces, pages), which `Slots` owns since the tail acquired a stride.
 fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1)
+    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
 use model_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Operands, Platform, RuntimeInput, Seam, Trace, Ty,
@@ -272,8 +274,7 @@ fn windows(trace: &Trace, compiled: &CompiledModel, fire: &Composition) -> Windo
     Windows::of(
         trace,
         compiled,
-        fire.classes(),
-        fire.patch_classes(),
+        model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]),
         &boundaries(fire),
         Copies::off(),
         test_slots(),
@@ -288,7 +289,7 @@ fn launch_rows(compiled: &CompiledModel, table: &Windows) -> Vec<u32> {
     let mut rows = Vec::new();
     for region in 0..compiled.template().len() as u32 {
         for run in 0..table.runs(region) {
-            rows.push(table.at(region, run).span.rows);
+            rows.push(table.at(region, run).span().rows);
         }
     }
     rows
@@ -322,7 +323,7 @@ fn every_region_of_the_subject_addresses_off_the_seat() {
     let offset = (0..compiled.template().len() as u32).any(|region| {
         (0..table.runs(region)).any(|run| {
             let window = table.at(region, run);
-            window.span.rows > 0 && window.span.row_offset > 0
+            window.span().rows > 0 && window.span().row_offset > 0
         })
     });
     assert!(
@@ -362,7 +363,7 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
         .find(|&region| {
             (0..table.runs(region as u32)).any(|run| {
                 let window = table.at(region as u32, run);
-                window.span.rows > 0 && window.span.row_offset > 0
+                window.span().rows > 0 && window.span().row_offset > 0
             })
         })
         .expect("(a) found a windowed region");
@@ -433,8 +434,8 @@ fn two_splits_of_one_key_move_a_launch_the_total_does_not() {
         "and therefore a lattice point",
     );
     assert_eq!(
-        BodyKey::of(first.classes(), first.bucket(), &no_decode_class(), LANES),
-        BodyKey::of(second.classes(), second.bucket(), &no_decode_class(), LANES),
+        BodyKey::of_axes(first.classes(), first.bucket(), &no_decode_class(), LANES, None),
+        BodyKey::of_axes(second.classes(), second.bucket(), &no_decode_class(), LANES, None),
         "the two fires must reach the SAME body, or there is no hazard here",
     );
 

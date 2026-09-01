@@ -160,7 +160,8 @@ pub fn merge_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(),
         return Err(refuse(
             OP,
             format!(
-                "{block} rows of {} concatenate into {merged}, and the destination's rows are                  {} wide",
+                "{block} rows of {} concatenate into {merged}, and the destination's rows are {} \
+                 wide",
                 x.width, y.width
             ),
         ));

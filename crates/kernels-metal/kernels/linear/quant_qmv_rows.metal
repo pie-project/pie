@@ -92,16 +92,33 @@
 // rows' packs and their two factors — and the activation slice is one row's,
 // loaded and spent inside the loop exactly as `affine_qmv_fast` loads it.
 //
-// # Bit identity with the one-row point, which is a PROPERTY and not a hope
+// # Bit identity with the one-row point — AT ONE PACK WIDTH, AND ONLY ONE
 //
-// `qdot_staged` is `quant_qmv.metal`'s `qdot` with its pack handed in rather
-// than read in. Nothing about the k order, the accumulator type, the
-// `scale * SUM + bias * sum` factoring or the `simd_sum` fold changes, so row
-// `r` of an R-row group lands the bits `affine_qmv_fast` lands for that row
-// alone — `affine_floor`'s `the_folded_vector_point_lands_the_one_row_bits`
-// is the regression that says so. That is worth having even under a ruling
-// that waives it: it means this arm can serve a band the one-row point used
-// to serve without moving a pinned token.
+// This section used to promise identity outright. It does not hold, and the
+// sentence cost two campaigns: `throughput_probe`'s
+// `gemma4_26b_a4b_decodes_on_many_lanes_at_once` was triaged first as a
+// dequantization width and then as a suspected window / page-table defect,
+// and it was this file all along. `.wiki/macos-bench.md` §23.
+//
+// `qdot_staged` IS `quant_qmv.metal`'s `qdot` with its pack handed in rather
+// than read in: same accumulator, same `scale * SUM + bias * sum` factoring,
+// same `simd_sum` over the same thirty-two lanes. What the two files do not
+// share is HOW K IS DEALT OUT to those lanes, because that is
+//
+//   block_size = pack_factor * packs_per_thread * SIMD_SIZE
+//
+// and `packs_per_thread` is a template parameter on both — fixed at 2 in
+// `qmv_fast_impl` (its only stamp) and set from `DeviceTuning::qmv_rows_packs`
+// here, which is 1 on the M1 Max. At four bits that is an eight-code slice of
+// a 256-code block against a sixteen-code slice of a 512-code one: the same
+// products, thirty-two different partial sums, a different fold.
+//
+// So row `r` of an R-row group lands `affine_qmv_fast`'s bits when this point
+// is minted at TWO packs, and reassociates at one. The reassociation is one
+// bfloat16 ulp in about one element in eight thousand — nothing on a dense
+// stack, and a different expert on a checkpoint that routes a top-k on it.
+// `affine_floor`'s `the_folded_vector_point_lands_the_one_row_bits` measures
+// both sides and is the regression that keeps the distinction.
 //
 // # The tail is clamped on the read and guarded on the write
 //
@@ -140,9 +157,26 @@ inline constexpr short get_bytes_per_pack() {
 
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector(const device T* x, thread U* x_thread) {
-  static_assert(bits == 4 || bits == 8, "port covers the two widths mlx_lm ships");
+  static_assert(bits == 2 || bits == 4 || bits == 8,
+                "port covers the widths mlx affine ships this box");
   U sum = 0;
-  if (bits == 4) {
+  if (bits == 2) {
+    // Verbatim `quant_qmv.metal`'s two-bit arm — eight codes a uint16, so the
+    // activation is pre-divided by 4^j over each run of eight to cancel the
+    // `<< 2j` the unshifted mask in `qdot_staged` leaves on code j.
+    for (int i = 0; i < values_per_thread; i += 8) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+          x[i + 6] + x[i + 7];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 4.0f;
+      x_thread[i + 2] = x[i + 2] / 16.0f;
+      x_thread[i + 3] = x[i + 3] / 64.0f;
+      x_thread[i + 4] = x[i + 4] / 256.0f;
+      x_thread[i + 5] = x[i + 5] / 1024.0f;
+      x_thread[i + 6] = x[i + 6] / 4096.0f;
+      x_thread[i + 7] = x[i + 7] / 16384.0f;
+    }
+  } else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -167,8 +201,11 @@ inline U load_vector(const device T* x, thread U* x_thread) {
 /// spend it R times.
 ///
 /// The accumulation is term for term the one `qdot` performs — same order,
-/// same `float` accumulator, same `scale * SUM + bias * sum` factoring — so a
-/// row folded here lands the bits it lands alone.
+/// same `float` accumulator, same `scale * SUM + bias * sum` factoring — over
+/// THIS point's `values_per_thread`, which is `pack_factor * packs_per_thread`
+/// and is the one thing the two files can disagree about. A row folded here
+/// lands the bits it lands alone when `packs_per_thread` is the one-row
+/// point's 2; see the header.
 template <typename U, int values_per_thread, int bits, int packs>
 inline U qdot_staged(
     const thread uint16_t* p,
@@ -176,9 +213,25 @@ inline U qdot_staged(
     U scale,
     U bias,
     U sum) {
-  static_assert(bits == 4 || bits == 8, "port covers the two widths mlx_lm ships");
+  static_assert(bits == 2 || bits == 4 || bits == 8,
+                "port covers the widths mlx affine ships this box");
   U accum = 0;
-  if (bits == 4) {
+  if (bits == 2) {
+    // The staged twin of `quant_qmv.metal`'s two-bit `qdot`: the pack is in
+    // registers rather than device memory, but the eight masks and the term
+    // order are the one arm's, so a row folded here lands the bits the one-row
+    // point lands AT THE SAME PACK WIDTH (header).
+    // `words_per_thread` is `values_per_thread / 8` here, which is
+    // exactly the count this loop walks.
+    for (int i = 0; i < (values_per_thread / 8); i++) {
+      const uint16_t q = p[i];
+      accum +=
+          (x_thread[8 * i] * (q & 0x0003) + x_thread[8 * i + 1] * (q & 0x000c) +
+           x_thread[8 * i + 2] * (q & 0x0030) + x_thread[8 * i + 3] * (q & 0x00c0) +
+           x_thread[8 * i + 4] * (q & 0x0300) + x_thread[8 * i + 5] * (q & 0x0c00) +
+           x_thread[8 * i + 6] * (q & 0x3000) + x_thread[8 * i + 7] * (q & 0xc000));
+    }
+  } else if (bits == 4) {
     for (int i = 0; i < (values_per_thread / 4); i++) {
       const uint16_t q = p[i];
       accum +=

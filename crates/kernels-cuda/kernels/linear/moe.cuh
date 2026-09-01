@@ -582,46 +582,6 @@ __global__ void moe_topk_sqrt_softplus(
 }
 
 template <class T>
-__global__ void hash_route_lookup(
-    const i32* __restrict__ token_ids,
-    const i64* __restrict__ tid2eid,
-    const T* __restrict__ logits,
-    i32* __restrict__ topk_idx,
-    float* __restrict__ topk_w,
-    int tokens,
-    int vocab_size,
-    int E,
-    int K,
-    bool renormalize,
-    float routed_scaling_factor)
-{
-    const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    if (n >= tokens) return;
-    const int tok = token_ids[n];
-    const int clamped = (tok >= 0 && tok < vocab_size) ? tok : 0;
-
-    const i64* row = tid2eid + static_cast<long long>(clamped) * K;
-    const T* lg = logits + static_cast<long long>(n) * E;
-    i32* out_idx = topk_idx + static_cast<long long>(n) * K;
-    float* out_w = topk_w + static_cast<long long>(n) * K;
-
-    float sum = 0.f;
-    for (int k = 0; k < K; ++k) {
-        const int e = static_cast<int>(row[k]);
-        const int ec = (e >= 0 && e < E) ? e : 0;
-        out_idx[k] = ec;
-        const float w = sqrt_softplus(Elem<T>::to_f32(lg[ec]));
-        out_w[k] = w;
-        sum += w;
-    }
-
-    const float scale = renormalize
-        ? routed_scaling_factor / fmaxf(sum, 1e-20f)
-        : routed_scaling_factor;
-    for (int k = 0; k < K; ++k) out_w[k] *= scale;
-}
-
-template <class T>
 __global__ void build_dual_gemm_ptrs(
     const T* act,
     const T* w0,

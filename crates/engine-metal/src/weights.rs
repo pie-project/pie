@@ -41,8 +41,8 @@
 //! a second table. What it gets is a smaller RESERVATION for the bands it
 //! streams — `slots` expert seats where the plan declares `experts` of them,
 //! which is [`places`] reading [`Plan::resident`] and nothing more — and one
-//! host `Vec<u8>` holding those bands whole, which the landing sink fills
-//! instead of the store. The weight rows are minted exactly as they always
+//! host mapping holding those bands whole ([`crate::host_source`]), which the
+//! landing sink fills instead of the store. The weight rows are minted exactly as they always
 //! were: a `Tensor` over the seats, at the same alignment, resolved through
 //! the same handle table. Every kernel that reads one computes
 //! `base + e * stride` and is told nothing, because between two command
@@ -78,7 +78,7 @@
 //! describes. That is decision #18 read from the residency side: the runtime
 //! links `model`, traces the `Trace` and states the load contract; the shell
 //! compiles the contract against a checkpoint and lands the bytes. A shell
-//! that reached for `model::qwen_3` would be a shell that has to grow an arm
+//! that reached for `models::qwen_3` would be a shell that has to grow an arm
 //! per family, which is exactly the shape the string-plan era had.
 //!
 //! # Names are the plan's, both sides
@@ -108,6 +108,12 @@
 //! transform it admits has a host implementation. For the SKUs this shell
 //! serves today it is a handful of bf16→f32 widenings on norm scales.
 //!
+//! A STREAMED load hands no arena at all — see the branch in
+//! [`Weights::resident`] — and the sentence above still holds for it: the
+//! executor's streaming residency owns each buffer as a host allocation and
+//! frees it at its last use, so the transforms run in the same place, on
+//! bytes nothing kept.
+//!
 //! [`Handles`]: crate::device::Handles
 //! [`Handles::seal`]: crate::device::Handles::seal
 
@@ -120,11 +126,16 @@ use std::path::Path;
 // beside `parse_metadata` would say nothing about which of the two doors
 // this line opened.
 use checkpoint::file::read::parse_metadata;
+use checkpoint::file::serve;
 use checkpoint::file::zt;
 use checkpoint::contract::ModelContract;
 use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
-use checkpoint::plan::{LoadPlan, StorageTarget, compile};
+use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
+// The `pie.serving/1` vocabulary, consumed and never re-spelled: `Stamp::of`
+// is the constructor that fills the four policy fields from the profile's own
+// constants, and `Mismatch::refuse` is the one place the refusal is written.
+use checkpoint::serving::{self, Stamp};
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_metal::Tensor;
 use model_ir::{Dtype, ParamSource, Trace};
@@ -132,6 +143,7 @@ use model_ir::{Dtype, ParamSource, Trace};
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 use crate::experts::{Attachments, Plan, Tier};
+use crate::host_source::HostSource;
 use crate::run::{WeightRow, WeightTable};
 
 /// What a matrix operand wants, and what a Metal buffer's own base is already
@@ -194,7 +206,37 @@ struct Bank {
     adapters: u32,
     /// One adapter's bytes in this bank.
     slot: u64,
+    /// The leading axis of ONE slot.
+    rows: u64,
+    /// The trailing axes of one slot, multiplied out.
+    cols: u64,
+    /// One element in bytes.
+    elem: u64,
 }
+
+/// **ONE BANK, AS THE ADAPTER RESOLVER READS IT** (alto adapter §6.3).
+///
+/// Everything [`crate::adapter`] needs to slice a `[layers, ...]` seed into
+/// one full-capacity plane per bank: the name it registers under, the
+/// capacity, the slot's bytes, and the rectangle those bytes are. A flattened
+/// [`Bank`] — the resolver lives in another module and a private field is not
+/// a contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BankSeat {
+    /// The param's own name, which is what a registration names.
+    pub name: String,
+    /// How many adapters it seats.
+    pub adapters: u32,
+    /// One adapter's bytes.
+    pub slot: u64,
+    /// The leading axis of one slot.
+    pub rows: u64,
+    /// The trailing axes of one slot, multiplied out.
+    pub cols: u64,
+    /// One element in bytes.
+    pub elem: u64,
+}
+
 
 /// The banks a plan declares, read off `ParamSource::Registered`.
 ///
@@ -221,12 +263,19 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
             } else {
                 place.full / u64::from(adapters)
             };
+            // The slot's own rectangle: the param's shape with the adapters
+            // axis cut off. `[adapters, rank, in]` is a `[rank, in]` slot and
+            // `[adapters, out, rank]` is an `[out, rank]` one.
+            let (rows, cols) = rectangle(param.shape.get(1..).unwrap_or(&[]));
             (
                 param.name.clone(),
                 Bank {
                     offset: place.offset,
                     adapters,
                     slot,
+                    rows,
+                    cols,
+                    elem: model_compiler::arena::elem_bytes(param.dtype).unwrap_or(0),
                 },
             )
         })
@@ -246,9 +295,20 @@ impl Weights {
     /// caller seals `handles` once every load-time row is minted; this
     /// constructor does not, because it is not the last minter.
     ///
+    /// `tp_size` and `precision` are **the two deployment facts a shell cannot
+    /// look up** (§M-4c): a shell must not know a model family, so the
+    /// degree and the served numeric form arrive from the runtime, through
+    /// `LoadRequest` and `Boot`. The other three the artifact is checked
+    /// against are already here — `trace.platform.backend()` is the backend and
+    /// `trace.name` is the SKU — and are deliberately not restated beside
+    /// them, for the reason `request_of` gives: a fact carried twice is a fact
+    /// that can disagree with itself. [`serves_this_deployment`] is where the
+    /// whole of the rule is written down.
+    ///
     /// # Errors
     ///
-    /// [`Fault::Load`] for a checkpoint the contract does not fit,
+    /// [`Fault::Recipe`] for a serving artifact stamped for another
+    /// deployment, [`Fault::Load`] for a checkpoint the contract does not fit,
     /// [`Fault::Param`] for a plan and a contract that do not name the same
     /// tensors, [`Fault::Ceiling`] for a store past `maxBufferLength` or a
     /// view that leaves it, [`Fault::Device`] when the device declined the
@@ -260,7 +320,32 @@ impl Weights {
         contract: &ModelContract,
         path: &Path,
         plan: &Plan,
+        tp_size: u64,
+        precision: &str,
     ) -> Result<Weights> {
+        // **BEFORE THE METADATA PARSE**, because this refusal is about the
+        // TRACE and not about the file: a plane order this shell cannot read
+        // is unreadable whichever checkpoint states it, and answering it with
+        // a checkpoint's sentence would send the reader to the wrong crate.
+        // See `readable_plane_orders`.
+        readable_plane_orders(trace)?;
+
+        // **AND THEN THE STAMP, STILL BEFORE ANYTHING IS TAKEN** (§M-4c).
+        // Every line below this one spends something the machine cannot give
+        // back for free — `Buffer::zeroed` reserves the whole store,
+        // `HostSource::open` takes a descriptor and an address range, the
+        // executor's arena is the image's own size — and an artifact compiled
+        // for another shell's kernels is refused whichever of them it would
+        // have filled. The order is the promise: a cross-recipe boot costs one
+        // manifest read and no reservation at all.
+        serves_this_deployment(
+            path,
+            trace.platform.backend(),
+            &trace.name,
+            tp_size,
+            precision,
+        )?;
+
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
         } else {
@@ -272,18 +357,11 @@ impl Weights {
         // are the loader's whole notion of a rank, so a shell that grows
         // tensor parallelism states it here and nowhere else.
         let target = StorageTarget::for_backend(BackendKind::Metal, 0, 1);
-        let landing = compile(&metadata, contract, target)?;
+        let landing = compile(&metadata, contract, target.clone())?;
 
         let places = places(trace, plan)?;
         let total = places.last().map_or(0, |p| p.offset + p.reserved);
         let mut store = Buffer::zeroed(device, total)?;
-
-        // The executor's own arena: where a transform's intermediates live
-        // while it runs. Host memory, because the transforms run host-side;
-        // it is dropped the moment the load is over, and only the finalized
-        // tensors the sink took survive.
-        let mut scratch = vec![0u8; usize::try_from(landing.memory.arena_bytes()).unwrap_or(0)];
-        let mut backing: &mut [u8] = &mut scratch;
 
         let index: BTreeMap<&str, usize> = trace
             .params
@@ -294,8 +372,15 @@ impl Weights {
         // The host band table, sized off the plan and empty for a
         // full-residency load — where a streamed band's bytes go instead of
         // into the store.
-        let mut host =
-            vec![0u8; usize::try_from(plan.source_bytes()).unwrap_or(0)];
+        //
+        // **IT IS A MAPPING AND NOT A `Vec`**, which is the whole of W-b's
+        // interim step: an unlinked temporary file the kernel may page these
+        // bytes back to, rather than anonymous memory whose only home under
+        // pressure is swap ([`crate::host_source`] argues it, and states why
+        // nothing ever binds a buffer over it). A plan that streams nothing
+        // asks for zero bytes and creates no file at all, so a full-residency
+        // load is untouched by this line.
+        let mut host = HostSource::open(plan.source_bytes())?;
         let mut sink = Landing {
             store: &mut store,
             host: &mut host,
@@ -304,13 +389,62 @@ impl Weights {
             index: &index,
             landed: vec![false; places.len()],
         };
-        Execution::new(&landing, snapshot)
-            .arena(&mut backing)
-            .sink(&mut sink)
-            .run()?;
-
-        let landed = sink.landed;
-        drop(scratch);
+        // ── **A STREAMED LOAD HAS NO ARENA AT ALL** (alto §K.3's Metal
+        //    reading; the CUDA twin states the same branch over its own
+        //    memory). The arena is where a transform's intermediates live
+        //    while the schedule runs, and it is planned at the whole image's
+        //    size: a resident load wants it, because its image IS the store's
+        //    and every finalized tensor is copied out of it. A streamed
+        //    load's image is not staged anywhere — each tensor goes to the
+        //    device store or to the host band table as it finalizes — so the
+        //    executor's own streaming residency owns every buffer and frees
+        //    it at its last use, and what the load holds at once is one
+        //    tensor's chain rather than the whole model.
+        //
+        //    **AND ON THIS PLANE THE ARENA IS NOT SOMEBODY ELSE'S MEMORY.**
+        //    The CUDA arena is host staging beside a discrete card's own
+        //    budget; here the store, the band table and the arena are all
+        //    bytes of the ONE pool `Context::working_set` reports and
+        //    `Accounting` admitted the weight budget against (`api.rs`). A
+        //    load that streams because it did not fit was then allocating a
+        //    second whole-image term on the very side it was shrunk to fit —
+        //    which is the term this branch subtracts, and the reason it is
+        //    worth a second compile here at all.
+        //
+        //    The plan is compiled a SECOND TIME for that, and that is the
+        //    whole price: `compile_streaming` is this same contract against
+        //    this same Metal target, minus the two passes that exist to serve
+        //    an arena (it says there why the target cannot be weakened to
+        //    `Unknown` instead). Milliseconds, against an image.
+        //
+        //    **AND THE SECOND PLAN IS NOT WHAT ANYTHING ELSE READS.** It is
+        //    compiled, run, and dropped inside this branch. `landing` — the
+        //    one the whole pipeline lowered — is what `pairings` reads below,
+        //    for the same reason the CUDA side keeps it as its key: a plan
+        //    that differed by how its caller intended to run it must never be
+        //    the plan anything downstream identifies the load by.
+        let landed = if plan.streams() {
+            let streaming = compile_streaming(&metadata, contract, target)?;
+            Execution::new(&streaming, snapshot)
+                .streaming()
+                .sink(&mut sink)
+                .run()?;
+            sink.landed
+        } else {
+            // The executor's own arena: where a transform's intermediates
+            // live while it runs. Host memory, because the transforms run
+            // host-side; it is dropped the moment the load is over, and only
+            // the finalized tensors the sink took survive.
+            let mut scratch = vec![0u8; usize::try_from(landing.memory.arena_bytes()).unwrap_or(0)];
+            let mut backing: &mut [u8] = &mut scratch;
+            Execution::new(&landing, snapshot)
+                .arena(&mut backing)
+                .sink(&mut sink)
+                .run()?;
+            let landed = sink.landed;
+            drop(scratch);
+            landed
+        };
 
         let pairings = pairings(&landing, &index)?;
 
@@ -456,6 +590,47 @@ impl Weights {
             .collect()
     }
 
+    /// **THE BANKS, AS THE ADAPTER RESOLVER READS THEM** — name, capacity,
+    /// slot bytes, the slot's rectangle and its element size.
+    ///
+    /// [`Weights::banks`]'s longer twin, and a second method rather than a
+    /// widened one because the two have different readers: a caller sizing a
+    /// plane by hand wants three numbers, and [`crate::adapter::planes_of`]
+    /// slicing a `[layers, ...]` seed needs the shape to check the out-major
+    /// statute against (alto adapter §6.3).
+    #[must_use]
+    pub fn seats(&self) -> Vec<BankSeat> {
+        self.banks
+            .iter()
+            .map(|(name, bank)| BankSeat {
+                name: name.clone(),
+                adapters: bank.adapters,
+                slot: bank.slot,
+                rows: bank.rows,
+                cols: bank.cols,
+                elem: bank.elem,
+            })
+            .collect()
+    }
+
+    /// **HOW MANY ADAPTERS THIS LOAD CAN HOLD RESIDENT AT ONCE** — the
+    /// smallest capacity any declared bank states, and zero for a plan that
+    /// declares none.
+    ///
+    /// The SMALLEST, because an adapter occupies one slot of every bank it
+    /// fills: a load whose `A` seats eight and whose `B` seats four holds
+    /// four adapters, and a fifth would have nowhere to put its `B`. Model
+    /// texts declare the two alike today and this is the honest reading of a
+    /// text that does not.
+    #[must_use]
+    pub fn adapter_seats(&self) -> u32 {
+        self.banks
+            .values()
+            .map(|bank| bank.adapters)
+            .min()
+            .unwrap_or(0)
+    }
+
     /// The table a fire resolves `Def::Weight(i)` through.
     #[must_use]
     pub fn table(&self) -> &WeightTable {
@@ -491,6 +666,9 @@ impl Weights {
 ///
 /// [`experts::Plan::of`]: crate::experts::Plan::of
 pub fn attachments(trace: &Trace, contract: &ModelContract, path: &Path) -> Result<Attachments> {
+    // The admission gate runs in front of the landing, so it meets an
+    // unreadable plane order first — see `readable_plane_orders`.
+    readable_plane_orders(trace)?;
     let metadata = if path.is_dir() {
         parse_metadata(path)?
     } else {
@@ -661,6 +839,227 @@ fn pairings<'a>(
     Ok(out)
 }
 
+/// **A PLANE ORDER THIS SHELL HAS NO READER FOR IS REFUSED BY NAME**, before
+/// a plan is compiled and before a byte is reserved.
+///
+/// `Dtype::U4g64tiled` is `U4g64`'s codes in m16n8k16 fragment order — the
+/// same scheme, the same group of sixty-four, the same two bf16 companions,
+/// and a different ORDER, written for `kernels_cuda::linear::tiled`. This
+/// shell has no point that reads it: `pairings` seats every affine bank as
+/// codes + scales + biases with a `group` and a `bits`, and
+/// `kernels_metal::linear::quant`'s qmm/qmv arms index that rectangle
+/// ROW-MAJOR. Handed a relaid plane they compute finite, deterministic
+/// nonsense.
+///
+/// # What it was written for, and what closed that
+///
+/// It was written because a correct load PRODUCED one. `qwen_3::model`'s
+/// projection flip declared `U4g64tiled` off the weight's width alone — no
+/// platform, no backend — so all seven `*-mlxu4-*` qwen_3 rows asked this
+/// shell for an order it does not read. A raw MLX snapshot refused at
+/// `checkpoint::plan::passes::validate`'s `validate_target_support`
+/// (`METAL_TILE_MAP_MASK` carries no `TILE_MAP_REPACK`, and a serving plan
+/// does not convert), and a `pie model import` artifact — whose projections
+/// the import HAD relaid, and which `qwen_3::import`'s `read_own` arm then
+/// binds with no transform — sailed past that and landed here, loading in
+/// 0.1s and answering the first-light prompt `"一时的وات**!.energy…"`.
+///
+/// **§J4c CLOSED IT AT THE DECLARATION, WHICH IS WHERE THE PARAGRAPH ABOVE
+/// SAID IT BELONGED.** `model_dsl::place` resolves a placed dtype against
+/// the platform the declaration is being read for (`Platform::placement`),
+/// and BOTH readings of a family's text go through one — the trace through
+/// `catalog!`, the load contract through `runtime::engine::load`. So a Metal
+/// trace of those rows declares the canonical `U4g64` its qmm and qmv arms
+/// already read, its contract states no repack, and the raw snapshot serves
+/// as stored with no import at all. That is §M's own ruling in a dtype: a
+/// `.zt` is a function of the RECIPE, so one text is two artifacts.
+///
+/// # What it is still for, and what it is NOT
+///
+/// **IT IS THE NET UNDER THE DECLARATION.** A text that reaches for a
+/// placement `place` was not asked about — a literal `Dtype::U4g64tiled` in a
+/// declaration, or a future placed variant whose `Platform::placement` row
+/// nobody wrote — arrives here rather than at a wrong number. `models`'
+/// `no_trace_declares_a_plane_its_platform_cannot_read` is the same fact
+/// asserted over the whole catalog, one layer earlier and with no device in
+/// the room; this is the one that runs on the load path.
+///
+/// **IT IS NOT THE NET UNDER THE ARTIFACT, AND CANNOT BE.** It reads
+/// `Trace::params` — a declaration — so a `.zt` CONVERTED FOR CUDA and fed to
+/// this shell sails past it: the trace is this shell's and says `U4g64`, and
+/// the artifact says nothing to the contrary, because a repack moves no value
+/// and `U4g64tiled` shares `U4g64`'s TERM (`dtype::Dtype::U4g64tiled`) while
+/// a `.zt` records terms. Measured: the CUDA artifact of the 0.8B loads here
+/// in 0.1s and answers `"productiveeldahar打造成…"`.
+///
+/// **AND THE OPEN ITEM IS CLOSED, ONE FUNCTION DOWN** (§M-4c). A guard on the
+/// NAME was tried and does not hold: it read "a projection under the weight's
+/// own name is a plane some repack produced", which was true while a promotion
+/// moved only the repack and stopped being true at §M-4a, where a promotion
+/// moves the whole landing and a row-major artifact holds its projections under
+/// their own names too. What this paragraph said would settle it — *the
+/// artifact SAYING which recipe it was written for* — is what
+/// [`serves_this_deployment`] now asks, off the `pie.serving/1` stamp `pie
+/// model import` writes, on the line after this check and before anything is
+/// reserved. The division of labour stands as it was stated: this one is about
+/// the TRACE and refuses a declaration no artifact could rescue; that one is
+/// about the FILE and refuses a file no declaration can.
+///
+/// # Errors
+///
+/// [`Fault::Param`] naming the first param declared in an order this shell
+/// cannot read.
+pub(crate) fn readable_plane_orders(trace: &Trace) -> Result<()> {
+    match trace
+        .params
+        .iter()
+        .find(|param| param.dtype == Dtype::U4g64tiled)
+    {
+        None => Ok(()),
+        Some(param) => Err(Fault::Param {
+            name: param.name.clone(),
+            why: "is declared U4g64tiled — MLX affine codes in m16n8k16 fragment order, which \
+                  this shell has no reader for: its qmm and qmv arms index an affine bank \
+                  row-major and would answer nonsense off a relaid plane. The order is \
+                  `kernels_cuda::linear::tiled`'s, and a model text reaches it only by asking \
+                  for it: `model_dsl::place` resolves a placed dtype against the platform the \
+                  declaration is read for, and this platform's answer is the canonical \
+                  row-major sibling. So either this plane came out of an artifact converted \
+                  FOR the cuda shell — convert it again on this box, or serve it there — or a \
+                  text stated the order outright, in which case it is the text that has to ask",
+        }),
+    }
+}
+
+/// **IS THIS ARTIFACT FOR THIS DEPLOYMENT?** — the `pie.serving/1` stamp gate,
+/// asked before a byte of the machine is spent (§M-4c).
+///
+/// This is the net under the ARTIFACT that
+/// [`readable_plane_orders`] says it cannot be. That one reads
+/// `Trace::params` — a DECLARATION — so a `.zt` converted for the CUDA shell
+/// sails past it: the trace is this shell's and says `U4g64`, the artifact
+/// says nothing to the contrary because a repack moves no value and shares the
+/// canonical term, and the measured result is a 0.1s load that answers
+/// nonsense. What settles it is the file SAYING which recipe it was written
+/// for, and `pie model import` writes exactly that down.
+///
+/// # Two absences, two meanings — the cut both shells implement
+///
+/// **A raw snapshot or an ordinary `.zt` has no stamp and PROCEEDS.** This is
+/// not a hole left open: a checkpoint that carries no `pie.serving/1` block is
+/// not claiming to be anybody's serving artifact, and every load this tree has
+/// ever run — every device gate, every four-bit first light — is one. Refusing
+/// them would be refusing the format that predates the profile.
+///
+/// **A stamped artifact is CHECKED, field by field**, and the refusal is
+/// `serving::Mismatch::refuse`'s sentence rather than one written here: what
+/// disagreed, that nothing on this path rewrote or deleted the file, and the
+/// `pie model import --force` that writes it again. `Stamp::check` compares
+/// the version, the backend, the tp degree, the SKU, the precision, the layout
+/// revision, the block size, the block algorithm and the zeroed-adapters
+/// assertion, and stops at the FIRST one that differs — which is what makes
+/// the sentence name a fact an operator can act on instead of saying only
+/// *different*.
+///
+/// **A REQUEST THAT STATES NO PRECISION IS REFUSED, and it is refused BEFORE
+/// the file is looked at.** `runtime::engine::load::request_of` fills that
+/// field unconditionally off the catalog, so an empty one is a runtime that
+/// could not assemble the comparison — and the tempting reading, "nothing to
+/// compare against, so no check", is precisely the silent cross-recipe landing
+/// this function exists to prevent. Asked first rather than after the read
+/// because it is a fact about the LOAD and not about the file: it is true of an
+/// ordinary checkpoint too, and a shell that only noticed when the artifact
+/// happened to be stamped would report a caller's bug at random.
+///
+/// # What it costs, and what it is not
+///
+/// One positioned manifest read (`serve::stamp_of`, which opens no mapping)
+/// for a single-container load, and nothing at all for a snapshot DIRECTORY: a
+/// serving artifact is one file by construction, so a directory is answered
+/// without touching the disk.
+///
+/// **It hashes nothing.** The blocks are the verify doors' business
+/// (`Artifact::verify_all`); this asks whether the recipe matches, which is a
+/// question about nine text fields.
+///
+/// **And it is asserted rather than assumed.** The CUDA twin makes the same
+/// claim structurally — positioned reads, and the call's position in the file;
+/// `a_cross_recipe_artifact_refuses_before_it_allocates` measures it, around
+/// this call, off `device::reservations` and `host_source::descriptors`.
+///
+/// # The claim and the reading are separate questions, and both are asked
+///
+/// [`serve::stamp_of`] answers in the shape that has three answers:
+/// `Ok(None)` is a container with no `pie.serving` key — an ordinary
+/// checkpoint, the ONLY outcome that proceeds. `Ok(Some(_))` is a stamp that
+/// read back, and is checked. `Err(_)` is a file that CLAIMS a serving
+/// profile (`serving::stated_profile`) but whose stamp does not read back — a
+/// rotted member, a future `pie.serving/<n>`, a manifest-less container — and
+/// is refused, because landing it as the ordinary checkpoint it also is would
+/// be a stamped artifact losing its stamp to decay and passing the very check
+/// the stamp exists to feed. (This split was the recorded ask of the sibling
+/// lane; `eaff5950d` answered it with the public predicate and this door.)
+///
+/// # Errors
+///
+/// [`Fault::Recipe`] for a stamp that disagrees, for a serving version this
+/// build does not read, and for a load that states no precision.
+pub(crate) fn serves_this_deployment(
+    path: &Path,
+    backend: &str,
+    sku: &str,
+    tp_size: u64,
+    precision: &str,
+) -> Result<()> {
+    if precision.is_empty() {
+        return Err(Fault::Recipe(format!(
+            "internal: this load states no precision, so nothing here can check that {} \
+             was written for it. `runtime::engine::load::request_of` fills that field \
+             from the catalog and a request without one did not come through it; \
+             landing the planes unchecked is the cross-recipe boot the `{}` stamp \
+             exists to prevent, so this is loud rather than skipped",
+            path.display(),
+            serving::PROFILE,
+        )));
+    }
+    // A snapshot directory is a set of source files and not one container, so
+    // it holds no file-level attributes and can carry no stamp. Asked before
+    // the door is opened rather than through it, because `read_head` on a
+    // directory would refuse for a reason that has nothing to do with serving.
+    if path.is_dir() {
+        return Ok(());
+    }
+    let artifact = match serve::stamp_of(path) {
+        // No `pie.serving/1` key at all: an ordinary checkpoint, which is
+        // every load this tree ran before the profile existed — the ONLY
+        // outcome that proceeds. See the header.
+        Ok(None) => return Ok(()),
+        Ok(Some(stamp)) => stamp,
+        // The file CLAIMS a serving profile and its stamp does not read back
+        // (a rotted member, a future profile, no manifest at all). Serving it
+        // as the ordinary checkpoint it also is would be the quiet cousin of
+        // the cross-recipe boot: a stamped artifact losing its stamp to decay
+        // and passing the very check the stamp exists to feed.
+        Err(why) => return Err(Fault::Recipe(format!("checkpoint: {why}"))),
+    };
+    // The four policy fields are NOT spelled here. `Stamp::of` fills them from
+    // `serving::LAYOUT_REVISION` and `serving::BLOCK_BYTES`, which is the
+    // whole reason the constructor exists: a constant spelled twice is a field
+    // that can disagree with itself, and `check` compares field by field.
+    let deployment = Stamp::of(backend, tp_size, sku, precision, None);
+    artifact.check(&deployment).map_err(|mismatch| {
+        // `refuse` takes the artifact's name and the SOURCE the refusing load
+        // should be re-imported from. The artifact's own `model_id` is that
+        // source when it carries one — it is what the operator named at import
+        // — and the command is left as a slot when it does not, rather than
+        // printing this artifact's own path as the thing to convert.
+        Fault::Recipe(mismatch.refuse(
+            &path.display().to_string(),
+            artifact.model_id.as_deref(),
+        ))
+    })
+}
+
 /// Where one param's plane sits in the store.
 #[derive(Debug, Clone, Copy)]
 struct Place {
@@ -713,7 +1112,28 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
             let (rows, width) = rectangle(&param.shape);
             Ok(match param.dtype {
                 Dtype::Mxfp4 => rows.saturating_mul(width),
-                Dtype::U4g64 | Dtype::U4g32 => rows.saturating_mul(width).div_ceil(2),
+                // A tiled affine plane is the same nibbles relaid; the band
+                // padding rides in the shape, so it is this arm's number.
+                // This shell has no reader for the order and refuses one by
+                // name at the two load doors (`readable_plane_orders`), so
+                // nothing reaches here declaring it — the arm stays because
+                // sizing is a fact about the rectangle and not about who can
+                // read it, and because `experts::Plan` budgets off this
+                // function without going through a door.
+                Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => {
+                    rows.saturating_mul(width).div_ceil(2)
+                }
+                // Two bits a code, sixteen to the `u32` word MLX packs them
+                // into — so a row of `width` codes is `width / 4` bytes, and
+                // the `div_ceil` is the four-bit arm's own argument one notch
+                // narrower: a row whose width is not a multiple of four would
+                // round up into the next, and none of the three groups (32,
+                // 64, 128) admits such a row in the first place. The group
+                // does not appear here; it sizes the COMPANION planes, which
+                // are their own params with their own rectangles.
+                Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => {
+                    rows.saturating_mul(width).div_ceil(4)
+                }
                 // The same logical rectangle at a whole byte a code — see
                 // `dtype::Dtype::U8g64`, and note that the `div_ceil` above is
                 // the one thing that does NOT carry over: an eight-bit code
@@ -861,7 +1281,7 @@ mod tests {
     #[test]
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
         let trace =
-            model::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships the SKU");
+            models::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships the SKU");
         let trace = trace(Platform::Metal);
         let places = places(&trace, &Plan::default())
             .expect("every param of a bf16 SKU has an element size");

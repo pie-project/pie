@@ -36,7 +36,7 @@ const HEADER: &str = "\
 # change to it shows up as a diff instead of passing unnoticed.
 #
 # A mismatch here is a question, not a verdict: decide whether the new output is
-# right, then re-pin with `PTIR_REGEN=1 cargo test -p pie-compiler-tests`.
+# right, then re-pin with `PTIR_REGEN=1 cargo test -p eta-compiler`.
 #
 # Where a kernel is digested, `bytes` and the hash cover what the *compiler*
 # generated: the hand-written device text under `crates/eta-compiler/runtime/` is
@@ -190,9 +190,15 @@ fn extended_corpus_plans_are_pinned() {
 /// leave a kernel that runs, faults nothing, and hands a guest the logits
 /// under the score's name.
 ///
-/// The grouped half is asserted as a REFUSAL for the same reason, because
-/// there the parameter does not exist: a grouped kernel reads
-/// `lane.logits_base` and the slab is not that allocation.
+/// **THE GROUPED HALF IS THE SAME SENTENCE ABOUT A DIFFERENT KIND OF
+/// BINDING**, and it used to be a refusal. That form takes no per-intrinsic
+/// parameter at all — every rectangle it reads arrives as an address on the
+/// lane record — so for as long as `lane.logits_base` was the only such
+/// address the score slab was unreachable and the emitter said so by name.
+/// `LaneRecord::attn_score_base` is the second address, and what is asserted
+/// here is that the gather reads THAT one: a grouped kernel that reached for
+/// `logits` instead would be the identical mis-binding, one indirection
+/// further in and with no argument index to make it visible.
 #[test]
 fn the_score_rectangle_is_emitted_at_its_own_buffer_index() {
     use eta_compiler::codegen::metal;
@@ -222,12 +228,32 @@ fn the_score_rectangle_is_emitted_at_its_own_buffer_index() {
         "the `intrinsic_val` op's a0 is not the score rectangle"
     );
 
-    let grouped = metal::emit_grouped_fused_region("ptir_grouped_probe_r0", &stage.plan, region);
+    let grouped = metal::emit_grouped_fused_region("ptir_grouped_probe_r0", &stage.plan, region)
+        .expect("the score rectangle has a lane-record address on the grouped path");
     assert!(
-        matches!(
-            grouped,
-            Err(eta_compiler::codegen::error::EmitError::UnbindableIntrinsic { intrinsic: 7 })
+        grouped.contains(
+            "const device float* score_planes = \
+             reinterpret_cast<const device float*>(lane.attn_score_base);"
         ),
-        "the grouped path binds no per-intrinsic buffer and must still refuse: {grouped:?}"
+        "the grouped gather does not read the lane record's score base"
+    );
+    assert!(
+        !grouped.contains("score_planes = reinterpret_cast<const device float*>(lane.logits_base)"),
+        "the grouped gather reaches the score rectangle off the READOUT base, which is \
+         the mis-binding this door exists to prevent"
+    );
+    // The F32 arm, stated where the M2 form states it as an element width: a
+    // per-key mass is a probability a policy divides by, and reading the slab
+    // as `bfloat` would halve every plane into the next one's keys.
+    assert!(
+        grouped.contains("device float* score_out = reinterpret_cast<device float*>("),
+        "the grouped gather does not write the score rectangle as F32"
+    );
+    // A zero base is the absence of a captured block, and the device refuses
+    // it rather than dereferencing null — the guest-plane half of
+    // `program::session`'s third guard.
+    assert!(
+        grouped.contains("lane.attn_score_base == 0ul"),
+        "the grouped gather does not refuse an unbound score base"
     );
 }

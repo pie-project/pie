@@ -45,10 +45,10 @@ use crate::executor::arena::{ArenaBacking, ArenaSpan, TileMapOp};
 use crate::executor::sink::TensorSink;
 use crate::plan::index::{PlanIndex, instr_by_id};
 use crate::plan::{
-    CONVERT_TILE_MAP_MASK, DestExtent, Extent, LoadPlan, SourceExtent, StorageInstr, TileMapKind,
-    TransformSpec,
+    CONVERT_TILE_MAP_MASK, DestExtent, Extent, GatherSpec, LoadPlan, SourceExtent, StorageInstr,
+    TileMapKind, TransformSpec,
 };
-use crate::types::{BufferId, DType, Encoding, QuantScheme};
+use crate::types::{BufferId, DType, Encoding, QuantScheme, RepackLayout, TILED_BAND, TILED_STEP};
 
 #[derive(Debug, Clone)]
 enum BufferLoc {
@@ -197,7 +197,8 @@ fn last_uses(plan: &LoadPlan) -> Result<HashMap<BufferId, usize>, Error> {
             StorageInstr::Allocate { buffer, .. } | StorageInstr::Fill { buffer, .. } => {
                 touch(*buffer);
             }
-            StorageInstr::ExtentWrite { dest, .. } => touch(dest.buffer),
+            StorageInstr::ExtentWrite { dest, .. }
+            | StorageInstr::GatherWrite { dest, .. } => touch(dest.buffer),
             StorageInstr::BulkExtentWrite { .. } => {}
             StorageInstr::TileMap {
                 inputs,
@@ -1012,7 +1013,8 @@ impl Walk<'_, '_> {
             // after its work is done.
             let consumed = match &instr {
                 StorageInstr::ExtentWrite { source, .. }
-                | StorageInstr::BulkExtentWrite { source, .. } => source.span_bytes,
+                | StorageInstr::BulkExtentWrite { source, .. }
+                | StorageInstr::GatherWrite { source, .. } => source.span_bytes,
                 StorageInstr::TileMap { source, .. } => {
                     source.as_ref().map_or(0, |source| source.span_bytes)
                 }
@@ -1037,12 +1039,23 @@ impl Walk<'_, '_> {
                     if self.stream {
                         return Err(invalid(
                             "streaming execution has no persistent arena for this \
-                             BulkExtentWrite to target; run this plan through \
-                             execute_plan instead",
+                             BulkExtentWrite to target; compile the plan with \
+                             plan::compile_streaming, or give the execution an \
+                             arena",
                         ));
                     }
                     let bytes = self.read_extent(&source)?;
                     self.write_arena(dest_offset, &bytes)?;
+                }
+                StorageInstr::GatherWrite {
+                    source,
+                    dest,
+                    gather,
+                    ..
+                } => {
+                    let bytes = self.read_extent(&source)?;
+                    let permuted = permute(&bytes, &gather)?;
+                    self.write_extent(&dest, &permuted, &Extent::byte_run(permuted.len() as u64))?;
                 }
                 StorageInstr::TileMap { .. } => self.tile_map(&instr)?,
                 StorageInstr::CreateView {
@@ -1294,6 +1307,11 @@ impl Walk<'_, '_> {
             TileMapKind::Decode => {
                 self.decode_bytes(outputs.first().copied(), &input, &transform)?
             }
+            // **THE ONLY EXECUTOR A REPACK HAS.** No device mask carries the
+            // bit, so this arm is not the host fallback the ones above it
+            // are — it is where the transform runs, at `pie model import`,
+            // once per plane.
+            TileMapKind::Repack => self.repack_bytes(&input, &transform)?,
             // Encode is the one transform with more than one output — the
             // payload and the scale (and zero-point) tensors it cannot be
             // read without — so both arms write their own buffers and return
@@ -1342,7 +1360,10 @@ impl Walk<'_, '_> {
             // mismatch is a bug worth catching.
             if kind == TileMapKind::Cast {
                 require_same_element_count(source_stride, &dest.stride)?;
-            } else if transform.scale_blocks.is_empty() && kind != TileMapKind::Decode {
+            } else if transform.scale_blocks.is_empty()
+                && kind != TileMapKind::Decode
+                && kind != TileMapKind::Repack
+            {
                 require_same_byte_count(source_stride, &dest.stride)?;
             }
             if !dest.stride.has_dense_destination() {
@@ -1521,6 +1542,140 @@ impl Walk<'_, '_> {
     /// The operand is always a plain float buffer — a quantized operand was
     /// refused before a plan existed, at both ranks: the per-block `Scale`
     /// before a per-block `Bias` is what turned codes into numbers.
+    /// **THE REPACK, ON THE HOST** — the permutation
+    /// `kernels_cuda::linear::tiled`'s two relabelling passes write, computed
+    /// here because this is where a repack runs.
+    ///
+    /// The invariant every lowerable transform is held to is that it has a
+    /// host implementation (`plan::passes::tile`'s
+    /// `every_transform_a_backend_may_lower_has_a_host_implementation`), and
+    /// for this one the host is not a fallback: no device mask carries
+    /// `Repack`, so this is the ONLY executor it has. `pie model import`
+    /// compiles against `CONVERT_TILE_MAP_MASK`, reaches here once per plane,
+    /// and the artifact it writes holds the repacked bytes.
+    ///
+    /// **IT IS A GATHER AND NOTHING ELSE.** No arithmetic touches a code or a
+    /// factor: an output word is eight input nibbles shifted into place, and
+    /// an output factor is one input factor moved. That is what makes it
+    /// legal under serve-as-stored — the served row is the stored row — and
+    /// it is what lets the golden be an exact round trip rather than a
+    /// tolerance.
+    ///
+    /// The two marlin layouts are NOT implemented here and say so: they are
+    /// the `native_mxfp4_moe` device path's, no plan in this tree lowers one
+    /// to the host, and a permutation written from a banner nobody runs is a
+    /// second answer waiting to disagree with the first.
+    fn repack_bytes(&self, bytes: &[u8], transform: &TransformSpec) -> Result<Vec<u8>, Error> {
+        let spec = transform
+            .repack
+            .ok_or_else(|| invalid("a Repack instruction carries no layout"))?;
+        let (rows, cols) = (spec.source_rows as usize, spec.source_cols as usize);
+        let (target_rows, target_cols) = (spec.target_rows as usize, spec.target_cols as usize);
+        match spec.layout {
+            RepackLayout::TiledAffineU4Weight => {
+                if target_cols != cols {
+                    return Err(invalid(format!(
+                        "TiledAffineU4Weight Repack pads columns ({cols} -> {target_cols}), \
+                         and the fragment map has no column padding"
+                    )));
+                }
+                let row_bytes = cols / 2;
+                if bytes.len() < rows * row_bytes {
+                    return Err(invalid(format!(
+                        "TiledAffineU4Weight Repack reads {rows} rows of {row_bytes} bytes \
+                         from a {}-byte operand",
+                        bytes.len()
+                    )));
+                }
+                // Word `lane` of tile `(band, k tile)` holds, at nibble
+                // `s + 4h`, the code at `k = 16*kt + 2*(lane%4) + 8*(s&1) + h`
+                // and `n = 16*band + lane/4 + 8*(s>=2)`; four k tiles are
+                // grouped as one lane's `uint4`, so the word order is
+                // `[band][k quad][lane][4]`. This is `tiled.cuh`'s
+                // `repack_affine_tiled` read off its banner, which is where
+                // the golden's un-repack is read from too.
+                let band = TILED_BAND as usize;
+                let quad = (TILED_STEP / TILED_BAND) as usize;
+                let bands = target_rows / band;
+                let k_tiles = cols / band;
+                let quads = k_tiles / quad;
+                let mut out = vec![0u8; target_rows * row_bytes];
+                let mut at = 0usize;
+                for b in 0..bands {
+                    for kq in 0..quads {
+                        for lane in 0..32usize {
+                            for word in 0..quad {
+                                let kt = kq * quad + word;
+                                let col_of = lane / 4;
+                                let k_base = kt * band + 2 * (lane % 4);
+                                let mut res = 0u32;
+                                for s in 0..4usize {
+                                    let col = b * band + col_of + usize::from(s >= 2) * 8;
+                                    let k_off = usize::from(s % 2 == 1) * 8;
+                                    for h in 0..2usize {
+                                        if col >= rows {
+                                            continue;
+                                        }
+                                        let kk = k_base + k_off + h;
+                                        let byte = bytes[col * row_bytes + kk / 2];
+                                        let code = if kk % 2 == 0 {
+                                            u32::from(byte & 0xF)
+                                        } else {
+                                            u32::from(byte >> 4)
+                                        };
+                                        res |= code << (4 * (s + 4 * h));
+                                    }
+                                }
+                                out[at * 4..at * 4 + 4].copy_from_slice(&res.to_le_bytes());
+                                at += 1;
+                            }
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            RepackLayout::TiledAffineFactor => {
+                if target_cols != cols {
+                    return Err(invalid(format!(
+                        "TiledAffineFactor Repack pads groups ({cols} -> {target_cols}), \
+                         and a band's padding is rows and not groups"
+                    )));
+                }
+                // `[n][group]` becomes `[n band][group][16]`, which is a
+                // transpose of the (column, group) rectangle inside each band
+                // — the sixteen columns of a band adjacent, so a lane's two
+                // (eight apart) are one short run. A band's columns past `n`
+                // are a zero factor, which with the zero code above makes the
+                // padded weight exactly zero.
+                const FACTOR: usize = 2;
+                if bytes.len() < rows * cols * FACTOR {
+                    return Err(invalid(format!(
+                        "TiledAffineFactor Repack reads {rows} rows of {cols} two-byte \
+                         factors from a {}-byte operand",
+                        bytes.len()
+                    )));
+                }
+                let band = TILED_BAND as usize;
+                let mut out = vec![0u8; target_rows * cols * FACTOR];
+                for (at, slot) in out.chunks_exact_mut(FACTOR).enumerate() {
+                    let j = at % band;
+                    let rest = at / band;
+                    let g = rest % cols;
+                    let row = rest / cols * band + j;
+                    if row < rows {
+                        let from = (row * cols + g) * FACTOR;
+                        slot.copy_from_slice(&bytes[from..from + FACTOR]);
+                    }
+                }
+                Ok(out)
+            }
+            other => Err(invalid(format!(
+                "host storage executor does not implement the {other:?} Repack layout; it \
+                 is the mxfp4 MoE device path's, and no plan in this tree lowers one here"
+            ))),
+        }
+    }
+
     fn bias_bytes(
         &self,
         source: Option<&SourceExtent>,
@@ -2333,6 +2488,55 @@ fn resolve_range(
         return Err(invalid("buffer range is out of bounds"));
     }
     Ok((root, base + extra_offset, len))
+}
+
+/// Walk a [`GatherSpec`]'s table over `bytes`, one block at a time.
+///
+/// This is the whole of the gather lowering's execution, and it is deliberately
+/// the dullest function in the file. The table was compiled by
+/// `contract::compile`, priced by `contract::compile::Lowering::cost`, and
+/// checked by `plan::verify`; all that is left is the copy, on the host, while
+/// the bytes are between the file and the device they are staged into. A
+/// `[768, 1536]` bf16 bank is 2.3 MB moved once against a load measured in
+/// gigabytes.
+///
+/// Rows are the axes outside the gathered one, and they share one table — which
+/// is why a permutation of 1.18M elements is 1536 numbers and a loop.
+fn permute(bytes: &[u8], gather: &GatherSpec) -> Result<Vec<u8>, Error> {
+    let block = checked_usize(gather.block_bytes)?;
+    let rows = checked_usize(gather.rows)?;
+    let src_row = checked_usize(gather.src_row_bytes)?;
+    let dst_row = checked_usize(gather.dst_row_bytes())?;
+    let total = rows
+        .checked_mul(dst_row)
+        .ok_or_else(|| invalid("gather output size overflow"))?;
+    if rows.saturating_mul(src_row) > bytes.len() {
+        return Err(invalid(format!(
+            "gather reads {} bytes of a {}-byte source",
+            rows.saturating_mul(src_row),
+            bytes.len()
+        )));
+    }
+    let mut out = vec![0u8; total];
+    for (at, index) in gather.indices.iter().enumerate() {
+        let index = usize::try_from(*index)
+            .map_err(|_| invalid(format!("gather index {index} is negative")))?;
+        let src = index
+            .checked_mul(block)
+            .ok_or_else(|| invalid("gather source offset overflow"))?;
+        if src + block > src_row {
+            return Err(invalid(format!(
+                "gather index {index} reads past the end of a {src_row}-byte row"
+            )));
+        }
+        let dst = at * block;
+        for row in 0..rows {
+            let from = row * src_row + src;
+            let to = row * dst_row + dst;
+            out[to..to + block].copy_from_slice(&bytes[from..from + block]);
+        }
+    }
+    Ok(out)
 }
 
 fn gather_strided(raw: Vec<u8>, extent: &Extent) -> Result<Vec<u8>, Error> {
@@ -3879,6 +4083,208 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// **A DEVICE-TARGETED PLAN CAN BE STREAMED — BY BEING COMPILED FOR IT.**
+    ///
+    /// The refusal above this one is real and stays: `BulkExtentWrite`
+    /// addresses an arena by offset and a streaming execution has none. What
+    /// changes is that a caller who wants the device's plan and the host's
+    /// memory shape no longer has to choose between them. It compiles the same
+    /// contract against the same backend through
+    /// [`crate::plan::compile_streaming`], which runs the pipeline without the
+    /// two passes that exist to serve the arena, and gets a schedule the
+    /// streaming residency can run.
+    ///
+    /// ```text
+    ///  1. shaped    -> the ordinary CUDA plan carries `BulkExtentWrite`s and
+    ///                  the streaming one carries none
+    ///  2. refused   -> streaming the ordinary one still fails, and the
+    ///                  sentence says what to do about it
+    ///  3. identical -> the streaming run of the streaming plan publishes the
+    ///                  same tensors, byte for byte, as the arena run of the
+    ///                  ordinary one — which is the whole correctness claim,
+    ///                  because a load's artifact is a function of what its
+    ///                  sink was handed
+    ///  4. freed     -> and it is not the same plan with the instruction
+    ///                  renamed: the hoist that emits those writes also pulls
+    ///                  every `Allocate` to the head of the schedule, and
+    ///                  under that arrangement "freed at its last use" frees
+    ///                  nothing until the whole model is live at once. The
+    ///                  streaming plan finalizes its first tensor before it
+    ///                  allocates its last buffer.
+    /// ```
+    #[test]
+    fn a_device_plan_compiled_for_streaming_runs_without_an_arena() {
+        use crate::contract::{Expr, ModelContract, TensorContract};
+        use crate::file::{File, Metadata, RawTensor};
+        use crate::types::BackendKind;
+
+        let dir = std::env::temp_dir().join(format!(
+            "pie_streaming_device_plan_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Three dense passthroughs and one cast, so the plan carries both the
+        // writes the coalescer rewrites and a transform it must leave alone.
+        let header = r#"{"a":{"dtype":"U8","shape":[64],"data_offsets":[0,64]},"#.to_string()
+            + r#""b":{"dtype":"U8","shape":[64],"data_offsets":[64,128]},"#
+            + r#""c":{"dtype":"F16","shape":[8],"data_offsets":[128,144]},"#
+            + r#""d":{"dtype":"U8","shape":[64],"data_offsets":[144,208]}}"#;
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(header.as_bytes());
+        let data_offset = file.len() as u64;
+        file.extend((0..64u8).map(|byte| byte.wrapping_mul(3).wrapping_add(1)));
+        file.extend((0..64u8).map(|byte| byte.wrapping_mul(5).wrapping_add(2)));
+        for value in 0..8u16 {
+            let element = half::f16::from_f32(f32::from(value) + 0.5);
+            file.extend_from_slice(&element.to_bits().to_le_bytes());
+        }
+        file.extend((0..64u8).map(|byte| byte.wrapping_mul(7).wrapping_add(3)));
+        let size_bytes = file.len() as u64;
+        std::fs::write(dir.join("model.safetensors"), &file).unwrap();
+
+        let raw = |id: u32, name: &str, at: u64, span: u64, shape: Vec<i64>, encoding| RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: data_offset + at,
+            span_bytes: span,
+            shape,
+            encoding,
+        };
+        let metadata = Metadata {
+            files: vec![File {
+                id: FileId(0),
+                path: "model.safetensors".to_string(),
+                size_bytes,
+                format: crate::types::CheckpointFormat::Safetensors,
+            }],
+            tensors: vec![
+                raw(0, "a", 0, 64, vec![64], Encoding::Raw(DType::U8)),
+                raw(1, "b", 64, 64, vec![64], Encoding::Raw(DType::U8)),
+                raw(2, "c", 128, 16, vec![8], Encoding::Raw(DType::F16)),
+                raw(3, "d", 144, 64, vec![64], Encoding::Raw(DType::U8)),
+            ],
+        };
+        let contract = ModelContract {
+            alignment: 1,
+            tensors: vec![
+                TensorContract::new("w_a", Expr::src("a"), vec![64], Encoding::Raw(DType::U8)),
+                TensorContract::new("w_b", Expr::src("b"), vec![64], Encoding::Raw(DType::U8)),
+                TensorContract::new(
+                    "w_c",
+                    Expr::src("c").cast(Encoding::Raw(DType::Bf16)),
+                    vec![8],
+                    Encoding::Raw(DType::Bf16),
+                ),
+                TensorContract::new("w_d", Expr::src("d"), vec![64], Encoding::Raw(DType::U8)),
+            ],
+            groups: Vec::new(),
+        };
+
+        let target = StorageTarget::for_backend(BackendKind::Cuda, 0, 1);
+        let arena_plan = crate::plan::compile(&metadata, &contract, target.clone()).unwrap();
+        let stream_plan = crate::plan::compile_streaming(&metadata, &contract, target).unwrap();
+
+        // ── (1) THE TWO SHAPES.
+        let bulk = |plan: &LoadPlan| {
+            plan.instrs
+                .iter()
+                .filter(|instr| matches!(instr, StorageInstr::BulkExtentWrite { .. }))
+                .count()
+        };
+        assert!(
+            bulk(&arena_plan) > 0,
+            "a CUDA-targeted plan coalesces its dense persistent writes, or this \
+             test is not testing the thing it names"
+        );
+        assert_eq!(
+            bulk(&stream_plan),
+            0,
+            "the streaming pipeline leaves the coalescer out, so nothing addresses \
+             an arena by offset"
+        );
+        assert!(
+            !stream_plan
+                .passes
+                .iter()
+                .any(|pass| pass.pass == "coalesce-persistent-arena-writes"
+                    || pass.pass == "hoist-bulk-arena-writes"),
+            "and it says so in the passes it ran: {:?}",
+            stream_plan.passes.iter().map(|pass| &pass.pass).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            arena_plan.passes.len(),
+            stream_plan.passes.len() + 2,
+            "and it leaves out exactly those two"
+        );
+
+        // ── (2) THE REFUSAL THE OTHER PLAN STILL EARNS.
+        let mut refused = MemorySink::default();
+        let error = Execution::new(&arena_plan, &dir)
+            .streaming()
+            .sink(&mut refused)
+            .run()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no persistent arena") && error.contains("compile_streaming"),
+            "{error}"
+        );
+
+        // ── (3) AND THE SAME BYTES OUT OF BOTH.
+        let mut arena = vec![0u8; arena_plan.memory.arena_bytes() as usize];
+        let mut landed = MemorySink::default();
+        Execution::new(&arena_plan, &dir)
+            .arena(&mut &mut arena[..])
+            .sink(&mut landed)
+            .run()
+            .unwrap();
+        let mut streamed = MemorySink::default();
+        Execution::new(&stream_plan, &dir)
+            .streaming()
+            .sink(&mut streamed)
+            .run()
+            .unwrap();
+        assert_eq!(
+            streamed.tensors, landed.tensors,
+            "the arena is where the bytes waited, never what they were"
+        );
+        assert_eq!(streamed.tensors.len(), 4);
+        assert_eq!(
+            streamed.tensors["w_a"],
+            (0..64u8).map(|byte| byte.wrapping_mul(3).wrapping_add(1)).collect::<Vec<_>>()
+        );
+
+        // ── (4) AND A SCHEDULE THAT CAN FREE AS IT GOES.
+        let positions = |plan: &LoadPlan, want: fn(&StorageInstr) -> bool| -> Vec<usize> {
+            plan.schedule
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| want(instr_by_id(&plan.instrs, **id).unwrap()))
+                .map(|(at, _)| at)
+                .collect()
+        };
+        let allocates = |instr: &StorageInstr| matches!(instr, StorageInstr::Allocate { .. });
+        let finalizes = |instr: &StorageInstr| matches!(instr, StorageInstr::Finalize { .. });
+        assert!(
+            positions(&arena_plan, allocates).iter().max().unwrap()
+                < positions(&arena_plan, finalizes).iter().min().unwrap(),
+            "the hoist puts every Allocate ahead of every Finalize — which is what \
+             makes streaming this plan hold the whole model at once even where the \
+             instruction it refuses is not the problem"
+        );
+        assert!(
+            positions(&stream_plan, finalizes).iter().min().unwrap()
+                < positions(&stream_plan, allocates).iter().max().unwrap(),
+            "and the streaming plan publishes its first tensor before it allocates \
+             its last buffer, which is the property the freeing rests on"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     fn fixture() -> (PathBuf, LoadPlan) {
         let dir = std::env::temp_dir().join(format!(
             "pie_host_storage_{}_{}",
@@ -3990,7 +4396,6 @@ mod tests {
                 outputs: vec![BufferId(1)],
                 tile: TileSpec {
                     max_tile_bytes: 2,
-                    rows_per_tile: 0,
                 },
                 transform: TransformSpec::default(),
             },

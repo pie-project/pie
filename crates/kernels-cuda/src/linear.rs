@@ -19,6 +19,11 @@ pub mod mlp;
 
 pub mod moe;
 
+/// The router that reads no logits: `linear.moe_hash_route`, a per-token
+/// LOOKUP where its neighbours score a gate. Its own module because its
+/// device text is its own unit, for the reason that file states.
+pub mod moe_route;
+
 pub mod fp8;
 
 pub mod kquant;
@@ -26,3 +31,6 @@ pub mod kquant;
 pub mod nvfp4;
 
 pub mod quant;
+
+/// The tiled tensor-core reading of `quant`'s post-affine form (§J4).
+pub mod tiled;

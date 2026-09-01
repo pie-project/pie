@@ -170,6 +170,50 @@ instantiate_rms_strided_head_row(bfloat16, bfloat, 4)
 
 instantiate_rms_single_row(bfloat16, bfloat, 4)
 
+// The hyper-connection norm (`norm.cuh`'s `rmsnorm_grouped_plus_one`): the
+// moments are per `axis_size`-wide group, exactly as `rms_single_row` already
+// takes them, and the ONE thing that differs is where the gain comes from.
+// `rms_single_row` reads one `axis_size`-wide weight plane and shares it
+// across every group of the row; this one gives each group its OWN plane, so
+// the bank is `groups * axis_size` wide and the group picks its slice.
+//
+// The flattening is `rms_single_row`'s: one threadgroup per (row, group), laid
+// out `rows x groups`, so `gid % groups` is the group and the weight plane
+// moves with it while the data pointer does not care which is which.
+template <typename T, int N_READS>
+[[kernel]] void rms_grouped_row(
+    const device T* x          [[buffer(0)]],
+    const device T* w          [[buffer(1)]],
+    device T* out              [[buffer(2)]],
+    const constant float& eps  [[buffer(3)]],
+    const constant uint& axis_size [[buffer(4)]],
+    const constant uint& w_stride  [[buffer(5)]],
+    const constant uint& plus_one  [[buffer(6)]],
+    const constant float& gain     [[buffer(7)]],
+    const constant uint& groups    [[buffer(8)]],
+    uint gid                   [[threadgroup_position_in_grid]],
+    uint lid                   [[thread_position_in_threadgroup]],
+    uint simd_lane             [[thread_index_in_simdgroup]],
+    uint simd_group            [[simdgroup_index_in_threadgroup]],
+    uint tg_size               [[threads_per_threadgroup]]) {
+  threadgroup float inv_rms[1], partials[32];
+  rms_row_body<T, N_READS>(
+      x, w + size_t(gid % groups) * size_t(axis_size) * size_t(w_stride), out,
+      eps, axis_size, w_stride, plus_one, gain,
+      size_t(gid) * size_t(axis_size),
+      inv_rms, partials, lid, simd_lane, simd_group, tg_size);
+}
+
+#define instantiate_rms_grouped_row(name, itype, n_reads)              \
+  template [[host_name("rms_grouped_row_" #name)]] [[kernel]] void      \
+  rms_grouped_row<itype, n_reads>(                                      \
+      const device itype*, const device itype*, device itype*,          \
+      const constant float&, const constant uint&, const constant uint&, \
+      const constant uint&, const constant float&, const constant uint&, \
+      uint, uint, uint, uint, uint);
+
+instantiate_rms_grouped_row(bfloat16, bfloat, 4)
+
 template <typename T, int N_READS, bool SCALED>
 METAL_FUNC void rms_residual_impl(
     const device T* x,

@@ -394,6 +394,24 @@ impl Region {
     }
 }
 
+/// What the grouped form answered for one region.
+///
+/// **A DECLINE CARRIES ITS REASON, AND IT DID NOT USED TO.** The single-lane
+/// refusal this feeds ends `…and the grouped form could not serve it either`,
+/// which was a CONSTANT: the sentence was printed whether the planner had
+/// refused the stage, the emitter had refused the region, the table had no
+/// kernel at the slot this shell reads, or the pipeline was too narrow for a
+/// library sampler. Four different doors behind one sentence, and the metal
+/// verify queue spent two sessions attributing `trackb-h2o`'s decline to the
+/// wrong one. The reason is a `String` rather than an enum because its only
+/// consumer is that message — nothing branches on which door it was.
+enum GroupedAnswer {
+    /// The grouped kernel compiled; this is it.
+    Served(Region),
+    /// It did not, and this is the clause the caller's refusal appends.
+    Declined(String),
+}
+
 /// One compiled stage: every generated region it declares, in region order.
 ///
 /// Shared rather than owned: two programs naming the same stage share one
@@ -641,11 +659,14 @@ impl Cache {
             //    [`KERNEL_GROUPED`]. Everything else stays on the M2 kernel
             //    byte for byte: an existing green region is not moved onto a
             //    second ABI to buy nothing.
-            if let Some(region) = self.grouped_region(context, stage_index, region_index, plan, index)?
-            {
-                regions.push(region);
-                continue;
-            }
+            let grouped_declined =
+                match self.grouped_region(context, stage_index, region_index, plan, index)? {
+                    GroupedAnswer::Served(region) => {
+                        regions.push(region);
+                        continue;
+                    }
+                    GroupedAnswer::Declined(why) => why,
+                };
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
                 Slot::Kernel { source, entry } => (source, entry),
                 // NOT a `continue`. "The host declined on purpose" presumes a
@@ -661,8 +682,8 @@ impl Cache {
                         reason: format!(
                             "stage {stage_index} region {region_index} was declined by the \
                              emitter ({why}), and the grouped form could not serve it \
-                             either; this shell runs only compiled regions, so a declined \
-                             one would silently not run at all"
+                             either ({grouped_declined}); this shell runs only compiled \
+                             regions, so a declined one would silently not run at all"
                         ),
                     });
                 }
@@ -734,12 +755,26 @@ impl Cache {
     /// library one alone. It used to be both, and that cost `beam_epilogue`
     /// its widest region — a 67-op kernel measures 384 on an M1 Max.
     ///
+    /// **AND THE SCORE RECTANGLE IS ON THIS ROAD NOW, NOT OFF IT.** This
+    /// paragraph used to end by naming a region reading the F32 score plane
+    /// as the example of a decline: `m3_intrinsic_bindable` refused
+    /// `AttnScore`, because a grouped kernel reads every rectangle as an
+    /// ADDRESS off the lane record and the record carried only
+    /// `logits_base`. It carries `attn_score_base` now (emitter 42), the two
+    /// intrinsic tables agree id for id, and that matters here rather than
+    /// only in the compiler: a score-reading region also has the LOWEST M2
+    /// ceiling there is — `fused_channel_ceiling` puts it at ten channels
+    /// instead of twelve — so the single-lane form is exactly what cannot
+    /// serve it, and this is the only path that can. `trackb-h2o` is the
+    /// shape that proves it; `eta-compiler`'s
+    /// `the_score_rectangle_beside_many_channels` pins the compiler's half.
+    ///
     /// # Errors
     ///
     /// Whatever the compile said. A REFUSAL is not an error: it answers
-    /// `None` and the caller takes the single-lane path, which is what a
-    /// region reading the F32 score rectangle does (`m3_intrinsic_bindable`
-    /// declines it, and the M2 slot table has an index for it).
+    /// [`GroupedAnswer::Declined`] with the reason, and the caller takes the
+    /// single-lane path — appending that reason if the single-lane form has
+    /// no kernel either.
     fn grouped_region(
         &mut self,
         context: &Context,
@@ -747,9 +782,21 @@ impl Cache {
         region_index: u32,
         plan: &LaunchStagePlan,
         index: &Emitted<'_>,
-    ) -> std::result::Result<Option<Region>, Failure> {
+    ) -> std::result::Result<GroupedAnswer, Failure> {
         if !plan.needs.grouped_valid {
-            return Ok(None);
+            // The planner's own words when it has them: `LaunchStagePlan`
+            // sets `error` and clears the bit together, and a plan that
+            // cleared the bit with nothing to say is itself worth seeing.
+            return Ok(GroupedAnswer::Declined(if plan.error.is_empty() {
+                "the plan says the grouped path cannot cover this stage, and states \
+                 no reason"
+                    .to_string()
+            } else {
+                format!(
+                    "the plan says the grouped path cannot cover this stage: {}",
+                    plan.error
+                )
+            }));
         }
         let region = plan.fused.get(region_index as usize);
         let library = matches!(
@@ -768,7 +815,12 @@ impl Cache {
             })
         });
         if !(library || refused || gathers) {
-            return Ok(None);
+            return Ok(GroupedAnswer::Declined(
+                "this shell keeps a region on the single-lane form unless the grouped \
+                 one buys something: a library sampler, a refusal to route around, or \
+                 an intrinsic gather. This region is none of the three"
+                    .to_string(),
+            ));
         }
         // The grouped table names a fused region at `singleton.len() + i`,
         // because the singleton partition's regions take the low indices of
@@ -782,10 +834,42 @@ impl Cache {
             .and_then(|offset| offset.checked_add(region_index))
         {
             Some(slot) => slot,
-            None => return Ok(None),
+            None => {
+                return Ok(GroupedAnswer::Declined(format!(
+                    "the grouped slot index overflows: {} singleton regions plus \
+                     region {region_index}",
+                    plan.singleton.len()
+                )));
+            }
         };
-        let Slot::Kernel { source, entry } = index.get(KERNEL_GROUPED, stage_index, slot) else {
-            return Ok(None);
+        let (source, entry) = match index.get(KERNEL_GROUPED, stage_index, slot) {
+            Slot::Kernel { source, entry } => (source, entry),
+            // **NAMED, BECAUSE THE THREE ARE DIFFERENT BUGS.** A refusal is
+            // the emitter's own sentence and belongs to the compiler; an
+            // absence at this slot with kernels present at others is the
+            // `singleton.len()` offset disagreeing between the two sides
+            // (`program_parity`'s `the_grouped_table_names_a_fused_region_
+            // where_this_shell_looks` is the standing check); a malformed one
+            // is a table built with neither half.
+            Slot::Refused(why) => {
+                return Ok(GroupedAnswer::Declined(format!(
+                    "the grouped emitter declined it too ({why})"
+                )));
+            }
+            Slot::Absent => {
+                return Ok(GroupedAnswer::Declined(format!(
+                    "the emitted table has no grouped kernel at (stage {stage_index}, \
+                     region {slot}), which is where this shell reads a fused region's \
+                     grouped form — {} singleton regions plus region {region_index}",
+                    plan.singleton.len()
+                )));
+            }
+            Slot::Malformed => {
+                return Ok(GroupedAnswer::Declined(format!(
+                    "the grouped kernel at (stage {stage_index}, region {slot}) was \
+                     emitted with neither a source nor a reason for declining"
+                )));
+            }
         };
         let module = self.region_module(context, entry, source)?;
         #[cfg(target_vendor = "apple")]
@@ -793,9 +877,14 @@ impl Cache {
             // Compiled and dropped. A rare enough answer that carrying a
             // second cache tier for it would be a table nobody reads, and the
             // caller's fallback compiles the M2 kernel this pipeline can run.
-            return Ok(None);
+            return Ok(GroupedAnswer::Declined(format!(
+                "the grouped library sampler opens by declining any width but \
+                 {}, and this pipeline's own limit is {}",
+                super::launch::LIBRARY_SAMPLER_THREADS,
+                module.max_threads()
+            )));
         }
-        Ok(Some(Region {
+        Ok(GroupedAnswer::Served(Region {
             region_index,
             form: if library {
                 Form::GroupedLibrary

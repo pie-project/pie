@@ -36,8 +36,8 @@
 //!
 //! 1. **identity** — one prefill and sixteen greedy decodes, eager then
 //!    bodies-on, ONE load, byte-identical tokens.
-//! 2. **it was a body** — `BodyStats::captures >= 1` and
-//!    `BodyStats::hits >= 1`, so the diff is not eager against eager. A
+//! 2. **it was a body** — `BodyTally::captures >= 1` and
+//!    `BodyTally::hits >= 1`, so the diff is not eager against eager. A
 //!    steady decode stream presents one composition, so the second decode
 //!    fire captures it (`record::WARM_FIRES`) and every fire after replays
 //!    it. **`captures` ALONE IS NOT EVIDENCE ON AN ARMED LOAD** — the boot's
@@ -49,15 +49,15 @@
 //!    prefill-only and mixed — before it serves anything, and then SEALS the
 //!    map. So the first fire of each of those shapes REPLAYS rather than
 //!    capturing, and no fire past the load records a graph at all.
-//!    `BodyStats::armed_at_load` says how many keys made it, `captures` must
+//!    `BodyTally::armed_at_load` says how many keys made it, `captures` must
 //!    not move afterwards, and `sealed_declines` is where a shape the boot
 //!    did not arm shows up.
-//! 4. **the limit is stated, not hidden** — `BodyStats::refusals` is printed,
+//! 4. **the limit is stated, not hidden** — `BodyTally::refusals` is printed,
 //!    and since the tier-2 campaign it counts something narrower than it
 //!    used to. A windowed region whose ops do not all read the staged seat's
 //!    START no longer refuses its composition: it is an `Admit::Island`, the
 //!    body is captured in SEGMENTS around it, and the island is re-issued
-//!    eagerly between the execs (`BodyStats::islands` is where that shows,
+//!    eagerly between the execs (`LastCapture::islands` is where that shows,
 //!    and `an_island_body_replays_at_another_split.rs` is its gate). What
 //!    `refusals` counts now is a key no cut can rescue: an artifact with two
 //!    row axes, or a composition whose islands, GROWN to their nearest legal
@@ -96,7 +96,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use engine_cuda::record::BodyStats;
-use engine_cuda::{Boot, Graphs, Lane, Shell};
+use engine_cuda::{Boot, Graphs, Lane, Seated, Shell};
 use model_compiler::Budget;
 use model_dsl::{Classify, Platform, Request};
 
@@ -157,7 +157,87 @@ fn argmax(logits: &[f32]) -> u32 {
 
 /// The lane word the model's own `Classify` computes.
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+}
+
+/// **THE ADAPTER THE HYBRID DECODE GATE ROUTES TO.** Slot zero, because the
+/// arming pass's own synthetic for an adapted class binds slot zero too
+/// (`Shell::synthetic_lanes`: `self.corrected.contains(class).then_some(0)`) —
+/// a fire that named a different row would be asking a body captured over one
+/// bank's arithmetic to serve another's.
+const ADAPTER: u32 = 0;
+
+/// The same word with `Facts::has_adapter` set — the second decode class of
+/// this bake, and the one that makes a decode fire present two decode words.
+fn adapted_word(query_len: u32, adapted: bool) -> u64 {
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).adapted(adapted)).word()
+}
+
+/// A lane whose word is derived from the same fact the seat states — the
+/// standing rule and not a convenience: the word decides the CLASS and the
+/// seat carries the PAYLOAD, and a shell that found them disagreeing refuses
+/// the fire by name (`Fault::AdapterWord`).
+fn routed_seat<'a>(slot: u32, tokens: &'a [u32], adapter: Option<u32>) -> Seated<'a> {
+    let lane = Lane {
+        slot,
+        word: adapted_word(tokens.len() as u32, adapter.is_some()),
+        tokens,
+    };
+    Seated {
+        adapter,
+        ..Seated::of(lane)
+    }
+}
+
+/// **ONE ADAPTER, WRITTEN INTO EVERY BANK THE PLAN DECLARES**, with values
+/// large enough that the correction moves the logits it touches — a bank of
+/// zeros would register fine and prove nothing about the class it unlocks.
+///
+/// A copy of `an_island_body_replays_at_another_split`'s helper, which is the
+/// other file that has to reach an adapted class; the shell's own
+/// `register_adapter` is the only door either of them has and neither can lend
+/// a bank to the other across a test binary.
+fn register_loud(shell: &mut Shell, id: u32) {
+    let built: Vec<(String, Vec<u8>)> = shell
+        .banks()
+        .iter()
+        .map(|&(name, _, slot)| {
+            let count = usize::try_from(slot).expect("a slot fits this host") / 2;
+            let mut bytes = Vec::with_capacity(count * 2);
+            for at in 0..count {
+                let value = if name.ends_with(".lora_a") {
+                    0.20 - ((at % 5) as f32) * 0.07
+                } else {
+                    0.15 + ((at % 3) as f32) * 0.05
+                };
+                bytes.extend_from_slice(&bf16_bits(value).to_le_bytes());
+            }
+            (name.to_string(), bytes)
+        })
+        .collect();
+    assert!(
+        !built.is_empty(),
+        "this plan declares no adapter bank, so the second decode class is \
+         unreachable and the two-word fire this file makes cannot be composed"
+    );
+    let planes: Vec<engine_cuda::AdapterPlane<'_>> = built
+        .iter()
+        .map(|(bank, bytes)| engine_cuda::AdapterPlane {
+            bank: bank.as_str(),
+            bytes,
+        })
+        .collect();
+    shell
+        .register_adapter(id, &planes)
+        .unwrap_or_else(|why| panic!("registering adapter {id}: {why}"));
+}
+
+/// f32 to bf16, round-to-nearest-even — the loader's conversion, restated so
+/// the adapter registered is the one described.
+fn bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounding = 0x7fff + ((bits >> 16) & 1);
+    ((bits + rounding) >> 16) as u16
 }
 
 /// A loaded shell, or `None` and a sentence saying what was missing.
@@ -170,18 +250,29 @@ fn word(query_len: u32) -> u64 {
 /// that what they diff is one load's two arms — and the arming gate wants
 /// `true`.
 fn ready(what: &str, bodies: bool) -> Option<(Shell, tokenizer::Tokenizer)> {
-    ready_with(what, Graphs::On, bodies, 4, 4)
+    ready_with(what, Graphs::On, bodies, 4, 4, 0)
 }
 
 /// The same load with the deployment dials exposed — the growth gate below
 /// needs more seats than the siblings so the load can arm MORE THAN ONE
 /// rung, which is what makes slab growth happen between two captures.
+///
+/// **AND `adapters` IS A DIAL RATHER THAN A CONSTANT BECAUSE ONE CLAIM NEEDS
+/// A SECOND DECODE WORD** (the hybrid decode wave). This bake's decode
+/// classes are `1` (plain) and `3` (plain + `Facts::has_adapter`), so the
+/// composition `a_two_word_decode_fire_replays_from_the_load` fires cannot be
+/// staged at `max_adapters: 0` — a lane may not claim the adapter bit without
+/// a bank to route to (`Fault::AdapterWord`). It is a BAKE-time capacity
+/// check and feeds no other pass: it moves no window, no class, no order and
+/// no bucket, so every sibling below keeps its zero and keeps the load it
+/// always had.
 fn ready_with(
     what: &str,
     graphs: Graphs,
     bodies: bool,
     slots: u32,
     max_lanes: u32,
+    adapters: u32,
 ) -> Option<(Shell, tokenizer::Tokenizer)> {
     if !engine_cuda::device::present() {
         eprintln!("skipping {what}: no CUDA device on this machine");
@@ -201,11 +292,12 @@ fn ready_with(
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let trace = trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the SKU's import contract fits its own checkpoint");
+    let contract =
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+            .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let mut shell = Shell::load(Boot {
@@ -213,7 +305,10 @@ fn ready_with(
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
-        budget: Budget::new(max_lanes, 256),
+        budget: Budget {
+            max_adapters: adapters,
+            ..Budget::new(max_lanes, 256)
+        },
         patches: None,
         profile: None,
         page_size: 16,
@@ -227,7 +322,7 @@ fn ready_with(
             bodies,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         // The warm-boot weight artifact cache is off for a gate: a test that
         // shared one would be asserting about the last run.
@@ -329,13 +424,13 @@ fn a_fire_served_from_a_body_says_token_for_token_what_an_eager_fire_says() {
     );
 
     assert!(
-        bodies.captures >= 1,
+        bodies.tally.captures >= 1,
         "no body was ever captured, so this test compared the eager walk \
          against itself; refusals says whether the admissibility rule turned \
          every fire away: {bodies}"
     );
     assert!(
-        bodies.hits >= 1,
+        bodies.tally.hits >= 1,
         "a body was captured and never replayed, so nothing was served FROM \
          one and the seat went unread: {bodies}"
     );
@@ -454,18 +549,18 @@ fn a_load_that_states_the_word_arms_its_decode_bodies_before_it_serves_anything(
         "the boot stated `[engine] bodies` and the shell came up without it"
     );
     assert!(
-        armed.armed_at_load >= 1,
+        armed.tally.armed_at_load >= 1,
         "the load armed no decode body at all, so nothing below is testing \
          load-time arming; the boot line says how many rungs were wanted and \
          `refusals`/`declines` say what turned them away: {armed}"
     );
     assert_eq!(
-        armed.captures, armed.armed_at_load,
+        armed.tally.captures, armed.tally.armed_at_load,
         "an armed body is a captured one and nothing but the arming had run: \
          {armed}"
     );
     assert_eq!(
-        armed.hits, 0,
+        armed.tally.hits, 0,
         "the arming pass replayed something, which means a rung was fired \
          more times than the warm ladder asks for: {armed}"
     );
@@ -527,10 +622,10 @@ fn a_load_that_states_the_word_arms_its_decode_bodies_before_it_serves_anything(
     eprintln!("across the first decode fire: {after}");
     assert_eq!(
         (
-            after.hits - before.hits,
-            after.misses - before.misses,
-            after.reshapes - before.reshapes,
-            after.captures - before.captures,
+            after.tally.hits - before.tally.hits,
+            after.tally.misses - before.tally.misses,
+            after.tally.reshapes - before.tally.reshapes,
+            after.tally.captures - before.tally.captures,
         ),
         (1, 0, 0, 0),
         "the FIRST decode fire of a load-armed shell did not replay the body \
@@ -557,7 +652,7 @@ fn a_load_that_states_the_word_arms_its_decode_bodies_before_it_serves_anything(
     eprintln!("after {STEPS} decodes: {done}");
     eprintln!("continuation: {:?}", tokenizer.decode(&produced, false));
     assert_eq!(
-        done.misses, steady.misses,
+        done.tally.misses, steady.tally.misses,
         "a decode fire past the first one missed, so the armed body stopped \
          serving mid-stream: {done}"
     );
@@ -569,12 +664,12 @@ fn a_load_that_states_the_word_arms_its_decode_bodies_before_it_serves_anything(
     // the decode plan's every hashed field is a function of the `BodyKey` and
     // the load.
     assert_eq!(
-        done.reshapes, before.reshapes,
+        done.tally.reshapes, before.tally.reshapes,
         "the decode stream reshaped its body, so some hashed plan number is \
          still following the fire rather than the bucket: {done}"
     );
     assert_eq!(
-        done.hits - steady.hits,
+        done.tally.hits - steady.tally.hits,
         (STEPS - 1) as u64,
         "every decode fire past the first was supposed to be a hit: {done}"
     );
@@ -625,7 +720,7 @@ fn an_enumerated_load_arms_prefill_and_mixed_keys_and_then_captures_nothing() {
     // as their lane split moves — which would be this test failing on the
     // DEPLOYMENT rather than on the wave.
     let Some((mut shell, tokenizer)) =
-        ready_with("the enumerated arming gate", Graphs::On, true, 8, 16)
+        ready_with("the enumerated arming gate", Graphs::On, true, 8, 16, 0)
     else {
         return;
     };
@@ -645,14 +740,14 @@ fn an_enumerated_load_arms_prefill_and_mixed_keys_and_then_captures_nothing() {
     // decode rungs alone is the claim — a decode-only arming could not reach
     // it.
     assert!(
-        armed.armed_at_load > 2,
+        armed.tally.armed_at_load > 2,
         "the load armed {} bodies, which is at most its decode rungs — the \
          prefill and mixed enumeration did not run, or every key of it \
          refused. The boot line names which: {armed}",
-        armed.armed_at_load,
+        armed.tally.armed_at_load,
     );
     assert_eq!(
-        armed.captures, armed.armed_at_load,
+        armed.tally.captures, armed.tally.armed_at_load,
         "an armed body is a captured one and nothing but the arming had run: \
          {armed}"
     );
@@ -745,7 +840,7 @@ fn an_enumerated_load_arms_prefill_and_mixed_keys_and_then_captures_nothing() {
     let done = shell.body_stats();
     eprintln!("after the enumerated script: {done}");
     assert_eq!(
-        done.captures, armed.captures,
+        done.tally.captures, armed.tally.captures,
         "the serving path recorded a graph. Every capture on an enumerated \
          load belongs to `Shell::arm_bodies`, and the seal is what makes that \
          a property rather than a hope: {done}"
@@ -756,12 +851,106 @@ fn an_enumerated_load_arms_prefill_and_mixed_keys_and_then_captures_nothing() {
 /// the five numbers every claim in the gate above is made of.
 fn moved(before: &BodyStats, after: &BodyStats) -> (u64, u64, u64, u64, u64) {
     (
-        after.hits - before.hits,
-        after.misses - before.misses,
-        after.reshapes - before.reshapes,
-        after.captures - before.captures,
-        after.sealed_declines - before.sealed_declines,
+        after.tally.hits - before.tally.hits,
+        after.tally.misses - before.tally.misses,
+        after.tally.reshapes - before.tally.reshapes,
+        after.tally.captures - before.tally.captures,
+        after.tally.sealed_declines - before.tally.sealed_declines,
     )
+}
+
+/// **A DECODE FIRE THAT PRESENTS TWO DECODE WORDS REPLAYS FROM THE LOAD**
+/// (the hybrid decode wave, `serve::arming::ensemble_keys`) — the claim the
+/// arming enumeration's blind spot cost, stated where it bites.
+///
+/// # The blind spot
+///
+/// Every arm of the enumeration presented decode as a SINGLETON. `decode_keys`
+/// walks one decode class per rung; `mixed_keys` pairs a decode class with a
+/// NON-decode one; `fragmented_keys` walks the present sets that break a mask.
+/// So a bake with two decode words had no key for `{both}` — and on such a
+/// bake `{both}` is what a batched decode fire brings whenever the scheduler
+/// has one sequence of each word in flight, which for a steady stream is
+/// almost always. Past the seal every one of those fires walked eagerly and was
+/// counted in `sealed_declines`, for the life of the load. It was found on a
+/// `gemma4-e4b` load — a hybrid ATTENTION bake, whose sliding arm and full arm
+/// are two classes that both run `Attention::Decode` — reading
+/// `the sealed map holds no body for b256[c0:256 c1:256]`.
+///
+/// # Why THIS bake has two decode words, and why that is the same claim
+///
+/// Not a hybrid attention: this SKU's attention is uniform. Its two decode
+/// classes are `1` (plain, one row) and `3` (plain, one row, WITH an adapter)
+/// — `Facts::has_adapter` crossing `Facts::qo_one`, which is the other way a
+/// class table reaches two `Attention::Decode` masks. The composition is the
+/// same shape: one present set, two classes, both decode, one row per lane,
+/// and a `record::Ladder` with two rungs of `min(lane_ceiling, bucket)`. What
+/// the enumerator produces for it is what it produces for a hybrid attention
+/// bake, and the arm cannot tell the two apart — it reads `Shell::decoding`
+/// and nothing else. The `gemma4-e4b` SKU has no CI gate on this tree; this is
+/// where the claim rides.
+///
+/// # And it is `hits` that says it
+///
+/// The map is SEALED, so a key the boot did not arm cannot become a capture on
+/// the serving path: it walks and shows up as a `sealed_decline`. So a fire
+/// that replays on its FIRST arrival is a fire the load armed, and the three
+/// numbers below say which of the two happened.
+#[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
+fn a_two_word_decode_fire_replays_from_the_load() {
+    let _serial = serialized();
+    // One adapter bank's worth of capacity, which is what buys the right to
+    // compose class `3` at all — and four seats, so the one reachable rung is
+    // the lattice floor at four lanes and the ensemble arm splits it two and
+    // two.
+    let Some((mut shell, tokenizer)) =
+        ready_with("the hybrid decode gate", Graphs::On, true, 4, 4, 1)
+    else {
+        return;
+    };
+    let prompt = tokenizer.encode(PROMPT);
+    register_loud(&mut shell, ADAPTER);
+
+    let armed = shell.body_stats();
+    eprintln!("after load, before any fire: {armed}");
+    assert!(
+        armed.tally.armed_at_load >= 1,
+        "the boot armed nothing at all, so nothing below is about arming: {armed}"
+    );
+
+    // ── TWO SLOTS, PRIMED ONE WORD EACH. The prefills are ordinary fires and
+    //    are not what this test is about; what they buy is kv under each lane,
+    //    so that the fire below is a DECODE of two words rather than a prefill
+    //    of them.
+    for slot in 0..2u32 {
+        shell.open(slot).unwrap_or_else(|why| panic!("slot {slot} opens: {why}"));
+    }
+    let plain = shell
+        .fire_seated(&[routed_seat(0, &prompt, None)])
+        .expect("the plain prefill fires");
+    let routed = shell
+        .fire_seated(&[routed_seat(1, &prompt, Some(ADAPTER))])
+        .expect("the routed prefill fires");
+    let fed = [argmax(&plain[0]), argmax(&routed[0])];
+
+    // ── AND THE COMPOSITION THE DEFECT WAS ABOUT: one lane of each decode
+    //    word, one row each, in ONE fire.
+    let before = shell.body_stats();
+    let two = shell
+        .fire_seated(&[
+            routed_seat(0, &fed[..1], None),
+            routed_seat(1, &fed[1..], Some(ADAPTER)),
+        ])
+        .expect("the two-word decode fires");
+    let after = shell.body_stats();
+    assert_eq!(two.len(), 2, "a two-lane fire answers two lanes");
+    assert_eq!(
+        moved(&before, &after),
+        (1, 0, 0, 0, 0),
+        "the FIRST two-word decode fire of an armed load did not replay.          (hits, misses, reshapes, captures, sealed_declines) moved by {:?}. A          sealed decline is the defect itself: the enumeration armed each decode          word alone and never the pair, so this composition — which is what a          hybrid load's decode traffic IS — walks eagerly for the life of the          load. The boot line's `ensemble` column says whether the arm ran:          before {before} / after {after}",
+        moved(&before, &after),
+    );
 }
 
 /// **AND A LOAD THAT STANDS THE WORD DOWN ARMS NOTHING**, which is the other
@@ -774,9 +963,11 @@ fn moved(before: &BodyStats, after: &BodyStats) -> (u64, u64, u64, u64, u64) {
 /// `Shell::arm_bodies` is called unconditionally at the tail of every load and
 /// returns on its gate when `[engine] bodies` is stood down — no synthetic
 /// fire, no capture, no counter, and no boot line. (The gate has three more
-/// clauses and each returns the same way: a mode that records nothing, a
-/// multi-unit artifact, and a load whose weights rotate. This test states the
-/// first, which is the one a deployment chooses.) The counters are what a
+/// clauses and each returns the same way: a mode that records nothing, an
+/// artifact with more capture units than a `BodyKey` names — none today, since
+/// the key carries a lattice point per row axis — and a load whose weights
+/// rotate. This test states the first, which is the one a deployment
+/// chooses.) The counters are what a
 /// test can see, and they are the default value; a moving one would mean the
 /// load had fired something nobody asked it to.
 #[test]
@@ -852,7 +1043,7 @@ fn a_load_that_stands_the_word_down_arms_nothing_at_all() {
 /// **AND NEITHER WALL WOULD REFUSE THE COMPOSITION TODAY**, which is worth
 /// saying because it changes what a failure here MEANS. Since the tier-2
 /// campaign a region the rule turns away is an island: the body is cut around
-/// it and this fire would replay with `BodyStats::islands` nonzero. So the
+/// it and this fire would replay with `LastCapture::islands` nonzero. So the
 /// claim below is sharper than it was — this composition's every windowed
 /// region is on `SHIFTED` or `PLANNED` or empty, so its body should hold NO
 /// island, and a hit is the whole of what is owed.
@@ -927,7 +1118,7 @@ fn a_mixed_fire_says_at_one_split_what_the_eager_walk_says_at_another() {
     // never engaged, which is a different fault from a refusal and worth its
     // own sentence before the replay claim below.
     assert!(
-        bodies.captures >= 1,
+        bodies.tally.captures >= 1,
         "the bodies arm captured nothing at all, so it never reached the \
          mixed gate: {bodies}"
     );
@@ -945,7 +1136,7 @@ fn a_mixed_fire_says_at_one_split_what_the_eager_walk_says_at_another() {
     // whole claim. (The FIFTH round moves the row total too, and the
     // assertion under this one is that claim on its own.)
     assert!(
-        bodies.hits >= 1,
+        bodies.tally.hits >= 1,
         "no mixed replay: a composition whose every windowed region is on \
          `SHIFTED` or `PLANNED` was not served from a body. A refusal here \
          names a region this shell still will not shift — read it off the \
@@ -1053,8 +1244,8 @@ fn mixed(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, (u64, u64)) {
         if round + 1 == SPLITS.len() {
             let after = shell.body_stats();
             last = (
-                after.hits - before.hits,
-                after.reshapes - before.reshapes,
+                after.tally.hits - before.tally.hits,
+                after.tally.reshapes - before.tally.reshapes,
             );
         }
     }
@@ -1077,7 +1268,7 @@ fn mixed(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, (u64, u64)) {
 fn a_body_armed_before_the_slabs_grew_still_reads_its_own_scratch() {
     let _serial = serialized();
     let Some((mut eager, tokenizer)) =
-        ready_with("the growth gate's oracle", Graphs::Off, false, 16, 16)
+        ready_with("the growth gate's oracle", Graphs::Off, false, 16, 16, 0)
     else {
         return;
     };
@@ -1085,13 +1276,14 @@ fn a_body_armed_before_the_slabs_grew_still_reads_its_own_scratch() {
     let (eager_tokens, _) = run(&mut eager, &prompt);
     drop(eager);
 
-    let Some((mut shell, _)) = ready_with("the growth gate", Graphs::On, true, 16, 16) else {
+    let Some((mut shell, _)) = ready_with("the growth gate", Graphs::On, true, 16, 16, 0)
+    else {
         return;
     };
     let armed = shell.body_stats();
     eprintln!("after the wide load: {armed}");
     assert!(
-        armed.armed_at_load >= 3,
+        armed.tally.armed_at_load >= 3,
         "fewer than two rungs' worth of bodies armed, so no slab grew between \
          two captures and this gate is not testing growth-after-capture: {armed}"
     );
@@ -1102,7 +1294,7 @@ fn a_body_armed_before_the_slabs_grew_still_reads_its_own_scratch() {
     let after = shell.body_stats();
     eprintln!("after the smallest rung's stream: {after}");
     assert!(
-        after.hits >= 1,
+        after.tally.hits >= 1,
         "the smallest rung's fires never replayed, so nothing read a \
          pre-growth capture: {after}"
     );
@@ -1196,7 +1388,7 @@ fn a_split_inside_one_bucket_replays_and_a_split_across_one_is_a_second_key() {
     // the sixteen lanes step 4d can stage and leave the decode class behind it
     // with nothing.)
     let Some((mut shell, tokenizer)) =
-        ready_with("the ladder gate", Graphs::On, false, 8, 16)
+        ready_with("the ladder gate", Graphs::On, false, 8, 16, 0)
     else {
         return;
     };
@@ -1348,9 +1540,9 @@ fn laddered(
         }
         let after = shell.body_stats();
         let moved = (
-            after.hits - before.hits,
-            after.misses - before.misses,
-            after.reshapes - before.reshapes,
+            after.tally.hits - before.tally.hits,
+            after.tally.misses - before.tally.misses,
+            after.tally.reshapes - before.tally.reshapes,
         );
         if round == 3 {
             inside = moved;
@@ -1439,7 +1631,7 @@ fn the_shaped_walk_and_the_tiered_one_say_what_the_eager_walk_says() {
         tokenizer.decode(&shaped, false),
     );
     assert!(
-        bodies.hits >= 1,
+        bodies.tally.hits >= 1,
         "the tiered arm never replayed a body, so it was the shaped arm over \
          again and the third column asserts nothing: {bodies}"
     );
@@ -1504,7 +1696,7 @@ fn compositions_that_alternate_say_what_the_eager_walk_says() {
     );
 
     assert!(
-        bodies.hits >= 1,
+        bodies.tally.hits >= 1,
         "neither composition of the alternation was ever served from a body, \
          so this diffed the eager walk against itself; `refusals` says whether \
          the admissibility rule turned the mixed half away: {bodies}"

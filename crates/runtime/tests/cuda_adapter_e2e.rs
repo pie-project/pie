@@ -329,7 +329,7 @@ fn bf16_bits(value: f32) -> u16 {
 /// other column is.
 fn word(query_len: u32, adapted: bool) -> u64 {
     let classify = runtime::engine::load::classify(SKU).expect("this build ships the gate's SKU");
-    classify(&model::Request::new(query_len, false).adapted(adapted))
+    classify(&models::Request::new(query_len, false).adapted(adapted))
 }
 
 fn max_abs_difference(one: &[f32], other: &[f32]) -> f32 {

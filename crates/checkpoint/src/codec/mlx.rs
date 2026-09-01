@@ -64,7 +64,21 @@ pub fn decode_mlx_affine_codes(bytes: &[u8], bits: u32) -> Vec<f64> {
             }
             values
         }
+        // Four codes a byte, least significant first — the same walk as the
+        // four-bit arm at half the stride. Defensive rather than load-bearing:
+        // the serving path passes the codes through as stored
+        // (`contract/materialize.rs`), and this decoder is what a REPACK and
+        // the fixtures read them by.
+        2 => {
+            let mut values = Vec::with_capacity(bytes.len() * 4);
+            for byte in bytes {
+                for shift in [0, 2, 4, 6] {
+                    values.push(f64::from((byte >> shift) & 0x3));
+                }
+            }
+            values
+        }
         8 => bytes.iter().map(|byte| f64::from(*byte)).collect(),
-        other => unreachable!("an MLX affine code is 4 or 8 bits, not {other}"),
+        other => unreachable!("an MLX affine code is 2, 4 or 8 bits, not {other}"),
     }
 }

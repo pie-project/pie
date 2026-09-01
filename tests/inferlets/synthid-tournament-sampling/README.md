@@ -82,7 +82,7 @@ is bimodal" section of
 `inference-time-algorithms/10-implementation-faithfulness-audit.md`.
 
 Separately: the **first** call against a plan shape it has not seen before pays
-a 12–31 s NVRTC compile, cached thereafter under `~/.cache/pie/ptir-cuda`. All
+a 12–31 s NVRTC compile, cached thereafter under `$PIE_HOME/cache/cubins`. All
 figures here are warm.
 
 ## Run

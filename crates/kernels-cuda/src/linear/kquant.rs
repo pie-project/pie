@@ -204,9 +204,9 @@ fn kquant(
             y.arg(),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
-            // The staged-geometry seat, null until `Ctx::stage()` lands with
-            // the staged-rows wave; the kernel's guard no-ops on nullptr.
-            crate::jit::ArgValue::Ptr(0),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

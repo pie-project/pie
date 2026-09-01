@@ -62,6 +62,16 @@ pub enum Residency<'a> {
     /// caller only through its sink.
     /// [`StorageInstr::BulkExtentWrite`](crate::plan::StorageInstr::BulkExtentWrite)
     /// is refused under this residency: it addresses the persistent arena by offset, and there is not one.
+    ///
+    /// **THE REFUSAL IS THE CONTRACT, NOT A GAP.** A plan meant for this
+    /// residency is compiled for it —
+    /// [`plan::compile_streaming`](crate::plan::compile_streaming) leaves out
+    /// the two passes that exist to serve an arena — so a `BulkExtentWrite`
+    /// arriving here is a plan compiled for the other shape, and executing it
+    /// anyway would silently reinstate the memory profile this mode exists to
+    /// avoid: the hoist that emits those writes also pulls every `Allocate` to
+    /// the head of the schedule, under which nothing is freed at its last use
+    /// until the whole model is live.
     Streaming,
 }
 

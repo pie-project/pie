@@ -70,6 +70,18 @@
 //!   a kernel takes a segment list is what `DeviceProfile::grouped` carries
 //!   into the bake.
 //!
+//! **AND BOTH ARE ASKED PER ROW AXIS, WHICH IS THE THIRD INVARIANT THIS RULE
+//! USED TO KEEP UNWRITTEN.** A plan states one seriation and therefore one
+//! menu per row space (`CompiledModel::fallback_for`), and this loop walks
+//! regions of both: it cuts each region's spans out of its own axis's table
+//! already, and until this wave it then asked the TOKEN axis's fallback table
+//! about the result. Nothing went wrong, because a patch region's node range
+//! never appears in the token table — but that was an invariant nobody had
+//! written down and nothing enforced. The axis is an argument to
+//! [`fallback::grouped`](crate::fire::fallback::grouped) now, so the
+//! invariant is typed: the table answers per axis, and a row space with no
+//! menu answers `false`.
+//!
 //! Both collapse the trip count to 1 where the span count is `r`, and no
 //! reading of the spans recovers that — hence the branch. `Grouped` wins the
 //! tie: it moves no bytes, so a region that could be either is never gathered.
@@ -150,13 +162,13 @@
 
 use crate::dispatch::Dispatch;
 use model_compiler::{CompiledModel, Lowering, Phase};
-use model_ir::{Operation, RowAxis, Trace};
+use model_ir::{Operation, Trace};
 
 use crate::Result;
 use crate::fire::Fault;
 use crate::fire::compose::MaskSpan;
 use crate::fire::descriptor::FireDescriptor;
-use crate::fire::fallback::Serve;
+use crate::fire::fallback::{Serve, grouped as grouped_fallback};
 use crate::fire::sink::Sink;
 
 /// Walk one fire.
@@ -337,7 +349,8 @@ pub fn walk_phases<D: Dispatch + Serve, S: Sink>(
 /// no host in it (multimodal §1, Article 2).
 ///
 /// **THE WINDOW A REGION READS IS ITS UNIT'S AXIS'S WINDOW**, which is the
-/// one thing here that is not a filter. A region on [`RowAxis::Patches`] asks
+/// one thing here that is not a filter. A region on
+/// [`RowAxis::Patches`](model_ir::RowAxis::Patches) asks
 /// the descriptor's PATCH table for its interval, because its row count is a
 /// patch row count out of the second seriation and its "lanes" are images;
 /// asking the token table would hand it the token interval of the same
@@ -345,6 +358,17 @@ pub fn walk_phases<D: Dispatch + Serve, S: Sink>(
 /// of number. Everything downstream — the split, the copy, the zero-row skip
 /// — is unchanged, because all three are about intervals and not about which
 /// axis produced them.
+///
+/// **ITS ONE CALLER IN THIS TREE IS [`walk_phases`], AND IT IS KEPT ANYWAY.**
+/// The four entry points are a ladder and each rung defaults exactly one
+/// filter — `walk` → `walk_phases` → this → [`walk_regions`] — which is what
+/// makes "three filters, one mechanism" (this module's header) a shape a
+/// reader can see rather than a claim. Collapsing this rung would have
+/// `walk_phases` reach past [`Units`] to hand `Units::All` in beside
+/// `Regions::All`, defaulting two filters in one line and leaving the unit
+/// filter with no door of its own. No shell walks a two-exec chain yet —
+/// `engine_cuda::record` takes `walk_phases` and `walk_regions` — and this is
+/// the door the one that does will take.
 ///
 /// # Errors
 ///
@@ -445,15 +469,8 @@ pub fn walk_regions<D: Dispatch + Serve, S: Sink>(
         // are two seriations and a region belongs to exactly one of them —
         // its capture unit's — so this is a lookup and never a merge.
         let unit = compiled.unit_of(index);
-        let axis = compiled
-            .units
-            .get(unit as usize)
-            .copied()
-            .unwrap_or(RowAxis::PRIMARY);
-        match axis {
-            RowAxis::Tokens => descriptor.spans_into(&region.mask, &mut runs),
-            RowAxis::Patches => descriptor.patch_spans_into(&region.mask, &mut runs),
-        }
+        let axis = compiled.axis_of(index);
+        descriptor.table(axis).spans_into(&region.mask, &mut runs);
 
         // Does this pass dispatch this region at all? The phase filter, the
         // unit filter and the SPAN filter are one question with three halves,
@@ -483,7 +500,13 @@ pub fn walk_regions<D: Dispatch + Serve, S: Sink>(
         // window is the zero-row pass below either way; so the scan happens on
         // the path P4 exists to make rare, and a fire of an artifact that
         // seated everything never touches the table at all.
-        let grouped = runs.len() > 1 && crate::fire::fallback::grouped(compiled, region.nodes.clone());
+        //
+        // **AND IT IS THIS REGION'S OWN AXIS'S TABLE THAT IS ASKED.** A plan
+        // states one menu per row space and this line reads regions of both,
+        // so the axis resolved above travels into the question rather than
+        // being assumed to be the token one — which is what rule 4's third
+        // invariant used to rest on, unwritten.
+        let grouped = runs.len() > 1 && grouped_fallback(compiled, axis, region.nodes.clone());
 
         // P3's answer, and the two instants a recording sink needs it at.
         //

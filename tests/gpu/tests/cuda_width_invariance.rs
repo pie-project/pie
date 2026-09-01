@@ -14,7 +14,39 @@
 //! rectangle is a function of lane 0's inputs and of nothing else. Bit for
 //! bit, or the wave is not a wave.
 //!
-//! # What was broken
+//! # WHAT IS BROKEN NOW, AND IT IS NOT WHAT THIS FILE WAS WRITTEN FOR
+//!
+//! **This gate is RED on the default configuration, and has been for at least
+//! as long as `8c2aaa7c1`** — verified by checking that commit out and running
+//! it there, byte for byte the same failure. It is not a regression from the
+//! §M-4 wave and it is not the cuBLASLt reassociation the section below
+//! describes.
+//!
+//! ```text
+//!   [decode  width  2] max |delta logit| 11.046875 at 99129
+//!                      argmax solo 248068 "<think>" -> crowd 3710 "What"
+//!   [decode  width  3] 0.000000      [decode  width  4] 0.000000
+//!   [decode  width  8] 0.000000      [decode  width 16] 0.000000
+//!   every prefill width               0.000000
+//! ```
+//!
+//! Eleven logits is not an accumulation order. It is a different answer, at
+//! ONE width, deterministic across runs, on a DENSE bf16 SKU whose
+//! `act_x_wt` path this file already fixed.
+//!
+//! **AND `[engine] graphs = "off"` MAKES IT ALL ZERO.** Same binary, same
+//! model, same probe: every width bit-clean at prefill and decode. So the
+//! divergence is in CUDA GRAPH CAPTURE OR REPLAY at decode width 2 — a
+//! replayed body computing something other than what the eager walk computes
+//! — and not in any kernel's arithmetic.
+//!
+//! That is a worse shape than reassociation and it is on by default:
+//! `Graphs::On` is `Graphs::default()`, so the wrong answer is what a
+//! deployment gets unless it says otherwise. Handed to the cuda-graph session,
+//! whose machinery it is.
+//!
+//! # What was broken BEFORE, and what this file was written for
+
 //!
 //! Every kernel this tree owns keeps its LIVE extent, and every one of them is
 //! row-parallel: a row's arithmetic reads that row. One entry does not.
@@ -107,7 +139,7 @@ const PAGES_PER_LANE: u32 = 2;
 /// The lane word the model's own `Classify` computes.
 fn word(query_len: u32) -> u64 {
     let classify = runtime::engine::load::classify(SKU).expect("this build ships the gate's SKU");
-    classify(&model::Request::new(query_len, false))
+    classify(&models::Request::new(query_len, false))
 }
 
 /// One teacher-forced lane, seated on its own slot over its own pages.
@@ -181,15 +213,42 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
         eprintln!("skipping the width-invariance gate: no CUDA device on this machine");
         return;
     }
-    let Ok(checkpoint) = common::resolve_qwen35_snapshot() else {
-        eprintln!("skipping the width-invariance gate: no Qwen3.5-0.8B snapshot in the HF cache");
-        return;
+    // **AND THE SKU IS OVERRIDABLE, BECAUSE THE DEFAULT ONE IS THE PATH
+    // ALREADY FIXED.** This gate has always run a DENSE bf16 Qwen3.5-0.8B —
+    // which is `linear::gemm::act_x_wt`, the entry the header above says was
+    // broken and is now batch-invariant. Nothing here has ever named a
+    // QUANTIZED, TILED or ROUTED row, and those have their own row-count
+    // boundaries: `kernels_cuda::linear::tiled::carve_for` picks `kSplit` 32
+    // at `rows <= 8` and 16 above, and `split` partitions K — the same
+    // reassociation one axis over — and `dispatch::linear` has two more
+    // `act.rows >= PREFILL_ROWS` boundaries documented as reassociating.
+    //
+    // Handed over by the mac-engine session, which found exactly this shape on
+    // their vector point: two kernels chosen by ROW COUNT, summing the same
+    // products in different partial-sum orders, one bf16 ulp per ~8k elements
+    // — invisible on a dense row and worth a different EXPERT once top-k
+    // routing over 128 experts multiplies it.
+    //
+    // `PIE_WIDTH_INVARIANCE_SNAPSHOT` names another checkpoint to run it
+    // against; a routed one is the interesting case.
+    let checkpoint = match std::env::var("PIE_WIDTH_INVARIANCE_SNAPSHOT") {
+        Ok(named) => named,
+        Err(_) => match common::resolve_qwen35_snapshot() {
+            Ok(found) => found,
+            Err(_) => {
+                eprintln!(
+                    "skipping the width-invariance gate: no Qwen3.5-0.8B snapshot in the \
+                     HF cache and no PIE_WIDTH_INVARIANCE_SNAPSHOT"
+                );
+                return;
+            }
+        },
     };
     let checkpoint = std::path::PathBuf::from(checkpoint);
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    let mut engine = open::cuda(b"[model]\ndevice = \"cuda:0\"\n").expect("the cuda seam opens");
+    let mut engine = open::cuda(std::env::var("PIE_WI_ENGINE_TOML").unwrap_or_else(|_| "[model]\ndevice = \"cuda:0\"\n".to_string()).as_bytes()).expect("the cuda seam opens");
     let budgets = Budgets {
         max_lanes: 16,
         max_tokens: 1024,
@@ -198,6 +257,8 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
         page_size: 16,
         max_context: 512,
         slots: 16,
+        max_patches: None,
+        max_images: None,
     };
     let request = runtime::engine::load::request(
         &checkpoint,
@@ -250,7 +311,16 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
     );
 
     let mut failures = Vec::new();
-    for width in [2usize, 4, 8, 16] {
+    // **1 AND 3 BESIDE 2 AND 4, WHICH IS THE SIGNATURE AND NOT A WIDER
+    // SWEEP.** A kernel chosen by row count divides the batch to pick its
+    // arm, so an ODD width and an EVEN one take different arms and a
+    // DIVISIBILITY signature — 1,3 clean while 2,4 dirty — says "two kernels"
+    // where a geometry fault would dirty all four. That is how the mac-engine
+    // session separated their two `affine_qmv` arms from a window bug.
+    //
+    // Width 1 is NOT in the list: it is the solo baseline itself, so comparing
+    // it would be comparing a read to itself. 3 is the odd probe.
+    for width in [2usize, 3, 4, 8, 16] {
         let crowd = read(engine.as_mut(), prefill(), &neighbours, width);
         report("prefill", &solo, &crowd, width, &tokenizer, &mut failures);
     }
@@ -284,7 +354,16 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
         argmax(&solo.values),
         tokenizer.decode(&[argmax(&solo.values)], false)
     );
-    for width in [2usize, 4, 8, 16] {
+    // **1 AND 3 BESIDE 2 AND 4, WHICH IS THE SIGNATURE AND NOT A WIDER
+    // SWEEP.** A kernel chosen by row count divides the batch to pick its
+    // arm, so an ODD width and an EVEN one take different arms and a
+    // DIVISIBILITY signature — 1,3 clean while 2,4 dirty — says "two kernels"
+    // where a geometry fault would dirty all four. That is how the mac-engine
+    // session separated their two `affine_qmv` arms from a window bug.
+    //
+    // Width 1 is NOT in the list: it is the solo baseline itself, so comparing
+    // it would be comparing a read to itself. 3 is the odd probe.
+    for width in [2usize, 3, 4, 8, 16] {
         let crowd = decode(engine.as_mut(), width);
         report("decode ", &solo, &crowd, width, &tokenizer, &mut failures);
     }

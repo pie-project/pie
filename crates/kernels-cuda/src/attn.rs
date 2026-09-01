@@ -140,7 +140,8 @@ fn lanes_carry(
     Err(refuse(
         op,
         format!(
-            "the fire's indptr spells {carried} lanes and this schedule names              {num_requests} requests from lane {lane_offset}"
+            "the fire's indptr spells {carried} lanes and this schedule names {num_requests} \
+             requests from lane {lane_offset}"
         ),
     ))
 }
@@ -202,7 +203,8 @@ fn fa2_decode(
     if plan.shape.lane_offset > 0 && !plan.info.split_kv {
         return Err(refuse(
             op,
-            "this schedule names fire lanes and did not split kv, so its              output rows would be the launch's own and not the plane's",
+            "this schedule names fire lanes and did not split kv, so its output rows would be \
+             the launch's own and not the plane's",
         ));
     }
 

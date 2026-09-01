@@ -132,7 +132,7 @@ fn no_two_regions_that_claim_a_slab_are_ever_scheduled_together() {
     let profile = profile();
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         let trace = trace(Platform::Cuda);
         let Ok(compiled) = compile(&trace, &budgets_for(&trace), &profile) else {
             continue;
@@ -183,7 +183,7 @@ fn the_per_stream_slab_gives_back_the_arms_the_name_key_silenced() {
     let mut wrong: Vec<String> = Vec::new();
     let mut recovered = 0usize;
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         let trace = trace(Platform::Cuda);
         let before = compile(&trace, &budgets_for(&trace), &was).expect("bakes");
         let after = compile(&trace, &budgets_for(&trace), &now).expect("bakes");
@@ -274,7 +274,7 @@ fn the_off_arm_is_the_artifact_and_not_a_flag() {
         side_streams: 0,
         ..profile()
     };
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         let trace = trace(Platform::Cuda);
         let compiled = compile(&trace, &budgets_for(&trace), &off).expect("bakes");
         assert!(

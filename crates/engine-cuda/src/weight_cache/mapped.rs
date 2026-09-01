@@ -89,6 +89,20 @@ pub enum Refused {
         /// `mmap`'s own errno, as a sentence.
         why: String,
     },
+    /// **The name and the header disagree about which deployment this is.**
+    ///
+    /// A file under one key's name holding another key's bytes is the case
+    /// that would restore the wrong weights with every digest agreeing, so it
+    /// is refused with both numbers rather than believed on either. Raised by
+    /// [`tier::Artifact::open`](super::tier::Artifact::open), whose filenames
+    /// carry the key; the resident door is handed its expected key by the
+    /// caller and answers a MISS instead (see [`super::restore`]).
+    WrongKey {
+        /// The key the header states.
+        states: u64,
+        /// The key the filename names.
+        names: u64,
+    },
 }
 
 impl fmt::Display for Refused {
@@ -106,6 +120,10 @@ impl fmt::Display for Refused {
             ),
             Refused::IndexCorrupt { why } => write!(out, "has an index that {why}"),
             Refused::Unmappable { why } => write!(out, "cannot be mapped: {why}"),
+            Refused::WrongKey { states, names } => write!(
+                out,
+                "is named for key {names:016x} and states key {states:016x}"
+            ),
         }
     }
 }
@@ -364,11 +382,15 @@ fn read_at(file: &fs::File, at: u64, into: &mut [u8]) -> Result<(), String> {
 
 /// One read-only private mapping of a whole file.
 ///
+/// `pub(super)` so that [`tier`](super::tier) maps its payload through the
+/// same twelve lines rather than through a second `mmap` call somebody has to
+/// keep in step with this one.
+///
 /// `libc` rather than a crate: this is `mmap`, `munmap` and a length, and the
 /// manifest already carries `libc` for the one other question the standard
 /// library cannot answer (`statvfs`, for the declined write).
 #[derive(Debug)]
-struct Map {
+pub(super) struct Map {
     base: *mut core::ffi::c_void,
     len: usize,
 }
@@ -383,7 +405,7 @@ unsafe impl Sync for Map {}
 
 impl Map {
     /// Map the whole file.
-    fn open(file: &fs::File, len: usize) -> Result<Map, String> {
+    pub(super) fn open(file: &fs::File, len: usize) -> Result<Map, String> {
         if len == 0 {
             return Ok(Map {
                 base: core::ptr::null_mut(),
@@ -410,7 +432,7 @@ impl Map {
     }
 
     /// The mapped bytes.
-    fn bytes(&self) -> &[u8] {
+    pub(super) fn bytes(&self) -> &[u8] {
         if self.base.is_null() || self.len == 0 {
             return &[];
         }

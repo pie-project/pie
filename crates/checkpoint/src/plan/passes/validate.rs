@@ -72,7 +72,8 @@ pub(super) fn validate_fill_order(program: &mut LoadPlan) -> Result<usize> {
 
         // Writes that name their destination.
         let named: &[BufferId] = match instr {
-            StorageInstr::ExtentWrite { dest, .. } => std::slice::from_ref(&dest.buffer),
+            StorageInstr::ExtentWrite { dest, .. }
+            | StorageInstr::GatherWrite { dest, .. } => std::slice::from_ref(&dest.buffer),
             StorageInstr::TileMap { outputs, .. } => outputs.as_slice(),
             _ => &[],
         };
@@ -172,8 +173,53 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
                             repack.layout,
                             RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale
                         )
+                    }))
+                // **THE TILED AFFINE PAIR NEEDS NO DEVICE CAPABILITY BIT**
+                // (§J4b), because it is not a device transform: the two
+                // rows are a pure gather the HOST executor runs, and the
+                // only target whose mask carries `Repack` at all is
+                // `CONVERT_TILE_MAP_MASK`. `advertised` above is therefore
+                // the whole gate, and a serving plan that states one is
+                // refused before this line is reached.
+                || (*kind == TileMapKind::Repack
+                    && transform.repack.is_some_and(|repack| {
+                        matches!(
+                            repack.layout,
+                            RepackLayout::TiledAffineU4Weight
+                                | RepackLayout::TiledAffineFactor
+                        )
                     })));
         if !supported {
+            // **AN ENCODE IS NAMED FOR WHAT IT IS AND WHERE IT BELONGS**
+            // (§M-3). Every other refusal here says a backend lacks a
+            // kernel; this one says a SERVING plan may not convert, which is
+            // not a gap to be filled but the serve-as-stored rule, and an
+            // operator meeting it has one thing to do about it.
+            if *kind == TileMapKind::Encode {
+                return Err(Error::Unsupported(format!(
+                    "this load would quantize on the way in ({:?}->{:?}), and a serving \
+                     plan does not convert: the stored form IS the served form. Run \
+                     `pie model import` on the source checkpoint — the encode runs there, \
+                     once, and the artifact it writes holds the codes this load wants.",
+                    transform.from, transform.to
+                )));
+            }
+            // **AND A REPACK IS NAMED THE SAME WAY, FOR THE SAME REASON**
+            // (§J4b). It is not a conversion — a relabelling serves the row
+            // it stored — but it is paid once per weight, and a serving load
+            // that took one would rearrange a hundred gigabytes on the way
+            // in at every boot. The site is the import, and an operator
+            // meeting this has one thing to do about it.
+            if *kind == TileMapKind::Repack {
+                return Err(Error::Unsupported(format!(
+                    "this load would relayout a weight plane on the way in ({:?}), and a \
+                     serving plan does not: a repack is paid once per weight, not once per \
+                     boot. Run `pie model import` on the source checkpoint — the \
+                     relabelling runs there, and the artifact it writes holds the plane in \
+                     the order the kernel reads.",
+                    transform.repack.map(|repack| repack.layout)
+                )));
+            }
             return Err(Error::Unsupported(format!(
                 "{:?} target does not support {:?} TileMap ({:?}->{:?})",
                 program.target.backend, kind, transform.from, transform.to
@@ -216,6 +262,15 @@ pub(super) fn validate_target_support(program: &mut LoadPlan) -> Result<usize> {
 /// intermediate the plan itself consumes and the engine never sees, and a
 /// blocked one is exactly what a `Decode` reads from — refusing it would
 /// refuse the repair.
+///
+/// **THE POLICY WAS REVISITED, EXACTLY AS THE PARAGRAPH ABOVE SAID IT WOULD
+/// BE** (QNF wave, alto `next.md` §J5). "No device kernel reads one" was a
+/// statement about the kernels of the day, and it is no longer true of all of
+/// them: `kernels_cuda::linear::kquant` reads a ggml K-quant super-block row
+/// AS STORED, decoding each block inside the dot. So the invariant narrowed
+/// from "a device is never handed a block" to "a device is never handed a
+/// block IT CANNOT READ", and [`binds_block`] is the whole of the difference.
+/// The 3.5x on disk is what is on the other side of it.
 pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> {
     // A host target legitimately publishes blocked tensors: `pie model
     // import`'s passthrough is this, and the whole point of an offline
@@ -230,16 +285,56 @@ pub(super) fn validate_bound_encodings(program: &mut LoadPlan) -> Result<usize> 
         let Encoding::Quant(spec) = &tensor.encoding else {
             continue;
         };
-        if spec.scheme.is_self_contained() {
+        if spec.scheme.is_self_contained() && !binds_block(program.target.backend, spec.scheme) {
             return Err(Error::Unsupported(format!(
                 "{}: a {:?} target would bind `{}` as {:?}, whose scales live \
-                 inside the payload — no device kernel reads one. It has to be \
-                 decoded, and this plan does not decode it",
+                 inside the payload and which no kernel of that backend reads. \
+                 It has to be decoded, and this plan does not decode it",
                 tensor.name, program.target.backend, tensor.name, spec.scheme
             )));
         }
     }
     Ok(0)
+}
+
+/// **THE BLOCK SCHEMES A BACKEND'S KERNELS READ AS STORED**, and the whole of
+/// the exception [`validate_bound_encodings`] carries.
+///
+/// A capability table in this crate, which is where the tile-map masks
+/// already live and for their reason: a plan is compiled here, so the question
+/// "may this plan exist" has to be answerable here. Like those masks it is
+/// widened by a load that needed it and never by reasoning about what a shell
+/// could presumably do — `CUDA_TILE_MAP_MASK`'s own history is the precedent.
+fn binds_block(backend: BackendKind, scheme: QuantScheme) -> bool {
+    match backend {
+        // **THE FIVE ggml K-QUANTS, ON CUDA** (QNF §J2 priority 3):
+        // `kernels_cuda::linear::kquant` names a point per scheme and reads
+        // the super-block row as one byte plane, decoding inside the dot. A
+        // model text reaches them by declaring the variant that names the term
+        // (`dtype::Fmt`), and `engine_cuda::dispatch::linear` routes there.
+        //
+        // NOT the 32-element blocks — `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0`
+        // and gguf's interleaved mxfp4. Their arithmetic HAS a CUDA point
+        // (`linear::quant`'s symmetric and affine arms), but that point reads
+        // a leaf-per-plane operand, so serving one as stored wants a repack
+        // at import rather than a row here. And not the IQ lattices, whose
+        // points are compiled into llama.cpp: `QuantSpec::term` gives them no
+        // signature at all, which is the same refusal said one crate over.
+        BackendKind::Cuda => matches!(
+            scheme,
+            QuantScheme::GgufQ2K
+                | QuantScheme::GgufQ3K
+                | QuantScheme::GgufQ4K
+                | QuantScheme::GgufQ5K
+                | QuantScheme::GgufQ6K
+        ),
+        // Metal has no stored-block point — `kernels_metal::linear` carries
+        // the affine family and nothing braided — and the Vulkan shell is out
+        // of the workspace. `Unknown` never reaches here (the host arm above
+        // returns first), and answering `false` for it is the conservative
+        // reading of a backend that is not a device.
+        BackendKind::Metal | BackendKind::Vulkan | BackendKind::Unknown => false,
+    }
 }
 
 /// A per-group [`TileMapKind::Scale`] keeps the operand holding its factors.

@@ -117,7 +117,7 @@ fn every_sku_bakes_on_every_platform() {
     let mut refused: Vec<String> = Vec::new();
     let (mut pairs, mut towers) = (0usize, 0usize);
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             pairs += 1;
@@ -152,7 +152,7 @@ fn every_sku_bakes_on_every_platform() {
 fn no_sku_carves_an_arena_that_shares_live_bytes() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -221,7 +221,7 @@ fn no_sku_carves_an_arena_that_shares_live_bytes() {
 fn the_refined_clash_rule_agrees_with_the_v1_oracle_wherever_no_column_is_shared() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -311,7 +311,7 @@ fn co_tenants(arena: &model_compiler::ArenaMap) -> Vec<(ValueId, ValueId)> {
 fn the_carve_lands_on_the_busiest_instant_and_not_the_sum() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -367,7 +367,7 @@ fn the_carve_lands_on_the_busiest_instant_and_not_the_sum() {
 fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -446,7 +446,7 @@ fn the_regions_tile_every_plan_prepare_first_and_in_order_within_each_phase() {
 fn a_collective_is_never_elided_and_a_conditional_is_a_structural_arm() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -504,12 +504,14 @@ fn a_collective_is_never_elided_and_a_conditional_is_a_structural_arm() {
                 }
                 if region.phase != model_compiler::Phase::Capture {
                     wrong.push(format!(
-                        "`{sku}` as {platform:?}: region {at} is host work and was put                          on a side stream",
+                        "`{sku}` as {platform:?}: region {at} is host work and was put on a side \
+                         stream",
                     ));
                 }
                 if region.collective {
                     wrong.push(format!(
-                        "`{sku}` as {platform:?}: region {at} carries a collective and                          left the main stream — NCCL matches by call order",
+                        "`{sku}` as {platform:?}: region {at} carries a collective and left the \
+                         main stream — NCCL matches by call order",
                     ));
                 }
             }
@@ -555,7 +557,7 @@ fn every_correction_region_gets_a_window_of_one_run() {
     let (mut intervals, mut answered) = (0usize, 0usize);
     let mut broken: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {

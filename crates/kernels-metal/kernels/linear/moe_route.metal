@@ -293,6 +293,51 @@ inline float sqrt_softplus(float x) {
   }
 }
 
+/* The hash router's gather: layers 0..num_hash_layers route by a per-token
+ * LOOKUP, not a learned gate. `tid2eid [vocab, top_k]` (I64) names `top_k`
+ * expert ids for every token id; this reads the row the token id selects and
+ * lays down UNIFORM weights, so its (expert_ids, expert_weights) are the same
+ * pair `router_topk` writes above -- `int` ids and `float` weights, row-major
+ * at `top_k` per token -- and drop straight into the `route_sort` /
+ * `expert_combine` path with nothing between.
+ *
+ * One thread per (token row, slot).
+ *
+ * THE TABLE IS I64 AND THE ROUTES ARE I32, which is not a narrowing this op
+ * gets to refuse: `tid2eid` is a lookup, not a weight-representation dtype the
+ * trace can intern, and everything downstream -- `route_sort`,
+ * `expert_bias_combine` -- already reads an expert id as `int`. An expert
+ * count never approaches 2^31, so the id is read at 64 bits where the table
+ * spells it and written at 32 where the path consumes it, in the one place
+ * the two planes meet.
+ *
+ * THE TOKEN ID IS `uint` AND OUT-OF-RANGE FALLS TO ROW 0, exactly as
+ * `embed.metal` reads it: a non-negative i32 and a u32 are the same bits, so
+ * the id stream a shell hands this and the one it hands the embed gather need
+ * not disagree, and a token id at the vocab boundary reads the last table row
+ * rather than off the end. A row that names the same expert twice is copied
+ * as-is -- the hash may repeat, and the uniform fold weights every slot
+ * alike.
+ */
+[[kernel]] void hash_route_gather(
+    const device uint* token_ids   [[buffer(0)]],
+    const device long* tid2eid     [[buffer(1)]],
+    device int* expert_ids         [[buffer(2)]],
+    device float* expert_weights   [[buffer(3)]],
+    const constant uint& vocab             [[buffer(4)]],
+    const constant uint& experts_per_token [[buffer(5)]],
+    uint2 gid                      [[thread_position_in_grid]]) {
+  const uint k = experts_per_token;
+  const uint slot = gid.x;
+  const uint row = gid.y;
+  if (slot >= k) return;
+  const uint raw = token_ids[row];
+  const uint tid = (vocab > 0u && raw < vocab) ? raw : 0u;
+  const size_t at = size_t(row) * size_t(k) + size_t(slot);
+  expert_ids[at] = int(tid2eid[size_t(tid) * size_t(k) + size_t(slot)]);
+  expert_weights[at] = 1.0f / float(k);
+}
+
 constant constexpr uint kMaxExperts = 1024;
 
 [[kernel]] void route_sort(

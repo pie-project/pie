@@ -6,7 +6,7 @@
 //! reproduce the step lines exactly.
 //!
 //! Regenerate (bless) with:
-//! `PTIR_REGEN=1 cargo test -p pie-compiler-tests --test eta_golden`
+//! `PTIR_REGEN=1 cargo test -p eta-compiler --test eta_golden`
 
 use std::fmt::Write as _;
 use eta_compiler::eval::interp::Value;

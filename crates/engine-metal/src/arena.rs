@@ -129,10 +129,9 @@ impl Arena {
         &self,
         handles: &Handles,
         map: &ArenaMap,
-        tokens: u64,
-        lanes: u64,
+        rows: FireRows,
     ) -> Result<SlotTable> {
-        carve(handles, &self.store, map, tokens, lanes)
+        carve(handles, &self.store, map, rows)
     }
 
     /// Copy `into.len()` bytes back from `offset` bytes into this arena.
@@ -221,16 +220,19 @@ pub fn carve(
     handles: &Handles,
     store: &Buffer,
     map: &ArenaMap,
-    tokens: u64,
-    lanes: u64,
+    fire: FireRows,
 ) -> Result<SlotTable> {
     let mut rows: Vec<Option<Tensor>> = Vec::with_capacity(map.placements.len());
     for value in 0..map.placements.len() {
         let value = ValueId(value as u32);
-        // **`text_only`, AND IT IS TRUE HERE RATHER THAN DEFAULTED**: this plane
-        // binds no patch seat and refuses every patch-axis input by name, so a
-        // fire it serves has no patch rows to size a rectangle at.
-        rows.push(match rect(map, value, FireRows::text_only(tokens, lanes)) {
+        // **ALL FOUR COUNTS, AND STATING ONLY THE TOKEN PAIR IS THE FAILURE
+        // MODE WORTH NAMING.** `FireRows::text_only` sizes `Dim::Patches` and
+        // `Dim::Images` at zero, which does not fault — it COMPUTES — and the
+        // failure would arrive inside a tower GEMM whose destination has no
+        // rows. So the caller states the composition's own patch counts, and a
+        // fire with no image gets the zeros because it has no patch rows and
+        // not because this line assumed so.
+        rows.push(match rect(map, value, fire) {
             Some(rect) => Some(Tensor::new(
                 handles.bind(store, rect.offset, rect.bytes)?,
                 rect.rows,

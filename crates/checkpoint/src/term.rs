@@ -195,8 +195,9 @@ const _: () = assert!(spells(&GR_I8_F32_N, "gr_i8_f32_n"));
 
 /// The affine row whose gain and offset are both a bf16 leaf and whose
 /// offset ADDS: `code × scale + bias`. MLX's shape at whichever width and
-/// group the plane declares. At `(4, 64)`, `(8, 64)` and `(4, 32)` the
-/// result IS a [`Dtype`] repr, and [`Dtype::of_fmt`] recognizes it.
+/// group the plane declares. At `(4, 64)`, `(8, 64)`, `(4, 32)` and the three
+/// two-bit points `(2, 32)`, `(2, 64)`, `(2, 128)` the result IS a [`Dtype`]
+/// repr, and [`Dtype::of_fmt`] recognizes it.
 fn post_affine_bf16(group: u32, elem: Elem) -> Fmt<'static> {
     const BF16: Fmt<'static> = Fmt::Elem(Elem::Bf16);
     Fmt::Q {
@@ -303,10 +304,12 @@ impl QuantSpec {
                 pre_affine_u4(group)
             }
 
-            // MLX's affine codes at whichever width the plane declares — four, or
-            // eight for the MoE router gates a `quant_predicate` lifts. Both
-            // widths are this one scheme, which is [`Dtype::U8g64`]'s whole
-            // argument, and `codec/mlx.rs` decodes exactly those two.
+            // MLX's affine codes at whichever width the plane declares — four,
+            // eight for the MoE router gates a `quant_predicate` lifts, or two
+            // for the DQ stacks whose expert banks ship at [`Dtype::U2g32`],
+            // [`Dtype::U2g64`] and [`Dtype::U2g128`]. All three widths are this
+            // one scheme, which is [`Dtype::U8g64`]'s whole argument, and
+            // `codec/mlx.rs` decodes exactly those three.
             //
             // The offset ADDS: `mlx_affine_group_params` returns a scale that is
             // usually NEGATIVE and a bias that is the group's dominant endpoint,
@@ -314,7 +317,7 @@ impl QuantSpec {
             // domain and not a zero point in the code domain, whatever the
             // companion plane is called.
             QuantScheme::MlxAffineU4 => match bits {
-                4 | 8 => post_affine_bf16(group, Elem::U(bits)),
+                2 | 4 | 8 => post_affine_bf16(group, Elem::U(bits)),
                 _ => return None,
             },
 
@@ -356,7 +359,7 @@ impl QuantSpec {
             // ── the GGUF blocks ────────────────────────────────────────────
             //
             // Constants, because a block fixes its own widths. Each row is
-            // checked against `block_layout` by `tests/qnf_bridge.rs`: bits per
+            // checked against `block_layout` by `tests/quant_terms.rs`: bits per
             // weight times the block's element count is the block's byte count
             // exactly, for all eleven. The K family and `mxfp4` are SERVED —
             // their terms are `Dtype` reprs — and the scalar-group four are not.
@@ -439,4 +442,60 @@ impl QuantSpec {
             _ => None,
         }
     }
+}
+
+/// **EVERY SCHEME THAT KEEPS ITS SCALES INSIDE ITS PAYLOAD**, in the order
+/// [`spec_of_term`] asks them.
+///
+/// These are the rows [`QuantScheme::is_self_contained`] answers `true` for,
+/// which is the same set [`QuantScheme::block_layout`] gives sizes to. Written
+/// out rather than derived because there is nothing to derive it from —
+/// [`QuantScheme`] has no iterator — and a row missing from it is a REFUSAL by
+/// [`spec_of_term`] rather than a wrong answer, which is the direction this
+/// crate errs in.
+const BLOCKS: &[QuantScheme] = &[
+    QuantScheme::GgufQ4_0,
+    QuantScheme::GgufQ4_1,
+    QuantScheme::GgufQ5_0,
+    QuantScheme::GgufQ5_1,
+    QuantScheme::GgufQ8_0,
+    QuantScheme::GgufQ2K,
+    QuantScheme::GgufQ3K,
+    QuantScheme::GgufQ4K,
+    QuantScheme::GgufQ5K,
+    QuantScheme::GgufQ6K,
+    QuantScheme::GgufMxfp4,
+    QuantScheme::GgufIq4Nl,
+    QuantScheme::GgufIq4Xs,
+    QuantScheme::GgufIq2Xxs,
+    QuantScheme::GgufIq2Xs,
+    QuantScheme::GgufIq2S,
+    QuantScheme::GgufIq3Xxs,
+    QuantScheme::GgufIq3S,
+];
+
+/// **[`QuantSpec::term`] READ BACKWARDS, AND ONLY OVER THE BLOCK FAMILY** —
+/// the door a declared storage term walks to reach a load contract.
+///
+/// Only the self-contained rows are searched, and that is what makes the
+/// answer unique: a block scheme's group and width are fixed by its own
+/// layout, so no two of [`BLOCKS`] share a term. The parametric families are
+/// deliberately absent — their term is a function of numbers a spec carries,
+/// so a term alone cannot say which `(bits, group)` produced it.
+///
+/// `None` is a term no block scheme spells, which is a refusal and never a
+/// default: guessing here would hand a kernel the wrong decoder.
+#[must_use]
+pub fn spec_of_term(f: &Fmt<'_>) -> Option<QuantSpec> {
+    BLOCKS.iter().copied().find_map(|scheme| {
+        let (elems, _) = scheme.block_layout()?;
+        let spec = QuantSpec {
+            scheme,
+            logical_dtype: Dtype::Bf16,
+            bits_per_element: scheme.default_bits(),
+            group_size: u32::try_from(elems).ok()?,
+            channel_axis: None,
+        };
+        (spec.term() == Some(*f)).then_some(spec)
+    })
 }

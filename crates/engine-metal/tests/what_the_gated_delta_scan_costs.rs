@@ -43,7 +43,7 @@ use kernels_metal::attn::ssm;
 use kernels_metal::{Arg, Ctx, Fire, Grid, RaggedTensor, RecurrentPool, Tensor};
 use model_ir::Dtype;
 
-// qwen3.6-27b's gated-delta shape (`model::qwen_3::model::d27b_dims`).
+// qwen3.6-27b's gated-delta shape (`models::qwen_3::model::d27b_dims`).
 const K_HEADS: u32 = 16;
 const V_HEADS: u32 = 48;
 const K_DIM: u32 = 128;

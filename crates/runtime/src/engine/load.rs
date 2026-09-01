@@ -66,16 +66,16 @@ pub use model_ir::Platform;
 /// The catalog row a load names: its SKU, the tensor-parallel width it was
 /// traced for, the trace itself, and how it sorts a request into the fact
 /// word a lane carries.
-pub type Row = (&'static str, u32, fn(Platform) -> Trace, ::model::ClassifyFn);
+pub type Row = (&'static str, u32, fn(Platform) -> Trace, models::ClassifyFn);
 
 /// Every SKU this build ships.
 ///
-/// A pass-through of `model::catalog`, here so that the rest of the runtime
+/// A pass-through of `models::catalog`, here so that the rest of the runtime
 /// reads the catalog through the load door rather than reaching into the
 /// model crate at eleven sites.
 #[must_use]
 pub fn catalog() -> Vec<Row> {
-    ::model::catalog()
+    models::catalog()
 }
 
 /// The traced supergraph for `sku`, on `platform`.
@@ -86,8 +86,32 @@ pub fn catalog() -> Vec<Row> {
 /// because "unknown model" and "you meant the -bf16 row" are different
 /// operator actions.
 pub fn trace(sku: &str, platform: Platform) -> Result<Trace> {
-    let trace = ::model::trace_of(sku).ok_or_else(|| anyhow!("{}", no_such_sku(sku)))?;
+    let trace = models::trace_of(sku).ok_or_else(|| anyhow!("{}", no_such_sku(sku)))?;
     Ok(trace(platform))
+}
+
+/// **The served numeric form a catalog row states**, for the one caller that
+/// has to write it down: `pie model import`, which puts it in the artifact's
+/// `pie.serving/1` stamp and in its filename.
+///
+/// Beside [`catalog`], [`trace`] and [`classify`] because it is the same kind
+/// of thing — a fact the catalog states about a row — and because `pie` does
+/// not depend on `models` directly, it reaches it through this door.
+///
+/// # Errors
+///
+/// A row this build's catalog does not ship. Not a default: `precision` is a
+/// field `serving::Stamp::check` COMPARES, so a stamp carrying a placeholder
+/// would be checked against a deployment and either refuse a good artifact or
+/// pass a bad one. `models::precision_disagreements` is what makes this
+/// unreachable for a row that is in the catalog.
+pub fn precision(sku: &str) -> Result<&'static str> {
+    models::precision_of(sku).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the catalog claims `{sku}` and states no precision for it; the artifact's \
+             stamp and its filename both carry that field"
+        )
+    })
 }
 
 /// How `sku` sorts a request into the fact word its lanes carry — the fourth
@@ -104,8 +128,8 @@ pub fn trace(sku: &str, platform: Platform) -> Result<Trace> {
 /// # Errors
 ///
 /// When this build's catalog has no such SKU, with the near misses named.
-pub fn classify(sku: &str) -> Result<::model::ClassifyFn> {
-    ::model::classify_of(sku).ok_or_else(|| anyhow!("{}", no_such_sku(sku)))
+pub fn classify(sku: &str) -> Result<models::ClassifyFn> {
+    models::classify_of(sku).ok_or_else(|| anyhow!("{}", no_such_sku(sku)))
 }
 
 /// The one refusal both doors above raise, written once: an unknown SKU, and
@@ -113,7 +137,7 @@ pub fn classify(sku: &str) -> Result<::model::ClassifyFn> {
 fn no_such_sku(sku: &str) -> String {
     format!(
         "this build ships no SKU named {sku:?}; it ships {}",
-        ::model::catalog()
+        models::catalog()
             .iter()
             .map(|(name, ..)| *name)
             .collect::<Vec<_>>()
@@ -211,7 +235,7 @@ fn containers(checkpoint: &Path) -> Result<Vec<PathBuf>> {
 ///
 /// # Why the name match is not the answer
 ///
-/// `model::identify` returns the first SKU whose import contract builds, and
+/// `models::identify` returns the first SKU whose import contract builds, and
 /// an import contract is a NAME mapping: it says that this checkpoint
 /// publishes `model.layers.7.self_attn.q_proj.weight` under the plan's
 /// `layer.7.q_proj`, and every SKU of a family spells its tensors the same
@@ -250,16 +274,27 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<&'static str> {
     let target = checkpoint::plan::StorageTarget::for_backend(backend, 0, 1);
 
     let mut misses: Vec<String> = Vec::new();
-    for (sku, import) in ::model::imports() {
+    for (sku, tp, import) in models::imports() {
         // A row traced for more than one rank describes a shard, not a
-        // checkpoint; `model::identify` skips those for the same reason.
-        if !::model::catalog()
+        // checkpoint; `models::identify` skips those for the same reason.
+        if !models::catalog()
             .iter()
             .any(|(name, tp, ..)| *name == sku && *tp == 1)
         {
             continue;
         }
-        let contract = match import(&source) {
+        // **READ FOR THE SETUP THIS IS IDENTIFYING FOR** (§J4c). A family's
+        // text may state a `Dtype` PLACEMENT — an arrangement of a bank's
+        // bytes some platforms' kernels read and others cannot — and
+        // `model_dsl::place` resolves one against the platform the
+        // declaration is read under. The trace gets that through `catalog!`;
+        // an import contract takes a checkpoint and a world size and gets it
+        // here, from the same `platform` the target above is built for. Read
+        // under no setup, a contract would state the text's own arrangement
+        // and then be checked against a plan traced for this one — two
+        // readings of one text, free to disagree about a plane neither can
+        // see.
+        let contract = match models::placing_for(platform, || import(&source, tp)) {
             Ok(contract) => contract,
             Err(why) => {
                 misses.push(format!("{sku}: {why}"));
@@ -275,6 +310,106 @@ pub fn identify(checkpoint: &Path, platform: Platform) -> Result<&'static str> {
         "{checkpoint:?} matches no SKU this build ships:\n  {}",
         misses.join("\n  ")
     ))
+}
+
+/// **THE SETUP THIS BINARY SERVES**, for the commands that convert rather
+/// than serve.
+///
+/// A serving boot never asks: `worker::embedded_engine` opens a backend and
+/// hands the `Platform` down beside it, so a shell's own platform is a fact
+/// about the shell it opened. `pie model import` has no shell — it reads a
+/// checkpoint and writes an artifact — and it still has to name a setup,
+/// because an artifact IS one (§M, and [`conversion_contract`]'s note). The
+/// honest answer for a converter is the box it is converting on, which is
+/// what its prepare already answers for: the same device, the same budgets,
+/// the same tier key.
+///
+/// **THE FEATURE IS THE FACT AND THE TARGET IS NOT.** `engine-metal` is
+/// target-gated as well as feature-gated — a build with the flag and no Apple
+/// target links a shell whose device half does not exist — so the flag alone
+/// is what says a binary MEANT Metal, and pairing it with the target is what
+/// says the device is there. A build with both shells linked is a real build
+/// and CUDA wins it: a box with an NVIDIA card is converting for the card.
+///
+/// A build with NO engine linked converts for `Cuda`. That is the shape of
+/// every artifact this tree has ever written and the one an unqualified
+/// conversion keeps writing, so a converter-only machine's output does not
+/// change under this wave.
+#[must_use]
+pub fn this_box() -> Platform {
+    #[cfg(feature = "_engine-cuda")]
+    {
+        Platform::Cuda
+    }
+    #[cfg(all(not(feature = "_engine-cuda"), feature = "engine-metal", target_vendor = "apple"))]
+    {
+        Platform::Metal
+    }
+    #[cfg(all(
+        not(feature = "_engine-cuda"),
+        not(all(feature = "engine-metal", target_vendor = "apple"))
+    ))]
+    {
+        Platform::Cuda
+    }
+}
+
+/// **WHAT THIS SOURCE WOULD BE CONVERTED AS** — the SKU whose import contract
+/// this checkpoint satisfies, asked at the CONVERSION target rather than at a
+/// device one.
+///
+/// [`identify`] above answers the SERVING question and compiles against a
+/// backend, so a contract that states a conversion — a bank a family declares
+/// quantized over a checkpoint that ships it raw — is refused there, and
+/// refused correctly: no device target carries an encode
+/// ([`CUDA_TILE_MAP_MASK`](checkpoint::plan::CUDA_TILE_MAP_MASK)). That is
+/// exactly the source `pie model import` has to be able to name, so it asks
+/// this instead, against the mask conversion compiles under.
+///
+/// `None` and not an error: an unidentifiable source is not a failed import.
+/// Every checkpoint this command has ever converted converts the same way
+/// whether or not a SKU claims it, and the contract is read for one reason
+/// only — to learn which tensors this build would have to encode.
+///
+/// **AND IT TAKES A `platform`, BECAUSE AN ARTIFACT IS SETUP-SPECIFIC** (§M,
+/// §J4c). "Every checkpoint converts the same way" is true of the ENCODES
+/// above and was never true of a PLACEMENT: a repack is an arrangement of a
+/// bank's bytes into the fragment order one shell's kernels read, and writing
+/// one into an artifact a different shell will boot is how a `.zt` comes to
+/// load in 0.1s and answer nonsense. §M already said what makes a tier key —
+/// "a function of the RECIPE — backend, tensor parallelism, precision" — and
+/// this is that sentence reaching the planes themselves. The command passes
+/// the setup it is converting FOR, which for `pie model import` is the box it
+/// is running on, the same box whose device and budgets its prepare answers
+/// for.
+#[must_use]
+pub fn conversion_contract(
+    checkpoint: &Path,
+    platform: Platform,
+) -> Option<(&'static str, ModelContract)> {
+    let source = open_source(checkpoint).ok()?;
+    let metadata = checkpoint_metadata(checkpoint).ok()?;
+    let target = checkpoint::plan::StorageTarget {
+        tile_map_mask: checkpoint::plan::CONVERT_TILE_MAP_MASK,
+        ..checkpoint::plan::StorageTarget::default()
+    };
+    for (sku, tp, import) in models::imports() {
+        // A row traced for more than one rank describes a shard, not a
+        // checkpoint — [`identify`]'s rule, for its reason.
+        if !models::catalog()
+            .iter()
+            .any(|(name, tp, ..)| *name == sku && *tp == 1)
+        {
+            continue;
+        }
+        let Ok(contract) = models::placing_for(platform, || import(&source, tp)) else {
+            continue;
+        };
+        if checkpoint::plan::compile(&metadata, &contract, target.clone()).is_ok() {
+            return Some((sku, contract));
+        }
+    }
+    None
 }
 
 /// The checkpoint's own tensor table — a snapshot directory or one container.
@@ -303,7 +438,7 @@ fn checkpoint_metadata(checkpoint: &Path) -> Result<Metadata> {
 /// carries a sentence and the pointer must not put an error crate in an
 /// engine's signature.
 pub fn contract_for(trace: &Trace, checkpoint: &Path) -> std::result::Result<ModelContract, String> {
-    let import = ::model::import_of(&trace.name).ok_or_else(|| {
+    let import = models::import_of(&trace.name).ok_or_else(|| {
         format!(
             "this build ships no import contract for {:?}, so a checkpoint's \
              tensors cannot be mapped onto its params",
@@ -311,7 +446,13 @@ pub fn contract_for(trace: &Trace, checkpoint: &Path) -> std::result::Result<Mod
         )
     })?;
     let source = open_source(checkpoint).map_err(|error| format!("{error:#}"))?;
-    import(&source).map_err(|error| {
+    // **THE PLAN'S OWN PLATFORM, WHICH IS THE WHOLE POINT OF ASKING HERE**
+    // (§J4c). This contract exists to publish a checkpoint's tensors under
+    // THIS plan's param names, so the setup it is read for is the setup the
+    // plan was traced for and cannot be anything else. `Trace::platform` is
+    // that word, already on the value in hand — see `identify` above for what
+    // a reading with no setup would cost.
+    models::placing_for(trace.platform, || import(&source)).map_err(|error| {
         format!(
             "the import contract for {:?} does not fit {checkpoint:?}: {error}",
             trace.name
@@ -389,6 +530,16 @@ pub fn request_of(
             found.to_string()
         }
     };
+    // **THE TWO FACTS A SHELL CANNOT LOOK UP** (§M-4c). A shell must not know
+    // a model family — both engines' `models` edges are DEV for that reason —
+    // so the degree and the served numeric form are stated here, by the one
+    // party that sees the catalog. The other three facts a serving artifact is
+    // checked against are already in the trace (`name` is the sku,
+    // `platform.backend()` is the backend), which is why they are not
+    // restated: a request carrying its own copy of a fact the trace already
+    // holds is a fact that can disagree with itself.
+    let tp_size = tp_of(&sku);
+    let precision = precision(&sku)?.to_string();
     Ok(LoadRequest {
         trace: trace(&sku, platform)?,
         checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
@@ -396,7 +547,95 @@ pub fn request_of(
         residency,
         ordinal,
         frames_in_flight,
+        tp_size,
+        precision,
     })
+}
+
+/// **THE ORDER A SERVING ARTIFACT'S PLANES SHOULD LIE IN** — the shell's own
+/// ranking, as plane names, for `pie model import` to write them in.
+///
+/// `emit` writes the objects in the order it is handed and
+/// `checkpoint::serving::sequence` reads that order back off the offsets. What
+/// makes it worth getting right is the one thing a payload run is for: a
+/// streaming boot walking the file FORWARD ONCE, hottest planes first, rather
+/// than seeking through a name-ordered file. An artifact in any other order is
+/// still correct — `emit`'s doc says it "reads perfectly and merely reads
+/// unranked" — so this is locality and never meaning.
+///
+/// # It is HERE and not in the shell, and that is the dependency direction
+///
+/// The ranking is `engine_cuda::experts::Ranking`, and it needs to know which
+/// planes travel together. A boot learns that from a COMPILED LOAD PLAN, and
+/// `pie model import` has none: the plan would be compiled against the
+/// artifact it is about to write. What states the pairing without a plan is
+/// [`models::scales_name`] and `biases_name` — the two functions that MINT
+/// a companion's name — asked of a trace whose params those same calls
+/// declared. **That is not a suffix match**, which this tree refuses by name;
+/// it is the minting function run forwards.
+///
+/// And `model_dsl` is a DEV dependency of both shells on purpose — a shell
+/// must not know a model family — so the derivation cannot live in one. It
+/// lives at the seam that already sees both, beside [`precision`] and
+/// [`this_box`].
+///
+/// `None` when no shell is linked. A build that cannot rank writes an
+/// unranked artifact, which is the same graceful answer `--no-prepare`'s
+/// shelf conversion has always given.
+#[cfg(feature = "_engine-cuda")]
+#[must_use]
+pub fn sequence(trace: &Trace) -> Option<Vec<String>> {
+    let at: std::collections::BTreeMap<&str, usize> = trace
+        .params
+        .iter()
+        .enumerate()
+        .map(|(at, param)| (param.name.as_str(), at))
+        .collect();
+    let mut pairings = engine_cuda::experts::Attachments::new();
+    for (codes, param) in trace.params.iter().enumerate() {
+        let mut companions = Vec::new();
+        if let Some(&scales) = at.get(models::scales_name(&param.name).as_str()) {
+            companions.push(scales);
+        }
+        if let Some(&biases) = at.get(models::biases_name(&param.name).as_str()) {
+            companions.push(biases);
+        }
+        if !companions.is_empty() {
+            pairings.insert(codes, companions);
+        }
+    }
+    let ranking = engine_cuda::experts::Ranking::of(trace, &pairings).ok()?;
+    Some(
+        ranking
+            .images()
+            .into_iter()
+            .filter_map(|(param, ..)| trace.params.get(param as usize))
+            .map(|param| param.name.clone())
+            .collect(),
+    )
+}
+
+/// [`sequence`], for a build with no shell linked: no ranking, and an
+/// unranked artifact is a correct one.
+#[cfg(not(feature = "_engine-cuda"))]
+#[must_use]
+pub fn sequence(_trace: &Trace) -> Option<Vec<String>> {
+    None
+}
+
+/// The tensor-parallel degree the catalog states for `sku`.
+///
+/// One for a row this build does not ship, which is unreachable from
+/// [`request_of`] — the sku there either came from [`identify`], which only
+/// returns rows that are in the catalog, or from `[model] sku`, whose trace
+/// lookup one line below refuses a name the catalog does not hold. It is a
+/// default rather than an error only because there is no reachable caller to
+/// give an error to.
+fn tp_of(sku: &str) -> u64 {
+    models::catalog()
+        .iter()
+        .find(|(row, _, _, _)| *row == sku)
+        .map_or(1, |(_, tp, _, _)| u64::from(*tp))
 }
 
 #[cfg(test)]

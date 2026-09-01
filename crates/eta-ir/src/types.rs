@@ -88,10 +88,27 @@ pub const fn class_of(d: Dtype) -> Option<DtypeClass> {
         | Dtype::E5m2
         | Dtype::E2m1
         | Dtype::Mxfp4
-        | Dtype::Nvfp4
         | Dtype::U4g64
         | Dtype::U8g64
         | Dtype::U4g32
+        | Dtype::U4g64tiled
+        | Dtype::U2g32
+        | Dtype::U2g64
+        | Dtype::U2g128
+        | Dtype::E8m0
+        | Dtype::I64
+        | Dtype::I16
+        | Dtype::I8
+        | Dtype::U64
+        | Dtype::U16
+        | Dtype::U8
+        // The composite formats, for a stronger reason than the elements
+        // above them: each names a whole storage TERM — codes, a group, a
+        // gain, an offset — and every part of that is a fact about how a
+        // weight plane is STORED. ETA computes over traced values, and a
+        // traced value is never stored: it materializes in the classes
+        // above whatever a backend holds underneath.
+        | Dtype::Nvfp4
         | Dtype::U2g16k
         | Dtype::I3g16k
         | Dtype::U4g32k
@@ -99,13 +116,8 @@ pub const fn class_of(d: Dtype) -> Option<DtypeClass> {
         | Dtype::I6g16k
         | Dtype::E4m3row
         | Dtype::E4m3tile128
-        | Dtype::E8m0
-        | Dtype::I64
-        | Dtype::I16
-        | Dtype::I8
-        | Dtype::U64
-        | Dtype::U16
-        | Dtype::U8 => None,
+        | Dtype::Bool => None,
+
     }
 }
 

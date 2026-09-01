@@ -285,12 +285,36 @@ impl Kda {
     }
 }
 
+/// **THE HISTORY A DILATED CONVOLUTION KEEPS**: `(conv_width − 1)·dilation + 1`
+/// rows of channels, which is `conv_width` at the undilated point and is the
+/// rectangle the model text declares for the state bank
+/// (`models::qwen_4`'s `[(conv_kernel − 1)·dilation + 1, streams·hidden]`).
+///
+/// Stated here rather than left to the shader because it is also the SLAB
+/// STRIDE — the shader multiplies a slot by it — so the day a text declares a
+/// bank at a different extent the two disagree silently, and the assert below
+/// is what makes them disagree loudly instead.
+fn conv_history(op: &'static str, conv_width: u32, dilation: u32) -> Result<u32, Error> {
+    nonzero(op, "the conv width this statement states", conv_width)?;
+    nonzero(op, "the dilation this statement states", dilation)?;
+    (conv_width - 1)
+        .checked_mul(dilation)
+        .and_then(|span| span.checked_add(1))
+        .ok_or_else(|| {
+            refuse(
+                op,
+                format!("a width of {conv_width} at dilation {dilation} keeps no countable history"),
+            )
+        })
+}
+
 pub fn causal_conv1d(
     ctx: &Ctx<'_>,
     x: Tensor,
     weight: Tensor,
     state: &RecurrentPool,
     conv_width: u32,
+    dilation: u32,
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d";
@@ -302,6 +326,12 @@ pub fn causal_conv1d(
         "the conv lands the row it convolves"
     );
     let taps = stated(OP, nonzero(OP, "the conv width this statement states", conv_width)?)?;
+    let hist = conv_history(OP, conv_width, dilation)?;
+    debug_assert_eq!(
+        u64::from(state.conv_state.width),
+        u64::from(hist) * u64::from(channels),
+        "the state bank a dilated conv reads is `(width - 1) * dilation + 1` rows of channels"
+    );
     ctx.fire(
         Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(conv_grid(channels, rows)),
         &[
@@ -313,6 +343,7 @@ pub fn causal_conv1d(
             y.arg_mut(),
             stated(OP, x.width)?.arg(),
             taps.arg(),
+            stated(OP, dilation)?.arg(),
         ],
     )
 }
@@ -325,6 +356,7 @@ pub fn causal_conv1d_chunked(
     weight: Tensor,
     state: &RecurrentPool,
     conv_width: u32,
+    dilation: u32,
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_causal_conv1d_chunked";
@@ -336,6 +368,12 @@ pub fn causal_conv1d_chunked(
         "the conv lands the row it convolves"
     );
     let taps = stated(OP, nonzero(OP, "the conv width this statement states", conv_width)?)?;
+    let hist = conv_history(OP, conv_width, dilation)?;
+    debug_assert_eq!(
+        u64::from(state.conv_state.width),
+        u64::from(hist) * u64::from(channels),
+        "the state bank a dilated conv reads is `(width - 1) * dilation + 1` rows of channels"
+    );
     let lanes = requests(OP, x)?;
     ctx.fire(
         Fire::at("attn/ssm_causal_conv1d.metal", entry).apply(conv_grid(channels, lanes)),
@@ -349,6 +387,7 @@ pub fn causal_conv1d_chunked(
             y.arg_mut(),
             stated(OP, x.data.width)?.arg(),
             taps.arg(),
+            stated(OP, dilation)?.arg(),
         ],
     )
 }

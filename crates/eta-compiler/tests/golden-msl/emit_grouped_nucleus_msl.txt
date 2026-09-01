@@ -2,7 +2,15 @@
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
 # emitter_version: 33
 # @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
-# @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
+# @grouped: bytes=1043 fnv1a64=0x429904221e8e963f
+# @grouped was bytes=970 fnv1a64=0xa8ab9e1ebf8714d9 through emitter 41. The lane
+#   record grew `attn_score_base` and `attn_score_row_stride` (+73 bytes of struct
+#   text, no field before them moved), which is the grouped form's route to the
+#   attention-score rectangle: that form binds no per-intrinsic buffer, so a
+#   rectangle it must reach arrives as an address on the record. Unlike @runtime,
+#   this prefix is not kernel-side text an `oracle-inputs/` copy could stand in
+#   for -- `codegen::layout` declares the table and prints it, so the bytes are
+#   the emitter's and the move belongs in the diff.
 # cases: 192
 #   re-blessed again (emitter 27): `m1_reduce_argmax` no longer materializes one
 #   16-byte candidate per element into device `temporary` and tree-reduces it in
@@ -21,7 +29,7 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: additive corpus growth: the lora_prologue stage (stage-4 lora sink) joined the shared corpus and the MSL dumps were never re-pinned for it, while the CUDA ones were -- the same reason those carry. The case list gains exactly lora_prologue#0's five entries and loses none; every pre-existing case keeps its identity, its order and its emitted text.
+#   reason: metal emitter 41->42, and the shared lane record is what moved. The GROUPED (M3) form binds no per-intrinsic buffer -- every rectangle it reads arrives as an address on the lane record -- so `attn_score` was the one id its table refused: the observability slab is the shell's own reservation (engine_metal::scores), not the readout arena, and no row displacement off lane.logits_base reaches it. LaneRecord now carries attn_score_base and attn_score_row_stride (appended, so every field before them keeps its offset; the record is 96 -> 112 bytes), emit_grouped_fused_region gathers the F32 planes from that base, and m3_intrinsic_bindable stops declining the id. What moved in these dumps is exactly the +73 bytes of struct text the two fields add to the M1 and M3 preambles, plus the emitter version spelled into ptir_m3_generic_{ready,commit}_v42. No emitted logic changed for any corpus case: the base corpus reads no score rectangle, so no kernel body here grew an arm. The bump is load-bearing rather than hygienic -- a library cached under 41 reads the 96-byte record, so lane 1 of any grouped table would start sixteen bytes early -- and CUDA bumps 24 -> 25 for the same reason on its own copy of the struct. The reason the record grew at all is the M2 ceiling: the score rectangle costs two of the twelve argument slots the channels grow into, so a ten-channel guest reading scores (trackb-h2o) was refused by a limit that had nothing to do with what it asked for.
 === beam_epilogue#0 singleton#0
 function_name: ptir_m3_b4fadd8446eb58dd_r0
 region: library=0 library_op=0 schedule=0 nodes=1 inputs=0 outputs=1 sinks=0
@@ -122,7 +130,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_b4fadd8446eb58dd_r35
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51943 prefix=@runtime+@grouped tail_bytes=10474
+source: bytes=52016 prefix=@runtime+@grouped tail_bytes=10474
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -484,7 +492,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_4f4b856e5ef3e8b4_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51938 prefix=@runtime+@grouped tail_bytes=10469
+source: bytes=52011 prefix=@runtime+@grouped tail_bytes=10469
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -907,7 +915,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_101abcfb79b08b89_r3
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51938 prefix=@runtime+@grouped tail_bytes=10469
+source: bytes=52011 prefix=@runtime+@grouped tail_bytes=10469
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1213,7 +1221,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_963137d4ffed0445_r4
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51938 prefix=@runtime+@grouped tail_bytes=10469
+source: bytes=52011 prefix=@runtime+@grouped tail_bytes=10469
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1611,7 +1619,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_82921040f7bc2612_r12
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51942 prefix=@runtime+@grouped tail_bytes=10473
+source: bytes=52015 prefix=@runtime+@grouped tail_bytes=10473
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -1912,7 +1920,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_82921040f7bc2612_r1
 region: library=1 library_op=0 schedule=3 nodes=13 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51939 prefix=@runtime+@grouped tail_bytes=10470
+source: bytes=52012 prefix=@runtime+@grouped tail_bytes=10470
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -2297,7 +2305,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_dff3bc6795a9dcdf_r23
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51942 prefix=@runtime+@grouped tail_bytes=10473
+source: bytes=52015 prefix=@runtime+@grouped tail_bytes=10473
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {
@@ -2695,7 +2703,7 @@ skipped: cxx-oracle-undefined (emit_grouped_nucleus_msl indexes region.inputs[0]
 function_name: ptir_m3_4cf3882bf2fff913_r6
 region: library=0 library_op=0 schedule=1 nodes=1 inputs=3 outputs=1 sinks=0
 ok: true
-source: bytes=51938 prefix=@runtime+@grouped tail_bytes=10469
+source: bytes=52011 prefix=@runtime+@grouped tail_bytes=10469
 
 inline uint m3_nucleus_order_digit(float value, uint pass) {
   if (pass < 8u) {

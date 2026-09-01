@@ -33,8 +33,10 @@ use model_ir::ops::Elementwise;
 
 /// A slot table generously above every hand-built fire below — the tests ask
 /// about window semantics, not the carve, so the ceiling only has to hold.
+/// The last three are what one GATHERED payload is bounded by (rows, kv
+/// spaces, pages), which `Slots` owns since the tail acquired a stride.
 fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1)
+    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
 use model_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
@@ -181,8 +183,7 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
     let windows = Windows::of(
         &trace,
         &compiled,
-        fire.classes(),
-        fire.patch_classes(),
+        model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]),
         &indptr(&[5, 3, 4]),
         Copies::off(),
         test_slots(),
@@ -203,21 +204,21 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
             RowAxis::Patches => {
                 towers += 1;
                 assert_eq!(
-                    window.span.rows,
+                    window.span().rows,
                     fire.patch_classes().rows_of(&region.mask),
                     "a tower region's launch runs over PATCH rows",
                 );
                 assert_eq!(
-                    window.span.lanes,
+                    window.span().lanes,
                     fire.patch_classes().lanes_of(&region.mask),
                     "and its lane count is images",
                 );
-                assert_eq!(window.span, window.patch, "one axis, one window");
+                assert_eq!(window.span(), window.on(RowAxis::Patches), "one axis, one window");
             }
             RowAxis::Tokens => {
                 trunks += 1;
                 assert_eq!(
-                    window.span.rows,
+                    window.span().rows,
                     fire.classes().rows_of(&region.mask),
                     "a trunk region's launch runs over token rows",
                 );
@@ -225,11 +226,11 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
                 // classes — a class with token rows and no image contributes
                 // none, which is the invariant break.
                 assert_eq!(
-                    window.patch.rows,
+                    window.on(RowAxis::Patches).rows,
                     fire.patch_classes().rows_of(&region.mask),
                 );
-                merge_saw_the_tower |= window.patch.rows == fire.patch_rows()
-                    && window.span.rows == fire.rows();
+                merge_saw_the_tower |= window.on(RowAxis::Patches).rows == fire.patch_rows()
+                    && window.span().rows == fire.rows();
             }
         }
     }
@@ -276,8 +277,7 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
         Windows::of(
             &trace,
             &compiled,
-            fire.classes(),
-            fire.patch_classes(),
+            model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]),
             &boundaries,
             Copies::off(),
             test_slots(),
@@ -291,13 +291,13 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
         let a = without.at(at as u32, 0);
         let b = with.at(at as u32, 0);
         if axis_of(&compiled, at) == RowAxis::Tokens {
-            assert_eq!(a.span, b.span, "region {at}'s token window moved");
+            assert_eq!(a.span(), b.span(), "region {at}'s token window moved");
             assert_eq!(a.indptr_host, b.indptr_host);
         }
         // And the imageless fire's patch window is the zero window, which is
         // what an axis-empty fire has: the tower's launches read zero rows and
         // return, so the unit's exec runs nothing.
-        assert_eq!(a.patch.rows, 0, "region {at} found patch rows in a text fire");
+        assert_eq!(a.on(RowAxis::Patches).rows, 0, "region {at} found patch rows in a text fire");
     }
     assert_eq!(plain.patch_rows(), 0);
     assert_eq!(mixed.patch_rows(), 128);

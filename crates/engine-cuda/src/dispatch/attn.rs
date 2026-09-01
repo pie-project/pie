@@ -47,7 +47,7 @@ impl Run<'_> {
         let Some(plane) = seat.plane_of(lse) else {
             return Ok(());
         };
-        let lane_offset = self.window().span.lane_offset;
+        let lane_offset = self.window().span().lane_offset;
         let mut slab = seat.slab;
         // **AND THE OBSERVATION TAKES THE WINDOW BACK** (chunk 2c-b). The arm
         // above is on `crate::SHIFTED` now and may be handed the plane's
@@ -1030,6 +1030,17 @@ impl Run<'_> {
                 *rope_dim,
                 *theta,
             ),
+            // **THE KEY STRIDE IS WHAT THIS PLANE SERVES AND WHAT IT
+            // REFUSES.** `index.cuh`'s `index_topk_paged` scans `j = 0 .. pos`
+            // and reads cell `j` — one key per TOKEN, which is `ratio == 1`
+            // and is glm_5's whole indexer. dsv4-flash keys one row per
+            // COMPRESSED BLOCK and states its compressor's ratio; the metal
+            // shader takes that stride as a number, `index.cuh` does not, and
+            // serving it here would score cells nobody wrote and publish ids
+            // in a space the reader does not walk. So the arm serves the
+            // stride the kernel has and names the op for the rest. The day
+            // `index.cuh` grows the parameter, this arm is the guard that
+            // goes.
             Attention::IndexTopk {
                 q,
                 weights,
@@ -1037,17 +1048,25 @@ impl Run<'_> {
                 heads,
                 head_dim,
                 top_k,
+                ratio,
                 selection,
-            } => index::topk(
-                self.ctx(),
-                self.ragged(*q),
-                self.tensor(*weights),
-                &self.pool(*keys),
-                *heads,
-                *head_dim,
-                *top_k,
-                &mut self.tensor(*selection),
-            ),
+            } => {
+                if *ratio != 1 {
+                    return Err(kernels_cuda::Error::Unsupported {
+                        op: "attention.index_topk",
+                    });
+                }
+                index::topk(
+                    self.ctx(),
+                    self.ragged(*q),
+                    self.tensor(*weights),
+                    &self.pool(*keys),
+                    *heads,
+                    *head_dim,
+                    *top_k,
+                    &mut self.tensor(*selection),
+                )
+            }
             // As `attention.mla_kv_append`: the arm resolves the op's write
             // descriptors, and the entry marks its own remaining seam.
             Attention::IndexKvAppend {
@@ -1069,6 +1088,7 @@ impl Run<'_> {
                 ratio,
                 boundary_pos,
                 boundary_req,
+                boundary_rope,
             } => pool::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
@@ -1076,6 +1096,7 @@ impl Run<'_> {
                 *ratio,
                 &mut self.tensor(*boundary_pos),
                 &mut self.tensor(*boundary_req),
+                &mut self.tensor(*boundary_rope),
             ),
             Attention::PoolBoundaryPrefill {
                 positions,
@@ -1083,6 +1104,7 @@ impl Run<'_> {
                 ratio,
                 boundary_pos,
                 boundary_req,
+                boundary_rope,
             } => pool::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
@@ -1090,14 +1112,32 @@ impl Run<'_> {
                 *ratio,
                 &mut self.tensor(*boundary_pos),
                 &mut self.tensor(*boundary_req),
+                &mut self.tensor(*boundary_rope),
             ),
             // MENLO-SEAM: the dsv4 compressor state (`state_kv`,
-            // `state_score`, `ape`) has no IR seat; the arm binds the slabs
-            // the shell staged for the pooled space (`Run::slabs`).
+            // `state_score`) has no IR seat; the arm binds the slabs the
+            // shell staged for the pooled space (`Run::slabs`).
+            //
+            // **`ape` HAS A SEAT NOW** — it is a checkpoint plane
+            // (`attn.compressor.ape`) and not shell scratch — so the op's own
+            // operand is what reaches the entry when the compressor states
+            // one, and the shell's absent seat when it does not (the toy's
+            // parameter-free pool, the `ape == nullptr` path).
+            //
+            // **AND THIS SHELL STILL STAGES ONE PLANE FOR EVERY POOLED
+            // LAYER.** `engine-metal`'s reservation moved to one plane per
+            // SPACE when `attention.pool_state_write` gave the slabs a
+            // writer, because two pooled layers hold different projections at
+            // the same paged cell. This shell's `fire.tables.pool_state` is
+            // still fire-wide; a dsv4 artifact with two pooled layers reads
+            // the later layer's state in the earlier layer's gather here.
+            // Stated rather than hidden — the move belongs to a CUDA lane
+            // that can build.
             Attention::PoolGather {
                 boundary_pos,
                 boundary_req,
                 pages,
+                ape,
                 head_dim,
                 ratio,
                 entries,
@@ -1112,8 +1152,31 @@ impl Run<'_> {
                     *ratio,
                     slabs.state_kv,
                     slabs.state_score,
-                    slabs.ape,
+                    ape.map_or(slabs.ape, |id| self.tensor(id)),
                     &mut self.tensor(*entries),
+                )
+            }
+            Attention::PoolStateWrite {
+                kv,
+                score,
+                pages,
+                write_page,
+                write_offset,
+                head_dim,
+                ratio,
+            } => {
+                let slabs = self.slabs();
+                pool::state_write(
+                    self.ctx(),
+                    self.tensor(*kv),
+                    self.tensor(*score),
+                    &self.pool(*pages),
+                    self.tensor(*write_page),
+                    self.tensor(*write_offset),
+                    *head_dim,
+                    *ratio,
+                    slabs.state_kv,
+                    slabs.state_score,
                 )
             }
             // As the other appenders: the arm resolves the op's write
@@ -1161,6 +1224,19 @@ impl Run<'_> {
                 &mut self.tensor(*o),
                 &mut self.tensor(*lse),
             ),
+            // **THE NSA FINE BRANCH REFUSES BY NAME ON THIS PLANE.**
+            // `pool.cuh` carries `pool_lse_paged`, the DENSE reader over every
+            // visible compressed row, and no selected twin of it — the metal
+            // shell serves `attention.pool_lse_selected` off
+            // `attn/pool.metal`'s `pool_lse_selected_paged`. Falling back to
+            // the dense reader here would answer a different attention (every
+            // compressed row instead of the indexer's chosen ones) under the
+            // selected op's name, so this arm says which kernel is missing.
+            // The day `pool.cuh` grows the selected walk, this arm is the one
+            // line that changes.
+            Attention::PoolLseSelected { .. } => Err(kernels_cuda::Error::Unsupported {
+                op: "attention.pool_lse_selected",
+            }),
         }
     }
 }

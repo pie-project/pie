@@ -124,7 +124,8 @@ fn read_bindings(plan: &LoadPlan) -> Vec<SourceBinding> {
         .filter_map(|instr| {
             let (id, source) = match instr {
                 StorageInstr::ExtentWrite { id, source, .. }
-                | StorageInstr::BulkExtentWrite { id, source, .. } => (*id, source),
+                | StorageInstr::BulkExtentWrite { id, source, .. }
+                | StorageInstr::GatherWrite { id, source, .. } => (*id, source),
                 StorageInstr::TileMap {
                     id,
                     source: Some(source),
@@ -169,7 +170,8 @@ fn assert_interchangeable(
     for instr in &mut rebound.instrs {
         let source = match instr {
             StorageInstr::ExtentWrite { source, .. }
-            | StorageInstr::BulkExtentWrite { source, .. } => source,
+            | StorageInstr::BulkExtentWrite { source, .. }
+            | StorageInstr::GatherWrite { source, .. } => source,
             StorageInstr::TileMap {
                 source: Some(source),
                 ..

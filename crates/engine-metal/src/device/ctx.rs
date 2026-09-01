@@ -30,6 +30,35 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLResourceOptions, MTLSize,
 };
 
+/// **EVERY DEVICE RESERVATION THIS PROCESS HAS ASKED FOR**, counted.
+///
+/// One relaxed increment at the top of each of the three doors that can hand
+/// back an `MTLBuffer` — [`Context::reserve`], [`Context::no_copy`] and
+/// [`Context::empty`] — which is the whole of how memory is minted on this
+/// plane. Nothing in the shell reads it; it exists so a gate can assert the
+/// stronger half of a refusal: not merely that the load said no, but that it
+/// said no before it took anything.
+///
+/// ATTEMPTS AND NOT SUCCESSES, deliberately. A door entered and refused by the
+/// `maxBufferLength` ceiling still counts, because what a zero-allocation gate
+/// is claiming is that the door was never reached at all — and a counter that
+/// only recorded successes would let a refusal that had already walked past
+/// the check read as zero.
+///
+/// Relaxed because it is a monotone counter nobody synchronises against: a
+/// gate reads it on the thread that called, around a call on that thread.
+static RESERVATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`RESERVATIONS`] — how many device reservations this PROCESS has asked for.
+///
+/// A gate takes it before and after the call it is making a claim about and
+/// compares the two; the absolute number is meaningless, because every test in
+/// a binary shares the process.
+#[must_use]
+pub fn reservations() -> u64 {
+    RESERVATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Is there a Metal device on this machine?
 ///
 /// **A BUILD THAT NAMES METAL IS NOT A MACHINE THAT HAS IT** — a headless
@@ -231,6 +260,7 @@ impl Context {
     /// device declined.
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn reserve(&self, bytes: u64) -> Result<super::alloc::Slab> {
+        RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_vendor = "apple")]
         {
             if bytes > self.max_buffer {
@@ -259,6 +289,64 @@ impl Context {
         }
     }
 
+    /// **Wrap `span` bytes of memory this process already holds**, without
+    /// copying one of them — `newBufferWithBytesNoCopy:length:options:
+    /// deallocator:` over a `StorageModeShared` reservation.
+    ///
+    /// The deallocator is nil, so Metal does NOT own the pages: releasing
+    /// the returned buffer frees nothing and the caller's memory must
+    /// outlive it. That is why this is `pub(crate)` and `unsafe` and why the
+    /// only door onto it is
+    /// [`Buffer::mapped`](super::alloc::Buffer::mapped), which takes an
+    /// `Arc<Mapping>` and holds it for the reservation's whole life. See
+    /// [`crate::mapping`] for the ownership argument and for the wiring
+    /// measurement that says when this primitive may be used at all.
+    ///
+    /// # Safety
+    ///
+    /// `at` must be page-aligned and `span` must be a multiple of the page
+    /// size (both of which `newBufferWithBytesNoCopy` requires on macOS and
+    /// neither of which it checks), `[at, at + span)` must be one live
+    /// readable mapping, and the caller must keep it mapped until every
+    /// reference to the returned buffer is gone.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`] past `maxBufferLength`, [`Fault::Device`] when the
+    /// device declined the span.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) unsafe fn no_copy(
+        &self,
+        at: std::ptr::NonNull<u8>,
+        span: usize,
+    ) -> Result<super::alloc::Slab> {
+        RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let bytes = span as u64;
+        if bytes > self.max_buffer {
+            return Err(Fault::Ceiling {
+                what: "bytes in one buffer",
+                need: bytes,
+                have: self.max_buffer,
+            });
+        }
+        // SAFETY: the caller's contract is exactly this call's — an aligned
+        // live mapping of `span` readable bytes that outlives the buffer —
+        // and a nil deallocator is what leaves the pages theirs.
+        unsafe {
+            self.device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    at.cast::<std::ffi::c_void>(),
+                    span,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+                .ok_or(Fault::Device {
+                    call: "newBufferWithBytesNoCopy:length:options:deallocator:",
+                    why: format!("the device declined a zero-copy wrap of {bytes} bytes"),
+                })
+        }
+    }
+
     /// The stand-in a zero-length reservation holds.
     ///
     /// Metal refuses a zero-length buffer and a plan may state an empty
@@ -266,6 +354,7 @@ impl Context {
     /// handle into (`Buffer::bytes` stays 0, and every `span` refuses).
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn empty(&self) -> super::alloc::Slab {
+        RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_vendor = "apple")]
         {
             self.device
@@ -419,6 +508,14 @@ impl Frame {
     /// ordered after every dispatch encoded before it by the command
     /// buffer's own encoder order.
     ///
+    /// **THE SECOND CALLER MOVES CELLS WITHIN ONE RESERVATION** — a kv graft
+    /// (`crate::store::Pools::copy_kv`) reads and writes pages of the same
+    /// pool, so `source` and `into` are the same buffer at two offsets. Metal
+    /// serves that as long as the two regions do not overlap, and the caller
+    /// is where the refusal for one that does lives
+    /// (`crate::store::Move::plan`): an overlapping blit is undefined rather
+    /// than a shift, and silently so.
+    ///
     /// # Errors
     ///
     /// [`Fault::Deviceless`] off Apple, [`Fault::Device`] when the command
@@ -447,11 +544,12 @@ impl Frame {
                 })?);
             }
             let blit = self.blit.as_deref().expect("just opened");
-            // SAFETY: both spans were bounds-checked by `Buffer::span` at the
-            // handle that named them, and both buffers outlive the command
-            // buffer — the readout seat is owned by the shell for the life of
-            // the load, and the source is retained by the handle row the
-            // caller resolved it through.
+            // SAFETY: both spans were bounds-checked by `Buffer::span` — at
+            // the handle that named them for the readout, at the pool row for
+            // a graft — and both buffers outlive the command buffer: the
+            // readout seat and the pools are owned by the shell for the life
+            // of the load, and a source resolved through a handle row is
+            // retained by it.
             unsafe {
                 blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                     source,

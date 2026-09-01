@@ -93,6 +93,36 @@ pub fn swiglu_clamp_alpha(
     )
 }
 
+/// [`swiglu_clamp`] over an unfused pair: the same clamps and the same silu,
+/// with the halves handed over as two tensors rather than as one packed row.
+pub fn swiglu_clamp_split(
+    ctx: &Ctx<'_>,
+    gate: Tensor,
+    up: Tensor,
+    limit: f32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_swiglu_clamp_split";
+    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "swiglu_clamp_bfloat16" });
+    debug_assert_eq!(
+        (up.rows, up.width),
+        (gate.rows, gate.width),
+        "the unfused halves are one rectangle each and they are the same rectangle"
+    );
+    debug_assert_eq!(
+        (y.rows, y.width),
+        (gate.rows, gate.width),
+        "the activation lands on the halves' own rectangle"
+    );
+    ctx.fire(
+        Fire::at("linear/mlp_gated.metal", entry).apply(Grid::of(
+            elementwise(OP, gate.width, gate.rows)?,
+            [GROUP, 1, 1],
+        )),
+        &[gate.arg(), up.arg(), y.arg_mut(), limit.arg()],
+    )
+}
+
 pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.mlp_geglu_tanh";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "geglu_tanh_bfloat16" });
@@ -102,6 +132,20 @@ pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<
             [GROUP, 1, 1],
         )),
         &[gate.arg(), up.arg(), y.arg_mut()],
+    )
+}
+
+/// The ungated map (multimodal §6.2): gelu_tanh over one projection, no
+/// `up` multiply — a tower MLP's spelling, not a gated trunk's with ones.
+pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.mlp_gelu_tanh";
+    let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "mlp_gelu_tanh_bfloat16" });
+    ctx.fire(
+        Fire::at("linear/mlp_gated.metal", entry).apply(Grid::of(
+            elementwise(OP, x.width, x.rows)?,
+            [GROUP, 1, 1],
+        )),
+        &[x.arg(), y.arg_mut()],
     )
 }
 

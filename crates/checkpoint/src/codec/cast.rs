@@ -13,6 +13,17 @@ use crate::types::DType;
 use super::invalid;
 
 pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
+    // **ASKED BEFORE THE WIDTH IS**, because a quantization term has no
+    // element width at all (`Dtype::bits` answers zero and says why), and
+    // `chunks_exact(0)` panics rather than refusing. The arm inside the loop
+    // below says the same thing and is what a NON-empty input reaches; this
+    // is the one that catches an empty one.
+    if dtype.elem().is_none() {
+        return Err(invalid(
+            "host Cast does not implement a quantization term: a block decodes \
+             through its own scheme, not element by element",
+        ));
+    }
     let width = dtype.bytes_ceil() as usize;
     if !bytes.len().is_multiple_of(width) {
         return Err(invalid("cast input byte count is not element-aligned"));
@@ -47,29 +58,33 @@ pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 // Sub-byte codes have no element to chunk on: `width` above
                 // rounded them up to a byte, and a byte holds two of them.
                 // Packing and unpacking them is `codec::mxfp4`'s, not a cast's.
-                DType::E2m1 => {
-                    return Err(invalid("host Cast does not implement the sub-byte codes"));
-                }
-                // A quantized format's byte is a CODE, meaningless without
-                // its group's factors. Reading it as the integer it happens
-                // to be would produce a number, which is the failure mode
-                // this arm exists to prevent; decoding a whole plane is a
-                // codec's or a kernel's job, never a cast's.
-                DType::Mxfp4
-                | DType::Nvfp4
+                DType::E2m1
+                | DType::Mxfp4
                 | DType::U4g64
-                | DType::U8g64
                 | DType::U4g32
+                | DType::U4g64tiled
+                | DType::U2g32
+                | DType::U2g64
+                | DType::Nvfp4
                 | DType::U2g16k
                 | DType::I3g16k
                 | DType::U4g32k
                 | DType::U5g32k
                 | DType::I6g16k
                 | DType::E4m3row
-                | DType::E4m3tile128 => {
+                | DType::E4m3tile128
+                | DType::U2g128 => {
+                    return Err(invalid("host Cast does not implement the sub-byte codes"));
+                }
+                // Byte-wide, and no more castable for it: an `U8g64` byte is
+                // an affine CODE, meaningless without the scale and the offset
+                // of its group. Reading it as the integer it happens to be
+                // would produce a number, which is the failure mode this arm
+                // exists to prevent.
+                DType::U8g64 => {
                     return Err(invalid(
-                        "host Cast does not implement quantized formats: a code means \
-                         nothing without its group's factors",
+                        "host Cast does not implement affine codes: an U8g64 byte means \
+                         nothing without its group's scale and offset",
                     ));
                 }
             })
@@ -102,28 +117,33 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
                 return Err(invalid("host Cast does not implement FP8"));
             }
             // See `decode_values`: a sub-byte code is packed, not cast.
-            DType::E2m1 => {
-                return Err(invalid("host Cast does not implement the sub-byte codes"));
-            }
-            // And a quantized format's code is quantized, not cast — choosing
-            // one picks the group's factors too. See `decode_values`.
-            DType::Mxfp4
-            | DType::Nvfp4
+            DType::E2m1
+            | DType::Mxfp4
             | DType::U4g64
-            | DType::U8g64
             | DType::U4g32
+            | DType::U4g64tiled
+            | DType::U2g32
+            | DType::U2g64
+            | DType::Nvfp4
             | DType::U2g16k
             | DType::I3g16k
             | DType::U4g32k
             | DType::U5g32k
             | DType::I6g16k
             | DType::E4m3row
-            | DType::E4m3tile128 => {
+            | DType::E4m3tile128
+            | DType::U2g128 => {
+                return Err(invalid("host Cast does not implement the sub-byte codes"));
+            }
+            // And an affine code is quantized, not cast — see `decode_values`.
+            DType::U8g64 => {
                 return Err(invalid(
-                    "host Cast does not encode to quantized formats: choosing a code \
-                     is a quantization, which picks the group's factors too",
+                    "host Cast does not encode to affine codes: choosing an U8g64 byte \
+                     is a quantization, which picks the group's scale and offset too",
                 ));
             }
+            // See `decode_values`: writing a block is the scheme's, and
+            // choosing its codes is a quantization rather than a cast.
             DType::I64 | DType::U64 => {
                 return Err(invalid("host Cast does not implement 64-bit integers"));
             }

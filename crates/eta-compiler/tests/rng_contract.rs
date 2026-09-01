@@ -25,14 +25,14 @@ fn check_or_regenerate(path: &Path, expected: &str) {
     }
     let actual = fs::read_to_string(path).unwrap_or_else(|error| {
         panic!(
-            "{} missing ({error}); regenerate with PTIR_REGEN=1 cargo test -p pie-compiler-tests --test rng_contract",
+            "{} missing ({error}); regenerate with PTIR_REGEN=1 cargo test -p eta-compiler --test rng_contract",
             path.display()
         )
     });
     assert_eq!(
         actual,
         expected,
-        "{} is stale; regenerate with PTIR_REGEN=1 cargo test -p pie-compiler-tests --test rng_contract",
+        "{} is stale; regenerate with PTIR_REGEN=1 cargo test -p eta-compiler --test rng_contract",
         path.display()
     );
 }
@@ -270,7 +270,13 @@ fn allowlists() -> Allowlists {
             // splitmix64 id generation: the canonical splitmix increment
             // happens to be the same golden-ratio word; not a keyed-RNG
             // transcription.
-            "crates/runtime/src/pipeline/offload.rs",
+            //
+            // MOVED, and repointed rather than dropped: `pipeline/offload.rs`
+            // came up a level to `src/offload.rs` at `e339ac304` when offload
+            // climbed to the front door. `next_random` came with it verbatim,
+            // so the exemption is the same exemption at a new path — the
+            // rename this list's own doc says should fail HERE, and did.
+            "crates/runtime/src/offload.rs",
             // driver-cuda/src/fire/lora.rs STOOD HERE — the staged lora
             // table's fingerprint, a splitmix mixer over what a captured lora
             // body baked, allowlisted because it had to agree with the
@@ -325,6 +331,22 @@ fn allowlists() -> Allowlists {
             // went in the same commit -- which is what
             // [`allowlisted_paths_still_exist`] is for, and what every move
             // and deletion in that test's own doc failed to do.
+            //
+            // SEEDS AGAIN, and the successor the paragraph above was waiting
+            // for: `kernels-cuda/tests/` came back at `b5cd17f67` with a
+            // shared `Lcg` filler, seeded by xor-ing the golden-ratio word
+            // into the caller's seed and stepped by Knuth's MMIX multiplier.
+            // It fills golden kernel inputs so a run can be bisected; it
+            // reproduces no ETA stream. (It writes the shift too — see the
+            // `shift` list, which this entry's twin re-opens.)
+            "crates/kernels-cuda/tests/common/mod.rs",
+            // NOT a seed and not a cache key: the word is the splitmix64
+            // increment inside `hash_constants`, which reproduces qwen4's
+            // published per-layer multipliers constant for constant so the
+            // device hash agrees with the reference's `long` arithmetic. The
+            // number is fixed by the checkpoint it has to match, not chosen
+            // here, and the ETA stream's own two words appear nowhere in it.
+            "crates/models/src/qwen_4/model.rs",
         ],
         mask: &["crates/grammar/src/brle.rs"],
         // The float conversion's shift is the weakest needle here: any 64-bit
@@ -354,8 +376,23 @@ fn allowlists() -> Allowlists {
         // CUDA kernels so a Metal one could be compared against them. The
         // fixture went with the old engine-metal test tree in the palo sweep,
         // and both its exemptions go with it; nothing outside the contract
-        // writes the shift or the divisor today.
-        shift: &[],
+        // wrote the shift or the divisor that day.
+        //
+        // NOT EMPTY ANY MORE, and by the route the paragraph above predicted:
+        // both entries below are test-data fillers that arrived after the
+        // list was last emptied, each taking twenty-four bits off the top of
+        // a 64-bit state and scaling them. Neither reproduces the ETA stream
+        // — the divisor is 2^23 in both, not the contract's, so `unit` stays
+        // empty and the two lists are NOT the single idiom `Allowlists::unit`
+        // describes here.
+        shift: &[
+            // The gated-delta-scan cost test's xorshift64 filler.
+            "crates/engine-metal/tests/what_the_gated_delta_scan_costs.rs",
+            // `Lcg::unit`, rounding each draw through bf16 so host reference
+            // and device read the same numbers. Its seed is the other half of
+            // this file's `stride` entry for the same path.
+            "crates/kernels-cuda/tests/common/mod.rs",
+        ],
         unit: &[],
     }
 }

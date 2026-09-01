@@ -126,18 +126,28 @@ impl Run<'_> {
                 *alpha,
                 self.tensor(*y),
             ),
+            // The unfused twin of `MlpSwigluClamp`: two routed matmuls landed
+            // two rectangles, and this reads both instead of one row's halves.
+            Linear::MlpSwigluClampSplit { gate, up, limit, y } => {
+                linear::mlp::swiglu_clamp_split(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    self.tensor(*up),
+                    *limit,
+                    self.tensor(*y),
+                )
+            }
             Linear::MlpGegluTanh { gate, up, y } => linear::mlp::geglu_tanh(
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
                 self.tensor(*y),
             ),
-            // **THE UNGATED GELU, REFUSED BY NAME** (multimodal §6.2): this
-            // plane's `linear::mlp` ships `geglu_tanh` and its packed twin,
-            // both of which multiply by an `up` half, and no ungated entry.
-            Linear::MlpGeluTanh { .. } => {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
-            }
+            Linear::MlpGeluTanh { x, y } => linear::mlp::gelu_tanh(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*y),
+            ),
             Linear::MlpGegluTanhPacked {
                 packed,
                 intermediate,
@@ -230,6 +240,26 @@ impl Run<'_> {
                 *top_k,
                 *renormalize,
                 *scaling,
+                self.tensor(*routes),
+                self.tensor(*weights),
+            ),
+            // `experts` is the router's field for the passes that divide a
+            // band by it (`crate::experts`, `crate::scratch`) and is no
+            // argument of the kernel: the table names ids outright.
+            Linear::MoeHashRoute {
+                ids,
+                tid2eid,
+                vocab,
+                experts: _,
+                top_k,
+                routes,
+                weights,
+            } => linear::moe::hash_route(
+                self.ctx(),
+                self.tensor(*ids),
+                self.tensor(*tid2eid),
+                *vocab,
+                *top_k,
                 self.tensor(*routes),
                 self.tensor(*weights),
             ),

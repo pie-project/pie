@@ -117,6 +117,7 @@ use crate::error::{Fault, Result};
 use super::compile::Compiled;
 use super::launch::{ChannelShape, Cursor, Prepared, Rings};
 use super::ports::{self, Envelope};
+use super::shared::SharedRing;
 
 /// What one fire produced.
 ///
@@ -139,6 +140,51 @@ pub enum Fired {
     /// [`eta_exec::StepOutcome::Faulted`], and on this plane it is reachable
     /// from the DEVICE as well as from the commit: see [`Session::fire`].
     Faulted(String),
+}
+
+/// Why a fire would block, in the terms the answer was computed from —
+/// [`Session::readiness`].
+///
+/// The channel index alone is what [`Fired::Blocked`] carries, because that is
+/// what the host interpreter's outcome carries and the parity test compares
+/// the two. This is the same fact for a HUMAN: the direction the program
+/// declared, how many cells the ring holds right now, and how many it can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Blocked {
+    /// The first channel whose requirement a fire now would not meet.
+    pub channel: u32,
+    /// What the program declares it needs of that channel. `None` is a
+    /// channel with no stated requirement, which never blocks — so it never
+    /// appears here.
+    pub needs: Option<Direction>,
+    /// Cells in the ring: `tail - head`.
+    pub live: u64,
+    /// Cells the ring was declared to hold.
+    pub capacity: u64,
+}
+
+impl std::fmt::Display for Blocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.needs {
+            Some(Direction::NeedsFull) => write!(
+                f,
+                "channel {} is empty and its program takes from it (needs a cell, \
+                 holds {} of {})",
+                self.channel, self.live, self.capacity
+            ),
+            Some(Direction::NeedsEmpty) => write!(
+                f,
+                "channel {} is full and its program puts into it (needs room, holds \
+                 {} of {})",
+                self.channel, self.live, self.capacity
+            ),
+            None => write!(
+                f,
+                "channel {} holds {} of {}",
+                self.channel, self.live, self.capacity
+            ),
+        }
+    }
 }
 
 /// **What the STAGING half of an attached fire answers** —
@@ -170,6 +216,14 @@ pub enum Launched {
 pub struct Session {
     rings: Rings,
     shapes: Vec<ChannelShape>,
+    /// Where each channel this instance OWNS stands.
+    ///
+    /// **NOT THE ANSWER FOR EVERY CHANNEL, WHICH IS WHY NOTHING READS IT
+    /// DIRECTLY** (design §5). A device-only channel two passes share keeps
+    /// its cursors in the ring itself, because "where is this ring" is a
+    /// question whose answer another SESSION moved — see
+    /// [`Session::cursors_now`], which is the one place the two are read as
+    /// one, and the shared slots of this vector are dead where it applies.
     cursors: Vec<Cursor>,
     /// One per stage plan, `None` for a stage with nothing to launch — the
     /// adapter prologue is exactly that, its one region being a sink the model
@@ -228,6 +282,7 @@ impl Session {
         plan: &ExecPlan,
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
+        adopted: &[Option<std::sync::Arc<SharedRing>>],
     ) -> Result<Session> {
         stages_and_plans_agree(compiled)?;
         if plan.package.channels.is_empty() {
@@ -240,7 +295,7 @@ impl Session {
 
         let shapes: Vec<ChannelShape> =
             plan.package.channels.iter().map(ChannelShape::of).collect();
-        let rings = Rings::allocate(device, &shapes)?;
+        let rings = Rings::allocate(device, &shapes, adopted)?;
         let cursors = vec![Cursor { head: 0, tail: 0 }; shapes.len()];
 
         let mut prepared = Vec::with_capacity(compiled.plans.len());
@@ -267,6 +322,20 @@ impl Session {
             airborne: None,
         };
         for (channel, wire) in seeds {
+            // **A SHARED RING IS SEEDED ONCE, BY WHICHEVER ATTACHMENT BINDS
+            //    FIRST** (design §5). Every attachment arrives carrying the
+            //    same declaration, so every attachment arrives carrying the
+            //    same seed; planting it per session was right while the ring
+            //    was per session, and would now leave a two-attachment ring
+            //    holding the seed twice with its tail two on. The ring hands
+            //    out the right to plant exactly once, and the losers skip —
+            //    which is not a silent fallback but the same cell, already
+            //    there, put there by the same bytes.
+            if let Some(ring) = session.rings.shared(*channel as usize)
+                && !ring.claim_seeding()
+            {
+                continue;
+            }
             if !session.publish(*channel, wire)? {
                 return Err(Fault::program(
                     "program::session",
@@ -293,9 +362,53 @@ impl Session {
     }
 
     /// Channel `channel`'s cursors.
+    ///
+    /// **THE RING'S, WHERE THE RING IS THE CHANNEL'S** — see
+    /// [`Session::cursors_now`].
     #[must_use]
     pub fn cursor(&self, channel: u32) -> Option<Cursor> {
-        self.cursors.get(channel as usize).copied()
+        let channel = channel as usize;
+        if let Some(ring) = self.rings.shared(channel) {
+            return Some(ring.cursor());
+        }
+        self.cursors.get(channel).copied()
+    }
+
+    /// **Every channel's cursor, from wherever that channel's cursor lives**
+    /// (design §5).
+    ///
+    /// A ring one pass owns keeps its two counts in [`Session::cursors`], and
+    /// that is the whole of the answer for almost every channel. A DEVICE-ONLY
+    /// ring two passes share keeps them in the ring, because the party that
+    /// last moved them is another session with a `cursors` of its own — so
+    /// this session's copy of that slot is not stale, it is not an answer at
+    /// all, and the ring's counters are read instead.
+    ///
+    /// This is the line the "channel 0 is empty and its program takes from
+    /// it" refusal came from. The gate, [`super::ports::resolve`] and
+    /// [`Prepared::refresh`] all resolve a cell through a cursor; while every
+    /// one of them read a per-session copy, the taker's gate and the taker's
+    /// port read agreed perfectly with each other and both disagreed with the
+    /// ring the putter had actually filled.
+    ///
+    /// **AND THERE IS NO IN-FLIGHT TERM, WHICH IS THIS PLANE'S OWN SHAPE.**
+    /// The CUDA sibling adds back what its fire has minted and not settled,
+    /// because a mint advances its prediction. Nothing here advances a cursor
+    /// before [`Session::commit`], which runs at the settle — so a shared
+    /// ring's counters say exactly what has LANDED, and the fence in
+    /// `serve::fence_instances` is what makes that the right thing for the
+    /// next pass to read.
+    ///
+    /// [`Prepared::refresh`]: super::launch::Prepared::refresh
+    #[must_use]
+    pub fn cursors_now(&self) -> Vec<Cursor> {
+        let mut cursors = self.cursors.clone();
+        for (channel, cursor) in cursors.iter_mut().enumerate() {
+            if let Some(ring) = self.rings.shared(channel) {
+                *cursor = ring.cursor();
+            }
+        }
+        cursors
     }
 
     /// How many fires have committed on this instance.
@@ -313,8 +426,7 @@ impl Session {
     /// How many unconsumed cells channel `channel` holds.
     #[must_use]
     pub fn depth(&self, channel: u32) -> u64 {
-        self.cursors
-            .get(channel as usize)
+        self.cursor(channel)
             .map_or(0, |cursor| cursor.tail.saturating_sub(cursor.head))
     }
 
@@ -359,9 +471,17 @@ impl Session {
                 ),
             ));
         }
-        let tail = self.cursors[channel as usize].tail;
-        self.rings.write_cell(channel as usize, tail, wire)?;
-        self.cursors[channel as usize].tail = tail + 1;
+        // **THE TAIL COMES FROM WHEREVER THIS CHANNEL'S TAIL LIVES**, and so
+        // does the advance — a shared ring's counters are the ring's, and a
+        // host put into one (which is a SEED, the only host put a device-only
+        // channel takes) has to be visible to the other attachments.
+        let slot = channel as usize;
+        let tail = self.cursor(channel).unwrap_or_default().tail;
+        self.rings.write_cell(slot, tail, wire)?;
+        match self.rings.shared(slot) {
+            Some(ring) => ring.bump_tail(),
+            None => self.cursors[slot].tail = tail + 1,
+        }
         Ok(true)
     }
 
@@ -383,9 +503,13 @@ impl Session {
         if self.depth(channel) == 0 {
             return Ok(None);
         }
-        let head = self.cursors[channel as usize].head;
-        let cell = self.rings.read_cell(channel as usize, head)?;
-        self.cursors[channel as usize].head = head + 1;
+        let slot = channel as usize;
+        let head = self.cursor(channel).unwrap_or_default().head;
+        let cell = self.rings.read_cell(slot, head)?;
+        match self.rings.shared(slot) {
+            Some(ring) => ring.bump_head(),
+            None => self.cursors[slot].head = head + 1,
+        }
         Ok(Some(cell))
     }
 
@@ -435,7 +559,7 @@ impl Session {
     /// carry or holding a cell of the wrong element type, and whatever the
     /// read said.
     pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
-        ports::resolve(plan, class, &self.rings, &self.cursors, &self.shapes)
+        ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
     }
 
     /// Point one intrinsic at a device buffer, for every stage of this
@@ -566,6 +690,12 @@ impl Session {
             return Ok(refused);
         }
 
+        // ONE READ OF THE CURSORS FOR THE WHOLE FIRE, which is the module
+        // header's own property said in code: every stage resolves its cell
+        // addresses from the SAME cursors. It also has to be one read for a
+        // SHARED ring, whose counters another session could move between two
+        // stages of this loop if each stage asked again.
+        let cursors = self.cursors_now();
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
             let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
@@ -574,7 +704,7 @@ impl Session {
                 // this shape.
                 continue;
             };
-            prepared.refresh(&self.rings, &self.cursors)?;
+            prepared.refresh(&self.rings, &cursors)?;
             for region in stage.regions.iter() {
                 prepared.launch_region(device, pipelines, &self.rings, region)?;
             }
@@ -636,12 +766,14 @@ impl Session {
             return Ok(Launched::Refused(refused));
         }
 
+        // As [`Session::fire`]: one read of the cursors for the whole pass.
+        let cursors = self.cursors_now();
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
             let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
-            prepared.refresh(&self.rings, &self.cursors)?;
+            prepared.refresh(&self.rings, &cursors)?;
             for region in stage.regions.iter() {
                 prepared.encode_into(frame, region)?;
             }
@@ -848,21 +980,41 @@ impl Session {
     /// Same arithmetic, one implementation: [`Session::fire`] calls this.
     #[must_use]
     pub fn blocked_channel(&self, plan: &ExecPlan) -> Option<u32> {
+        self.readiness(plan).map(|blocked| blocked.channel)
+    }
+
+    /// [`Session::blocked_channel`], with the three numbers the answer was
+    /// computed from.
+    ///
+    /// **A CHANNEL INDEX IS NOT A DIAGNOSIS.** The refusal used to say only
+    /// "channel 0 does not meet the requirement its program declares", and
+    /// from outside the shell that sentence is compatible with three very
+    /// different faults: a take-side ring nobody filled, a put-side ring
+    /// nobody drained, and a ring that was declared with no room at all. They
+    /// are told apart by the direction, the depth and the capacity, and the
+    /// session is the only party that holds all three — so it says them.
+    #[must_use]
+    pub fn readiness(&self, plan: &ExecPlan) -> Option<Blocked> {
         for channel in 0..self.shapes.len() {
-            let readiness = plan
+            let needs = plan
                 .package
                 .channels
                 .get(channel)
                 .and_then(|declared| declared.readiness);
             let live = self.depth(channel as u32);
             let capacity = u64::from(self.shapes[channel].capacity);
-            let ready = match readiness {
+            let ready = match needs {
                 Some(Direction::NeedsFull) => live != 0,
                 Some(Direction::NeedsEmpty) => live < capacity,
                 None => true,
             };
             if !ready {
-                return Some(channel as u32);
+                return Some(Blocked {
+                    channel: channel as u32,
+                    needs,
+                    live,
+                    capacity,
+                });
             }
         }
         None
@@ -887,24 +1039,51 @@ impl Session {
     /// each put into the pending cell, which is the cell at `tail`, and on
     /// shared storage that write is already visible to this function.
     fn commit(&mut self, plan: &ExecPlan) -> std::result::Result<(), String> {
-        let mut next = self.cursors.clone();
-        for (channel, cursor) in self.cursors.iter().enumerate() {
+        let now = self.cursors_now();
+        let mut next = now.clone();
+        // **A SHARED RING'S ADVANCE IS A BUMP AND NOT AN ASSIGNMENT** (design
+        // §5), collected here and applied below so that a channel refused
+        // mid-loop leaves nothing half-moved. `next[channel] = base + 1` is
+        // right for a counter this session owns and wrong for one the
+        // channel does: between the read above and this write another
+        // attachment's settle may have moved the same counter, and an
+        // assignment computed from a stale base would walk that commit back.
+        // An increment composes, which is what the pipeline FIFO's ordering
+        // actually promises.
+        let mut bumps: Vec<(usize, bool, bool)> = Vec::new();
+        for (channel, cursor) in now.iter().enumerate() {
             if cursor.tail < cursor.head {
                 return Err(format!("channel {channel}: tail precedes head at commit"));
             }
             let mut used = cursor.tail - cursor.head;
             let capacity = u64::from(self.shapes[channel].capacity);
-            if plan.takes_channel(channel as u32) && used != 0 {
+            let took = plan.takes_channel(channel as u32) && used != 0;
+            if took {
                 next[channel].head = cursor.head + 1;
                 used -= 1;
             }
-            if plan.puts_channel(channel as u32) {
+            let put = plan.puts_channel(channel as u32);
+            if put {
                 if used >= capacity {
                     return Err(format!(
                         "channel {channel}: put overflows capacity {capacity} at commit"
                     ));
                 }
                 next[channel].tail = cursor.tail + 1;
+            }
+            if (took || put) && self.rings.shared(channel).is_some() {
+                bumps.push((channel, took, put));
+            }
+        }
+        for (channel, took, put) in bumps {
+            let Some(ring) = self.rings.shared(channel) else {
+                continue;
+            };
+            if took {
+                ring.bump_head();
+            }
+            if put {
+                ring.bump_tail();
             }
         }
         self.cursors = next;

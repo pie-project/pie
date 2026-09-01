@@ -289,13 +289,13 @@ fn fire_and_check(
             // promised is the bake-integrity failure `Fault::Fragmented`
             // keeps, and a fire that produced one would mean the class order
             // did not come from P4's tree.
-            if fallback::promised(compiled, region) {
+            if fallback::promised(compiled, model_ir::RowAxis::Tokens, region) {
                 wrong.push(format!(
                     "{what}: region {at} is in {} pieces and P4 promised it whole",
                     spans.len(),
                 ));
             }
-            let bound = fallback::bound(compiled, &region.mask);
+            let bound = fallback::bound(compiled, model_ir::RowAxis::Tokens, &region.mask);
             if spans.len() > bound as usize {
                 wrong.push(format!(
                     "{what}: region {at} covers {} runs where its baked order breaks \
@@ -385,7 +385,7 @@ fn every_catalog_window_p4_could_not_seat_fires_as_several_launches() {
     let mut fragmented = 0usize;
     let mut unwalkable: Vec<&str> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         let trace = trace(Platform::Cuda);
         let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
             continue; // an adapter capacity this text cannot seat; not this test's subject.
@@ -454,7 +454,7 @@ fn every_catalog_window_p4_could_not_seat_fires_as_several_launches() {
 fn the_smallest_qwen_fire_that_fragments_a_window_is_three_lanes() {
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
-    let (_, _, trace, _) = model::catalog()
+    let (_, _, trace, _) = models::catalog()
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
@@ -493,7 +493,10 @@ fn the_smallest_qwen_fire_that_fragments_a_window_is_three_lanes() {
     let scores = compiled
         .template()
         .iter()
-        .find(|region| !fallback::answers(&compiled, region.nodes.clone()).is_empty())
+        .find(|region| {
+            !fallback::answers(&compiled, model_ir::RowAxis::Tokens, region.nodes.clone())
+                .is_empty()
+        })
         .expect("some region is owed a fallback");
     let descriptor = FireDescriptor::of(&fire);
     let spans = descriptor.spans(&scores.mask);

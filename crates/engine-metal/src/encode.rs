@@ -45,17 +45,37 @@ use crate::window::{At, Windows};
 #[cfg(target_vendor = "apple")]
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
-/// **The shader point every routing decision is made at.**
+/// **The shader file every routing decision is made in.**
 ///
 /// The segment cut has to fall between the node that DECIDES and the nodes
 /// that READ, and both live inside one region — so the region cursor says
-/// WHICH mixture and this says WHEN. All three `Linear::MoeTopk*` arms lower
-/// to an entrypoint of this file whose name begins with the prefix below
-/// (`router_topk_f32w_bfloat16`, `router_topk_sigmoid`,
-/// `router_topk_sqrt_softplus`); `route_sort` lives in the same file and is
-/// deliberately outside the prefix, because it is the sorted arm's
-/// permutation and runs AFTER the ids have already been rewritten.
-const ROUTER: (&str, &str) = ("linear/moe_route.metal", "router_topk");
+/// WHICH mixture and [`ROUTER_POINTS`] says WHEN.
+const ROUTER_FILE: &str = "linear/moe_route.metal";
+
+/// **The entrypoints of [`ROUTER_FILE`] that land a routing vector**, by
+/// prefix.
+///
+/// The four ranked `Linear::MoeTopk*` arms all lower to a point named
+/// `router_topk…` (`router_topk_f32w_bfloat16`, `router_topk_sigmoid`,
+/// `router_topk_sqrt_softplus`). `Linear::MoeHashRoute` lands the SAME
+/// `routes`/`weights` pair off a table instead of off logits, and its point is
+/// named for what it does rather than for the ranking it does not do — so it
+/// is a second prefix here and not a wider one.
+///
+/// **THIS LIST IS LOAD-BEARING AND ITS OMISSION IS SILENT.** A router whose
+/// point is not named here fires, lands real expert ids, and is never cut: the
+/// tier never rewrites that vector from expert id to SEAT index, and the
+/// selects behind it then index a slab of `slots` seats by an id in
+/// `0..experts`. On a full-residency load the two numbers are equal and
+/// nothing is visible; on a streamed one the matmul reads another band's
+/// bytes and the logits are quietly wrong. `hash_route_gather` was missing
+/// here for exactly as long as dsv4-flash could not plan a streamed load at
+/// all, which is why nothing caught it.
+///
+/// `route_sort` lives in the same file and is deliberately outside every
+/// prefix: it is the sorted arm's permutation and runs AFTER the ids have
+/// already been rewritten.
+const ROUTER_POINTS: [&str; 2] = ["router_topk", "hash_route_gather"];
 
 /// One fire's encode sink: everything a dispatch needs, borrowed — and, for a
 /// streamed load, the command buffer itself.
@@ -102,7 +122,8 @@ enum Held<'a> {
 /// one FIRE fact (which region the walk is inside, which
 /// `crate::window::Cursor` writes into [`At`]) against one PLAN fact (where
 /// the carve put the routing vector). Nothing here is a kernel name except
-/// [`ROUTER`], and nothing here is positional in a launch's argument list.
+/// [`ROUTER_POINTS`], and nothing here is positional in a launch's argument
+/// list.
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub struct Cuts<'a> {
     /// Which region the walk is inside, and which run of its window.
@@ -334,8 +355,10 @@ impl Encode for Sink<'_> {
             //    this file knows the tier exists. A full-residency load has no
             //    `cuts` and this is one `Option` test per dispatch.
             if let Some(cuts) = &self.cuts
-                && fire.file == ROUTER.0
-                && fire.entrypoint.starts_with(ROUTER.1)
+                && fire.file == ROUTER_FILE
+                && ROUTER_POINTS
+                    .iter()
+                    .any(|point| fire.entrypoint.starts_with(point))
             {
                 self.cut(fire, cuts)?;
             }

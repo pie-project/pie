@@ -19,7 +19,7 @@ use checkpoint::file::{File, Metadata, RawTensor};
 use checkpoint::contract::ModelContract;
 use checkpoint::plan::compile as compile_load_plan;
 use checkpoint::plan::{
-    CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, LoadPlan, StorageInstr, StorageTarget,
+    CUDA_TILE_MAP_MASK, LoadPlan, StorageInstr, StorageTarget,
 };
 use checkpoint::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 
@@ -165,9 +165,6 @@ fn target(tp_rank: u32, tp_size: u32) -> StorageTarget {
         preferred_alignment: 256,
         tile_map_mask: CUDA_TILE_MAP_MASK,
         native_mxfp4_moe: false,
-        fusion_mask: FUSION_FP8_TO_MXFP4,
-        encode_scratch_dtype: DType::Bf16,
-        block_scale_rows: 128,
     }
 }
 

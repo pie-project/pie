@@ -550,20 +550,18 @@ fn load_model_engines(
     // Resolve the weight-artifact directory here, before any engine bootstrap
     // TOML is written. `$PIE_HOME` is this layer's to know: the engine has
     // never been told it, which is why the old env-var form fell back to XDG.
-    let weight_cache_dir = if user_cfg.model.weight_cache_dir.is_empty() {
-        // Under `cache/`, not `models/`. `models/` is the artifact store now,
-        // and these are the opposite kind of thing: device bytes for one
-        // engine, one TP layout and one ABI version, rebuilt by a single cold
-        // load. Sharing a directory left `.weights` files sitting in a store
-        // that scans for `.zt` and silently ignored them, while `pie cache`
-        // reported their size under the store's name.
-        crate::state::weight_cache_dir()
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        user_cfg.model.weight_cache_dir.clone()
-    };
-    crate::embedded_engine::set_weight_cache_dir(weight_cache_dir);
+    // The rule itself is `embedded_engine::resolved_weight_cache_dir`, because
+    // `pie model import` reads the same answer to decide whether it has
+    // anywhere to prepare into (§M wave M-1).
+    crate::embedded_engine::set_weight_cache_dir(
+        crate::embedded_engine::resolved_weight_cache_dir(user_cfg),
+    );
+
+    // **AND THE SHARED-ADAPTER MOUNT, IF THE OPERATOR STATED ONE** (alto
+    // adapter §3.3). Unlike the two above there is no derivation and no
+    // default: an unstated mount is the feature OFF, because a directory pie
+    // invented would be a namespace of adapters nobody wrote.
+    crate::embedded_engine::set_adapter_dir(user_cfg.model.adapter_dir.clone());
 
     let (engine_groups, snapshot_dir, metadata) = {
         let m = &user_cfg.model;

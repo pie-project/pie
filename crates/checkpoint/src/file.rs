@@ -1,15 +1,19 @@
 //! A checkpoint's own files: reading them, writing them, and the namespace
 //! pie reserves inside one.
 //!
-//! Four modules over one subject. [`read`] turns a snapshot *directory* into a
+//! Six modules over one subject. [`read`] turns a snapshot *directory* into a
 //! [`Metadata`], [`zt`] turns a single *container* into one, [`write`] puts
 //! one back on disk, and [`meta`] owns the `__meta__/` names that tell a pie
-//! artifact's own payloads apart from its weights. Everything above this
-//! module computes over the value it produces: this is the only place in the
-//! crate where a *path* becomes one, which is what `tests/standalone.rs`
-//! holds the compiler to. The two files it exempts beside this directory —
-//! `executor/walk.rs` and `verify.rs` — copy bytes and compare a plan against
-//! the world; neither decides anything.
+//! artifact's own payloads apart from its weights. [`emit`] and [`serve`] are
+//! the `pie.serving/1` pair — the import-only writer and the lean serving
+//! reader — and both spell their agreement in [`serving`](crate::serving),
+//! which sits outside this directory because it opens nothing.
+//!
+//! Everything above this module computes over the value it produces: this is
+//! the only place in the crate where a *path* becomes one,
+//! which is what `tests/standalone.rs` holds the compiler to. The two files it
+//! exempts beside this directory — `executor/walk.rs` and `verify.rs` — copy
+//! bytes and compare a plan against the world; neither decides anything.
 //!
 //! # It was called `checkpoint`, inside a crate called `checkpoint`
 //!
@@ -20,8 +24,10 @@
 //! that makes `io::Error` right and `io::IoError` wrong. [`Metadata`] is the
 //! checkpoint's, because there is nowhere else it could be from.
 
+pub mod emit;
 pub mod meta;
 pub mod read;
+pub mod serve;
 pub mod write;
 pub mod zt;
 

@@ -256,16 +256,7 @@ impl Context {
     ///
     /// [`Fault::Device`] when the runtime refuses the ordinal.
     pub fn bind_thread(&self) -> Result<()> {
-        #[cfg(feature = "_cuda")]
-        {
-            use cudarc::runtime::sys as rt;
-            // SAFETY: an ordinal this context was already bound with.
-            unsafe { check("cudaSetDevice", rt::cudaSetDevice(self.ordinal)) }
-        }
-        #[cfg(not(feature = "_cuda"))]
-        {
-            Err(Fault::Runtimeless)
-        }
+        bind_thread(self.ordinal)
     }
 
     /// The context every kernel entry fires on.
@@ -680,6 +671,71 @@ fn capability(ordinal: i32) -> (i32, i32) {
     {
         let _ = ordinal;
         (0, 0)
+    }
+}
+
+/// **WHICH DEVICE IS THIS THREAD ON?** `cudaGetDevice`, and nothing else.
+///
+/// The question a thread asks before it hands its ordinal to ANOTHER thread.
+/// `cudaSetDevice` is per-thread state and does not travel with a spawn
+/// ([`Context::bind_thread`] is that lesson learned once already), so a worker
+/// that will allocate or copy on this shell's device has to be told which one
+/// that is — and the only agent that knows is the bound thread doing the
+/// spawning. It reads the runtime rather than a `Context` field because the
+/// callers that need it hold neither: `weights::resident` runs below the shell
+/// and the tier knows nothing about contexts.
+///
+/// # Errors
+///
+/// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`] when
+/// the runtime has no current device to name.
+pub fn current() -> Result<i32> {
+    #[cfg(feature = "_cuda")]
+    {
+        let mut ordinal = 0i32;
+        // SAFETY: `ordinal` is a live out-parameter.
+        unsafe {
+            check(
+                "cudaGetDevice",
+                cudarc::runtime::sys::cudaGetDevice(&raw mut ordinal),
+            )?;
+        }
+        Ok(ordinal)
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        Err(Fault::Runtimeless)
+    }
+}
+
+/// **BIND THE CALLING THREAD TO `ordinal`** — [`Context::bind_thread`]'s body,
+/// for a thread that carries an ordinal instead of a context.
+///
+/// The pair to [`current`], and the reason that one exists: a spawned worker
+/// takes the number across and calls this first, before it allocates a byte or
+/// enqueues a copy. `Context::bind_thread` is this function with the ordinal
+/// the context already holds — the doctrine and the argument for it are stated
+/// there.
+///
+/// # Errors
+///
+/// [`Fault::Runtimeless`] for a build with no runtime, [`Fault::Device`] when
+/// the runtime refuses the ordinal.
+pub fn bind_thread(ordinal: i32) -> Result<()> {
+    #[cfg(feature = "_cuda")]
+    {
+        // SAFETY: an ordinal the runtime itself answered with.
+        unsafe {
+            check(
+                "cudaSetDevice",
+                cudarc::runtime::sys::cudaSetDevice(ordinal),
+            )
+        }
+    }
+    #[cfg(not(feature = "_cuda"))]
+    {
+        let _ = ordinal;
+        Err(Fault::Runtimeless)
     }
 }
 

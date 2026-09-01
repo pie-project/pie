@@ -152,9 +152,12 @@ class SrcTensor:
     shape: list[int]
     start: int          # absolute byte offset in the shard file
     end: int
-    # When the expert bank is stacked on dim 0, only the leading `keep_rows`
-    # rows survive -- and they are a contiguous prefix, so only that prefix
-    # needs to be fetched.
+    # The dim-0 ROW WINDOW that survives, when only part of the tensor does.
+    # An expert bank stacked on dim 0 keeps a prefix (`keep_from` 0); the PLE
+    # carve keeps an interior window of one n-gram shard, so the window needs
+    # an origin as well as a length. Either way it is ONE contiguous range, so
+    # it is one range request.
+    keep_from: int = 0
     keep_rows: int | None = None
 
     @property
@@ -162,14 +165,24 @@ class SrcTensor:
         return self.end - self.start
 
     @property
+    def row_bytes(self) -> int:
+        return self.nbytes // self.shape[0] if self.shape and self.shape[0] else self.nbytes
+
+    @property
+    def fetch_start(self) -> int:
+        return self.start + self.keep_from * self.row_bytes
+
+    @property
     def keep_bytes(self) -> int:
-        if self.keep_rows is None or not self.shape or self.shape[0] <= self.keep_rows:
+        if self.keep_rows is None or not self.shape:
             return self.nbytes
-        return self.nbytes // self.shape[0] * self.keep_rows
+        if self.keep_from == 0 and self.shape[0] <= self.keep_rows:
+            return self.nbytes
+        return self.row_bytes * self.keep_rows
 
     @property
     def keep_end(self) -> int:
-        return self.start + self.keep_bytes
+        return self.fetch_start + self.keep_bytes
 
 
 def read_shard_header(repo: str, revision: str, shard: str) -> dict[str, SrcTensor]:
@@ -228,6 +241,17 @@ class Plan:
     expert_re: re.Pattern | None
     # names (relative to a layer prefix) whose leading dim indexes experts
     router_suffixes: tuple[str, ...] = ()
+    # A weight the checkpoint stores as a fixed number of side-by-side pieces
+    # rather than one tensor -- Qwen4's PLE n-gram table ships as
+    # `split_ngram_parts` shards of one row space. `part_re` names the piece
+    # index the way `expert_re` names the expert; the output keeps `parts` of
+    # them, and the config's own part count and row budget are scaled to match.
+    # For a HASHED table the pieces cannot simply be truncated (see
+    # `PleCarve`), so the family also names the config keys the hashing is
+    # derived from.
+    part_re: re.Pattern | None = None
+    parts: int | None = None
+    ple_carve: "PleCarve | None" = None
     # extra top-level tensors to keep
     globals_keep: tuple[str, ...] = ()
     drop_res: tuple[re.Pattern, ...] = ()
@@ -287,8 +311,10 @@ def _rewrite_dsv4(cfg: dict, plan: Plan) -> None:
     if isinstance(cfg.get("compress_ratios"), list):
         cfg["compress_ratios"] = _slice_list(cfg["compress_ratios"], plan.src_layers)
     if "num_hash_layers" in cfg:
-        cfg["num_hash_layers"] = sum(1 for i in plan.src_layers
-                                     if i < cfg["num_hash_layers"])
+        # The hash-routed layers are the leading ones, and the config can only
+        # say "the first N" -- so they have to stay leading after the cut.
+        cfg["num_hash_layers"] = _prefix_count(
+            plan, "num_hash_layers", cfg["num_hash_layers"])
 
 
 def _rewrite_kimi(cfg: dict, plan: Plan) -> None:
@@ -299,23 +325,30 @@ def _rewrite_kimi(cfg: dict, plan: Plan) -> None:
             1 for i in plan.src_layers if i < tc["first_k_dense_replace"])
 
 
-def _dense_prefix_len(plan: Plan, first_k_dense_replace: int) -> int:
-    """Length of the leading run of selected layers that are dense.
+def _prefix_count(plan: Plan, key: str, bound: int) -> int:
+    """Length of the leading run of selected layers with `src_idx < bound`.
 
-    `first_k_dense_replace` names a *prefix* of the output layers, so a
-    selection that puts a dense source layer anywhere but at the front (or
-    repeats it) cannot be described by the config at all.
+    Config keys like `first_k_dense_replace` and `num_hash_layers` name a
+    *prefix* of the output layers, so a selection that puts one of those source
+    layers anywhere but at the front (or repeats it) cannot be described by the
+    config at all -- and silently renumbering it would move the marked layers
+    onto layers that are not of that kind.
     """
-    is_dense = [i < first_k_dense_replace for i in plan.src_layers]
+    marked = [i < bound for i in plan.src_layers]
     n = 0
-    while n < len(is_dense) and is_dense[n]:
+    while n < len(marked) and marked[n]:
         n += 1
-    if any(is_dense[n:]):
+    if any(marked[n:]):
         raise SystemExit(
-            f"{plan.family}: the dense (pre-MoE) source layers must be selected "
-            f"once and up front, because `first_k_dense_replace` can only name a "
-            f"prefix; got --layers {plan.src_layers}")
+            f"{plan.family}: the first {bound} source layers are the ones "
+            f"`{key}` names, and it can only name a *prefix* of the output "
+            f"layers -- so they must be selected once and up front; got "
+            f"--layers {plan.src_layers}")
     return n
+
+
+def _dense_prefix_len(plan: Plan, first_k_dense_replace: int) -> int:
+    return _prefix_count(plan, "first_k_dense_replace", first_k_dense_replace)
 
 
 TEXT_TOWER_PREFIX = "language_model."
@@ -409,6 +442,423 @@ def _rewrite_qwen3_5_moe(cfg: dict, plan: Plan) -> None:
         tc["layer_types"] = _slice_list(tc["layer_types"], plan.src_layers)
 
 
+def _rewrite_qwen4_exp(cfg: dict, plan: Plan) -> None:
+    """Qwen3.8-Flash-Next (`qwen4_exp`), as `mlx_lm` converts it.
+
+    Four things beyond the common rewrite, and each one is a *declaration* the
+    shrunken artifact would otherwise keep lying about:
+
+    * `layer_types` -- linear vs full attention, period
+      `full_attention_interval`. A whole number of periods keeps the ratio the
+      model was trained with.
+    * the PLE. The hashed n-gram table ships as `split_ngram_parts` pieces of
+      one row space; the output keeps `--parts` of them, so
+      `split_ngram_parts` and the row budget `ngram_vocab_size_base` both
+      scale by the same fraction. The padding quantum
+      `make_ngram_vocab_size_divisible_by` does NOT scale -- it is the table's
+      row alignment, not its size. `ple_layer_ids` is **one-indexed**
+      (`Ple::layer`'s doc: the shipped `[2]` names layer 1), so it is remapped
+      through the selection rather than sliced.
+
+      **AND THE TABLE ITSELF IS RE-CARVED, NOT TRUNCATED.** The table's row
+      count is a *derived* number, not a stored one: sixteen primes past
+      `ngram_vocab_size_base`, summed, rounded up to
+      `make_ngram_vocab_size_divisible_by`. At the shipped base that is
+      320_001_536 rows == 128 x 2_500_012, and the shards divide it exactly --
+      but 2_500_012 is not itself a multiple of 128, so `parts` shards kept
+      VERBATIM hold a row count that is not a multiple of the padding quantum
+      and therefore cannot be the output of the derivation for ANY base. At
+      `--parts 8` the base scales to 1_250_000, whose sixteen primes pad to
+      20_001_536 while eight verbatim shards would hold 20_000_096: a
+      1_440-row overstatement, and sixteen head offsets running to 300_001_275
+      into a table a sixteenth that tall. That is a checkpoint no reader can
+      load and no hasher can index.
+
+      So the shards are not a slice of the source's row space; they are a
+      re-carve of it. `PleCarve` derives BOTH hashings, takes each miniature
+      head's rows from the head's own segment of the original table, and
+      rewrites the two published buffers that describe them --
+      `ngram_heads_vocab_sizes` and `ngram_heads_offsets` -- to the
+      miniature's. (`layer_multipliers` is derived from the seed and the
+      vocabulary, neither of which a shrink touches, so it is carried
+      unchanged and asserted equal.) Config, tensors and a reader that derives
+      its own constants then all say the same thing.
+    * the MTP head. `mtp.*` is a separate bring-up, and none of its planes are
+      kept, so the count that promises them goes to zero and the sub-config
+      that shapes them goes away.
+    * the vision tower. Its 333 planes are not kept either, and this config
+      carries the switch that names the text-only reading of the artifact.
+    """
+    _rewrite_common(cfg, plan)
+    tc = _text_cfg(cfg, plan)
+    if isinstance(tc.get("layer_types"), list):
+        tc["layer_types"] = _slice_list(tc["layer_types"], plan.src_layers)
+
+    src_parts = tc.get("split_ngram_parts")
+    if plan.parts is not None and isinstance(src_parts, int):
+        if plan.parts > src_parts:
+            raise SystemExit(f"qwen4_exp: --parts {plan.parts} exceeds the "
+                             f"checkpoint's {src_parts} n-gram shards")
+        tc["split_ngram_parts"] = plan.parts
+        base = tc.get("ngram_vocab_size_base")
+        if isinstance(base, int):
+            tc["ngram_vocab_size_base"] = ple_base_for(base, src_parts, plan.parts)
+        # The config is the only place the row count is written down, and the
+        # carve is the only place it was ACTED on. If they were derived from
+        # different numbers the artifact would ship the old disagreement under
+        # a new name, so they are held together here rather than trusted.
+        carve = plan.ple_carve
+        if carve is not None and carve.dst_base != tc.get("ngram_vocab_size_base"):
+            raise SystemExit(
+                f"qwen4_exp: the carve cut the table for "
+                f"ngram_vocab_size_base {carve.dst_base} and the config rewrite "
+                f"declares {tc.get('ngram_vocab_size_base')}")
+
+    ids = tc.get("ple_layer_ids")
+    if isinstance(ids, list) and ids:
+        out_of = {src: out for out, src in enumerate(plan.src_layers)}
+        kept = [out_of[i - 1] + 1 for i in ids if (i - 1) in out_of]
+        if not kept:
+            raise SystemExit(
+                f"qwen4_exp: the selection drops every PLE layer (the config's "
+                f"one-indexed ple_layer_ids {ids} name layer(s) "
+                f"{[i - 1 for i in ids]}), and a Flash-Next without its n-gram "
+                f"memory is a different model; got --layers {plan.src_layers}")
+        tc["ple_layer_ids"] = kept
+
+    if "mtp_num_hidden_layers" in tc:
+        tc["mtp_num_hidden_layers"] = 0
+    tc.pop("mtp", None)
+
+    if "language_model_only" in cfg:
+        cfg["language_model_only"] = True
+
+
+# --------------------------------------------------------------------------- #
+# The PLE n-gram table: a re-carve, not a slice
+# --------------------------------------------------------------------------- #
+def ple_base_for(src_base: int, src_parts: int, dst_parts: int) -> int:
+    """The miniature's `ngram_vocab_size_base`: the same fraction as the parts."""
+    return src_base * dst_parts // src_parts
+
+
+def _is_prime(v: int) -> bool:
+    if v < 2:
+        return False
+    if v % 2 == 0:
+        return v == 2
+    d = 3
+    while d * d <= v:
+        if v % d == 0:
+            return False
+        d += 2
+    return True
+
+
+def ngram_hash_geometry(base: int, heads: int, divisible_by: int
+                        ) -> tuple[list[int], list[int], int]:
+    """`_find_nth_prime_after`'s arithmetic, restated: `heads` consecutive
+    primes at or past `base`, their prefix sums, and the sum rounded up to
+    `divisible_by`.
+
+    This is the SAME derivation `model::qwen_4::model::hash_constants` runs and
+    the reference's `modular_qwen4_exp.py` runs, and it is the only thing that
+    decides how tall a qwen4's n-gram table is. Held against the checkpoint's
+    own published buffers by `PleCarve.checks`, so a mis-port of it fails the
+    build rather than shipping a table nobody can index.
+    """
+    primes: list[int] = []
+    offsets: list[int] = []
+    total = 0
+    prime = base - 1
+    for _ in range(heads):
+        prime += 1
+        while not _is_prime(prime):
+            prime += 1
+        primes.append(prime)
+        offsets.append(total)
+        total += prime
+    return primes, offsets, -(-total // divisible_by) * divisible_by
+
+
+@dataclass
+class Piece:
+    """`rows` rows of one source tensor, starting at its row `row0`."""
+    src: SrcTensor
+    row0: int
+    rows: int
+
+
+@dataclass
+class PleCarve:
+    """**HOW THE MINIATURE'S HASHED TABLE IS CUT OUT OF THE ORIGINAL'S.**
+
+    A qwen4's PLE table is not one embedding: it is `heads` embeddings stacked
+    into one row space, head `h` occupying `offsets[h] .. offsets[h] +
+    primes[h]`. The hash is `mixed % primes[h] + offsets[h]`, so a row's
+    MEANING is its position, and both numbers come out of the derivation above
+    -- from `ngram_vocab_size_base` and nothing else.
+
+    Which is why keeping the first `parts` stored shards produces a checkpoint
+    that cannot be loaded OR indexed. The stored shards are equal slices of the
+    padded row space, and that space is cut by the SHARD seam, not by the HEAD
+    seam: at `--parts 8` of 128 the eight kept shards are the whole of head 0's
+    segment and ninety-three rows of head 1's. Every other head's rows are
+    gone, and the offsets beside them still name where those rows used to be.
+
+    So the table is re-cut by head. Head `h` of the miniature takes the first
+    `dst_primes[h]` rows of head `h` of the ORIGINAL -- real rows of the real
+    table, at the real head they belong to, from the original's own
+    `src_offsets[h]` -- and the sixteen segments are concatenated in order and
+    re-chopped into `dst_parts` equal shards. The rows the padding quantum adds
+    past the last head come off the last head's own segment too, so every row
+    of the miniature is a row of the original and no row is invented.
+
+    Two consequences worth naming:
+
+    * a shard boundary of the OUTPUT falls wherever the concatenation puts it,
+      which is not where any source shard ends -- so an output shard is a
+      CONCATENATION of source row windows, and that is what `Piece` is for;
+    * the quantisation is affine over the LAST axis (`(4, 32)` here: 20 u32
+      code words and 5 `bf16` scale/bias groups per row), so every plane is
+      row-aligned however the rows are cut. The carve is stated once in rows
+      and applied to the code, scale and bias planes alike.
+    """
+    heads: int
+    divisible_by: int
+    src_base: int
+    dst_base: int
+    src_parts: int
+    dst_parts: int
+    src_primes: list[int]
+    src_offsets: list[int]
+    src_padded: int
+    dst_primes: list[int]
+    dst_offsets: list[int]
+    dst_padded: int
+    # dst shard -> the source (part, row-in-part, rows) it is made of
+    layout: list[list[tuple[int, int, int]]]
+    # source part -> the one contiguous row window that part contributes
+    windows: dict[int, tuple[int, int]]
+
+    @property
+    def src_rows(self) -> int:
+        return self.src_padded // self.src_parts
+
+    @property
+    def dst_rows(self) -> int:
+        return self.dst_padded // self.dst_parts
+
+
+def plan_ple_carve(cfg: dict, plan: Plan) -> PleCarve | None:
+    """Derive both hashings and cut one out of the other, in rows.
+
+    Runs off the config alone, before a byte is fetched, because WHICH source
+    shards the carve reads is what decides the download.
+    """
+    if plan.parts is None or plan.part_re is None:
+        return None
+    tc = _text_cfg(cfg, plan)
+    keys = ("ngram_vocab_size_base", "split_ngram_parts", "ngram_size",
+            "heads_per_ngram", "make_ngram_vocab_size_divisible_by")
+    if any(not isinstance(tc.get(k), int) for k in keys):
+        return None
+    src_base, src_parts, ngram, per_ngram, divisible_by = (tc[k] for k in keys)
+    if plan.parts == src_parts:
+        return None
+    heads = (ngram - 1) * per_ngram
+    dst_base = ple_base_for(src_base, src_parts, plan.parts)
+
+    src_primes, src_offsets, src_padded = ngram_hash_geometry(src_base, heads, divisible_by)
+    dst_primes, dst_offsets, dst_padded = ngram_hash_geometry(dst_base, heads, divisible_by)
+    if src_padded % src_parts:
+        raise SystemExit(
+            f"qwen4_exp: the source's {src_padded} padded n-gram rows do not "
+            f"divide into its {src_parts} stored shards")
+    if dst_padded % plan.parts:
+        raise SystemExit(
+            f"qwen4_exp: `ngram_vocab_size_base {dst_base}` derives {dst_padded} "
+            f"padded n-gram rows, which do not divide into --parts {plan.parts} "
+            f"equal shards. Pick a --parts that divides it, or the table cannot "
+            f"be stored the way this family stores tables.")
+
+    # Every miniature head reads its own head's segment of the original, and
+    # the padding rows come off the last one -- so nothing is invented and
+    # nothing is read past a head seam.
+    spans = [(src_offsets[h], dst_primes[h]) for h in range(heads)]
+    spans[-1] = (spans[-1][0], spans[-1][1] + dst_padded - sum(dst_primes))
+    for h, (_, rows) in enumerate(spans):
+        if rows > src_primes[h]:
+            raise SystemExit(
+                f"qwen4_exp: miniature head {h} wants {rows} rows and the "
+                f"source's head {h} has {src_primes[h]}: this is a shrink, and "
+                f"that would be a growth")
+
+    src_rows = src_padded // src_parts
+    dst_rows = dst_padded // plan.parts
+    flat: list[tuple[int, int, int]] = []
+    for row0, rows in spans:
+        at, left = row0, rows
+        while left:
+            part, local = divmod(at, src_rows)
+            take = min(left, src_rows - local)
+            flat.append((part, local, take))
+            at += take
+            left -= take
+
+    layout: list[list[tuple[int, int, int]]] = [[] for _ in range(plan.parts)]
+    windows: dict[int, tuple[int, int]] = {}
+    at = 0
+    for part, local, rows in flat:
+        lo, hi = windows.get(part, (local, local + rows))
+        windows[part] = (min(lo, local), max(hi, local + rows))
+        while rows:
+            shard, off = divmod(at, dst_rows)
+            take = min(rows, dst_rows - off)
+            layout[shard].append((part, local, take))
+            local += take
+            at += take
+            rows -= take
+    if at != dst_padded:
+        raise SystemExit(f"qwen4_exp: the carve laid {at} rows, not {dst_padded}")
+
+    return PleCarve(
+        heads=heads, divisible_by=divisible_by,
+        src_base=src_base, dst_base=dst_base,
+        src_parts=src_parts, dst_parts=plan.parts,
+        src_primes=src_primes, src_offsets=src_offsets, src_padded=src_padded,
+        dst_primes=dst_primes, dst_offsets=dst_offsets, dst_padded=dst_padded,
+        layout=layout, windows=windows,
+    )
+
+
+def carve_source_names(pairs: list[tuple[str, str]], plan: Plan) -> list[str]:
+    """The source shard tensor names the carve reads that `pairs` does not.
+
+    `pairs` maps output shard `k` to source shard `k` -- which is the right
+    NAME mapping (it is what carries the per-shard quantisation override) and
+    the wrong BYTE mapping. The rows come from wherever the head segments are.
+    """
+    carve = plan.ple_carve
+    if carve is None:
+        return []
+    extra: set[str] = set()
+    for _, src_name in pairs:
+        if plan.part_re.search(src_name) is None:
+            continue
+        for part in carve.windows:
+            extra.add(_part_name(src_name, plan, part))
+    return sorted(extra)
+
+
+def _part_name(src_name: str, plan: Plan, part: int) -> str:
+    """`...shard_3.scales` with its part index rewritten to `part`."""
+    m = plan.part_re.search(src_name)
+    lo, hi = m.span(1)
+    return f"{src_name[:lo]}{part}{src_name[hi:]}"
+
+
+def apply_ple_carve(outs: list[OutTensor], src: dict[str, SrcTensor],
+                    plan: Plan) -> list[tuple[str, SrcTensor, bytes]]:
+    """Turn the table's placeholder outputs into concatenations, mark the row
+    windows the download should fetch, and restate the published head buffers.
+
+    Returns the checks to run once the bytes are down: what the source's own
+    `ngram_heads_*` must say if [`ngram_hash_geometry`] is the derivation the
+    conversion used.
+    """
+    carve = plan.ple_carve
+    if carve is None:
+        return []
+    i64 = lambda v: b"".join(int(x).to_bytes(8, "little", signed=True) for x in v)  # noqa: E731
+
+    seen = 0
+    checks: list[tuple[str, SrcTensor, bytes]] = []
+    for ot in outs:
+        if plan.part_re.search(ot.src.name) is not None:
+            out_part = int(plan.part_re.search(ot.name).group(1))
+            rows_each = ot.src.shape[0]
+            if rows_each != carve.src_rows:
+                raise SystemExit(
+                    f"{ot.src.name} stores {rows_each} rows and the config's "
+                    f"hashing derives {carve.src_rows} per shard: the table in "
+                    f"the file is not the table the config describes, and this "
+                    f"tool will not guess which is right")
+            ot.pieces = [
+                Piece(src[_part_name(ot.src.name, plan, part)], row0, rows)
+                for part, row0, rows in carve.layout[out_part]
+            ]
+            ot.rows = carve.dst_rows
+            seen += 1
+            # The row window this plane reads out of each source shard: one
+            # contiguous range per shard, because the head segments are twenty
+            # million rows apart and a shard is two and a half.
+            for part, (lo, hi) in carve.windows.items():
+                piece = src[_part_name(ot.src.name, plan, part)]
+                piece.keep_from, piece.keep_rows = lo, hi - lo
+            continue
+        tail = ot.src.name.rsplit(".", 1)[-1]
+        if tail == "ngram_heads_vocab_sizes":
+            ot.literal = i64(carve.dst_primes)
+            checks.append((ot.src.name, ot.src, i64(carve.src_primes)))
+        elif tail == "ngram_heads_offsets":
+            ot.literal = i64(carve.dst_offsets)
+            checks.append((ot.src.name, ot.src, i64(carve.src_offsets)))
+    print(f"      the n-gram table is re-carved by head: {carve.src_padded} rows "
+          f"in {carve.src_parts} shards -> {carve.dst_padded} in {carve.dst_parts}, "
+          f"{seen} planes from {len(carve.windows)} source shards")
+    print(f"      heads past {carve.dst_base}: primes {carve.dst_primes[0]}"
+          f"..{carve.dst_primes[-1]}, offsets to {carve.dst_offsets[-1]}, "
+          f"padded to {carve.dst_padded} = {carve.dst_parts} x {carve.dst_rows}")
+    return checks
+
+
+# --------------------------------------------------------------------------- #
+# Per-tensor quantisation overrides
+# --------------------------------------------------------------------------- #
+def carry_quant_overrides(cfg: dict, pairs: list[tuple[str, str]]) -> dict[str, int]:
+    """Move the per-tensor quant overrides onto the names that survived.
+
+    A mixed-precision MLX conversion does not carry one recipe. `quantization`
+    (and its `quantization_config` twin) holds the default bit width and group
+    size as scalars, plus one entry per *module* that departs from it --
+    Qwen4's 128 four-bit/group-32 PLE shards and its two-bit/group-128
+    `switch_mlp` banks, DeepSeek-V4's two-bit split where every routed
+    `gate_proj` is group 32 except layer 42's, which is group 64.
+
+    Those keys name modules by their **source** name. Dropping layers and
+    renumbering the survivors invalidates every one of them at once: keys that
+    name a dropped layer become stale claims about tensors that are not there,
+    and the surviving tensors lose the override that describes them, silently
+    falling back to the file's scalar default -- which for both of these
+    artifacts is the *wrong* width. So the map is rebuilt from the output
+    names, not edited in place.
+
+    A key is kept exactly when some tensor under it survived, and it is renamed
+    by the same edit that renamed that tensor. Returns a per-dict count of the
+    entries that survived, for the caller to report.
+    """
+    kept: dict[str, int] = {}
+    for key in ("quantization", "quantization_config"):
+        table = cfg.get(key)
+        if not isinstance(table, dict):
+            continue
+        modules = {k: v for k, v in table.items() if isinstance(v, dict)}
+        rebuilt = {k: v for k, v in table.items() if not isinstance(v, dict)}
+        for module, spec in modules.items():
+            head = module + "."
+            for out_name, src_name in pairs:
+                if not src_name.startswith(head):
+                    continue
+                # The rename is a prefix edit, so the module's new name is the
+                # output tensor's name minus the same trailing plane.
+                tail = len(src_name) - len(module)
+                rebuilt[out_name[:-tail]] = spec
+        cfg[key] = rebuilt
+        kept[key] = len(rebuilt) - (len(table) - len(modules))
+    return kept
+
+
 FAMILIES: dict[str, dict[str, Any]] = {
     "qwen3_5_moe": dict(
         layer_prefix="model.language_model.layers.",
@@ -448,6 +898,93 @@ FAMILIES: dict[str, dict[str, Any]] = {
                       "hc_head_fn", "hc_head_scale", "hc_head_base"),
         default_layers="0-5",
         config_rewrite=_rewrite_dsv4,
+    ),
+    # The same architecture as it comes out of `mlx_lm.convert`, which is a
+    # different *checkpoint*: the trunk is re-rooted under `model.`, the routed
+    # bank is stacked on dim 0 into one `switch_mlp` triple instead of 256
+    # per-expert names, and every quantised plane is a
+    # `weight`/`scales`/`biases` trio. Two entries share one `model_type`, so
+    # the family is picked by which layer prefix the index actually uses.
+    "deepseek_v4_mlx": dict(
+        model_type="deepseek_v4",
+        layer_prefix="model.layers.",
+        expert_re=None,
+        router_suffixes=(
+            "ffn.gate.weight",
+            "ffn.gate.e_score_correction_bias",
+            "ffn.switch_mlp.gate_proj.weight",
+            "ffn.switch_mlp.gate_proj.scales",
+            "ffn.switch_mlp.gate_proj.biases",
+            "ffn.switch_mlp.up_proj.weight",
+            "ffn.switch_mlp.up_proj.scales",
+            "ffn.switch_mlp.up_proj.biases",
+            "ffn.switch_mlp.down_proj.weight",
+            "ffn.switch_mlp.down_proj.scales",
+            "ffn.switch_mlp.down_proj.biases",
+        ),
+        globals_keep=("model.embed_tokens.weight", "model.embed_tokens.scales",
+                      "model.embed_tokens.biases", "model.norm.weight",
+                      "lm_head.weight", "lm_head.scales", "lm_head.biases",
+                      "model.hc_head.base", "model.hc_head.fn",
+                      "model.hc_head.scale"),
+        # Five layers that between them hold every per-layer kind this
+        # architecture has: 0 and 1 are `compress_ratio` 0 and hash-routed
+        # (`ffn.gate.tid2eid`), 2 is ratio 4 (compressor *and* indexer), 3 is
+        # ratio 128 (compressor only, and the first `e_score_correction_bias`),
+        # and 42 is the one layer in the artifact whose routed `gate_proj` is
+        # quantised at group 64 where all forty-two of its siblings are group
+        # 32 -- the per-tensor quant override has nothing to discriminate
+        # against unless that layer is in the miniature.
+        default_layers="0-3,42",
+        config_rewrite=_rewrite_dsv4,
+    ),
+    "qwen4_exp": dict(
+        layer_prefix="language_model.model.layers.",
+        # Stacked on dim 0, like gpt-oss and Qwen3.5: one `switch_mlp` triple
+        # per layer, three planes each, no per-expert name. The 2-bit packing
+        # is on the LAST axis, so the leading axis is still whole experts and
+        # a dim-0 prefix is still a valid bank.
+        expert_re=None,
+        router_suffixes=(
+            "mlp.gate.weight",
+            "mlp.switch_mlp.gate_proj.weight",
+            "mlp.switch_mlp.gate_proj.scales",
+            "mlp.switch_mlp.gate_proj.biases",
+            "mlp.switch_mlp.up_proj.weight",
+            "mlp.switch_mlp.up_proj.scales",
+            "mlp.switch_mlp.up_proj.biases",
+            "mlp.switch_mlp.down_proj.weight",
+            "mlp.switch_mlp.down_proj.scales",
+            "mlp.switch_mlp.down_proj.biases",
+        ),
+        # The PLE n-gram table is `split_ngram_parts` pieces of one row space.
+        part_re=re.compile(r"\.ngram_embedding\.shard_(\d+)\."),
+        default_parts=8,
+        globals_keep=("language_model.model.embed_tokens.weight",
+                      "language_model.lm_head.weight",
+                      "language_model.model.hyper_connection_mixer.hc_norm.weight",
+                      "language_model.model.hyper_connection_mixer."
+                      "input_mix_weight_down.weight",
+                      "language_model.model.hyper_connection_mixer."
+                      "input_mix_weight_down.scales",
+                      "language_model.model.hyper_connection_mixer."
+                      "input_mix_weight_down.biases",
+                      "language_model.model.hyper_connection_mixer."
+                      "input_mix_weight_up.weight",
+                      "language_model.model.hyper_connection_mixer."
+                      "input_mix_weight_up.scales",
+                      "language_model.model.hyper_connection_mixer."
+                      "input_mix_weight_up.biases"),
+        # There is no `language_model.model.norm.weight` in this artifact: the
+        # trunk's output norm IS the residual mixer's own
+        # `hyper_connection_mixer.hc_norm.weight`, which is also the only
+        # trunk-level norm `model::qwen_4::import` reads.
+        # `full_attention_interval` is 4: three `linear_attention` layers then
+        # one `full_attention`. Layers 0-3 are one whole period -- and layer 1
+        # is the PLE layer, so the n-gram memory is in the block too.
+        default_layers="0-3",
+        config_rewrite=_rewrite_qwen4_exp,
+        text_cfg_key="text_config",
     ),
     "kimi_k25": dict(
         layer_prefix="language_model.model.layers.",
@@ -506,6 +1043,40 @@ FAMILIES: dict[str, dict[str, Any]] = {
 }
 
 
+def resolve_family(cfg: dict, weight_map: dict[str, str],
+                   forced: str | None) -> str:
+    """Pick the FAMILIES entry that describes this checkpoint.
+
+    `model_type` names the *architecture*, and one architecture can ship in two
+    checkpoint layouts -- DeepSeek-V4 upstream roots its trunk at `layers.` and
+    gives every expert its own name, while `mlx_lm.convert`'s output of the
+    same model roots at `model.layers.` and stacks the bank. So the model_type
+    narrows the candidates and the index itself decides between them: only one
+    layer prefix is actually a prefix of the names in the file.
+    """
+    if forced is not None:
+        if forced not in FAMILIES:
+            raise SystemExit(f"unknown --family {forced!r}; "
+                             f"known: {sorted(FAMILIES)}")
+        return forced
+    model_type = cfg.get("model_type", "")
+    named = [k for k, v in FAMILIES.items() if v.get("model_type", k) == model_type]
+    if not named:
+        raise SystemExit(f"unsupported model_type {model_type!r}; known: "
+                         f"{sorted({v.get('model_type', k) for k, v in FAMILIES.items()})}")
+    if len(named) == 1:
+        return named[0]
+    fits = [k for k in named
+            if any(n.startswith(FAMILIES[k]["layer_prefix"]) for n in weight_map)]
+    if len(fits) != 1:
+        raise SystemExit(
+            f"model_type {model_type!r} is described by {named}, and the index "
+            f"{'matches all of' if fits else 'matches none of'} their layer "
+            f"prefixes {[FAMILIES[k]['layer_prefix'] for k in named]}; "
+            f"pass --family")
+    return fits[0]
+
+
 def parse_layer_spec(spec: str) -> list[int]:
     out: list[int] = []
     for part in spec.split(","):
@@ -527,10 +1098,28 @@ def parse_layer_spec(spec: str) -> list[int]:
 class OutTensor:
     name: str
     src: SrcTensor
-    # row slice applied to dim 0 (router rows when the expert bank shrinks)
+    # row slice applied to dim 0 (router rows when the expert bank shrinks;
+    # the carved row count when `pieces` is set)
     rows: int | None = None
     # remap int64 expert ids into the reduced bank
     mod: int | None = None
+    # The rows of OTHER tensors this one is a concatenation of -- the PLE
+    # re-carve, whose output shard seams fall nowhere near the source's. `src`
+    # stays the representative plane it takes its name, dtype and row width
+    # from.
+    pieces: list[Piece] | None = None
+    # Content supplied by the build rather than by the checkpoint: the two
+    # published n-gram head buffers, which describe a hashing the carve just
+    # changed.
+    literal: bytes | None = None
+
+    @property
+    def out_bytes(self) -> int:
+        if self.literal is not None:
+            return len(self.literal)
+        if self.rows is None or not self.src.shape:
+            return self.src.nbytes
+        return self.src.row_bytes * self.rows
 
 
 def layer_index(name: str, prefix: str) -> int | None:
@@ -570,6 +1159,10 @@ def build_out_tensors(index: dict[str, str], plan: Plan,
                 m = plan.expert_re.search(name)
                 if m and int(m.group(1)) >= plan.experts:
                     continue
+            if plan.parts is not None and plan.part_re is not None:
+                m = plan.part_re.search(name)
+                if m and int(m.group(1)) >= plan.parts:
+                    continue
             pairs.append((out_pfx + suffix, name))
     return pairs
 
@@ -588,6 +1181,15 @@ def main() -> int:
                          "reused, so this costs no extra download)")
     ap.add_argument("--experts", type=int, default=8,
                     help="routed experts to keep per MoE layer (0 = all)")
+    ap.add_argument("--parts", type=int, default=None,
+                    help="pieces to keep of a weight the checkpoint splits "
+                         "into a fixed number of them -- Qwen4's PLE n-gram "
+                         "table (default: the family's, 0 = all)")
+    ap.add_argument("--family", default=None,
+                    help="force a FAMILIES entry instead of picking one from "
+                         "config.json's model_type (two entries can describe "
+                         "one model_type: upstream naming vs an mlx_lm "
+                         f"conversion of it). Known: {sorted(FAMILIES)}")
     ap.add_argument("--attn-res-block-size", type=int, default=None,
                     help="Kimi-K3 AttnRes residual-block stride (default: "
                          "scaled down with the kept depth so the blend sees "
@@ -610,17 +1212,19 @@ def main() -> int:
 
     print(f"[1/6] reading {args.repo} config + index")
     cfg = json.loads(fetch_bytes(args.repo, args.revision, "config.json"))
-    model_type = cfg.get("model_type", "")
-    if model_type not in FAMILIES:
-        raise SystemExit(f"unsupported model_type {model_type!r}; "
-                         f"known: {sorted(FAMILIES)}")
-    fam = FAMILIES[model_type]
+    index_json = json.loads(fetch_bytes(args.repo, args.revision,
+                                        "model.safetensors.index.json"))
+    weight_map: dict[str, str] = index_json["weight_map"]
+
+    family = resolve_family(cfg, weight_map, args.family)
+    fam = FAMILIES[family]
 
     src_layers = parse_layer_spec(args.layers or fam["default_layers"])
     if args.repeat > 1:
         src_layers = src_layers * args.repeat
+    parts = fam.get("default_parts") if args.parts is None else args.parts
     plan = Plan(
-        family=model_type,
+        family=family,
         layer_prefix=fam["layer_prefix"],
         src_layers=src_layers,
         experts=args.experts or None,
@@ -631,11 +1235,13 @@ def main() -> int:
         text_cfg_key=fam.get("text_cfg_key"),
         attn_res_block_size=args.attn_res_block_size,
         text_only=args.text_only,
+        part_re=fam.get("part_re"),
+        parts=parts or None,
     )
-
-    index_json = json.loads(fetch_bytes(args.repo, args.revision,
-                                        "model.safetensors.index.json"))
-    weight_map: dict[str, str] = index_json["weight_map"]
+    # Which source rows the hashed table is re-cut from is pure arithmetic over
+    # the config, and it decides which shards get read at all -- so it is
+    # settled before the pairs are.
+    plan.ple_carve = plan_ple_carve(cfg, plan)
 
     pairs = build_out_tensors(weight_map, plan,
                               () if args.text_only else fam.get("keep_res", ()))
@@ -645,7 +1251,11 @@ def main() -> int:
         # the wrapper prefix has to come off the tensor names too, not just
         # out of the config.
         pairs = [(_strip_text_tower(out), src) for out, src in pairs]
-    src_names = sorted({s for _, s in pairs})
+    src_names = sorted(set(carve_source_names(pairs, plan)) | {s for _, s in pairs})
+    missing = [n for n in src_names if n not in weight_map]
+    if missing:
+        raise SystemExit(f"the n-gram carve reads {len(missing)} tensor(s) the "
+                         f"index does not have, first {missing[0]}")
     print(f"      {len(weight_map)} source tensors -> {len(pairs)} output tensors "
           f"({len(src_names)} distinct downloads)")
 
@@ -667,6 +1277,7 @@ def main() -> int:
 
     print("[3/6] applying expert-bank slicing")
     outs = assign_rows(pairs, src, plan)
+    checks = apply_ple_carve(outs, src, plan)
     raw_total = sum(src[n].nbytes for n in src_names)
     total = sum(src[n].keep_bytes for n in src_names)
     if total < raw_total:
@@ -686,10 +1297,10 @@ def main() -> int:
     done_bytes = 0
     t0 = time.time()
     for shard, tensors in by_shard.items():
-        tensors.sort(key=lambda t: t.start)
+        tensors.sort(key=lambda t: t.fetch_start)
         groups: list[list[SrcTensor]] = []
         for t in tensors:
-            if groups and t.start - groups[-1][-1].keep_end <= COALESCE_GAP:
+            if groups and t.fetch_start - groups[-1][-1].keep_end <= COALESCE_GAP:
                 groups[-1].append(t)
             else:
                 groups.append([t])
@@ -698,7 +1309,7 @@ def main() -> int:
             if not missing:
                 done_bytes += sum(t.keep_bytes for t in grp)
                 continue
-            lo = grp[0].start
+            lo = grp[0].fetch_start
             hi = max(t.keep_end for t in grp)
             blob_path = cache / f"span-{shard.replace('/', '_')}-{lo}-{hi}.bin"
             fetch_to_file(args.repo, args.revision, shard, blob_path, lo, hi)
@@ -707,7 +1318,7 @@ def main() -> int:
                     dest = cache / cache_key(t)
                     if dest.exists():
                         continue
-                    bf.seek(t.start - lo)
+                    bf.seek(t.fetch_start - lo)
                     data = bf.read(t.keep_bytes)
                     tmp = dest.with_suffix(".part")
                     tmp.write_bytes(data)
@@ -719,11 +1330,33 @@ def main() -> int:
                   f"({done_bytes/1024**2/max(el,1e-3):.0f} MiB/s)", end="\r", flush=True)
     print(" " * 78, end="\r")
 
+    # **THE DERIVATION, HELD AGAINST THE CHECKPOINT'S OWN BUFFERS.** The carve
+    # cut the table for the sixteen primes `ngram_hash_geometry` derives from
+    # the SOURCE base; if the conversion hashed with anything else then those
+    # are not the head seams and the carve read the wrong rows. The file says
+    # what it hashed with, so it is asked.
+    for name, tensor, want in checks:
+        got = (cache / cache_key(tensor)).read_bytes()
+        if got != want:
+            wide = lambda b: [int.from_bytes(b[i:i + 8], "little", signed=True)  # noqa: E731
+                              for i in range(0, len(b), 8)]
+            raise SystemExit(
+                f"{name}: this tool derives {wide(want)} and the checkpoint "
+                f"publishes {wide(got)}. The n-gram carve reads the head "
+                f"segments the derivation names, so it must not run against a "
+                f"hashing it cannot reproduce.")
+    if checks:
+        print(f"      the source's own n-gram head buffers are the derivation's "
+              f"({len(checks)} of them)")
+
     print("[5/6] writing shards")
     shard_files = write_output(out_dir, cache, outs)
 
     print("[6/6] writing config + tokenizer")
     plan.config_rewrite(cfg, plan)
+    for key, n in carry_quant_overrides(cfg, pairs).items():
+        print(f"      {key}: {n} per-tensor overrides carried onto the "
+              f"renumbered names")
     (out_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
     copy_aux_files(args.repo, args.revision, out_dir)
     write_index(out_dir, shard_files)
@@ -743,7 +1376,7 @@ def cache_key(t: SrcTensor) -> str:
     # The cached blob is a *prefix* when the expert bank is sliced, so the row
     # count has to be part of the key or a full blob from an earlier run with a
     # different `--experts` would be reused as if it were the prefix.
-    rows = "" if t.keep_rows is None else f".rows{t.keep_rows}"
+    rows = "" if t.keep_rows is None else f".rows{t.keep_from}+{t.keep_rows}"
     return f"{safe}{rows}.bin"
 
 
@@ -794,6 +1427,55 @@ def transform_bytes(ot: OutTensor, raw: bytes) -> tuple[bytes, list[int]]:
     return raw, shape
 
 
+def _rows_from(path: Path, row_bytes: int, skip: int, rows: int) -> Iterable[bytes]:
+    """`rows` rows of a cached blob, `skip` rows in, a chunk at a time."""
+    left = rows * row_bytes
+    with path.open("rb") as f:
+        f.seek(skip * row_bytes)
+        while left:
+            buf = f.read(min(CHUNK, left))
+            if not buf:
+                raise RuntimeError(f"{path}: ran out {left} bytes early")
+            left -= len(buf)
+            yield buf
+
+
+def output_entry(cache: Path, ot: OutTensor
+                 ) -> tuple[str, str, list[int], Callable[[], Iterable[bytes]]]:
+    """One `write_safetensors` entry, as a LAZY generator.
+
+    Streamed rather than materialised: a carved n-gram shard is two hundred
+    megabytes and an output file holds up to four gigabytes of them, and this
+    tool has to run beside nothing else on a 32 GiB box.
+    """
+    shape = list(ot.src.shape)
+    if ot.literal is not None:
+        data = ot.literal
+        return ot.name, ot.src.dtype, shape, (lambda: iter((data,)))
+    if ot.pieces is not None:
+        shape[0] = ot.rows
+
+        def joined() -> Iterable[bytes]:
+            for piece in ot.pieces:
+                yield from _rows_from(cache / cache_key(piece.src),
+                                      piece.src.row_bytes,
+                                      piece.row0 - piece.src.keep_from, piece.rows)
+
+        return ot.name, ot.src.dtype, shape, joined
+    if ot.mod:
+        # Tiny, and the only entry that needs its bytes in hand.
+        raw, shape = transform_bytes(ot, (cache / cache_key(ot.src)).read_bytes())
+        return ot.name, ot.src.dtype, shape, (lambda r=raw: iter((r,)))
+    rows = ot.src.shape[0] if shape else 1
+    if ot.rows is not None and shape and shape[0] > ot.rows:
+        rows, shape[0] = ot.rows, ot.rows
+    path = cache / cache_key(ot.src)
+    if not shape:
+        return ot.name, ot.src.dtype, shape, (lambda: iter((path.read_bytes(),)))
+    return ot.name, ot.src.dtype, shape, (
+        lambda: _rows_from(path, ot.src.row_bytes, 0, rows))
+
+
 def write_output(out_dir: Path, cache: Path, outs: list[OutTensor]) -> list[tuple[str, list[str]]]:
     for f in out_dir.glob("*.safetensors"):
         f.unlink()
@@ -806,17 +1488,13 @@ def write_output(out_dir: Path, cache: Path, outs: list[OutTensor]) -> list[tupl
         if not batch:
             return
         name = f"model-{idx:05d}.safetensors"
-        entries = []
-        for ot in batch:
-            raw, shape = transform_bytes(ot, (cache / cache_key(ot.src)).read_bytes())
-            entries.append((ot.name, ot.src.dtype, shape, (lambda r=raw: iter((r,)))))
-        write_safetensors(out_dir / name, entries)
+        write_safetensors(out_dir / name, [output_entry(cache, ot) for ot in batch])
         shards.append((name, [ot.name for ot in batch]))
         batch, acc = [], 0
 
     idx = 1
     for ot in outs:
-        n = ot.src.nbytes if ot.rows is None else ot.src.nbytes * ot.rows // max(ot.src.shape[0], 1)
+        n = ot.out_bytes
         if acc + n > MAX_SHARD_BYTES and batch:
             flush(idx)
             idx += 1

@@ -218,6 +218,29 @@ impl CompiledModel {
         self.units_of.get(region).copied().unwrap_or(0)
     }
 
+    /// **WHICH ROW SPACE THIS REGION'S OWN WINDOW IS A SPAN OF** — its capture
+    /// unit's axis, which is the only thing a region's rows can be counted in.
+    ///
+    /// A METHOD BECAUSE FOUR READERS ASK IT AND MUST ALL PICK THE SAME WAY:
+    /// `model_exec::fire::walk` cuts the region's spans with it,
+    /// `model_exec::fire::fallback` resolves P4's menu with it, and both
+    /// shells' window tables record it beside the windows they cut. It was
+    /// written out four times as `units[unit_of(r)]` with a `PRIMARY` default,
+    /// which is one expression that could drift in four places; it is one
+    /// expression now.
+    ///
+    /// [`RowAxis::PRIMARY`] for a region past the table or a unit past
+    /// [`units`](CompiledModel::units) — the one-unit answer, and the only
+    /// honest one for a region that is not there, exactly as
+    /// [`unit_of`](CompiledModel::unit_of) reads.
+    #[must_use]
+    pub fn axis_of(&self, region: usize) -> RowAxis {
+        self.units
+            .get(self.unit_of(region) as usize)
+            .copied()
+            .unwrap_or(RowAxis::PRIMARY)
+    }
+
     /// The class order this axis's rows are seriated by, or `None` for an axis
     /// this plan does not state.
     #[must_use]
@@ -513,10 +536,13 @@ impl ClassOrder {
 ///
 /// A row here names a consumer the C1P instance could not seat — see
 /// [`crate::layout`] for which one gets withdrawn and why — and
-/// `engine::fire::fallback` is what reads it, at the bucket the fire landed in
-/// (`fallback::answer_at`): [`Fallback::Split`] is what every shell serves, and
-/// [`Fallback::Copy`] is served by a shell that publishes a row gather and says
-/// so (`fallback::Serve`) — `engine-cuda` does; `engine-metal` does not, and
+/// `model_exec::fire::fallback` is what reads it, at the bucket the fire
+/// landed in and through the AXIS whose table this is
+/// ([`CompiledModel::fallback_for`]; a plan has one menu per row space, and
+/// the reader takes the axis rather than assuming the token one):
+/// [`Fallback::Split`] is what every shell serves, and [`Fallback::Copy`] is
+/// served by a shell that publishes a row gather and says so
+/// (`fallback::Serve`) — `engine-cuda` does; `engine-metal` does not, and
 /// splits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FallbackTable {

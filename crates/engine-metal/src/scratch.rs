@@ -17,7 +17,17 @@
 //! copy       the dense rectangle  a `Fallback::Copy` region's operands,
 //!                                 gathered contiguous for one encode and
 //!                                 scattered back after it
+//! pool       the pool's cells     the dsv4 compressor's rolling state, which
+//!                                 `attention.pool_gather` reads beside the
+//!                                 cache and no op names
+//! ple        one u64 row per      qwen4's PLE hash constants, written once
+//!            hashing              at load because this plane's `ArgValue`
+//!                                 has no by-value blob seat
 //! ```
+//!
+//! (`index`, the NSA selection's score slab, is the sixth and is documented at
+//! its field rather than here, because it aliases and the four above do not
+//! all do the same thing about that.)
 //!
 //! # Reserved at load, at the budget's ceiling — article 7
 //!
@@ -31,7 +41,9 @@
 //! What does NOT carry over from `inputs` is the second copy. That plane is
 //! duplicated per in-flight arm because the HOST writes it — a `memcpy` into
 //! shared storage lands in the bytes a committed command buffer is already
-//! reading. **Nothing here is ever touched by the host.** Every byte is
+//! reading. **No FIRE PATH here is ever touched by the host** (the `ple`
+//! role is written once, inside [`Scratch::reserve`], before a command buffer
+//! exists — see its field). Every other byte is
 //! written by a shader and read by a shader later in the same command
 //! buffer, which puts this plane in the same class as the arena and the
 //! pools: ONE copy, resting on the property `serve`'s header states and gates
@@ -90,8 +102,15 @@
 //! not, so it is charged honestly:
 //!
 //! ```text
-//! bytes = max(precast, routed) + copy
+//! bytes = max(precast, routed, index) + copy + pool
 //! ```
+//!
+//! **AND THE POOL ROLE IS ADDED FOR A HARDER REASON THAN THE COPY'S.** A copy
+//! is live across a region; the compressor state is live across FIRES. It is
+//! indexed by the source pool's paged slot, so a cell holds the state of a
+//! token some earlier fire wrote and the whole point of the plane is that it
+//! survives — it fails the third sentence above, not merely the first. See
+//! the field.
 //!
 //! What that costs is bounded and small, and the bound is the bucket lattice's
 //! rather than the budget's: P4 writes `Fallback::Copy` only BELOW the
@@ -139,18 +158,31 @@
 //! aliasing note above for why that is the honest ceiling and `max_tokens` is
 //! not.
 //!
+//! **pool.** TWO slabs at `pool cells x coff·head_dim x 2B`, where the cells
+//! are the whole paging's (`slots x context`) and not a fire's rows — the
+//! gather addresses the state by the source pool's paged slot. `coff` is 2 at
+//! ratio 4 and 1 elsewhere, and the widest gather in the artifact sets the
+//! pitch. This is the same size class as one layer's kv pool, twice over, and
+//! it is charged rather than trimmed: a slab short of the paging's ceiling is
+//! an out-of-bounds device read on the first long sequence. Zero for every
+//! artifact whose trace names no `attention.pool_gather`, which is every SKU
+//! outside the dsv4-flash family.
+//!
 //! [`Run::tensor`]: crate::run::Run::tensor
 //! [`RoutedScratch`]: kernels_metal::linear::moe::RoutedScratch
 
 use kernels_metal::Tensor;
+use kernels_metal::attn::ple;
 use kernels_metal::linear::moe::{self, RoutedScratch};
-use model_compiler::{Budget, CompiledModel, Fallback, FireRows};
+use model_compiler::{Budget, Budgets, CompiledModel, Fallback, FireRows};
 use model_exec::store::arena::rect;
-use model_ir::{Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
+use model_ir::{Attention, Def, Dim, Dtype, Linear, Operation, Trace, Ty, ValueId};
+
+use crate::store::kv::Paging;
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::Result;
-use crate::run::{WeightRow, WeightTable};
+use crate::run::{PoolSlabs, WeightRow, WeightTable};
 
 /// The alignment every role and every sub-rectangle starts on — `inputs`'
 /// number, for `inputs`' reason.
@@ -210,6 +242,32 @@ struct CopyRoom {
     bytes: u64,
 }
 
+/// **ONE POOLED SPACE'S two state slabs**, in the order they are laid down.
+///
+/// `space` is the SOURCE cache's index — the `pages` operand of the
+/// `attention.pool_gather` that reads these slabs, and of the
+/// `attention.pool_state_write` that fills them. A layer's compressor state
+/// is a function of that layer's own kv rows, so two pooled layers hold
+/// DIFFERENT state at the same paged cell and cannot share a plane.
+#[derive(Clone, Copy, Debug)]
+struct Pool {
+    space: u32,
+    state_kv: Room,
+    state_score: Room,
+}
+
+/// One hashing's constants: the plane they were written into, and the numbers
+/// themselves as the key a dispatch arm finds it by.
+#[derive(Clone, Debug)]
+struct PleHash {
+    /// `[mults][primes][offsets]`, exactly as
+    /// [`kernels_metal::attn::ple::hash_constants`] lays them down — which is
+    /// also what was written to the device, so this field IS the plane's
+    /// contents and not a summary of them.
+    key: Box<[u64]>,
+    room: Room,
+}
+
 /// The sorted arm's six rectangles, in the order they are laid down.
 #[derive(Clone, Copy, Debug)]
 struct Routed {
@@ -236,12 +294,82 @@ pub struct Scratch {
 
     precast: Option<Room>,
     routed: Option<Routed>,
+    /// The NSA indexer's per-row score slab: `rows x max_kv` floats,
+    /// `None` for an artifact with no `attention.index_topk` node — which is
+    /// every SKU outside the dsv4-flash family.
+    ///
+    /// **ALIASED WITH THE TWO ABOVE, AND IT PASSES ALL THREE SENTENCES.** The
+    /// selection writes this rectangle and bisects over it INSIDE ONE
+    /// KERNEL — `index_topk_paged_bfloat16` scores every visible key into its
+    /// row, folds a min/max over it, halves forty times counting against it,
+    /// and collects; nothing outside that dispatch ever reads a byte of it.
+    /// So it is not merely dead before the next chain, it is dead before the
+    /// next DISPATCH, which is the strongest form of the first bullet
+    /// available. It cannot collide with a copied region either, because
+    /// `copy` is added rather than unioned.
+    index: Option<Room>,
     /// **NOT ALIASED ONTO THE THREE ABOVE**, and the header's fourth bullet
     /// is why: a copy's bytes are live across a whole region's dispatch
     /// chains, where every other role's are dead before the next chain
     /// starts. `None` for an artifact P4 withdrew no copyable region from,
     /// which is every SKU outside the qwen family.
     copy: Option<CopyRoom>,
+
+    /// The dsv4 compressor's rolling state, ONE ENTRY PER POOLED SPACE and
+    /// empty for an artifact with no `attention.pool_gather` node — which is
+    /// every SKU outside the dsv4 family.
+    ///
+    /// **ALSO NOT ALIASED, AND FOR A STRONGER REASON THAN THE COPY'S.** Every
+    /// other role here is working storage whose first dispatch writes every
+    /// byte it later reads. This one is not written by its reader at all: it
+    /// is addressed by the SOURCE POOL'S PAGED SLOT, so a cell holds the
+    /// compressor state of a token from some earlier fire, and the whole
+    /// point of the plane is that it survives. Unioning it with a pre-cast
+    /// staging rectangle would let a projection three layers up overwrite the
+    /// window this fire is about to pool. So it is added, like the copy, and
+    /// the honest cost is stated rather than hidden.
+    ///
+    /// **AND IT IS ONE PLANE PER SPACE NOW, NOT ONE PLANE FOR ALL OF THEM.**
+    /// The reservation used to lay one, on the argument that nothing wrote
+    /// either slab so no two pooled layers could disagree about a cell — a
+    /// statement about the seam and explicitly not a licence.
+    /// `attention.pool_state_write` is that writer, so the licence expired:
+    /// layer 2's `wkv · x` and layer 3's are different numbers at the same
+    /// paged cell, and one plane would hand the earlier layer's gather the
+    /// later layer's projections. The cost is honest and large — a pooled
+    /// layer's state is two slabs the size class of its own kv pool — and it
+    /// is charged per pooled layer because that is what the addressing is.
+    pool: Vec<Pool>,
+
+    /// qwen4's PLE hash constants: one `u64` plane per DISTINCT hashing the
+    /// trace states, empty for an artifact with no `attention.ple_ngram_ids`
+    /// node — which is every SKU outside the qwen38-flash family.
+    ///
+    /// **THE ONE ROLE THE HOST WRITES, AND IT WRITES IT ONCE.** The header
+    /// says nothing here is ever touched by the host; this is the exception
+    /// and it is a narrow one. The bytes are written inside
+    /// [`Scratch::reserve`] — before the reservation is handed to a `Shell`,
+    /// so before any command buffer exists that could be reading them — and
+    /// no fire path ever writes a byte of this plane again. That is why it
+    /// needs no second copy where [`crate::inputs`] needs one: the hazard
+    /// `inputs` duplicates against is a host `memcpy` landing in bytes a
+    /// committed buffer is already reading, and a write that happens before
+    /// the first command buffer cannot be that.
+    ///
+    /// **ALSO NOT ALIASED**, for a stronger reason than the compressor's: it
+    /// is not working storage at all. It is a trace CONSTANT — the seed-derived
+    /// multipliers, primes and offsets `models::qwen_4::hash_constants` derives
+    /// — living on the device because `kernels_metal::ArgValue` has no
+    /// by-value blob seat to carry them through, and the day a pre-cast
+    /// overwrote it the hasher would still answer a number.
+    ///
+    /// **AND IT IS A LIST BECAUSE A HASHING IS NOT A LAYER.** The two arms of
+    /// one PLE — the decode form and the chunked form — state the SAME
+    /// constants, so today's catalog lays exactly one plane; a second PLE
+    /// layer would state its own and get its own, and the lookup is by the
+    /// numbers themselves rather than by node, because the numbers are what
+    /// the shader reads.
+    ple: Vec<PleHash>,
 
     /// Per `ValueId`: how many ROWS the arena slot behind it can hold — the
     /// slot's whole reservation at the budget's ceiling, not this fire's
@@ -270,9 +398,19 @@ impl Scratch {
     /// Carve the plane this artifact can ask for, at the budget's ceiling.
     ///
     /// Every ceiling is read off the same carve the arena is driven by, at
-    /// `max_tokens x max_lanes` — so a rectangle this plane is sized for is a
-    /// rectangle the arena also reserved room for, and the two cannot
-    /// disagree about how big a fire may be.
+    /// ALL FOUR of the budget's row counts — so a rectangle this plane is
+    /// sized for is a rectangle the arena also reserved room for, and the two
+    /// cannot disagree about how big a fire may be.
+    ///
+    /// **AND THE PATCH PAIR IS STATED RATHER THAN ZEROED**, which is the same
+    /// sentence [`crate::arena::carve`] carries: `FireRows::text_only` sizes a
+    /// patch rectangle at no rows, and a tower node whose bank the loader
+    /// seated as an affine triplet would then ask this plane for a
+    /// zero-row pre-cast room and be handed one. Every tower in the catalog
+    /// is dense bf16 and asks for none — the towers are never quantized
+    /// (multimodal §21.1) — but gemma's `embed_vision.embedding_projection`
+    /// IS a quantized bank reading a patch-axis activation, so the honest
+    /// ceiling is the one that counts its rows.
     ///
     /// # Errors
     ///
@@ -284,13 +422,18 @@ impl Scratch {
         trace: &Trace,
         weights: &WeightTable,
         compiled: &CompiledModel,
-        budget: &Budget,
+        budgets: &Budgets,
+        paging: Paging,
     ) -> Result<Scratch> {
+        let budget = &budgets.tokens;
         let map = &compiled.arena;
-        let tokens = u64::from(budget.max_tokens);
-        let lanes = u64::from(budget.max_lanes);
-        // `text_only` for `crate::arena::carve`'s reason, one file over.
-        let of = |id: ValueId| rect(map, id, FireRows::text_only(tokens, lanes));
+        let ceiling = FireRows {
+            tokens: u64::from(budget.max_tokens),
+            lanes: u64::from(budget.max_lanes),
+            patches: u64::from(budgets.max_patches()),
+            images: u64::from(budgets.max_images()),
+        };
+        let of = |id: ValueId| rect(map, id, ceiling);
         let banked = |id: ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
             Some(Def::Weight(w)) => matches!(
                 weights.0.get(*w as usize).copied().flatten(),
@@ -381,9 +524,39 @@ impl Scratch {
             }
         });
 
+        // **THE INDEXER'S SCORE SLAB, AT THE PAGING'S OWN CEILING.** One row
+        // per query row the selection launches over, one float per cached key
+        // that row can see. The width is `pages_per_slot * page_size` — the
+        // per-request page budget the pool was reserved at, which is exactly
+        // the `max_pages_per_request * page_size` the CUDA entry sizes its
+        // process-global scratch by. It is a ceiling and not a measurement,
+        // so the shader's `nkeys > score_stride` clamp is the same clamp on
+        // both planes.
+        //
+        // A trace with no `attention.index_topk` node asks for nothing, so
+        // the bytes are charged to the one model family that selects.
+        let index = trace
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Attention(Attention::IndexTopk { selection, .. }) => of(*selection),
+                _ => None,
+            })
+            .map(|rect| u64::from(rect.rows))
+            .max()
+            .filter(|rows| *rows > 0)
+            .and_then(|rows| {
+                let keys = u64::from(paging.pages_per_slot) * u64::from(paging.page_size);
+                (keys > 0).then(|| {
+                    let mut at = 0u64;
+                    Room::lay(&mut at, rows, keys, Dtype::F32)
+                })
+            });
+
         let union = precast
             .map_or(0, |r| r.at + r.bytes())
-            .max(routed.map_or(0, |r| r.y.at + r.y.bytes()));
+            .max(routed.map_or(0, |r| r.y.at + r.y.bytes()))
+            .max(index.map_or(0, |r| r.at + r.bytes()));
         // **ADDED, NOT UNIONED** — the header's fourth bullet. It starts
         // where the three aliased roles end, so a copied region holding a
         // routed matmul is two disjoint spans and not one span read twice.
@@ -392,13 +565,70 @@ impl Scratch {
             bytes,
         });
 
-        let bytes = copy.map_or(union, |room| room.at + room.bytes);
+        let mut at = copy.map_or(union, |room| room.at + room.bytes);
+        // **THE COMPRESSOR'S STATE, ADDED AFTER THE COPY, ONE PLANE PER
+        // POOLED SPACE** — see the field. A gather reads the cell its own
+        // `pages` operand addresses, so the plane is keyed by that space:
+        // `attention.pool_state_write` now fills the slabs from the layer's
+        // own `wkv`/`wgate` projections, and two pooled layers hold different
+        // state at the same paged cell.
+        let pool: Vec<Pool> = pool_state(trace, paging)
+            .into_iter()
+            .map(|(space, cells, width)| Pool {
+                space,
+                state_kv: Room::lay(&mut at, cells, width, Dtype::Bf16),
+                state_score: Room::lay(&mut at, cells, width, Dtype::Bf16),
+            })
+            .collect();
+
+        // **THE PLE'S CONSTANTS, ADDED LAST AND WRITTEN ONCE** — see the
+        // field. One plane per distinct hashing, so the two arms of one PLE
+        // layer share the plane whose numbers they share.
+        let mut ple: Vec<PleHash> = Vec::new();
+        for node in &trace.nodes {
+            let Operation::Attention(
+                Attention::PleNgramIds {
+                    mults,
+                    primes,
+                    offsets,
+                    ..
+                }
+                | Attention::PleNgramIdsChunked {
+                    mults,
+                    primes,
+                    offsets,
+                    ..
+                },
+            ) = &node.op
+            else {
+                continue;
+            };
+            let key: Box<[u64]> = ple::hash_constants(mults, primes, offsets).into();
+            if key.is_empty() || ple.iter().any(|held| held.key == key) {
+                continue;
+            }
+            let room = Room::lay(&mut at, 1, key.len() as u64, Dtype::U64);
+            ple.push(PleHash { key, room });
+        }
+
+        let mut plane = Buffer::zeroed(device, at)?;
+        for hashing in &ple {
+            let bytes: Vec<u8> = hashing
+                .key
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect();
+            plane.write(hashing.room.at, &bytes)?;
+        }
 
         Ok(Scratch {
-            plane: Buffer::zeroed(device, bytes)?,
+            plane,
             precast,
             routed,
+            index,
             copy,
+            pool,
+            ple,
             capacity: crate::arena::capacities(map),
             routers,
         })
@@ -512,6 +742,154 @@ impl Scratch {
         };
         Some(mint())
     }
+
+    /// The NSA indexer's score slab, whole — `rows x max_kv` f32, where the
+    /// WIDTH is the `score_stride` the selection shader clamps each row's
+    /// visible key count against.
+    ///
+    /// Handed over at its reserved extent rather than cut to the fire, for
+    /// the reason the shader reads it: `score_stride` is the row pitch a
+    /// launch addresses by, so narrowing it per fire would move every row of
+    /// the slab and mean a different thing by the same argument.
+    ///
+    /// `None` for an artifact whose trace names no `attention.index_topk` —
+    /// and the caller's answer to `None` is the refusal that says the load
+    /// reserved no slab, not a fire against a rectangle that is not there.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`](crate::error::Fault::Ceiling) for a handle table
+    /// already full.
+    pub fn index_scores(&self, handles: &Handles) -> Option<Result<Tensor>> {
+        Some(self.index?.bind(handles, &self.plane))
+    }
+
+    /// The dsv4 compressor's two state slabs for ONE POOLED SPACE, whole.
+    ///
+    /// `space` is the source cache's index — the `pages` operand of the
+    /// gather asking, and of the state write that filled it. Two pooled
+    /// layers hold different state at the same paged cell, so the plane they
+    /// are handed is the one reserved for their own space.
+    ///
+    /// Handed over at their reserved extent for [`Scratch::index_scores`]'s
+    /// reason: the width is the ROW PITCH the shader addresses cells by, so
+    /// narrowing it per fire would move every row of the plane and mean a
+    /// different thing by the same argument. The rows are the pool's cells,
+    /// which no fire is a fraction of.
+    ///
+    /// `None` for an artifact whose trace names no `attention.pool_gather` —
+    /// and the caller's answer to `None` is the refusal that says the load
+    /// reserved no state, not a launch against a plane that is not there.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`](crate::error::Fault::Ceiling) for a handle table
+    /// already full.
+    pub fn pool_state(&self, handles: &Handles, space: u32) -> Option<Result<PoolSlabs>> {
+        let rooms = *self.pool.iter().find(|held| held.space == space)?;
+        let mint = || {
+            Ok(PoolSlabs {
+                state_kv: rooms.state_kv.bind(handles, &self.plane)?,
+                state_score: rooms.state_score.bind(handles, &self.plane)?,
+            })
+        };
+        Some(mint())
+    }
+
+    /// The `u64` plane holding THIS hashing's constants, minted into the fire.
+    ///
+    /// **FOUND BY THE NUMBERS AND NOT BY THE NODE**, which is what makes the
+    /// two arms of one PLE share one plane without anything having to say they
+    /// are the same layer: the shader reads the numbers, so the numbers are
+    /// the identity. The list is one entry long on every SKU in the catalog,
+    /// so the scan is a comparison and not a search.
+    ///
+    /// `None` for an artifact whose trace states no hashing with these
+    /// constants — and the caller's answer to `None` is the refusal that says
+    /// the load wrote no such plane, not a fire against constants that are not
+    /// there.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`](crate::error::Fault::Ceiling) for a handle table
+    /// already full.
+    pub fn ple_hash(
+        &self,
+        handles: &Handles,
+        mults: &[u64],
+        primes: &[u64],
+        offsets: &[u64],
+    ) -> Option<Result<Tensor>> {
+        let want = ple::hash_constants(mults, primes, offsets);
+        let held = self.ple.iter().find(|h| *h.key == *want)?;
+        Some(held.room.bind(handles, &self.plane))
+    }
+}
+
+/// `2` for the overlapping `2*ratio` window of the ratio-4 compressor, `1`
+/// otherwise — the reservation's copy of `kernels_metal::attn::pool`'s own
+/// `compressor_coff`, which is private to that module and derived from the
+/// ratio on both sides of the seam.
+const fn compressor_coff(ratio: u32) -> u64 {
+    if ratio == 4 { 2 } else { 1 }
+}
+
+/// The compressor state planes this artifact asks for: one
+/// `(space, cells, width)` per POOLED CACHE SPACE, empty for a trace that
+/// names no `attention.pool_gather`.
+///
+/// **KEYED BY THE SPACE THE GATHER ADDRESSES**, which is the `pages` operand
+/// resolved through `Def::Cache`. Every gather over one space states the same
+/// ratio in this catalog, but the width is taken as a maximum inside a space
+/// all the same — a space read at two ratios strides the wider row, which is
+/// exactly what `pool_gather_paged`'s `state_pitch` is for.
+///
+/// **THE ROWS ARE THE POOL'S CELLS AND NOT THE FIRE'S ROWS**, which is the
+/// one thing that makes this reservation a different animal from every other
+/// role in this file. `pool_gather_paged` addresses the state at
+/// `paged_slot(...) * width + col`, and `paged_slot` is
+/// `page_indices[...] * page_size + pos % page_size` — a GLOBAL cell of the
+/// source pool. So the plane has to cover every cell the paging can hand out
+/// (`pages() * page_size`, which is `slots x context`), at the widest pitch
+/// any gather in this artifact states.
+///
+/// That is a large number — the same size class as one layer's kv pool, twice
+/// over — and it is charged honestly rather than trimmed to something that
+/// fits: a slab short of the paging's ceiling is an out-of-bounds device read
+/// on the first long sequence, which is the failure mode this crate reserves
+/// at ceilings to avoid.
+fn pool_state(trace: &Trace, paging: Paging) -> Vec<(u32, u64, u64)> {
+    let cells = paging.pages() * u64::from(paging.page_size);
+    if cells == 0 {
+        return Vec::new();
+    }
+    let mut spaces: Vec<(u32, u64)> = Vec::new();
+    for node in &trace.nodes {
+        let Operation::Attention(Attention::PoolGather {
+            pages,
+            head_dim,
+            ratio,
+            ..
+        }) = &node.op
+        else {
+            continue;
+        };
+        let Some(Def::Cache(space)) = trace.values.get(pages.0 as usize).map(|v| &v.def) else {
+            continue;
+        };
+        let width = compressor_coff(*ratio) * u64::from(*head_dim);
+        if width == 0 {
+            continue;
+        }
+        match spaces.iter_mut().find(|(held, _)| *held == *space) {
+            Some((_, held)) => *held = (*held).max(width),
+            None => spaces.push((*space, width)),
+        }
+    }
+    spaces
+        .into_iter()
+        .map(|(space, width)| (space, cells, width))
+        .collect()
 }
 
 /// The most bytes any one copied region's staging rectangles come to.
@@ -623,6 +1001,19 @@ fn routers(trace: &Trace) -> Vec<u32> {
                 routes, experts, ..
             }
             | Linear::MoeTopkSqrtSoftplus {
+                routes, experts, ..
+            }
+            // **AND THE LOOKUP ROUTER**, which lands the same vector off a
+            // table instead of off logits. Omitted, `experts` reads 0 for
+            // every hash-routed layer, the sweep above `continue`s on it, and
+            // the sorted arm reserves nothing for a mixture that is otherwise
+            // exactly the ranked routers' — a silent narrowing, not a fault,
+            // and so one nothing went red over. Measured on
+            // `what_a_two_bit_prefill_costs`: dsv4-flash-mlxu2's 512-token
+            // prefill runs 555 tok/s with the arm below missing and 768 with
+            // it, because three of that model's five mixtures route by table
+            // and were taking the matvec arm at every rectangle.
+            | Linear::MoeHashRoute {
                 routes, experts, ..
             } => (*routes, *experts),
             _ => continue,

@@ -46,7 +46,7 @@ pub const SOURCE_KEY: &str = "pie_source";
 /// the archive it came from did not state it.
 ///
 /// **Not the same fact as an encoding, and the difference is the point.**
-/// `model::serve::encoding::Encoding` answers "how are THIS checkpoint's numbers
+/// `models::serve::encoding::Encoding` answers "how are THIS checkpoint's numbers
 /// stored" by reading `config.json`'s `quantization_config`. An archive
 /// `pie model import` wrote has no such block — GGUF states its quantization
 /// per tensor and never in a config — so that question returns "not

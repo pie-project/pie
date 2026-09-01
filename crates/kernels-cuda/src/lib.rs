@@ -113,6 +113,7 @@ pub mod layout_embed_concat;
 pub mod channel;
 pub mod collective;
 pub mod custom;
+pub mod disk;
 pub mod elemwise;
 pub mod error;
 pub mod graph;

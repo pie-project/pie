@@ -5,8 +5,8 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use ::model::template::{ReasoningDecoder, ReasoningEvent};
 use anyhow::Result;
+use models::template::{ReasoningDecoder, ReasoningEvent};
 use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

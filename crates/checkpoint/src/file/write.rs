@@ -29,6 +29,7 @@ use ztensor::format::cbor::{self, Value};
 
 use crate::error::Error;
 use crate::types::{DType, Encoding, QuantScheme, TensorDecl};
+use crate::serving::{self, Stamp};
 
 /// One tensor of the file: what to call it, and the bytes as stored.
 pub struct WriteTensor<'a> {
@@ -68,7 +69,7 @@ pub struct WriteTensor<'a> {
 /// longer said so.
 /// `every_scheme_the_writer_accepts_is_one_the_reader_gives_back` is what found
 /// this and is what keeps the two functions agreeing.
-fn storage_of(
+pub(crate) fn storage_of(
     decl_dtype: DType,
     encoding: &Encoding,
 ) -> Result<(ZDType, Option<&'static str>), Error> {
@@ -104,22 +105,98 @@ fn storage_of(
         // to store, and there is no zTensor dtype for it.
         DType::E2m1
         | DType::Mxfp4
-        | DType::Nvfp4
         | DType::U4g64
         | DType::U8g64
         | DType::U4g32
+        | DType::U4g64tiled
+        | DType::U2g32
+        | DType::U2g64
+        | DType::Nvfp4
         | DType::U2g16k
         | DType::I3g16k
         | DType::U4g32k
         | DType::U5g32k
         | DType::I6g16k
         | DType::E4m3row
-        | DType::E4m3tile128 => {
+        | DType::E4m3tile128
+        | DType::U2g128 => {
             return Err(Error::Checkpoint(format!(
                 "cannot store a raw {decl_dtype:?} tensor: the packed codes \
                  are written as packed U8 under a quant encoding"
             )));
         }
+    })
+}
+
+/// Everything an object says about its own encoding: the layout profile it is
+/// written under, and the attributes a reader recovers it from.
+///
+/// Two halves, and they answer different questions. [`layout_of`] says how the
+/// payload is ADDRESSED, which is what a reader needs to find a block; then
+/// [`stamp_qnf`] adds what the bytes MEAN, which is what a kernel table needs
+/// to decide it can serve them.
+pub(crate) fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Error> {
+    let (name, attributes) = layout_of(encoding)?;
+    Ok((name, stamp_qnf(attributes, encoding)))
+}
+
+/// The `qnf` attribute: what this tensor's bytes MEAN, as one word.
+///
+/// The layout profile above says how the payload is *addressed* —
+/// `gguf.q4_k/1`, `zt.quant_group/1` plus its parameters, `dense` — and two
+/// files with the same profile can still hold different arithmetic (AWQ and
+/// GPTQ share a row; `dense` covers every plain width there is). QNF is the
+/// other half: `QuantSpec::term` maps a scheme, and `Dtype::repr` a dtype, onto a term, and its
+/// mangled spelling is a name a kernel table can be keyed on directly, with no
+/// second scheme enum in between.
+///
+/// **ADDITIVE, AND THE CONTAINER SAYS SO.** zTensor's attribute rule (spec
+/// §3.1/§3.5, `format::check_attributes`) is that the value is a map whose
+/// top-level keys are text obeying the name rules — no key registry, no
+/// closed-world check — and this crate's own reader looks its keys up by name
+/// (`file/zt.rs::encoding_of` asks for `group_size`, `bits`, `axis`,
+/// `elems_per_block`) and never enumerates them. So a reader built before this
+/// attribute existed reads a file carrying it exactly as it read one without.
+///
+/// **`None` FROM THE BRIDGE MEANS NO ATTRIBUTE, NEVER A GUESS.** That is
+/// `crate::qnf`'s own rule and the reason it answers `Option`: an IQ lattice's
+/// points are compiled into llama.cpp rather than stored, so no group width and
+/// no code leaf describes what its bytes hold. Such a tensor is written with
+/// its profile and without this attribute, which is the honest statement that
+/// the tree cannot yet name its arithmetic.
+fn stamp_qnf(attributes: Option<Value>, encoding: &Encoding) -> Option<Value> {
+    let sig = match encoding {
+        Encoding::Quant(spec) => spec.term(),
+        Encoding::Raw(dtype) => Some(*dtype.repr()),
+    };
+    // A refusal leaves the profile's own attributes exactly as they were: this
+    // function ADDS a key or adds nothing, and dropping `bits`/`group_size`
+    // here would write a file the reader cannot open — which is what the first
+    // draft of it did, for every scheme the bridge has no row for.
+    //
+    // `is_canonical` is asked because `mangle` PANICS otherwise: a factor slot
+    // with no factor has no spelling. Nothing in the bridge builds such a term
+    // today, and this is what keeps that a fact rather than a hope.
+    let Some(sig) = sig else {
+        return attributes;
+    };
+    let qnf = (
+        Value::Text("qnf".to_string()),
+        Value::Text(sig.mangle().as_str().to_string()),
+    );
+    Some(match attributes {
+        // The encoder sorts a map by encoded key bytes (`format::cbor`), so
+        // appending is placement-free: the file is the same whatever order the
+        // pairs arrive in, and the artifact stays byte-reproducible.
+        Some(Value::Map(mut entries)) => {
+            entries.push(qnf);
+            Value::Map(entries)
+        }
+        // Only reachable if a profile ever returns a non-map attribute value,
+        // which the format forbids; keeping it rather than replacing it means
+        // this never silently drops what a profile said.
+        Some(other) => other,
+        None => Value::Map(vec![qnf]),
     })
 }
 
@@ -131,7 +208,7 @@ fn storage_of(
 /// so those are written down and the scheme's *name* is not. A reader
 /// recovers the scheme by looking at the parameters, which is what keeps the
 /// file readable by something that never heard of pie's enum.
-fn profile_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Error> {
+fn layout_of(encoding: &Encoding) -> Result<(&'static str, Option<Value>), Error> {
     let Encoding::Quant(spec) = encoding else {
         return Ok(("dense", None));
     };
@@ -268,6 +345,29 @@ pub struct Writer {
     open: Option<ztensor::Sink>,
     /// Present when the output is a shard set rather than one file.
     sharding: Option<Sharding>,
+    /// The file-level provenance, kept because the serving block below is
+    /// merged with it at [`finish`](Writer::finish) and `set_attributes`
+    /// replaces rather than merges.
+    metadata: BTreeMap<String, String>,
+    /// Present when this file is to be a SERVING artifact as well as a
+    /// checkpoint — see [`Writer::serving`].
+    serving: Option<Serving>,
+}
+
+/// What a [`Writer`] accumulates on the way to a `pie.serving/1` file key.
+///
+/// The tables cannot be written when their objects are declared: an object's
+/// attributes are frozen at declaration and a table is a fold over bytes that
+/// have not arrived yet. So they are folded here as the payload goes past and
+/// handed over at `finish`, which is where the manifest is written. The same
+/// argument, and the 95.4 GiB plane that forced it, is at
+/// `serving::BLOCKS_KEY`.
+struct Serving {
+    stamp: Stamp,
+    /// The open tensor's name and running fold, when the open tensor is one
+    /// that will be served. A `__meta__/` object gets neither.
+    open: Option<(String, serving::BlockFold)>,
+    tables: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
 }
 
 /// The state of a multi-file write: where the root goes, which shard is open,
@@ -352,7 +452,62 @@ impl Writer {
                 Error::Checkpoint(format!("cannot create {}: {err}", parent.display()))
             })?;
         }
-        let mut writer = ztensor::Writer::publish(path).map_err(Error::from)?;
+        Self::opened(path, metadata, None)
+    }
+
+    /// [`create`](Self::create), for a file that is to be a SERVING artifact
+    /// as well as a checkpoint — §M-4's one `.zt`, which is both.
+    ///
+    /// It adds exactly one file attribute, keyed `pie.serving/1`, holding the
+    /// stamp's members and every served object's block table, folded from the
+    /// payload as it streams past. Delete that key and an ordinary checkpoint
+    /// of the same weights remains, which is the owner's rule and the reason
+    /// the vocabulary is one key in one place.
+    ///
+    /// # It is a CONSTRUCTOR and not a setter, and the reason is placement
+    ///
+    /// A serving artifact's objects are written in the BOOT'S READ ORDER,
+    /// which is not name order — and `ztensor`'s canonical form requires
+    /// ascending insertion and refuses anything else outright
+    /// (`"canonical form requires sorted insertion: \"embed\" after
+    /// \"layer.0.qg_proj\""`). So the label has to be off from the first
+    /// object, which is before any method could be called. That the ordinary
+    /// [`create`](Self::create) stays canonical is deliberate: nothing else
+    /// in this tree wants a non-ascending checkpoint, and the label is cheap
+    /// to keep where it is true.
+    ///
+    /// The label is all that is given up. `ztensor::write::Options::canonical`
+    /// says it from the other side — *"Placement is not part of what you give
+    /// up"* — and since 2.1.0 a non-canonical writer still places on 64 KiB.
+    /// Nothing on disk records the label and no reader checks it.
+    ///
+    /// **The ORDER itself is the caller's and this does not touch it.** A
+    /// writer that re-sorted would be overruling the only party that knows
+    /// the read order; a caller that adds in some other order writes a file
+    /// this build reads perfectly and merely reads unranked, which is
+    /// `serving::sequence`'s own admitted limit.
+    pub fn create_serving(
+        path: &Path,
+        metadata: &BTreeMap<String, String>,
+        stamp: Stamp,
+    ) -> Result<Self, Error> {
+        Self::opened(path, metadata, Some(stamp))
+    }
+
+    fn opened(
+        path: &Path,
+        metadata: &BTreeMap<String, String>,
+        stamp: Option<Stamp>,
+    ) -> Result<Self, Error> {
+        let mut writer = match &stamp {
+            // Canonical form requires ascending insertion and a serving
+            // artifact's order is the boot's — see `create_serving`.
+            Some(_) => ztensor::Writer::options()
+                .canonical(false)
+                .publish(path)
+                .map_err(Error::from)?,
+            None => ztensor::Writer::publish(path).map_err(Error::from)?,
+        };
         if !metadata.is_empty() {
             writer.set_attributes(Value::Map(
                 metadata
@@ -365,6 +520,12 @@ impl Writer {
             writer: Some(writer),
             open: None,
             sharding: None,
+            metadata: metadata.clone(),
+            serving: stamp.map(|stamp| Serving {
+                stamp,
+                open: None,
+                tables: BTreeMap::new(),
+            }),
         })
     }
 
@@ -400,6 +561,8 @@ impl Writer {
         Ok(Self {
             writer: Some(writer),
             open: None,
+            metadata: metadata.clone(),
+            serving: None,
             sharding: Some(Sharding {
                 root: root.to_path_buf(),
                 attributes: metadata.clone(),
@@ -451,6 +614,17 @@ impl Writer {
             })
             .map_err(Error::from)?;
         self.open = Some(sink);
+        if let Some(serving) = &mut self.serving {
+            serving.open = serving::is_serving(&decl.name).then(|| {
+                (
+                    decl.name.clone(),
+                    serving::BlockFold::new(
+                        serving.stamp.block_algorithm,
+                        serving.stamp.block_bytes,
+                    ),
+                )
+            });
+        }
         if let Some(sharding) = &mut self.sharding {
             sharding.current_bytes = sharding.current_bytes.saturating_add(nbytes);
         }
@@ -464,6 +638,13 @@ impl Writer {
             .as_mut()
             .ok_or_else(|| Error::Checkpoint("no tensor is open".into()))?;
         let writer = self.writer.as_mut().expect("writer present");
+        // The fold takes the SAME slice the container is handed, on the way
+        // in, so the table describes what was written rather than what was
+        // meant. Splitting the two would be the one bug this attribute cannot
+        // survive: a wrong table refuses a good file at every boot.
+        if let Some((_, fold)) = self.serving.as_mut().and_then(|it| it.open.as_mut()) {
+            fold.eat(chunk);
+        }
         sink.write(writer, chunk).map_err(Error::from)
     }
 
@@ -473,6 +654,16 @@ impl Writer {
             .open
             .take()
             .ok_or_else(|| Error::Checkpoint("no tensor is open".into()))?;
+        if let Some(serving) = self.serving.as_mut()
+            && let Some((name, fold)) = serving.open.take()
+        {
+            // Single-part by construction: `begin_tensor` declares one part
+            // and names it `data`, so a checkpoint's streamed object is
+            // always a one-part object and the table map has one entry.
+            serving
+                .tables
+                .insert(name, BTreeMap::from([("data".to_string(), fold.finish())]));
+        }
         let writer = self.writer.as_mut().expect("writer present");
         sink.close(writer).map_err(Error::from)
     }
@@ -564,7 +755,21 @@ impl Writer {
             .canonical(false)
             .publish(&sharding.root)
             .map_err(Error::from)?;
-        if !sharding.attributes.is_empty() {
+        // **THE SERVING KEY GOES ON THE ROOT**, which is the only manifest
+        // there is: the shards carry blobs and the root carries every
+        // object's description, so a table keyed by object name addresses a
+        // part in a shard exactly as the manifest's own blob reference does.
+        //
+        // **AND NOTHING CONSTRUCTS A SHARDED SERVING WRITER YET.**
+        // `create_serving` is single-file and `create_sharded` takes no
+        // stamp, so this arm is written and waiting rather than running. It
+        // is here rather than as a refusal because the fact it states — the
+        // root is where the key goes — is the answer whenever the import
+        // starts sharding a serving artifact, and a refusal would have to be
+        // deleted to be replaced by exactly these four lines.
+        if let Some(serving) = self.serving.take() {
+            root.set_attributes(serving_attributes(&serving, &sharding.attributes)?);
+        } else if !sharding.attributes.is_empty() {
             root.set_attributes(Value::Map(
                 sharding
                     .attributes
@@ -617,7 +822,12 @@ impl Writer {
         if let Some(sharding) = self.sharding.take() {
             return self.finish_sharded(sharding);
         }
-        let writer = self.writer.take().expect("writer present");
+        let serving = self.serving.take();
+        let metadata = std::mem::take(&mut self.metadata);
+        let mut writer = self.writer.take().expect("writer present");
+        if let Some(serving) = serving {
+            writer.set_attributes(serving_attributes(&serving, &metadata)?);
+        }
         writer.finish().map_err(Error::from)?;
         Ok(())
     }
@@ -625,6 +835,34 @@ impl Writer {
     fn writer(&mut self) -> &mut ztensor::Writer {
         self.writer.as_mut().expect("writer present")
     }
+}
+
+/// The file attributes of a serving artifact: the profile's one key, and the
+/// flat provenance beside it.
+///
+/// A provenance key that collides with the profile's is REFUSED rather than
+/// resolved, for `file/emit.rs`'s reason and in its words: a caller passing
+/// one has two beliefs about the serving block, and either choice makes the
+/// file say something nobody wrote.
+fn serving_attributes(
+    serving: &Serving,
+    metadata: &BTreeMap<String, String>,
+) -> Result<Value, Error> {
+    let Value::Map(mut entries) = serving::file_block(&serving.stamp, &serving.tables) else {
+        return Err(Error::Internal(
+            "the stamp encoded to something that is not a map".to_string(),
+        ));
+    };
+    for (key, value) in metadata {
+        if key.starts_with(serving::PROFILE_FAMILY) {
+            return Err(Error::Checkpoint(format!(
+                "the provenance key {key:?} is the key the stamp itself is written \
+                 under, so this artifact would carry two answers for it"
+            )));
+        }
+        entries.push((Value::Text(key.clone()), Value::Text(value.clone())));
+    }
+    Ok(Value::Map(entries))
 }
 
 /// Writes `tensors` as one canonical `.zt` file at `path`.
@@ -1279,6 +1517,128 @@ mod tests {
     /// all — the reader *derives* it from `bits`, `packing`, `scale_form` and
     /// `zero_point`, so six schemes share one profile and are told apart only
     /// by values that survive a serialization round trip.
+    /// **THE TWO WRITERS AGREE, TABLE FOR TABLE.**
+    ///
+    /// `file/emit.rs` writes a serving artifact from objects handed to it;
+    /// this `Writer` writes one as `pie model import` streams a checkpoint
+    /// through it. Both produce the same file attribute, and nothing in the
+    /// type system says they must — which is exactly the shape
+    /// `every_scheme_the_writer_accepts_is_one_the_reader_gives_back` exists
+    /// for one level down, and the reason `serving::BlockFold` is one value
+    /// both call rather than a loop each spells.
+    ///
+    /// A wrong table is the one thing this attribute cannot survive: it
+    /// refuses a GOOD file at every boot, and the payload is fine, so nothing
+    /// downstream is in a position to notice which half is lying.
+    ///
+    /// The planes are added in a NON-name order on purpose. Both writers must
+    /// leave the order alone — a serving artifact's sequence is the boot's
+    /// read order and neither of them knows it — so a writer that sorted
+    /// would be caught here rather than by a cold first light.
+    #[test]
+    fn the_streaming_writer_states_what_the_emitter_states() {
+        use crate::file::emit::{self, Object, Payload, Part};
+        use crate::serving::{BlockAlgorithm, Stamp};
+
+        let dir = tmpdir("two-writers");
+        let stamp = Stamp {
+            serving: crate::serving::PROFILE.to_string(),
+            backend: "cuda".to_string(),
+            tp_size: 1,
+            sku: "qwen_3".to_string(),
+            precision: "bf16".to_string(),
+            layout_revision: 1,
+            block_bytes: crate::serving::MIN_BLOCK_BYTES,
+            block_algorithm: BlockAlgorithm::Xxh3,
+            adapters_zeroed: true,
+            model_id: None,
+            recipe_digest: None,
+        };
+        let block = crate::serving::MIN_BLOCK_BYTES as usize;
+        let planes: Vec<(&str, Vec<u8>)> = vec![
+            ("layer.0.qg_proj", vec![0x11u8; 3 * block + 7]),
+            ("embed", vec![0x22u8; block - 1]),
+            ("layer.0.norm", vec![0x33u8; 2 * block]),
+        ];
+
+        // The emitter, bytes in hand.
+        let emitted = dir.join("emitted.zt");
+        let objects: Vec<Object<'_>> = planes
+            .iter()
+            .map(|(name, bytes)| Object {
+                name,
+                shape: vec![bytes.len() as u64],
+                layout: "dense",
+                attributes: None,
+                parts: vec![Part {
+                    name: "data",
+                    dtype: ZDType::U8,
+                    logical: None,
+                    payload: Payload::Whole(bytes),
+                }],
+            })
+            .collect();
+        emit::write(
+            &emitted,
+            &stamp,
+            &BTreeMap::new(),
+            crate::serving::MIN_BLOCK_BYTES,
+            &objects,
+            |object, part, _| panic!("{object}/{part} is not streamed here"),
+        )
+        .unwrap();
+
+        // The streaming writer, in 97-byte pieces so no chunk is a block.
+        let streamed = dir.join("streamed.zt");
+        let mut writer =
+            Writer::create_serving(&streamed, &BTreeMap::new(), stamp.clone()).unwrap();
+
+        for (name, bytes) in &planes {
+            let d = decl(name, vec![bytes.len() as i64], Encoding::Raw(DType::U8));
+            writer.begin_tensor(&d, bytes.len() as u64).unwrap();
+            for piece in bytes.chunks(97) {
+                writer.write(piece).unwrap();
+            }
+            writer.end_tensor().unwrap();
+        }
+        writer.finish().unwrap();
+
+        let table_of = |path: &std::path::Path, object: &str| -> Vec<u8> {
+            let manifest = ztensor::read::manifest_of(path).unwrap().unwrap();
+            crate::serving::stated_blocks(manifest.attributes.as_ref().unwrap(), object, "data")
+                .unwrap_or_else(|| panic!("{} states no table for {object}", path.display()))
+                .to_vec()
+        };
+        for (name, bytes) in &planes {
+            assert_eq!(
+                table_of(&streamed, name),
+                table_of(&emitted, name),
+                "the two writers disagree about {name}'s block table",
+            );
+            assert_eq!(
+                table_of(&streamed, name).len(),
+                crate::serving::table_len(
+                    bytes.len() as u64,
+                    crate::serving::MIN_BLOCK_BYTES,
+                    BlockAlgorithm::Xxh3,
+                ),
+                "{name}'s table is not as long as its bytes say",
+            );
+        }
+        // And the sequence is the order each was handed, not the names.
+        let sequence = |path: &std::path::Path| -> Vec<String> {
+            let manifest = ztensor::read::manifest_of(path).unwrap().unwrap();
+            crate::serving::sequence(&manifest)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        let want: Vec<String> = planes.iter().map(|(n, _)| (*n).to_string()).collect();
+        assert_eq!(sequence(&streamed), want);
+        assert_eq!(sequence(&emitted), want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn every_scheme_the_writer_accepts_is_one_the_reader_gives_back() {
         use crate::types::Axis;
@@ -1351,6 +1711,116 @@ mod tests {
             28,
             "a scheme was added; give it a case above"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The six schemes that share `zt.quant_group/1`, and the widths each is
+    /// written and read at.
+    ///
+    /// The profile carries no scheme name — the reader derives one from the
+    /// stated parameters — so these six are the only rows where two schemes
+    /// can be confused for each other, and `bits` is a parameter they share
+    /// rather than a name any of them owns.
+    const AFFINE_WIDTHS: &[(QuantScheme, &[u8])] = &[
+        // Four and only four, and [`QuantSpec::term`] says the same in its
+        // own words: `zt.quant_group/1` names these at four bits and there.
+        (QuantScheme::AwqInt4, &[4]),
+        (QuantScheme::GptqInt4, &[4]),
+        (QuantScheme::Int4B8, &[4]),
+        // **THE ROW WITH THREE.** Two for the DQ expert banks, four for the
+        // ordinary projections, eight for the MoE router gates a
+        // `quant_predicate` lifts — one arithmetic with a number in it, which
+        // is `Dtype::U8g64`'s and `Dtype::U2g32`'s whole argument.
+        (QuantScheme::MlxAffineU4, &[2, 4, 8]),
+        (QuantScheme::Int8Symmetric, &[8]),
+        (QuantScheme::Int8Asymmetric, &[8]),
+    ];
+
+    /// Every width a scheme is written at reads back as THAT scheme, and no
+    /// width reads back as a different one.
+    ///
+    /// [`every_scheme_the_writer_accepts_is_one_the_reader_gives_back`] walks
+    /// each scheme once, at the width `normalized` fills in — MLX's default
+    /// is four — so the two widths MLX gained after that default was chosen
+    /// were never written by any test. Both were broken, in the two different
+    /// ways a shared profile can break:
+    ///
+    /// - at **two**, the reader had no row and refused a file THIS WRITER had
+    ///   just produced ("names no scheme this loader implements"), which is
+    ///   loud and would have been found the first time a 2-bit artifact was
+    ///   opened;
+    /// - at **eight**, an MLX bank matched `Int8Asymmetric`'s row — same
+    ///   packing order, same zero-point form, same zero-point packing — and
+    ///   came back as a scheme whose factors are f32 where MLX's are bf16.
+    ///   Silent, and wrong at the kernel.
+    ///
+    /// So the sweep has two halves. The positive half is [`AFFINE_WIDTHS`]:
+    /// a width a scheme is listed at must survive the trip, scheme AND width.
+    /// The negative half needs no table and is the one that would have caught
+    /// the eight: at every width from one to sixteen, a file that parses at
+    /// all must come back as the scheme that wrote it. A REFUSAL is a fine
+    /// answer there and a different scheme never is.
+    #[test]
+    fn a_shared_profile_gives_every_width_back_to_the_scheme_that_wrote_it() {
+        use crate::types::Axis;
+
+        let dir = tmpdir("affine-widths");
+        let write_at = |scheme: QuantScheme, bits: u8| -> Result<QuantSpec, Error> {
+            let spec = QuantSpec {
+                scheme,
+                logical_dtype: DType::Bf16,
+                bits_per_element: bits,
+                group_size: 0,
+                channel_axis: Some(Axis(0)),
+            }
+            .normalized();
+            let group = u64::from(spec.normalized_group_size()).max(1);
+            let nbytes = usize::try_from((group * u64::from(bits)).div_ceil(8)).unwrap();
+            let path = dir.join(format!("{scheme:?}-{bits}.zt"));
+            let d = decl("w", vec![1, group as i64], Encoding::Quant(spec));
+            write_zt(
+                &path,
+                &BTreeMap::new(),
+                &[WriteTensor {
+                    decl: &d,
+                    bytes: &vec![0x5au8; nbytes],
+                }],
+            )?;
+            let read = parse(&path)?;
+            match &read.tensor_by_name("w").unwrap().encoding {
+                Encoding::Quant(got) => Ok(got.clone()),
+                other => panic!("{scheme:?} at {bits} bits came back {other:?}, not quantized"),
+            }
+        };
+
+        for &(scheme, widths) in AFFINE_WIDTHS {
+            for &bits in widths {
+                let got = write_at(scheme, bits).unwrap_or_else(|err| {
+                    panic!("{scheme:?} at {bits} bits does not survive its own writer: {err}")
+                });
+                assert_eq!(
+                    got.scheme, scheme,
+                    "{scheme:?} at {bits} bits was read back as {:?}",
+                    got.scheme
+                );
+                assert_eq!(
+                    got.bits_per_element, bits,
+                    "{scheme:?} kept its name at {bits} bits and lost its width"
+                );
+            }
+            // The half that needs no table: a width off the list may be
+            // refused, and must never be answered with somebody else's row.
+            for bits in 1u8..=16 {
+                if let Ok(got) = write_at(scheme, bits) {
+                    assert_eq!(
+                        got.scheme, scheme,
+                        "{scheme:?} written at {bits} bits reads back as {:?} — a shared \
+                         profile handed one scheme's bytes to another scheme's decoder",
+                        got.scheme
+                    );
+                }
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

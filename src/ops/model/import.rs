@@ -12,17 +12,52 @@
 //! the knobs are operational (`--dry-run`, `--force`, `--delete-source`) or
 //! about placement (`--out`), never about what the artifact means.
 //!
-//! Every checkpoint converts the same way. Tensors whose encoding the loader
-//! can decode (GGUF's blocked schemes) decode to plain dtypes; everything else
-//! is copied byte for byte, keeping its encoding — `.zt` carries quantization
-//! schemes parametrically, so the copy is exact. What the format then gives for
-//! free is the point of the exercise: every tensor lands on a 64 KiB page of
-//! its own (what lets the engine mmap-stream routed experts), carries an XXH3
-//! digest, and records its provenance in the file.
+//! Every checkpoint converts the same way, and **SERVE-AS-STORED is the whole
+//! of the rule**: a tensor keeps the encoding it arrived in, and the one
+//! rewrite this command performs is narrowing an F16 or F32 tensor to the BF16
+//! every device kernel reads. GGUF's blocked schemes — every `q*_k`, `q4_0`,
+//! `q8_0`, `mxfp4`, and the IQ lattices too — are copied byte for byte with
+//! their scheme intact, because `.zt` names a layout profile
+//! (`gguf.q4_k/1`) rather than a dtype tag, so the copy is exact and the
+//! artifact can be read back as the same quantized tensor. What the format
+//! then gives for free is the point of the exercise: every tensor lands on a
+//! 64 KiB page of its own (what lets the engine mmap-stream routed experts),
+//! carries an XXH3 digest, and records its provenance in the file.
+//!
+//! **THERE IS NO `--stored` FLAG, AND THERE IS NOTHING FOR ONE TO DO.** Keeping
+//! a block as stored was once opt-in-shaped work — `contract::materialize`
+//! decoded every self-contained scheme on the way in, because nothing
+//! downstream could read a block — and the flip to keeping them landed with
+//! the decode moving to the point that needs the tensor unpacked. So the
+//! forward door the QNF campaign asks for is already the default and is
+//! unconditional; a flag would name a choice that is not being made. What §J5
+//! still needs is on the SERVING side: an engine binding that routes a
+//! k-quant-schemed plane at a kernel instead of decoding it at load. The
+//! artifact this command writes is ready for it, and the `qnf` attribute below
+//! is the name that binding will key on.
+//!
+//! **EVERY TENSOR IS STAMPED WITH WHAT ITS BYTES MEAN**, when the bridge can
+//! say: `checkpoint::file::write` puts the QNF spelling of the tensor's
+//! encoding (`QuantSpec::term`, `dtype::Fmt`'s mangle) in a `qnf`
+//! attribute beside the layout profile — `g32_u4_g8_u6_f16_n_b_g8_u6_f16_n`
+//! for a Q4_K block, `bf16` for a narrowed norm. A scheme the bridge refuses
+//! (the IQ lattices, whose points are compiled into llama.cpp rather than
+//! stored) gets no attribute rather than a guess, and the summary counts them.
 //!
 //! Passthrough tensors stream from the source through a bounded buffer, so
-//! converting a checkpoint far larger than memory is fine; only the decoded set
-//! is ever resident, and only GGUF checkpoints decode today.
+//! converting a checkpoint far larger than memory is fine; only the narrowed
+//! set is ever resident.
+//!
+//! **THAT LAST CLAUSE IS TRUE AGAIN, AND FOR A WHILE IT WAS NOT.** The decode
+//! has always run through `Execution::streaming`, the residency that owns each
+//! buffer and frees it at its last use — but the plan it ran was compiled
+//! through the pass pipeline's arena half, whose `hoist-bulk-arena-writes`
+//! pulls every `Allocate` to the head of the schedule so a device arena can be
+//! filled in one sweep. With every allocation ahead of every publish there is
+//! no last use to free at, and the whole narrowed set was resident after all.
+//! `compile_decode` compiles through `plan::compile_streaming`, which leaves
+//! the two arena passes out, and the sentence above went back to describing
+//! what the command does.
 //!
 //! FAMILY-BLIND, and now entirely: it does not know or ask what model this
 //! is. It had a family-aware half — an ingest pass that renamed a GGUF's
@@ -32,7 +67,7 @@
 //! through the SKU's own import table at load, so a naming pass here would be
 //! an earlier, worse answer to a question the load already asks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +78,7 @@ use checkpoint::file::read::{parse_attributes, parse_metadata};
 use checkpoint::file::write::Writer;
 use checkpoint::file::{Metadata, RawTensor};
 use checkpoint::contract::materialize::{Materialization, materialize_contract};
+use checkpoint::contract::{BiasBy, Expr, ScaleFactor, TensorContract};
 use checkpoint::executor::Progress;
 use checkpoint::executor::sink::TensorSink;
 use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
@@ -54,7 +90,7 @@ use checkpoint::file::meta::{SOURCE_ENCODING_KEY, SOURCE_KEY, VERSION_KEY, meta_
 // The artifact's on-disk names come from whoever owns them: the loader owns
 // the metadata namespace and the provenance attributes, and the object the
 // checkpoint's own config lands in belongs to the party that reads it back.
-// That was `model::serve::encoding`, beside a parser for the document; M18
+// That was `models::serve::encoding`, beside a parser for the document; M18
 // deleted the module and the parser did not come with it — the loader reads a
 // checkpoint's quantization off its STORED encodings now — so the name lives
 // with its remaining readers, in `worker::weights`. A literal here would be a
@@ -99,7 +135,7 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
 ///
 /// One string, here, because two parties have to agree on it and neither can
 /// derive it: this command writes it and a model text reads it
-/// (`model::qwen_3::model::Recipe::Eagle`). It is a `.`-terminated prefix so
+/// (`models::qwen_3::model::Recipe::Eagle`). It is a `.`-terminated prefix so
 /// that the joined name is the overlay's own spelling with a namespace in
 /// front of it — `fc.weight` becomes `aux.fc.weight` — which keeps the head's
 /// internal names readable in `pie model info` and keeps the two sets
@@ -172,6 +208,65 @@ pub struct ImportArgs {
     /// consumes. For a HuggingFace cache shared with other tools.
     #[arg(long)]
     pub keep_source: bool,
+    /// Skip the weight-tier prepare that normally follows a successful import.
+    ///
+    /// An import ends by running the cold half of a load once, on this box's
+    /// device and at this box's budgets, so that the artifact the engine reads
+    /// on a warm boot is already on disk (§M wave M-1). It costs the load's
+    /// own time — minutes on a large MoE — and tens of gigabytes under
+    /// `[model] weight_cache_dir`.
+    ///
+    /// **THE CASE THAT WANTS IT: a box with a device that will not serve THIS
+    /// model.** Converting a shelf of checkpoints for other machines pays that
+    /// time and that disk once per model, and what it would write is a file
+    /// those machines cannot read — a tier artifact's key is a function of the
+    /// RECIPE, so a prepare here answers for this box's backend, tensor
+    /// parallelism and precision and for no other box's.
+    ///
+    /// **AND "THE BUDGETS ARE NOT DECIDED YET" IS NOT ONE, NOT SINCE M-2.**
+    /// This paragraph named it while the file was a function of the rungs, and
+    /// the wave that made one artifact serve any budget pair took the reason
+    /// away with them: an operator who prepares at 4 GiB and later serves at 8
+    /// keeps the file they wrote (§M.3, and `tier_key` no longer mixes a
+    /// budget in). There is nothing here to wait for.
+    ///
+    /// **AND KNOW WHAT YOU ARE SKIPPING** (§M wave M-3). This used to buy back
+    /// some minutes at the cost of a slow first request: the boot could still
+    /// build the artifact itself. It cannot. A SKU whose weights stream — any
+    /// model the device budget does not hold outright — will refuse to serve
+    /// until a prepare has run, so on the box that serves, this flag defers
+    /// the work rather than declining it. `--prepare-only` is how it is picked
+    /// back up.
+    ///
+    /// Accepted in every build. A binary with no engine feature, and a box
+    /// with no serving config, never prepares anything and this flag has
+    /// nothing to turn off — which is why a machine that ONLY converts has
+    /// never needed to pass it.
+    #[arg(long, conflicts_with = "prepare_only")]
+    pub no_prepare: bool,
+    /// **PREPARE AN ARTIFACT THAT IS ALREADY IMPORTED, AND DO NOTHING ELSE**
+    /// (§M wave M-3).
+    ///
+    /// `SOURCE` names something already in the store — a name as
+    /// `pie model list` prints it, or a path to a `.zt` or a snapshot
+    /// directory — and this command skips every conversion step and runs only
+    /// the last one: the cold load, on this box's device and at this box's
+    /// budgets, that writes the serving artifact the engine boots from.
+    ///
+    /// **THIS IS THE REBUILD DOOR.** A serving boot never writes one and never
+    /// deletes one, so an artifact that has rotted, that was written by an
+    /// older build's format, or that a changed model text has orphaned under
+    /// an old key is fixed HERE and nowhere else. Every refusal the engine
+    /// prints names this exact command with this exact argument.
+    ///
+    /// An artifact that is already good is not rewritten: the run opens it,
+    /// cuts it and verifies every image it reads, which costs a warm boot and
+    /// leaves the file alone. So it is also the integrity check.
+    ///
+    /// Unlike the prepare that follows an ordinary import, a failure here is
+    /// the command's failure — there is no other product to weigh it against.
+    #[arg(long)]
+    pub prepare_only: bool,
 }
 
 /// Deletes the weight files a consuming import has been releasing as it read.
@@ -192,7 +287,15 @@ impl Drop for Consumed<'_> {
     }
 }
 
-pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
+pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
+    // **THE REBUILD DOOR, AND IT IS THE FIRST LINE OF THE COMMAND** (§M wave
+    // M-3). `--prepare-only` names something that is already imported, so
+    // every step below it — fetching, decoding, writing, digesting — is work
+    // about a file that exists. It returns before any of it. See
+    // `reprepare`.
+    if args.prepare_only {
+        return reprepare(&args, global);
+    }
     let mut source = resolve_source(&args.source)?;
     let metadata = parse_metadata(&source.path)
         .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?;
@@ -322,7 +425,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     //
     // There is no such binding any more. An engine produces its weights from
     // the CHECKPOINT through the SKU's own import table
-    // (`model::import_of`), which reads the source's own spelling and states
+    // (`models::import_of`), which reads the source's own spelling and states
     // every rewrite it performs. So a naming pass here would be a second,
     // earlier answer to a question the load already answers — and the wrong
     // one for a GGUF, whose rewrites are the import table's to declare.
@@ -344,6 +447,53 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
             );
         }
     }
+    // **THE ONE CONVERSION THAT IS NOT A NARROWING** (§M-3; §J3 closes here).
+    //
+    // Serve-as-stored says the stored form IS the served form, and one family
+    // still asked a load to break that: kimi declares `Mxfp4` expert banks
+    // over a checkpoint that ships them BF16, so every boot re-quantized a
+    // hundred gigabytes before it could answer. The rule did not change and
+    // the site did — this command is the transform point, so the encode runs
+    // HERE, once, and the artifact holds the codes.
+    //
+    // **AND A REPACK RIDES THE SAME ARM** (§J4b), for the same reason one
+    // step milder: a relabelling is not a conversion — the served row is the
+    // stored row — but it is paid once per weight, and a load that took one
+    // would rearrange a hundred gigabytes into m16n8k16 fragment order at
+    // every boot. `CONVERT_TILE_MAP_MASK` is the only mask that admits an
+    // `Expr::Repack`, so this command is where one runs, and the artifact
+    // holds the plane in the order the kernel reads.
+    //
+    // **AND THE LANDING RIDES IT TOO** (§M-4a). The two arms above are the
+    // ones a serving load REFUSES; the rest of what a contract states — the
+    // q/k/v fusion, the band a bank is split into, the rank a stored word is
+    // lifted to, the fold gemma takes back out — a load performs, and pays
+    // for in fragmented reads and a copy at every boot. §M-4a's ruling is
+    // that those belong here as well, so the artifact's tensors ARE the
+    // planes the engine binds and the landing becomes a read. See
+    // `states_an_import_transform` for the set and for the one node that is
+    // never taken.
+    //
+    // **AND IT IS STILL FAMILY-BLIND**, which is the whole reason it is four
+    // lines. Nothing below knows what kimi is: it asks the catalog which SKU
+    // this source would convert as, reads that SKU's OWN contract, and takes
+    // the tensors whose expression already states a transform. The Expr chain
+    // is the family's sentence, not this command's; what this command
+    // supplies is the place to run it. A source no SKU claims, or one whose
+    // SKU states nothing but copies, adds nothing and pays a header parse.
+    //
+    // **AND "NO SKU CLAIMS THIS SOURCE" IS A REFUSAL NOW, NOT A SHRUG** (§M-4g).
+    // The `None` this used to swallow is the whole of the paragraph above
+    // failing to apply, and since §M-4a that is not a smaller import — it is a
+    // different product. See `refuse_a_source_no_sku_in_this_build_claims`,
+    // and see `--no-prepare` for the one path that legitimately writes one.
+    let (encoded, sku) = promote_import_transforms(
+        &mut materialization,
+        &metadata,
+        &source.path,
+        !args.no_prepare,
+    )?;
+
     // Three counts and not two, because the middle one used to be folded into
     // the first and stopped being true.
     //
@@ -373,6 +523,45 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         packed,
         materialization.passthrough.len().saturating_sub(packed)
     );
+    // WHICH OF THE STORED ONES THE TREE CAN NAME (campaign J5).
+    //
+    // Keeping a block's bytes needs no decoder -- only a `.zt` profile to keep
+    // them under, and there is one for every GGUF scheme this loader parses.
+    // Being SERVED from those bytes is the other question, and its first half
+    // is whether the QNF bridge can say what the arithmetic is: a scheme it
+    // refuses has no spelling for a kernel table to key on, so no serving path
+    // will arrive for it however faithfully the bytes were copied.
+    //
+    // Counted and named rather than silent, because the operator asking "did
+    // the import do what I meant" for an IQ-mixed release is asking exactly
+    // this. It is not a refusal: the tensor is still kept as stored, and a
+    // host decode reads it at load as it always did.
+    //
+    // Every quantized weight here is a stored one — the only tensors this
+    // command rewrites are F16 and F32 — so `weights()` filtered on the
+    // encoding is exactly the set to ask about, at no extra pass and with the
+    // planar schemes (an `Int8Asymmetric` whose offset nothing in this tree
+    // fixes) included beside the blocks.
+    let mut unnamed: BTreeMap<String, usize> = BTreeMap::new();
+    for tensor in metadata.weights() {
+        if let Encoding::Quant(spec) = &tensor.encoding
+            && spec.term().is_none()
+        {
+            *unnamed.entry(format!("{:?}", spec.scheme)).or_default() += 1;
+        }
+    }
+    if !unnamed.is_empty() {
+        let listed: Vec<String> = unnamed
+            .iter()
+            .map(|(scheme, count)| format!("{scheme} ×{count}"))
+            .collect();
+        println!(
+            "convert: {} tensor(s) kept as stored carry no QNF spelling ({}); their \
+             bytes are exact, but nothing keyed on QNF can name their arithmetic yet",
+            unnamed.values().sum::<usize>(),
+            listed.join(", "),
+        );
+    }
     // Metadata compiles here, before any bytes are written: an artifact whose
     // weights are perfect but whose tokenizer would not compile cannot serve,
     // and finding that out after copying 800 GB helps nobody.
@@ -564,40 +753,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     let plan = if materialization.contract.tensors.is_empty() {
         None
     } else {
-        let target = StorageTarget {
-            tile_map_mask: CONVERT_TILE_MAP_MASK,
-            max_tile_bytes: 64 << 20,
-            ..StorageTarget::default()
-        };
-        let plan = checkpoint::plan::compile(&metadata, &materialization.contract, target)
-            .map_err(|err| anyhow!("cannot compile the decode: {err}"))?;
-        // A SECOND OPINION, before a byte is read.
-        //
-        // `verify` is not a second compiler: it takes the plan as it stands and
-        // asks what can be answered from the plan plus the filesystem — is the
-        // schedule a permutation of the instructions, is every public
-        // declaration finalized exactly once, does every read land inside the
-        // file it names at the size that file actually is, and does the result
-        // deliver the contract this was compiled from. `compile` cannot catch
-        // those itself, because the same wrong belief would have produced both
-        // halves.
-        //
-        // It ran only in this crate's own golden tests, over sixteen compiled
-        // plans, while the command a user actually runs skipped it. There is no
-        // reason for that asymmetry: an import reads gigabytes and writes an
-        // artifact other machines will serve, so it is the caller with the most
-        // to gain from finding out here rather than at load.
-        if let Err(violations) = checkpoint::verify::verify_plan(
-            &plan,
-            Some(&ContractView::of(&materialization.contract)),
-        ) {
-            let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
-            bail!(
-                "the compiled decode does not honour its contract:\n  {}",
-                listed.join("\n  ")
-            );
-        }
-        Some(plan)
+        Some(compile_decode(&metadata, &materialization.contract)?)
     };
 
     // The decode's read total, taken from the checkpoint rather than from the
@@ -606,6 +762,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     let decode_bytes: u64 = materialization
         .decoded
         .iter()
+        .chain(encoded.iter())
         .filter_map(|name| metadata.tensor_by_name(name))
         .map(|raw| raw.span_bytes)
         .sum();
@@ -663,9 +820,48 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         // rounding is on the table. See `SOURCE_ENCODING_KEY`.
         (SOURCE_ENCODING_KEY.to_string(), source_encoding(&metadata)),
     ]);
-    let mut writer = match args.max_shard_size {
-        Some(max) => Writer::create_sharded(&out_file, &provenance, max),
-        None => Writer::create(&out_file, &provenance),
+    // **AND THE ARTIFACT SAYS WHAT IT IS FOR** (§M-4b-3). A source some SKU in
+    // this build claims produces a SERVING artifact: the same one `.zt`, with
+    // one more file attribute stating the recipe it was converted for and a
+    // block table per plane, folded from the payload as it streams past. A
+    // source no SKU claims is an ordinary checkpoint and gets no stamp — that
+    // is `--no-prepare`'s legitimate path, converting a shelf for machines
+    // whose build ships the row, and `refuse_a_source_no_sku_in_this_build_claims`
+    // is what makes it the only one.
+    let stamp = sku
+        .map(|sku| serving_stamp(sku, &source.origin))
+        .transpose()?;
+    // Kept, because the writer consumes it and the FILENAME states the same
+    // five facts the stamp does — the owner's rule is that both say the
+    // specialization, so both read one value.
+    let named = stamp.clone();
+    // **THE ORDER THE PLANES WILL LIE IN**, when a shell is linked to state
+    // one. Derived from the trace and nothing else — see
+    // `runtime::engine::load::sequence` — so it costs no plan compile and no
+    // second pass over the payload. `None` writes an unranked artifact, which
+    // every build reads correctly and only a streaming boot pays for.
+    let ranked = sku
+        .and_then(|sku| runtime::engine::load::trace(sku, runtime::engine::load::this_box()).ok())
+        .and_then(|trace| runtime::engine::load::sequence(&trace));
+    let mut writer = match (args.max_shard_size, stamp) {
+        (Some(max), None) => Writer::create_sharded(&out_file, &provenance, max),
+        (None, None) => Writer::create(&out_file, &provenance),
+        (None, Some(stamp)) => Writer::create_serving(&out_file, &provenance, stamp),
+        (Some(_), Some(_)) => {
+            // Refused rather than silently written without a stamp. A sharded
+            // serving artifact is a real product and its answer is already
+            // written down — `Writer::finish_sharded` puts the key on the
+            // root, which is the only manifest there is — but nothing
+            // constructs one yet, and an artifact that quietly came out
+            // unservable is the failure §M-4g exists to stop.
+            return Err(anyhow!(
+                "`--max-shard-size` and a servable artifact cannot be had together yet: \
+                 this checkpoint is claimed by `{}`, so the artifact would carry a \
+                 serving stamp, and the sharded writer does not take one. Drop the \
+                 flag to write one file.",
+                sku.unwrap_or_default(),
+            ));
+        }
     }
     .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
     if consume {
@@ -688,6 +884,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         spool.as_mut(),
         &passthrough,
         &meta,
+        ranked.as_deref(),
         &mut bar,
         decode_bytes,
         copy_bytes,
@@ -700,6 +897,8 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     if let Some(spool) = spool {
         spool.remove();
     }
+    let out_file =
+        name_the_specialization(out_file, &source.name, named.as_ref(), args.out.as_deref())?;
 
     // `ui::bytes` and `ui::duration`, not `/ (1 << 20)` and `{:.1?}`: this line
     // reported megabytes while every other line pie prints reports GiB, and a
@@ -723,7 +922,302 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
             crate::ui::bytes(source_bytes(&metadata))
         );
     }
+    // **AND THEN THE COLD LOAD, ONCE, HERE** (§M wave M-1). Everything above
+    // is format work that needs no device; this is the one step that does, and
+    // it runs last because it is the only one that can be skipped without
+    // costing the artifact. See `prepare`.
+    if !args.no_prepare {
+        prepare(global, &out_file);
+    }
     Ok(crate::ui::Answer::did(did))
+}
+
+/// **RUN THE COLD HALF OF A LOAD SO THE FIRST SERVE DOES NOT HAVE TO** (§M
+/// wave M-1: `.wiki/alto/zt-as-serving-artifact.md`).
+///
+/// The serving artifact the engine reads on a warm boot is written by
+/// whichever load materializes the weights first. Before §M that was the first
+/// SERVE, which is why the first serve after an import paid the full cold load
+/// — measured at 290-440 s on the 4-bit flash SKU against 21.5 s warm. Nothing
+/// about that work is a serving decision: it is the same transforms, from the
+/// same checkpoint. So it happens here, where the operator is already waiting,
+/// and the deployment's first real request meets a warm boot.
+///
+/// **AND IT IS PREPARED ONCE, FOR ANY BUDGET** (§M.3, wave M-2). The budget
+/// this reads out of the box's config decides which planes THIS call happens
+/// to put on which tier; it does not decide what the file holds. The artifact
+/// carries one image per plane in a budget-free ranking and a boot cuts it, so
+/// an operator who later raises `device_weight_budget` does not go back to
+/// paying the cold path on their next request.
+///
+/// **A FAILURE HERE IS NOT AN IMPORT FAILURE, AND THAT IS THE WHOLE POLICY.**
+/// The artifact is written and verified by the time this runs; the tier file
+/// is an ACCELERATOR, and a boot that does not find one runs the cold path it
+/// has always run. So every refusal is printed and swallowed, and
+/// `pie model import` exits zero — the alternative is a command that fails
+/// after producing exactly what it was asked for.
+///
+/// **AND IT IS SILENT WHEN IT HAS NOTHING TO SAY.** With no engine feature
+/// compiled in, this function is empty. With no serving config on the box
+/// there is no device, no budget and no cache directory to prepare against,
+/// and an import on a conversion-only machine should read exactly as it read
+/// before this existed.
+///
+/// **AND CONVERSION-ONLY IS STILL A REAL BOX, AFTER §M-3 AS BEFORE IT.** A
+/// build with no engine feature converts checkpoints and cannot serve them —
+/// that was true when the cold path existed too, since it is the DEVICE this
+/// half needs and not the artifact. Killing the cold serving path takes
+/// nothing away from such a box: it produces `.zt` files for other machines to
+/// serve, exits zero, and says nothing about weights it was never going to load.
+///
+/// **AND IT IS NO LONGER A PREREQUISITE** (§M-4d). This said the box that DOES
+/// serve "must run this, or `--prepare-only` later, before a streamed SKU will
+/// boot", and that stopped being true the moment a boot learned to read its
+/// planes out of the artifact itself: `experts::Spill::Serving` is asked before
+/// either older road, and a serving artifact answers for every plane of the
+/// trace. A streamed SKU boots off what this command has already written.
+///
+/// What is left is worth keeping and is a different thing: this is the one
+/// check that THIS BOX can serve the artifact — a device load, which no format
+/// test can stand in for. It writes nothing now (`weights::resident` skips the
+/// tier write for a deployment served out of its own `.zt`), so what it costs
+/// is one cold load and what it buys is finding out here rather than at the
+/// first serve.
+#[cfg(feature = "_engine-cuda")]
+fn prepare(global: &bootstrap::GlobalArgs, artifact: &Path) {
+    let Some(cfg) = serving_config(global) else {
+        return;
+    };
+    println!(
+        "prepare: one cold load against the engine {} configures, to check this box \
+         can serve what was just written (--no-prepare skips it, and \
+         `pie model import --prepare-only` runs it later)",
+        crate::ui::short_path(&bootstrap::cli_config_path(global).0)
+    );
+    let started = std::time::Instant::now();
+    match worker::embedded_engine::prepare_weight_artifact(&cfg, artifact) {
+        Ok(dir) => println!(
+            "prepare: this box serves the artifact ({} in {})",
+            crate::ui::short_path(&dir),
+            crate::ui::duration(started.elapsed())
+        ),
+        // **STILL SWALLOWED HERE, AND ONLY HERE.** The import's own product is
+        // written and verified by the time this runs, and a command that
+        // failed after producing exactly what it was asked for is a worse
+        // answer than a printed line. What the line may no longer say is "the
+        // first boot will be a cold one" — there is no cold boot — so it names
+        // the command that finishes the job instead.
+        // **AND THE SENTENCE NO LONGER THREATENS A BOOT THAT WILL HAPPEN
+        // ANYWAY.** It said a streamed SKU would not boot until a prepare
+        // succeeded; since §M-4d the artifact IS the serving file and it will.
+        // What a failure here means is narrower and worth saying plainly: the
+        // file is fine and THIS BOX could not serve it, which is a fact about
+        // the box — a device, a budget, a build without the row — and the
+        // operator's next move is to read the reason, not to re-run a step.
+        Err(why) => println!(
+            "prepare: this box did not serve {} ({why:#}); the artifact itself is \
+             written and verified — this is a fact about this machine, not about \
+             the file",
+            artifact.display(),
+        ),
+    }
+}
+
+/// The no-engine build's half: an import that reaches no device prepares
+/// nothing, and says nothing about it.
+#[cfg(not(feature = "_engine-cuda"))]
+fn prepare(_global: &bootstrap::GlobalArgs, _artifact: &Path) {}
+
+/// **THE SERVING CONFIG, OR `None` FOR A BOX THAT HAS NONE.**
+///
+/// Split out of [`prepare`] so that [`reprepare`] reads the same file the same
+/// way — the tier artifact's KEY is a function of the residency plan the two
+/// weight budgets decide, and two readings of one config would name two files.
+/// A parse failure is said out loud and answered `None`, because an operator
+/// who broke their config should hear it from the command that tried to use
+/// it.
+#[cfg(feature = "_engine-cuda")]
+fn serving_config(global: &bootstrap::GlobalArgs) -> Option<worker::Config> {
+    let (config_path, _) = bootstrap::cli_config_path(global);
+    // No config is the conversion-only box: nothing to prepare against, and
+    // nothing worth saying about it.
+    let text = std::fs::read_to_string(&config_path).ok()?;
+    match worker::Config::parse(&text) {
+        Ok(cfg) => Some(cfg),
+        Err(why) => {
+            println!("prepare: skipped — {} does not parse: {why}", config_path.display());
+            None
+        }
+    }
+}
+
+/// **`pie model import --prepare-only <artifact-or-name>` — THE ONE COMMAND
+/// THAT REBUILDS A SERVING ARTIFACT** (§M wave M-3).
+///
+/// # Why this shape, and not the two that were considered
+///
+/// The wave had to put the verify-then-replace behind an explicit command
+/// before it could kill the cold boot, and there were three candidate shapes.
+///
+/// **"Just re-run `pie model import <original source>`"** was rejected. It
+/// works, and it is what an operator would try — but it pays the whole
+/// conversion to reach the one step that was wanted, which on a large MoE is
+/// tens of minutes of decode and a second copy of the source on disk, and it
+/// needs the ORIGINAL source, which §M.6's own premise says may be gone. The
+/// thing that rotted is the tiers file; the `.zt` beside it is intact and is a
+/// perfectly good checkpoint to land from. Making the operator re-derive it is
+/// asking for a receipt they were never told to keep.
+///
+/// **A separate verb — `pie model prepare`** — was rejected for now, though
+/// §M.6 flags it as where the naming may end up. It would be a second
+/// top-level command whose entire body is this one's, and the argument it
+/// takes is the same argument, and the config it reads is the same config. One
+/// flag on the verb that already owns "make this model servable" is a smaller
+/// surface than a second verb that owns half of it.
+///
+/// **A flag on import it is**, and the deciding property is the message: every
+/// engine-side refusal prints `tier::rebuild`'s line, and that line has to be
+/// something an operator can paste. It names the CHECKPOINT PATH the refusing
+/// load was pointed at — `boot.checkpoint`, which is `[model] model` resolved
+/// — and this command's argument is resolved by
+/// [`worker::weights::resolve`], the same door `[model] model` goes through.
+/// So the pasted line resolves to the same file the engine refused about, by
+/// construction rather than by an operator's care.
+///
+/// # What it does
+///
+/// It resolves the argument, reads the box's serving config, and calls
+/// [`worker::embedded_engine::prepare_weight_artifact`] — the same call an
+/// ordinary import ends with, against the same config, so the key is the same
+/// key. `Weights::resident` under `Intent::Prepare` then does the rest: an
+/// artifact that opens, cuts and verifies is left alone and the run is a warm
+/// boot's worth of checking, and anything else is said out loud and REPLACED
+/// by `tier::store`'s verify-then-replace, which is the authority this wave
+/// moved out of the boot.
+///
+/// # And a failure here IS a failure
+///
+/// [`prepare`] swallows its refusals because the import it follows has already
+/// produced the artifact it was asked for. This command has no such product:
+/// preparing is the whole of what it was asked to do, so a box with no serving
+/// config, an engine-less build, an unresolvable name and a refused landing
+/// all exit non-zero with their own sentence.
+///
+/// # Errors
+///
+/// A `SOURCE` that names nothing on this machine, a box with no serving config
+/// or one that will not parse, a build with no engine feature, or whatever the
+/// bake and the landing refused.
+#[cfg(feature = "_engine-cuda")]
+fn reprepare(args: &ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
+    // `{why:#}` and not `with_context`: the CLI renders one line, so a context
+    // that pushed the resolver's own sentence — the one naming the store and
+    // `pie model list` — out of it would be a worse message than no context.
+    let model = worker::weights::resolve(&args.source)
+        .map_err(|why| anyhow!("--prepare-only {}: {why:#}", args.source))?;
+    let artifact = model.path().to_path_buf();
+    let Some(cfg) = serving_config(global) else {
+        bail!(
+            "--prepare-only writes the serving artifact this box's engine boots from, \
+             and this box states no serving config to read a device, a budget and a \
+             weight cache directory out of. Run it where the model will be served."
+        );
+    };
+    println!(
+        "prepare: {} — one cold load against the engine {} configures. An artifact \
+         that is already good is verified and left alone; a rotted, stale or absent \
+         one is written again.",
+        crate::ui::short_path(&artifact),
+        crate::ui::short_path(&bootstrap::cli_config_path(global).0),
+    );
+    let started = std::time::Instant::now();
+    let dir = worker::embedded_engine::prepare_weight_artifact(&cfg, &artifact)
+        .map_err(|why| anyhow!("preparing {}: {why:#}", artifact.display()))?;
+    Ok(crate::ui::Answer::did(format!(
+        "prepared {} — weight tiers under {} in {}",
+        crate::ui::short_path(&artifact),
+        crate::ui::short_path(&dir),
+        crate::ui::duration(started.elapsed()),
+    )))
+}
+
+/// The no-engine build's half: there is no device to land on and no artifact
+/// format to write, so the flag refuses rather than exiting zero on a job it
+/// did not do.
+#[cfg(not(feature = "_engine-cuda"))]
+fn reprepare(
+    _args: &ImportArgs,
+    _global: &bootstrap::GlobalArgs,
+) -> Result<crate::ui::Answer> {
+    bail!(
+        "this build has no engine compiled in, so it cannot write a serving artifact. \
+         Conversion still works — `pie model import <source>` without --prepare-only — \
+         and the box that serves the model is where the prepare belongs."
+    )
+}
+
+/// What the decode is compiled FOR: this host, writing file bytes.
+///
+/// `BackendKind::Unknown` (the default) because nothing here is staged for a
+/// device, and `CONVERT_TILE_MAP_MASK` because the transforms this executor
+/// implements are the convert set rather than a kernel table's.
+///
+/// Named rather than inlined so the test below can compile the same contract
+/// the other way against the same target — the two plans are only comparable
+/// if the target is one thing.
+fn decode_target() -> StorageTarget {
+    StorageTarget {
+        tile_map_mask: CONVERT_TILE_MAP_MASK,
+        max_tile_bytes: 64 << 20,
+        ..StorageTarget::default()
+    }
+}
+
+/// The decode, compiled and checked, before a byte is read.
+///
+/// **`compile_streaming`, BECAUSE THAT IS HOW IT RUNS.** Both places that
+/// execute this plan — the spool in `run` and `decode_into` — run it through
+/// `Execution::streaming`, the residency that owns each buffer and frees it at
+/// its last use. The ordinary pipeline ends its rewrites with
+/// `hoist-bulk-arena-writes`, which pulls every `Allocate` to the head of the
+/// schedule so a device arena can be filled in one sweep; it does that whether
+/// or not there is a bulk write to hoist, so an Unknown-backend plan with none
+/// got the reordering and nothing else. Under it there is no last use to free
+/// at, and an import of a checkpoint far larger than memory held the whole
+/// narrowed set at once — the one thing the module doc says it does not do.
+/// `plan::compile_streaming` is the same contract, the same target and the
+/// same bytes, minus the two passes that exist to serve an arena this
+/// execution never allocates.
+///
+/// **A SECOND OPINION.** `verify` is not a second compiler: it takes the plan
+/// as it stands and asks what can be answered from the plan plus the
+/// filesystem — is the schedule a permutation of the instructions, is every
+/// public declaration finalized exactly once, does every read land inside the
+/// file it names at the size that file actually is, and does the result
+/// deliver the contract this was compiled from. `compile` cannot catch those
+/// itself, because the same wrong belief would have produced both halves.
+///
+/// It ran only in the checkpoint crate's own golden tests, over sixteen
+/// compiled plans, while the command a user actually runs skipped it. There is
+/// no reason for that asymmetry: an import reads gigabytes and writes an
+/// artifact other machines will serve, so it is the caller with the most to
+/// gain from finding out here rather than at load.
+fn compile_decode(
+    metadata: &Metadata,
+    contract: &checkpoint::contract::ModelContract,
+) -> Result<checkpoint::plan::LoadPlan> {
+    let plan = checkpoint::plan::compile_streaming(metadata, contract, decode_target())
+        .map_err(|err| anyhow!("cannot compile the decode: {err}"))?;
+    if let Err(violations) =
+        checkpoint::verify::verify_plan(&plan, Some(&ContractView::of(contract)))
+    {
+        let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
+        bail!(
+            "the compiled decode does not honour its contract:\n  {}",
+            listed.join("\n  ")
+        );
+    }
+    Ok(plan)
 }
 
 /// Say whether the artifact this run is about to write is one this build can
@@ -1332,6 +1826,675 @@ fn declares_tied_head(source: &Source) -> bool {
 /// The names a tied checkpoint materializes for a head it does not have.
 const TIED_HEAD_NAMES: [&str; 2] = ["lm_head.weight", "lm_head.bias"];
 
+/// Move the SKU's encode chains into the rewritten set, and answer with the
+/// source legs they consume.
+///
+/// The one place this command reads a model family, and it reads it as an
+/// EXPRESSION and never as a name: a tensor whose chain holds a
+/// [`Expr::Cast`] into a quantized encoding is a tensor the checkpoint ships
+/// raw and the SKU serves packed, which is a conversion, which is this
+/// command's job. The legs that chain names stop being byte copies — they are
+/// what it reads — so they leave the passthrough set and their bytes join the
+/// decode's read total.
+///
+/// The plan publishes the scales plane beside the codes on its own
+/// (`plan::build`'s encode outputs), so nothing here has to know that a
+/// packed bank is two tensors.
+///
+/// Answers an empty list for every checkpoint whose SKU states no encode,
+/// which is every SKU but one and is the resting state this whole file was
+/// written for.
+fn promote_import_transforms(
+    materialization: &mut Materialization,
+    metadata: &Metadata,
+    checkpoint: &Path,
+    will_prepare: bool,
+) -> Result<(Vec<String>, Option<&'static str>)> {
+    // **CONVERTED FOR THIS BOX** (§M, §J4c). The chains this promotes are
+    // paid once and written into the artifact, and one of them — a repack —
+    // is an ARRANGEMENT of a bank's bytes rather than a change to them, legal
+    // only for the shell whose kernels read that order. So the contract is
+    // read for the setup this command is converting for, which is the box it
+    // is running on: the same box the prepare below answers for.
+    let platform = runtime::engine::load::this_box();
+    let Some((sku, contract)) = runtime::engine::load::conversion_contract(checkpoint, platform)
+    else {
+        refuse_a_source_no_sku_in_this_build_claims(checkpoint, will_prepare)?;
+        return Ok((Vec::new(), None));
+    };
+    let mut promoted: Vec<TensorContract> = Vec::new();
+    let mut kept: Vec<TensorContract> = Vec::new();
+    for tensor in contract.tensors {
+        if states_an_import_transform(&tensor.expr, metadata) {
+            promoted.push(tensor);
+        } else {
+            kept.push(tensor);
+        }
+    }
+    close_over_the_declared_pairings(&mut promoted, &mut kept);
+    if promoted.is_empty() {
+        return Ok((Vec::new(), Some(sku)));
+    }
+    let mut legs: BTreeSet<String> = BTreeSet::new();
+    for tensor in &promoted {
+        refuse_a_chain_this_command_cannot_close(sku, tensor)?;
+        for leg in tensor.expr.sources() {
+            legs.insert(leg.to_string());
+        }
+    }
+    let consumed: Vec<String> = legs.into_iter().collect();
+    refuse_a_leg_a_surviving_read_still_needs(sku, &kept, &consumed)?;
+    // THREE SETS, AND THE THIRD IS THE ONE THAT WRITES.
+    //
+    // `passthrough` and `decoded` say which SOURCE names the artifact will
+    // hold, and dropping a consumed leg from them is what makes a promotion
+    // mean "read here instead of at every boot". But neither set puts a byte
+    // on disk: `contract.tensors` does, through `compile_decode` and
+    // `write_artifact`'s public decls — and `materialize_contract` has
+    // already put an entry there, UNDER THE SOURCE'S OWN NAME, for every F16
+    // or F32 tensor it narrows to BF16. A promotion that consumed such a leg
+    // left that entry standing, so the artifact held the same values twice:
+    // once under the source's name, narrowed, and once under the contract's,
+    // transformed. Only the second is a plane the SKU asks for.
+    //
+    // The predicate is the LEG'S name, not the promoted one — what is dropped
+    // is the tensor whose source name is now produced under a contract name,
+    // which is exactly what `consumed` lists. And it runs BEFORE the promoted
+    // tensors are appended, which is what keeps the identity case honest: a
+    // chain whose output name IS its source's — the raw-to-raw cast M-4a
+    // widens to — would otherwise retain itself straight back out.
+    materialization
+        .passthrough
+        .retain(|name| !consumed.contains(name));
+    materialization
+        .decoded
+        .retain(|name| !consumed.contains(name));
+    materialization
+        .contract
+        .tensors
+        .retain(|tensor| !consumed.contains(&tensor.name));
+    refuse_a_name_two_parties_claim(sku, materialization, &promoted)?;
+    let banks = promoted.len();
+    materialization.contract.tensors.extend(promoted);
+    println!(
+        "convert: {sku} states {banks} tensor(s) whose form or layout the checkpoint does not \
+         hold, so {} source tensor(s) are transformed here instead of at every boot",
+        consumed.len(),
+    );
+    // **THE SKU TRAVELS BACK**, because this is where it was decided. The
+    // conversion contract is chosen here — for this box, from this checkpoint
+    // — and `Stamp::sku` has to be the SAME answer: an artifact whose stamp
+    // named one contract while its planes were compiled under another would
+    // be checked against the wrong deployment and pass.
+    Ok((consumed, Some(sku)))
+}
+
+/// The stamp this box would write for `sku`.
+///
+/// Everything that is a POLICY — the layout revision, the block size, the
+/// digest algorithm, the zeroed adapters — comes from
+/// [`serving::Stamp::of`](checkpoint::serving::Stamp::of) and is not spelled
+/// here, because a boot compares field by field and a constant spelled twice
+/// is a field that can disagree with itself. What this function supplies is
+/// the five facts that are about THIS conversion:
+///
+/// * `backend` is `this_box()`, the SAME call [`promote_import_transforms`]
+///   makes to pick the conversion contract. The artifact must say the recipe
+///   its planes were compiled under, and two calls that could disagree would
+///   be two answers to one question.
+/// * `tp_size` is 1 because an import states the WHOLE checkpoint, which
+///   `Builder::whole_checkpoint` refuses to do otherwise, by name.
+/// * `sku` is the row `conversion_contract` chose, travelled back from where
+///   it was decided.
+/// * `precision` is a stated catalog fact and deliberately not read off the
+///   SKU name — the two DQ rows are named for their two-bit experts and are
+///   mostly four-bit. It ERRORS rather than defaulting: `Stamp::check`
+///   compares this field, so a placeholder would either refuse a good
+///   artifact or pass a bad one.
+/// * `model_id` is what the operator named, the same string `pie_source`
+///   records, so the two can never disagree. It is BELIEVED and never
+///   compared, which is why `serving::LAYOUT_REVISION` sits beside it:
+///   `file/meta.rs`'s first ruling is that a believed identity is safe only
+///   when paired with a revision.
+fn serving_stamp(sku: &str, origin: &str) -> Result<checkpoint::serving::Stamp> {
+    let platform = runtime::engine::load::this_box();
+    Ok(checkpoint::serving::Stamp::of(
+        &format!("{platform:?}").to_lowercase(),
+        1,
+        sku,
+        runtime::engine::load::precision(sku)?,
+        (!origin.is_empty()).then(|| origin.to_string()),
+    ))
+}
+
+/// **THE ARTIFACT'S NAME STATES ITS SPECIALIZATION**, which is the other half
+/// of the owner's §M-4 ruling — *"생성된 .zt 파일의 메타데이터와 파일명에는 이
+/// specialization에 대해서 기술하도록"* — the metadata half being the stamp.
+///
+/// The reason is coexistence: one model at two quantizations, or converted for
+/// two shells, is two artifacts that must be able to sit in one directory. A
+/// single `archive.zt` per store entry cannot hold two, so the second import
+/// would silently replace the first and an operator would discover it by
+/// serving the wrong one.
+///
+/// [`serving::Name`] renders `<slug>.<sku>.<backend>-tp<n>.<precision>.zt`.
+/// Four of the five are the stamp's own fields, read from it rather than
+/// recomputed, so the name and the metadata cannot disagree about the
+/// specialization.
+///
+/// The SLUG is the store's name for the model and NOT `Stamp::model_id`,
+/// which is what the operator typed. Those are the same string for a repo-id
+/// import and very different for a directory one — `model_id` is then an
+/// absolute path, and slugging it produced
+/// `root---cache--huggingface--hub--models--…--snapshots--da28692b…` on the
+/// first run of this. The store name is what every other pie surface already
+/// calls the model, so it is what a filename should say, and
+/// [`Name::of`](checkpoint::serving::Name::of) takes it as the one argument
+/// the stamp cannot supply.
+///
+/// **AND THE NAME IS BUILT BY `Name::of`, NOT FIELD BY FIELD.** It slugs every
+/// field, which matters for exactly one of them: eight catalog SKUs hold a dot
+/// (`qwen35-d0.8b-mlxu4-kv-bf16`), and `.` is the separator `Name::parse`
+/// splits on. A name assembled by hand out of the stamp's raw fields renders
+/// something `Name::parse` cannot read back — I built one that way first and
+/// the round trip is what said so. The filename therefore carries
+/// `qwen35-d0-8b-…` where the stamp carries `qwen35-d0.8b-…`: the name is for
+/// a human at a directory listing, and the stamp is what a boot compares.
+///
+/// # It renames rather than choosing the name up front
+///
+/// The name is a function of the SKU, and the sku is not known until
+/// `promote_import_transforms` has picked a conversion contract — which is
+/// well after `out_file` has to exist, because the same-file check, the
+/// staleness comparison and the destination's own directory all read it. So
+/// the file is written where it always was and moved once at the end, which
+/// costs one `rename` inside one directory and leaves every check above
+/// reading the path it was written to expect.
+///
+/// # What it does NOT rename
+///
+/// **An `--out` that names a file.** An operator who wrote
+/// `--out /srv/models/mine.zt` named it, and a command that renamed their
+/// file underneath them would be answering a question they did not ask. The
+/// stamp still states the specialization; the filename is theirs.
+///
+/// **An artifact with no stamp.** A source no SKU claims has no
+/// specialization to state — no sku, no precision — and `Name` has nothing to
+/// render. It keeps the store's own name, which is what `--no-prepare`'s
+/// shelf-conversion path has always produced.
+fn name_the_specialization(
+    written: PathBuf,
+    slug: &str,
+    stamp: Option<&checkpoint::serving::Stamp>,
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    let Some(stamp) = stamp else {
+        return Ok(written);
+    };
+    if out.is_some_and(|out| {
+        out.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zt"))
+    }) {
+        return Ok(written);
+    }
+    let Some(directory) = written.parent() else {
+        return Ok(written);
+    };
+    let Some(name) = checkpoint::serving::Name::of(stamp, Some(slug)) else {
+        return Ok(written);
+    };
+    let renamed = directory.join(name.render());
+    if renamed == written {
+        return Ok(written);
+    }
+    std::fs::rename(&written, &renamed).map_err(|why| {
+        anyhow!(
+            "cannot name the artifact {}: {why}",
+            renamed.display()
+        )
+    })?;
+    Ok(renamed)
+}
+
+/// **REFUSE A SOURCE NO SKU IN THIS BUILD CLAIMS** (§M-4g).
+///
+/// `conversion_contract` answers `None` when no catalog row's import contract
+/// both builds over this checkpoint and compiles against
+/// [`CONVERT_TILE_MAP_MASK`], and the caller used to read that as "nothing to
+/// promote" and carry on. Before §M-4a that reading was right: promotion was
+/// `Cast{Quant}` and `Repack` only, a source whose SKU stated neither added
+/// nothing, and one no SKU claimed at all was the same case one step further
+/// out. §M-4a took the reading away. The import runs the SKU's OWN contract to
+/// produce the planes a serving load binds, so a source no SKU claims cannot
+/// produce a servable artifact — and the command still exited zero having
+/// written one, with the operator's only evidence a missing line of output.
+///
+/// **AND `CONVERT_TILE_MAP_MASK` IS THE WIDER DOOR, WHICH IS WHY THIS IS THE
+/// PLACE TO ASK.** It is `HOST | ENCODE | DECODE | REPACK` and every device
+/// mask is a subset, so a contract that will not compile here will not compile
+/// for a device either: `None` from the conversion door is not "not yet" but
+/// "not in this build", and `runtime::engine::load::identify` would refuse the
+/// artifact for the same reason a serve boot will.
+///
+/// # Why it is conditional, and on what
+///
+/// **THE RUN THAT WILL PREPARE IS THE RUN THAT OWES THE ANSWER.** An ordinary
+/// import ends by running the cold half of a load on this box's device so the
+/// first serve is a warm one — and [`prepare`]'s standing policy is to PRINT
+/// its refusals and swallow them, deliberately, because the artifact is
+/// written and verified by then and a tier file is an accelerator. So
+/// `prepare` is structurally unable to be the party that says "nothing will
+/// ever serve this": it is the wrong side of the write. The question therefore
+/// gets asked here, before a byte is copied, by the run that was going to
+/// prepare.
+///
+/// **AND `--no-prepare` IS THE PATH THAT LEGITIMATELY CONVERTS ONE.** Its own
+/// doc names the case: *a box with a device that will not serve THIS model —
+/// converting a shelf of checkpoints for other machines.* A build's catalog is
+/// not every build's catalog, and a `.zt` written for a machine whose pie
+/// ships the row is a real product, so that path keeps converting and says
+/// nothing. `tests/model_artifact.rs`'s spool fixture is exactly this shape —
+/// two layers of 64 hidden over a 128-token vocabulary, `no_prepare: true`,
+/// and an artifact it parses rather than serves — and it stays green by that
+/// property and not by luck.
+///
+/// **AND THE DEFERRAL STAYS HONEST.** `--no-prepare` also covers "prepare
+/// later on this box", and later is `pie model import --prepare-only`, where
+/// [`reprepare`] propagates the landing's failure instead of swallowing it.
+/// So every path that ends in serving asks this question exactly once, and
+/// asks it where a refusal is the command's own answer.
+///
+/// # What it does not change
+///
+/// `--out` picks a destination and not a product — a `[model] model` key
+/// takes a path as readily as a store name — so it is not the discriminator
+/// and is not consulted. The `.zt`-to-`.zt` no-op and `--prepare-only` both
+/// return from [`run`] above this line and never reach it. `--dry-run` does
+/// reach it, and refuses: a dry run reports what a real run would do, a real
+/// run would refuse, and the tokenizer compile three paragraphs down has
+/// bailed on a dry run since it was written.
+fn refuse_a_source_no_sku_in_this_build_claims(
+    checkpoint: &Path,
+    will_prepare: bool,
+) -> Result<()> {
+    if !will_prepare {
+        return Ok(());
+    }
+    bail!(
+        "{}: no SKU this build ships claims this checkpoint, so nothing here can \
+         say what its planes are. Since the import performs a SKU's whole landing, \
+         the artifact would hold the source's own tensors under the source's own \
+         names — a file that converts, verifies and opens, and that no serve boot \
+         and no `--prepare-only` on any box with this catalog can load. \
+         `pie model list` prints what a checkpoint identifies as. If this box is \
+         converting for a machine whose build DOES ship the row, say so with \
+         `--no-prepare` and the conversion runs.",
+        crate::ui::short_path(checkpoint),
+    )
+}
+
+/// Refuse a promoted chain that reads ANOTHER ENTRY of the same contract.
+///
+/// The leg walk above is [`Expr::sources`], which sees [`Expr::Src`] and
+/// nothing else. A chain may equally read [`Expr::Out`] — an earlier entry of
+/// the contract it belongs to, the DAG edge `sources` deliberately does not
+/// follow — and such a leg is not a source tensor, so no retain can move it
+/// and no promotion carries it. What arrives in `materialization.contract` is
+/// then a lone consumer naming a producer that set does not contain, which
+/// `infer` refuses when `compile_decode` resolves the expression. The import
+/// does fail — but on an unresolved output, in a sentence that names neither
+/// this command nor the promotion that caused it.
+///
+/// **Refused rather than repaired, and that is the honest answer here.** The
+/// repair is to pull the producer into the promoted set with its consumer,
+/// which means promoting an entry this gate never admitted, deciding what its
+/// name in the artifact is, and ordering the two — machinery for a shape
+/// nothing in this tree can exercise. The only import verbs that state an
+/// `Expr::Out` are `Builder::read_dequant` and `read_dequant_concat`, both
+/// with zero callers.
+///
+/// **§M-4a WIDENED THE GATE PAST THOSE VERBS' NODES AND THIS STAYED
+/// UNREACHABLE**, which is worth saying because the old sentence here
+/// predicted the opposite: it named a per-block `Scale` or `Bias` as what
+/// would make one reachable, and both are now admitted. What keeps them out
+/// is the OTHER rule — `dequant_planes` states `Scale`/`Bias` over codes, so
+/// [`decodes_a_packed_plane`] refuses the chain before this is asked. The two
+/// refusals overlap on purpose: one is about a leg this command cannot carry,
+/// the other about bytes it must not write, and a chain can want either.
+fn refuse_a_chain_this_command_cannot_close(sku: &str, tensor: &TensorContract) -> Result<()> {
+    let Some(producer) = tensor.expr.outputs().first().copied() else {
+        return Ok(());
+    };
+    bail!(
+        "{sku}: `{name}` states a transform this command runs, but its chain reads \
+         `{producer}` — another tensor of the same contract — through `Expr::Out`. \
+         Promoting `{name}` would write it into the artifact and leave `{producer}` \
+         behind, and this command has no way to carry a producer across with its \
+         consumer. Give `{name}` a chain that reads the checkpoint's own tensors, or \
+         teach the promoter to take a producer too.",
+        name = tensor.name,
+    )
+}
+
+/// Refuse a promoted name the artifact already holds under another claim.
+///
+/// A promoted tensor enters the artifact under the CONTRACT'S name; every
+/// other tensor enters under the SOURCE'S. Those are two namespaces, and
+/// while the gate admitted only forms a checkpoint does not ship they could
+/// not meet — a name the SKU invents for a repacked or encoded plane is not a
+/// name the source also has. M-4a widens the gate to transforms whose input
+/// and output names can coincide, and the artifact is one flat name table:
+/// two entries under one name is `write_artifact`'s ascending merge writing a
+/// name twice, with no party to say which bytes are the tensor.
+///
+/// Checked against `passthrough` and against the surviving contract entries,
+/// which between them are every weight the write will emit — `decoded` is the
+/// second set's shadow, listing the same names `materialize_contract` gave
+/// entries to, so checking it as well would only find the same collision
+/// under a less exact name. The check runs AFTER the retains, because a name
+/// the promotion has just consumed is not a rival claim: it is the same
+/// tensor, arriving under the name the SKU serves it as.
+///
+/// It cannot fire on any checkpoint this tree imports today. That is the
+/// reason to write it now rather than a reason not to: the check is three
+/// comparisons, and the widening that makes it reachable should arrive to
+/// find it already standing.
+fn refuse_a_name_two_parties_claim(
+    sku: &str,
+    materialization: &Materialization,
+    promoted: &[TensorContract],
+) -> Result<()> {
+    for tensor in promoted {
+        let held = if materialization.passthrough.contains(&tensor.name) {
+            "copied through from the source byte for byte"
+        } else if materialization
+            .contract
+            .tensors
+            .iter()
+            .any(|held| held.name == tensor.name)
+        {
+            "narrowed to bf16 from the source's own F16 or F32"
+        } else {
+            continue;
+        };
+        bail!(
+            "{sku}: `{name}` is the name this contract gives a plane it transforms at \
+             import, and the artifact already holds a tensor called `{name}` — {held}. \
+             One name, two claimants, and an artifact entry written twice; the \
+             transformed plane needs a name of its own.",
+            name = tensor.name,
+        );
+    }
+    Ok(())
+}
+
+/// Does this chain state a transform this command should run ONCE, so that a
+/// serving load can read the plane instead of building it?
+///
+/// **THE SET IS NO LONGER TWO NODES, AND THE REASON IT WIDENED IS NOT COST
+/// ALONE** (§M-4a). `Cast { to: Quant }` and `Repack` were here because a
+/// device mask REFUSES them — `CUDA_TILE_MAP_MASK` is `CAST|SCALE|DECODE|BIAS`
+/// and `CONVERT_TILE_MAP_MASK` is the only one carrying `ENCODE` or `REPACK` —
+/// so a load that met one could not proceed at all, and running it here is
+/// what makes the refusal survivable. Every other node in the vocabulary is
+/// AFFINE ([`Expr::is_affine`]) and never FAILS at load; it costs fragmented
+/// I/O and a copy, at every boot, forever. §M-4a's ruling is that the artifact
+/// should hold the LANDED plane and not the checkpoint's spelling of it, and
+/// that makes the whole landing this command's work:
+///
+/// * the placement family — [`Expr::Slice`], [`Expr::Stride`],
+///   [`Expr::Gather`], [`Expr::Concat`] — which is where a q/k/v fusion, a
+///   gate/up interleave and a GGUF's fused-bank split live. A fusion read at
+///   load is three spans copied into one buffer; written here it is one
+///   contiguous image the engine binds where it lies;
+/// * [`Expr::Transmute`], the rename that moves nothing — a stack of expert
+///   slabs gaining the axis it is stacked along, MLX's four-bit codes lifted
+///   out of the `u32` words they were packed into. It costs no arithmetic and
+///   it still costs a name: written here, the plane the SKU asks for is the
+///   plane the file holds;
+/// * [`Expr::Scale`] and [`Expr::Bias`] over a plane the file stores RAW —
+///   gemma's `+1` norm fold and mlx_lm's, taken back out. Arithmetic somebody
+///   asked for, a function of the weight alone, and the alternative is an
+///   engine rewriting every norm in the stack at every boot. Over a plane the
+///   file stores PACKED the same two nodes are a decode, which is the rule
+///   below;
+/// * [`Expr::Cast`] between two RAW dtypes, which is the F16/F32 narrowing
+///   `materialize_contract` performs under the SOURCE's name. Promoting it
+///   moves the same bytes under the CONTRACT's name, which is why the caller
+///   retains the consumed leg out of `contract.tensors` as well as out of the
+///   two name sets — see the three retains below.
+///
+/// **AND THE ONE HARD RULE: A DECODE IS NEVER PROMOTED.** A
+/// [`Expr::Cast`] out of a quantized encoding lands codes as values, and so
+/// does a per-block [`Expr::Scale`] or [`Expr::Bias`] — MLX's affine
+/// dequantization is exactly that pair. Promoting one would write bf16 where
+/// the artifact must hold codes, which is serve-as-stored undone: the whole
+/// point of keeping a packed bank packed is that the bytes on disk are the
+/// bytes the kernel reads. The old predicate said this by ENCODING A
+/// DIRECTION in its pattern — `Cast { to: Encoding::Quant(_) }` admits the
+/// encode and cannot match the decode — and a widened `matches!` loses that
+/// by accident, because a decode and a narrowing are the same node with a
+/// different operand. So the arm is named, explicit and asked FIRST, and it
+/// reads the operand's encoding off the checkpoint's own header rather than
+/// off the node: see [`decodes_a_packed_plane`].
+///
+/// **AND [`Expr::Shard`] IS NOT PROMOTED IN THIS COMMIT**, nor is any chain
+/// that carries one. Rank belongs to the format wave (§M-4b/M-4e): a rank's
+/// band is an INDEX ENTRY's business, keyed `(plane, rank)`, and there is no
+/// entry to put it in until the container takes the placement table. At
+/// `tp = 1` — the only degree this tree can build, asserted by
+/// `Builder::whole_checkpoint` and filtered for by `conversion_contract` —
+/// a shard IS the identity, so refusing to promote one costs exactly nothing
+/// and leaves the wave that must decide the layout free to decide it.
+/// [`Expr::Select`] and [`Expr::SrcIndexed`] are refused for the same shape
+/// of reason one level over: their meaning depends on a GROUP INSTANCE, and
+/// promoting one would bake instance zero.
+fn states_an_import_transform(expr: &Expr, checkpoint: &Metadata) -> bool {
+    if decodes_a_packed_plane(expr, checkpoint) {
+        return false;
+    }
+    let mut admitted = false;
+    let mut deferred = false;
+    expr.visit(&mut |node| match node {
+        Expr::Src(_) | Expr::Out(_) | Expr::Fill { .. } => {}
+        Expr::Shard { .. } | Expr::Select { .. } | Expr::SrcIndexed(_) => deferred = true,
+        Expr::Slice { .. }
+        | Expr::Stride { .. }
+        | Expr::Gather { .. }
+        | Expr::Concat { .. }
+        | Expr::Transmute { .. }
+        | Expr::Repack { .. }
+        | Expr::Cast { .. }
+        | Expr::Scale { .. }
+        | Expr::Bias { .. } => admitted = true,
+    });
+    admitted && !deferred
+}
+
+/// Does this chain DECODE — land, anywhere in it, a value the checkpoint holds
+/// packed into a form that is not packed any more?
+///
+/// The question [`states_an_import_transform`] asks first, and it is asked of
+/// the whole chain at every depth rather than of its root: a promotion moves
+/// the ENTIRE expression into the import, so one decode buried under two
+/// concats and a slice is a decode this command would run.
+///
+/// Three nodes can do it, and all three are the same node in two directions:
+/// a [`Expr::Cast`] whose `to` is raw, and a per-block [`Expr::Scale`] or
+/// [`Expr::Bias`] — `code · scale + zero`, MLX's affine decode, which
+/// `Builder::read_dequant` states and whose own doc calls it a decode in
+/// plain words. Each is a decode exactly when its OPERAND is quantized, which
+/// no field of the node says: `Cast { to: Raw(Bf16) }` over a bf16-stored
+/// tensor is the narrowing every import already performs, and the same node
+/// over an mxfp4-stored one is the thing that must never happen here.
+///
+/// **SO THE OPERAND IS TYPED, AND UNTYPEABLE MEANS NO.** [`yields`] reads the
+/// encoding off the nodes that state one and off the checkpoint's header at
+/// the leaves, and answers `None` where the chain does not say — an
+/// [`Expr::Out`] leg, a name this checkpoint does not hold. Both answers that
+/// are not "raw" refuse the promotion, because the cost of being wrong is
+/// asymmetric: a promotion not taken leaves a transform at load, where it
+/// already lives and where it works; a decode taken writes an artifact that
+/// holds values where its own contract says codes, and nothing downstream is
+/// in a position to notice.
+fn decodes_a_packed_plane(expr: &Expr, checkpoint: &Metadata) -> bool {
+    let mut decodes = false;
+    expr.visit(&mut |node| {
+        let operand = match node {
+            Expr::Cast { src, to: Encoding::Raw(_) } => src,
+            Expr::Scale { src, factor: ScaleFactor::PerBlock { .. } } => src,
+            Expr::Bias { src, by: BiasBy::PerBlock { .. } } => src,
+            _ => return,
+        };
+        if !matches!(yields(operand, checkpoint), Some(Encoding::Raw(_))) {
+            decodes = true;
+        }
+    });
+    decodes
+}
+
+/// What representation an expression's value is IN — the fact
+/// [`decodes_a_packed_plane`] needs and no single node carries.
+///
+/// Four nodes state their own output type and are read off; the placement
+/// family and the two value operators preserve their operand's and are
+/// recursed through; a [`Expr::Src`] is answered by the checkpoint's own
+/// header, which is the only party that knows. `None` is not "raw": it is
+/// "this expression does not say", and the one caller treats it as the
+/// refusing answer.
+///
+/// A per-block [`Expr::Scale`] over packed codes genuinely yields a raw value
+/// and this reports its operand's encoding instead. Deliberate, and it only
+/// ever makes the caller MORE careful: such a chain has already been named a
+/// decode by the node itself, so the imprecision cannot admit one.
+fn yields<'a>(expr: &'a Expr, checkpoint: &'a Metadata) -> Option<&'a Encoding> {
+    match expr {
+        Expr::Src(name) => checkpoint.tensor_by_name(name).map(|held| &held.encoding),
+        Expr::Fill { ty, .. } => Some(&ty.encoding),
+        Expr::Cast { to, .. } => Some(to),
+        Expr::Transmute { to, .. } | Expr::Repack { to, .. } => Some(&to.encoding),
+        Expr::Slice { src, .. }
+        | Expr::Stride { src, .. }
+        | Expr::Gather { src, .. }
+        | Expr::Shard { src, .. }
+        | Expr::Select { src, .. }
+        | Expr::Scale { src, .. }
+        | Expr::Bias { src, .. } => yields(src, checkpoint),
+        Expr::Concat { parts, .. } => parts.first().and_then(|leg| yields(leg, checkpoint)),
+        Expr::Out(_) | Expr::SrcIndexed(_) => None,
+    }
+}
+
+/// Move into `promoted` every entry that a promoted one is PAIRED WITH, until
+/// nothing moves.
+///
+/// **A PACKED PLANE AND ITS FACTORS ARE ONE THING, AND THE ARTIFACT HAS TO
+/// HOLD THEM UNDER ONE STEM.** `Builder::read_own` is the verb a serving load
+/// reaches when the file already holds a plane under the contract's name, and
+/// it claims the companions BY NAME — `claim` pairs a quantized weight with
+/// `<w>.scales` and `<w>.biases`, and `interned` declares them there. So an
+/// artifact holding `layer.0.q_proj` beside
+/// `model.layers.0.self_attn.q_proj.scales` is an artifact no load can read:
+/// the first arm fires on the codes, and the factors it then asks for are
+/// under a name the promotion left behind.
+///
+/// It is reachable without any of this being exotic. An MLX affine projection
+/// states its codes as a [`Expr::Transmute`] — always, because the file packs
+/// them into `u32` words — and its factors as a plain rename whenever the
+/// checkpoint already ships them bf16. One node on one entry and none on the
+/// other, and the group would split down the middle.
+///
+/// **PAIRED, AND NOT SUFFIX-MATCHED.** [`Scales::of`](checkpoint::contract::Scales)
+/// and `TensorContract::zero_points` are the contract's own statement of which
+/// weight a factors plane belongs to, written for exactly the reason this
+/// reads them rather than comparing names: "a suffix match is how a plane gets
+/// paired with a weight it never belonged to". Both directions travel — a
+/// promoted weight pulls its factors across, a promoted factors plane pulls
+/// its weight — and to a fixed point, because pulling the scales in is what
+/// makes the biases beside them reachable.
+fn close_over_the_declared_pairings(
+    promoted: &mut Vec<TensorContract>,
+    kept: &mut Vec<TensorContract>,
+) {
+    loop {
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        for tensor in promoted.iter() {
+            named.insert(tensor.name.clone());
+            if let Some(scales) = &tensor.scales {
+                named.insert(scales.of.clone());
+            }
+            if let Some(of) = &tensor.zero_points {
+                named.insert(of.clone());
+            }
+        }
+        let mut moved = false;
+        let mut still: Vec<TensorContract> = Vec::with_capacity(kept.len());
+        for tensor in std::mem::take(kept) {
+            let joined = named.contains(&tensor.name)
+                || tensor
+                    .scales
+                    .as_ref()
+                    .is_some_and(|scales| named.contains(&scales.of))
+                || tensor
+                    .zero_points
+                    .as_ref()
+                    .is_some_and(|of| named.contains(of));
+            if joined {
+                promoted.push(tensor);
+                moved = true;
+            } else {
+                still.push(tensor);
+            }
+        }
+        *kept = still;
+        if !moved {
+            return;
+        }
+    }
+}
+
+/// Refuse a promotion that eats a source tensor another read still names.
+///
+/// A promoted chain's legs leave the artifact: that is what makes the
+/// promotion mean "read the answer here" rather than "hold both". The entries
+/// this command did NOT promote are still read from the source's own
+/// spelling at every load, so a leg one of them names must survive — and
+/// nothing about the gate above keeps two entries from reaching for the same
+/// tensor with only one of them stating a transform.
+///
+/// **REFUSED RATHER THAN PARTIALLY PROMOTED**, and the alternative is what
+/// makes the case: dropping the promotion whose leg is contested would make
+/// the artifact's contents depend on the order this command happened to walk
+/// the contract in, and would do it silently. A refusal names the two entries
+/// and the tensor they disagree over, and points at the repair — promote both
+/// or neither, which is the contract author's call and not this command's.
+///
+/// It cannot fire on any checkpoint this tree imports today: every family's
+/// shared legs are shared by entries that state the same node, so they promote
+/// together. That is the reason to write it now rather than a reason not to.
+fn refuse_a_leg_a_surviving_read_still_needs(
+    sku: &str,
+    kept: &[TensorContract],
+    consumed: &[String],
+) -> Result<()> {
+    for tensor in kept {
+        for leg in tensor.expr.sources() {
+            if consumed.iter().any(|eaten| eaten == leg) {
+                bail!(
+                    "{sku}: `{name}` is read from the checkpoint's `{leg}` at every load, and \
+                     another tensor of the same contract states a transform over `{leg}` that \
+                     this command would run here — which takes `{leg}` out of the artifact and \
+                     leaves `{name}` naming a tensor that is no longer there. Promote both or \
+                     neither: give `{name}` a chain that states its own transform, or take the \
+                     transform off the tensor that shares its leg.",
+                    name = tensor.name,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Removes a materialized tied head from every set that would write it.
 ///
 /// Returns what was dropped, which is what the caller reports. Both sets are
@@ -1404,7 +2567,7 @@ fn tied_head_sources(metadata: &Metadata) -> Vec<String> {
 ///
 /// What is left for a config to say is the part the tensors cannot: the
 /// declared quantization, because a group size is not an extent of anything.
-/// `model::serve::encoding::Encoding` read exactly that, from the checkpoint's
+/// `models::serve::encoding::Encoding` read exactly that, from the checkpoint's
 /// own words, and M18 deleted it along with the module — a checkpoint's
 /// quantization comes off its STORED tensor encodings now, which is a stronger
 /// answer to the same question. The honest thing to carry is still the
@@ -1601,6 +2764,7 @@ fn write_artifact<'a>(
     spool: Option<&'a mut Spool>,
     passthrough: &[(&'a RawTensor, &'a str, &'a str)],
     meta: &'a [(String, Vec<u8>)],
+    ranked: Option<&[String]>,
     progress: &mut ProgressLine,
     decode_bytes: u64,
     copy_bytes: u64,
@@ -1626,7 +2790,30 @@ fn write_artifact<'a>(
     for (name, bytes) in meta {
         entries.push((name.as_str(), From::Meta(bytes)));
     }
-    entries.sort_by(|a, b| a.0.cmp(b.0));
+    // **THE ORDER IS THE RANKING'S WHEN THERE IS ONE, AND NAMES OTHERWISE.**
+    //
+    // A serving artifact's planes should lie in the order a streaming boot
+    // reads them — hottest first, one forward walk — and that order is the
+    // shell's ranking, which `runtime::engine::load::sequence` derives from
+    // the trace. Name order was never a choice here: `Writer::create` opens
+    // canonical and canonical form REFUSES non-ascending insertion, so this
+    // sort was the writer's rule wearing a caller's clothes.
+    // `Writer::create_serving` is non-canonical for exactly this.
+    //
+    // A plane the ranking does not name keeps its place among the names,
+    // AFTER everything ranked: `__meta__/` objects are not served and never
+    // appear in a sequence, and a weight the ranking missed is one this shell
+    // could not size — it belongs in the file and not in the hot run.
+    match ranked {
+        Some(order) => {
+            let rank: BTreeMap<&str, usize> =
+                order.iter().enumerate().map(|(at, name)| (name.as_str(), at)).collect();
+            entries.sort_by_key(|(name, _)| {
+                (rank.get(name).copied().unwrap_or(usize::MAX), *name)
+            });
+        }
+        None => entries.sort_by(|a, b| a.0.cmp(b.0)),
+    }
 
     // The copies, cut into reads and dealt round-robin to a few threads.
     //
@@ -2225,6 +3412,335 @@ mod tests {
     // still spools an out-of-order set. Nothing in this command reorders a
     // tensor any more, so the case cannot arise here.
 
+    /// **THE WHOLE LANDING IS PROMOTED, AND A DECODE NEVER IS** (§M-4a).
+    ///
+    /// The selector is the whole of the family knowledge here, and §M-4a
+    /// widened it from two nodes to the landing: the placement family, the
+    /// rename, the two value operators at a uniform factor and the raw
+    /// narrowing all join the encode and the repack, so that the artifact's
+    /// tensors are the planes the engine binds.
+    ///
+    /// **THE NEGATIVES ARE THE POINT OF THE TEST.** The old predicate could
+    /// not express a decode — `Cast { to: Encoding::Quant(_) }` matches one
+    /// direction and one direction only — and the widened one can, because a
+    /// decode and a narrowing are the SAME NODE with a different operand. So
+    /// the decode arm is asserted at three depths and under two spellings
+    /// (`Cast`, and MLX's per-block `Scale`), and once with the operand's
+    /// encoding known only from the checkpoint's header rather than from any
+    /// node of the chain — which is the case a structural predicate cannot
+    /// see and would have promoted.
+    ///
+    /// And `Shard` is asserted absent: rank is §M-4b/M-4e's, the index entry
+    /// is where it goes, and at `tp = 1` there is nothing to promote anyway.
+    #[test]
+    fn the_landing_is_promoted_and_a_decode_never_is() {
+        use checkpoint::contract::TensorType;
+        use checkpoint::types::{FileId, QuantScheme, QuantSpec, TensorId};
+
+        let mxfp4 = Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::Mxfp4E2M1E8M0,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 4,
+            group_size: 32,
+            channel_axis: None,
+        });
+
+        // A checkpoint holding three raw tensors and one packed one. `w`,
+        // `a` and `b` are stored bf16; `packed` ships the codes.
+        let held = |id: u32, name: &str, encoding: Encoding| RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 64,
+            shape: vec![4, 32],
+            encoding,
+        };
+        let checkpoint = Metadata {
+            files: Vec::new(),
+            tensors: vec![
+                held(0, "w", Encoding::Raw(DType::Bf16)),
+                held(1, "a", Encoding::Raw(DType::Bf16)),
+                held(2, "b", Encoding::Raw(DType::Bf16)),
+                held(3, "packed", mxfp4.clone()),
+            ],
+        };
+        let promoted = |expr: &Expr| states_an_import_transform(expr, &checkpoint);
+
+        // A plain copy states nothing at all, and a rename is a copy.
+        assert!(!promoted(&Expr::src("w")));
+
+        // THE DECODE, REFUSED FOUR WAYS.
+        //
+        // Stated by the chain: a transmute names the packed type and the cast
+        // takes the value out of it.
+        assert!(!promoted(
+            &Expr::src("w")
+                .transmute(TensorType {
+                    shape: vec![4, 32],
+                    encoding: mxfp4.clone(),
+                })
+                .cast(Encoding::Raw(DType::Bf16))
+        ));
+        // Stated by the FILE and by nothing else — the case that has no
+        // structural tell: this is the same node as the narrowing below, over
+        // a tensor the checkpoint happens to ship packed.
+        assert!(!promoted(
+            &Expr::src("packed").cast(Encoding::Raw(DType::Bf16))
+        ));
+        // At depth, under a chain that would otherwise be promoted twice
+        // over: a promotion moves the WHOLE expression, so a decode buried
+        // under a concat and a slice is a decode this command would run.
+        assert!(!promoted(&Expr::concat(
+            0,
+            vec![
+                Expr::src("a"),
+                Expr::src("packed")
+                    .cast(Encoding::Raw(DType::Bf16))
+                    .slice(0, 0, 2),
+            ]
+        )));
+        // And in MLX's spelling of it, which is not a `Cast` at all: a
+        // per-block scale over packed codes is `code · scale`, the first half
+        // of an affine decode.
+        assert!(!promoted(
+            &Expr::src("packed").scale_per_block(Expr::src("a"))
+        ));
+
+        // THE NARROWING, WHICH IS THE SAME NODE AND IS PROMOTED. It moves the
+        // bytes `materialize_contract` would have written under the SOURCE's
+        // name under the CONTRACT's instead; the third retain in
+        // `promote_import_transforms` is what stops that being two copies.
+        assert!(promoted(&Expr::src("w").cast(Encoding::Raw(DType::Bf16))));
+
+        // THE ENCODE AND THE REPACK — the two a serving load refuses outright,
+        // found under the chain a family actually writes and not only at the
+        // root.
+        assert!(promoted(&Expr::src("w").cast(mxfp4.clone())));
+        assert!(promoted(
+            &Expr::concat(0, vec![Expr::src("a"), Expr::src("b")]).cast(mxfp4.clone())
+        ));
+        assert!(promoted(&Expr::src("w").repack(
+            checkpoint::types::RepackLayout::TiledAffineU4Weight,
+            TensorType {
+                shape: vec![16, 64],
+                encoding: Encoding::Raw(DType::Bf16),
+            }
+        )));
+
+        // THE LANDING §M-4a ADDS: the fusion, the band, the rename, the fold.
+        assert!(promoted(&Expr::concat(
+            0,
+            vec![Expr::src("a"), Expr::src("b")]
+        )));
+        assert!(promoted(&Expr::src("w").slice(0, 0, 2)));
+        assert!(promoted(&Expr::src("w").stride(0, 0, 2, 2)));
+        assert!(promoted(&Expr::src("w").transmute(TensorType {
+            shape: vec![2, 64],
+            encoding: Encoding::Raw(DType::Bf16),
+        })));
+        assert!(promoted(&Expr::src("w").bias(1.0)));
+        assert!(promoted(&Expr::src("w").scale(2.0)));
+
+        // AND RANK IS NOT PROMOTED, NOR IS ANY CHAIN CARRYING IT. `Shard` is
+        // the identity at `tp = 1` and an index entry's business above it, so
+        // refusing costs nothing and leaves §M-4b free to decide the layout.
+        assert!(!promoted(&Expr::src("w").shard(0)));
+        assert!(!promoted(&Expr::concat(
+            0,
+            vec![Expr::src("a").shard(0), Expr::src("b").shard(0)]
+        )));
+    }
+
+    /// A promoted packed plane takes its FACTORS with it, and a promoted
+    /// factors plane takes its weight.
+    ///
+    /// `Builder::read_own` claims a quantized weight's companions by name —
+    /// `<w>.scales` and `<w>.biases` — so a group split across the two
+    /// namespaces is a group no load can read: the codes under the contract's
+    /// name, the factors under the source's. The pairing travels through
+    /// `Scales::of` and `zero_points`, which is the contract's own statement
+    /// of it, and to a fixed point: promoting the weight pulls the scales,
+    /// and the scales' presence is what makes the biases beside them
+    /// reachable in the same sweep.
+    #[test]
+    fn a_promoted_plane_takes_its_declared_factors_with_it() {
+        use checkpoint::contract::Scales;
+        use checkpoint::types::{QuantGranularity, ScaleForm};
+
+        let plain = |name: &str, expr: Expr| {
+            TensorContract::new(name, expr, vec![4, 32], Encoding::Raw(DType::Bf16))
+        };
+        // The codes state a transform; neither companion does.
+        let mut promoted = vec![plain(
+            "layer.0.q_proj",
+            Expr::concat(0, vec![Expr::src("q.weight"), Expr::src("g.weight")]),
+        )];
+        let mut kept = vec![
+            TensorContract {
+                scales: Some(Scales {
+                    of: "layer.0.q_proj".to_string(),
+                    granularity: QuantGranularity::PerGroup,
+                    group_size: 64,
+                    channel_axis: 1,
+                    form: ScaleForm::Bf16AffineFactors,
+                }),
+                ..plain("layer.0.q_proj.scales", Expr::src("q.scales"))
+            },
+            TensorContract {
+                zero_points: Some("layer.0.q_proj".to_string()),
+                ..plain("layer.0.q_proj.biases", Expr::src("q.biases"))
+            },
+            plain("layer.0.o_proj", Expr::src("o.weight")),
+        ];
+
+        close_over_the_declared_pairings(&mut promoted, &mut kept);
+
+        let names: Vec<&str> = promoted.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "layer.0.q_proj",
+                "layer.0.q_proj.scales",
+                "layer.0.q_proj.biases"
+            ],
+            "the codes carried both factors planes across"
+        );
+        let left: Vec<&str> = kept.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            left,
+            ["layer.0.o_proj"],
+            "and a plane that pairs with nothing promoted stays where it was"
+        );
+    }
+
+    /// A promoted plane whose name the artifact already holds is refused, and
+    /// the refusal names the name and both claimants.
+    ///
+    /// The two namespaces the artifact flattens: a promoted tensor lands under
+    /// the CONTRACT'S name, everything else under the SOURCE'S. Both arms are
+    /// asserted because the surviving claim can come from either set — a
+    /// passthrough copy or a `materialize_contract` narrowing — and a check
+    /// that swept only one would pass while the other wrote a name twice.
+    #[test]
+    fn a_promoted_name_that_collides_with_a_passthrough_is_refused_by_name() {
+        use checkpoint::contract::{Expr, ModelContract, TensorContract};
+
+        let bank = |name: &str| {
+            TensorContract::new(
+                name,
+                Expr::src("blk.0.ffn_gate_exps.weight").cast(Encoding::Raw(DType::Bf16)),
+                vec![64, 64],
+                Encoding::Raw(DType::Bf16),
+            )
+        };
+        let narrowed = |name: &str| {
+            TensorContract::new(
+                name,
+                Expr::src(name).cast(Encoding::Raw(DType::Bf16)),
+                vec![64, 64],
+                Encoding::Raw(DType::Bf16),
+            )
+        };
+        let materialization = |contract: Vec<TensorContract>, passthrough: Vec<String>| {
+            Materialization {
+                contract: ModelContract {
+                    alignment: 1,
+                    tensors: contract,
+                    groups: Vec::new(),
+                },
+                decoded: Vec::new(),
+                passthrough,
+                meta: Vec::new(),
+            }
+        };
+
+        // A copy already claims the name.
+        let m = materialization(Vec::new(), vec!["blk.0.ffn_gate_exps.weight".into()]);
+        let promoted = [bank("blk.0.ffn_gate_exps.weight")];
+        let refusal = refuse_a_name_two_parties_claim("kimi-k3", &m, &promoted)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("blk.0.ffn_gate_exps.weight"), "{refusal}");
+        assert!(refusal.contains("byte for byte"), "{refusal}");
+
+        // A narrowing already claims it.
+        let m = materialization(vec![narrowed("blk.0.ffn_gate_exps.weight")], Vec::new());
+        let promoted = [bank("blk.0.ffn_gate_exps.weight")];
+        let refusal = refuse_a_name_two_parties_claim("kimi-k3", &m, &promoted)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("blk.0.ffn_gate_exps.weight"), "{refusal}");
+        assert!(refusal.contains("F16 or F32"), "{refusal}");
+
+        // And a name no other party holds passes -- the resting state, which
+        // is every checkpoint this tree imports today.
+        let m = materialization(
+            vec![narrowed("model.norm.weight")],
+            vec!["model.embed_tokens.weight".into()],
+        );
+        assert!(
+            refuse_a_name_two_parties_claim("kimi-k3", &m, &[bank("blk.0.ffn_gate_exps.weight")])
+                .is_ok()
+        );
+    }
+
+    /// A promoted chain that reads another contract entry is refused, and the
+    /// refusal names both the consumer and the producer it cannot carry.
+    ///
+    /// `Expr::sources` sees `Expr::Src` and stops; the DAG edge is
+    /// `Expr::Out`, and a promotion that took the consumer alone would hand
+    /// `compile_decode` an expression naming a tensor its contract does not
+    /// declare. Asserted against a chain that also states a real gate node,
+    /// because the refusal is only reached for tensors the gate admits.
+    #[test]
+    fn a_promoted_chain_that_reads_another_contract_entry_is_refused_by_name() {
+        use checkpoint::contract::{Expr, TensorContract};
+
+        let reads_a_sibling = TensorContract::new(
+            "blk.0.attn_q.weight",
+            Expr::out("blk.0.attn_q.scaled").repack(
+                checkpoint::types::RepackLayout::TiledAffineU4Weight,
+                checkpoint::contract::TensorType {
+                    shape: vec![16, 64],
+                    encoding: Encoding::Raw(DType::Bf16),
+                },
+            ),
+            vec![16, 64],
+            Encoding::Raw(DType::Bf16),
+        );
+        // A repack is admitted by the gate whatever the checkpoint holds —
+        // it names a kernel and reads no encoding — so an empty table is the
+        // honest fixture here, and it is what a chain rooted at `Expr::Out`
+        // would find anyway.
+        let nothing = Metadata {
+            files: Vec::new(),
+            tensors: Vec::new(),
+        };
+        assert!(states_an_import_transform(&reads_a_sibling.expr, &nothing));
+        let refusal = refuse_a_chain_this_command_cannot_close("qwen3", &reads_a_sibling)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("blk.0.attn_q.weight"), "{refusal}");
+        assert!(refusal.contains("blk.0.attn_q.scaled"), "{refusal}");
+
+        // The same chain rooted at the checkpoint's own tensor is what every
+        // live contract states, and it passes.
+        let reads_the_source = TensorContract::new(
+            "blk.0.attn_q.weight",
+            Expr::src("model.layers.0.self_attn.q_proj.weight").repack(
+                checkpoint::types::RepackLayout::TiledAffineU4Weight,
+                checkpoint::contract::TensorType {
+                    shape: vec![16, 64],
+                    encoding: Encoding::Raw(DType::Bf16),
+                },
+            ),
+            vec![16, 64],
+            Encoding::Raw(DType::Bf16),
+        );
+        assert!(refuse_a_chain_this_command_cannot_close("qwen3", &reads_the_source).is_ok());
+    }
+
     /// The head is dropped from every set that would write it, at either width.
     ///
     /// Both sets are swept because the width decides which one the head lands
@@ -2280,5 +3796,105 @@ mod tests {
         // Idempotent: a second sweep finds nothing, so a re-import of an
         // artifact this already cleaned reports no drops.
         assert!(drop_tied_head(&mut m, &heads).is_empty());
+    }
+
+    /// **THE DECODE FREES AS IT GOES, AND THE SCHEDULE IS WHERE THAT IS
+    /// DECIDED.**
+    ///
+    /// The honest gate is peak RSS, which no unit test can hold still. What it
+    /// rests on is a property of the plan, and that can be pinned exactly: a
+    /// buffer is freed at its LAST USE, so a schedule that publishes its first
+    /// tensor before it allocates its last buffer has somewhere to free, and
+    /// one that allocates everything first does not.
+    ///
+    /// Both plans below are the same contract against the same
+    /// [`decode_target`] — an Unknown backend, which carries no
+    /// `BulkExtentWrite` for the coalescer to make and none for the hoist to
+    /// move. The hoist reorders it anyway, because it fronts every `Allocate`
+    /// whether or not it found a bulk write to put behind them, and reports
+    /// zero rewrites while doing it. That is why the import's own streaming
+    /// execution held the whole narrowed set: not a refused instruction, just
+    /// an order.
+    #[test]
+    fn the_decode_publishes_a_tensor_before_it_allocates_its_last_buffer() {
+        use checkpoint::plan::{LoadPlan, StorageInstr};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.zt");
+        let names = ["a", "b", "c", "d"];
+        let decls: Vec<TensorDecl> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| TensorDecl {
+                id: TensorId(i as u32),
+                name: (*name).to_string(),
+                shape: vec![64],
+                encoding: Encoding::Raw(DType::F32),
+                alignment: 64,
+                visibility: Visibility::default(),
+            })
+            .collect();
+        let payloads: Vec<Vec<u8>> = (0..names.len())
+            .map(|seed| {
+                (0..64u32)
+                    .flat_map(|i| (i as f32 + seed as f32).to_le_bytes())
+                    .collect()
+            })
+            .collect();
+        let tensors: Vec<WriteTensor> = decls
+            .iter()
+            .zip(payloads.iter())
+            .map(|(decl, bytes)| WriteTensor { decl, bytes })
+            .collect();
+        write_zt(&path, &BTreeMap::new(), &tensors).unwrap();
+
+        let metadata = parse_metadata(&path).unwrap();
+        let materialization = materialize_contract(&metadata).unwrap();
+        // Every one of them narrows, so the decode is the whole file and the
+        // schedule below is not a two-instruction degenerate case.
+        assert_eq!(materialization.decoded, names);
+
+        let positions = |plan: &LoadPlan, want: fn(&StorageInstr) -> bool| -> Vec<usize> {
+            plan.schedule
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| want(plan.instr(**id).unwrap()))
+                .map(|(at, _)| at)
+                .collect()
+        };
+        let allocates = |instr: &StorageInstr| matches!(instr, StorageInstr::Allocate { .. });
+        let finalizes = |instr: &StorageInstr| matches!(instr, StorageInstr::Finalize { .. });
+
+        let arena =
+            checkpoint::plan::compile(&metadata, &materialization.contract, decode_target())
+                .unwrap();
+        assert!(
+            positions(&arena, allocates).iter().max().unwrap()
+                < positions(&arena, finalizes).iter().min().unwrap(),
+            "the ordinary pipeline fronts every Allocate, which is the arrangement \
+             under which nothing is ever at its last use"
+        );
+
+        let streaming = compile_decode(&metadata, &materialization.contract).unwrap();
+        assert!(
+            positions(&streaming, finalizes).iter().min().unwrap()
+                < positions(&streaming, allocates).iter().max().unwrap(),
+            "and the plan this command compiles publishes its first tensor before it \
+             allocates its last buffer"
+        );
+        assert!(
+            !streaming.passes.iter().any(|pass| {
+                pass.pass == "hoist-bulk-arena-writes"
+                    || pass.pass == "coalesce-persistent-arena-writes"
+            }),
+            "it says so in the passes it ran: {:?}",
+            streaming.passes.iter().map(|pass| &pass.pass).collect::<Vec<_>>()
+        );
+        // The SCHEDULE is all that differs. Same tensors, same declarations,
+        // same instruction set -- a plan that decoded something else would be
+        // a different artifact rather than a smaller footprint.
+        assert_eq!(arena.passes.len(), streaming.passes.len() + 2);
+        assert_eq!(arena.tensors, streaming.tensors);
+        assert_eq!(arena.instrs.len(), streaming.instrs.len());
     }
 }

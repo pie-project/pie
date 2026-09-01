@@ -41,7 +41,7 @@
 //! describes. That is decision #18 read from the residency side: the runtime
 //! links `model`, traces the `Trace` and states the load contract; the shell
 //! compiles the contract against a checkpoint and lands the bytes. A shell
-//! that reached for `model::qwen_3` would be a shell that has to grow an arm
+//! that reached for `models::qwen_3` would be a shell that has to grow an arm
 //! per family, which is exactly the shape the string-plan era had.
 //!
 //! # Names are the plan's, both sides
@@ -92,7 +92,7 @@ use checkpoint::file::zt;
 use checkpoint::contract::ModelContract;
 use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
-use checkpoint::plan::{LoadPlan, StorageTarget, compile};
+use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 use checkpoint::types::{BackendKind, ScaleForm, TensorId};
 use kernels_cuda::Tensor;
 use kernels_cuda::linear::moe::GroupSeat;
@@ -317,10 +317,41 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                 // The shape is logical and the element is a nibble: two codes
                 // to a byte, and an odd row rounds up rather than overlapping
                 // the next one.
-                Dtype::U4g64 | Dtype::U4g32 => rows.saturating_mul(width).div_ceil(2),
+                // **AND THE TILED ROW IS THE SAME NIBBLES**, in the order a
+                // fragment reads them. A repack is size-preserving up to the
+                // band padding, and the padding is already in the shape
+                // (`model_dsl::Weight::planes` bands the rows), so this is
+                // one arm and not two.
+                Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => {
+                    rows.saturating_mul(width).div_ceil(2)
+                }
+                // The same bank at two bits, sixteen codes to the `u32` word
+                // MLX packs them into: a row of `width` codes is `width / 4`
+                // bytes, and the `div_ceil` is the four-bit arm's argument one
+                // notch narrower. The group is not in this number — it sizes
+                // the COMPANION planes, which are their own params with their
+                // own rectangles — which is why all three groups share the
+                // arm. `engine_metal::weights::plane_bytes` has said the same
+                // since 2-bit opened; this shell's copy was missing, and the
+                // two `mlxu2` catalog rows refused at `Ranking::of` for it,
+                // uncapped included, before a device was touched.
+                Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => {
+                    rows.saturating_mul(width).div_ceil(4)
+                }
                 // The same bank at eight bits: one whole byte a code, so the
                 // logical rectangle IS the byte count and nothing rounds.
                 Dtype::U8g64 => rows.saturating_mul(width),
+                // **A STORED QUANTIZATION TERM, WHOSE SHAPE IS ALREADY ITS
+                // CONTAINER.** `model_dsl::Weight::planes` folded the logical
+                // `[n, k]` into `[n, Dtype::row_bytes(k)]` — one braided plane,
+                // scales inside the payload, which is what serving AS STORED
+                // means — so this is the mxfp4 arm's sentence with a term in
+                // place of a constant: the rectangle IS the byte count.
+                Dtype::U2g16k
+                | Dtype::I3g16k
+                | Dtype::U4g32k
+                | Dtype::U5g32k
+                | Dtype::I6g16k => rows.saturating_mul(width),
                 other => {
                     let element =
                         model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
@@ -360,6 +391,26 @@ pub struct Prospect {
     /// makes "boot once uncapped, then serve capped out of the artifact" a
     /// sentence an operator can act on.
     pub resident_key: u64,
+    /// **THE SERVING ARTIFACT'S NAME** — and since §M it is here, beside the
+    /// resident one, because it is the same KIND of number: a function of the
+    /// deployment and not of this load's budgets.
+    ///
+    /// Format 2's key mixed both layouts and every rung, so it could only be
+    /// formed once a `Plan` existed and a different budget named a different
+    /// file. §M's mixes the RANKING instead (`Ranking::images`), which no
+    /// budget touches — so one file serves any budget pair on this setup and
+    /// the name can be formed here, out of the one metadata parse and the one
+    /// plan compile this call already pays for.
+    ///
+    /// `0` for a load plan that will not serialize, which is the load that
+    /// forms no key at all and therefore neither reads nor writes the file.
+    pub tier_key: u64,
+    /// **The priority ranking this trace declares**, before any budget cuts
+    /// it — what [`experts::Plan::cut`] turns into a residency and what the
+    /// serving artifact's payload is laid out from.
+    ///
+    /// [`experts::Plan::cut`]: crate::experts::Plan::cut
+    pub ranking: crate::experts::Ranking,
 }
 
 /// **A ROUTED BANK'S OTHER DEVICE PLANES AND THE T2 SOURCE'S NAME, OFF THE
@@ -401,8 +452,31 @@ pub fn prospect(trace: &Trace, contract: &ModelContract, path: &Path) -> Result<
         .enumerate()
         .map(|(at, param)| (param.name.as_str(), at))
         .collect();
+    let planes = attachments(&landing, &index)?;
+    let ranking = crate::experts::Ranking::of(trace, &planes)?;
+    Ok(Prospect {
+        resident_key: resident_key(trace, &landing, path)?,
+        tier_key: tier_identity(trace, &landing, path, &ranking)?.unwrap_or(0),
+        ranking,
+        planes,
+    })
+}
+
+/// **THE SPLIT-PLANE PAIRINGS, AS A RESIDENCY DECISION WANTS THEM** — which
+/// other params move when a packed bank moves, keyed by the bank's own row.
+///
+/// [`pairings`] read through one map instead of two: it answers with the
+/// loader's `Pairing` and every caller then flattens it the same way. Stated
+/// once because two callers now need it — [`prospect`], which asks before a
+/// byte is landed, and [`Weights::resident`], which needs the same
+/// [`Ranking`](crate::experts::Ranking) to name the file it is about to read.
+///
+/// # Errors
+///
+/// [`pairings`]', verbatim.
+fn attachments(landing: &LoadPlan, index: &BTreeMap<&str, usize>) -> Result<Attachments> {
     let mut planes = Attachments::new();
-    for (name, pairing) in pairings(&landing, &index)? {
+    for (name, pairing) in pairings(landing, index)? {
         let Some(&at) = index.get(name) else {
             continue;
         };
@@ -410,10 +484,7 @@ pub fn prospect(trace: &Trace, contract: &ModelContract, path: &Path) -> Result<
         companions.extend(pairing.biases);
         planes.insert(at, companions);
     }
-    Ok(Prospect {
-        planes,
-        resident_key: resident_key(trace, &landing, path)?,
-    })
+    Ok(planes)
 }
 
 /// **The key a FULLY RESIDENT load of this deployment forms** — see
@@ -451,51 +522,1278 @@ fn resident_key(trace: &Trace, landing: &LoadPlan, path: &Path) -> Result<u64> {
     .key())
 }
 
-/// **Open the T2 source for this load, or answer why there is none.**
+/// **THE KEY THIS DEPLOYMENT'S SERVING ARTIFACT CARRIES** (§M.3) — and
+/// `None` for a load plan that will not serialize.
 ///
-/// The artifact a FULLY RESIDENT load of this deployment wrote, under
-/// [`Prospect::resident_key`]. `None` for every load that was offered no cache
-/// directory, and for one whose deployment has not booted uncapped yet — which
-/// is not an error here: it becomes
-/// [`Residency::admit_tiers`](engine::load::Residency::admit_tiers)'s refusal,
-/// with the sentence that says what to do about it.
+/// It used to be [`resident_key`]'s opposite in the one way that mattered: it
+/// was **budget-DEPENDENT**, mixing this load's device layout, its host layout
+/// and every param's rung, so a changed budget was a different key, a
+/// different file, and a hundred gigabytes rewritten to say the same thing
+/// about the same weights.
 ///
-/// **THE KEY IS CHECKED AGAINST THE FILE'S OWN.** `Artifact::open` validates
-/// the format, the index and the lengths, and the key lives in the FILENAME —
-/// so a file moved or renamed under a key it does not carry would open and
-/// serve another deployment's weights. The header states its key; it is read
-/// back and compared here.
+/// **None of that is here.** The artifact holds one image per plane in a
+/// budget-free order and a boot cuts it, so what identifies the file is the
+/// deployment and the sequence:
+///
+/// ```text
+///   layout, total   what a FULLY RESIDENT load of this deployment lays out
+///   images          (param, bytes, reserved) per image, in payload order
+/// ```
+///
+/// The first line is `resident_key`'s own two fields, verbatim and for its
+/// reason: they are the deployment's identity, a pure function of the trace
+/// and the recipe. The second is what this file physically holds — the
+/// ranking and every span in it — which is also a pure function of the trace
+/// and the recipe (`Ranking::of` reads no budget). Two boots at two DIFFERENT
+/// budgets therefore form the SAME key and read the SAME file, which is the
+/// whole of §M.3.
+///
+/// # Errors
+///
+/// [`Fault::Param`] for a param whose plane cannot be sized.
+fn tier_identity(
+    trace: &Trace,
+    landing: &LoadPlan,
+    path: &Path,
+    ranking: &crate::experts::Ranking,
+) -> Result<Option<u64>> {
+    let resident = places(trace, &crate::experts::Plan::default())?;
+    let layout: Vec<(u64, u64, u64)> = resident
+        .iter()
+        .map(|place| (place.offset, place.bytes, place.reserved))
+        .collect();
+    // The offsets are left out on purpose: the images tile the payload
+    // consecutively, so a span list in order states every offset it could
+    // carry, and a key that mixed both would be mixing one fact twice.
+    let images: Vec<(u64, u64, u64)> = ranking
+        .images()
+        .into_iter()
+        .map(|(param, _at, bytes, reserved)| (param, bytes, reserved))
+        .collect();
+    // As `resident_key`: a plan that will not serialize is not a fault, it is
+    // a key this load cannot form — and a load with no key neither reads nor
+    // writes the artifact.
+    let Ok(plan_json) = serde_json::to_vec(landing) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        crate::weight_cache::tier::Identity {
+            checkpoint: path,
+            trace_name: &trace.name,
+            plan_json: &plan_json,
+            total: resident.last().map_or(0, |place| place.offset + place.reserved),
+            layout: &layout,
+            images: &images,
+        }
+        .key(),
+    ))
+}
+
+/// **The serving artifact this deployment would name**, computed from the
+/// outside — [`Prospect::resident_key`]'s twin, and `None` for a load plan
+/// that does not serialize.
+///
+/// One metadata parse and one plan compile, reading no tensor bytes, exactly
+/// as [`prospect`] costs — and it IS [`Prospect::tier_key`], reachable on its
+/// own for a caller that holds neither. It no longer takes a
+/// [`Plan`](crate::experts::Plan): the key stopped being a function of the
+/// budgets when the artifact did (§M.3), so an operator naming a file and a
+/// gate asserting what a boot wrote both ask the same question of the
+/// deployment alone.
+///
+/// # Errors
+///
+/// [`Fault::Load`] for a checkpoint the contract does not fit,
+/// [`Fault::Param`] for a param whose plane cannot be sized.
+pub fn tier_key(trace: &Trace, contract: &ModelContract, path: &Path) -> Result<Option<u64>> {
+    let metadata = if path.is_dir() {
+        parse_metadata(path)?
+    } else {
+        zt::parse(path)?
+    };
+    let landing = compile(
+        &metadata,
+        contract,
+        StorageTarget::for_backend(BackendKind::Cuda, 0, 1),
+    )?;
+    let index: BTreeMap<&str, usize> = trace
+        .params
+        .iter()
+        .enumerate()
+        .map(|(at, param)| (param.name.as_str(), at))
+        .collect();
+    let planes = attachments(&landing, &index)?;
+    tier_identity(trace, &landing, path, &crate::experts::Ranking::of(trace, &planes)?)
+}
+
+
+/// **OPEN THIS DEPLOYMENT'S SERVING ARTIFACT AS A T2 SOURCE, OR ANSWER WHY
+/// THERE IS NONE** (§K.6-T4, §M.3).
+///
+/// [`spill_source`]'s twin for the SECOND file, and the road that frees a
+/// spilled deployment from the hundred-gigabyte resident snapshot that seeded
+/// it: the serving artifact carries one image per plane of this trace, so it
+/// answers for whatever this budget spills — and for whatever the NEXT budget
+/// spills too, which is the difference §M made.
+///
+/// **THE KEY IS THE ADMISSION.** `key` is [`tier_key`]'s, which is
+/// budget-FREE (§M.3): it mixes the deployment and the sequence, so a file
+/// found under it describes this trace's images whatever rung a budget puts
+/// them on. `Artifact::open` then checks the header's arithmetic, that the
+/// images tile their own payload, the index digest and the key the filename
+/// states.
+///
+/// **NOTHING IS HASHED HERE.** Whether the bytes are the bytes is
+/// [`open_tiers`]'s question, asked once, of the same file — see its own doc
+/// for why the answer is a verification up front and not a first-touch one.
+///
+/// `None` for a load offered no cache directory, a key it could not form, a
+/// deployment that has never been imported, and every refusal
+/// `Artifact::open` states.
 #[must_use]
-pub fn spill_source(cache_dir: Option<&Path>, key: u64) -> Option<crate::weight_cache::Artifact> {
+pub fn tier_spill(
+    cache_dir: Option<&Path>,
+    key: u64,
+) -> Option<crate::weight_cache::tier::Artifact> {
+    use crate::weight_cache::tier;
+
     if key == 0 {
         return None;
     }
-    let dir = cache_dir?;
-    let artifact = crate::weight_cache::Artifact::open(&crate::weight_cache::artifact_path(dir, key))
-        .ok()?;
+    let artifact = tier::Artifact::open(&tier::path(cache_dir?, key)).ok()?;
+    // **AND THE CONDITION THAT USED TO BE HERE IS GONE.** Format 2 also asked
+    // whether the file's MAPPED SECTION was non-empty, because a file written
+    // by a boot that spilled nothing carried no third image and was no source.
+    // §M's file has no sections: it holds every plane of the trace, so any
+    // artifact under this key is a source for any spill this deployment can
+    // plan.
     (artifact.key() == key).then_some(artifact)
 }
 
-/// The transform arena's backing: RAM when it fits beside the tiers this
-/// load is about to pin, a file-backed map when it would not — see the
-/// construction site in [`Weights::resident`] for the argument.
+/// **OPEN THIS DEPLOYMENT'S SERVING ARTIFACT, OR SAY WHY THERE IS NONE**
+/// (§K.4, §M.3).
+///
+/// [`spill_source`]'s twin for the OTHER file. It is asked before the pinned
+/// tier is allocated, because whether that allocation pays for its
+/// `write_bytes(0)` is a function of whether these bytes are on the disk
+/// ([`Tier::open`](crate::experts::Tier::open)'s [`Fill`](crate::experts::Fill)),
+/// and that question has to be asked before the allocation is made rather
+/// than after.
+///
+/// # What an `Err` means, and it is three different things
+///
+/// ```text
+///   absent    no file under this key. Since §M-3 that is NEWS: the key is
+///             the filename, so a changed plan or recipe is a changed key,
+///             and the census beside the refusal names the files that are
+///             there instead of the one that is not
+///   stale     another build's format — said out loud, with the remedy
+///   rotten    a file under this key that does not describe itself, or whose
+///             mapped images do not hash: counted, named, LEFT ALONE
+/// ```
+///
+/// **AND NONE OF THEM DELETES ANYTHING** (§M.4). The file is the model on this
+/// machine, not a cache of a boot: the boot that finds it wrong is not the
+/// boot that can rewrite it, and the source it was imported from may not still
+/// be here. Every refusal names `pie model import --prepare-only`;
+/// [`tier::refuse`](crate::weight_cache::tier::refuse) is where that sentence
+/// lives, and all three of these are built through it so that they have one
+/// shape.
+///
+/// **AND NONE OF THEM RUNS A COLD LOAD EITHER** (§M-3). This used to answer
+/// `Option` and every `None` meant "stream, transform, write". A serving load
+/// has no such road left, so the answer is the SENTENCE — [`Miss`] — and the
+/// caller decides where it goes: a `Fault::Residency` under `Intent::Serve`, a
+/// printed line under `Intent::Prepare`, which is the run that then writes the
+/// file the sentence is about.
+///
+/// # The refusal this door adds
+///
+/// **A FILE WHOSE IMAGES ARE NOT THIS TRACE'S.** The key mixes the sequence
+/// (§M.3), so an index that disagrees with this boot's ranking cannot happen
+/// without the key having been reused for another deployment. It is checked
+/// anyway, image for image, because the alternative to a loud refusal here is
+/// a pump of the wrong length onto a store of this one's — and it costs one
+/// walk of an index already in hand.
+///
+/// **AND THE MAPPED-RUNG IMAGES ARE HASHED BEFORE A KERNEL IS POINTED AT
+/// THEM.** The body says why that one is asked here, up front, and whole.
+fn open_tiers(
+    dir: &Path,
+    key: u64,
+    ranking: &crate::experts::Ranking,
+    plan: &crate::experts::Plan,
+    source: &Path,
+) -> std::result::Result<crate::weight_cache::tier::Artifact, Miss> {
+    use crate::weight_cache::Refused;
+    use crate::weight_cache::tier;
+
+    let path = tier::path(dir, key);
+    let artifact = match tier::Artifact::open(&path) {
+        Ok(artifact) => artifact,
+        // **THE MISS THAT USED TO BE SILENT** (§M-3). While the cold path
+        // existed this was the ordinary first boot and nobody needed told;
+        // now it is the whole reason a deployment will not start, and the
+        // sentence has to answer the question an operator actually has, which
+        // is *why this key and not the one whose file is sitting right there*.
+        // `absent` is that census.
+        Err(Refused::Unreadable { .. } | Refused::NotAnArtifact) => {
+            return Err(Miss::Absent(absent(dir, key, &path, source)));
+        }
+        // An operator who upgraded a build over a populated directory learns
+        // why — and, since §M, what to run about it. Through `tier::refuse`
+        // like every other refusal here, so the three read as one message.
+        Err(Refused::StaleFormat { states, reads }) => {
+            return Err(Miss::Refused(tier::refuse(
+                &path,
+                Some(source),
+                &format!(
+                    "states format {states} and this build reads {reads}, so its images \
+                     cannot be cut by this one"
+                ),
+            )));
+        }
+        // A file under this key that does not describe itself: a header whose
+        // arithmetic does not close, images that do not tile their own
+        // payload, a name and a header that name different deployments. No
+        // byte was hashed to find any of them, so this is where they are
+        // counted.
+        Err(other) => {
+            tier::count_corrupt();
+            return Err(Miss::Refused(tier::refuse(&path, Some(source), &format!("{other}"))));
+        }
+    };
+    // **A FILE WHOSE ADAPTER BANKS WERE LIVE IS NOT A BOOT IMAGE.** The flag
+    // states that the registered planes were zeros when the snapshot was
+    // taken, which is what lets this file omit them and a restore leave the
+    // store's own zeros in place. A file without it was written by something
+    // that moved the call out of `Weights::resident`, and the right answer to
+    // that is a refusal rather than a silent extra weight.
+    if artifact.head().flags & tier::FLAG_ADAPTERS_ZEROED == 0 {
+        return Err(Miss::Refused(tier::refuse(
+            &path,
+            Some(source),
+            "does not state that its registered planes were zeros when it was written, \
+             and a restore that left this store's zeros in place would be seating \
+             whatever they held",
+        )));
+    }
+    // ── **AND THE INDEX IS THIS BOOT'S RANKING, IMAGE FOR IMAGE.**
+    let want = ranking.images();
+    let holds = artifact.entries();
+    if holds.len() != want.len() {
+        tier::count_corrupt();
+        return Err(Miss::Refused(tier::refuse(
+            &path,
+            Some(source),
+            &format!(
+                "carries {} plane images where this trace ranks {}; the key mixes the \
+                 sequence (§M.3), so a file this far from the ranking that names it is a \
+                 key that has been reused for another deployment",
+                holds.len(),
+                want.len(),
+            ),
+        )));
+    }
+    for (at, (param, offset, bytes, reserved)) in want.into_iter().enumerate() {
+        let holds = holds[at];
+        if u64::from(holds.id) != param
+            || holds.offset != offset
+            || holds.bytes != bytes
+            || holds.reserved != reserved
+        {
+            tier::count_corrupt();
+            return Err(Miss::Refused(tier::refuse(
+                &path,
+                Some(source),
+                &format!(
+                    "states image {at} as param {} at payload byte {} ({} of {} bytes) \
+                     where this trace ranks param {param} at {offset} ({bytes} of \
+                     {reserved}); the two were written from different traces",
+                    holds.id, holds.offset, holds.bytes, holds.reserved,
+                ),
+            )));
+        }
+    }
+    // ── AND THE MAPPED-RUNG IMAGES ARE HASHED BEFORE A KERNEL IS POINTED AT
+    //    THEM (§K.5). The other rungs are verified AS THEIR BYTES CROSS,
+    //    which is what keeps "always checksummed" from being a second pass
+    //    over a hundred gigabytes. A T2 image never crosses: its bytes are
+    //    read by the GPU, one page at a time, out of a mapping — there is no
+    //    moment a reader could hash a page at, and no hook to hang a
+    //    first-touch check on.
+    //
+    //    So they are hashed HERE, whole, once, and the cost is honest:
+    //    parallel FNV chains over the images this budget spills, which on
+    //    this SKU is a couple of seconds. It buys two things at that price.
+    //    The first is §K.5 itself — *a silently-corrupt weight artifact
+    //    produces garbage tokens with no error* — and the T2 images are the
+    //    ones whose corruption no later check would catch. The second is
+    //    free: the read that hashes them is a sequential NVMe pass that
+    //    leaves them in the page cache, which is precisely the state the
+    //    first fires would otherwise fault them into one page at a time.
+    //
+    //    **AND THE FILE SURVIVES A DISAGREEMENT** (§M.4). Format 2 deleted
+    //    here, on the argument that a tier artifact was one this shell could
+    //    re-form. It is the model now: an IMPORT rewrites it, and the
+    //    decision to replace a hundred gigabytes belongs to the write that
+    //    succeeds, not to the read that failed.
+    let spilled: Vec<u32> = artifact
+        .entries()
+        .iter()
+        .filter(|group| plan.mapped(usize::try_from(group.id).unwrap_or(usize::MAX)))
+        .map(|group| group.id)
+        .collect();
+    if !spilled.is_empty()
+        && let Err(why) = artifact.verify_entries(&spilled)
+    {
+        return Err(Miss::Refused(tier::refuse(&path, Some(source), &format!("{why}"))));
+    }
+    Ok(artifact)
+}
+
+/// **WHY THIS LOAD HAS NO SERVING ARTIFACT** — the sentence, and which kind of
+/// news it is (§M-3).
+///
+/// Both variants carry a finished sentence, so nothing downstream formats
+/// anything. What the variant decides is who SAYS it:
+///
+/// ```text
+///   Absent    a prepare says nothing — it is about to write the file
+///   Refused   a prepare SAYS IT, because "I am replacing a rotted 100 GiB
+///             artifact" is the one line that run owes an operator
+/// ```
+///
+/// A serving load refuses on either, with the sentence, and never prints from
+/// here: it hands it to `Fault::Residency` and the runtime logs it once
+/// against the load it refused.
+enum Miss {
+    /// No file under this key, and the census of what IS in the directory.
+    Absent(String),
+    /// A file this build will not read. Already counted at the door that
+    /// found it.
+    Refused(String),
+}
+
+impl Miss {
+    /// The sentence, whichever kind of miss it is.
+    fn why(&self) -> &str {
+        match self {
+            Miss::Absent(why) | Miss::Refused(why) => why,
+        }
+    }
+}
+
+/// **THE LOUD MISS** (§M-3): this key's file is not on the disk, said in a way
+/// that distinguishes the two things that means.
+///
+/// The bug this closes is M-3's own finding. `tier_key` is the FILENAME, and
+/// the key mixes the checkpoint, the load plan and the ranking — so an edit to
+/// a model text, a new recipe, a rebuilt contract all produce a NEW key, and
+/// before this wave the boot answered that by going cold beside a ~100 GiB
+/// file it would never open again. Two files, twice the disk, and not one line
+/// saying so.
+///
+/// So the refusal looks in the directory and answers the operator's real
+/// question:
+///
+/// ```text
+///   others found   the plan or the recipe changed. They are NAMED, with
+///                  their sizes, because the follow-up question is always
+///                  "then what is that hundred gigabytes" and the answer is
+///                  "the previous recipe's, and nothing will read it again"
+///   none found     this model was never prepared on this machine
+/// ```
+///
+/// Four names at most: the list is a prompt to go and look, not an inventory,
+/// and a cache directory with thirty deployments in it would bury the remedy
+/// under its own census. They are newest-first ([`tier::others`]), so the four
+/// shown are the ones most likely to be the recipe just replaced.
+fn absent(dir: &Path, key: u64, path: &Path, source: &Path) -> String {
+    use crate::weight_cache::tier;
+
+    let others = tier::others(dir, key);
+    let why = if others.is_empty() {
+        format!(
+            "is not there, and {dir:?} holds no serving artifact at all — this \
+             deployment has never been prepared on this machine"
+        )
+    } else {
+        let shown: Vec<String> = others
+            .iter()
+            .take(4)
+            .map(|other| {
+                let name = other
+                    .file_name()
+                    .map_or_else(|| other.display().to_string(), |name| {
+                        name.to_string_lossy().into_owned()
+                    });
+                let bytes = other.metadata().map_or(0, |meta| meta.len());
+                // GiB is the unit the disk cost is felt in and the unit every
+                // other line here uses; a file under one is rendered in MiB
+                // rather than as `0.0 GiB`, which reads as "empty" for a
+                // number whose whole job is to be alarming.
+                match bytes >= (1u64 << 30) {
+                    true => format!("{name} ({:.1} GiB)", bytes as f64 / (1u64 << 30) as f64),
+                    false => format!("{name} ({:.1} MiB)", bytes as f64 / (1u64 << 20) as f64),
+                }
+            })
+            .collect();
+        let rest = match others.len().saturating_sub(shown.len()) {
+            0 => String::new(),
+            more => format!(", and {more} more"),
+        };
+        format!(
+            "is not there, and {} other serving artifact{} sit{} beside it in {dir:?}: \
+             {}{rest}. The key is the filename and it is a function of the checkpoint, \
+             the load plan and the ranking — so a changed model text, a changed recipe \
+             or a changed contract is a changed key, and those files are this \
+             deployment under a recipe this build no longer reads",
+            others.len(),
+            if others.len() == 1 { "" } else { "s" },
+            if others.len() == 1 { "s" } else { "" },
+            shown.join(", "),
+        )
+    };
+    tier::refuse(path, Some(source), &why)
+}
+
+/// **THE MISS WITH NO KEY AT ALL** — the one refusal that is not about a file
+/// (§M-3).
+///
+/// A streamed load reaches this when it was offered no weight cache directory,
+/// or when the load plan would not serialize so no key could be formed
+/// ([`tier_identity`]). Neither is a rotted artifact and neither has a
+/// `pie model import` remedy on its own, so the sentence is its own rather
+/// than [`tier::refuse`](crate::weight_cache::tier::refuse)'s shape — what an
+/// operator has to change is the CONFIG, and it is named.
+fn unkeyed(dir: Option<&Path>, source: &Path) -> Miss {
+    Miss::Refused(match dir {
+        None => format!(
+            "engine-cuda: this load streams its expert banks and can only be served out \
+             of a prepared serving artifact, and this deployment states no weight cache \
+             directory to look in. Set `[model] weight_cache_dir` and run `{}`.",
+            crate::weight_cache::tier::rebuild(Some(source)),
+        ),
+        Some(dir) => format!(
+            "engine-cuda: this load streams its expert banks and can only be served out \
+             of a prepared serving artifact under {dir:?}, and its load plan does not \
+             serialize — so this build can form no key and can name no file. That is a \
+             refusal about this BUILD and not about anything on the disk."
+        ),
+    })
+}
+
+/// **THE CUT: WHAT THIS BOOT'S BUDGETS MAKE OF A BUDGET-FREE ARTIFACT**
+/// (§M.3).
+///
+/// The one place the file's ranking meets this load's plan. The artifact holds
+/// one image per plane in an order no budget touches; `places` and `plan` say
+/// where each of them goes THIS time, and this is that walk, done once, so
+/// that the restore and its verification cannot disagree about which image is
+/// on which rung.
+///
+/// ```text
+///   pump    images the device store holds: [0 .. c1)
+///   pinned  images the pinned tier holds:  [c1 .. c2)
+///   mapped  images served where they lie:  [c2 ..  )
+/// ```
+///
+/// The three cuts are RANK THRESHOLDS and not strict prefixes, because
+/// `Plan::cut`'s walk goes on past a group too large for the tier it is being
+/// offered (its own doc argues why). Nothing here needs them to be prefixes:
+/// every image is addressed by its own index entry, so a rung is a SET of
+/// entries and the ordering is what makes that set nearly contiguous rather
+/// than what makes it addressable.
+struct Cut {
+    /// `(payload offset, bytes, store offset)` per image the store holds.
+    pump: Vec<(u64, u64, u64)>,
+    /// `(payload offset, span, first block, pinned offset)` per T1 image.
+    pinned: Vec<(u64, u64, u64, u64)>,
+    /// The params behind `pump`, for the digest that runs beside it.
+    device_params: Vec<u32>,
+    /// The params behind `pinned`, for the deferred seat's verify-in-place.
+    pinned_params: Vec<u32>,
+}
+
+/// [`Cut`]'s walk. `Err` is a file that cannot be cut at all — which is a
+/// claim about the FILE, because the plan and the ranking were checked against
+/// each other in [`open_tiers`] before this ran.
+fn cut_of(
+    artifact: &crate::weight_cache::tier::Artifact,
+    places: &[Place],
+    plan: &crate::experts::Plan,
+) -> std::result::Result<Cut, String> {
+    let mut cut = Cut {
+        pump: Vec::new(),
+        pinned: Vec::new(),
+        device_params: Vec::new(),
+        pinned_params: Vec::new(),
+    };
+    // ── [0 .. c1): WHAT THE DEVICE STORE HOLDS.
+    for entry in artifact.entries() {
+        let param = usize::try_from(entry.id).unwrap_or(usize::MAX);
+        let Some(place) = places.get(param) else {
+            return Err(format!("carries an image for param {param}, which this trace has not"));
+        };
+        if place.reserved == 0 {
+            continue;
+        }
+        // **A STREAMED BANK'S SLAB IS NOT PUMPED.** The store gives it
+        // `resident` slots and `Tier::land` fills every one of them from the
+        // pinned copy — one copy per slot, because a slot's stride and an
+        // expert's stride are the same number only while the slots are the
+        // first `resident` experts. Pumping the bank's prefix here would write
+        // bytes that call overwrites, and would write them over the padding
+        // `Buffer::zeroed` left, which is the one difference a cold boot's
+        // store would still have from this one.
+        if plan.resident(param).is_some() {
+            continue;
+        }
+        if entry.bytes != place.bytes {
+            return Err(format!(
+                "states {} bytes for param {param} and this trace publishes {}",
+                entry.bytes, place.bytes,
+            ));
+        }
+        cut.pump
+            .push((entry.offset, place.bytes.min(place.reserved), place.offset));
+        cut.device_params.push(entry.id);
+    }
+    // ── [c1 .. c2): WHAT THE PINNED TIER HOLDS, at the tier's own offsets.
+    for (param, host_at, _, reserved) in plan.host_layout() {
+        let id = u32::try_from(param).unwrap_or(u32::MAX);
+        let Some((entry, first_block)) = artifact.locate(id) else {
+            return Err(format!("carries no image for param {param}, which this plan pins"));
+        };
+        if entry.reserved != reserved {
+            return Err(format!(
+                "gives param {param} a {}-byte image and the pinned tier seats it in \
+                 {reserved}",
+                entry.reserved,
+            ));
+        }
+        cut.pinned.push((entry.offset, reserved, first_block, host_at));
+        cut.pinned_params.push(id);
+    }
+    Ok(cut)
+}
+
+/// **SHOULD THIS WARM BOOT SERVE OUT OF THE FILE WHILE IT PAGE-LOCKS?**
+/// (§L.1, phase L-1). The artifact to serve T1 from, or `None` for a boot that
+/// makes its page-locked image up front the way every warm boot did.
+///
+/// # What it costs to say yes, and what it buys
+///
+/// A warm streamed boot of this SKU spends the great majority of its life in
+/// two terms that produce no answer: `cudaHostAlloc` page-locking the whole
+/// pinned image, and the read that fills it. Neither is needed to SERVE. A
+/// packed select reads its plane bases out of a cell and dereferences them; it
+/// cannot tell a page-locked address from a mapped one, and neither can a
+/// dense bank's table entry. So the images this cut puts on T1 are verified
+/// where they lie — once, before a kernel is pointed at them — and the tier
+/// serves them out of the mapping. The first token arrives at meta + compile +
+/// the device pump.
+///
+/// The window that follows is the honest cost and §L.5 states it: until the
+/// background fill lands, every T1 plane a fire reads is an NVMe page fault
+/// over HMM rather than a PCIe read out of page-locked memory. **This wave
+/// buys the first token, not the throughput.**
+///
+/// # The three conditions, and why each is a condition
+///
+/// ```text
+///   a warm artifact   there is nothing to serve out of without one
+///   host_image > 0    a plan that seats nothing on T1 has nothing to defer
+///   pageable_access   without HMM a mapped host pointer is not a device
+///                     pointer at all — the same attribute T2 stands on
+/// ```
+///
+/// **A DEVICE WITHOUT THE ATTRIBUTE FALLS BACK, IT IS NOT REFUSED** (§L,
+/// hazard H4). `Tier::open`'s T2 arm refuses instead, and the difference is
+/// which promise is being kept: a plan that SPILLED cannot be served at all
+/// without the attribute, while this is a boot-time optimization over a road
+/// that still works. A policy, not a refusal.
+///
+/// The artifact is opened a second time here, and deliberately — `resident`'s
+/// own note on the T2 source argues the shape: `warm` is borrowed by the
+/// restore and dropped at the end of the load, while THIS mapping has to
+/// outlive it, because every T1 address the tier hands out points inside it
+/// until the install. Two `mmap`s of one inode share their pages, so the
+/// second costs a file descriptor and an address range.
+fn defer_tiers(
+    warm: Option<&crate::weight_cache::tier::Artifact>,
+    plan: &crate::experts::Plan,
+) -> Option<crate::weight_cache::tier::Artifact> {
+    use crate::weight_cache::tier;
+
+    let warm = warm?;
+    if plan.host_image() == 0 || !crate::experts::pageable_access() {
+        return None;
+    }
+    let artifact = tier::Artifact::open(warm.path()).ok()?;
+    // The same comparison `open_tiers` makes and for the same reason: this is
+    // a SECOND open of a path, and a file that changed under the boot between
+    // the two is a file this tier must not seat itself over. Nothing is
+    // counted here — the door that hashed the bytes owns that — and a
+    // disagreement simply means the eager road. Every image this seat will
+    // actually serve is checked one at a time by `Tier::open`'s deferred arm.
+    (artifact.key() == warm.key()).then_some(artifact)
+}
+
+/// **Why a warm streamed boot did not get its images.**
+///
+/// It said "fell through to the cold load" until §M-3, and there is nothing to
+/// fall through to: a `Serve` refuses on either of these and only a `Prepare`
+/// goes on to write the file. What the distinction still decides is what the
+/// operator is TOLD, which is the whole reason it is two variants and not one
+/// string: bytes that do not hash to what the block table states are a file
+/// that will be refused identically on every boot until somebody rebuilds it,
+/// and a device or a disk that stopped answering is not the file's doing at
+/// all — telling that operator to re-import would send them to fix the one
+/// thing that is not broken. **Neither of them deletes it** (§M.4).
+enum Rotten {
+    /// The bytes are not the bytes. Counted at the door that hashed them —
+    /// [`Artifact::verify_entries`](crate::weight_cache::tier::Artifact::verify_entries)
+    /// and [`read_spans_into`](crate::weight_cache::tier::read_spans_into)
+    /// each count what they find — and named here with the remedy.
+    Bytes(String),
+    /// The machine could not do it. Said out loud.
+    Machine(String),
+}
+
+/// **The pinned tier's read targets, as something a scope thread may carry.**
+///
+/// A `*mut u8` is not `Send` and must not be, because nothing about a raw
+/// pointer says who else is holding it. What makes THESE sound to move is the
+/// sentence at their one construction site: the allocation is the tier's, the
+/// tier belongs to a `Weights::resident` that has not returned, the spans are
+/// disjoint because `Plan::host_layout` tiles the image, and the only other
+/// thread in that scope writes the device store.
+struct Destinations(Vec<crate::weight_cache::tier::Span>);
+
+// SAFETY: as above — a list of disjoint spans of one allocation, moved once,
+// into a thread that is their sole writer for as long as the scope is open.
+unsafe impl Send for Destinations {}
+
+/// **FILL THIS LOAD'S TIERS OUT OF THE ARTIFACT** (§K.4), or say why not.
+///
+/// Answers `None` when every image the cut names crossed AND verified, which
+/// is the only answer that lets the caller skip the executor. Every `Some` is
+/// the refusal's sentence — and, under [`Intent::Prepare`], leaves the store
+/// zeroed and the pinned tier zeroed, the state a cold load starts from, so
+/// the landing that follows starts from where it would have started.
+///
+/// # The shape
+///
+/// ```text
+///   T1      one positioned read per image, straight into the pinned tier,
+///           each hashing its own blocks from the bytes as they land
+///   T0      one staged transfer per image, at the store's own offsets, with
+///           the block digests running beside them over the same mapping
+/// ```
+///
+/// **THE DEVICE ARM IS A LIST OF TRANSFERS NOW AND NOT ONE.** Format 2's
+/// device section WAS the store's image, so a restore pumped it back as a
+/// single copy at offset zero. §M's payload is the ranking's order and the
+/// store's layout is `places`' — two orders, and the store's is the one that
+/// moves with the budget — so the restore names each image's destination
+/// itself. It costs nothing: `Lanes::pump` splits every transfer into 2 MiB
+/// chunks and round-robins the lot across its lanes, so a hundred transfers
+/// and one transfer of the same bytes are the same queue.
+///
+/// # And the deferred shape, which is the same shape (§L.3)
+///
+/// A tier opened over the mapping ([`Tier::deferring`](
+/// crate::experts::Tier::deferring)) has nowhere to read its T1 images INTO,
+/// so the host arm hashes them WHERE THEY LIE — `verify_entries` in the same
+/// position, in the same scope, beside the same device pump. Everything else
+/// about this function is unchanged, including both recoveries.
+///
+/// **Verify-first, and the alternative was rejected by name.** Trusting the
+/// mapping and checking it lazily has no place to hang the check: nothing
+/// hooks a first touch, the GPU faults each page in on its own, and the blast
+/// radius of a wrong byte is tokens that have already been handed to a caller.
+/// `open_tiers` wrote that argument for the mapped rung and it is the same
+/// argument here.
+///
+/// Nothing is staged on the host for T1 — the read target IS the pinned tier —
+/// and nothing is staged for T0 beyond the pump's own lanes. **Both
+/// verifications happen as the bytes cross**, which is what keeps "always
+/// verified" (§K.5) from being a second pass over 100 GiB.
+///
+/// # Why the host arm goes first
+///
+/// Because it is the one whose failure has an ordering consequence. The tier
+/// was allocated WITHOUT its memset on the strength of this call covering
+/// every byte of it, and reading it first means the window in which that
+/// promise is outstanding is as short as the file allows.
+///
+/// # And what a refusal is now (§M-3)
+///
+/// It answers the SENTENCE rather than `false`, for [`open_tiers`]' reason:
+/// there is no cold serving path left, so a serving caller turns this into a
+/// `Fault::Residency` and only a prepare goes on to write the file. `None` is
+/// a restore that happened.
+///
+/// **AND A SERVING REFUSAL PAYS NO RECOVERY.** The zeroing below exists so
+/// that the load which CONTINUES starts where a cold boot starts; a load that
+/// is about to return an error continues nowhere, its `Buffer` and its `Tier`
+/// are dropped on the way out, and `Tier::undefer` in particular would
+/// page-lock tens of gigabytes for a `Weights` that will never exist. So it is
+/// spent under [`Intent::Prepare`] and skipped under [`Intent::Serve`].
+///
+/// # Errors
+///
+/// [`Fault::Device`] only, and only for the zeroing a refusal owes the store.
+/// A refusal is not an error here: a prepare has a way to produce these bytes,
+/// and taking it is what a `Some` lets it do.
+fn restore_tiers(
+    artifact: &crate::weight_cache::tier::Artifact,
+    source: &Path,
+    places: &[Place],
+    store: &mut Buffer,
+    tier: &mut crate::experts::Tier,
+    intent: Intent,
+) -> Result<Option<String>> {
+    use crate::weight_cache::tier;
+
+    let deferring = tier.deferring();
+    match fill_tiers(artifact, places, store, tier) {
+        Ok(()) => {
+            tier::count_restored();
+            // ── **AND THE WINDOW OPENS HERE, NOT EARLIER** (§L.4). The
+            //    background fill is armed AFTER the scope above has closed,
+            //    which is after `Lanes::standard()` has opened its own pinned
+            //    buffers and freed them again. Two reasons, and the charter
+            //    names the first: a `cudaHostAlloc` over the whole image holds
+            //    the runtime's memory-manager lock for tens of seconds, and a
+            //    lane pool trying to allocate behind it waits (hazard H1). The
+            //    second is the disk — the pump and the host verify above are
+            //    the road to the first token, and a third reader on the same
+            //    NVMe is bandwidth taken off it.
+            if deferring {
+                tier::count_deferred();
+                arm_refill(tier);
+            }
+            Ok(None)
+        }
+        Err(rotten) => {
+            // **TWO SENTENCES, AND ONLY ONE OF THEM IS ABOUT THE FILE.** A
+            // rotted image is `tier::refuse`'s shape like every other refusal
+            // an artifact earns; a read the MACHINE would not do is not the
+            // artifact's fault and must not tell an operator to rebuild it —
+            // it names the file, says what failed, and stops.
+            let why = match &rotten {
+                Rotten::Bytes(why) => tier::refuse(artifact.path(), Some(source), why),
+                Rotten::Machine(why) => format!(
+                    "engine-cuda: the serving artifact {:?} could not be read back \
+                     ({why}). The file is left exactly where it is: this is a device or \
+                     a disk that stopped answering rather than an artifact that rotted, \
+                     and rebuilding it would fix nothing.",
+                    artifact.path(),
+                ),
+            };
+            if intent == Intent::Serve {
+                return Ok(Some(why));
+            }
+            // **WHATEVER CROSSED IS THROWN AWAY**, whichever arm failed. The
+            // store goes back to `Buffer::zeroed`'s state for
+            // `weight_cache::restore`'s reason — a half-filled store is not a
+            // state the cold load has ever started from — and the pinned tier
+            // goes back to it because the allocation skipped its memset on
+            // this call's promise (`Fill::Restored`). Zeroing a tier that was
+            // in fact filled correctly, because the OTHER arm rotted, costs
+            // one memset on the rarest path there is; the alternative is a
+            // second piece of state to reason about.
+            //
+            // **AND A DEFERRED SEAT OWES MORE THAN A MEMSET** (§L.3): it has
+            // no allocation at all, and no verified mapping left to serve out
+            // of. `Tier::undefer` makes the page-locked image the deferred arm
+            // declined to make, zeroed, which is the state the prepare's cold
+            // landing below starts from.
+            store.zero_span(0, store.bytes())?;
+            match deferring {
+                true => tier.undefer()?,
+                false => tier.zero_host(),
+            }
+            Ok(Some(why))
+        }
+    }
+}
+
+/// [`restore_tiers`] without the counting or the zeroing — so that every
+/// refusal below is one `?` and the recovery is stated once.
+fn fill_tiers(
+    artifact: &crate::weight_cache::tier::Artifact,
+    places: &[Place],
+    store: &mut Buffer,
+    tier: &crate::experts::Tier,
+) -> std::result::Result<(), Rotten> {
+    use crate::weight_cache::Refused;
+    use crate::weight_cache::tier;
+
+    let head = artifact.head();
+    let cut = cut_of(artifact, places, tier.plan()).map_err(Rotten::Bytes)?;
+    // ── T1'S DESTINATIONS. `Plan::host_layout` tiles the pinned image
+    //    exactly — every bank's padded span, then every pinned plane's — so
+    //    the spans below cover `0..Pinned::bytes` with no gap and no overlap,
+    //    and every byte of the allocation is written by this call.
+    // A DEFERRED SEAT HAS NO ALLOCATION TO MEASURE, and `Tier::open` already
+    // measured the thing it has instead: it resolved every one of these images
+    // against the file, or it refused.
+    let seated = tier.deferred_image();
+    let host = tier.host();
+    let covers: u64 = cut.pinned.iter().map(|(_, span, _, _)| *span).sum();
+    if seated.is_none() && covers != host.bytes() as u64 {
+        return Err(Rotten::Bytes(format!(
+            "answers for {covers} pinned bytes and this boot allocated {}",
+            host.bytes(),
+        )));
+    }
+    let into = Destinations(
+        cut.pinned
+            .iter()
+            .map(|(at, span, first_block, host_at)| tier::Span {
+                at: *at,
+                len: *span,
+                first_block: *first_block,
+                // SAFETY: `host_at + span <= host.bytes()`, because the spans
+                // tile the allocation and the sum was just checked against its
+                // length.
+                into: unsafe {
+                    host.host().add(usize::try_from(*host_at).unwrap_or(usize::MAX))
+                },
+            })
+            .collect(),
+    );
+
+    // ── T0'S. One transfer per image the store holds, at the store's own
+    //    offsets, out of the mapping.
+    let base = store.at(0).map_err(|why| Rotten::Machine(format!("{why}")))?;
+    let payload = artifact.payload();
+    let mut transfers = Vec::with_capacity(cut.pump.len());
+    for (at, len, store_at) in &cut.pump {
+        let from = usize::try_from(*at).unwrap_or(usize::MAX);
+        let want = usize::try_from(*len).unwrap_or(usize::MAX);
+        let Some(span) = payload.get(from..from.saturating_add(want)) else {
+            return Err(Rotten::Bytes(format!(
+                "maps {} payload bytes and an image wants {from}..{}",
+                payload.len(),
+                from + want,
+            )));
+        };
+        // The one bounds check on this path: the pump takes device addresses,
+        // so the span meets the store's length here rather than at
+        // `Buffer::write`'s door, which this arm does not go through.
+        store.at(store_at.saturating_add(*len)).map_err(|why| {
+            Rotten::Machine(format!("an image does not fit the store: {why}"))
+        })?;
+        transfers.push(crate::staged_h2d::Transfer {
+            dst: base + store_at,
+            src: span.as_ptr(),
+            len: *len,
+        });
+    }
+
+    // ── AND THE TWO ARMS RUN AT THE SAME TIME.
+    //
+    // **BECAUSE NEITHER OF THEM IS WAITING ON A DISK.** Both are verified as
+    // they arrive, one FNV chain per 64 MiB block, and an FNV-1a chain is a
+    // serial multiply per byte — call it a gigabyte a second on one core,
+    // which is well under what the NVMe behind either read will give. Run one
+    // after the other and the machine spends half its time with idle cores and
+    // a queue-depth of nothing; run them together and the whole restore costs
+    // what its longer arm costs. The two touch nothing in common: one writes
+    // page-locked host memory through positioned reads, the other writes
+    // device memory through the staged pump's own lanes.
+    let (read, moved, verified) = std::thread::scope(|scope| {
+        // SAFETY: the spans in `into` are disjoint windows on the tier's own
+        // allocation, they tile it, and this load is inside
+        // `Weights::resident` — so no kernel has been enqueued against the
+        // tier, no guest exists, and the landing sink that writes it has not
+        // run. Nothing else in this scope names a byte of it: the device arm
+        // below writes the STORE.
+        let reading = scope.spawn(move || match seated {
+            // ── **VERIFIED WHERE THEY LIE** (§L.3). There is nowhere to read
+            //    them into: the tier is seated over these very images and the
+            //    kernels will fault their pages in themselves. So the same
+            //    chains hash the same bytes in the same position in this
+            //    scope, and what the answer decides is the same thing —
+            //    whether the load may go on. The read that hashes them also
+            //    leaves them in the page cache, which is exactly the state the
+            //    first fires would otherwise fault them into one page at a
+            //    time.
+            //
+            //    AND IT IS THE TIER'S OWN MAPPING THAT IS HASHED, not this
+            //    restore's view of the path — `Tier::deferred_image` argues
+            //    the difference, and it is the difference between promising
+            //    that the FILE was checked and promising that the BYTES SERVED
+            //    were.
+            Some(seated) => seated.verify_entries(&cut.pinned_params),
+            None => {
+                let into = into;
+                let blocks = artifact.blocks();
+                unsafe { tier::read_spans_into(artifact.path(), &head, blocks, &into.0) }
+            }
+        });
+        let (moved, verified) = match transfers.is_empty() {
+            true => (Ok(()), Ok(Ok(()))),
+            false => {
+                let mut lanes = match crate::staged_h2d::Lanes::standard() {
+                    Ok(lanes) => lanes,
+                    Err(why) => return (reading.join(), Err(why), Ok(Ok(()))),
+                };
+                // **THE DEVICE DIGESTS RUN BESIDE THEIR OWN LANES**, over the
+                // same mapping the lanes are faulting in, exactly as the
+                // resident restore's does.
+                std::thread::scope(|inner| {
+                    let hashing = inner.spawn(|| artifact.verify_entries(&cut.device_params));
+                    let moved = lanes.pump(&transfers);
+                    (moved, hashing.join())
+                })
+            }
+        };
+        (reading.join(), moved, verified)
+    });
+
+    // The host arm first, whichever failed: it is the one whose destination
+    // the allocation skipped a memset for, so its answer is the one a reader
+    // of this function is looking for.
+    match read {
+        Ok(Ok(())) => {}
+        Ok(Err(Refused::IndexCorrupt { why })) => return Err(Rotten::Bytes(why)),
+        Ok(Err(other)) => return Err(Rotten::Machine(other.to_string())),
+        Err(_) => return Err(Rotten::Machine("a host reader panicked".to_string())),
+    }
+    moved.map_err(|why| Rotten::Machine(format!("staged upload failed: {why}")))?;
+    match verified {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(why)) => Err(Rotten::Bytes(why.to_string())),
+        Err(_) => Err(Rotten::Machine("a digest worker panicked".to_string())),
+    }
+}
+
+/// **ARM THE BACKGROUND FILL BEHIND A DEFERRED SEAT** (§L.4).
+///
+/// Spawns the thread, hands the tier its end of the channel, and answers
+/// nothing: a fill that cannot be armed is a seat that serves out of the
+/// mapping for its whole life, which is slower and is not wrong. Every refusal
+/// is a line an operator can read.
+///
+/// **WHAT CROSSES, AND IT IS THE WHOLE LIST**: a `PathBuf`, a `Head`, the
+/// block table, the span list this seat's cut produced, and a device ordinal.
+/// Not the tier, not the mapping, not the artifact — the thread re-opens the
+/// file by path and reads it with positioned reads, so nothing on this side is
+/// aliased and no lifetime has to be argued across a spawn.
+fn arm_refill(tier: &mut crate::experts::Tier) {
+    // The tier's OWN mapping, which is the one the arm above just verified —
+    // so the digests this thread reads the file back against are the digests
+    // of the bytes this seat is serving. See `Tier::deferred_image`.
+    let Some(image) = tier.deferred_image() else {
+        return;
+    };
+    let path = image.path().to_path_buf();
+    let head = image.head();
+    let blocks = image.blocks().to_vec();
+    // The spans in the PAGE-LOCKED image's own coordinates: `host_at` is the
+    // offset the install will re-form every address from, so the copy this
+    // thread builds is laid out exactly as `Tier::reseat` expects it.
+    let mut spans: Vec<(u64, u64, u64, u64)> = Vec::new();
+    for (param, host_at, _, reserved) in tier.plan().host_layout() {
+        let id = u32::try_from(param).unwrap_or(u32::MAX);
+        let Some((entry, first_block)) = image.locate(id) else {
+            eprintln!(
+                "engine-cuda: the deferred tier's fill cannot find param {param} in \
+                 {path:?}; it will serve out of the mapping for the life of this load"
+            );
+            return;
+        };
+        spans.push((entry.offset, reserved.min(entry.reserved), first_block, host_at));
+    }
+    let bytes = usize::try_from(tier.plan().host_image()).unwrap_or(usize::MAX);
+    // `cudaSetDevice` is per-thread and does not travel with a spawn, so the
+    // ordinal is read HERE — on the thread the shell bound — and carried.
+    let ordinal = match crate::device::ctx::current() {
+        Ok(ordinal) => ordinal,
+        Err(why) => {
+            eprintln!(
+                "engine-cuda: the deferred tier cannot name its device ({why}); it will \
+                 serve out of {path:?} for the life of this load"
+            );
+            return;
+        }
+    };
+    let (send, filled) = std::sync::mpsc::channel();
+    match std::thread::Builder::new()
+        .name("pie-tier-refill".to_string())
+        .spawn(move || refill(&path, &head, &blocks, &spans, bytes, ordinal, &send))
+    {
+        Ok(filling) => tier.arm_refill(filling, filled),
+        Err(why) => eprintln!(
+            "engine-cuda: the deferred tier's fill thread would not start ({why}); it \
+             will serve out of the artifact for the life of this load"
+        ),
+    }
+}
+
+/// **THE FILL, ON ITS OWN THREAD**: bind, map, read, verify, page-lock, send.
+///
+/// The order is the order, and §L-3 moved one term of it: the mapping comes
+/// before the open so that the bytes have somewhere to land, and the
+/// PAGE-LOCK comes last, after they have landed and hashed. What that buys is
+/// [`Pinning`](crate::device::Pinning)'s subject — a `cudaHostAlloc` of this
+/// size holds the runtime's memory-manager lock against every other thread for
+/// tens of seconds, and this thread is armed while the boot still has work to
+/// do. `read_spans_into` does the reading and the hashing in one pass — one
+/// FNV chain per [`TIER_BLOCK`](crate::weight_cache::tier::TIER_BLOCK) AS THE
+/// BYTES LAND IN THIS ALLOCATION, which is a stronger claim than re-hashing
+/// the mapping would be: it verifies the copy the tier is about to serve out
+/// of and not a second view of the file. So the §L.3 corollary's "the
+/// background copy does not trust the boot's verify" is not a second pass
+/// bolted on here; it is what this call already is.
+///
+/// **A FAILURE SENDS NOTHING**, which is how [`Refill`](crate::experts) hears
+/// it. Bytes that do not hash to the table are a claim about the FILE: counted
+/// at the door that hashed them, named here with the remedy, and **the file is
+/// left where it is** (§M.4) — the seat keeps serving the verified mapping it
+/// has been serving all along, which is a performance failure and not a
+/// correctness one.
+fn refill(
+    path: &Path,
+    head: &crate::weight_cache::tier::Head,
+    blocks: &[u64],
+    spans: &[(u64, u64, u64, u64)],
+    bytes: usize,
+    ordinal: i32,
+    out: &std::sync::mpsc::Sender<crate::device::Pinned>,
+) {
+    use crate::weight_cache::Refused;
+    use crate::weight_cache::tier;
+
+    if let Err(why) = crate::device::ctx::bind_thread(ordinal) {
+        eprintln!("engine-cuda: the deferred tier's fill cannot bind device {ordinal} ({why})");
+        return;
+    }
+    // **UNINITIALIZED, AND THE PROMISE IS KEPT ONE LINE BELOW.**
+    // `read_spans_into` writes every span WHOLE — padding included, its own
+    // doc states it — and these spans tile this mapping. Nothing reads a byte
+    // of it before then: it is on this thread's stack and unreachable from the
+    // tier until it crosses the channel, which is a narrower window than the
+    // boot restore's.
+    //
+    // **AND IT IS NOT PAGE-LOCKED YET, WHICH IS THE WHOLE OF §L-3**
+    // ([`Pinning`](crate::device::Pinning) measures it). A `cudaHostAlloc`
+    // over sixty gigabytes holds the runtime's memory-manager lock for its
+    // whole length and every other CUDA call on every other thread waits
+    // behind it — the load's own remaining allocations, and the fires this
+    // seat exists to serve during the window. So the image is mapped, filled
+    // by the read below, and page-locked in ONE call at the end, by which time
+    // the boot that armed this thread has finished. Measured at qwen4's
+    // 60.2 GiB: a 3.4 s register where the allocation it replaces was ~36 s.
+    let host = match crate::device::Pinning::uninit(bytes) {
+        Ok(host) => host,
+        Err(why) => {
+            eprintln!(
+                "engine-cuda: the deferred tier's fill could not map {bytes} bytes \
+                 ({why}); the seat serves out of {path:?} for the life of this load"
+            );
+            return;
+        }
+    };
+    // SAFETY: `host` is a mapping of exactly `bytes`, which is
+    // `Plan::host_image`; the spans below are that plan's own `host_layout`,
+    // which tiles it; and the mapping was made on this thread one line above,
+    // has been handed to nobody, and no kernel, guest or other thread can name
+    // a byte of it until it is sent.
+    let spans: Vec<tier::Span> = spans
+        .iter()
+        .map(|(at, len, first_block, host_at)| tier::Span {
+            at: *at,
+            len: *len,
+            first_block: *first_block,
+            into: unsafe { host.host().add(usize::try_from(*host_at).unwrap_or(usize::MAX)) },
+        })
+        .collect();
+    // SAFETY: as above.
+    match unsafe { tier::read_spans_into(path, head, blocks, &spans) } {
+        // **THE LOCK IS TAKEN OVER BYTES THAT ARE ALREADY VERIFIED**, which is
+        // the other half of the reordering: a fill whose digests disagree
+        // never page-locks anything at all, where the old order paid for the
+        // whole allocation before it knew whether the file was worth one.
+        Ok(()) => match host.lock() {
+            Ok(host) => {
+                let _ = out.send(host);
+            }
+            Err(why) => eprintln!(
+                "engine-cuda: the deferred tier's fill could not page-lock {bytes} bytes \
+                 ({why}); the seat serves out of {path:?} for the life of this load"
+            ),
+        },
+        // **THE ONE REFUSAL WITH NO LOAD TO REFUSE.** This runs on the thread
+        // §L armed, behind a seat that is already serving out of the verified
+        // mapping, so the file is named, the remedy is named, and the fill
+        // stops — see `tier::rebuild`'s `None` for why the command is spelled
+        // with a slot in it here and with a path everywhere else.
+        Err(Refused::IndexCorrupt { why }) => eprintln!("{}", tier::refuse(path, None, &why)),
+        Err(other) => eprintln!(
+            "engine-cuda: the deferred tier's fill could not read {path:?} back ({other}); \
+             the seat serves out of the mapping and the file is left alone"
+        ),
+    }
+}
+
+/// **WRITE THIS DEPLOYMENT'S SERVING ARTIFACT** — one image per plane of the
+/// ranking, whatever rung this boot happened to put it on (§M.3).
+///
+/// Called once, from inside [`Weights::resident`], after the executor has run
+/// and before the tier is landed. Best effort in every direction: the load
+/// already succeeded and the images this reads from are the answer, so every
+/// refusal below is a counted line rather than a fault.
+///
+/// # The peak this does not add
+///
+/// No image is ever held. Each is streamed to the file in
+/// [`TIER_BLOCK`](crate::weight_cache::tier::TIER_BLOCK) pieces, out of
+/// whichever rung this boot put it on: `Buffer::read` for a plane in the
+/// store, `Pinned::view` for one on T1 — a window on the page-locked bytes,
+/// where `Pinned::read` would have allocated a second copy of a tier that may
+/// be sixty gigabytes — and a window on the source mapping for one on T2.
+///
+/// # What the file says, and what THIS boot has to do with it
+///
+/// The index is [`Ranking::images`](crate::experts::Ranking::images) verbatim:
+/// the sequence, hottest first, then the dense routed banks whole. **Not one
+/// entry of it is a function of the budgets** — which is the point, and the
+/// difference from every format before 3. What the budgets decide is only
+/// where this writer READS each image from, and the three rungs hold the same
+/// bytes (§M.3's measured fact), so two boots at two different budgets write
+/// the same file.
+///
+/// **A BANK IS WRITTEN WHOLE.** Its image is every expert, read out of the
+/// pinned tier — which holds all of them authoritatively — and never out of
+/// the device slab, which holds `resident` of them and is a cache over it.
+///
+/// **AND THE REGISTERED PLANES ARE NOT WRITTEN AT ALL.**
+/// [`FLAG_ADAPTERS_ZEROED`](crate::weight_cache::tier::FLAG_ADAPTERS_ZEROED)
+/// is what states that, and the ordering that makes it true is structural
+/// rather than checked: this runs INSIDE `Weights::resident`, which has not yet
+/// returned a `Weights` — and `register_adapter` is a method on one. So no
+/// registration can have happened, every adapter bank still holds what
+/// `Buffer::zeroed` left, and a restore leaves this store's own zeros in place
+/// rather than reading a hundred megabytes of them back. A caller that moves
+/// this call out of the constructor owes the flag a new argument or must stop
+/// setting it.
+fn write_tiers(
+    dir: Option<&Path>,
+    key: u64,
+    trace: &Trace,
+    landed: &[bool],
+    ranking: &crate::experts::Ranking,
+    places: &[Place],
+    tier: &crate::experts::Tier,
+    store: &Buffer,
+) {
+    use crate::weight_cache::Group;
+    use crate::weight_cache::tier;
+
+    // **NOTHING IS WRITTEN FOR A LOAD THAT DID NOT LAND.** The refusal for an
+    // unpublished plane is thirty lines below this call, in the table build,
+    // and it is the load's own answer; what must not happen in between is a
+    // FILE under this key describing an image with a hole in it — because the
+    // warm boot that reads it skips the executor, and therefore skips the
+    // check that would have caught the hole. Same condition as the table's,
+    // said here first: a registered plane is one the checkpoint does not have.
+    if let Some(at) = (0..trace.params.len())
+        .find(|at| !landed[*at] && trace.params[*at].source == ParamSource::Checkpoint)
+    {
+        tier::decline(&format!(
+            "`{}` is a plan param the load contract never published, so this load is \
+             about to be refused and its images describe a model with a hole in it",
+            trace.params[at].name,
+        ));
+        return;
+    }
+
+    let entries: Vec<Group> = ranking
+        .images()
+        .into_iter()
+        .map(|(param, at, bytes, reserved)| Group {
+            id: u32::try_from(param).unwrap_or(u32::MAX),
+            plane: 0,
+            offset: at,
+            bytes,
+            reserved,
+        })
+        .collect();
+    tier::store(dir, key, &entries, tier::FLAG_ADAPTERS_ZEROED, |param, at, into| {
+        let param = usize::try_from(param).unwrap_or(usize::MAX);
+        // The rungs are asked in the order that makes each answer a whole
+        // image: T1 holds a bank's every expert and a pinned plane whole, the
+        // mapping holds a spilled plane whole, and the store holds everything
+        // else — where `place.bytes` is what the checkpoint published into it.
+        if let Some(host_at) = tier.host_offset(param) {
+            let span = tier
+                .host()
+                .view(host_at + at, into.len() as u64)
+                .ok_or_else(|| {
+                    format!("the pinned tier holds no bytes for param {param} at {at}")
+                })?;
+            into.copy_from_slice(span);
+            return Ok(());
+        }
+        if let Some(bytes) = tier.mapped_plane(param) {
+            let from = usize::try_from(at).unwrap_or(usize::MAX);
+            let span = bytes
+                .get(from..from.saturating_add(into.len()))
+                .ok_or_else(|| format!("param {param} is short of {at} on the mapping"))?;
+            into.copy_from_slice(span);
+            return Ok(());
+        }
+        let place = places
+            .get(param)
+            .ok_or_else(|| format!("param {param} is not a plane of this trace"))?;
+        store
+            .read(place.offset + at, into)
+            .map_err(|why| format!("reading the device store for param {param} at {at}: {why}"))
+    });
+}
+
+/// The transform arena's backing: RAM when the machine has room for it beside
+/// everything this load has already spent, a file-backed map when it does not
+/// — see [`Scratch::fitting`] and the construction site in
+/// [`Weights::resident`] for the argument.
 enum Scratch {
     Ram(Vec<u8>),
     Disk(SpillArena),
 }
 
 impl Scratch {
-    /// `arena` bytes of scratch, spilled to disk when RAM will not hold the
-    /// arena AND the `pinned` bytes the tiers are about to lock, with a
-    /// safety share left for the rest of the load.
-    fn fitting(arena: usize, pinned: u64) -> Result<Scratch> {
-        let need = arena as u64 + pinned + (2 << 30);
+    /// `arena` bytes of scratch, spilled to disk when RAM will not hold it
+    /// with a safety share left for the rest of the load.
+    ///
+    /// **THE PINNED TIER IS NOT AN ARGUMENT HERE, BECAUSE IT IS ALREADY
+    /// SPENT.** The doc that stood here said this weighed the arena against
+    /// "the pinned bytes the tiers are about to lock", and the call site has
+    /// never passed those: `Tier::open` runs well above this line and its
+    /// `cudaHostAlloc` has already moved `MemAvailable` and this cgroup's
+    /// `memory.current` by the whole of T1. So [`available_memory`] READS the
+    /// tier rather than being told about it, and adding it to `need` would
+    /// have charged the same gigabytes twice and spilled arenas that fit.
+    ///
+    /// What the second argument really is: the bytes this load put on the
+    /// MAPPED tier — the ones no allocation has accounted for, because they
+    /// are a file the kernel will page in behind the executor. Charged as
+    /// headroom, which is what the page cache holding them costs.
+    fn fitting(arena: usize, mapped: u64) -> Result<Scratch> {
+        let need = arena as u64 + mapped + (2 << 30);
         if need <= available_memory() {
             return Ok(Scratch::Ram(vec![0u8; arena]));
         }
         eprintln!(
-            "engine-cuda: the load's {arena}-byte transform arena will not fit \
-             beside its {pinned} pinned bytes; spilling the arena to disk"
+            "engine-cuda: the load's {arena}-byte transform arena does not fit \
+             what is left of this machine's memory beside its {mapped} mapped \
+             bytes; spilling the arena to disk"
         );
         SpillArena::new(arena).map(Scratch::Disk)
     }
@@ -717,6 +2015,51 @@ fn pairings<'a>(
     Ok(out)
 }
 
+/// **WHICH OF THE TWO RUNS THIS IS** (§M-3: `.wiki/alto/zt-as-serving-artifact.md`).
+///
+/// [`Weights::resident`] has always been two functions wearing one name: the
+/// COLD half — decode the checkpoint, run the landing transforms, materialize
+/// a store, write a serving artifact out of it — and the WARM half, which
+/// opens that artifact, cuts it against this boot's budgets and pumps. Both
+/// were reachable from a serve, and which one ran was decided by whether a
+/// file happened to be on the disk.
+///
+/// §M-3 makes it a decision instead, and gives the two halves different
+/// owners:
+///
+/// ```text
+///   Serve     the warm half, and NOTHING ELSE. A streamed load with no
+///             artifact it can cut REFUSES, naming the command that makes
+///             one. It never streams, never transforms, never writes.
+///   Prepare   both halves, warm first: an artifact that opens and restores
+///             is one this box can serve and the run is over; anything else
+///             is said out loud and the cold half writes the file.
+/// ```
+///
+/// # Why this is a parameter and not a `cache_dir` that is `None`
+///
+/// Because those are opposite meanings. `cache_dir: None` says *this
+/// deployment has no artifact and wants none* — which under `Serve` is now a
+/// refusal for a streamed plan, since there is no other road. The prepare run
+/// is the one that MUST have a directory. Overloading the option would have
+/// made the writer indistinguishable from the feature being off.
+///
+/// # And why the fully-resident path does not read it
+///
+/// A model that fits device memory outright plans no tier, forms no
+/// [`tier_key`], and lands out of the checkpoint every time; its own
+/// whole-table cache ([`crate::weight_cache::store_indexed`]) is an
+/// accelerator that a miss simply skips. Nothing in this wave touches it, and
+/// the gate below is `plan.streams()` for exactly that reason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Intent {
+    /// A load that will serve fires. Warm or refused.
+    Serve,
+    /// `pie model import`'s run, through [`Shell::prepare`](crate::Shell). The
+    /// only writer of serving artifacts there is.
+    Prepare,
+}
+
 impl Weights {
     /// Land `contract` against the checkpoint at `path`.
     ///
@@ -733,18 +2076,37 @@ impl Weights {
     /// # The warm boot
     ///
     /// `cache_dir` is the weight artifact cache's directory, typed from
-    /// `Boot` (article 9: shells read no environment). `None` turns the
-    /// feature off entirely — no reads, no writes. With a directory, the
+    /// `Boot` (article 9: shells read no environment). With a directory, the
     /// device table is keyed on this load's whole recipe
     /// ([`weight_cache::Identity`]) and, on a match, read STRAIGHT TO THE
     /// DEVICE: the plan compile still runs (it is milliseconds, and it is what
     /// validates the contract against the checkpoint), and everything after it
     /// — the executor's host-side dequant, cast and repack, and the
-    /// per-tensor uploads — does not. A cold load writes the artifact on its
-    /// way out, and declines the write rather than filling the disk.
+    /// per-tensor uploads — does not.
     ///
     /// A corrupt artifact is never trusted and never silently retried: it is
-    /// counted, said out loud, deleted, and followed by the full load.
+    /// counted, said out loud, and LEFT ON THE DISK (§M.4).
+    ///
+    /// # And a STREAMED load is warm or it is nothing (§M-3)
+    ///
+    /// `intent` is the whole of the difference and [`Intent`] argues it. In
+    /// one line: a `Serve` whose `plan.streams()` and which cannot open,
+    /// cut and verify a serving artifact returns [`Fault::Residency`] naming
+    /// `pie model import --prepare-only`; it does not stream the checkpoint,
+    /// does not run the landing transforms, and cannot write a file. Only
+    /// `Prepare` reaches [`write_tiers`], which is the only caller of
+    /// [`tier::store`](crate::weight_cache::tier::store), which is the only
+    /// door that replaces one.
+    ///
+    /// **THE FULLY-RESIDENT PATH IS UNTOUCHED.** A plan that streams nothing
+    /// asks none of this: no [`tier_key`], no artifact, no refusal. It lands
+    /// out of the checkpoint and its whole-table cache stays what it was — an
+    /// accelerator whose miss costs a load, not a deployment.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Residency`] for a streamed `Serve` with no artifact it can
+    /// cut, beside the errors above.
     pub fn resident(
         trace: &Trace,
         contract: &ModelContract,
@@ -752,6 +2114,7 @@ impl Weights {
         cache_dir: Option<&Path>,
         plan: crate::experts::Plan,
         stream: *mut core::ffi::c_void,
+        intent: Intent,
     ) -> Result<Weights> {
         let (metadata, snapshot) = if path.is_dir() {
             (parse_metadata(path)?, path)
@@ -764,7 +2127,21 @@ impl Weights {
         // are the loader's whole notion of a rank, so a shell that grows
         // tensor parallelism states it here and nowhere else.
         let target = StorageTarget::for_backend(BackendKind::Cuda, 0, 1);
-        let landing = compile(&metadata, contract, target)?;
+        let landing = compile(&metadata, contract, target.clone())?;
+
+        // The plan's own name -> row map, and the pairings it states. Read by
+        // the landing sink to place an arriving tensor, by the table build to
+        // resolve an attachment's planes onto rows, and — since §M — by the
+        // RANKING, which is what names the file this boot is about to read. So
+        // it is stated once above all three rather than inside whichever
+        // branch used to be its only reader.
+        let index: BTreeMap<&str, usize> = trace
+            .params
+            .iter()
+            .enumerate()
+            .map(|(at, param)| (param.name.as_str(), at))
+            .collect();
+        let ranking = crate::experts::Ranking::of(trace, &attachments(&landing, &index)?)?;
 
         let places = places(trace, &plan)?;
         let total = places.last().map_or(0, |p| p.offset + p.reserved);
@@ -774,17 +2151,173 @@ impl Weights {
         // PINNED tier, whole, and the slab takes a copy of its first
         // `resident` slots afterwards. `None` for the degenerate plan, and
         // then nothing below this line is different from what it was.
-        // ── THE T2 SOURCE, OPENED BEFORE THE TIER THAT POINTS INTO IT.
-        //    The artifact a fully-resident load of this deployment wrote, found
-        //    under the key that load would have formed — `resident_key`'s doc
-        //    says why a capped load can name it. `None` for a plan that spills
-        //    nothing, which is every plan whose host budget held its groups.
+        // ── THE OTHER KEY, AND IT IS FORMED BEFORE THE TIER IS ALLOCATED
+        //    (§K.4, phase T-3). It used to sit below `Tier::open`, because a
+        //    phase that only WROTE the file could form its name at any point
+        //    before the write. A phase that reads it cannot: whether the
+        //    pinned tier — tens of gigabytes of page-locked memory — pays for
+        //    its `write_bytes(0)` is a function of whether these bytes are on
+        //    the disk, and that question has to be asked before the allocation
+        //    is made rather than after.
+        //
+        //    Formed only when there is a directory and a plan that streams, so
+        //    a fully-resident load pays for neither the second `places` walk
+        //    nor the second serialization. `plan.streams()` is the condition
+        //    `experts.is_some()` stood for.
+        let tiers = match cache_dir.filter(|_| plan.streams()) {
+            Some(_) => tier_identity(trace, &landing, path, &ranking)?,
+            None => None,
+        };
+        // ── AND THE ARTIFACT ITSELF, OPENED BEFORE THE TIER IT WILL FILL.
+        //    `Ok` only for a file this build can cut; every refusal is
+        //    `open_tiers`', built there and counted there — and none of them
+        //    deletes it (§M.4).
+        //
+        //    **AND THIS IS WHERE A SERVING LOAD ENDS IF THERE IS NOTHING TO
+        //    CUT** (§M-3). Before the pinned tier is allocated, before a byte
+        //    of the checkpoint is read, and with the sentence the miss built:
+        //    a streamed serve has one road to these weights and this is the
+        //    door onto it. A PREPARE goes on — that is the run whose whole job
+        //    is to make the thing that is missing — and it says so first,
+        //    unless the miss was merely that the file is not there yet, which
+        //    is the ordinary shape of an import and not news.
+        //
+        //    **AND A SERVING ARTIFACT MAKES THE WHOLE QUESTION MOOT**
+        //    (§M-4d). Since §M-4b the model's own `.zt` holds every plane of
+        //    the trace: it IS the file this door goes looking for, so a
+        //    deployment served from one has nothing to prepare and no second
+        //    file to miss. Asked here, before the miss is built, because the
+        //    miss is a REFUSAL — `open_tiers` is where a streamed serve ends
+        //    when there is nothing to cut — and refusing a load whose weights
+        //    are sitting in the checkpoint it was pointed at would be this
+        //    wave breaking the thing it exists to make.
+        let serving = crate::checkpoint_serving::Serving::open(path, trace);
+        // Kept past the move below: a PREPARE writes a tier file and a
+        // deployment served out of its own `.zt` has nothing for one to hold.
+        let served_from_checkpoint = serving.is_some();
+        let opened = match (cache_dir, tiers) {
+            (Some(dir), Some(key)) => open_tiers(dir, key, &ranking, &plan, path),
+            (dir, _) => Err(unkeyed(dir, path)),
+        };
+        let warm = match opened {
+            Ok(artifact) => Some(artifact),
+            // A plan that streams nothing never wanted one; the miss it was
+            // handed is about a file it does not read.
+            Err(_) if !plan.streams() => None,
+            // Nor did a plan whose planes come out of the checkpoint itself.
+            // `None` and not a refusal: there is no tier artifact, which is
+            // the point, and `defer_tiers` reads that as "no deferred seat"
+            // exactly as it does for every load that has no second file.
+            Err(_) if serving.is_some() => None,
+            Err(miss) => match intent {
+                Intent::Serve => return Err(Fault::Residency(miss.why().to_string())),
+                Intent::Prepare => {
+                    if let Miss::Refused(why) = &miss {
+                        eprintln!("{why}");
+                    }
+                    None
+                }
+            },
+        };
+        // ── THE T2 SOURCE, OPENED BEFORE THE TIER THAT POINTS INTO IT — AND
+        //    THERE ARE TWO FILES IT CAN BE NOW (§K.6-T4).
+        //
+        //    **THIS DEPLOYMENT'S SERVING ARTIFACT FIRST.** It carries one
+        //    image per plane of this trace, so it answers for whatever THIS
+        //    budget spills — and, since §M, for whatever the next one spills
+        //    too — and it arrives with every other image beside it, so a hit
+        //    here is the whole load off one file and the resident snapshot
+        //    that seeded the deployment is no longer needed on this disk at
+        //    all. `open_tiers` has already hashed the spilled images by the
+        //    time this asks (see its doc), so the plane windows below are
+        //    windows on bytes that have been checked.
+        //
+        //    **THE WHOLE-TABLE RESIDENT ARTIFACT SECOND**, which is where
+        //    every spilled deployment starts: the file a fully-resident load
+        //    wrote, under the key that load would have formed —
+        //    `resident_key`'s doc says why a capped load can name it. It is
+        //    the bootstrap, and the run it feeds is the one that writes the
+        //    tier artifact above.
+        //
+        //    **AND THAT SECOND ARM SURVIVES §M-3, AS PREPARE'S ONLY ROAD
+        //    IN.** It is tempting to read "the boot is warm-only" as "the
+        //    bootstrap is dead", and it is the reverse: a SERVE reaching this
+        //    line already holds a `warm`, so it takes the first arm and the
+        //    second is a formality. A PREPARE of a spilled deployment holds
+        //    no `warm` by definition — the file it is about to write is the
+        //    one that does not exist — and its landing still has to read the
+        //    spilled planes from somewhere. That somewhere is the whole-table
+        //    artifact an uncapped boot wrote, exactly as it was in §K.6-T4.
+        //    Deleting this arm would make a spilled deployment unpreparable
+        //    and therefore unservable, which is the opposite of the wave.
+        //    `Residency::admit_tiers` still counts either file as a source
+        //    for the same reason: it is asked by `Cuda::prepare` as well as
+        //    by `Engine::load`, and a statute that demanded the tier artifact
+        //    would refuse the run that creates it.
+        //
+        //    `None` for a plan that spills nothing, which is every plan whose
+        //    host budget held its groups — and for a spilled plan with neither
+        //    file, which `Residency::admit_tiers` refused before the store was
+        //    reserved.
+        //
+        //    **THE FILE IS OPENED TWICE ON A WARM SPILLED BOOT**, once as
+        //    `warm` and once here, and deliberately: `warm` is borrowed by the
+        //    restore and dropped, while this mapping has to outlive the load
+        //    because the weight rows point into it. Two `mmap`s of one inode
+        //    share their pages, so the second costs a file descriptor and an
+        //    address range.
+        //    **AND THE FIRST ARM IS GATED ON `warm`** (§M.4). It used to stand
+        //    on `tier_spill` alone, because a file whose bytes did not hash
+        //    was DELETED by the door that found out — so by the time this ran
+        //    there was nothing left to open. Nothing deletes now, and a
+        //    parseable file with a rotted image would otherwise be mapped
+        //    here and served, one page at a time, with no door left to catch
+        //    it. `warm` is `open_tiers`' answer, and `open_tiers` is the door
+        //    that hashed the spilled images. Since §M-3 a serving load with
+        //    no `warm` never reaches this line at all, so the gate is what a
+        //    PREPARE reads: it says "do not map a file this run has just
+        //    refused; map the bootstrap and rewrite the refused one".
+        // **AND THE SOURCE IS THE CHECKPOINT, WHICH IS THE ONLY ONE LEFT**
+        // (§M-4d step 3). Since §M-4b the `.zt` `pie model import` writes IS
+        // the serving file — every plane of the trace, under this SKU's names,
+        // in the order a boot reads them — so a deployment served from one
+        // needs no second file beside it and no `[model] weight_cache_dir` to
+        // find it.
+        //
+        // The two roads that stood here are gone. A tier artifact a prepare
+        // wrote and the whole-table snapshot an uncapped boot left behind were
+        // both a SECOND COPY of the model on the disk, which is the cost §M-4
+        // exists to stop paying, and the two doors were measured equal within
+        // noise before either was removed (W1@c128: 10,441 tok/s through the
+        // snapshot door against 10,269 through this one).
+        //
+        // `Serving::open` answering `None` is now a refusal and not a
+        // fallback: a spilled load whose checkpoint is not a serving artifact
+        // has nowhere to read the planes it did not keep, and
+        // `Residency::admit` says so by name above this line.
         let source = match plan.spill_demand() > 0 {
-            true => spill_source(cache_dir, resident_key(trace, &landing, path)?),
+            true => serving.map(crate::experts::Spill::Serving),
             false => None,
         };
+        // ── AND WHETHER THE PAGE-LOCKED IMAGE IS MADE AT THIS INSTANT AT ALL
+        //    (§L.1, phase L-1). `defer_tiers` states the policy and the price;
+        //    a `None` from it is every road this file had before §L.
+        let deferred = defer_tiers(warm.as_ref(), &plan);
         let mut experts = match plan.streams() {
-            true => Some(crate::experts::Tier::open(plan.clone(), source)?),
+            // **AND THE MEMSET IS SKIPPED EXACTLY WHEN A FILE WILL COVER IT.**
+            // `restore_tiers` reads every T1 image — padding included, and
+            // `Plan::host_layout` tiles the allocation — straight into it
+            // before anything reads a byte out of it, and owes it
+            // `Tier::zero_host` if it cannot. **A DEFERRED SEAT SKIPS THE
+            // ALLOCATION TOO**, and owes it `Tier::undefer`.
+            true => {
+                let fill = match (deferred, warm.is_some()) {
+                    (Some(artifact), _) => crate::experts::Fill::Deferred(artifact),
+                    (None, true) => crate::experts::Fill::Restored,
+                    (None, false) => crate::experts::Fill::Cold,
+                };
+                Some(crate::experts::Tier::open(plan.clone(), source, fill)?)
+            }
             false => None,
         };
 
@@ -798,14 +2331,22 @@ impl Weights {
         //    there is no key to form, so the layout is not collected and the
         //    plan is not serialized. A load that was never offered a cache
         //    costs exactly what it cost before this block existed.
-        // **A STREAMED LOAD FORMS NO KEY.** The artifact is a snapshot of the
-        // DEVICE STORE, and a streamed load's store is a cache over a pinned
-        // tier the artifact says nothing about — so restoring one would fill
-        // the slabs and leave T1 empty, which is a table whose non-resident
-        // entries point at zeros. The tiers get their own artifact the day
-        // T2's background prefetch does (design §7); until then a load that
-        // streams neither reads nor writes the cache, and says so here rather
-        // than by a digest mismatch later.
+        // **TWO KEYS, TWO PATHS, AND A LOAD FORMS EXACTLY ONE OF THEM**
+        // (§K.2, phase T-2). The statute this replaces said that a streamed
+        // load formed NO key: the artifact is a snapshot of the DEVICE STORE,
+        // and a streamed load's store is a cache over a pinned tier that file
+        // says nothing about — so restoring one would fill the slabs and
+        // leave T1 empty, which is a table whose non-resident entries point
+        // at zeros.
+        //
+        // What retires it is not a wider artifact but a SECOND one. A
+        // resident load keys the store exactly as it always did; a streamed
+        // load keys the SEQUENCE with `tier_identity`, which mixes what the
+        // ranking lays out on top of everything the resident identity mixes —
+        // and since §M.3 no budget and no rung, so one file serves any cut.
+        // The two live in one directory under one key space and cannot be
+        // handed to each other's reader: different magics, different
+        // extensions (`weight_cache::tier`'s header argues both).
         let key = cache_dir.filter(|_| experts.is_none()).and_then(|_| {
             let layout: Vec<(u64, u64, u64)> = places
                 .iter()
@@ -828,48 +2369,72 @@ impl Weights {
                 .key(),
             )
         });
-
+        // ── THE WARM STREAMED BOOT (§K.4, §M.3). Every image out of one
+        //    file, cut by THIS boot's budgets: the store's planes pumped to
+        //    their own offsets, the T1 images read straight into the pinned
+        //    tier's own bytes, the T2 images left where they lie — and all of
+        //    them verified. A `true` here skips exactly what a resident
+        //    restore skips — the source walk, every `TileMap`, `Finalize`'s
+        //    read-back, the sink's copies, the arena and the spill — and
+        //    leaves the load running only what it would have run anyway:
+        //    `Tier::land`, the rotor, the pools.
+        //
+        //    A refusal is where the two intents part (§M-3). Under `Serve`
+        //    it is the end of the load: the sentence goes into a
+        //    `Fault::Residency`, nothing is zeroed, and nothing is written —
+        //    a serving path that rewrote a hundred gigabytes on the strength
+        //    of one bad block is the thing this wave removed. Under `Prepare`
+        //    both images go back to zeros, the file stays on the disk with a
+        //    sentence beside it (§M.4), and the cold branch below rewrites it,
+        //    which is the only door that ever replaces one.
+        //
+        //    **TWO KEYS, TWO PATHS, AND A LOAD FORMS EXACTLY ONE OF THEM.**
+        //    `key` is `None` for a streamed load and `tiers` is `None` for a
+        //    resident one, so these two restores are alternatives and not a
+        //    sequence.
         let from_cache = match key {
             Some(key) => crate::weight_cache::restore(cache_dir, key, &mut store)?,
-            None => false,
+            None => match (warm, experts.as_mut()) {
+                // **AND A REFUSAL HERE ENDS A SERVE TOO** (§M-3). The images
+                // opened, the index was this trace's, and then the bytes did
+                // not hash — or the machine would not read them. There is no
+                // second road: `restore_tiers` states the sentence and skips
+                // the recovery for a load that is about to return.
+                (Some(artifact), Some(tier)) => {
+                    match restore_tiers(&artifact, path, &places, &mut store, tier, intent)? {
+                        None => true,
+                        Some(why) => match intent {
+                            Intent::Serve => return Err(Fault::Residency(why)),
+                            Intent::Prepare => {
+                                eprintln!("{why}");
+                                false
+                            }
+                        },
+                    }
+                }
+                _ => false,
+            },
         };
-
-        // The plan's own name -> row map. Read by the landing sink to place an
-        // arriving tensor and by the pairing below to resolve an attachment's
-        // planes onto rows, so it is stated once above both rather than inside
-        // the branch that used to be its only reader.
-        let index: BTreeMap<&str, usize> = trace
-            .params
-            .iter()
-            .enumerate()
-            .map(|(at, param)| (param.name.as_str(), at))
-            .collect();
 
         let landed = if from_cache {
             // EVERY PARAM IS LANDED, because the blob is the whole table —
             // the layout is part of the key, so a restore that matched wrote
-            // exactly the bytes this `places` describes.
+            // exactly the bytes this `places` describes. The same sentence
+            // holds for the streamed restore, one rung further out: the
+            // serving artifact's key mixes the RANKING (§M.3), `open_tiers`
+            // checked the file's index against it image for image, and the
+            // cut then routed every one of those images to the rung this
+            // `places` and this `Plan::host_layout` put it on.
+            //
+            // **AND THE WRITE IS SKIPPED WITH THE BRANCH.** A hit that
+            // restored must not re-write what it just read; it does not
+            // reach `write_tiers` at all, which is a stronger statement than
+            // that function's own already-on-the-disk arm.
             vec![true; places.len()]
         } else {
-            // The executor's own arena: where a transform's intermediates live
-            // while it runs. Host memory, because the transforms run host-side;
-            // it is dropped the moment the load is over, and only the finalized
-            // tensors the sink took survive.
-            //
-            // **AND HOST MEMORY HAS A SECOND SPELLING NOW** (qwen4 flash).
-            // The arena is planned at the image's own size, and an image can
-            // outgrow the RAM the machine will actually give this process —
-            // the 4-bit flash load plans a 102 GiB arena inside a 125 GiB
-            // cgroup, with a ~64 GiB pinned tier still to come. So an arena
-            // that will not fit beside the tiers goes to a FILE-BACKED map
-            // instead: dirty file pages are the kernel's to write back and
-            // reclaim under pressure, which turns an OOM kill into a slower
-            // load. Asking the machine how much room it has is the same
-            // class of question as asking the card its memory.
-            let bytes = usize::try_from(landing.memory.arena_bytes()).unwrap_or(0);
-            let mut scratch = Scratch::fitting(bytes, plan.spill_demand())?;
-            let mut backing: &mut [u8] = scratch.as_mut();
-
+            // Where every finalized tensor goes, whichever shape produces it:
+            // the sink is the load's own placement rule and knows nothing
+            // about how the executor held the bytes on the way here.
             let mut sink = Landing {
                 store: &mut store,
                 experts: experts.as_ref(),
@@ -878,13 +2443,76 @@ impl Weights {
                 index: &index,
                 landed: vec![false; places.len()],
             };
-            Execution::new(&landing, snapshot)
-                .arena(&mut backing)
-                .sink(&mut sink)
-                .run()?;
-
-            let landed = sink.landed;
-            drop(scratch);
+            // ── **A STREAMED LOAD HAS NO ARENA AT ALL** (§K.3 follow-on).
+            //    The arena is where a transform's intermediates live while the
+            //    schedule runs, and a resident load needs one: its image is
+            //    the device store's, staged host-side and pumped over. A
+            //    STREAMED load's image is not staged anywhere — each tensor
+            //    goes to the pinned tier or the slab as it finalizes — so the
+            //    executor's own streaming residency owns every buffer and
+            //    frees it at its last use, and what the load holds at once is
+            //    one tensor's chain rather than the whole model.
+            //
+            //    What that subtracts is the traffic §K.0 measured: the write
+            //    of the whole image into the arena, `Finalize` reading the
+            //    whole image back out of it, and — the one that actually hurt
+            //    — the `MAP_SHARED` spill file `Scratch::fitting` falls to
+            //    when the image will not fit beside the tiers, which turned
+            //    both of those into disk. The 4-bit flash load planned a
+            //    102 GiB arena; now it plans none.
+            //
+            //    The plan is compiled a SECOND TIME for it, and that is the
+            //    whole price: `compile_streaming` is this same contract
+            //    against this same CUDA target, minus the two passes that
+            //    exist to serve an arena (it says there why the target cannot
+            //    be weakened to `Unknown` instead). Milliseconds, against a
+            //    hundred gigabytes of disk.
+            //
+            //    **AND THE SECOND PLAN IS NEVER A KEY.** `landing` — the
+            //    coalesced one — is what `resident_key` and `tier_identity`
+            //    hash, above and below this branch, exactly as they did
+            //    before. It has to be: `prospect` and `tier_key` compile from
+            //    OUTSIDE the load, holding no residency to state, so a key
+            //    formed here off a streaming-shaped plan would name a file no
+            //    caller could ever find. This one is compiled, run, dropped.
+            let landed = if plan.streams() {
+                let streaming = compile_streaming(&metadata, contract, target)?;
+                Execution::new(&streaming, snapshot)
+                    .streaming()
+                    .sink(&mut sink)
+                    .run()?;
+                sink.landed
+            } else {
+                // Host memory, because the transforms run host-side; dropped
+                // the moment the load is over, and only the finalized tensors
+                // the sink took survive.
+                //
+                // **AND HOST MEMORY HAS A SECOND SPELLING** (qwen4 flash). The
+                // arena is planned at the image's own size, and an image can
+                // outgrow the RAM the machine will actually give this process.
+                // So an arena that will not fit beside the tiers goes to a
+                // FILE-BACKED map instead: dirty file pages are the kernel's
+                // to write back and reclaim under pressure, which turns an OOM
+                // kill into a slower load. Asking the machine how much room it
+                // has is the same class of question as asking the card its
+                // memory. The pinned tier does not appear in this call and
+                // must not: `Tier::open` allocated it above, so the machine
+                // has already counted it and `Scratch::fitting` asks the
+                // machine. (A load that reaches this arm streams nothing, so
+                // its `spill_demand` is zero and the mapped term with it. The
+                // argument is stated where it is answered, not where it
+                // happens to be non-zero.)
+                let bytes = usize::try_from(landing.memory.arena_bytes()).unwrap_or(0);
+                let mut scratch = Scratch::fitting(bytes, plan.spill_demand())?;
+                let mut backing: &mut [u8] = scratch.as_mut();
+                Execution::new(&landing, snapshot)
+                    .arena(&mut backing)
+                    .sink(&mut sink)
+                    .run()?;
+                let landed = sink.landed;
+                drop(scratch);
+                landed
+            };
 
             // **THE ARTIFACT IS WRITTEN FROM THE STORE, NOT FROM THE
             // TRANSFORMS.** What is cached is what is resident, which is the
@@ -916,6 +2544,80 @@ impl Weights {
                     })
                     .collect();
                 crate::weight_cache::store_indexed(cache_dir, key, &groups, &store);
+            }
+            // **AND THE STREAMED LOAD'S SERVING ARTIFACT** (§K.3, §M.3), from
+            // the same instant and for the same reason: what is written is
+            // what is materialized, which is the only thing a digest can be a
+            // claim about.
+            //
+            // **HERE, AND NOT AFTER `Tier::land`.** The landing is what this
+            // file is a function of; the ladder is what a load does with it
+            // afterwards. Taking the snapshot before the slabs are seated
+            // keeps the file a function of the RANKING alone — two boots at
+            // two different budgets write the same bytes — and keeps a
+            // promotion that has already happened out of an image a later boot
+            // cuts as its starting position.
+            //
+            // **AND ONLY A PREPARE REACHES IT** (§M-3). This is the whole of
+            // the rebuild door: `write_tiers` -> `tier::store` -> the
+            // verify-then-replace, and `Intent::Prepare` is the only way in.
+            // A serving load that got this far streams nothing (it would have
+            // refused above), so the condition is belt-and-braces — but it is
+            // the STATEMENT of the property, and a future caller that lands a
+            // streamed serve back on the cold arm should meet it here rather
+            // than discover it by finding a hundred gigabytes rewritten
+            // underneath a serving deployment.
+            //
+            //    **AND A DEPLOYMENT SERVED OUT OF ITS OWN `.zt` HAS NOTHING
+            //    TO WRITE** (§M-4d step 2). The artifact `pie model import`
+            //    wrote already holds every plane of this trace, ranked, with
+            //    a digest table apiece — a tier file beside it would be a
+            //    second copy of the model on the disk that no boot will ever
+            //    open, because `Spill::Serving` is asked first and answers.
+            //    So a prepare of one still runs (it is the check that this
+            //    BOX can serve the artifact, which no format test can make)
+            //    and writes nothing.
+            //
+            //    **AND THIS IS STILL REACHABLE, WHICH DECIDES WHETHER §M-4d's
+            //    LAST STEP IS A DELETION OR A PORT.** The tempting reading is
+            //    that nothing writes a tier file any more — step 2 stopped it
+            //    for artifact deployments and step 3a refuses a spilled load
+            //    that is not one, so `Fill::{Restored, Deferred}` would have
+            //    no inputs and could simply go. That reading is WRONG, and the
+            //    case it misses is narrow and real: a plan that STREAMS but
+            //    does not SPILL, on a checkpoint that is not a serving
+            //    artifact. `experts` is `Some` because the plan streams;
+            //    `admit_tiers` passes because `spilled` is zero, so 3a's
+            //    refusal never fires; and a prepare of it writes a tier file
+            //    that the next boot reads back as `warm`.
+            //
+            //    So the tier road still carries the PINNED image for such a
+            //    deployment, and retiring `Fill::Restored` would take a
+            //    working optimization off it rather than removing dead
+            //    machinery.
+            //
+            //    **AND IT IS NOT A CORNER — IT IS THE COMMON CASE, MEASURED.**
+            //    Swept over the catalog at `Platform::Cuda`, sixteen device
+            //    budgets from the ranking's floor to its full against four
+            //    host budgets: **all 42 SKUs have budget pairs that stream
+            //    without spilling**, and it is typically more than half of
+            //    them — `dsv4-flash-bf16` 60 of 64, `gemma4-31b-bf16` 37 of
+            //    64, `dsv4-base-bf16` 56 of 64. A capped deployment that fits
+            //    device-plus-host is the ordinary shape of a streamed load,
+            //    not an edge of it.
+            //
+            //    So the answer is to PORT the two fills at the `.zt` and not
+            //    to delete them. Deleting would make every capped deployment
+            //    rebuild its page-locked image on every boot — which is the
+            //    tens of seconds of memory bandwidth `Fill::Restored` exists
+            //    to skip — and artifact deployments already take `Fill::Cold`
+            //    today, so the wave would END by making the common case
+            //    slower than the world it replaced. The port's own hazard is
+            //    written at `experts::Fill::Restored`.
+            if let (Intent::Prepare, false, Some(key), Some(tier)) =
+                (intent, served_from_checkpoint, tiers, experts.as_ref())
+            {
+                write_tiers(cache_dir, key, trace, &landed, &ranking, &places, tier, &store);
             }
             landed
         };
@@ -977,6 +2679,14 @@ impl Weights {
                 // holds whole with no tier open, which is every group of a
                 // fully-resident load.
                 Some(pairing) => WeightRow::Planes {
+                    // **THE ORDER THE PLANES ARE IN, OFF THE DECLARATION**
+                    // (§J4b). `Dtype::U4g64tiled` is the model text saying
+                    // this projection's three rectangles were written by
+                    // `pie model import` through the tiled relabelling; the
+                    // bytes are the same bytes and the rectangle is the same
+                    // rectangle, so the declaration is the only thing that
+                    // could say it. `dispatch::linear` is where it is spent.
+                    repacked: place.dtype == Dtype::U4g64tiled,
                     codes: packed(experts.as_ref(), &store, &places, at)?,
                     scales: packed(experts.as_ref(), &store, &places, pairing.scales)?,
                     biases: match pairing.biases {
@@ -1124,21 +2834,22 @@ impl Weights {
         // the raw pointer sound to hold.
         let mut source: Vec<*const u8> = Vec::with_capacity(rotation.tenants().len());
         for tenant in rotation.tenants() {
-            let at = tier.host_offset(tenant.param).ok_or_else(|| {
+            // **THE PLANE'S OWN ADDRESS AND NOT A BASE PLUS AN OFFSET**
+            // (§M.3). It was `serving_host() + host_offset()` while a deferred
+            // seat served T1 out of one contiguous section; the serving
+            // artifact holds one image per plane in a ranking order a budget
+            // cuts, so the tier answers per plane and there is no base to add
+            // to. The address it hands back — the pinned allocation's, or the
+            // artifact mapping's while the window is open — outlives this
+            // `Weights`, because the tier holds the mapping for its whole life
+            // for exactly this reason.
+            let at = tier.serving_host_of(tenant.param).ok_or_else(|| {
                 Fault::Residency(format!(
                     "`{}` was planned to rotate and the pinned tier seats no bytes for it",
                     trace.params[tenant.param].name
                 ))
             })?;
-            // SAFETY: `host_offset` is an offset the tier itself laid out
-            // inside its own pinned allocation, and the allocation outlives
-            // this `Weights`.
-            source.push(unsafe {
-                tier.host()
-                    .host()
-                    .add(usize::try_from(at).unwrap_or(usize::MAX))
-                    .cast_const()
-            });
+            source.push(at);
         }
         let rotor = crate::rotate::Rotor::open(rotation, source)?;
         // ── AND THE ROWS NOW NAME THE SLOTS.
@@ -1402,7 +3113,7 @@ fn packed(
         Dtype::Mxfp4 => place.width,
         // Two codes to a byte; `plane_bytes` rounds the TOTAL up, and a
         // row's width is even for every whole-group bank this arm serves.
-        Dtype::U4g64 | Dtype::U4g32 => place.width.div_ceil(2),
+        Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => place.width.div_ceil(2),
         // One byte a code.
         Dtype::U8g64 => place.width,
         other => model_compiler::arena::elem_bytes(other)
@@ -1595,7 +3306,7 @@ mod tests {
     #[test]
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {
         let trace =
-            model::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships the SKU");
+            models::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships the SKU");
         let trace = trace(Platform::Cuda);
         let places = places(&trace, &crate::experts::Plan::default())
             .expect("every param of a bf16 SKU has an element size");
@@ -1615,5 +3326,118 @@ mod tests {
         assert_eq!(places[0].rows, 248_320);
         assert_eq!(places[0].width, 1024);
         assert_eq!(places[0].bytes, 248_320 * 1024 * 2);
+    }
+
+    /// **THE THREE REFUSALS A WARM-ONLY BOOT CAN PRINT, IN ONE PLACE** (§M-3).
+    ///
+    /// The messages are the deliverable of this wave as much as the code is:
+    /// an operator meeting one of them has a deployment that will not start,
+    /// and what they do next is whatever the sentence says. So the sentence is
+    /// asserted rather than inspected, and asserted HERE, on the host, with no
+    /// device and no checkpoint — because a claim that only a `-- --ignored`
+    /// GPU gate can check is a claim that goes stale between waves.
+    ///
+    /// Two of the three are built by [`absent`], which is the one this wave
+    /// ADDS: the census that turns M-3's silent miss into the loudest thing
+    /// the boot says. The third is the shape every refused-file message shares
+    /// ([`tier::refuse`](crate::weight_cache::tier::refuse)), and it is checked
+    /// through the stale-format wording because that arm needs no bytes.
+    #[test]
+    fn the_refusals_name_what_is_wrong_and_the_command_that_fixes_it() {
+        use crate::weight_cache::tier;
+
+        let dir = std::env::temp_dir().join(format!(
+            "pie-refusals-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos()),
+        ));
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        let source = Path::new("/models/gpt-oss-20b.zt");
+        let key = 0x1234_5678_9abc_def0u64;
+
+        // ── (1) NEVER PREPARED. An empty directory is a deployment that has
+        //    not been imported on this box, and nothing else.
+        let said = absent(&dir, key, &tier::path(&dir, key), source);
+        assert!(
+            said.contains("has never been prepared on this machine"),
+            "{said}"
+        );
+        assert!(
+            said.contains("pie model import --prepare-only /models/gpt-oss-20b.zt"),
+            "the remedy is spelled against the checkpoint the load names: {said}"
+        );
+        assert!(
+            said.contains("no cold serving path left"),
+            "and it says there is nowhere else to go: {said}"
+        );
+
+        // ── (2) THE PLAN OR THE RECIPE CHANGED. The same absence with other
+        //    files beside it is a DIFFERENT operator situation and the wave's
+        //    whole finding: the key is the filename, so a changed model text
+        //    orphans a hundred gigabytes under a name nothing will open again.
+        let stale = tier::path(&dir, 0xdead_beef_dead_beefu64);
+        std::fs::write(&stale, b"not a real artifact, and this door reads no bytes")
+            .expect("a sibling artifact");
+        let said = absent(&dir, key, &tier::path(&dir, key), source);
+        assert!(
+            said.contains("1 other serving artifact"),
+            "the census counts them: {said}"
+        );
+        assert!(
+            said.contains("deadbeefdeadbeef.tiers"),
+            "and NAMES them, which is the whole point: {said}"
+        );
+        assert!(
+            said.contains("a changed key"),
+            "and says why this deployment stopped naming that file: {said}"
+        );
+        assert!(
+            said.contains("nothing here deletes it"),
+            "and that it will not tidy anything away on its own (§M.4) — said \
+             ONCE, in the shared clause, rather than twice: {said}"
+        );
+        assert_eq!(
+            said.matches("deletes").count(),
+            1,
+            "the census must not repeat the policy the shared tail states: {said}"
+        );
+        assert!(said.contains(".tiers (0.0 MiB)"), "sub-GiB reads as MiB: {said}");
+        assert!(
+            said.contains("pie model import --prepare-only /models/gpt-oss-20b.zt"),
+            "same remedy, same shape: {said}"
+        );
+
+        // ── (3) A FILE THAT WILL NOT BE READ. The third shape, checked
+        //    through the arm that needs no payload.
+        let said = tier::refuse(
+            &tier::path(&dir, key),
+            Some(source),
+            "states format 2 and this build reads 3, so its images cannot be cut by this one",
+        );
+        assert!(said.contains("states format 2"), "{said}");
+        assert!(
+            said.contains("nothing here rewrites it and nothing here deletes it"),
+            "the middle clause is the §M.4 policy, said the same way every time: {said}"
+        );
+        assert!(
+            said.contains("pie model import --prepare-only /models/gpt-oss-20b.zt"),
+            "{said}"
+        );
+
+        // ── AND THE ONE THAT IS NOT ABOUT A FILE. No cache directory is a
+        //    config to change, not an artifact to rebuild, so it names the
+        //    key an operator has to set.
+        let Miss::Refused(said) = unkeyed(None, source) else {
+            panic!("a missing directory is not an absent file");
+        };
+        assert!(said.contains("weight_cache_dir"), "{said}");
+        assert!(
+            said.contains("pie model import --prepare-only /models/gpt-oss-20b.zt"),
+            "{said}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

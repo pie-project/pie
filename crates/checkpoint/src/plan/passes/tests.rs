@@ -270,7 +270,6 @@ fn rejects_a_named_kernel_over_a_host_operand() {
         outputs: vec![BufferId(0)],
         tile: TileSpec {
             max_tile_bytes: 1,
-            rows_per_tile: 0,
         },
         transform: TransformSpec {
             kernel: Some("quant::quantize_bf16_to_fp8_e4m3_per_channel".to_string()),
@@ -319,7 +318,6 @@ fn rejects_a_named_kernel_that_still_reads_the_checkpoint() {
         outputs: vec![BufferId(0)],
         tile: TileSpec {
             max_tile_bytes: 1,
-            rows_per_tile: 0,
         },
         transform: TransformSpec {
             kernel: Some("quant::quantize_bf16_to_fp8_e4m3_per_channel".to_string()),
@@ -364,7 +362,6 @@ fn target_transform_matrix_matches_host_and_metal_executors() {
         outputs: Vec::new(),
         tile: TileSpec {
             max_tile_bytes: 1,
-            rows_per_tile: 0,
         },
         transform: TransformSpec::default(),
     };
@@ -470,6 +467,48 @@ fn a_device_is_not_handed_a_block_whose_scales_are_inside_it() {
         validate_bound_encodings(&mut mxfp4).is_ok(),
         "gpt-oss binds MXFP4 on CUDA, and it is not a self-contained block"
     );
+
+    // **THE NARROWING** (QNF §J5). The five K-quants ARE read as stored on
+    // CUDA — `kernels_cuda::linear::kquant` is the point — so the invariant
+    // is "a device is never handed a block it cannot read" rather than "a
+    // device is never handed a block". Both halves are asserted here, because
+    // a guard that admitted everything would pass the first half above by
+    // being switched off.
+    for scheme in [
+        QuantScheme::GgufQ2K,
+        QuantScheme::GgufQ3K,
+        QuantScheme::GgufQ4K,
+        QuantScheme::GgufQ5K,
+        QuantScheme::GgufQ6K,
+    ] {
+        let mut k = plan(BackendKind::Cuda, decl(scheme, Visibility::Public));
+        assert!(
+            validate_bound_encodings(&mut k).is_ok(),
+            "{scheme:?} is one of the five `linear::kquant` reads as stored"
+        );
+        // And Metal has no such point, so the same plan is refused there.
+        let mut metal = plan(BackendKind::Metal, decl(scheme, Visibility::Public));
+        assert!(
+            validate_bound_encodings(&mut metal).is_err(),
+            "{scheme:?} has no metal stored-block point and must still be refused"
+        );
+    }
+
+    // The blocks CUDA still refuses: a 32-element ggml block has no
+    // stored-form point, whatever its arithmetic can be served as elsewhere.
+    for scheme in [
+        QuantScheme::GgufQ4_1,
+        QuantScheme::GgufQ5_0,
+        QuantScheme::GgufQ8_0,
+        QuantScheme::GgufMxfp4,
+        QuantScheme::GgufIq4Xs,
+    ] {
+        let mut narrow = plan(BackendKind::Cuda, decl(scheme, Visibility::Public));
+        assert!(
+            validate_bound_encodings(&mut narrow).is_err(),
+            "{scheme:?} has no stored-form point and must still be refused"
+        );
+    }
 }
 
 /// Two persistent buffers, so that an arena-relative write has to be matched to
@@ -569,11 +608,13 @@ fn a_rewrite_scheduled_after_a_check_is_refused() {
         Pass {
             name: "check",
             stage: Stage::Check,
+            for_arena: false,
             run: nothing,
         },
         Pass {
             name: "late-rewrite",
             stage: Stage::Rewrite,
+            for_arena: false,
             run: nothing,
         },
     ];
@@ -591,6 +632,7 @@ fn a_check_that_reports_a_rewrite_is_refused() {
     let bad = [Pass {
         name: "lying-check",
         stage: Stage::Check,
+        for_arena: false,
         run: rewrote,
     }];
     let mut plan = fill_order_plan(bulk_into_b(), &[0, 1, 2]);

@@ -30,7 +30,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::file::{Metadata, RawTensor, Sources};
-use crate::contract::compile::{Leaf, Lowering, compile};
+use crate::contract::compile::{CopyList, GatherList, Leaf, Lowering, compile};
 use crate::contract::infer::{Resolver, repack_spec};
 use crate::contract::{
     BiasBy, Expr, ModelContract, Partition, ScaleFactor, TensorContract, TensorType, Visibility,
@@ -41,8 +41,9 @@ use crate::plan::geometry::{
     full_dest_extent, repack_stage_bytes, storage_extent_for_shape, strided_physical_source_bytes,
 };
 use crate::plan::{
-    BufferDecl, CheckpointFileDecl, DestExtent, LoadPlan, QuantAttachment, SourceExtent,
-    SourceTensorDecl, StorageInstr, StorageTarget, TileMapKind, TileSpec, TransformSpec,
+    BufferDecl, CheckpointFileDecl, DestExtent, GatherSpec, LoadPlan, QuantAttachment,
+    SourceExtent, SourceTensorDecl, StorageInstr, StorageTarget, TileMapKind, TileSpec,
+    TransformSpec,
 };
 use crate::types::{
     BufferId, DType, Encoding, InstrId, QuantGranularity, QuantScheme, RepackSpec, ScaleForm,
@@ -510,11 +511,82 @@ impl Builder<'_> {
     /// Solve the affine expression and emit the copies that satisfy it.
     fn affine(&mut self, expr: &Expr, decl: &TensorDecl) -> Result<Value> {
         let lowering = compile(expr, self.resolver.checked(), MAX_RUNS)?;
-        self.copies(&lowering, decl, Role::Declared)
+        self.emit(&lowering, decl, Role::Declared)
+    }
+
+    /// Emit whichever lowering the expression got.
+    ///
+    /// The choice was made in `contract::compile`, from the algebra alone, and
+    /// is not revisited here: a plan that second-guessed it would be a second
+    /// cost model.
+    fn emit(&mut self, lowering: &Lowering, decl: &TensorDecl, role: Role) -> Result<Value> {
+        match lowering {
+            Lowering::Copy(copies) => self.copies(copies, decl, role),
+            Lowering::Gather(gather) => self.gather(gather, decl),
+        }
+    }
+
+    /// Emit the one instruction a gather lowering is.
+    ///
+    /// A gather reads a whole checkpoint tensor and writes a whole
+    /// destination, so there is nothing to alias and nothing to fill: the
+    /// zero-copy cases `copies` weighs all require the source and destination
+    /// to be the same bytes in the same order, and a permutation is exactly
+    /// the case where they are not.
+    ///
+    /// A gather off a *computed* buffer is refused rather than staged. It
+    /// would be the same table over a buffer instead of a file, which the
+    /// instruction could carry — but no contract writes one, and a lowering
+    /// with no caller is a lowering nothing keeps honest.
+    fn gather(&mut self, gather: &GatherList, decl: &TensorDecl) -> Result<Value> {
+        let geometry = gather.byte_geometry(&decl.encoding)?;
+        let output_bytes = encoding_nbytes(&decl.shape, &decl.encoding)
+            .or_overflow(format!("'{}' size overflow", decl.name))?;
+        let Value::Source(source) = self.leaf(gather.leaves.as_slice(), gather.leaf)? else {
+            return Err(Error::Unsupported(format!(
+                "'{}' gathers from a computed buffer; the gather lowering reads \
+                 the checkpoint",
+                decl.name
+            )));
+        };
+        let raw = self.raw(source.tensor_id)?;
+        let (file_id, tensor_id, base) = (raw.file_id, raw.id, raw.file_offset);
+        let file_offset = base
+            .checked_add(source.offset_bytes)
+            .or_overflow("gather source file offset")?;
+        let source_bytes = geometry.source_bytes();
+        let dtype = source.encoding.dtype();
+
+        let out = self.allocate(decl, true)?;
+        let instr = self.next_instr();
+        self.program.instrs.push(StorageInstr::GatherWrite {
+            id: instr,
+            source: SourceExtent {
+                file_id,
+                tensor_id,
+                file_offset,
+                span_bytes: source_bytes,
+                stride: Extent::byte_run(source_bytes),
+                dtype,
+            },
+            dest: DestExtent {
+                buffer: out,
+                offset: 0,
+                stride: Extent::byte_run(output_bytes),
+            },
+            gather: GatherSpec {
+                indices: gather.indices.clone(),
+                block_bytes: geometry.block_bytes,
+                rows: geometry.rows,
+                src_row_bytes: geometry.src_row_bytes,
+            },
+        });
+        self.program.schedule.push(instr);
+        Ok(Value::Buffer(out))
     }
 
     /// Emit the rectangular copies of a solved expression.
-    fn copies(&mut self, lowering: &Lowering, decl: &TensorDecl, role: Role) -> Result<Value> {
+    fn copies(&mut self, lowering: &CopyList, decl: &TensorDecl, role: Role) -> Result<Value> {
         let output_bytes = encoding_nbytes(&decl.shape, &decl.encoding)
             .or_overflow(format!("'{}' size overflow", decl.name))?;
         let rects = lowering.byte_pieces(&decl.encoding)?;
@@ -535,7 +607,7 @@ impl Builder<'_> {
             && rect.dst_offset == 0
             && rect.bytes() == output_bytes
         {
-            match self.leaf(lowering, rect.leaf)? {
+            match self.leaf(lowering.leaves.as_slice(), rect.leaf)? {
                 Value::Source(source) if source_is_dense(&source)? => {
                     let (stride, _) = rect.split()?;
                     return Ok(Value::Source(SourceView {
@@ -579,7 +651,7 @@ impl Builder<'_> {
             self.program.schedule.push(instr);
         }
         for rect in &rects {
-            match self.leaf(lowering, rect.leaf)? {
+            match self.leaf(lowering.leaves.as_slice(), rect.leaf)? {
                 Value::Source(source) => {
                     let raw = self.raw(source.tensor_id)?;
                     let (file_id, tensor_id, base) = (raw.file_id, raw.id, raw.file_offset);
@@ -608,7 +680,7 @@ impl Builder<'_> {
                     self.program.schedule.push(instr);
                 }
                 Value::Buffer(buffer) => {
-                    let (shape, encoding) = self.leaf_type(lowering, rect.leaf)?;
+                    let (shape, encoding) = self.leaf_type(lowering.leaves.as_slice(), rect.leaf)?;
                     let input_bytes = encoding_nbytes(&shape, &encoding);
                     if !rect.is_byte_run()
                         || rect.src_offset != 0
@@ -740,7 +812,7 @@ impl Builder<'_> {
             ..decl.clone()
         };
         Ok((
-            self.copies(&lowering, &operand, Role::Operand)?,
+            self.emit(&lowering, &operand, Role::Operand)?,
             ty.encoding,
         ))
     }
@@ -1004,25 +1076,24 @@ impl Builder<'_> {
     }
 
     /// The value one of a lowering's leaves refers to.
-    fn leaf(&mut self, lowering: &Lowering, index: usize) -> Result<Value> {
-        let leaf = lowering
-            .leaves
+    fn leaf(&mut self, leaves: &[Leaf], index: usize) -> Result<Value> {
+        let leaf = leaves
             .get(index)
-            .ok_or_else(|| Error::Internal(format!("lowering has no leaf {index}")))?;
+            .ok_or_else(|| Error::Internal(format!("lowering has no leaf {index}")))?
+            .clone();
         match leaf {
-            Leaf::Checkpoint(name) => Ok(Value::Source(self.source_view(name)?)),
+            Leaf::Checkpoint(name) => Ok(Value::Source(self.source_view(&name)?)),
             Leaf::Contract(name) => self
                 .values
-                .get(name)
+                .get(&name)
                 .cloned()
                 .ok_or_else(|| Error::Contract(format!("reads '{name}' before it exists"))),
         }
     }
 
     /// The shape and encoding of one of a lowering's leaves.
-    fn leaf_type(&self, lowering: &Lowering, index: usize) -> Result<(Vec<i64>, Encoding)> {
-        let leaf = lowering
-            .leaves
+    fn leaf_type(&self, leaves: &[Leaf], index: usize) -> Result<(Vec<i64>, Encoding)> {
+        let leaf = leaves
             .get(index)
             .ok_or_else(|| Error::Internal(format!("lowering has no leaf {index}")))?;
         let ty =
@@ -1148,7 +1219,6 @@ impl Builder<'_> {
                 max_tile_bytes: self.program.target.max_tile_bytes,
                 // A budget, not yet a decision: the tile pass turns it into a
                 // row count once the whole plan exists.
-                rows_per_tile: 0,
             },
             transform,
         });

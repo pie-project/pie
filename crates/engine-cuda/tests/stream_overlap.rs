@@ -63,7 +63,7 @@ struct Block {
     mean_ms: f64,
     tokens: (u32, u32, u32),
     captures: u64,
-    /// Fires served FROM a recorded body — `BodyStats::hits`. It was
+    /// Fires served FROM a recorded body — `BodyTally::hits`. It was
     /// `Stats::replays` while there were two recording paths; the keyed one is
     /// gone and a replay is a hit.
     hits: u64,
@@ -314,7 +314,7 @@ mod gemma {
     }
 
     pub fn word(query_len: u32, masked: bool) -> u64 {
-        model::gemma_4::forward::Facts::of(&Request::new(query_len, masked)).word()
+        models::gemma_4::forward::Facts::of(&Request::new(query_len, masked)).word()
     }
 
     pub fn argmax(logits: &[f32]) -> u32 {
@@ -387,9 +387,9 @@ mod gemma {
         let container = container(&checkpoint).expect("a tensor container");
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let trace = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
+        let trace = models::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
         let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-        let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+        let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
@@ -428,7 +428,7 @@ mod gemma {
                 bodies: false,
                 ..engine_cuda::Knobs::default()
             },
-            program_cache_dir: None,
+            cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
             // claims. `Runahead::of` is the door a deployment comes through.
@@ -525,7 +525,7 @@ mod gemma {
         for _ in 0..3 {
             tokens = one(&mut shell, &mut discard);
         }
-        let before = shell.body_stats().hits;
+        let before = shell.body_stats().tally.hits;
 
         let mut timed = Vec::with_capacity(FIRES);
         for _ in 0..FIRES {
@@ -534,7 +534,7 @@ mod gemma {
         }
         let stats = shell.body_stats();
         assert!(
-            stats.hits > before,
+            stats.tally.hits > before,
             "the block replayed nothing, so it measured the eager walk and \
              there is no captured topology under the numbers below. A moved \
              `refusals` says the admissibility rule turned this composition \
@@ -548,10 +548,10 @@ mod gemma {
             median_ms: sorted[sorted.len() / 2],
             mean_ms: timed.iter().sum::<f64>() / timed.len() as f64,
             tokens,
-            captures: stats.captures,
-            hits: stats.hits,
-            nodes: stats.nodes,
-            edges: stats.edges,
+            captures: stats.tally.captures,
+            hits: stats.tally.hits,
+            nodes: stats.last_capture.nodes,
+            edges: stats.last_capture.edges,
             streams: shell.streams(),
             rows: fresh.len() as u32,
         }
@@ -572,7 +572,7 @@ mod qwen {
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn word(query_len: u32) -> u64 {
-        model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+        models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
     }
 
     fn snapshot() -> Option<PathBuf> {
@@ -623,9 +623,9 @@ mod qwen {
         let container = container(&checkpoint).expect("a tensor container");
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+        let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
         let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-        let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+        let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
@@ -660,7 +660,7 @@ mod qwen {
                 bodies: false,
                 ..engine_cuda::Knobs::default()
             },
-            program_cache_dir: None,
+            cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
             // claims. `Runahead::of` is the door a deployment comes through.
@@ -727,7 +727,7 @@ mod qwen {
         for _ in 0..3 {
             tokens = one(&mut shell, &mut discard);
         }
-        let before = shell.body_stats().hits;
+        let before = shell.body_stats().tally.hits;
 
         let mut timed = Vec::with_capacity(FIRES);
         for _ in 0..FIRES {
@@ -736,7 +736,7 @@ mod qwen {
         }
         let stats = shell.body_stats();
         assert!(
-            stats.hits > before,
+            stats.tally.hits > before,
             "the block replayed nothing, so it measured the eager walk and \
              there is no captured topology under the numbers below. A moved \
              `refusals` says the admissibility rule turned this composition \
@@ -750,10 +750,10 @@ mod qwen {
             median_ms: sorted[sorted.len() / 2],
             mean_ms: timed.iter().sum::<f64>() / timed.len() as f64,
             tokens,
-            captures: stats.captures,
-            hits: stats.hits,
-            nodes: stats.nodes,
-            edges: stats.edges,
+            captures: stats.tally.captures,
+            hits: stats.tally.hits,
+            nodes: stats.last_capture.nodes,
+            edges: stats.last_capture.edges,
             streams: shell.streams(),
             rows: fresh.len() as u32,
         }

@@ -9,7 +9,7 @@
 
 pub(crate) mod host;
 /// **THE MEDIA CODEC AND THE SPAN DIGEST, RE-EXPORTED** — the two pieces of
-/// the media pipe that are the HOST'S half (`model::media`'s dependency rule:
+/// the media pipe that are the HOST'S half (`models::media`'s dependency rule:
 /// the catalog does arithmetic, the host decodes and hashes), surfaced so the
 /// whole-pipe gate in `tests/media_pipe_is_the_pinned_preprocessing` can
 /// compose them exactly as `image.from-bytes` does. The guest boundary

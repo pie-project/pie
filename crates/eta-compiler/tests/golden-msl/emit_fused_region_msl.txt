@@ -2,7 +2,15 @@
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
 # emitter_version: 33
 # @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
-# @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
+# @grouped: bytes=1043 fnv1a64=0x429904221e8e963f
+# @grouped was bytes=970 fnv1a64=0xa8ab9e1ebf8714d9 through emitter 41. The lane
+#   record grew `attn_score_base` and `attn_score_row_stride` (+73 bytes of struct
+#   text, no field before them moved), which is the grouped form's route to the
+#   attention-score rectangle: that form binds no per-intrinsic buffer, so a
+#   rectangle it must reach arrives as an address on the record. Unlike @runtime,
+#   this prefix is not kernel-side text an `oracle-inputs/` copy could stand in
+#   for -- `codegen::layout` declares the table and prints it, so the bytes are
+#   the emitter's and the move belongs in the diff.
 # cases: 192
 #   re-blessed again (emitter 27): `m1_reduce_argmax` no longer materializes one
 #   16-byte candidate per element into device `temporary` and tree-reduces it in

@@ -20,7 +20,20 @@
 //! rebind         prices `cudaGraphExecKernelNodeSetParams` per node and
 //!                finds which fields the driver validates
 //! exec_footprint instantiates copies to weigh one exec
+//! free_bytes      what the device has left — the same reading taken one
+//!                 instantiation at a time, and the ONE thing here a load
+//!                 calls (`record::Graphs::fire_body` brackets an
+//!                 instantiation with it so `Shell::arm_bodies` can spend a
+//!                 byte budget instead of a constant)
 //! ```
+//!
+//! **SO "NOTHING HERE IS CALLED FROM A FIRE" IS STILL TRUE AND IS NOW WORTH
+//! SPELLING PRECISELY** (the capacity wave): [`free_bytes`] is called from a
+//! CAPTURE, which is a boot-time pass on a sealed load, and never from a
+//! replay. The distinction is the same one the module was written around —
+//! reading a graph is free of policy, and this reads the device rather than a
+//! graph — and it is why the byte a body costs is measured here rather than
+//! modelled in `record.rs`.
 //!
 //! The split between reading and writing is still worth keeping, and it is
 //! why the write half never grew a caller: what moved between two captures is
@@ -771,11 +784,19 @@ fn arity(func: cudarc::driver::sys::CUfunction) -> usize {
 /// wall time, measured by instantiating `copies` of `graph` and watching
 /// `cudaMemGetInfo`.
 ///
-/// The number a cache multiplies by its exec count, and the one that sized
-/// [`crate::record::MAX_BODIES`]: the retired keyed path would have multiplied
-/// it by the traffic's distinct `(rows, lanes)` tables, and the sealed lattice
-/// multiplies it by the present sets times the buckets, which is a list the
-/// load can walk.
+/// The number a cache multiplies by its exec count, and the one the arming
+/// pass's BUDGET is denominated in: the retired keyed path would have
+/// multiplied it by the traffic's distinct `(rows, lanes)` tables, and the
+/// sealed lattice multiplies it by the present sets times the buckets, which
+/// is a list the load can walk.
+///
+/// **AND SINCE THE CAPACITY WAVE THE LOAD DOES NOT HAVE TO TRUST THIS
+/// MULTIPLICATION AT ALL.** `[engine] bodies_mem` states a byte budget and
+/// [`free_bytes`] weighs each body as it is instantiated, so what stops the
+/// enumeration is what was actually spent rather than a count somebody
+/// derived from this probe's figure. What the probe is FOR now is sizing the
+/// default: an operator reading `one exec of N nodes: X KiB` is reading the
+/// arithmetic behind [`crate::serve::DEFAULT_BODIES_MEGABYTES`].
 ///
 /// # Errors
 ///
@@ -806,4 +827,46 @@ pub fn exec_footprint(graph: &Graph, copies: usize) -> Result<(f64, f64)> {
 #[allow(unused_variables)]
 pub fn exec_footprint(graph: &Graph, copies: usize) -> Result<(f64, f64)> {
     Err(Fault::Runtimeless)
+}
+
+/// **WHAT THE DEVICE HAS LEFT**, in bytes, or `None` where there is no
+/// runtime to ask.
+///
+/// [`exec_footprint`] above is the PROBE that established what this number
+/// means for a graph: instantiate `copies` execs, watch `cudaMemGetInfo`, and
+/// divide. This is the same reading taken one instantiation at a time, and it
+/// exists so that a load can charge a BUDGET for the bodies it arms
+/// (`record::Graphs::fire_body` brackets `Graph::instantiate` with it,
+/// `Shell::arm_bodies` spends the total). The probe stays a probe: it costs
+/// `copies` execs nobody launches, and a boot cannot afford to double every
+/// instantiation to weigh it.
+///
+/// **A DELTA ACROSS ONE INSTANTIATION IS LUMPY AND THE SUM IS STILL EXACT**,
+/// which is the whole argument for pricing a body this way. The driver
+/// sub-allocates an exec out of a reservation it may already hold, so one
+/// instantiation can read zero and the next one can read a slab; what a
+/// budget is spending, though, IS device free memory, and free memory is the
+/// ground truth of that quantity rather than a model of it. A per-body figure
+/// is therefore an estimate and a running total is a measurement — which is
+/// the direction that matters, because the total is what the arming loop
+/// stops on.
+///
+/// `None` rather than a `Fault`: a caller weighing something is not a caller
+/// that fails when it cannot, and the one arithmetic that reads this
+/// (`Shell::arm_bodies`) treats an unmeasurable body as a body that spends
+/// nothing and leans on the count belt instead ([`crate::record::MAX_BODIES`]).
+#[cfg(feature = "_cuda")]
+#[must_use]
+pub fn free_bytes() -> Option<usize> {
+    use cudarc::runtime::sys as rt;
+
+    let (mut free, mut total) = (0usize, 0usize);
+    let said = unsafe { rt::cudaMemGetInfo(&raw mut free, &raw mut total) };
+    (said == rt::cudaError::cudaSuccess).then_some(free)
+}
+
+#[cfg(not(feature = "_cuda"))]
+#[must_use]
+pub fn free_bytes() -> Option<usize> {
+    None
 }

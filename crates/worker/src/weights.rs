@@ -33,7 +33,7 @@ use checkpoint::file::read::{parse_metadata, read_meta};
 
 /// The artifact object the checkpoint's own `config.json` is written under.
 ///
-/// It was `model::serve::encoding::CONFIG_OBJECT`, beside an `Encoding` that
+/// It was `models::serve::encoding::CONFIG_OBJECT`, beside an `Encoding` that
 /// parsed the document. M18 deleted that module, and the parser did not come
 /// with it: the loader reads a checkpoint's quantization off its STORED
 /// tensor encodings now, not off what its config claims, so the one reader
@@ -71,7 +71,7 @@ impl Model {
     /// second path that parses the files beside a snapshot.
     ///
     /// It is carried and not parsed. The last in-tree reader of the config's
-    /// own fields was `model::serve::encoding::Encoding`, which asked what
+    /// own fields was `models::serve::encoding::Encoding`, which asked what
     /// quantization the checkpoint declared; M18 deleted it, because the
     /// loader reads that off the stored tensor encodings instead of believing
     /// the document. Everything else the old `pie.model/1` document carried
@@ -492,7 +492,7 @@ mod tests {
         // THE QUANTIZATION BLOCK, absent here, which is not a defect: most
         // checkpoints declare none, and an absent block is an unquantized
         // checkpoint rather than a missing answer. This used to run it
-        // through `model::serve::encoding::Encoding`; that parser is deleted
+        // through `models::serve::encoding::Encoding`; that parser is deleted
         // and had no non-test caller, so what is left to assert is that the
         // block is not there and nothing invented one.
         assert!(

@@ -91,6 +91,20 @@ mod mapped;
 
 pub use mapped::{Artifact, Refused};
 
+/// **The streamed load's warm boot** (§K, §M): the same promise over one image
+/// per plane of the trace, ranked but not placed — the device store, the
+/// pinned tier and T2 are three CUTS of it, decided at load time — under its
+/// own magic, its own version and its own budget-FREE key.
+///
+/// `pub` where [`mapped`] is private, and the difference is not a preference.
+/// `mapped`'s two public types are re-exported flat above because they ARE
+/// this module's `Artifact` and `Refused`; the tier artifact's are a `Head`, an
+/// `Identity`, an `Artifact` and a `path` that would each collide with one of
+/// this module's own. So it keeps its name, and every caller spells the file
+/// it means. It is not a new top-level module either way (§K.7's second
+/// zero-overlap condition).
+pub mod tier;
+
 /// The artifact format's own version.
 ///
 /// **A DIFFERENT ONE IS A MISS ON THE RESTORE PATH, AND A REFUSAL ON THE
@@ -757,7 +771,9 @@ pub fn restore_is_pumped() -> bool {
 /// streaming §2, wave W-1). `weights::spill_source` opens this path to map a
 /// load's T2 tier out of it, and a second spelling of the filename in another
 /// module is exactly the drift that makes a cache miss look like a corruption.
-/// One home for one string.
+/// One home for one string. [`tier::path`] is this function one file over, and
+/// the two extensions are what keep a reader expecting a plane index from
+/// being handed the other file's blob (§K.6-T4 made both of them T2 sources).
 #[must_use]
 pub fn artifact_path(dir: &Path, key: u64) -> PathBuf {
     dir.join(format!("{key:016x}.weights"))

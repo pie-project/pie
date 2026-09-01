@@ -203,6 +203,50 @@ pub enum Elementwise {
         out: ValueId,
         out_out: ValueId,
     },
+    /// **THE VISION TOWER'S OUTPUT STANDARDIZATION** (`vision_config.
+    /// standardize: true`): `y = (x − bias) · scale`, per COLUMN, both planes
+    /// `[width]`, in place.
+    ///
+    /// `Gemma4VisionModel.forward` ends
+    ///
+    /// ```text
+    /// hidden_states = (hidden_states - self.std_bias.float()) * self.std_scale.float()
+    /// ```
+    ///
+    /// after the pooler's `√hidden` scaling and before the multimodal
+    /// embedder's projection. The two `[hidden]` buffers ride the checkpoint
+    /// (`vision_tower.std_{bias,scale}`) and only the towers that state the
+    /// flag ship them: gemma4's 27-block 1152-wide tower does, E4B's
+    /// 16-block 768-wide one does not.
+    ///
+    /// **WHY IT IS A ROW AND NOT A FOLD.** Both halves are per-column affine
+    /// and the node behind them is a GEMM, so the obvious move is to fold —
+    /// and §9.1 already measured that this pair does not compose: `Expr::Scale`
+    /// bakes a column scale into the bank, `Expr::Bias` adds a compile-time
+    /// constant where `(b·s)·Mᵀ` is a matrix-vector product, and the two do
+    /// not meet. **And the bank it would fold into is QUANTIZED**, which
+    /// settles it independently: `embed_vision.embedding_projection` is an
+    /// MLX affine triplet at `group_size: 64`, so a scale that varies WITHIN
+    /// a group cannot ride the group's own. The fold is unavailable twice.
+    ///
+    /// **AND IT IS NOT [`AddBias`](Elementwise::AddBias) PLUS
+    /// [`Scale`](Elementwise::Scale).** `AddBias` would answer the
+    /// subtraction with a negated plane, but `Scale` reads ONE device-held
+    /// scalar for the whole rectangle, and this multiplier is a column
+    /// vector — no row in this IR multiplies by a `[width]` plane. Two ops
+    /// where the reference states one would also round the difference to the
+    /// activation's storage type between them, which is the trap §20.2
+    /// itemised for the composed `LayerNorm`.
+    ///
+    /// Fires ONCE per tower fire — after the pool, on `rows / pool²` rows —
+    /// so it is a row on the cheapest edge of the plan and not a per-block
+    /// launch.
+    Standardize {
+        x: ValueId,
+        bias: ValueId,
+        scale: ValueId,
+        x_out: ValueId,
+    },
     MulScalar {
         s: f32,
         x: ValueId,
@@ -332,7 +376,26 @@ pub enum Elementwise {
         eps: f32,
         y: ValueId,
     },
+    /// **THE PER-TOKEN MIX ROW**: `rmsnorm(streams) · hc_fn^T`, the `[N, M·H]`
+    /// normed stream row projected through the layer's dynamic hyper plane
+    /// (`{attn,ffn}_hc.fn`, `[2M + M², M·H]`) into the `[2M + M², ]` row
+    /// [`Self::HcGates`] splits into pre, post and the combiner.
+    ///
+    /// It is a GEMM and it is not [`Linear::Matmul`](crate::ops::Linear): both
+    /// operands are f32 (the mix coefficients are too sensitive for a bf16
+    /// round trip — [`Self::HcRmsnormF32`] widens for exactly that reason) and
+    /// the dense gemm points are bf16. The rectangle is also tiny: `2M + M²`
+    /// is twenty-four columns at `hc_mult 4`.
+    HcProject {
+        normed: ValueId,
+        weight: ValueId,
+        stream_count: u32,
+        mixes: ValueId,
+    },
     /// Computes the layer input `x` plus the post/comb mixing matrices.
+    ///
+    /// `normed` is the mix row [`Self::HcProject`] lands — `[N, 2M + M²]`,
+    /// which is the stride this op has always read its operand at.
     HcGates {
         normed: ValueId,
         streams: ValueId,
@@ -465,6 +528,7 @@ impl Operands for Elementwise {
             Self::RmsnormGatedBy { x, gate, weight, .. } => sink.extend([*x, *gate, *weight]),
             Self::ResidualAdd { x, y, .. } => sink.extend([*x, *y]),
             Self::AddBias { bias, out, .. } => sink.extend([*bias, *out]),
+            Self::Standardize { x, bias, scale, .. } => sink.extend([*x, *bias, *scale]),
             Self::MulScalar { x, .. } => sink.push(*x),
             Self::SiluScaled { x, .. } => sink.push(*x),
             Self::Scale { s, x, .. } => sink.extend([*s, *x]),
@@ -483,6 +547,7 @@ impl Operands for Elementwise {
             Self::GateSigmoidMul { x, gate, .. } => sink.extend([*x, *gate]),
             Self::HcExpand { x, .. } => sink.push(*x),
             Self::HcRmsnormF32 { streams, .. } => sink.push(*streams),
+            Self::HcProject { normed, weight, .. } => sink.extend([*normed, *weight]),
             Self::HcGates { normed, streams, scale, base, .. } => {
                 sink.extend([*normed, *streams, *scale, *base]);
             }
@@ -510,6 +575,7 @@ impl Operands for Elementwise {
             Self::RmsnormGatedBy { y, .. } => sink.push(*y),
             Self::ResidualAdd { y_out, .. } => sink.push(*y_out),
             Self::AddBias { out_out, .. } => sink.push(*out_out),
+            Self::Standardize { x_out, .. } => sink.push(*x_out),
             Self::MulScalar { x_out, .. } => sink.push(*x_out),
             Self::SiluScaled { x_out, .. } => sink.push(*x_out),
             Self::Scale { x_out, .. } => sink.push(*x_out),
@@ -523,6 +589,7 @@ impl Operands for Elementwise {
             Self::GateSigmoidMul { x_out, .. } => sink.push(*x_out),
             Self::HcExpand { y, .. } => sink.push(*y),
             Self::HcRmsnormF32 { y, .. } => sink.push(*y),
+            Self::HcProject { mixes, .. } => sink.push(*mixes),
             Self::HcGates { x, post_mix, comb_mix, .. } => sink.extend([*x, *post_mix, *comb_mix]),
             Self::HcFold { y, .. } => sink.push(*y),
             Self::HcMix { y, .. } => sink.push(*y),
@@ -546,6 +613,7 @@ impl Operands for Elementwise {
             Self::RmsnormGatedBy { .. } => {}
             Self::ResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::AddBias { out_out, out, .. } => sink.push((*out_out, *out)),
+            Self::Standardize { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::MulScalar { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::SiluScaled { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::Scale { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -563,6 +631,7 @@ impl Operands for Elementwise {
             Self::GateSigmoidMul { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::HcExpand { .. } => {}
             Self::HcRmsnormF32 { .. } => {}
+            Self::HcProject { .. } => {}
             Self::HcGates { .. } => {}
             Self::HcFold { .. } => {}
             Self::HcMix { .. } => {}
@@ -586,6 +655,7 @@ impl Operands for Elementwise {
             Self::RmsnormGatedBy { .. } => "elementwise.rmsnorm_gated_by",
             Self::ResidualAdd { .. } => "elementwise.residual_add",
             Self::AddBias { .. } => "elementwise.add_bias",
+            Self::Standardize { .. } => "elementwise.standardize",
             Self::MulScalar { .. } => "elementwise.mul_scalar",
             Self::SiluScaled { .. } => "elementwise.silu_scaled",
             Self::Scale { .. } => "elementwise.scale",
@@ -599,6 +669,7 @@ impl Operands for Elementwise {
             Self::GateSigmoidMul { .. } => "elementwise.gate_sigmoid_mul",
             Self::HcExpand { .. } => "elementwise.hc_expand",
             Self::HcRmsnormF32 { .. } => "elementwise.hc_rmsnorm_f32",
+            Self::HcProject { .. } => "elementwise.hc_project",
             Self::HcGates { .. } => "elementwise.hc_gates",
             Self::HcFold { .. } => "elementwise.hc_fold",
             Self::HcMix { .. } => "elementwise.hc_mix",

@@ -40,10 +40,35 @@
 //!     answers sensible tokens rather than refusing.
 //! (b) BIT-IDENTITY across the {T0+T1+T2} mix (W-2). The three-tier load's
 //!     greedy tokens and logits are the uncapped load's, exactly.
-//! (c) THE REFUSAL IS STILL THERE. The same plan with no artifact to map is
+//! (c) THE REFUSAL IS STILL THERE. The same plan against an empty cache is
 //!     `Fault::Residency` by name — a spilled load with no source is the one
 //!     thing this shell cannot serve, and it says so instead of pretending.
 //! ```
+//!
+//! # And the boot no longer writes what the boot reads (§M wave M-3)
+//!
+//! The shape of this gate changed under it. It used to be two boots: the
+//! uncapped one wrote the whole-table `.weights` artifact, and the capped one
+//! read its own spilled planes straight out of that bootstrap, landing the
+//! checkpoint cold on its way past and leaving a `.tiers` file behind. A
+//! serving load that streams cannot land cold any more
+//! (`engine_cuda::weights::Intent`) — it is served out of a prepared serving
+//! artifact or it is refused — so a `Shell::prepare` sits between the two
+//! boots, and it is the call that reads the `.weights` bootstrap now.
+//!
+//! ```text
+//!   uncapped boot   lands the checkpoint, writes `<resident>.weights`
+//!   prepare         reads that bootstrap for its spilled planes, writes
+//!                   `<tier>.tiers` — the ONLY writer of one in the process
+//!   capped boot     cuts the `.tiers` by these two budgets and serves,
+//!                   mapping what neither budget holds
+//! ```
+//!
+//! Nothing about the CAPABILITY moved: the bytes the GPU faults in over HMM
+//! are the same bytes off the same kind of file, and (a), (b) and (c) are the
+//! claims they always were. What moved is which call produces the file, and
+//! the reason is that a hundred gigabytes must not be written underneath a
+//! deployment that was asked to serve.
 //!
 //! ```text
 //! cargo test -p engine-cuda --features cuda-13 \
@@ -53,9 +78,11 @@
 //! # Gating and cost
 //!
 //! `#[ignore]`d. It wants a CUDA device that reports `pageableMemoryAccess`
-//! (CUDA 12.2+ HMM) with ~15 GiB free, the gpt-oss-20b snapshot, and ~15 GiB
-//! of scratch disk for the artifact it writes. It loads the model twice,
-//! sequentially. Skips with a sentence when any of that is missing.
+//! (CUDA 12.2+ HMM) with ~15 GiB free, the gpt-oss-20b snapshot, and ~30 GiB
+//! of scratch disk for the two artifacts it writes — the whole-table
+//! `.weights` bootstrap and the `.tiers` the prepare cuts out of it. It lands
+//! the model THREE times, sequentially: the uncapped boot, the prepare, and
+//! the three-tier boot. Skips with a sentence when any of that is missing.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -87,7 +114,7 @@ fn serialized() -> MutexGuard<'static, ()> {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn snapshot() -> Option<PathBuf> {
@@ -162,9 +189,9 @@ fn rig(what: &str) -> Option<Rig> {
     }
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index_all(&shards).expect("the checkpoint's shards open as one");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
     Some(Rig {
@@ -175,8 +202,12 @@ fn rig(what: &str) -> Option<Rig> {
     })
 }
 
-fn load(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result<Shell> {
-    Shell::load(Boot {
+/// **ONE DOCUMENT, TWO DOORS** (§M-3). The prepare and the boot have to
+/// describe the same deployment in every field or they name two different
+/// files — the serving artifact's key is a function of the trace, the recipe
+/// and the ranking — so the gate states it once and hands it to both.
+fn doc<'a>(rig: &'a Rig, residency: Plan, cache: Option<&'a Path>) -> Boot<'a> {
+    Boot {
         trace: rig.trace.clone(),
         contract: &rig.contract,
         checkpoint: &rig.checkpoint,
@@ -188,17 +219,30 @@ fn load(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result
         ordinal: 0,
         graphs: Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         // No second row axis: this gate fires text lanes only.
         patches: None,
         // **THE CACHE DIRECTORY IS THE T2 SOURCE'S HOME**, and here it is a
         // gate's own scratch rather than a shared one: the uncapped boot below
-        // WRITES the artifact and the capped boot MAPS it, so what is under
-        // test is this run's file and not the last run's.
+        // writes the `.weights` bootstrap, the PREPARE cuts a `.tiers` out of
+        // it, and the capped boot maps that — so what is under test is this
+        // run's files and not the last run's.
         weight_cache_dir: cache,
         residency,
-    })
+    }
+}
+
+fn load(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result<Shell> {
+    Shell::load(doc(rig, residency, cache))
+}
+
+/// **THE WRITER OF A SERVING ARTIFACT**, and since §M-3 the only one there is.
+/// `pie model import --prepare-only` reaches it through `Cuda::prepare`; the
+/// gate reaches it directly, because what it needs is the file and not the
+/// plumbing.
+fn prepare(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result<()> {
+    Shell::prepare(doc(rig, residency, cache))
 }
 
 fn run(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>) {
@@ -255,11 +299,12 @@ fn finite(logits: &[f32], what: &str) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// **(a), (b) and (c).** One uncapped boot to write the artifact and set the
-/// golden, one three-tier boot to serve out of it, and one refusal.
+/// **(a), (b) and (c).** One refusal against an empty cache, one uncapped
+/// boot to write the `.weights` bootstrap and set the golden, one prepare to
+/// cut the serving artifact out of it, and one three-tier boot to serve.
 #[test]
 #[ignore = "real-hardware: needs a CUDA device with HMM and ~15 GiB free, a local \
-            gpt-oss-20b snapshot, and ~15 GiB of scratch disk; run it with `-- --ignored`"]
+            gpt-oss-20b snapshot, and ~30 GiB of scratch disk; run it with `-- --ignored`"]
 fn a_model_larger_than_both_budgets_serves() {
     let _one = serialized();
     let Some(rig) = rig("the W-1 capability gate") else {
@@ -321,20 +366,51 @@ fn a_model_larger_than_both_budgets_serves() {
     // ── (c) THE REFUSAL, FIRST, WHILE THE CACHE IS STILL EMPTY. A spilled
     //    plan with no artifact to map is not a slow load; it is a load this
     //    machine cannot serve, and it says which file it wanted.
+    //
+    //    **AND IT IS A DIFFERENT DOOR'S REFUSAL SINCE §M-3.** W-1 got this
+    //    sentence out of `experts::Tier::open`, whose T2 arm answers "`{bank}`
+    //    is planned onto the mapped tier and this load opened no artifact to
+    //    map it out of" — the last check standing between a spilled plan and a
+    //    null pointer. That arm is still there and still says that, but a
+    //    streamed serving load no longer reaches it: `Weights::resident` looks
+    //    for this deployment's serving artifact BEFORE it opens a tier or
+    //    allocates a byte, and under `Intent::Serve` a miss is the whole load's
+    //    answer. So what an operator is handed here is the sentence with the
+    //    REMEDY in it, which is the point of the wave, and the empty directory
+    //    is the never-prepared case rather than the changed-recipe one.
+    //
+    //    Note which refusal this is NOT: `Residency::admit_tiers`' "spilled
+    //    bytes, no source" is the runtime's statute and it is asked in
+    //    `api.rs`'s `settle`, off an `engine::Residency`. This gate cuts its
+    //    own `Plan` and calls `Shell::load` directly, so it has never crossed
+    //    that door and does not here either.
     let said = match load(&rig, plan.clone(), Some(&cache.0)) {
         Err(why) => format!("{why}"),
         Ok(_) => panic!("a spilled plan with no artifact cannot be served"),
     };
     assert!(
-        said.contains("mapped tier"),
-        "the refusal names the tier: {said}"
+        said.contains("pie model import --prepare-only"),
+        "the refusal names the command that fixes it: {said}"
+    );
+    assert!(
+        said.contains("never been prepared"),
+        "and an empty cache directory is the never-prepared case: {said}"
     );
     eprintln!("with an empty cache: {said}");
 
-    // ── THE GOLDEN, UNCAPPED — and the boot that WRITES the artifact the
-    //    capped boot will map. `weight_cache_dir` is what makes the warm-boot
-    //    file a serving-time source (streaming §0's promotion).
-    let mut resident = load(&rig, Plan::default(), Some(&cache.0)).expect("the uncapped shell loads");
+    // ── THE GOLDEN, UNCAPPED — and the boot that writes the whole-table
+    //    `.weights` artifact. **THIS BOOT IS UNCHANGED BY §M-3 AND STILL
+    //    WRITES**: the wave took the cold path away from loads that STREAM,
+    //    and this one is fully resident — it lands the checkpoint, keeps the
+    //    whole table on the device, and snapshots the store it materialized
+    //    exactly as it always did. `weight_cache_dir` is what makes that
+    //    snapshot a serving-time source (streaming §0's promotion).
+    //
+    //    What changed is who spends it. The bootstrap used to be the CAPPED
+    //    BOOT's road in; it is the PREPARE's now, and the boot reads what the
+    //    prepare leaves.
+    let mut resident =
+        load(&rig, Plan::default(), Some(&cache.0)).expect("the uncapped shell loads");
     assert!(resident.weights_resident());
     let (golden, golden_rows) = run(&mut resident, &prompt);
     let says = rig.tokenizer.decode(&golden, false);
@@ -351,6 +427,25 @@ fn a_model_larger_than_both_budgets_serves() {
         "artifact: {} ({} bytes on disk)",
         artifact.display(),
         std::fs::metadata(&artifact).map(|m| m.len()).unwrap_or(0)
+    );
+
+    // ── THE PREPARE, WHICH IS WHAT READS THAT BOOTSTRAP (§M-3). The same
+    //    three-tier plan and the same directory as the boot below, because the
+    //    serving artifact's key is a function of this document: a prepare at a
+    //    different seat writes a file the boot will not look for.
+    //
+    //    It is the one call here that still lands cold — the store's planes
+    //    and the pinned tier come out of the checkpoint, and the ~7 GiB this
+    //    budget SPILLS come out of the `.weights` above, mapped, because a
+    //    spilled plan has to source its third tier from somewhere whichever
+    //    intent is asking. The whole product is the `.tiers` file it leaves;
+    //    no shell, no arena, nothing on the device when it returns.
+    let prepared = std::time::Instant::now();
+    prepare(&rig, plan.clone(), Some(&cache.0))
+        .expect("a spilled deployment prepares out of the whole-table bootstrap");
+    eprintln!(
+        "prepared the serving artifact in {:.1} s",
+        prepared.elapsed().as_secs_f64()
     );
 
     // ── (a) THE CAPABILITY. The same plan, now that the source exists.

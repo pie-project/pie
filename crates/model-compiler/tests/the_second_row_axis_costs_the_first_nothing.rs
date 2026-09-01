@@ -70,7 +70,7 @@ fn every_pre_campaign_sku_is_exactly_one_capture_unit() {
     let mut wrong: Vec<String> = Vec::new();
     let (mut baked, mut towers) = (0usize, 0usize);
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -202,7 +202,7 @@ fn admitting_a_patch_axis_does_not_move_one_byte_of_a_text_only_artifact() {
     let mut moved: Vec<String> = Vec::new();
     let (mut compared, mut towers) = (0usize, 0usize);
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let profile = DeviceProfile::default();

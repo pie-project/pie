@@ -95,10 +95,8 @@ fn serialized() -> MutexGuard<'static, ()> {
 /// The lane word the model's own `Classify` computes — the facts qwen
 /// declares, and no third opinion about any of them.
 fn word(query_len: u32, captures: bool) -> u64 {
-    model::qwen_3::forward::Facts::of(
-        &Request::new(query_len, false).capturing_scores(captures),
-    )
-    .word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).capturing_scores(captures))
+        .word()
 }
 
 /// The word a DRAFTING request carries, which this SKU's artifact has no arm
@@ -108,7 +106,7 @@ fn word(query_len: u32, captures: bool) -> u64 {
 /// `UnknownWord`: the two halves agree perfectly, and what is missing is the
 /// ARM.
 fn drafting_word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false).drafting(true)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).drafting(true)).word()
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -493,7 +491,7 @@ fn a_capture_composition_captures_once_and_replays_identically() {
         tok.decode(&replayed, false),
     );
     assert!(
-        stats.hits >= 1,
+        stats.tally.hits >= 1,
         "the capture composition was never served from a body, so this \
          compared eager against eager. `refusals` would say the admissibility \
          rule turned it away, which on a whole-fire composition would be a \
@@ -542,7 +540,7 @@ fn a_fire_no_lane_captured_costs_the_axis_nothing() {
         "a lane that captured nothing was handed {} capture column(s)",
         mass.len(),
     );
-    let plain_nodes = shell.body_stats().nodes;
+    let plain_nodes = shell.body_stats().last_capture.nodes;
 
     // Now capture on another slot, then fire the plain composition again. Its
     // graph is already recorded and keyed by the composition, so a plain fire
@@ -562,7 +560,7 @@ fn a_fire_no_lane_captured_costs_the_axis_nothing() {
     eprintln!(
         "uncaptured floor: {plain_nodes} nodes before, {} after; {after}; \
          continuation {:?}",
-        after.nodes,
+        after.last_capture.nodes,
         tok.decode(&plain, false),
     );
     assert_eq!(
@@ -648,7 +646,7 @@ fn a_capturing_prefill_beside_a_capturing_decode_is_two_launches_and_the_same_to
     // at the same budgets, compose the same three words, and count the windows
     // that come back in pieces.
     let split_windows = {
-        let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+        let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
         let compiled = compile(&trace, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
         let words = [
             model_exec::fire::Lane::new(word(1, true), 1),
@@ -769,7 +767,7 @@ fn a_capturing_prefill_beside_a_capturing_decode_is_two_launches_and_the_same_to
 /// chunked mixer arms are on that list, which is why this fire is held WHOLE
 /// by its body. A region that left the list would not refuse the composition
 /// since the tier-2 campaign — it would become an island the body is cut
-/// around — so what names it now is `BodyStats::islands` rather than
+/// around — so what names it now is `LastCapture::islands` rather than
 /// `refusals`.
 ///
 /// The fragmented composition is repeated rather than passed through once:
@@ -853,7 +851,7 @@ fn a_split_composition_captures_once_and_replays_identically() {
     let stats = shell.body_stats();
     eprintln!("split replay: {stats}");
     assert!(
-        stats.hits >= 1,
+        stats.tally.hits >= 1,
         "the split composition was never served from a body, so this compared \
          eager against eager. A moved `refusals` names the region whose ops are \
          not on `crate::SHIFTED` — the fragmented window has nowhere else to \
@@ -1024,8 +1022,7 @@ fn a_capture_against_a_text_that_declares_no_arm_is_refused() {
         // Gemma's own word for a plain prefill: its `Facts` reads `qo_one` and
         // `masked` and nothing else, so there is no capture bit to set and the
         // ask stands alone — which is exactly the case under test.
-        word: model::gemma_4::forward::Facts::of(&Request::new(prompt.len() as u32, false))
-            .word(),
+        word: models::gemma_4::forward::Facts::of(&Request::new(prompt.len() as u32, false)).word(),
         tokens: &prompt,
     })]);
     let said = asked
@@ -1043,7 +1040,7 @@ fn a_capture_against_a_text_that_declares_no_arm_is_refused() {
     shell
         .fire_seated(&[Seated::of(Lane {
             slot: 0,
-            word: model::gemma_4::forward::Facts::of(&Request::new(prompt.len() as u32, false))
+            word: models::gemma_4::forward::Facts::of(&Request::new(prompt.len() as u32, false))
                 .word(),
             tokens: &prompt,
         })])
@@ -1089,9 +1086,9 @@ mod gemma {
         };
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let trace = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
+        let trace = models::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
         let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-        let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+        let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
 
@@ -1118,7 +1115,7 @@ mod gemma {
                 bodies: true,
                 ..engine_cuda::Knobs::default()
             },
-            program_cache_dir: None,
+            cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
             // claims. `Runahead::of` is the door a deployment comes through.
@@ -1168,7 +1165,7 @@ fn the_drafting_sku_does_not_fit_this_device() {
         eprintln!("skipping the drafting load: {checkpoint:?} holds no tensor container");
         return;
     }
-    let trace = model::trace_of(DRAFTING).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(DRAFTING).expect("the catalog ships the SKU")(Platform::Cuda);
     // The plan is the half that DOES fit, and it is worth reading before the
     // load refuses: this SKU declares the draft export, which is what makes
     // the refusal below about the device rather than about the model text.
@@ -1183,7 +1180,7 @@ fn the_drafting_sku_does_not_fit_this_device() {
     // that has nothing to do with the device.
     let source =
         ztensor_compat::index_all(&shards).expect("the checkpoint's shards open as one");
-    let contract = model::import_of(DRAFTING).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(DRAFTING).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
 
@@ -1208,7 +1205,7 @@ fn the_drafting_sku_does_not_fit_this_device() {
             bodies: true,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
@@ -1345,9 +1342,9 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
 
@@ -1372,7 +1369,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
             bodies: true,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.

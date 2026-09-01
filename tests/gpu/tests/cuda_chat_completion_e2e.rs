@@ -16,7 +16,7 @@
 //!
 //! Booted through `common::boot_cuda`, which resolves the shipping
 //! `qwen35-d0.8b-bf16-kv-bf16` snapshot; the `Qwen/Qwen3-0.6B` this file used
-//! to name is a checkpoint no `::model::qwen_3::IMPORTS` row can claim.
+//! to name is a checkpoint no `models::qwen_3::IMPORTS` row can claim.
 //!
 //! Run:
 //! ```text

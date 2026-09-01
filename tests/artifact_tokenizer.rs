@@ -176,7 +176,7 @@ fn a_converted_artifact_carries_the_checkpoints_own_config() {
     );
 
     // UTF-8, because a config nobody can read as text is not a config. It used
-    // to be parsed here too — `model::serve::encoding::Encoding` read the
+    // to be parsed here too — `models::serve::encoding::Encoding` read the
     // declared quantization out of it, and that was said to be "the only
     // reason it is carried at all". M18 deleted the parser and did not replace
     // it: a checkpoint's quantization comes off its STORED tensor encodings

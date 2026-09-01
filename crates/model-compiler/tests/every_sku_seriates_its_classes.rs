@@ -127,7 +127,7 @@ fn a_text_owes_a_fallback_exactly_when_its_attention_merge_grows_a_third_arm() {
     let mut wrong: Vec<String> = Vec::new();
     let (mut compiled, mut owing, mut merged) = (0usize, 0usize, 0usize);
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(baked_one) = bake(&trace)
@@ -192,7 +192,7 @@ fn a_text_owes_a_fallback_exactly_when_its_attention_merge_grows_a_third_arm() {
     // alto A-6 put the correction in five more texts, which says nothing
     // either. So the ceiling is derived from the catalog's own size, and the
     // owing count is derived from the property that decides it.
-    let pairs = model::catalog().into_iter().count() * PLATFORMS.len();
+    let pairs = models::catalog().into_iter().count() * PLATFORMS.len();
     assert_eq!(
         compiled, pairs,
         "only {compiled} of {pairs} SKU x platform pairs compiled",
@@ -216,7 +216,7 @@ fn a_text_owes_a_fallback_exactly_when_its_attention_merge_grows_a_third_arm() {
 fn every_windowed_capture_region_is_an_interval_of_the_class_order() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -342,7 +342,7 @@ fn a_text_withdraws_one_mask_per_crossing_axis_once_its_merge_grows_a_third_arm(
     let mut wrong: Vec<String> = Vec::new();
     let mut with_axes = 0usize;
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -458,7 +458,7 @@ fn a_text_withdraws_one_mask_per_crossing_axis_once_its_merge_grows_a_third_arm(
 fn the_same_text_seriates_the_same_way_twice() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let profile = DeviceProfile::default();

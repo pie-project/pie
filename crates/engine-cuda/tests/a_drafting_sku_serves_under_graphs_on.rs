@@ -60,7 +60,7 @@ fn budget() -> Budget {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -93,11 +93,12 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
 }
 
 fn shell(checkpoint: &Path, container: &Path) -> Shell {
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let trace = trace(Platform::Cuda);
     let source = ztensor_compat::index(container).expect("the overlay opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the overlay's import contract fits its own checkpoint");
+    let contract =
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+            .expect("the overlay's import contract fits its own checkpoint");
     drop(source);
 
     Shell::load(Boot {
@@ -124,7 +125,7 @@ fn shell(checkpoint: &Path, container: &Path) -> Shell {
             bodies: true,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         weight_cache_dir: None,
     })
@@ -180,7 +181,7 @@ fn the_eagle_overlay_answers_the_same_tokens_recorded_as_it_does_eagerly() {
     // stopped baking a conditional, everything below would pass while testing
     // nothing — a graphs=on/off identity over an always-launch artifact is
     // `bodies_gate.rs`'s claim and not this one.
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let baked = compile(&trace(Platform::Cuda), &budget(), &DeviceProfile::default())
         .expect("the overlay's plan bakes");
     let conditional: Vec<usize> = baked
@@ -212,22 +213,23 @@ fn the_eagle_overlay_answers_the_same_tokens_recorded_as_it_does_eagerly() {
     eprintln!(
         "`{SKU}`: region {} is baked `If`; {} captures, {} hits, {} nodes\n  \
          eager    {eager:?}\n  recorded {recorded:?}",
-        conditional[0], stats.captures, stats.hits, stats.nodes,
+        conditional[0], stats.tally.captures, stats.tally.hits, stats.last_capture.nodes,
     );
     assert!(
-        stats.captures > 0,
+        stats.tally.captures > 0,
         "the recorded arm never captured, so the conditional was never \
          recorded and both arms are the same eager walk: {stats}",
     );
     // **AND THE HIT IS WHAT SAYS THE BRACKET RAN FROM THE GRAPH.** A body that
     // captured and never replayed leaves the recorded arm an eager walk with a
     // capture on the side, which is the same two token streams and no claim.
-    // (The overlay is ONE capture unit — a draft head runs on the token axis —
-    // so it is not the multi-unit refusal `CompiledModel::fold_refused`
-    // states, and a zero here would be an admissibility finding worth chasing
-    // rather than a known limit.)
+    // (The overlay is ONE capture unit — a draft head runs on the token axis
+    // — so this SKU never had a second unit to be refused for, and since the
+    // multi-unit bodies wave a second one would not refuse it either: a
+    // `record::BodyKey` names a lattice point per unit. A zero here is an
+    // admissibility finding worth chasing rather than a known limit.)
     assert!(
-        stats.hits >= 1,
+        stats.tally.hits >= 1,
         "the drafting row's body never replayed, so the conditional was \
          recorded and never served: {stats}",
     );

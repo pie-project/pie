@@ -132,7 +132,7 @@ fn one_image(first_placeholder: i32) -> Shot {
 
 fn ready_as(sku: &str, what: &str) -> Option<Shell> {
     let dir = store()?;
-    let trace = model::trace_of(sku).expect("the catalog ships the row")(Platform::Cuda);
+    let trace = models::trace_of(sku).expect("the catalog ships the row")(Platform::Cuda);
     let budgets = engine::load::Budgets {
         max_tokens: 256,
         max_lanes: 4,
@@ -141,7 +141,7 @@ fn ready_as(sku: &str, what: &str) -> Option<Shell> {
     let patches = engine_cuda::api::patch_ladder(&trace, &budgets);
     let container = dir.join("archive.zt");
     let source = ztensor_compat::index(&container).expect("the artifact opens");
-    let Ok(contract) = model::import_of(sku).expect("the catalog ships an import")(&source) else {
+    let Ok(contract) = models::import_of(sku).expect("the catalog ships an import")(&source) else {
         eprintln!("skipping {what}: {container:?} does not satisfy `{sku}`");
         return None;
     };
@@ -160,9 +160,15 @@ fn ready_as(sku: &str, what: &str) -> Option<Shell> {
             // Disjoint slots on both sides of every identity: a fire APPENDS.
             slots: 8,
             ordinal: 0,
+            // Eager by this file's own choice, and no longer by the router's.
+            // A two-unit artifact was refused the bodies path outright until
+            // the multi-unit bodies wave gave `record::BodyKey` a lattice
+            // point per capture unit; what asks whether a tower load arms and
+            // replays is `a_tower_body_replays_at_another_image_split.rs`, on
+            // qwen35's row. This one is about what a fire ANSWERS.
             graphs: engine_cuda::Graphs::Off,
             knobs: engine_cuda::Knobs::default(),
-            program_cache_dir: None,
+            cache_dir: None,
             runahead: engine::runahead::Runahead::F1,
             weight_cache_dir: None,
         })
@@ -175,11 +181,11 @@ fn bits(logits: &[f32]) -> Vec<u32> {
 }
 
 fn text_word(sku: &str, rows: u32) -> u64 {
-    model::classify_of(sku).expect("a classify")(&model_dsl::Request::new(rows, false))
+    models::classify_of(sku).expect("a classify")(&model_dsl::Request::new(rows, false))
 }
 
 fn media_word(sku: &str, rows: u32) -> u64 {
-    model::classify_of(sku).expect("a classify")(
+    models::classify_of(sku).expect("a classify")(
         &model_dsl::Request::new(rows, false).with_media(true),
     )
 }
@@ -201,7 +207,7 @@ fn shot_media<'a>(lane: u32, shot: &'a Shot) -> Media<'a> {
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local gemma-4-E4B artifact; run it with `-- --ignored`"]
 fn the_derived_ladder_seats_a_pooled_image() {
-    let trace = model::trace_of(SKU).expect("the catalog ships the row")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the row")(Platform::Cuda);
     let ladder = engine_cuda::api::patch_ladder(
         &trace,
         &engine::load::Budgets { max_tokens: 256, max_lanes: 4, ..engine::load::Budgets::default() },

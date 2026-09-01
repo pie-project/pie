@@ -5,11 +5,8 @@
     "tp_size": 1,
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
-    "tile_map_mask": 199,
-    "native_mxfp4_moe": true,
-    "fusion_mask": 1,
-    "encode_scratch_dtype": "Bf16",
-    "block_scale_rows": 128
+    "tile_map_mask": 451,
+    "native_mxfp4_moe": true
   },
   "passes": [
     {
@@ -104,7 +101,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -120,7 +117,7 @@
         16
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       }
     },
     {
@@ -135,7 +132,7 @@
         4
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       }
     },
     {
@@ -151,7 +148,7 @@
         16
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       }
     },
     {
@@ -166,7 +163,7 @@
         8
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       }
     },
     {
@@ -179,7 +176,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     }
   ],
@@ -191,7 +188,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -205,7 +202,7 @@
         16
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       },
       "alignment": 256
     },
@@ -218,7 +215,7 @@
         4
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       },
       "alignment": 256
     },
@@ -232,7 +229,7 @@
         16
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       },
       "alignment": 256
     },
@@ -245,7 +242,7 @@
         8
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       },
       "alignment": 256
     },
@@ -256,7 +253,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     }
@@ -270,7 +267,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 256,
@@ -289,7 +286,7 @@
           16
         ],
         "encoding": {
-          "Raw": "U8"
+          "Raw": "u8"
         }
       },
       "bytes": 65536,
@@ -307,7 +304,7 @@
           4
         ],
         "encoding": {
-          "Raw": "U8"
+          "Raw": "u8"
         }
       },
       "bytes": 4096,
@@ -326,7 +323,7 @@
           16
         ],
         "encoding": {
-          "Raw": "U8"
+          "Raw": "u8"
         }
       },
       "bytes": 32768,
@@ -344,7 +341,7 @@
           8
         ],
         "encoding": {
-          "Raw": "U8"
+          "Raw": "u8"
         }
       },
       "bytes": 2048,
@@ -360,7 +357,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 256,
@@ -425,7 +422,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest_offset": 0
       }

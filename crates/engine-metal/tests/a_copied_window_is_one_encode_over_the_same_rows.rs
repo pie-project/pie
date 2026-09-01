@@ -95,7 +95,7 @@ fn profile() -> DeviceProfile {
 
 /// The served text, baked for this plane.
 fn baked() -> (Trace, CompiledModel) {
-    let (_, _, trace, _) = model::catalog()
+    let (_, _, trace, _) = models::catalog()
         .into_iter()
         .find(|(sku, ..)| sku.starts_with(SERVED))
         .unwrap_or_else(|| panic!("the catalog no longer names a {SERVED} text"));
@@ -174,6 +174,14 @@ fn ambient(rows: usize) -> (Vec<i32>, Vec<i32>) {
 /// The windows this fire cuts, at one arm of the switch.
 fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
     let classes = every_class_once(compiled);
+    // **THE SECOND SERIATION'S TABLE, AND IT IS THE EMPTY ONE.** This
+    // artifact states no patch row, so its patch table is one all-zero window
+    // per class — which is what a text-only fire's composition answers and
+    // what makes every `Window::patch` here `(0, 0)`.
+    let no_patches = WindowTable::new(vec![
+        ClassWindow::default();
+        compiled.classes.classes.len()
+    ]);
     let lanes = compiled.classes.classes.len();
     let (positions, request_of_token) = ambient(lanes);
     let spaces = [geometry(lanes)];
@@ -181,6 +189,7 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
         trace,
         compiled,
         &classes,
+        &no_patches,
         &indptr(lanes),
         Copies {
             // Bucket 0 is 16 rows, which is below the crossover on every

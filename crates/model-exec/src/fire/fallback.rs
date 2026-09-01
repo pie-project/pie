@@ -49,12 +49,33 @@
 //! [`Fallback::Grouped`] and [`Fallback::View`] still need what they always
 //! needed — an op that takes an offset list rather than a rectangle — which
 //! is exactly why `model_compiler::layout`'s menu declines to choose them.
+//!
+//! # Every question here takes the axis, because there is a menu per axis
+//!
+//! **A PLAN HAS ONE SERIATION PER ROW SPACE AND THEREFORE ONE MENU PER ROW
+//! SPACE** (`CompiledModel::order_for`, `::fallback_for`), and until this wave
+//! every function below read `CompiledModel::order`/`::fallback` — the TOKEN
+//! axis's tables — whatever it was asked about. A mask does not disambiguate
+//! them: a tower region and a trunk region can state the very same
+//! [`ClassSet`] and be two regions only because their axes differ
+//! (`model_compiler::unit`'s `one_mask_and_one_phase_still_break_at_the_axis`),
+//! so a mask-keyed lookup on the token table can hand a patch region the
+//! token seriation's answer and a token region a patch region's row.
+//!
+//! It never did, and what stopped it was not a type: both shells wrote
+//! `let menu = axis == RowAxis::Tokens;` by hand in front of every call, and
+//! `model_exec::fire::walk` — which asks [`grouped`] for regions of either
+//! axis — wrote nothing at all and survived on the unstated invariant that a
+//! patch region's node range never appears in the token table. So the axis is
+//! an ARGUMENT now, resolved through `fallback_for`/`order_for`, and an axis
+//! this plan does not state answers the empty answer: `false`, `1`, no rows.
+//! The table answers per axis, so nobody has to guard the question.
 
 use core::ops::Range;
 
 use crate::error::KernelError;
 use model_compiler::{CompiledModel, Fallback, Phase, PqTree, Region};
-use model_ir::ClassSet;
+use model_ir::{ClassSet, RowAxis};
 
 /// Every answer P4 wrote for a region's nodes, deduplicated, in the order the
 /// bucket lattice states them.
@@ -77,10 +98,16 @@ use model_ir::ClassSet;
 /// The scan is linear over a table with tens of rows and is asked only about
 /// a region a fire ALREADY found fragmented, which is the rare case by
 /// construction — the whole point of P4 is that it is rare.
+///
+/// `axis` names WHICH menu — the table answers per axis now (module header),
+/// and an axis this plan does not state is owed nothing and answers nothing.
 #[must_use]
-pub fn answers(compiled: &CompiledModel, nodes: Range<u32>) -> Vec<Fallback> {
+pub fn answers(compiled: &CompiledModel, axis: RowAxis, nodes: Range<u32>) -> Vec<Fallback> {
+    let Some(table) = compiled.fallback_for(axis) else {
+        return Vec::new();
+    };
     let mut found: Vec<Fallback> = Vec::new();
-    for row in &compiled.fallback.rows {
+    for row in &table.rows {
         if !nodes.contains(&row.node) || found.contains(&row.fallback) {
             continue;
         }
@@ -106,10 +133,24 @@ pub fn answers(compiled: &CompiledModel, nodes: Range<u32>) -> Vec<Fallback> {
 /// the budgets and this crate does not, which is why the index is an
 /// argument: `Composition::bucket` is the bucket's ROW COUNT, and turning
 /// that into a position is a lookup in a table only the shell has.
+///
+/// PRIVATE, AND THAT IS THE WHOLE OF ITS EXPORT STORY. The resolution is
+/// [`copies`]' business — it is the one caller that holds both the mask and
+/// the bucket — and a `pub` resolver invites a reader to ask about a node
+/// range without saying which seriation's ladder its `bucket` counts in.
+/// [`answers`] stays public because the UNRESOLVED question is one a load-time
+/// check can ask honestly.
+///
+/// `axis` picks the menu, and the bucket indexes THAT axis's own ladder.
 #[must_use]
-pub fn answer_at(compiled: &CompiledModel, nodes: Range<u32>, bucket: u32) -> Option<Fallback> {
+fn answer_at(
+    compiled: &CompiledModel,
+    axis: RowAxis,
+    nodes: Range<u32>,
+    bucket: u32,
+) -> Option<Fallback> {
     compiled
-        .fallback
+        .fallback_for(axis)?
         .rows
         .iter()
         .find(|row| nodes.contains(&row.node) && row.buckets.contains(&bucket))
@@ -139,13 +180,24 @@ pub fn answer_at(compiled: &CompiledModel, nodes: Range<u32>, bucket: u32) -> Op
 /// A mask no region is owed a row for answers `false` — which is every mask
 /// P4 seated, where the question never arises because the window is one
 /// interval anyway.
+///
+/// **AND THE MASK IS THE KEY WITHIN ONE AXIS, NEVER ACROSS TWO.** A tower
+/// region and a trunk region can state the identical mask and be two regions
+/// only because their axes differ, so the filter below asks
+/// [`CompiledModel::axis_of`] as well: the inheritance argument above is
+/// about a builder and its readers sharing ONE window, and two regions in two
+/// row spaces share no window at all. The table answers per axis now (module
+/// header), and this is where the mask-keyed reading is narrowed to match.
 #[must_use]
-pub fn copies(compiled: &CompiledModel, mask: &ClassSet, bucket: u32) -> bool {
+pub fn copies(compiled: &CompiledModel, axis: RowAxis, mask: &ClassSet, bucket: u32) -> bool {
     compiled
         .template()
         .iter()
-        .filter(|region| &region.mask == mask)
-        .any(|region| answer_at(compiled, region.nodes.clone(), bucket) == Some(Fallback::Copy))
+        .enumerate()
+        .filter(|(at, region)| &region.mask == mask && compiled.axis_of(*at) == axis)
+        .any(|(_, region)| {
+            answer_at(compiled, axis, region.nodes.clone(), bucket) == Some(Fallback::Copy)
+        })
 }
 
 /// **THE SHELL'S HALF OF `Fallback::Copy`**: what a backend must be able to
@@ -245,13 +297,18 @@ fn unserved(half: &'static str) -> KernelError {
 /// Asked only of a region a fire ALREADY found fragmented — for a window that
 /// covers one interval the two answers are the same launch — which keeps the
 /// linear scan on the rare path where [`answers`] puts it.
+///
+/// `axis` is the region's own — the table answers per axis now (module
+/// header), which is what the walk used to be missing: it asks this for
+/// regions of either axis and had no guard at all in front of it.
 #[must_use]
-pub fn grouped(compiled: &CompiledModel, nodes: Range<u32>) -> bool {
-    compiled
-        .fallback
-        .rows
-        .iter()
-        .any(|row| nodes.contains(&row.node) && row.fallback == Fallback::Grouped)
+pub fn grouped(compiled: &CompiledModel, axis: RowAxis, nodes: Range<u32>) -> bool {
+    compiled.fallback_for(axis).is_some_and(|table| {
+        table
+            .rows
+            .iter()
+            .any(|row| nodes.contains(&row.node) && row.fallback == Fallback::Grouped)
+    })
 }
 
 
@@ -276,10 +333,19 @@ pub fn grouped(compiled: &CompiledModel, nodes: Range<u32>) -> bool {
 /// PREPARE region gets no row whatever the lattice — `model_compiler::layout`
 /// offers only capture regions to the C1P instance, so a plan builder's
 /// window is neither promised nor answered for.
+///
+/// **AND IT IS THE BOUND UNDER `axis`'S OWN SERIATION.** The two row spaces
+/// order the same classes independently (`CompiledModel::order_for`), so the
+/// same mask breaks into different runs in each, and an axis this plan does
+/// not state answers `1` — the seated bound, which is the honest answer for a
+/// row space that has no rows.
 #[must_use]
-pub fn bound(compiled: &CompiledModel, mask: &ClassSet) -> u32 {
+pub fn bound(compiled: &CompiledModel, axis: RowAxis, mask: &ClassSet) -> u32 {
+    let Some(order) = compiled.order_for(axis) else {
+        return 1;
+    };
     let classes = compiled.classes.classes.len();
-    let order = compiled.order.class_order(&ClassSet::of(0..classes), None);
+    let order = order.class_order(&ClassSet::of(0..classes), None);
     let mask: Vec<u8> = mask.iter().map(|class| class as u8).collect();
     PqTree::runs(&order, &mask).max(1)
 }
@@ -302,9 +368,14 @@ pub fn bound(compiled: &CompiledModel, mask: &ClassSet) -> u32 {
 /// readers get rows. Adding it as a constraint is a P4 change with a
 /// blast radius across every baked order, so it is named here rather than
 /// made here.)
+///
+/// `axis` is the region's own, because [`answers`] takes one: a promise is
+/// made by ONE seriation about ONE row space, and reading the token table for
+/// a tower region would call it promised on the strength of a table that was
+/// never asked about it.
 #[must_use]
-pub fn promised(compiled: &CompiledModel, region: &Region) -> bool {
-    region.phase == Phase::Capture && answers(compiled, region.nodes.clone()).is_empty()
+pub fn promised(compiled: &CompiledModel, axis: RowAxis, region: &Region) -> bool {
+    region.phase == Phase::Capture && answers(compiled, axis, region.nodes.clone()).is_empty()
 }
 
 /// How many DISTINCT windows this artifact can ever have in pieces.
@@ -320,11 +391,16 @@ pub fn promised(compiled: &CompiledModel, region: &Region) -> bool {
 /// for the same reason. Masks P4 seated are excluded, because
 /// [`bound`] is `1` for them and a window that is never in pieces is never
 /// gathered.
+///
+/// Each region is measured under ITS OWN axis's seriation, which is the only
+/// bound that says anything about that region's window.
 #[must_use]
 pub fn fragmentable(compiled: &CompiledModel) -> usize {
     let mut seen: Vec<&ClassSet> = Vec::new();
-    for region in compiled.template() {
-        if bound(compiled, &region.mask) > 1 && !seen.contains(&&region.mask) {
+    for (at, region) in compiled.template().iter().enumerate() {
+        if bound(compiled, compiled.axis_of(at), &region.mask) > 1
+            && !seen.contains(&&region.mask)
+        {
             seen.push(&region.mask);
         }
     }
@@ -345,7 +421,8 @@ pub fn max_runs(compiled: &CompiledModel) -> u32 {
     compiled
         .template()
         .iter()
-        .map(|region| bound(compiled, &region.mask))
+        .enumerate()
+        .map(|(at, region)| bound(compiled, compiled.axis_of(at), &region.mask))
         .max()
         .unwrap_or(1)
         .max(1)
@@ -398,8 +475,8 @@ mod tests {
 
         // The region the table names, and one it does not.
         let owed: Vec<u32> = compiled.fallback.rows.iter().map(|row| row.node).collect();
-        for region in compiled.template() {
-            let answers = answers(&compiled, region.nodes.clone());
+        for (at, region) in compiled.template().iter().enumerate() {
+            let answers = answers(&compiled, compiled.axis_of(at), region.nodes.clone());
             let named = region.nodes.clone().any(|node| owed.contains(&node));
             assert_eq!(named, !answers.is_empty(), "region {:?}", region.nodes);
         }
@@ -423,15 +500,16 @@ mod tests {
         // deriving the number from the order rather than reading it off the
         // table: P4 counts `r` on the frontier it shipped, and so does this.
         let mut checked = 0;
-        for region in compiled.template() {
-            let stated = answers(&compiled, region.nodes.clone())
+        for (at, region) in compiled.template().iter().enumerate() {
+            let axis = compiled.axis_of(at);
+            let stated = answers(&compiled, axis, region.nodes.clone())
                 .into_iter()
                 .find_map(|answer| match answer {
                     Fallback::Split { r } => Some(r),
                     _ => None,
                 });
             if let Some(stated) = stated {
-                assert_eq!(bound(&compiled, &region.mask), stated, "{:?}", region.nodes);
+                assert_eq!(bound(&compiled, axis, &region.mask), stated, "{:?}", region.nodes);
                 assert!(stated > 1, "a withdrawn consumer costs more than one launch");
                 checked += 1;
             }
@@ -440,9 +518,10 @@ mod tests {
 
         // A seated region is bounded at one launch — the promise, in the same
         // vocabulary.
-        for region in compiled.template() {
-            if promised(&compiled, region) {
-                assert_eq!(bound(&compiled, &region.mask), 1, "{:?}", region.nodes);
+        for (at, region) in compiled.template().iter().enumerate() {
+            let axis = compiled.axis_of(at);
+            if promised(&compiled, axis, region) {
+                assert_eq!(bound(&compiled, axis, &region.mask), 1, "{:?}", region.nodes);
             }
         }
     }
@@ -452,10 +531,10 @@ mod tests {
         let b = crossing();
         let compiled = compile(&b.trace, &Budget::new(8, 64), &DeviceProfile::default())
             .expect("the fixture bakes");
-        for region in compiled.template() {
+        for (at, region) in compiled.template().iter().enumerate() {
             if region.phase == Phase::Prepare {
                 assert!(
-                    !promised(&compiled, region),
+                    !promised(&compiled, compiled.axis_of(at), region),
                     "a prepare region's window is neither promised nor answered for",
                 );
             }

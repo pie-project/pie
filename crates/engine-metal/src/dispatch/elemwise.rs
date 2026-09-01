@@ -75,39 +75,122 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            // **THE CENTRED NORMS AND THE CLAMP, REFUSED BY NAME**
-            // (multimodal §6.1, §6.5, next.md B5). This plane's
-            // `elemwise::norm` ships no centred entry — neither the scale-less
-            // one nor the fused whole-`LayerNorm` beside it — and its
-            // `elemwise` no free-standing clamp, so the arms that exist here
-            // are the names — which is the family's rule
-            // the other way round from `attn::dense`'s: a written shader gets
-            // a forwarding arm, an unwritten one gets its own refusal rather
-            // than a shader that norms the wrong thing. One `kernels-metal`
-            // entry each retires these, and nothing else moves.
+            // **THE WHOLE `nn.LayerNorm`, IN ONE LAUNCH** (multimodal §9.1,
+            // next.md B5): every qwen vision block's `norm1`/`norm2` and its
+            // merger's, twenty-five of them per dev-tower fire. It is the
+            // fused row and not the three-op spelling because the centred row
+            // is never rounded to the activation's element on the way
+            // through, which the composition cannot claim.
+            Elementwise::Layernorm {
+                x,
+                weight,
+                bias,
+                eps,
+                y,
+            } => elemwise::norm::layernorm(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*weight),
+                self.tensor(*bias),
+                *eps,
+                self.tensor(*y),
+            ),
+            // **THE SCALE-LESS CENTRED NORM AND THE CLAMP, REFUSED BY NAME**
+            // (multimodal §6.1, §6.5). This plane's `elemwise::norm` ships no
+            // scale-less centred entry — what a text writes when the scale
+            // really does bake into the GEMM behind it, which no shipping row
+            // does — and its `elemwise` no free-standing clamp. That is the
+            // family's rule the other way round from `attn::dense`'s: a
+            // written shader gets a forwarding arm, an unwritten one gets its
+            // own refusal rather than a shader that norms the wrong thing.
+            //
+            // `clamp_learned` stays owed by `gemma4-e4b-vision-bf16` alone —
+            // the wide gemma tower publishes `use_clipped_linears: false` and
+            // spells no clamp — and its checkpoint is not on this box.
             Elementwise::LayernormNoScale { .. }
-            | Elementwise::Layernorm { .. }
             | Elementwise::Clamp { .. }
-            | Elementwise::ClampLearned { .. }
-            // qwen4's gated-residual family: not on this plane yet.
-            | Elementwise::RmsnormGroupedPlusOne { .. }
-            | Elementwise::SiluScaled { .. }
-            | Elementwise::HcMix { .. }
-            | Elementwise::HcInject { .. }
-            | Elementwise::PleGate { .. } => {
+            | Elementwise::ClampLearned { .. } => {
                 Err(kernels_metal::Error::Unsupported { op: op.name() })
             }
-            Elementwise::RmsnormGated {
-                act: model_ir::GateActivation::Sigmoid,
-                ..
-            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            // **THE GATED-RESIDUAL FAMILY (qwen4), WHICH THIS BLOCK USED TO
+            // REFUSE WHOLE.** Five arms, ported off `elemwise/hc.cuh` and
+            // `elemwise/norm.cuh`: the per-group norm whose gain bank spans
+            // the wide row, the shared gate's scaled silu, the stream collapse
+            // and its injection back, and the PLE's key·query gate. They were
+            // the reason a `qwen38-flash-*` fire could not reach its second
+            // layer even after the n-gram hasher landed — the census called
+            // every one of those rows "clears the bake" while these five
+            // refused at the first fire, which is a bake's blind spot and not
+            // a lie it can be talked out of.
+            Elementwise::RmsnormGroupedPlusOne {
+                x,
+                weight,
+                group,
+                eps,
+                y,
+            } => elemwise::norm::rmsnorm_grouped_plus_one(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*weight),
+                *group,
+                *eps,
+                self.tensor(*y),
+            ),
+            Elementwise::SiluScaled { s, x, x_out: _ } => {
+                elemwise::norm::silu_scaled(self.ctx(), *s, self.tensor(*x))
+            }
+            Elementwise::HcMix {
+                gates,
+                normed,
+                streams,
+                y,
+            } => elemwise::hc::mix(
+                self.ctx(),
+                self.tensor(*gates),
+                self.tensor(*normed),
+                *streams,
+                self.tensor(*y),
+            ),
+            Elementwise::HcInject {
+                o,
+                gates,
+                streams,
+                hyper,
+                hyper_out: _,
+            } => elemwise::hc::inject(
+                self.ctx(),
+                self.tensor(*o),
+                self.tensor(*gates),
+                *streams,
+                self.tensor(*hyper),
+            ),
+            Elementwise::PleGate {
+                key,
+                query,
+                value,
+                streams,
+                y,
+            } => elemwise::hc::ple_gate(
+                self.ctx(),
+                self.tensor(*key),
+                self.tensor(*query),
+                self.tensor(*value),
+                *streams,
+                self.tensor(*y),
+            ),
+            // **BOTH GATE CURVES, WHICH USED TO BE ONE.** The sigmoid arm
+            // answered `Unsupported` by name while the silu arm served, and
+            // qwen4's GatedDeltaNet is the sigmoid one — its checkpoint's
+            // `output_gate_type` says so. The shader was always templated on
+            // the choice; only the instantiation and the entry's argument
+            // were missing.
             Elementwise::RmsnormGated {
                 x,
                 gate,
                 weight,
                 head_dim,
                 eps,
-                act: _,
+                act,
                 y,
             } => elemwise::norm::rmsnorm_gated(
                 self.ctx(),
@@ -116,6 +199,7 @@ impl Run<'_> {
                 self.tensor(*weight),
                 *head_dim,
                 *eps,
+                matches!(act, model_ir::GateActivation::Sigmoid),
                 self.tensor(*y),
             ),
             Elementwise::RmsnormGatedBy {
@@ -142,6 +226,25 @@ impl Run<'_> {
                 out,
                 out_out: _,
             } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
+            // **THE TOWER'S OUTPUT STANDARDIZATION** (multimodal §21.3): the
+            // per-column affine `(x − bias) · scale`, in place. It sits beside
+            // `add_bias` because that is its launch — same grid, same
+            // threadgroup, one more plane — and it is a row of its own because
+            // neither neighbour can spell it: `scale` reads ONE device-held
+            // scalar, and the composed pair would round the difference to the
+            // activation's element between two launches at the one tower site
+            // where a bias cancels what it is subtracted from.
+            Elementwise::Standardize {
+                x,
+                bias,
+                scale,
+                x_out: _,
+            } => elemwise::norm::standardize(
+                self.ctx(),
+                self.tensor(*bias),
+                self.tensor(*scale),
+                self.tensor(*x),
+            ),
             Elementwise::MulScalar { s, x, x_out: _ } => {
                 elemwise::norm::mul_scalar(self.ctx(), *s, self.tensor(*x))
             }
@@ -233,10 +336,35 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
+            // **THE TOWER'S OWN LAYOUT** (multimodal §6.3): contiguous
+            // sections, each restarting the frequency ladder at a denominator
+            // that is `Σ sections` and not the head. Its own entry beside
+            // `interleaved` for the reason the refusal it retires gave — a
+            // rotation that handed the sections out the other way would answer
+            // plausible numbers for the wrong checkpoint — and the two forms
+            // differ in the ladder as well as the split, so one shader with a
+            // mode word would be two kernels sharing a register file.
             Elementwise::RopeMrope {
+                q,
+                k,
+                positions,
+                sections,
                 form: MropeForm::Blocked,
-                ..
-            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+                rotary_dim,
+                head_dim,
+                theta,
+                q_out: _,
+                k_out: _,
+            } => elemwise::rope_mrope::blocked(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*positions),
+                *sections,
+                *rotary_dim,
+                *head_dim,
+                *theta,
+            ),
             Elementwise::RopePartialQ {
                 q,
                 positions,
@@ -312,6 +440,18 @@ impl Run<'_> {
             Elementwise::HcRmsnormF32 { streams, eps, y } => {
                 elemwise::hc::rmsnorm_f32(self.ctx(), self.tensor(*streams), *eps, self.tensor(*y))
             }
+            Elementwise::HcProject {
+                normed,
+                weight,
+                stream_count,
+                mixes,
+            } => elemwise::hc::project(
+                self.ctx(),
+                self.tensor(*normed),
+                self.tensor(*weight),
+                *stream_count,
+                self.tensor(*mixes),
+            ),
             Elementwise::HcGates {
                 normed,
                 streams,

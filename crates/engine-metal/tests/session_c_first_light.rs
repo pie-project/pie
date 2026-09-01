@@ -21,13 +21,42 @@
 //! recorded at [`QWEN`], [`GPT_OSS`] and [`GEMMA`], each against the
 //! `mlx_lm` source that produced the file.
 //!
+//! # TWO OF THE FIVE ARMS WERE RED FOR A WAVE, AND NOTHING HERE WAS ADJUSTED
+//!
+//! **THE TWO QWEN_3 ROWS DID NOT SERVE ON THIS SHELL.**
+//! `qwen36-27b-mlxu4-kv-bf16` and `qwen36-35b-a3b-mlxu4-kv-bf16` declared
+//! their dense projections `U4g64tiled` — MLX affine codes in m16n8k16
+//! fragment order, written for `kernels_cuda::linear::tiled`, which this
+//! shell has no reader for. `four_bit_first_light`'s module header carries
+//! the whole chain and the measurement; the short of it is that
+//! `models::qwen_3::model`'s projection flip took that order for EVERY
+//! platform, so a raw MLX snapshot was refused by the load plan (a serving
+//! plan does not repack) and a `pie model import` artifact — whose planes the
+//! import HAD relaid — loaded and answered nonsense.
+//!
+//! **§J4c GAVE THE FLIP A PLATFORM TO ASK** (`model_dsl::place`), so this
+//! shell's trace of those two rows declares the canonical `U4g64` its qmm and
+//! qmv arms already read, their contracts state no repack, and both serve
+//! their raw snapshots as stored. Not one expectation in this file moved.
+//!
+//! **AND THE OTHER THREE WERE NEVER TOUCHED, WHICH IS WORTH STATING.** The
+//! flip is a fact about one family, not about four bits:
+//! `gemma4-31b-mlxu4-kv-bf16` and `gemma4-26b-a4b-mlxu4-kv-bf16` are the same
+//! MLX affine-U4 scheme with no flip in their text, and
+//! `gptoss-20b-mlxu4-mxfp4-kv-bf16` binds its expert banks by naming their
+//! planes and states neither an encode nor a repack. All three loaded raw
+//! snapshots off the cache through the whole of it.
+//!
 //! # Gating
 //!
-//! Apple-only at compile time, and every arm SKIPS at run time naming which
-//! precondition was missing — the device, the snapshot, the tokenizer, or a
-//! catalog row that does not exist yet. `PIE_QWEN36_SNAPSHOT`,
-//! `PIE_GPTOSS_SNAPSHOT` and `PIE_GEMMA4_SNAPSHOT` override where each is
-//! looked for.
+//! Apple-only at compile time. The plane order above is asserted FIRST, per
+//! family and before the device check — it is a fact about the trace, so an
+//! arm reports it rather than skipping into a misleading green on a box that
+//! happens to lack the snapshot. Past it, every arm SKIPS
+//! at run time naming which precondition was missing — the device, the
+//! snapshot, the tokenizer, or a catalog row that does not exist yet.
+//! `PIE_QWEN36_SNAPSHOT`, `PIE_GPTOSS_SNAPSHOT` and `PIE_GEMMA4_SNAPSHOT`
+//! override where each is looked for.
 //!
 //! # One model at a time
 //!
@@ -165,9 +194,7 @@ const QWEN: Family = Family {
     sku: "qwen36-27b-mlxu4-kv-bf16",
     env: "PIE_QWEN36_SNAPSHOT",
     repo: "models--mlx-community--Qwen3.6-27B-4bit",
-    word: |query_len| {
-        model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
-    },
+    word: |query_len| models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word(),
     bos: None,
     // Nine greedy tokens, `[11751, 13, 198, 760, 6511, 314, 9338, 369, 279]`,
     // from `mlx_lm.generate --temp 0 --max-tokens 9 --ignore-chat-template`
@@ -236,9 +263,7 @@ const GPT_OSS: Family = Family {
     sku: "gptoss-20b-mlxu4-mxfp4-kv-bf16",
     env: "PIE_GPTOSS_SNAPSHOT",
     repo: "models--mlx-community--gpt-oss-20b-MXFP4-Q4",
-    word: |query_len| {
-        model::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
-    },
+    word: |query_len| models::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word(),
     bos: None,
     // The full-forward path of the two above — see the type doc. Printed, not
     // asserted: step one is a 0.0625-logit tie.
@@ -301,9 +326,7 @@ const GEMMA: Family = Family {
     sku: "gemma4-31b-mlxu4-kv-bf16",
     env: "PIE_GEMMA4_SNAPSHOT",
     repo: "models--mlx-community--gemma-4-31b-it-4bit",
-    word: |query_len| {
-        model::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word()
-    },
+    word: |query_len| models::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word(),
     // `<bos>`, id 2 — see `Family::bos`, which this family is the reason for.
     bos: Some(2),
     // Nine greedy tokens from `mlx_lm` over this snapshot, this prompt and
@@ -444,9 +467,7 @@ const QWEN_A3B: Family = Family {
     sku: "qwen36-35b-a3b-mlxu4-kv-bf16",
     env: "PIE_QWEN36_A3B_SNAPSHOT",
     repo: "models--mlx-community--Qwen3.6-35B-A3B-4bit",
-    word: |query_len| {
-        model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
-    },
+    word: |query_len| models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word(),
     bos: None,
     // Both of mlx's paths, cached and full-forward, say this. The split at
     // step one is a 0.125-logit tie — see the table above.
@@ -516,9 +537,7 @@ const GEMMA_A4B: Family = Family {
     sku: "gemma4-26b-a4b-mlxu4-kv-bf16",
     env: "PIE_GEMMA4_A4B_SNAPSHOT",
     repo: "models--mlx-community--gemma-4-26b-a4b-it-4bit",
-    word: |query_len| {
-        model::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word()
-    },
+    word: |query_len| models::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word(),
     // `<bos>`, id 2 — the same prepend [`GEMMA`] needs, for the same reason.
     bos: Some(2),
     // Nine greedy tokens from `mlx_lm` over this snapshot, this prompt and
@@ -646,6 +665,43 @@ fn run(shell: &mut Shell, family: &Family, slot: u32, prompt: &[u32]) -> (Vec<u3
     (produced, millis)
 }
 
+/// **THE PLANE-ORDER HOLE, ASSERTED PER FAMILY AND BEFORE THE DEVICE CHECK.**
+///
+/// `four_bit_first_light`'s function of the same name, in this file's
+/// spelling, and the module header above argues it. It is asked of the SKU
+/// rather than hard-coded, which is what let it stop the two qwen_3 arms for
+/// a wave and go quiet on all five when §J4c gave the projection flip a
+/// platform to ask — without either list ever being written down, and without
+/// this function changing.
+///
+/// A panic and not a skip: the box is not missing a precondition, it is
+/// missing a reader. See `engine_metal::weights::readable_plane_orders`.
+fn serves_the_order_it_declares(sku: &str) {
+    let Some(trace) = models::trace_of(sku) else {
+        return;
+    };
+    let trace = trace(Platform::Metal);
+    let tiled: Vec<&str> = trace
+        .params
+        .iter()
+        .filter(|param| param.dtype == model_dsl::Dtype::U4g64tiled)
+        .map(|param| param.name.as_str())
+        .collect();
+    assert!(
+        tiled.is_empty(),
+        "{sku} declares {} plane(s) as U4g64tiled — MLX affine codes in m16n8k16 fragment \
+         order, which this shell has no reader for (first: {:?}). \
+         `kernels_metal::linear::quant` indexes an affine bank row-major, so neither road \
+         serves: a raw MLX snapshot is refused by the load plan (a serving plan does not \
+         repack) and a repacked artifact loads and answers nonsense. A text reaches that \
+         order only by asking for it — `model_dsl::place` answers this platform with the \
+         canonical `U4g64`. See `four_bit_first_light`'s module header for the measurement, \
+         and this file's for the wave it stopped",
+        tiled.len(),
+        tiled.first().unwrap_or(&""),
+    );
+}
+
 /// Everything an arm needs, or `None` and a sentence naming the missing
 /// precondition.
 ///
@@ -655,15 +711,16 @@ fn run(shell: &mut Shell, family: &Family, slot: u32, prompt: &[u32]) -> (Vec<u3
 /// choose. Nothing below asks for more than eight rows.
 fn ready(family: &Family) -> Option<(Shell, tokenizer::Tokenizer)> {
     let sku = family.sku;
+    serves_the_order_it_declares(sku);
     if !engine_metal::device::present() {
         eprintln!("skipping {sku}: this machine publishes no Metal device");
         return None;
     }
-    let Some(trace) = model::trace_of(sku) else {
+    let Some(trace) = models::trace_of(sku) else {
         eprintln!("skipping {sku}: the catalog ships no row by that name");
         return None;
     };
-    let Some(import) = model::import_of(sku) else {
+    let Some(import) = models::import_of(sku) else {
         eprintln!("skipping {sku}: the catalog ships no import for that row");
         return None;
     };
@@ -685,7 +742,10 @@ fn ready(family: &Family) -> Option<(Shell, tokenizer::Tokenizer)> {
         .expect("the checkpoint's tokenizer loads");
 
     let source = ztensor_compat::index_all(&files).expect("the checkpoint's shards open as one");
-    let contract = import(&source).unwrap_or_else(|why| {
+    // Read for this shell (§J4c): a family's text may state a `Dtype`
+    // PLACEMENT, and a contract read under a different setup than the trace
+    // below describes different planes. See `four_bit_first_light::ready`.
+    let contract = models::placing_for(Platform::Metal, || import(&source)).unwrap_or_else(|why| {
         panic!("{sku}'s import contract does not fit {snapshot:?}: {why}")
     });
     drop(source);
@@ -695,7 +755,14 @@ fn ready(family: &Family) -> Option<(Shell, tokenizer::Tokenizer)> {
         trace: trace(Platform::Metal),
         contract: &contract,
         checkpoint: &snapshot,
+        // §M-4c, as `serve_smoke` states it: an unstamped snapshot proceeds,
+        // and the deployment's facts are stated honestly all the same.
+        tp_size: 1,
+        precision: models::precision_of(sku)
+            .expect("the catalog states this row's precision")
+            .to_string(),
         budget: Budget::new(1, 128),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 256,

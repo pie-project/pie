@@ -134,31 +134,6 @@ __global__ void cast_per_channel(
     }
 }
 
-template <class Fmt>
-__global__ void quant_per_channel(
-    const bf16* __restrict__ W,
-    typename Fmt::store* __restrict__ out,
-    float* __restrict__ scale_inv,
-    i32 cols) {
-    const int tid = threadIdx.x;
-    extern __shared__ float warp_max[];
-
-    const usize row_off = static_cast<usize>(blockIdx.x) * cols;
-    float local = 0.f;
-    for (i32 j = tid; j < cols; j += kBlock) {
-        const float v = fabsf(bf16_to_f32(W[row_off + j]));
-        if (v > local) local = v;
-    }
-    const float row_max = row_absmax(local, warp_max, tid);
-
-    const float quant = (row_max > 0.f) ? (Fmt::max_abs() / row_max) : 1.f;
-    const float weight_scale_inv = (row_max > 0.f) ? (row_max / Fmt::max_abs()) : 1.f;
-    if (tid == 0) scale_inv[blockIdx.x] = weight_scale_inv;
-
-    for (i32 j = tid; j < cols; j += kBlock) {
-        out[row_off + j] = Fmt::narrow(bf16_to_f32(W[row_off + j]) * quant);
-    }
-}
 
 __global__ void quant_act_fp8_per_group(
     const bf16* __restrict__ act,
@@ -207,75 +182,17 @@ __global__ void quant_act_fp8_per_group(
     }
 }
 
-__device__ __forceinline__ unsigned encode_fp4_e2m1(float x) {
-    const float a = fabsf(x);
-    unsigned mag;
-    if (a < 0.25f) {
-        mag = 0;
-    } else if (a < 0.75f) {
-        mag = 1;
-    } else if (a < 1.25f) {
-        mag = 2;
-    } else if (a < 1.75f) {
-        mag = 3;
-    } else if (a < 2.5f) {
-        mag = 4;
-    } else if (a < 3.5f) {
-        mag = 5;
-    } else if (a < 5.0f) {
-        mag = 6;
-    } else {
-        mag = 7;
-    }
-    const unsigned sign = (x < 0.0f) ? 0x8u : 0x0u;
-    return (mag == 0) ? 0u : (sign | mag);
-}
 
-__device__ __forceinline__ u8 encode_e8m0(float absmax) {
-    if (!(absmax > 0.0f)) return 0;
-    const float l = log2f(absmax / 6.0f);
-    int b = static_cast<int>(ceilf(l)) + 127;
-    if (b < 0) b = 0;
-    if (b > 254) b = 254;
-    return static_cast<u8>(b);
-}
 
-template <class T>
-__global__ void quant_bf16_to_mxfp4_row(
-    const T* __restrict__ src,
-    u8* __restrict__ packed,
-    u8* __restrict__ scales,
-    i32 cols) {
-    const i32 row = blockIdx.x;
-    const i32 groups = cols / 32;
-    const usize row_src = static_cast<usize>(row) * cols;
-    const usize row_packed = static_cast<usize>(row) * (cols / 2);
-    const usize row_scale = static_cast<usize>(row) * groups;
 
-    for (i32 g = threadIdx.x; g < groups; g += blockDim.x) {
-        const i32 base = g * 32;
-        float absmax = 0.0f;
-        float vals[32];
-#pragma unroll
-        for (int k = 0; k < 32; ++k) {
-            const float v = Elem<T>::to_f32(src[row_src + base + k]);
-            vals[k] = v;
-            const float a = fabsf(v);
-            if (a > absmax) absmax = a;
-        }
-        const u8 sb = encode_e8m0(absmax);
-        scales[row_scale + g] = sb;
-
-        const float s = ldexpf(1.0f, static_cast<int>(sb) - 127);
-        const float inv_s = (s == 0.0f) ? 0.0f : (1.0f / s);
-#pragma unroll
-        for (int k = 0; k < 16; ++k) {
-            const unsigned lo = encode_fp4_e2m1(vals[2 * k] * inv_s);
-            const unsigned hi = encode_fp4_e2m1(vals[2 * k + 1] * inv_s);
-            packed[row_packed + g * 16 + k] = static_cast<u8>((hi << 4) | (lo & 0xFu));
-        }
-    }
-}
+// **THE TWO ENCODE KERNELS STOOD HERE** — `quant_per_channel` (bf16 to fp8
+// e4m3, one inverse scale a row) and `quant_bf16_to_mxfp4_row` (e2m1 codes in
+// 32-element blocks under one e8m0 exponent), with the `encode_fp4_e2m1` and
+// `encode_e8m0` codepoint helpers they were the only readers of. §M-3 shut the
+// load-time door they were the device half of: a serving load does not
+// quantize, and `pie model import` writes the codes on the host, where
+// `checkpoint::codec::mxfp4` holds the same two functions and is now the only
+// statement of them.
 
 __device__ __constant__ float kFp4Lut[16] = {
      0.f,  0.5f,  1.f,  1.5f,  2.f,  3.f,  4.f,  6.f,
@@ -765,7 +682,9 @@ __device__ __forceinline__ void moe_note_group(
 // hands nullptr and lets the routed bias mixture be stated after the reduce.
 //
 // `bases` and `group_hits` are the streamed seat, both `nullptr` for a
-// resident bank — see `MoeGroupBases`.
+// resident bank — see `MoeGroupBases`. `win` is the staged-geometry seat,
+// read in ROUTE space off a pair written in TOKEN space, and `top_k` is the
+// fan-out that converts between them.
 template <class T, int kRowsT>
 __global__ void moe_matmul_select_mxfp4(
     const T* __restrict__ act,
@@ -774,19 +693,33 @@ __global__ void moe_matmul_select_mxfp4(
     const u8* __restrict__ scales,
     const T* __restrict__ bias,
     T* __restrict__ out,
+    int top_k,
     int act_div,
     int n,
     int k,
     const MoeGroupBases* __restrict__ bases,
-    unsigned int* __restrict__ group_hits)
+    unsigned int* __restrict__ group_hits,
+    const u32* __restrict__ win)
 {
     constexpr int kRows = kRowsT;
     const int route = blockIdx.x;
+    // **THE SEAT IS IN TOKEN ROWS AND THIS AXIS IS IN ROUTES**, and the
+    // conversion between them is the fan-out — `moe_matmul_select_gemv_body`'s
+    // idiom in `moe.cuh`, which states it first and on the same route axis. A
+    // window of `win[0]` token rows starting at `win[1]` is a run of
+    // `win[0] * top_k` routes starting at route `win[1] * top_k`. Multiply
+    // once, and the routes, activation and result planes below all read a
+    // route ordinal that is the PLANE's and not the launch's — which is what
+    // `engine_cuda::SHIFTED` promises for a name on its list.
+    if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
+    const int plane_route = win != nullptr
+        ? route + static_cast<int>(win[1]) * top_k
+        : route;
     const int warp_in_block = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
     const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
     if (row0 >= n) return;
-    const int expert = routes[route];
+    const int expert = routes[plane_route];
 
     moe_note_group(group_hits);
 
@@ -805,7 +738,10 @@ __global__ void moe_matmul_select_mxfp4(
 
     const u8* w = codes_at + static_cast<long long>(expert) * n * (k / 2);
     const u8* s = scales_at + static_cast<long long>(expert) * n * groups_per_row;
-    const T* x = act + static_cast<long long>(route / act_div) * k;
+    // The activation follows the same ordinal into whichever space it was
+    // cut in: `act_div` is the fan-out on the up leg, where `act` holds one
+    // row per token, and one on the down leg, where it holds one per route.
+    const T* x = act + static_cast<long long>(plane_route / act_div) * k;
 
     int row_of[kRows];
 #pragma unroll
@@ -868,7 +804,7 @@ __global__ void moe_matmul_select_mxfp4(
             if (row >= n) break;
             float v = acc[r];
             if (b != nullptr) v += Elem<T>::to_f32(b[row]);
-            out[static_cast<long long>(route) * n + row] = Elem<T>::from_f32(v);
+            out[static_cast<long long>(plane_route) * n + row] = Elem<T>::from_f32(v);
         }
     }
 }
@@ -882,6 +818,7 @@ __global__ void moe_matmul_select_mxfp4(
 // per warp, a lane per group striding the row's groups. `bases` and
 // `group_hits` are the streamed seat, both `nullptr` for a resident bank —
 // and the base cell's THIRD pointer is this kernel's, see `MoeGroupBases`.
+// The staged-geometry seat is the twin's too, `top_k` and all.
 template <class T, int kRowsT>
 __global__ void moe_matmul_select_mlxu4(
     const T* __restrict__ act,
@@ -890,19 +827,28 @@ __global__ void moe_matmul_select_mlxu4(
     const u8* __restrict__ scales,
     const u8* __restrict__ biases,
     T* __restrict__ out,
+    int top_k,
     int act_div,
     int n,
     int k,
     const MoeGroupBases* __restrict__ bases,
-    unsigned int* __restrict__ group_hits)
+    unsigned int* __restrict__ group_hits,
+    const u32* __restrict__ win)
 {
     constexpr int kRows = kRowsT;
     const int route = blockIdx.x;
+    // The staged-geometry seat, in ROUTE space off a pair written in TOKEN
+    // space: `moe_matmul_select_mxfp4`'s conversion above, same grid, same
+    // fan-out (`moe.cuh` states it first).
+    if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
+    const int plane_route = win != nullptr
+        ? route + static_cast<int>(win[1]) * top_k
+        : route;
     const int warp_in_block = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
     const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;
     if (row0 >= n) return;
-    const int expert = routes[route];
+    const int expert = routes[plane_route];
 
     moe_note_group(group_hits);
 
@@ -925,7 +871,10 @@ __global__ void moe_matmul_select_mlxu4(
         scales_at + static_cast<long long>(expert) * n * groups_per_row * 2);
     const bf16* b16 = reinterpret_cast<const bf16*>(
         biases_at + static_cast<long long>(expert) * n * groups_per_row * 2);
-    const T* x = act + static_cast<long long>(route / act_div) * k;
+    // The activation follows the same ordinal into whichever space it was
+    // cut in: `act_div` is the fan-out on the up leg, where `act` holds one
+    // row per token, and one on the down leg, where it holds one per route.
+    const T* x = act + static_cast<long long>(plane_route / act_div) * k;
 
     int row_of[kRows];
 #pragma unroll
@@ -984,18 +933,53 @@ __global__ void moe_matmul_select_mlxu4(
         for (int r = 0; r < kRows; ++r) {
             const int row = row0 + r;
             if (row < n)
-                out[static_cast<long long>(route) * n + row] =
+                out[static_cast<long long>(plane_route) * n + row] =
                     Elem<T>::from_f32(acc[r]);
         }
     }
 }
 
-// **THE DENSE AFFINE PROJECTION** (qwen4 stored-form wave): `linear.matmul`
-// and `linear.lm_head` over a weight the store seats as an MLX affine
-// triplet — codes at four or eight bits, sixty-four to one bf16 (scale,
-// zero point) pair. The identity is `moe_matmul_select_mlxu4`'s on an
-// unrouted rectangle: `Σ (c·s + b)·x = s·Σ c·x + b·Σ x`, so each
-// activation is read once and the factors land once per group.
+/// **THE OFFSET ARM** an affine projection spends its `xsum` on —
+/// `matmul_affine`'s `kOffset` axis, and the launch side's `OffsetKind`.
+///
+/// `dtype::quant::OffSub` is the algebra these project. Three are its arms
+/// literally (`Post(L(f))`, `Pre(L(U(b)))`, `Pre(L(f))`); the fourth is the
+/// one that is NOT an offset in the signature at all — a symmetric term over
+/// excess-binary codes (`Leaf::I(b)`), whose `c − 2^(b−1)` decode IS a
+/// constant pre-offset once it reaches a dot. Q4_0, Q8_0 and Int4B8 land
+/// there after canon, which is why there is no zero-offset arm below: a
+/// point that only ever multiplied would be `linear::nvfp4`'s, not this one.
+constexpr int kOffPost = 0;
+constexpr int kOffPreInt = 1;
+constexpr int kOffPreReal = 2;
+constexpr int kOffPreConst = 3;
+
+// **THE DENSE AFFINE FAMILY, ON ONE SKELETON** (qwen4 stored-form wave,
+// generalized by QNF P1): `linear.matmul` and `linear.lm_head` over a weight
+// the store seats as codes plus one factor per group of them — MLX's affine
+// triplet, GPTQ/AWQ, HQQ, and the excess-binary symmetric rows, folded by
+// one point rather than four.
+//
+// The identity is `moe_matmul_select_mlxu4`'s on an unrouted rectangle.
+// Every arm accumulates the SAME pair per group — `part = Σ c·x` and
+// `xsum = Σ x` — and they differ only in the epilogue that spends them:
+//
+//     kOffPost      s·part + b·xsum              an offset in the VALUE domain
+//     kOffPreInt    s·(part − z·xsum)            an integer zero in the CODE domain
+//     kOffPreReal   s·(part − z·xsum)            the same fold, `z` a real
+//     kOffPreConst  s·(part − 2^(kBits−1)·xsum)  the zero the FORMAT fixes
+//
+// so each activation is read once and the factors land once per group. The
+// `biases` plane is the offset's, and its bytes are the arm's: `kFactor`
+// reals for `kOffPost` and `kOffPreReal`, ONE BYTE PER GROUP holding the
+// unsigned code-domain zero for `kOffPreInt`, and nothing at all for
+// `kOffPreConst`, which is fired with a null there.
+//
+// The GROUP is a runtime argument and not a constant: it comes off the
+// factor plane's own width at launch, so thirty-two, sixty-four and a
+// hundred and twenty-eight all fold here, and the entry refuses a width that
+// groups a row into nothing whole. What stays constant is that a group is a
+// whole number of code WORDS — eight codes at four bits, four at eight.
 //
 // One block column per ACTIVATION ROW (`blockIdx.x`), which is the decode
 // shape: a step's row count is small and the weight is read once per row.
@@ -1006,8 +990,8 @@ __global__ void moe_matmul_select_mlxu4(
 // `bases` is the streamed seat, `nullptr` for a resident plane — see
 // `MoeGroupBases`. No hit counter: a dense plane is not a routed group,
 // and the tier does not note it (`engine_cuda::experts` D2b).
-template <class T, int kBits, int kRowsT>
-__global__ void matmul_mlx_affine(
+template <class T, class F, int kBits, int kOffset, int kGroup, int kRowsT>
+__global__ void matmul_affine(
     const T* __restrict__ act,
     const u8* __restrict__ codes,
     const u8* __restrict__ scales,
@@ -1020,8 +1004,9 @@ __global__ void matmul_mlx_affine(
 {
     constexpr int kRows = kRowsT;
     constexpr int kPerWord = 32 / kBits;
-    constexpr int kWords = 64 / kPerWord;
     constexpr unsigned kMask = (1u << kBits) - 1u;
+    // The excess-binary midpoint, the only offset this point holds itself.
+    constexpr float kExcess = static_cast<float>(1 << (kBits - 1));
     const int token = blockIdx.x;
     // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
     // was carved at a bucket retires its padded rows here, off a word the
@@ -1042,11 +1027,19 @@ __global__ void matmul_mlx_affine(
         biases_at = seat.biases;
     }
 
-    const int groups_per_row = k / 64;
+    // The group width is a template argument so this loop's bound is a
+    // constant the compiler unrolls — the decode path lost a quarter of its
+    // tokens/s when the bound went runtime, and the jit's name-expression
+    // cache only ever holds the (bits, group) pairs a model actually fires.
+    const int groups_per_row = k / kGroup;
+    constexpr int kWordsPerGroup = kGroup / kPerWord;
     const int words_per_row = k / kPerWord;
     const unsigned* w32 = reinterpret_cast<const unsigned*>(codes_at);
-    const bf16* s16 = reinterpret_cast<const bf16*>(scales_at);
-    const bf16* b16 = reinterpret_cast<const bf16*>(biases_at);
+    const F* sf = reinterpret_cast<const F*>(scales_at);
+    // The offset plane under the two readings an arm may take of it: a real
+    // beside the scale, or one unsigned code-domain zero per group.
+    const F* bf = reinterpret_cast<const F*>(biases_at);
+    const u8* zb = biases_at;
     const T* x = act + static_cast<long long>(token) * k;
 
     int row_of[kRows];
@@ -1065,18 +1058,18 @@ __global__ void matmul_mlx_affine(
         float xsum = 0.f;
 
 #pragma unroll
-        for (int q = 0; q < kWords; ++q) {
+        for (int q = 0; q < kWordsPerGroup; ++q) {
             float xv[kPerWord];
 #pragma unroll
             for (int j = 0; j < kPerWord; ++j) {
-                xv[j] = Elem<T>::to_f32(x[g * 64 + q * kPerWord + j]);
+                xv[j] = Elem<T>::to_f32(x[g * kGroup + q * kPerWord + j]);
                 xsum += xv[j];
             }
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
                 const unsigned word =
                     w32[static_cast<long long>(row_of[r]) * words_per_row
-                        + g * kWords + q];
+                        + g * kWordsPerGroup + q];
 #pragma unroll
                 for (int j = 0; j < kPerWord; ++j) {
                     const float code =
@@ -1085,14 +1078,29 @@ __global__ void matmul_mlx_affine(
                 }
             }
         }
+        // xsum accumulated once per q-pass above counts every activation of
+        // the group exactly once across the group's words.
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {
             const long long fx =
                 static_cast<long long>(row_of[r]) * groups_per_row + g;
-            const float sv = Elem<bf16>::to_f32(s16[fx]);
-            const float bv = Elem<bf16>::to_f32(b16[fx]);
-            acc[r] = fmaf(part[r], sv, acc[r]);
-            acc[r] = fmaf(xsum, bv, acc[r]);
+            const float sv = Elem<F>::to_f32(sf[fx]);
+            if constexpr (kOffset == kOffPost) {
+                acc[r] = fmaf(part[r], sv, acc[r]);
+                acc[r] = fmaf(xsum, Elem<F>::to_f32(bf[fx]), acc[r]);
+            } else {
+                // One fold for the three code-domain arms: they agree on
+                // `s·(part − z·xsum)` and disagree only on where `z` is.
+                float z;
+                if constexpr (kOffset == kOffPreInt) {
+                    z = static_cast<float>(zb[fx]);
+                } else if constexpr (kOffset == kOffPreReal) {
+                    z = Elem<F>::to_f32(bf[fx]);
+                } else {
+                    z = kExcess;
+                }
+                acc[r] = fmaf(sv, fmaf(-z, xsum, part[r]), acc[r]);
+            }
         }
     }
 #pragma unroll
@@ -1109,6 +1117,105 @@ __global__ void matmul_mlx_affine(
                 out[static_cast<long long>(token) * n + row] =
                     Elem<T>::from_f32(acc[r]);
         }
+    }
+}
+
+// **THE SAME WEIGHT, DECODED INSTEAD OF FOLDED** — the INTERIM prefill arm
+// of the dense affine family (`linear::quant::matmul_via_dense`).
+//
+// `matmul_affine` above gives one block column per ACTIVATION ROW and reads
+// the whole weight inside each of them. At one token that is parity with
+// cuBLAS; at a prefill's hundreds it is the same weight read hundreds of
+// times, measured at 98-189x cuBLAS bf16 over 128..2048 rows. So at prefill
+// shapes the caller decodes the weight ONCE into a transient scratch tile
+// and fires the dense point on it. **The stored form does not change**: this
+// is a fire-time buffer, and the row the store seats is still codes plus
+// factors.
+//
+// The element written is `matmul_affine`'s epilogue with the activation
+// taken back out of it. That epilogue accumulates
+// `s·Σc·x + b·Σx = Σ(s·c + b)·x` under `kOffPost` and
+// `s·(Σc·x − z·Σx) = Σ s·(c − z)·x` under the three code-domain arms, so
+// what a decoded weight element IS, arm for arm, is:
+//
+//     kOffPost      s·c + b
+//     kOffPreInt    s·(c − z)     `z` one unsigned byte per group
+//     kOffPreReal   s·(c − z)     `z` a factor-dtype real
+//     kOffPreConst  s·(c − 2^(kBits−1))
+//
+// — the same planes, the same `fx` indexing, the same constant midpoint.
+//
+// **bf16, ROW-MAJOR `[n, k]`**, which is the rectangle `linear::gemm`'s
+// `act x w^T` reads. The decode rounds each element to bf16 exactly once,
+// which is the whole numeric difference between this arm and the fused one:
+// they answer the same numbers, not the same bits.
+//
+// **ONE THREAD PER CODE WORD** — eight elements at four bits, four at eight
+// — flat over `n · k / kPerWord`, because this point is bandwidth and not
+// arithmetic: one word and two factors in, `kPerWord` halves out.
+//
+// **NO WIN GUARD, DELIBERATELY.** `matmul_affine`'s `win` word retires the
+// padded rows of a grid carved over TOKEN rows; this grid is carved over the
+// WEIGHT's rows, which no bucket pads and no replay reshapes. And no `bases`
+// seat either: the launch side refuses a streamed seat, because a plane that
+// moves between fires has no fixed rectangle to decode into a slab.
+template <class F, int kBits, int kOffset, int kGroup>
+__global__ void dequant_affine(
+    const u8* __restrict__ codes,
+    const u8* __restrict__ scales,
+    const u8* __restrict__ biases,
+    bf16* __restrict__ out,
+    int n,
+    int k)
+{
+    constexpr int kPerWord = 32 / kBits;
+    constexpr unsigned kMask = (1u << kBits) - 1u;
+    // The excess-binary midpoint, this point's only self-held offset — the
+    // same constant `matmul_affine` folds.
+    constexpr float kExcess = static_cast<float>(1 << (kBits - 1));
+
+    const int words_per_row = k / kPerWord;
+    const long long words = static_cast<long long>(n) * words_per_row;
+    const long long at =
+        static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at >= words) return;
+
+    const int row = static_cast<int>(at / words_per_row);
+    const int word_in_row = static_cast<int>(at % words_per_row);
+    // A group is a whole number of code words (the entry refuses anything
+    // else), so a word belongs to exactly one group and this division is the
+    // group it belongs to.
+    const int groups_per_row = k / kGroup;
+    const long long fx = static_cast<long long>(row) * groups_per_row
+        + (word_in_row * kPerWord) / kGroup;
+
+    // The offset plane under the two readings an arm may take of it, and
+    // under the one arm that reads nothing at all.
+    const F* sf = reinterpret_cast<const F*>(scales);
+    const F* bf = reinterpret_cast<const F*>(biases);
+    const u8* zb = biases;
+    const float sv = Elem<F>::to_f32(sf[fx]);
+    float off;
+    if constexpr (kOffset == kOffPost || kOffset == kOffPreReal) {
+        off = Elem<F>::to_f32(bf[fx]);
+    } else if constexpr (kOffset == kOffPreInt) {
+        off = static_cast<float>(zb[fx]);
+    } else {
+        off = kExcess;
+    }
+
+    const unsigned word = reinterpret_cast<const unsigned*>(codes)[at];
+    bf16* dst = out + static_cast<long long>(row) * k + word_in_row * kPerWord;
+#pragma unroll
+    for (int j = 0; j < kPerWord; ++j) {
+        const float code = static_cast<float>((word >> (kBits * j)) & kMask);
+        float v;
+        if constexpr (kOffset == kOffPost) {
+            v = fmaf(code, sv, off);
+        } else {
+            v = sv * (code - off);
+        }
+        dst[j] = f32_to_bf16(v);
     }
 }
 

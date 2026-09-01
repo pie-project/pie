@@ -65,7 +65,7 @@ pub mod sink;
 pub mod walk;
 
 pub use compose::{
-    ClassWindow, Composition, Lane, LaneRow, MaskSpan, RowSpan, WindowTable, compose,
+    AxisComposition, ClassWindow, Composition, Lane, LaneRow, MaskSpan, WindowTable, compose,
     compose_axes, rung_of,
 };
 pub use descriptor::{

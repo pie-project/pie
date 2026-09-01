@@ -98,7 +98,7 @@ fn admits(trace: &Trace, compiled: &CompiledModel, at: usize, profile: &DevicePr
 fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             for profile in [DeviceProfile::default(), forced()] {
@@ -161,7 +161,7 @@ fn every_conditional_region_clears_every_gate_and_every_other_one_does_not() {
 /// the carve can only stay the same or get smaller.
 #[test]
 fn turning_conditionals_on_moves_one_field_and_nothing_else() {
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let off = DeviceProfile {
@@ -213,7 +213,7 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
     let mut report: Vec<String> = Vec::new();
     let mut chosen = 0usize;
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         let trace = trace(Platform::Cuda);
         let Ok(compiled) = bake_with(&trace, &profile) else {
             continue;
@@ -310,7 +310,7 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
     // lowering changed its mind". A conditional region that is neither a draft
     // head nor a tower trips the rule instead, and sends them to the pass.
 
-    let derived: usize = model::catalog()
+    let derived: usize = models::catalog()
         .into_iter()
         .map(|(_, _, trace, _)| {
             let trace = trace(Platform::Cuda);
@@ -324,8 +324,11 @@ fn the_catalog_is_declined_by_the_gates_and_here_is_by_how_much() {
          structural arms — one of them is neither a draft head nor a tower, or \
          one of them was declined; the report above says which text",
     );
+    // Nine became seventeen when the four-bit vision census landed: seven
+    // -vision-mlxu4 rows plus the twin the TOWERED list had already caught,
+    // every one a tower arm, the rule assert unmoved.
     assert_eq!(
-        chosen, 9,
+        chosen, 17,
         "the catalog's conditional count moved — one text gained or lost a \
          structural arm, and the report above says which. The rule assert just \
          above this one passed, so every arm counted IS a draft head or a \

@@ -32,7 +32,7 @@ fn serialized() -> MutexGuard<'static, ()> {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn snapshot() -> Option<PathBuf> {
@@ -82,17 +82,24 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let trace = trace(Platform::Metal);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
     let shell = Shell::load(Boot {
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
+        // §M-4c, as `serve_smoke` states it: an unstamped snapshot proceeds,
+        // and the deployment's facts are stated honestly all the same.
+        tp_size: 1,
+        precision: models::precision_of(SKU)
+            .expect("the catalog states this row's precision")
+            .to_string(),
         budget: Budget::new(8, 256),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,

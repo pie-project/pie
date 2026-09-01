@@ -252,9 +252,66 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 // bytes are untouched -- the single-lane form still has no stride to be told,
 // and keeps its one-row refusal, now stated at encode where the form is known
 // -- and CUDA does not share this emitter, so its row stands.
+// Re-pinned a thirteenth time, WITH BOTH BUMPS, and it is the first entry in
+// this ledger where the two rows move together — because what changed is the
+// one struct they share. `LaneRecord` is declared once, in
+// `codegen::layout`, and printed into the CUDA prologue, both MSL preambles
+// and the `#[repr(C)]` the hosts pack. It grew two fields:
+//
+//   attn_score_base        the lane's block of the observability slab
+//   attn_score_row_stride  that rectangle's plane pitch, in F32 elements
+//
+// **THE REASON IS THE GROUPED FORM'S ONE ABI RULE.** An M3 kernel binds no
+// per-intrinsic buffer at all: every rectangle it reads arrives as a `ulong`
+// on the lane record. `logits` and `mtp_logits` share one — the draft column
+// is the same rectangle in a second row block, reached through
+// `M3RowMeta::mtp_offset` — and `attn_score` was therefore the id
+// `m3_intrinsic_bindable` refused by name, because the score slab is the
+// SHELL's reservation (`engine_metal::scores`) and the readout is the arena's,
+// so no displacement off `logits_base` was ever going to land in it. A grouped
+// region reading it would have been emitted pointing at the trunk's rows,
+// which is the silent mis-binding that whitelist exists to prevent. The
+// rectangle has an address of its own now, `emit_grouped_fused_region` gathers
+// its F32 planes from that base, and the M2 and M3 tables agree id for id:
+//
+//   41 -> 42  the score rectangle gets a lane-record address. What moved in
+//             `golden-msl/` is exactly the +73 bytes of struct text the two
+//             fields add to the M1 and M3 preambles, plus the version spelled
+//             into `ptir_m3_generic_{ready,commit}_v42`; no corpus case reads
+//             a score rectangle in a grouped region, so no kernel body grew an
+//             arm. `golden-extended/`'s `extended_attn_score` is where the
+//             behaviour shows: its `metal_grouped` column was
+//             `UnbindableIntrinsic` and is emitted MSL.
+//
+//   24 -> 25  the same struct, on the plane that does not read the fields.
+//             CUDA reaches the score rectangle through its five
+//             per-(lane, intrinsic) side arrays and always has, so nothing
+//             about its emitted logic moves — but the record is 96 -> 112
+//             bytes on both planes and the lane table is an ARRAY of it. A
+//             kernel cached under 24 strides sixteen bytes short per lane and
+//             reads every lane after the first at the wrong offset, which is a
+//             wrong answer rather than a refusal. That is precisely the
+//             hand-back this file's preamble names, so the bump is
+//             load-bearing on the row whose bytes did not otherwise change.
+//
+// The fields were APPENDED rather than folded in beside `logits_base`, so
+// every offset a kernel already reads is where it was; only the stride between
+// lanes moved. Both `golden-cuda/` bodies stand — `fused_block0.cuh` is
+// kernel-side text with an oracle-era copy and `device_text.rs` puts it back —
+// and only their version stamps move.
+//
+// **AND THE REASON THE RECORD GREW AT ALL IS A CEILING, NOT A CAPABILITY.**
+// The M2 form can bind the score rectangle: it has had argument index 28 since
+// 37 -> 38. What it cannot do is bind it beside many channels, because the
+// intrinsic slots grow DOWN from 30 while the channels grow UP from 7 — so
+// `fused_channel_ceiling` puts a score-reading region at ten channels instead
+// of twelve. `trackb-h2o` wants ten channels and the scores, and was refused by
+// an argument-space limit that has nothing to do with what it asked for. On the
+// grouped form a channel is a row of the lane table and the score base is a
+// word beside it, so neither crowds the other.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 24, 0xc692_ce36_f07d_34df),
-    ("metal", 41, 0x899e_c2bd_850b_0273),
+    ("cuda", 25, 0xf481_2e2f_7393_1f3e),
+    ("metal", 42, 0x166f_c41f_c8b1_ff87),
 ];
 
 /// Everything an engine receives for both corpora, hashed.

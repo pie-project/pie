@@ -413,9 +413,14 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
 #: `Stage::Epilogue` binds and fires. What did NOT come off is the other two:
 #: `envelope_dot` wants a second-party page-envelope kernel that no shell
 #: ships (a separate design, `attn-score.md` §3's closing line), and
-#: `attn_page_mask` wants a shell that CONSUMES the sink -- a different door
-#: from this one, and the reason `trackb-h2o` and `trackb-snapkv` still stop
-#: at bind while `tova-attention` and `snapkv-eviction` do not.
+#: `attn_page_mask` wants a shell that CONSUMES the sink -- and the audit
+#: (`.wiki/alto/attn-score.md` section 7) found nobody knocking: every
+#: enforcing program here, `trackb-h2o` and `trackb-snapkv` included, goes
+#: through the mask door (`KvGeometry.mask` -> `Port::AttnMask`), which both
+#: shells advertise. The sink's sole caller is `quest`, behind
+#: `envelope_dot`; on Metal its legal stages and the plane's one boundary
+#: do not even intersect. The entry below stays because the WORD is still
+#: honestly false -- not because anything stops at bind any more.
 UNADVERTISED = {
     "envelope_dot": "has_kv_envelopes",
     "attn_page_mask": "has_attn_page_mask",

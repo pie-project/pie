@@ -90,6 +90,13 @@ struct Gpu {
 
 impl Gpu {
     fn open() -> Self {
+        // The same root `tests/common` states, and for the same reason: a
+        // compile-time constant under `target/`, so this crate's cubins
+        // survive between runs without the library reading an environment.
+        kernels_cuda::disk::install(Some(std::path::Path::new(concat!(
+            env!("CARGO_TARGET_TMPDIR"),
+            "/kernel-cache"
+        ))));
         unsafe {
             check(rt::cudaSetDevice(0), "cudaSetDevice");
             let mut stream: rt::cudaStream_t = core::ptr::null_mut();
@@ -1188,12 +1195,14 @@ fn a_pulled_cell_lands_whether_the_veto_comes_before_it_or_after_it() {
         assert_eq!(
             &bytes[..PAYLOAD.len()],
             &PAYLOAD,
-            "the veto arriving {order} the pull suppressed it; a pull is              predicated on its own ticket, not on the fire's commit word",
+            "the veto arriving {order} the pull suppressed it; a pull is predicated on its own \
+             ticket, not on the fire's commit word",
         );
         assert_eq!(
             registry.full(&gpu, slot, 4),
             vec![1, 0, 0, 0],
-            "and the full byte the pull sets is set on a pass that did not              commit — the header's documented exception, veto {order}",
+            "and the full byte the pull sets is set on a pass that did not commit — the header's \
+             documented exception, veto {order}",
         );
     }
 }

@@ -1,0 +1,159 @@
+pub mod forward;
+pub mod import;
+pub mod media;
+pub mod model;
+pub mod template;
+pub mod tokenizer;
+
+use model::Model;
+use model_dsl::Dtype;
+
+pub const CATALOG: &[crate::Row] = model_dsl::catalog![
+    (
+        "gemma4-e4b-eagle-bf16-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::e4b_eagle(Dtype::Bf16, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-e4b-vision-bf16-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::e4b_vision(Dtype::Bf16, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-e4b-bf16-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::e4b(Dtype::Bf16, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-26b-a4b-mlxu4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::a4b(Dtype::U4g64, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-26b-a4b-vision-mlxu4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::a4b_vision(Dtype::U4g64, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-31b-bf16-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::b31(Dtype::Bf16, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-31b-mlxu4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::b31(Dtype::U4g64, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-31b-vision-mlxu4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::b31_vision(Dtype::U4g64, Dtype::Bf16, 1)
+    ),
+    (
+        "gemma4-31b-bf16-kv-bf16-tp2",
+        2,
+        model_dsl::trace_hybrid,
+        Model::b31(Dtype::Bf16, Dtype::Bf16, 2)
+    ),
+];
+
+/// **THE `mlxu4` ROW COMES FIRST, AND THE ORDER IS LOAD-BEARING.**
+/// `model::identify` returns the first row whose contract the file can
+/// satisfy. The 4-bit row is the strictly more demanding one — every
+/// projection it reads is a `.weight` / `.scales` / `.biases` triplet, and a
+/// bf16 checkpoint holds only the first — so it misses on a bf16 file and the
+/// bf16 row below gets its turn. The reverse does not hold: a bf16 row asked
+/// about an MLX file finds every name it asks for, at a width it does not
+/// check here, and would claim it.
+///
+/// `gemma4-e4b` has no 4-bit row. Its per-layer-embedding table is a column
+/// band of one stored `embed_tokens_per_layer` bank, and a band of packed
+/// codes is cut in words while a band of its scales is cut in groups — two
+/// arithmetics this import does not state. `gemma4-31b` declares no PLE at
+/// all, so nothing about it is sliced and the triplet reading is whole.
+pub const IMPORTS: &[crate::ImportRow] = &[
+    // **BEFORE THE 31B's 4-BIT ROW, AND THE ORDER IS THE SAME ARGUMENT.**
+    // `identify` returns the first row whose contract the file satisfies, and
+    // this one is strictly the more demanding of the two: every plane the 31B
+    // asks for plus the mixture's six a layer. A 31B checkpoint misses on
+    // `router.proj.weight` at layer 0 and falls through; an A4B checkpoint
+    // would otherwise be claimed by the 31B row, which asks for sixty layers
+    // and finds thirty.
+    ("gemma4-26b-a4b-mlxu4-kv-bf16", 1, |src, tp| {
+        Model::a4b(Dtype::U4g64, Dtype::Bf16, tp).import(src)
+    }),
+    ("gemma4-31b-mlxu4-kv-bf16", 1, |src, tp| {
+        Model::b31(Dtype::U4g64, Dtype::Bf16, tp).import(src)
+    }),
+    ("gemma4-e4b-eagle-bf16-kv-bf16", 1, |src, tp| {
+        Model::e4b_eagle(Dtype::Bf16, Dtype::Bf16, tp).import(src)
+    }),
+    ("gemma4-e4b-bf16-kv-bf16", 1, |src, tp| {
+        Model::e4b(Dtype::Bf16, Dtype::Bf16, tp).import(src)
+    }),
+    ("gemma4-31b-bf16-kv-bf16", 1, |src, tp| {
+        Model::b31(Dtype::Bf16, Dtype::Bf16, tp).import(src)
+    }),
+    ("gemma4-31b-bf16-kv-bf16-tp2", 2, |src, tp| {
+        Model::b31(Dtype::Bf16, Dtype::Bf16, tp).import(src)
+    }),
+    // **LAST, FOR THE REASON `qwen_3::IMPORTS` MEASURED** (campaign M-1/M-2).
+    // A tower row is strictly more demanding and the E4B checkpoint HAS the
+    // planes, so strictness would put it first — and a vision load stands its
+    // fold down, which cost the qwen row 14.9% at c256 against its text-only
+    // twin. Until the fold goes per-unit a deployment reaches this row by
+    // name, and a stock gemma4 import answers the text-only one.
+    ("gemma4-e4b-vision-bf16-kv-bf16", 1, |src, tp| {
+        Model::e4b_vision(Dtype::Bf16, Dtype::Bf16, tp).import(src)
+    }),
+    // **AND THE WIDE-TOWER ROWS, IN THE MIXTURE-BEFORE-31B ORDER THE
+    // TEXT-ONLY PAIR ABOVE ALREADY ARGUES.** Both read
+    // [`TowerDims::wide`] — one tower, two trunk widths — so what separates
+    // them is exactly what separates their text-only twins: the A4B row asks
+    // for the mixture's six planes a layer and a 31B checkpoint misses on
+    // `router.proj.weight` at layer 0.
+    //
+    // These two are the first gemma vision rows whose weights are on this
+    // box: `mlx-community/gemma-4-{31b-it,26b-a4b-it}-4bit` each publish all
+    // 358 vision tensors beside a 4-bit trunk, and both towers are bf16
+    // whole (see `Model::new`'s census). The E4B row above still names an
+    // artifact nobody here holds.
+    ("gemma4-26b-a4b-vision-mlxu4-kv-bf16", 1, |src, tp| {
+        Model::a4b_vision(Dtype::U4g64, Dtype::Bf16, tp).import(src)
+    }),
+    ("gemma4-31b-vision-mlxu4-kv-bf16", 1, |src, tp| {
+        Model::b31_vision(Dtype::U4g64, Dtype::Bf16, tp).import(src)
+    }),
+];
+
+pub const TEMPLATES: &[crate::template::TemplateRow] = &[
+    ("gemma4-e4b-bf16-kv-bf16", template::gemma4),
+    ("gemma4-e4b-vision-bf16-kv-bf16", template::gemma4),
+    ("gemma4-e4b-eagle-bf16-kv-bf16", template::gemma4),
+    ("gemma4-26b-a4b-mlxu4-kv-bf16", template::gemma4),
+    ("gemma4-31b-bf16-kv-bf16", template::gemma4),
+    ("gemma4-31b-mlxu4-kv-bf16", template::gemma4),
+    ("gemma4-31b-bf16-kv-bf16-tp2", template::gemma4),
+    ("gemma4-31b-vision-mlxu4-kv-bf16", template::gemma4),
+    ("gemma4-26b-a4b-vision-mlxu4-kv-bf16", template::gemma4),
+];
+
+pub const TOKENIZERS: &[crate::tokenizer::ContractRow] = &[
+    ("gemma4-e4b-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-e4b-vision-bf16-kv-bf16", &tokenizer::CONTRACT_VISION),
+    ("gemma4-e4b-eagle-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-26b-a4b-mlxu4-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-31b-bf16-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-31b-mlxu4-kv-bf16", &tokenizer::CONTRACT),
+    ("gemma4-31b-bf16-kv-bf16-tp2", &tokenizer::CONTRACT),
+    ("gemma4-31b-vision-mlxu4-kv-bf16", &tokenizer::CONTRACT_VISION),
+    ("gemma4-26b-a4b-vision-mlxu4-kv-bf16", &tokenizer::CONTRACT_VISION),
+];

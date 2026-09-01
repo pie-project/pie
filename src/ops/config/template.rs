@@ -87,7 +87,7 @@ telemetry = false
 // THE DEFAULT NAMES A MODEL THIS BUILD CAN ACTUALLY SERVE.
 //
 // It was `Qwen/Qwen3-0.6B` and nothing here ships a trace for it: the catalog
-// (`model::catalog`) is qwen35 / gemma4 / gptoss / glm5 / kimik3 / dsv4, and
+// (`models::catalog`) is qwen35 / gemma4 / gptoss / glm5 / kimik3 / dsv4, and
 // the palo rewrite made the SKU the load's own identity — a checkpoint is
 // matched against every import contract in the build and refused by name when
 // none fits. So `pie config init && pie serve` answered

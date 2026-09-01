@@ -2,7 +2,15 @@
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
 # emitter_version: 33
 # @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
-# @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
+# @grouped: bytes=1043 fnv1a64=0x429904221e8e963f
+# @grouped was bytes=970 fnv1a64=0xa8ab9e1ebf8714d9 through emitter 41. The lane
+#   record grew `attn_score_base` and `attn_score_row_stride` (+73 bytes of struct
+#   text, no field before them moved), which is the grouped form's route to the
+#   attention-score rectangle: that form binds no per-intrinsic buffer, so a
+#   rectangle it must reach arrives as an address on the record. Unlike @runtime,
+#   this prefix is not kernel-side text an `oracle-inputs/` copy could stand in
+#   for -- `codegen::layout` declares the table and prints it, so the bytes are
+#   the emitter's and the move belongs in the diff.
 # cases: 45
 # re-blessed: the C++ oracle (crates/engine-metal/csrc/src/pipeline/m1_codegen.cpp) is
 #   deleted, so these bytes can no longer be re-derived from it. Three cases
@@ -34,12 +42,12 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
+#   reason: metal emitter 41->42, and the shared lane record is what moved. The GROUPED (M3) form binds no per-intrinsic buffer -- every rectangle it reads arrives as an address on the lane record -- so `attn_score` was the one id its table refused: the observability slab is the shell's own reservation (engine_metal::scores), not the readout arena, and no row displacement off lane.logits_base reaches it. LaneRecord now carries attn_score_base and attn_score_row_stride (appended, so every field before them keeps its offset; the record is 96 -> 112 bytes), emit_grouped_fused_region gathers the F32 planes from that base, and m3_intrinsic_bindable stops declining the id. What moved in these dumps is exactly the +73 bytes of struct text the two fields add to the M1 and M3 preambles, plus the emitter version spelled into ptir_m3_generic_{ready,commit}_v42. No emitted logic changed for any corpus case: the base corpus reads no score rectangle, so no kernel body here grew an arm. The bump is load-bearing rather than hygienic -- a library cached under 41 reads the 96-byte record, so lane 1 of any grouped table would start sixteen bytes early -- and CUDA bumps 24 -> 25 for the same reason on its own copy of the struct. The reason the record grew at all is the M2 ceiling: the score rectangle costs two of the twelve argument slots the channels grow into, so a ten-channel guest reading scores (trackb-h2o) was refused by a limit that had nothing to do with what it asked for.
 === empty
 function_name: ptir_m1_empty_commit
 channels: 0
 ok: true
-source: bytes=1132 prefix=none tail_bytes=1132
+source: bytes=1205 prefix=none tail_bytes=1205
 
 #include <metal_stdlib>
 using namespace metal;
@@ -64,6 +72,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -81,7 +92,7 @@ kernel void ptir_m1_empty_commit(device M1Status* status [[buffer(0)]], const de
 function_name: ptir_m1_flags_0_commit
 channels: 1
 ok: true
-source: bytes=1257 prefix=none tail_bytes=1257
+source: bytes=1330 prefix=none tail_bytes=1330
 
 #include <metal_stdlib>
 using namespace metal;
@@ -106,6 +117,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -127,7 +141,7 @@ kernel void ptir_m1_flags_0_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_1_commit
 channels: 1
 ok: true
-source: bytes=1257 prefix=none tail_bytes=1257
+source: bytes=1330 prefix=none tail_bytes=1330
 
 #include <metal_stdlib>
 using namespace metal;
@@ -152,6 +166,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -173,7 +190,7 @@ kernel void ptir_m1_flags_1_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_2_commit
 channels: 1
 ok: true
-source: bytes=1257 prefix=none tail_bytes=1257
+source: bytes=1330 prefix=none tail_bytes=1330
 
 #include <metal_stdlib>
 using namespace metal;
@@ -198,6 +215,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -219,7 +239,7 @@ kernel void ptir_m1_flags_2_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_3_commit
 channels: 1
 ok: true
-source: bytes=1257 prefix=none tail_bytes=1257
+source: bytes=1330 prefix=none tail_bytes=1330
 
 #include <metal_stdlib>
 using namespace metal;
@@ -244,6 +264,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -265,7 +288,7 @@ kernel void ptir_m1_flags_3_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_4_commit
 channels: 1
 ok: true
-source: bytes=1315 prefix=none tail_bytes=1315
+source: bytes=1388 prefix=none tail_bytes=1388
 
 #include <metal_stdlib>
 using namespace metal;
@@ -290,6 +313,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -312,7 +338,7 @@ kernel void ptir_m1_flags_4_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_5_commit
 channels: 1
 ok: true
-source: bytes=1315 prefix=none tail_bytes=1315
+source: bytes=1388 prefix=none tail_bytes=1388
 
 #include <metal_stdlib>
 using namespace metal;
@@ -337,6 +363,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -359,7 +388,7 @@ kernel void ptir_m1_flags_5_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_6_commit
 channels: 1
 ok: true
-source: bytes=1315 prefix=none tail_bytes=1315
+source: bytes=1388 prefix=none tail_bytes=1388
 
 #include <metal_stdlib>
 using namespace metal;
@@ -384,6 +413,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -406,7 +438,7 @@ kernel void ptir_m1_flags_6_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_7_commit
 channels: 1
 ok: true
-source: bytes=1315 prefix=none tail_bytes=1315
+source: bytes=1388 prefix=none tail_bytes=1388
 
 #include <metal_stdlib>
 using namespace metal;
@@ -431,6 +463,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -453,7 +488,7 @@ kernel void ptir_m1_flags_7_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_8_commit
 channels: 1
 ok: true
-source: bytes=1290 prefix=none tail_bytes=1290
+source: bytes=1363 prefix=none tail_bytes=1363
 
 #include <metal_stdlib>
 using namespace metal;
@@ -478,6 +513,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -500,7 +538,7 @@ kernel void ptir_m1_flags_8_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_9_commit
 channels: 1
 ok: true
-source: bytes=1290 prefix=none tail_bytes=1290
+source: bytes=1363 prefix=none tail_bytes=1363
 
 #include <metal_stdlib>
 using namespace metal;
@@ -525,6 +563,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -547,7 +588,7 @@ kernel void ptir_m1_flags_9_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_flags_10_commit
 channels: 1
 ok: true
-source: bytes=1291 prefix=none tail_bytes=1291
+source: bytes=1364 prefix=none tail_bytes=1364
 
 #include <metal_stdlib>
 using namespace metal;
@@ -572,6 +613,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -594,7 +638,7 @@ kernel void ptir_m1_flags_10_commit(device M1Status* status [[buffer(0)]], const
 function_name: ptir_m1_flags_11_commit
 channels: 1
 ok: true
-source: bytes=1291 prefix=none tail_bytes=1291
+source: bytes=1364 prefix=none tail_bytes=1364
 
 #include <metal_stdlib>
 using namespace metal;
@@ -619,6 +663,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -641,7 +688,7 @@ kernel void ptir_m1_flags_11_commit(device M1Status* status [[buffer(0)]], const
 function_name: ptir_m1_flags_12_commit
 channels: 1
 ok: true
-source: bytes=1349 prefix=none tail_bytes=1349
+source: bytes=1422 prefix=none tail_bytes=1422
 
 #include <metal_stdlib>
 using namespace metal;
@@ -666,6 +713,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -689,7 +739,7 @@ kernel void ptir_m1_flags_12_commit(device M1Status* status [[buffer(0)]], const
 function_name: ptir_m1_flags_13_commit
 channels: 1
 ok: true
-source: bytes=1349 prefix=none tail_bytes=1349
+source: bytes=1422 prefix=none tail_bytes=1422
 
 #include <metal_stdlib>
 using namespace metal;
@@ -714,6 +764,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -737,7 +790,7 @@ kernel void ptir_m1_flags_13_commit(device M1Status* status [[buffer(0)]], const
 function_name: ptir_m1_flags_14_commit
 channels: 1
 ok: true
-source: bytes=1349 prefix=none tail_bytes=1349
+source: bytes=1422 prefix=none tail_bytes=1422
 
 #include <metal_stdlib>
 using namespace metal;
@@ -762,6 +815,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -785,7 +841,7 @@ kernel void ptir_m1_flags_14_commit(device M1Status* status [[buffer(0)]], const
 function_name: ptir_m1_flags_15_commit
 channels: 1
 ok: true
-source: bytes=1349 prefix=none tail_bytes=1349
+source: bytes=1422 prefix=none tail_bytes=1422
 
 #include <metal_stdlib>
 using namespace metal;
@@ -810,6 +866,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -833,7 +892,7 @@ kernel void ptir_m1_flags_15_commit(device M1Status* status [[buffer(0)]], const
 function_name: ptir_m1_capacity_0_commit
 channels: 1
 ok: true
-source: bytes=1351 prefix=none tail_bytes=1351
+source: bytes=1424 prefix=none tail_bytes=1424
 
 #include <metal_stdlib>
 using namespace metal;
@@ -858,6 +917,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -881,7 +943,7 @@ kernel void ptir_m1_capacity_0_commit(device M1Status* status [[buffer(0)]], con
 function_name: ptir_m1_capacity_1_commit
 channels: 1
 ok: true
-source: bytes=1351 prefix=none tail_bytes=1351
+source: bytes=1424 prefix=none tail_bytes=1424
 
 #include <metal_stdlib>
 using namespace metal;
@@ -906,6 +968,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -929,7 +994,7 @@ kernel void ptir_m1_capacity_1_commit(device M1Status* status [[buffer(0)]], con
 function_name: ptir_m1_capacity_2_commit
 channels: 1
 ok: true
-source: bytes=1351 prefix=none tail_bytes=1351
+source: bytes=1424 prefix=none tail_bytes=1424
 
 #include <metal_stdlib>
 using namespace metal;
@@ -954,6 +1019,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -977,7 +1045,7 @@ kernel void ptir_m1_capacity_2_commit(device M1Status* status [[buffer(0)]], con
 function_name: ptir_m1_capacity_3_commit
 channels: 1
 ok: true
-source: bytes=1351 prefix=none tail_bytes=1351
+source: bytes=1424 prefix=none tail_bytes=1424
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1002,6 +1070,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1025,7 +1096,7 @@ kernel void ptir_m1_capacity_3_commit(device M1Status* status [[buffer(0)]], con
 function_name: ptir_m1_capacity_7_commit
 channels: 1
 ok: true
-source: bytes=1351 prefix=none tail_bytes=1351
+source: bytes=1424 prefix=none tail_bytes=1424
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1050,6 +1121,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1073,7 +1147,7 @@ kernel void ptir_m1_capacity_7_commit(device M1Status* status [[buffer(0)]], con
 function_name: ptir_m1_capacity_64_commit
 channels: 1
 ok: true
-source: bytes=1352 prefix=none tail_bytes=1352
+source: bytes=1425 prefix=none tail_bytes=1425
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1098,6 +1172,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1121,7 +1198,7 @@ kernel void ptir_m1_capacity_64_commit(device M1Status* status [[buffer(0)]], co
 function_name: ptir_m1_capacity_65535_commit
 channels: 1
 ok: true
-source: bytes=1355 prefix=none tail_bytes=1355
+source: bytes=1428 prefix=none tail_bytes=1428
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1146,6 +1223,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1169,7 +1249,7 @@ kernel void ptir_m1_capacity_65535_commit(device M1Status* status [[buffer(0)]],
 function_name: ptir_m1_capacity_4294967295_commit
 channels: 1
 ok: true
-source: bytes=1360 prefix=none tail_bytes=1360
+source: bytes=1433 prefix=none tail_bytes=1433
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1194,6 +1274,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1217,7 +1300,7 @@ kernel void ptir_m1_capacity_4294967295_commit(device M1Status* status [[buffer(
 function_name: ptir_m1_pair_0_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1242,6 +1325,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1269,7 +1355,7 @@ kernel void ptir_m1_pair_0_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_1_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1294,6 +1380,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1321,7 +1410,7 @@ kernel void ptir_m1_pair_1_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_2_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1346,6 +1435,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1373,7 +1465,7 @@ kernel void ptir_m1_pair_2_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_3_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1398,6 +1490,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1425,7 +1520,7 @@ kernel void ptir_m1_pair_3_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_4_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1450,6 +1545,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1477,7 +1575,7 @@ kernel void ptir_m1_pair_4_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_5_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1502,6 +1600,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1529,7 +1630,7 @@ kernel void ptir_m1_pair_5_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_6_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1554,6 +1655,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1581,7 +1685,7 @@ kernel void ptir_m1_pair_6_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_7_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1606,6 +1710,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1633,7 +1740,7 @@ kernel void ptir_m1_pair_7_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_8_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1658,6 +1765,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1685,7 +1795,7 @@ kernel void ptir_m1_pair_8_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_9_commit
 channels: 2
 ok: true
-source: bytes=1470 prefix=none tail_bytes=1470
+source: bytes=1543 prefix=none tail_bytes=1543
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1710,6 +1820,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1737,7 +1850,7 @@ kernel void ptir_m1_pair_9_commit(device M1Status* status [[buffer(0)]], const d
 function_name: ptir_m1_pair_10_commit
 channels: 2
 ok: true
-source: bytes=1471 prefix=none tail_bytes=1471
+source: bytes=1544 prefix=none tail_bytes=1544
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1762,6 +1875,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1789,7 +1905,7 @@ kernel void ptir_m1_pair_10_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_pair_11_commit
 channels: 2
 ok: true
-source: bytes=1471 prefix=none tail_bytes=1471
+source: bytes=1544 prefix=none tail_bytes=1544
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1814,6 +1930,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1841,7 +1960,7 @@ kernel void ptir_m1_pair_11_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_pair_12_commit
 channels: 2
 ok: true
-source: bytes=1471 prefix=none tail_bytes=1471
+source: bytes=1544 prefix=none tail_bytes=1544
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1866,6 +1985,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1893,7 +2015,7 @@ kernel void ptir_m1_pair_12_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_pair_13_commit
 channels: 2
 ok: true
-source: bytes=1471 prefix=none tail_bytes=1471
+source: bytes=1544 prefix=none tail_bytes=1544
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1918,6 +2040,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1945,7 +2070,7 @@ kernel void ptir_m1_pair_13_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_pair_14_commit
 channels: 2
 ok: true
-source: bytes=1471 prefix=none tail_bytes=1471
+source: bytes=1544 prefix=none tail_bytes=1544
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1970,6 +2095,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1997,7 +2125,7 @@ kernel void ptir_m1_pair_14_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_pair_15_commit
 channels: 2
 ok: true
-source: bytes=1471 prefix=none tail_bytes=1471
+source: bytes=1544 prefix=none tail_bytes=1544
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2022,6 +2150,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2049,7 +2180,7 @@ kernel void ptir_m1_pair_15_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_mix5_commit
 channels: 5
 ok: true
-source: bytes=1961 prefix=none tail_bytes=1961
+source: bytes=2034 prefix=none tail_bytes=2034
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2074,6 +2205,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2116,7 +2250,7 @@ kernel void ptir_m1_mix5_commit(device M1Status* status [[buffer(0)]], const dev
 function_name: ptir_m1_wide_28_commit
 channels: 28
 ok: true
-source: bytes=5945 prefix=none tail_bytes=5945
+source: bytes=6018 prefix=none tail_bytes=6018
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2141,6 +2275,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2298,7 +2435,7 @@ kernel void ptir_m1_wide_28_commit(device M1Status* status [[buffer(0)]], const 
 function_name: ptir_m1_wide_29_commit
 channels: 29
 ok: true
-source: bytes=6131 prefix=none tail_bytes=6131
+source: bytes=6204 prefix=none tail_bytes=6204
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2323,6 +2460,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;

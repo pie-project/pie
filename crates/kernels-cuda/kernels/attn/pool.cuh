@@ -336,6 +336,41 @@ __global__ void pool_boundary_prefill(
     out_rope[t] = is_boundary ? (p / ratio) * ratio : 0;
 }
 
+// Scatters this fire's compressor projections into the rolling state
+// `pool_gather_paged` below pools out of: `state_kv[slot] = wkv·x` and
+// `state_score[slot] = wgate·x`, at `slot = w_page[i] * page_size + w_off[i]`
+// — the SOURCE cache's own cell for token row `i`, the cell the latent
+// appender writes in the same fire.
+//
+// **THE STATE IS ADDRESSED BY THE CACHE AND NOT BY THE FIRE**, which is why
+// this is a scatter and not a rectangle: a pooling window closing at this
+// fire's boundary reaches back `coff * ratio` positions and most of those
+// tokens were written earlier. `paged_slot` in the gather and this `slot` are
+// the same arithmetic said two ways.
+//
+// One block per row, one thread per column.
+template <class T>
+__global__ void pool_state_write(
+    const T* __restrict__ kv,
+    const T* __restrict__ score,
+    T* __restrict__ state_kv,
+    T* __restrict__ state_score,
+    const u32* __restrict__ w_page,
+    const u32* __restrict__ w_off,
+    int width,
+    int page_size,
+    int state_pitch) {
+    const int i = blockIdx.x;
+    const long long slot =
+        static_cast<long long>(w_page[i]) * page_size + w_off[i];
+    const long long dst = slot * static_cast<long long>(state_pitch);
+    const long long src = static_cast<long long>(i) * width;
+    for (int d = threadIdx.x; d < width; d += blockDim.x) {
+        state_kv[dst + d] = kv[src + d];
+        state_score[dst + d] = score[src + d];
+    }
+}
+
 template <class T>
 __global__ void pool_gather_paged(
     const T* __restrict__ state_kv,
@@ -349,10 +384,19 @@ __global__ void pool_gather_paged(
     int head_dim,
     int ratio,
     int coff,
-    int page_size) {
+    int page_size,
+    // The ROW PITCH the two state slabs are laid out at, which is not always
+    // `coff * head_dim`: one artifact can hold pooled layers at two ratios
+    // (dsv4-flash carries ratio 4 and ratio 128), a reservation may lay one
+    // plane at the widest of them, and a narrower gather must still stride by
+    // the plane's row and read its own `coff * head_dim` columns inside it.
+    // `attn/pool.metal`'s twin took this argument first; the two shaders read
+    // the state at one arithmetic.
+    int state_pitch) {
     const int c = blockIdx.x;
     const int window = coff * ratio;
     const int width = coff * head_dim;
+    const long long pitch = static_cast<long long>(state_pitch);
     const int bpos = boundary_pos[c];
     const int req = boundary_req[c];
 
@@ -372,7 +416,7 @@ __global__ void pool_gather_paged(
             const int col = ((i >= ratio) ? head_dim : 0) + d;
             const long long slot =
                 paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
-            float sc = Elem<T>::to_f32(state_score[slot * width + col]);
+            float sc = Elem<T>::to_f32(state_score[slot * pitch + col]);
             if (ape != nullptr) {
                 sc += ape[static_cast<long long>(pos % ratio) * width + col];
             }
@@ -390,13 +434,13 @@ __global__ void pool_gather_paged(
             const int col = ((i >= ratio) ? head_dim : 0) + d;
             const long long slot =
                 paged_slot(kv_page_indices, kv_page_indptr, req, pos, page_size);
-            float sc = Elem<T>::to_f32(state_score[slot * width + col]);
+            float sc = Elem<T>::to_f32(state_score[slot * pitch + col]);
             if (ape != nullptr) {
                 sc += ape[static_cast<long long>(pos % ratio) * width + col];
             }
             const float e = __expf(sc - max_s);
             sum_e += e;
-            acc += e * Elem<T>::to_f32(state_kv[slot * width + col]);
+            acc += e * Elem<T>::to_f32(state_kv[slot * pitch + col]);
         }
         out[static_cast<long long>(c) * head_dim + d] =
             Elem<T>::from_f32(sum_e > 0.0f ? acc / sum_e : 0.0f);

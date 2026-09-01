@@ -128,7 +128,7 @@ members = [
     # Bakes a Plan once (palo design §2): classes, regions, the arena carve.
     "crates/model-compiler",
     # The model catalog: six forwards on the new surface, SKU names verbatim.
-    "crates/model",
+    "crates/models",
     # The provenance authoring surface: Builder over checkpoint's contract IR.
     "crates/checkpoint-dsl",
     # The prompt formats: ChatML/Harmony/Gemma/DeepSeek/Kimi, both directions.
@@ -177,7 +177,7 @@ default-members = [
     "crates/eta-exec",
     # The three shader drivers stood here through R2's quarantine and are out
     # of the workspace altogether now — see `exclude`.
-    "crates/model",
+    "crates/models",
     "crates/model-ir",
     "crates/model-dsl",
     "crates/checkpoint-dsl",

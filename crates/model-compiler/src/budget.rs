@@ -109,6 +109,24 @@ impl Budgets {
         self
     }
 
+    /// **THIS DEPLOYMENT'S CEILINGS ON ONE ROW AXIS**, or `None` for an axis
+    /// it does not admit at all.
+    ///
+    /// **THE ONE PLACE THIS CONTAINER'S SHAPE IS SPELLED.** The token
+    /// rectangle is always stated — a fire has token rows by definition — and
+    /// the patch one is an `Option`, which is `None` for every text-only
+    /// deployment and is what refusals like [`Error::Unsized`](crate::Error)
+    /// are decided off. Every pass that owes an answer per axis asks here
+    /// rather than re-deriving the asymmetry, so a third rectangle lands as
+    /// one more arm in this function and nowhere else.
+    #[must_use]
+    pub fn ladder(&self, axis: crate::RowAxis) -> Option<Ladder<'_>> {
+        match axis {
+            crate::RowAxis::Tokens => Some(self.tokens.ladder()),
+            crate::RowAxis::Patches => self.patches.as_ref().map(PatchLadder::ladder),
+        }
+    }
+
     /// The ceiling `Dim::Patches` is sized at, and `0` for a deployment that
     /// declared no patch axis — which is the number that makes a patch
     /// rectangle empty, and therefore the number the bake refuses a
@@ -188,6 +206,54 @@ impl PatchLadder {
             max_images,
         }
     }
+
+    /// This axis's ceilings and lattice, in the shape every pass reads them
+    /// in — [`Ladder`], which is what a `PatchLadder` IS once the names
+    /// `patches` and `images` are spent.
+    #[must_use]
+    pub fn ladder(&self) -> Ladder<'_> {
+        Ladder {
+            max_rows: self.max_patches,
+            max_lanes: self.max_images,
+            buckets: &self.buckets,
+        }
+    }
+}
+
+/// **ONE ROW AXIS'S CEILINGS AND ITS LATTICE** — the three numbers every axis
+/// states, and the only three any pass in this crate reads off one.
+///
+/// **THE INTERNAL CURRENCY, AND THE FACES STAY FACES.** [`Budget`] is what
+/// every caller in the tree holds and what a text-only deployment has to say;
+/// [`PatchLadder`] is what a boot TOML parses into and what a `Budgets`
+/// carries. Both are records with the axis's own vocabulary in their field
+/// names — `max_tokens` and `max_lanes` over here, `max_patches` and
+/// `max_images` over there — and that vocabulary is exactly what a pass
+/// asking "does this ladder ascend" must not have to know. So the passes take
+/// this: three numbers, no axis in any of their names, produced by
+/// [`Budget::ladder`] and [`PatchLadder::ladder`] and handed to the one
+/// acceptance walk (`accept_ladder`) instead of to two copies of it. P4's
+/// fallback menu takes the two of the three it reads — the lattice and the
+/// ceiling — because a whole ladder there was what made the patch axis
+/// FABRICATE a `Budget` to carry them.
+///
+/// **A BORROWED VIEW AND NOT AN OWNED STRUCT**, because the lattice is a
+/// `Vec` on both faces and a third owner of it would be a third copy per
+/// bake. Nothing here outlives the budget it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ladder<'a> {
+    /// The most rows one fire may carry on this axis —
+    /// [`Budget::max_tokens`] on the token axis,
+    /// [`PatchLadder::max_patches`] on the patch one.
+    pub max_rows: u32,
+    /// The most of this axis's own lanes one fire may carry —
+    /// [`Budget::max_lanes`] (requests) on the token axis,
+    /// [`PatchLadder::max_images`] (images) on the patch one.
+    pub max_lanes: u32,
+    /// The shape lattice a fire's row count on this axis is rounded up to —
+    /// one immutable graph per entry. Ascending, each entry at most
+    /// [`max_rows`](Ladder::max_rows).
+    pub buckets: &'a [u32],
 }
 
 /// The smallest rung a PATCH ladder should state, and the argument is the
@@ -210,6 +276,20 @@ impl PatchLadder {
 pub const PATCH_LATTICE_FLOOR: u32 = 64;
 
 impl Budget {
+    /// This axis's ceilings and lattice, in the shape every pass reads them
+    /// in — [`Ladder`]. The token rectangle's `max_tokens` is its
+    /// [`max_rows`](Ladder::max_rows) and its `max_lanes` is its
+    /// [`max_lanes`](Ladder::max_lanes), which is the whole conversion:
+    /// `max_adapters` is not a row-space fact and does not travel.
+    #[must_use]
+    pub fn ladder(&self) -> Ladder<'_> {
+        Ladder {
+            max_rows: self.max_tokens,
+            max_lanes: self.max_lanes,
+            buckets: &self.buckets,
+        }
+    }
+
     /// The ceilings, with no bucket lattice and no adapter pool — what a test
     /// or a golden-path walk wants.
     #[must_use]

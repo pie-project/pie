@@ -492,11 +492,14 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
     // calls `adopt_launch_package_with(package, Boundaries::CUDA)` because the
     // CUDA vocabulary — `envelope_dot`, `lora`, `attn_page_mask` — is not the
     // default. This plane's vocabulary IS the default: `adopt_launch_package`
-    // applies `Boundaries::METAL` (`metal.identity`, `metal.discard`), which
-    // is exactly what `Plane::register` adopts with. Spelling it out with
-    // `_with` here would restate the default and then drift from it the day
-    // the Metal vocabulary grows a name — and the test would be adopting a
-    // different plan from the plane it is diffing.
+    // applies `Boundaries::METAL` (`metal.identity`, `metal.discard`, and —
+    // since lane J — `lora`, which is admitted as a DECLARATION the host reads
+    // at bind and never as an op the interpreter runs; see
+    // `eta_exec::Boundaries::METAL`'s own note). That is exactly what
+    // `Plane::register` adopts with. Spelling it out with `_with` here would
+    // restate the default and then drift from it the next time the Metal
+    // vocabulary grows a name — and the test would be adopting a different
+    // plan from the plane it is diffing.
     let plan: ExecPlan = adopt_launch_package(package.clone())
         .unwrap_or_else(|error| panic!("{name} does not adopt: {error}"));
     // Adoption answers `Ok` for a package this backend cannot run and says so
@@ -584,6 +587,8 @@ fn parity(context: &Context, plane: &mut Plane, subject: &Subject) {
             &seeds.device,
             extents,
             GeometryClass::Host,
+            // No registered channels: these rings are the instance's own.
+            &[],
         )
         .unwrap_or_else(|error| panic!("{name} does not bind: {error}"));
 
@@ -1004,7 +1009,7 @@ fn the_channel_ceiling_is_an_escape_and_not_a_wall() {
         ..Extents::default()
     };
     let instance = plane
-        .bind(&context, program, &seeds.device, extents, GeometryClass::Host)
+        .bind(&context, program, &seeds.device, extents, GeometryClass::Host, &[])
         .unwrap_or_else(|error| panic!("{OVER_THE_CEILING} does not bind: {error}"));
 
     let readout = logits(rows, OVER_THE_CEILING);
@@ -1142,7 +1147,7 @@ fn beam_at_pitch(context: &Context, pitch: u32) -> Vec<Option<Vec<u8>>> {
         ..Extents::default()
     };
     let instance = plane
-        .bind(context, program, &seeds.device, extents, GeometryClass::Host)
+        .bind(context, program, &seeds.device, extents, GeometryClass::Host, &[])
         .unwrap_or_else(|error| panic!("{OVER_THE_CEILING} does not bind: {error}"));
 
     // The same two rows every time, moved apart by the pitch, and the gaps
@@ -1390,6 +1395,8 @@ fn a_source_metal_refuses_is_a_named_deterministic_refusal_and_nothing_else() {
             &seeds(&good.launch).device,
             Extents::default(),
             GeometryClass::Host,
+            // No registered channels: these rings are the instance's own.
+            &[],
         )
         .expect("and binds");
     assert_eq!(
@@ -1470,6 +1477,8 @@ fn the_second_bind_of_a_program_compiles_nothing() {
             &device_seeds,
             Extents::default(),
             GeometryClass::Host,
+            // No registered channels: these rings are the instance's own.
+            &[],
         )
         .expect("first instance");
     let b = plane
@@ -1479,6 +1488,8 @@ fn the_second_bind_of_a_program_compiles_nothing() {
             &device_seeds,
             Extents::default(),
             GeometryClass::Host,
+            // No registered channels: these rings are the instance's own.
+            &[],
         )
         .expect("second instance");
     assert_ne!(a, b, "two instances, two ids");

@@ -551,6 +551,16 @@ pub struct DeviceTuning {
     /// A machine with a wider register file or a cheaper unpack wants this
     /// HIGHER; a machine that fills on fewer threadgroups wants it higher
     /// too. Neither has been measured, so no family names a value.
+    ///
+    /// # AND IT IS A NUMERICS KNOB, WHICH THIS DOC USED TO DENY
+    ///
+    /// Setting it to 1 puts every width back on the one-row point and makes
+    /// the vector arm row-count invariant. That is not merely tidy: at the
+    /// stock pair (`max = 2`, [`packs`](DeviceTuning::qmv_rows_packs)` = 1`) a
+    /// 2- or 4-row fire computes a projection in a different thirty-two
+    /// partial sums from a 1- or 3-row one, and on gemma-4-26b-a4b that
+    /// reaches the token. See [`qmv_rows_packs`](DeviceTuning::qmv_rows_packs)
+    /// and `.wiki/macos-bench.md` §23.
     pub qmv_rows_max: u32,
 
     /// Weight packs one thread of the multi-row vector point reads per k
@@ -566,6 +576,40 @@ pub struct DeviceTuning {
     /// It is a knob and not a constant in the shader because which side wins
     /// is a property of the machine's register file rather than of the
     /// checkpoint.
+    ///
+    /// # **IT IS ALSO THE VECTOR ARM'S NUMERICAL POLICY, AND THAT WAS MISSED**
+    ///
+    /// The pack width is not a fetch schedule laid over a fixed sum. It IS the
+    /// sum's shape: `block_size = pack_factor * packs_per_thread * SIMD_SIZE`,
+    /// so at four bits one pack deals each of a simdgroup's thirty-two lanes
+    /// an EIGHT-code slice of a 256-code block and two packs deals it a
+    /// SIXTEEN-code slice of a 512-code one. `simd_sum` then folds a different
+    /// thirty-two partial sums. `quant_qmv.metal`'s one-row point is stamped
+    /// at two packs and at nothing else, so **the fold reproduces it bit for
+    /// bit at `qmv_rows_packs = 2` and reassociates at every other value.**
+    ///
+    /// The reassociation is one `bfloat16` ulp in about one element in eight
+    /// thousand (`affine_floor::the_folded_vector_point_lands_the_one_row_bits`
+    /// measures 1 of 8192 at both 1024 and 2816 terms). On a dense stack
+    /// nothing follows it. On a checkpoint that routes eight of 128 experts on
+    /// those elements thirty times over it is a different expert and then a
+    /// different token, and because `qmv_rows_fold` folds at 2 and 4 rows and
+    /// declines at 1 and 3, the arithmetic moves with the fire's ROW COUNT:
+    ///
+    /// ```text
+    ///   gemma-4-26b-a4b, 4 identical lanes against the same lane alone,
+    ///   worst |delta| over the logit row at the first decode step
+    ///
+    ///     width          1        2        3        4
+    ///     stock       0.0000   2.4062   0.0000   2.4062
+    ///     packs = 2   0.0000   0.0000   0.0000   0.0000
+    /// ```
+    ///
+    /// **THE DEFAULT STAYS 1** — the campaign's ruling is fast ladders by
+    /// default with a deterministic knob opt-in, and this is that knob: `2`
+    /// makes the vector arm row-count invariant for about 11% of an a4b decode
+    /// at four lanes (129.2 → 114.5 aggregate tok/s). `.wiki/macos-bench.md`
+    /// §23 is the table.
     pub qmv_rows_packs: u32,
 }
 

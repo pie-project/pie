@@ -92,7 +92,7 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
 
     let mut declaring: Vec<(String, usize)> = Vec::new();
     let mut maskless: Vec<String> = Vec::new();
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         let arms = masked_arms(&trace(Platform::Cuda));
         if arms > 0 {
             declaring.push((sku.to_string(), arms));
@@ -170,7 +170,7 @@ fn the_masked_axis_is_declared_by_gemma_and_qwen_and_by_nobody_else() {
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn gemma_s_one_kv_space_carries_two_readings_and_probes_them_apart() {
-    let trace = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
+    let trace = models::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
         Platform::Cuda,
     );
     let facts = engine_cuda::store::kv::probe(&trace).expect(
@@ -236,7 +236,7 @@ fn gemma_s_one_kv_space_carries_two_readings_and_probes_them_apart() {
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn every_sku_probes_its_caches() {
     let mut refused: Vec<String> = Vec::new();
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         if let Err(fault) = engine_cuda::store::kv::probe(&trace(Platform::Cuda)) {
             refused.push(format!("`{sku}`: {fault}"));
         }
@@ -257,7 +257,7 @@ fn every_sku_probes_its_caches() {
 /// The fix was model text, and the net that catches the next one is upstream
 /// of this file: `model_compiler::compile` refuses a straddle by name
 /// (`model_compiler::Error::Straddled`) off `ClassTable::node_mask`, and
-/// `crates/model/tests/no_schedule_straddles_its_readers.rs` asks the same
+/// `crates/models/tests/no_schedule_straddles_its_readers.rs` asks the same
 /// predicate one pass earlier, with no compiler in the room. This is the
 /// shell's own restatement over a `CompiledModel`, kept because the shell asks it at
 /// load and a `CompiledModel` can arrive from anywhere.
@@ -265,7 +265,7 @@ fn every_sku_probes_its_caches() {
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn no_sku_straddles_a_schedule() {
     let mut straddled: Vec<String> = Vec::new();
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         let trace = trace(Platform::Cuda);
         let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
             straddled.push(format!("`{sku}`: does not bake"));
@@ -301,7 +301,7 @@ fn no_sku_straddles_a_schedule() {
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn gemma_states_a_sliding_window_on_most_of_its_masked_arms() {
-    let trace = model::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
+    let trace = models::trace_of("gemma4-e4b-bf16-kv-bf16").expect("the catalog ships gemma")(
         Platform::Cuda,
     );
     let windowed = trace
@@ -702,7 +702,7 @@ fn a_masked_composition_captures_once_and_replays_identically() {
     let stats = shell.body_stats();
     eprintln!("masked capture: {stats}");
     assert!(
-        stats.hits >= 1,
+        stats.tally.hits >= 1,
         "the masked composition was never served from a body, so this compared \
          eager against eager. `refusals` says whether the admissibility rule \
          turned the masked window away and `declines` whether its schedule \
@@ -918,7 +918,7 @@ mod maskless {
     /// at the text; the refusal this module serves is what it looks like at
     /// the fire.
     pub fn word(query_len: u32) -> u64 {
-        model::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
+        models::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
     }
 
     fn snapshot() -> Option<PathBuf> {
@@ -977,10 +977,10 @@ mod maskless {
         }
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+        let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
         let source =
             ztensor_compat::index_all(&shards).expect("the checkpoint's shards open as one");
-        let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+        let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
         let shell = Shell::load(Boot {
@@ -1006,7 +1006,7 @@ mod maskless {
                 bodies: true,
                 ..engine_cuda::Knobs::default()
             },
-            program_cache_dir: None,
+            cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and read
             // its numbers, so a deeper ring would carve slots nothing claims.
             runahead: engine::runahead::Runahead::F1,
@@ -1479,7 +1479,7 @@ mod gemma {
     }
 
     pub fn word(query_len: u32, masked: bool) -> u64 {
-        model::gemma_4::forward::Facts::of(&Request::new(query_len, masked)).word()
+        models::gemma_4::forward::Facts::of(&Request::new(query_len, masked)).word()
     }
 
     pub fn argmax(logits: &[f32]) -> u32 {
@@ -1631,9 +1631,9 @@ mod gemma {
         };
         let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
             .expect("the checkpoint's tokenizer loads");
-        let trace = model::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
+        let trace = models::trace_of(SKU).expect("the catalog ships gemma")(Platform::Cuda);
         let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-        let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+        let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
             .expect("the import contract fits its own checkpoint");
         drop(source);
 
@@ -1661,7 +1661,7 @@ mod gemma {
                 bodies: true,
                 ..engine_cuda::Knobs::default()
             },
-            program_cache_dir: None,
+            cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
             // claims. `Runahead::of` is the door a deployment comes through.

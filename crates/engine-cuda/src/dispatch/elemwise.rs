@@ -165,6 +165,17 @@ impl Run<'_> {
                 out,
                 out_out: _,
             } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), &mut self.tensor(*out)),
+            Elementwise::Standardize {
+                x,
+                bias,
+                scale,
+                x_out: _,
+            } => elemwise::norm::standardize(
+                self.ctx(),
+                self.tensor(*bias),
+                self.tensor(*scale),
+                &mut self.tensor(*x),
+            ),
             Elementwise::MulScalar { s, x, x_out: _ } => {
                 elemwise::norm::mul_scalar(self.ctx(), *s, &mut self.tensor(*x))
             }
@@ -386,6 +397,18 @@ impl Run<'_> {
                 self.tensor(*streams),
                 *eps,
                 &mut self.tensor(*y),
+            ),
+            Elementwise::HcProject {
+                normed,
+                weight,
+                stream_count,
+                mixes,
+            } => elemwise::hc::project(
+                self.ctx(),
+                self.tensor(*normed),
+                self.tensor(*weight),
+                *stream_count,
+                &mut self.tensor(*mixes),
             ),
             Elementwise::HcGates {
                 normed,

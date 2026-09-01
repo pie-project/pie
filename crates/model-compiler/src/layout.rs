@@ -83,7 +83,7 @@ use std::ops::Range;
 use model_ir::{ClassTable, Trace};
 
 use crate::compiled::{Fallback, FallbackRow, FallbackTable, ClassOrder, Phase, Region};
-use crate::budget::{Budget, DeviceProfile};
+use crate::budget::DeviceProfile;
 
 use crate::pq::{Leaf, PqTree};
 
@@ -146,7 +146,8 @@ pub(crate) fn seriate(
     trace: &Trace,
     regions: &[Region],
     classes: &ClassTable,
-    budget: &Budget,
+    lattice: &[u32],
+    ceiling: u32,
     profile: &DeviceProfile,
 ) -> (ClassOrder, FallbackTable) {
     let count = classes.classes.len();
@@ -187,7 +188,8 @@ pub(crate) fn seriate(
         let answer = menu(
             PqTree::runs(tree.frontier(), mask),
             groupable[mask],
-            budget,
+            lattice,
+            ceiling,
             profile,
         );
         for &r in &matrix[mask] {
@@ -479,9 +481,18 @@ fn concede(masks: &[&Vec<Leaf>], costs: &[f32], count: usize) -> (PqTree, Vec<Ve
 ///
 /// **SPLIT AT PREFILL SCALE, COPY AT DECODE SCALE** — see [`CROSSOVER_ROWS`]
 /// for the measurement and [`CROSSOVER_SMS`] for how it is carried to a device
-/// nobody re-measured. The ranges index [`Budget::buckets`]; a deployment
-/// that declared no bucket lattice has one implicit bucket at
-/// [`Budget::max_tokens`], and gets one row covering it.
+/// nobody re-measured. The ranges index THIS AXIS'S OWN lattice — the token
+/// rectangle's [`Budget::buckets`](crate::Budget::buckets) or the patch
+/// rectangle's
+/// `PatchLadder::buckets`; a deployment that declared no lattice on this axis
+/// has one implicit bucket at its ceiling, and gets one row covering it.
+///
+/// **TWO NUMBERS AND NOT A WHOLE `Budget`**, which is what this took and what
+/// made the patch axis fabricate one: a four-field struct built to carry a
+/// lattice and a ceiling, with two of its four fields set to values that mean
+/// nothing on the second axis. [`Ladder`](crate::Ladder) is the shape a
+/// caller holding a whole axis passes through; what lands here is the two
+/// numbers it is asked for.
 ///
 /// **[`Fallback::Grouped`] IS CHOSEN WHEN, AND ONLY WHEN, THE CALLER SAID ITS
 /// KERNEL EXISTS** ([`groupable`], [`DeviceProfile::grouped`]). The standing
@@ -507,13 +518,14 @@ fn concede(masks: &[&Vec<Leaf>], costs: &[f32], count: usize) -> (PqTree, Vec<Ve
 fn menu(
     runs: u32,
     groupable: bool,
-    budget: &Budget,
+    lattice: &[u32],
+    ceiling: u32,
     profile: &DeviceProfile,
 ) -> Vec<(Range<u32>, Fallback)> {
-    let lattice: &[u32] = if budget.buckets.is_empty() {
-        std::slice::from_ref(&budget.max_tokens)
+    let lattice: &[u32] = if lattice.is_empty() {
+        std::slice::from_ref(&ceiling)
     } else {
-        &budget.buckets
+        lattice
     };
     if groupable {
         return vec![(0..lattice.len() as u32, Fallback::Grouped)];
@@ -539,7 +551,7 @@ fn menu(
 mod tests {
     use super::*;
     use crate::fixture::{Build, fact};
-    use crate::{CompiledModel, ClassOrder, compile};
+    use crate::{Budget, CompiledModel, ClassOrder, compile};
     use model_ir::Guard;
 
     fn bake(b: &Build) -> CompiledModel {
@@ -755,14 +767,14 @@ mod tests {
             ..Budget::default()
         };
         assert_eq!(
-            menu(3, false, &budget, &reference),
+            menu(3, false, &budget.buckets, budget.max_tokens, &reference),
             vec![(0..2, Fallback::Copy), (2..5, Fallback::Split { r: 3 })],
         );
 
         // A wider device needs more rows before a split has tiles to fill it.
         let wider = DeviceProfile::default();
         assert_eq!(
-            menu(2, false, &budget, &wider),
+            menu(2, false, &budget.buckets, budget.max_tokens, &wider),
             vec![(0..3, Fallback::Copy), (3..5, Fallback::Split { r: 2 })],
         );
 
@@ -774,14 +786,14 @@ mod tests {
             ..Budget::default()
         };
         assert_eq!(
-            menu(2, false, &prefill, &wider),
+            menu(2, false, &prefill.buckets, prefill.max_tokens, &wider),
             vec![(0..2, Fallback::Split { r: 2 })],
         );
         let decode = Budget {
             buckets: vec![1, 2, 4],
             ..Budget::default()
         };
-        assert_eq!(menu(2, false, &decode, &wider), vec![(0..3, Fallback::Copy)]);
+        assert_eq!(menu(2, false, &decode.buckets, decode.max_tokens, &wider), vec![(0..3, Fallback::Copy)]);
     }
 
     #[test]
@@ -869,13 +881,13 @@ mod tests {
         };
         let profile = DeviceProfile::default();
         assert_eq!(
-            menu(3, true, &budget, &profile),
+            menu(3, true, &budget.buckets, budget.max_tokens, &profile),
             vec![(0..5, Fallback::Grouped)],
         );
         // The same lattice, the same runs, the same device — and without the
         // word, the two entries the menu has always written.
         assert_eq!(
-            menu(3, false, &budget, &profile),
+            menu(3, false, &budget.buckets, budget.max_tokens, &profile),
             vec![(0..3, Fallback::Copy), (3..5, Fallback::Split { r: 3 })],
         );
     }

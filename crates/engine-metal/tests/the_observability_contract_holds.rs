@@ -230,6 +230,8 @@ fn a_guest_reads_the_score_rectangle_as_the_interpreter_reads_it() {
             &[],
             Extents::default(),
             GeometryClass::Host,
+            // No registered channels: these rings are the instance's own.
+            &[],
         )
         .unwrap_or_else(|error| panic!("the subject does not bind: {error}"));
 
@@ -727,10 +729,8 @@ fn budgets() -> Budget {
 /// The lane word the model's own `Classify` computes — the facts qwen declares,
 /// and no third opinion about any of them.
 fn word(query_len: u32, captures: bool) -> u64 {
-    model::qwen_3::forward::Facts::of(
-        &Request::new(query_len, false).capturing_scores(captures),
-    )
-    .word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).capturing_scores(captures))
+        .word()
 }
 
 fn seat<'a>(slot: u32, tokens: &'a [u32], captures: bool) -> Seated<'a> {
@@ -984,18 +984,26 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
 
     // The runtime's half: trace the row, state the load contract. Neither is
     // the shell's — `Trace` crosses the boundary, `CompiledModel` never does.
-    let trace = model::trace_of(SKU).expect("the catalog ships this SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships this SKU");
     let trace = trace(Platform::Metal);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the SKU's import contract fits its own checkpoint");
+    let contract =
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+            .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {
         trace,
         contract: &contract,
         checkpoint: &snapshot,
+        // §M-4c, as `serve_smoke` states it: an unstamped snapshot proceeds,
+        // and the deployment's facts are stated honestly all the same.
+        tp_size: 1,
+        precision: models::precision_of(SKU)
+            .expect("the catalog states this row's precision")
+            .to_string(),
         budget: budgets(),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,

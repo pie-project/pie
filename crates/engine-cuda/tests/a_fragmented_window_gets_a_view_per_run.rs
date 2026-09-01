@@ -32,7 +32,9 @@ use model_ir::Trace;
 /// A slot table generously above every hand-built fire below — the tests ask
 /// about window semantics, not the carve, so the ceiling only has to hold.
 fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1)
+    // The three new arguments are one gathered payload's ceiling — rows,
+    // kv spaces, pages — generous the same way the first four are.
+    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
 }
 
 /// The SKU whose `captures_scores` window P4 withdraws, and the one the
@@ -54,7 +56,7 @@ fn budget() -> Budget {
 }
 
 fn sku() -> (Trace, CompiledModel) {
-    let (_, _, trace, _) = model::catalog()
+    let (_, _, trace, _) = models::catalog()
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
@@ -101,8 +103,7 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
     let windows = Windows::of(
         &plan,
         &compiled,
-        fire.classes(),
-        fire.patch_classes(),
+        model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]),
         &boundaries,
         engine_cuda::window::Copies::off(),
         test_slots(),
@@ -128,15 +129,15 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
         let mut seen: Vec<MaskSpan> = Vec::new();
         for run in 0..windows.runs(at) {
             let window = windows.at(at, run);
-            assert_eq!(window.span, spans[run as usize], "region {at} run {run}");
+            assert_eq!(window.span(), spans[run as usize], "region {at} run {run}");
             assert!(
-                !seen.contains(&window.span),
+                !seen.contains(&window.span()),
                 "region {at} handed run {run} a window it already handed another",
             );
-            seen.push(window.span);
+            seen.push(window.span());
 
-            let first = window.span.lane_offset as usize;
-            let last = first + window.span.lanes as usize;
+            let first = window.span().lane_offset as usize;
+            let last = first + window.span().lanes as usize;
             let want: Vec<i32> = boundaries[first..=last]
                 .iter()
                 .map(|bound| bound - boundaries[first])
@@ -148,7 +149,7 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
             assert_eq!(window.indptr_host[0], 0);
             assert_eq!(
                 *window.indptr_host.last().expect("a closing bound"),
-                window.span.rows as i32,
+                window.span().rows as i32,
                 "a run's boundaries close at its own row count",
             );
         }
@@ -200,16 +201,16 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
         .template()
         .iter()
         .find(|region| {
-            fallback::promised(&compiled, region) && ascending.span(&region.mask).is_err()
+            fallback::promised(&compiled, model_ir::RowAxis::Tokens, region)
+                && ascending.span(&region.mask).is_err()
         })
         .expect("some seated window is not an interval of the ascending order");
-    assert_eq!(fallback::bound(&compiled, &seated.mask), 1);
+    assert_eq!(fallback::bound(&compiled, model_ir::RowAxis::Tokens, &seated.mask), 1);
 
     let refusal = Windows::of(
         &plan,
         &compiled,
-        &ascending,
-        &WindowTable::default(),
+        model_ir::PerAxis::new([&ascending, &WindowTable::default()]),
         &indptr(&vec![1; count]),
         engine_cuda::window::Copies::off(),
         test_slots(),

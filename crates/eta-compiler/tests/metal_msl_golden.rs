@@ -101,11 +101,21 @@ fn embedded_runtime_matches_the_oracle() {
         inputs.hint()
     );
 
+    // **THE GROUPED PREAMBLE DOES NOT GO THROUGH THAT DOOR, AND THE REASON IS
+    // WHO OWNS THE BYTES.** `OracleInputs` stands in for device text the
+    // KERNEL side owns and the compiler has no say in; the lane table is the
+    // opposite of that. `codegen::layout` is its single declaration,
+    // `ptir_m1_grouped.metal` is a replica the layout module prints and
+    // `preamble::tests::file_matches_emitted_text` holds to it, and every
+    // grouped kernel in this directory carries the struct text in full. So a
+    // field added to the record is an EMITTER change — the header line moves
+    // with the bodies and both are justified in the same re-bless, rather
+    // than being substituted away where nobody would read the diff.
     let grouped = grouped_preamble();
     assert_eq!(
         (grouped.len(), eta_ir::fnv1a64(grouped.as_bytes())),
         field("# @grouped:"),
-        "the grouped preamble has drifted from the C++ emitter"
+        "the grouped preamble has drifted from what the header records"
     );
 }
 

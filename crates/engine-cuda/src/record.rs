@@ -47,10 +47,24 @@
 //!
 //!   What this collects is the whole of what tier 1 refused for a reason of
 //!   SHAPE. A composition is refused admission today only when a `BodyKey`
-//!   cannot name it at all (a multi-unit artifact, whose two row axes are two
-//!   buckets — `CompiledModel::fold_refused`), when the load's own gates say
-//!   no fire records (`[engine] pad` off, rotating weights, buffered RS
-//!   moves), or when the WIDENING leaves nothing captured ([`Uncut::Eager`]).
+//!   cannot name it at all — an artifact with more capture units than the key
+//!   has coordinates, which is none the compiler can bake, since the key
+//!   names a lattice point PER UNIT ([`AxisKey`]) and `model_ir::RowAxis` has
+//!   two variants — when the load's own gates say no fire records
+//!   (`[engine] pad` off, rotating weights, buffered RS moves, or a fire whose
+//!   copy answer is not the one its key's segmentation was derived under —
+//!   [`BodyTally::eager_copy_world`]), or when the WIDENING leaves nothing
+//!   captured ([`Uncut::Eager`]).
+//!
+//!   **AND THE MULTI-UNIT REFUSAL IS GONE FROM THIS LIST, WHICH IS THE
+//!   MULTI-UNIT BODIES WAVE.** It read "a multi-unit artifact, whose two row
+//!   axes are two buckets — `CompiledModel::fold_refused`", and it was a
+//!   reading of the FOLD's refusal rather than of this path's: the fold arms
+//!   one graph per bucket per key and truly cannot hold two, while a body has
+//!   been `Vec<GraphExec>` since it was written and [`Cut`] has carried its
+//!   unit since tier 2. The key was the only thing in the way, and it names
+//!   both units now. `CompiledModel::fold_refused` is untouched and still
+//!   says exactly what it always said, about the fold.
 //!   That last one is what a structural refusal became: a boundary a graph
 //!   cannot be cut at — inside a fork group, between two arms of a
 //!   conditional, across a schedule from its readers — GROWS the island until
@@ -60,9 +74,9 @@
 //! * **Tier 3 — the eager walk, and a counter.** Everything neither tier
 //!   covers walks. That is not a fallback that got left in: it is the answer,
 //!   and the discipline is that it is never silent
-//!   ([`BodyStats::sealed_declines`], [`BodyStats::refusals`],
-//!   [`BodyStats::declines`], [`BodyStats::eager_rotating`],
-//!   [`BodyStats::eager_buffered`]).
+//!   ([`BodyTally::sealed_declines`], [`BodyTally::refusals`],
+//!   [`BodyTally::declines`], [`BodyTally::eager_rotating`],
+//!   [`BodyTally::eager_buffered`], [`BodyTally::eager_copy_world`]).
 //!
 //! # Why a miss walks TWICE, and why that is not a waste
 //!
@@ -204,7 +218,7 @@
 //! is an ISLAND: the body holds everything around it and re-issues it eagerly
 //! between the execs, so what the limit costs is that stretch's launch
 //! overhead and P6's overlap across its span, rather than the whole fire's
-//! replay. [`BodyStats::islands`] is where an operator reads how much of a
+//! replay. [`LastCapture::islands`] is where an operator reads how much of a
 //! body that is, and the discipline it is read under is SEAT-FIRST,
 //! SEGMENT-SECOND: a region that can be put on `crate::SHIFTED` should be, and
 //! a body carrying more than a couple of islands per layer is saying the op
@@ -220,7 +234,7 @@ use model_ir::Trace;
 
 use crate::device::graph::{Graph, GraphExec};
 use crate::error::Result;
-use crate::run::Run;
+use crate::run::{Run, Standing};
 use crate::window::{Admit, At, Cursor, Lanes};
 
 /// Which fire of a key captures it: the fires before it are eager, and so is
@@ -309,6 +323,24 @@ pub struct Fire<'a> {
     /// Read by [`Graphs::fire_body`] and by nobody else. Empty is a plan with
     /// no decode arm at all, and then every class takes the bucket.
     pub decoding: &'a model_ir::ClassSet,
+    /// **DOES THIS ARTIFACT STATE A PATCH AXIS AT ALL?** —
+    /// `CompiledModel::order_for(RowAxis::Patches).is_some()`, read once at
+    /// load and carried in (the multi-unit bodies wave).
+    ///
+    /// **AN ARTIFACT FACT AND NOT A FIRE'S**, which is the whole reason it is
+    /// a word here rather than `descriptor.has_patches()`. A text lane on a
+    /// vision SKU carries no patch row and still belongs to the two-unit key
+    /// space — its [`BodyKey`] holds `Some(AxisKey)` with a bucket of zero,
+    /// the rung that launches no tower exec — because it is a composition of
+    /// an artifact that HAS the axis, and the body it reaches is a body of
+    /// that artifact. Keying it off the fire's patch rows instead would put a
+    /// text fire of a vision load and a text fire of a text load in one key
+    /// space, and those are two different templates.
+    ///
+    /// `false` is every text-only SKU, and then the key is byte-for-byte the
+    /// key this shell built before the axis existed — the G4 invariant, on
+    /// the one line that decides it.
+    pub towered: bool,
     /// **THE MOST LANES THIS LOAD CAN EVER SEAT AT ONCE** —
     /// `Shell::lane_ceiling`, which is `min(slots, max_lanes, max_tokens)`
     /// and a LOAD CONSTANT rather than a fire's number.
@@ -322,7 +354,7 @@ pub struct Fire<'a> {
     pub lane_ceiling: u32,
     /// **WHICH REGIONS MOVE THEIR OWN PLANE** — `Shell::shifted`, the same
     /// slice the `Run` beside this was handed
-    /// ([`Run::bodied`](crate::run::Run::bodied)), one entry per TEMPLATE
+    /// ([`run::Ceilings`](crate::run::Ceilings)), one entry per TEMPLATE
     /// region.
     ///
     /// Read by [`launch_grids`] and [`grew_past`] and by nothing else, and
@@ -336,7 +368,7 @@ pub struct Fire<'a> {
     /// **WHICH REGIONS THIS BODY HOLDS AND WHICH ONES IT RE-ISSUES** —
     /// `Windows::admits` as `Shell::prepare` computed it, one entry per
     /// TEMPLATE region, and the same slice the `Run` beside this was handed
-    /// ([`Run::bodied`](crate::run::Run::bodied)) (the tier-2 campaign).
+    /// ([`run::Ceilings`](crate::run::Ceilings)) (the tier-2 campaign).
     ///
     /// Read by three things here and each spends it for its own reason:
     /// [`cuts`], which turns it into the capture script; [`launch_grids`] and
@@ -354,8 +386,13 @@ pub struct Fire<'a> {
     /// (`crate::window::Windows::admits` carries the proof, clause by
     /// clause), the launch count of a captured region is a function of the
     /// composition, and the copy policy — the one input that is not in the
-    /// key — moves nothing on the captured side, because the regions it moves
-    /// are exactly the regions it makes islands of.
+    /// key — cannot part two fires of one key at all any more: a fire whose
+    /// copy answer is not the one its key's table was derived under is refused
+    /// a body at the gate and never reaches this struct
+    /// ([`BodyTally::eager_copy_world`], the capacity wave). The argument that
+    /// stood here — that the policy moves nothing on the captured side,
+    /// because the regions it moves are exactly the regions it makes islands
+    /// of — is true and is now a second reason rather than the only one.
     pub admits: &'a [Admit],
     /// **THE ROW CEILING THE LAUNCHES WERE ISSUED AT**, or `0` for a shell
     /// that quantized nothing.
@@ -379,6 +416,17 @@ pub struct Fire<'a> {
     /// shell hands the armed bucket whole and `0` is a value no fire produces:
     /// [`launch_grid`] keeps its test as a belt, not as a path.
     pub carve_bucket: u32,
+    /// **THE SECOND ROW AXIS'S CEILING, THE SAME WAY** — `Pad::bucket` of the
+    /// PATCH pair as `Shell::enqueue_on` armed it, or `0` for an artifact with
+    /// no patch axis and for a shell that quantized nothing (the multi-unit
+    /// bodies wave).
+    ///
+    /// [`launch_grid`] picks between this and
+    /// [`carve_bucket`](Fire::carve_bucket) by the region's own axis, which is
+    /// the same pick `run::Ceilings::pad_on` makes on the launch side — and it has to
+    /// be the same pick, because this ledger is what [`grew_past`] compares a
+    /// resident body's grids against every fire.
+    pub carve_patch_bucket: u32,
 }
 
 /// One load's graph cache: the bodies, and the policy around them.
@@ -389,8 +437,8 @@ pub struct Fire<'a> {
 /// campaign, as the arm a body was measured against. It is gone: a body is
 /// the shipping answer, its keys are enumerable, and the honest reply to a
 /// composition no body covers is the eager walk this fire already has plus a
-/// counter that says so ([`BodyStats::sealed_declines`],
-/// [`BodyStats::refusals`]).
+/// counter that says so ([`BodyTally::sealed_declines`],
+/// [`BodyTally::refusals`]).
 #[derive(Default)]
 pub struct Graphs {
     /// **PROBE SEAM (`palo cuda-abi` wave), off by default.** When set, a
@@ -426,12 +474,13 @@ pub struct Graphs {
     /// Per body key, how many fires have run eagerly — [`WARM_FIRES`], for the
     /// dense tuner's reason.
     body_warm: HashMap<BodyKey, u32>,
-    /// Keys no body will ever stand for — a multi-unit artifact, or a
-    /// composition whose islands, grown to their legal boundaries, left no
-    /// captured stretch ([`Uncut::Eager`]). Refused for the life of
+    /// Keys no body will ever stand for — an artifact with more capture
+    /// units than a [`BodyKey`] has coordinates for, or a composition whose
+    /// islands, grown to their legal boundaries, left no captured stretch
+    /// ([`Uncut::Eager`]). Refused for the life of
     /// the load: both are properties of the artifact and the composition, so a
     /// key that fails once fails always, and re-deciding would make
-    /// [`BodyStats::refusals`] count traffic instead of counting shapes.
+    /// [`BodyTally::refusals`] count traffic instead of counting shapes.
     bodies_refused: HashSet<BodyKey>,
     /// **IS THE MAP CLOSED?** — set once, by [`Graphs::seal_bodies`], at the
     /// end of `Shell::arm_bodies` and only when that pass actually armed
@@ -450,12 +499,22 @@ pub struct Graphs {
     ///
     /// So after arming, a miss is an answer rather than a stage:
     /// [`Graphs::fire_body`] keeps the fire's eager numbers and counts
-    /// [`BodyStats::sealed_declines`]. `false` — a load that armed nothing, or
+    /// [`BodyTally::sealed_declines`]. `false` — a load that armed nothing, or
     /// one whose `arm_bodies` never ran at all — is the behaviour every fire
     /// had before the arming wave, which is what keeps a shell that turns
     /// `bodies` on AFTER load able to capture.
     sealed: bool,
-    bstats: BodyStats,
+    /// **THE ACCUMULATOR, AND THE ONLY PART OF [`BodyStats`] THAT IS STORED**
+    /// — twelve monotonic totals ([`BodyTally`]).
+    bstats: BodyTally,
+    /// **THE LAST CAPTURE'S THREE MEASUREMENTS** ([`LastCapture`]), assigned
+    /// by [`Graphs::body_captured`] rather than incremented.
+    ///
+    /// Its own field and not three more counters in `bstats`, because the
+    /// lifetime is the other one: a reader that subtracted two of these would
+    /// be subtracting two different bodies. The resident census has no field
+    /// at all — [`Graphs::body_stats`] folds the map for it.
+    last_capture: LastCapture,
 }
 
 impl Graphs {
@@ -487,8 +546,8 @@ impl Graphs {
     }
 
     /// **ONE MORE FIRE THAT WALKED EAGERLY WITHOUT REACHING THIS CACHE**, and
-    /// the mode said record — [`BodyStats::eager_rotating`] and
-    /// [`BodyStats::eager_buffered`].
+    /// the mode said record — [`BodyTally::eager_rotating`] and
+    /// [`BodyTally::eager_buffered`].
     ///
     /// The router's counter, not the cache's, and it is a `&mut self` method
     /// here rather than a field on the shell for the reason
@@ -502,7 +561,7 @@ impl Graphs {
     /// records nothing is not a warning, it is the deployment's choice, and a
     /// counter that moved under `Graphs::Off` would be measuring the knob
     /// rather than the anomaly. A fire with both clauses true is counted in
-    /// both, which is [`BodyStats::eager_buffered`]'s stated rule.
+    /// both, which is [`BodyTally::eager_buffered`]'s stated rule.
     ///
     /// **AND IT IS THE ONE THING IN THIS FILE THAT COUNTS A FIRE IT NEVER
     /// SAW**, which is why it is worth a name. Every other number in
@@ -518,6 +577,20 @@ impl Graphs {
         if buffered {
             self.bstats.eager_buffered += 1;
         }
+    }
+
+    /// **AND THE THIRD DISQUALIFIER: A FIRE WHOSE COPY WORLD IS NOT ITS
+    /// KEY'S** — [`BodyTally::eager_copy_world`], counted by `Shell::segmentation`
+    /// from the one line that can see both words (the capacity wave).
+    ///
+    /// [`eager_walk`](Graphs::eager_walk)'s doctrine exactly, and it is here
+    /// beside it for the same reason: the verdict is reached ABOVE this cache
+    /// — in the shell's gate — and "how many fires ran outside every graph"
+    /// is one question. Separate from `eager_walk` only because the two are
+    /// asked at different instants: those two are the router's, before a key
+    /// exists, and this one needs the key to have been composed.
+    pub fn eager_copy_world(&mut self) {
+        self.bstats.eager_copy_world += 1;
     }
 
     /// **PROBE SEAM (`palo cuda-abi` wave).** Ask captures to keep their
@@ -625,8 +698,8 @@ pub struct Cut {
 /// FIREABLE — the eager walk serves it exactly as it always did — and says
 /// only that no part of it reached a graph. `Shell::prepare` reads it as the
 /// third reason a key is refused admission ([`Graphs::body_refuse`]), beside
-/// the multi-unit refusal and the load gates, so the fire walks and the
-/// composition is counted once ([`BodyStats::refusals`]). Raising a `Fault`
+/// the unit-count belt and the load gates, so the fire walks and the
+/// composition is counted once ([`BodyTally::refusals`]). Raising a `Fault`
 /// here would fail a fire over a cache.
 ///
 /// **AND THREE OF THE FOUR ARE BELTS NOW RATHER THAN VERDICTS** — which is
@@ -730,6 +803,49 @@ pub enum Uncut {
     /// mask that admit differently are two launches, one gridded at the key's
     /// ceiling inside a graph and one gridded live in an island, which are the
     /// two readings this engine already ships side by side.
+    ///
+    /// # Why it does not narrow again, which was asked and answered
+    ///
+    /// The obvious next cut is that a PREPARE region never enters a captured
+    /// graph — which is TRUE, and is not the premise it looks like. Every
+    /// capture in this file walks `Phases::Capture` ([`walk_capture_cut`]), a
+    /// cut holding only prepare regions records an empty graph and is dropped
+    /// rather than instantiated, and the phase order is a prefix
+    /// (`model_exec::fire::walk` faults a prepare region behind a capture
+    /// one). So a prepare region's admission decides nothing about GRAPH
+    /// CONTENT and nothing about where the captured stretches fall.
+    ///
+    /// It decides two other things, and both are why the builder cannot leave
+    /// this weld:
+    ///
+    /// * **the carve.** `Run::planning` takes its ceiling from `run::Standing`
+    ///   read at the BUILDER's own region, so a builder outside the weld could
+    ///   carve at the key's rows while its readers were gridded live, or the
+    ///   reverse. That is this variant's whole sentence and it is unmoved;
+    /// * **the hash.** `Run::schedule_shape` skips a plan slot whose
+    ///   `struct_region` — the region that BUILT it — is an island, and
+    ///   `Body::shape` is what demotes a body whose payloads moved. Sound only
+    ///   if no captured launch reads a skipped slot, which is exactly "builder
+    ///   island implies readers island", which is exactly this weld.
+    ///
+    /// **AND THE FAMILY IS ALREADY THE SMALLEST SET THE INPUTS CAN NAME.**
+    /// What the hazard binds is the builder and its READERS; what this weld
+    /// holds is the builder and every region of its mask, which is a superset
+    /// whenever some same-mask region reads no schedule. Narrowing to the true
+    /// reader set means asking which region holds a node consuming the value
+    /// the builder defined — and [`welds`] is handed a `CompiledModel`, whose
+    /// regions carry a node RANGE and no node. The trace is what answers it
+    /// (`model_exec::store::check::no_schedule_straddles_its_readers` is that
+    /// question asked at load, and is the guard that makes readers a SUBSET of
+    /// the mask family in the first place), and plumbing a `Trace` into the
+    /// widening would buy a narrowing no SKU in this tree can exercise: the
+    /// admissions inside one mask family can differ only through
+    /// `exports::regions_shifting`, since every other clause of
+    /// `crate::window::Windows::admits` reads the window, and two regions of
+    /// one mask resolve to one window. So the flood is inert on every catalog
+    /// bake measured so far, and the honest thing is to say the rule is the
+    /// minimum its inputs support rather than to widen the inputs on
+    /// speculation.
     Plan {
         /// The region whose admission disagrees with an earlier region of the
         /// same planned mask.
@@ -779,7 +895,7 @@ impl core::fmt::Display for Uncut {
 ///
 /// **WHY THAT DIRECTION IS FREE, WHICH IS THE WHOLE ARGUMENT.** An island is
 /// re-issued by the eager walk at the fire's own live geometry
-/// (`Run::captured` stands every ceiling, seat and plane base down inside
+/// (`run::Held::Eager` stands every ceiling, seat and plane base down inside
 /// one), which is byte for byte the launch the `Graphs::Off` path makes. So a
 /// region moved to the island side is a region served exactly as a shell with
 /// no bodies at all serves it: the cost is host launches and the correctness
@@ -820,7 +936,7 @@ impl core::fmt::Display for Uncut {
 ///
 /// **AND THE DEPLOYMENT'S BILL IS THE THING TO WATCH, NOT THE CORRECTNESS.**
 /// A widening that swallows a layer is a body whose replay is buying less
-/// than a graph can buy, which is exactly what `BodyStats::islands` and the
+/// than a graph can buy, which is exactly what `LastCapture::islands` and the
 /// boot line's `segmented` count are for. The discipline this campaign was
 /// handed is seat-first, segment-second: more than a couple of islands per
 /// layer is a `crate::SHIFTED` or a seat problem being reported by the
@@ -926,20 +1042,45 @@ fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
     // no schedule for a boundary to straddle, and welding those would put
     // every trunk region of every layer in one weld with the join region of
     // every fork group (`Uncut::Plan` argues the contagion).
-    let mut planned: Vec<&model_ir::ClassSet> = Vec::new();
-    for region in template
+    //
+    // **AND THE FAMILY IS EVERY REGION OF THE MASK AND NOT EVERY READER**,
+    // which is wider than the hazard by exactly the same-mask regions that
+    // read no schedule — and is the smallest set this function's inputs can
+    // name, because a `CompiledModel` region carries a node RANGE and no node.
+    // `Uncut::Plan` works the whole derivation, including why the PREPARE
+    // member cannot be dropped from the weld even though its launches never
+    // enter a graph.
+    //
+    // **AND THE FAMILY IS PER UNIT, WHICH IS THE MULTI-UNIT WAVE'S ONE LINE
+    // HERE.** A mask is a set of CLASSES and both seriations run over the
+    // same classes, so a trunk region and a tower region of a two-unit
+    // artifact can carry byte-identical masks while describing rows of two
+    // different rectangles. Welding them would tie the tower's admission to
+    // the trunk's — one island in the trunk would flood every tower region of
+    // the same mask, and vice versa — for a schedule neither of them can
+    // possibly share: a plan builder builds into ITS unit's window table, and
+    // a launch on the other axis reads a different one. So the family is
+    // `(mask, unit)`, which is what the hazard actually is, and on a one-unit
+    // artifact every unit is zero and this is the set it always was.
+    let mut planned: Vec<(&model_ir::ClassSet, u32)> = Vec::new();
+    for (at, region) in template
         .iter()
-        .filter(|region| region.phase == model_compiler::Phase::Prepare)
+        .enumerate()
+        .filter(|(_, region)| region.phase == model_compiler::Phase::Prepare)
     {
-        if !planned.iter().any(|mask| **mask == region.mask) {
-            planned.push(&region.mask);
+        let unit = compiled.unit_of(at);
+        if !planned
+            .iter()
+            .any(|(mask, held)| **mask == region.mask && *held == unit)
+        {
+            planned.push((&region.mask, unit));
         }
     }
-    for mask in planned {
+    for (mask, unit) in planned {
         let family: Vec<u32> = template
             .iter()
             .enumerate()
-            .filter(|(_, region)| region.mask == *mask)
+            .filter(|(at, region)| region.mask == *mask && compiled.unit_of(*at) == unit)
             .map(|(at, _)| at as u32)
             .collect();
         if family.len() > 1 {
@@ -965,14 +1106,14 @@ fn welds(compiled: &CompiledModel) -> Vec<Vec<u32>> {
 /// [`Graphs::fire_body`] asks it for the CAPTURE LOOP and for the assert on
 /// every hit. Both hand the same admissibility table off the same window
 /// table, so a second reading is impossible by construction — which is the
-/// same discipline [`BodyKey::of`] is under. `Shell::segments` memoizes the
+/// same discipline [`BodyKey::of_axes`] is under. `Shell::segments` memoizes the
 /// verdict per key on the `prepare` side, which is sound for the reason this
 /// derivation is worth freezing at all: it reads the template and that table
 /// and nothing else.
 ///
 /// **AND THE TABLE IT IS HANDED IS ALREADY WIDENED, WHICH IS WHY THE
 /// WIDENING IS CALLED AGAIN HERE.** `Shell::segmentation` widens once per
-/// key and hands the SAME slice to the `Run` (`Run::captured`), to
+/// key and hands the SAME slice to the `Run` (`run::Ceilings::admits`), to
 /// [`Fire::admits`] and to this function, because a table only one of the
 /// three read would be a region a graph holds and a walk re-issues. Widening
 /// is idempotent — it turns `Captured` into `Island` and asks its rules
@@ -1084,37 +1225,66 @@ pub fn cuts(compiled: &CompiledModel, admits: &[Admit]) -> core::result::Result<
     Ok(cuts)
 }
 
-/// How many bodies one load keeps.
+/// **THE COUNT BELT.** How many bodies one load may keep, whatever it can
+/// afford.
 ///
-/// A bound, not a tuning: an exec holds device-side node parameters for a few
-/// hundred kernels, and an unbounded cache under a workload whose
-/// compositions wander is a slow leak with no error in it. Eviction is
-/// least-recently-launched and gated on settlement, with one clause that is
-/// this map's own: a body the LOAD armed is not a candidate at all
-/// ([`Body::pinned`], argued at [`Graphs::insert_body`]). It still spends a
-/// seat here; what it does not do is give the seat back under traffic that
-/// never asked for it.
+/// **IT IS NOT THE BOUND ANY MORE, AND THE WHOLE OF WHY IS THAT IT NEVER HAD
+/// AN ARGUMENT** (the capacity wave). What an arming pass spends is DEVICE
+/// MEMORY — an exec is device-side node parameters for a few hundred kernels
+/// — and every number this constant has held was a count somebody picked and
+/// then justified backwards. Thirty-two was "no catalog SKU presents
+/// thirty-two class sets", which was a claim about TRAFFIC and stopped being
+/// the thing that fills the map the moment the map was SEALED at boot.
+/// Sixty-four was "the same statement one doubling on", which is not a
+/// statement at all. And on the smoke SKU the four-kind enumeration wants two
+/// hundred and forty-eight keys and sixty-four of them fit, so the boot line
+/// had to tell an operator that a hundred and eighty-four compositions walk
+/// eagerly for the life of the load, with nothing to say about why that
+/// number and no knob to move it.
 ///
-/// **IT WAS THIRTY-TWO, AND THE ARGUMENT THAT SIZED IT WAS ABOUT TRAFFIC.**
-/// "One body per composition, so a load that fills this map is a load
-/// presenting thirty-two distinct class sets, which no catalog SKU can do" —
-/// true of TRAFFIC, and it stopped being the thing that fills the map the
-/// moment the map was SEALED at boot. What fills it now is the ENUMERATION
-/// (`Shell::arm_bodies`), and the tier-2 campaign gave that enumeration a
-/// fourth kind of present set: the FRAGMENTING ones, a class standing between
-/// two of a mask's own and the nearest of those two on either side of it,
-/// which are the only compositions a segmented body can exist for. Those are real keys a caller can present —
-/// a capturing lane beside a plain one is the catalog's own gate — and on a
-/// six-rung lattice each one costs six seats like every other present set.
-/// Thirty-two would have made the tier-2 arm push the largest buckets of the
-/// decode, prefill and mixed arms out of the map, which is trading a shape
-/// that replays whole for a shape that replays around an island.
+/// The bound is `[engine] bodies_mem` now — a byte budget the deployment
+/// states, spent against what each capture was MEASURED to take
+/// ([`Body::bytes`], `Shell::arm_bodies`). A card with room for three hundred
+/// bodies arms three hundred; a card that is mostly KV cache arms what is
+/// left; and either way the boot line reports bytes spent against bytes
+/// allowed, which is a sentence an operator can act on where "sixty-four
+/// seats" was not.
 ///
-/// Sixty-four is the same statement one doubling on: an exec is a few hundred
-/// nodes' worth of device-side parameters, and the boot line's truncation
-/// warning is what says when even this is not enough
-/// ([`BodyStats::sealed_declines`] is what it costs when it is not).
-pub const MAX_BODIES: usize = 64;
+/// # What the belt is still for
+///
+/// Three things a byte budget does not answer, all of them cheap to hold:
+///
+/// * **a load that cannot weigh anything.** [`crate::device::nodes::free_bytes`]
+///   answers `None` where there is no runtime to ask, or where the driver
+///   refuses the query; every body then costs zero and the budget never
+///   binds. This is the bound that load runs under, and it is the reason the
+///   belt is a constant rather than a debug assert.
+/// * **boot SECONDS, which memory does not price.** Each key costs
+///   [`WARM_FIRES`] executed walks, a capture and an instantiation. A bake
+///   whose class table enumerates thousands of keys would spend minutes
+///   arming a map that fits in memory comfortably, and an operator who never
+///   stated a budget did not ask for that either.
+/// * **and the map's own linear scans.** The eviction order is a `Vec`
+///   scanned per insert and the two censuses in [`Graphs::body_stats`] fold
+///   over every resident. Both are asked by an operator rather than by a
+///   fire, and both stay honest at a few hundred and stop being free at a few
+///   hundred thousand.
+///
+/// **SO THE NUMBER IS DELIBERATELY GENEROUS RATHER THAN TUNED**, which is what
+/// a belt is: five hundred and twelve is three doublings above the count that
+/// used to be the bound, comfortably past the two hundred and forty-eight the
+/// smoke SKU's enumeration wants, and far enough above any lattice a
+/// deployment realizes that a load which hits it has told the operator
+/// something real — the enumeration is a bake's phantom class table rather
+/// than a deployment's shapes. The boot line names which of the two stopped
+/// the pass ([`BodyTally::sealed_declines`] is what it costs either way).
+///
+/// Eviction is unchanged and is still least-recently-launched, gated on
+/// settlement, with the one clause that is this map's own: a body the LOAD
+/// armed is not a candidate at all ([`Body::pinned`], argued at
+/// [`Graphs::insert_body`]). It still spends a seat and its bytes; what it
+/// does not do is give either back under traffic that never asked for it.
+pub const MAX_BODIES: usize = 512;
 
 /// Which body a fire asks for: the lattice point and the COMPOSITION.
 ///
@@ -1192,19 +1362,31 @@ pub const MAX_BODIES: usize = 64;
 /// either half would break these ops silently.
 ///
 /// **SO WHAT IS LEFT TO REFUSE A KEY OUTRIGHT IS NOT A SHAPE AT ALL.** Three
-/// things are, and none of them is about a window: a MULTI-UNIT artifact,
-/// because a `BodyKey` names one bucket and two row axes are two
-/// (`CompiledModel::fold_refused`); the load's own gates, which say no fire
-/// records at all (`[engine] pad` off, rotating weights, a buffered RS move);
-/// and a composition the WIDENING left nothing captured in ([`Uncut::Eager`]).
+/// things are, and none of them is about a window: an artifact with more
+/// capture UNITS than this key has coordinates for — which is none the
+/// compiler can bake, because the key carries one pair per row axis
+/// ([`patch`](BodyKey::patch)) and `model_ir::RowAxis` has two variants, and
+/// the clause is a belt under the day a third row space is minted
+/// (`Shell::keyable_units`); the load's own gates, which say no fire records
+/// at all (`[engine] pad` off, rotating weights, a buffered RS move); and a
+/// composition the WIDENING left nothing captured in ([`Uncut::Eager`]).
+///
+/// **THAT FIRST ONE USED TO READ "A MULTI-UNIT ARTIFACT, BECAUSE A `BodyKey`
+/// NAMES ONE BUCKET", AND IT WAS TRUE OF A KEY WITH ONE LATTICE POINT IN
+/// IT.** The multi-unit bodies wave gave it two — the token pair and an
+/// [`AxisKey`] for the tower — so a fire that launches two execs is named by
+/// two named coordinates rather than refused for having them. The compiler's
+/// `CompiledModel::fold_refused` is untouched: it is the FOLD's refusal, the
+/// fold arms one graph per bucket per key, and this path has never been that
+/// shape.
 /// The third one used to be three structural refusals — a cut inside a fork
 /// group or a conditional bracket, or a plan builder landing on the far side
 /// of one from its readers — and every one of them is a rule for GROWING the
 /// island to the nearest legal boundary now ([`widen`]), so what is left to
 /// refuse is the composition that grew until nothing was left. All three are named
 /// by [`Graphs::body_refuse`], counted once per composition
-/// ([`BodyStats::refusals`]), and their fires WALK — producing their own
-/// numbers and counted again per fire ([`BodyStats::sealed_declines`]).
+/// ([`BodyTally::refusals`]), and their fires WALK — producing their own
+/// numbers and counted again per fire ([`BodyTally::sealed_declines`]).
 ///
 /// # And there is NO COPY AXIS here, which is a theorem of that rule
 ///
@@ -1214,10 +1396,10 @@ pub const MAX_BODIES: usize = 64;
 /// on the same argument. The argument does not survive the rule above being
 /// read carefully.
 ///
-/// **A COPY-FALLBACK REGION IS A GATHERED REGION**, and the gathered clause
-/// of `Windows::admits` is UNCONDITIONAL — it asks `gathered.is_none()` and
-/// `segs() == 0` of every window with rows, with no clause anywhere in it that
-/// reads the shell's policy. So the regions the two policies could record
+/// **A COPY-FALLBACK REGION IS A GATHERED REGION**, and the SHAPE clause of
+/// `Windows::admits` is UNCONDITIONAL — it asks `window::Window::is_interval`
+/// of every window with rows, and `window::WindowShape` refuses a gathered one
+/// with no clause anywhere in it that reads the shell's policy. So the regions the two policies could record
 /// differently are exactly the regions neither policy puts in a graph: under
 /// `copies` they are ISLANDS and under the split they are captured, and in
 /// both readings the CUTS are what moves rather than the key.
@@ -1233,18 +1415,52 @@ pub const MAX_BODIES: usize = 64;
 /// capture for a policy no fire mixes. A key axis that cannot distinguish two
 /// bodies a load can hold at once is not a distinction; it is weight.
 ///
-/// **WHICH LEAVES TWO WAYS THE POLICY CAN MOVE UNDER A RESIDENT BODY, AND
-/// BOTH ARE WRITTEN DOWN RATHER THAN GUARDED.** `Shell::set_copies` flips it
-/// between fires, which is a diagnostic A/B and is argued at its own door;
-/// and `window::Copies::enabled` is not the knob alone — a MASKED fire takes
-/// the split whatever the knob says, which `crate::window::Windows::admits`
-/// states as the one hole in its own key-function proof. In both cases the
-/// resident exec keeps the script it was cut with while the fire derives a
-/// different one, and in both cases [`Graphs::fire_body`]'s island
-/// `debug_assert` is the thing that says so by name. Neither is reachable on
-/// a catalog SKU today — no qwen text declares a masked axis, and a serving
-/// deployment states its copy policy at boot — which is why they are notes
-/// and not clauses.
+/// **WHICH LEFT TWO WAYS THE POLICY COULD MOVE UNDER A RESIDENT BODY, AND ONE
+/// OF THEM TURNED OUT NOT TO BE ONE** (the capacity wave). A MASKED fire takes
+/// the split whatever the knob says — but whether a fire is masked is decided
+/// by its present SET, because `Fault::MaskWord` refuses a lane whose mask and
+/// whose class disagree, so that half never separated two fires of one key
+/// (`crate::window::Windows::admits` derives it). What is real is
+/// `Shell::set_copies`, which flips the knob between fires as a diagnostic
+/// A/B: the resident exec then keeps the script it was cut with while the
+/// fire derives a different one, and a `debug_assert` is not a thing an
+/// operator's build runs.
+///
+/// So the copy answer stays OUT of this key and the difference is settled at
+/// the gate instead: `Shell::segments` memoizes each key's table with the
+/// copy word it was derived under, and a fire whose word disagrees is refused
+/// a body and walks ([`BodyTally::eager_copy_world`]). The key space does not
+/// double, the arming pass still seats one body per key, and the one thing
+/// that cannot happen is a body replaying a script cut in another world.
+/// `crate::window::Windows::admits` carries the argument, including why
+/// widening the key was the worse of the two answers.
+///
+/// # And a SECOND AXIS, which is what makes a multi-unit artifact keyable
+///
+/// **A `BodyKey` USED TO NAME ONE BUCKET, AND A MULTI-UNIT ARTIFACT HAS ONE
+/// PER UNIT** — the token rectangle's and the patch rectangle's — so a tower
+/// SKU was refused the body path outright and every vision fire walked, for
+/// the life of the load. That refusal is retired: [`patch`](BodyKey::patch)
+/// is the second unit's own coordinates, and the pair names a fire of a
+/// two-unit artifact exactly as the first pair alone names a fire of a
+/// one-unit one.
+///
+/// **AN `Option<AxisKey>` AND NOT A `Vec<AxisKey>`, WHICH IS THE G4
+/// INVARIANT SPELLED IN A TYPE.** The wave's oath is that a TEXT-ONLY LOAD IS
+/// BYTE-FOR-BYTE UNMOVED — the same keys, the same `Eq`, the same `Hash`, the
+/// same `Display` — and `None` is what says so: a `Vec` would put a length
+/// word in every text key's hash and a `[]` in every text key's name, and the
+/// two axes are not interchangeable anyway (their rung functions differ, see
+/// [`AxisKey`]). `None` is a key with no patch axis, `Some` is a key with
+/// one, and there is no third thing a `RowAxis` can be.
+///
+/// **AND `None` IS AN ARTIFACT FACT, NOT A FIRE'S.** An axis-empty fire of a
+/// TOWER artifact — a text lane on a vision SKU — still carries `Some`, with
+/// a patch bucket of zero and an empty ladder: it is a composition of the
+/// two-unit artifact that launches no tower exec (multimodal §1), and that is
+/// a different body from the one a fire with images reaches. What decides
+/// `None` is whether the plan states the axis at all
+/// (`CompiledModel::order_for(RowAxis::Patches)`), which is a load constant.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BodyKey {
     /// The lattice point (`Composition::bucket`).
@@ -1252,24 +1468,36 @@ pub struct BodyKey {
     /// Which classes this fire has rows in, and the ceiling each one is
     /// carved to — [`Ladder`], in the order the rows stand.
     pub classes: Ladder,
+    /// **THE SECOND CAPTURE UNIT'S OWN PAIR**, or `None` for an artifact with
+    /// no patch axis — which is every text-only SKU and therefore the G4
+    /// invariant's whole surface here.
+    pub patch: Option<AxisKey>,
 }
 
 impl BodyKey {
-    /// The key of one fire's class table at one lattice point.
+    /// The key of one fire's class table at one lattice point, on the token
+    /// axis alone — **A TEST DOOR, AND SAYING SO IS THE POINT.**
     ///
-    /// Reads the fire's whole class table and asks it the coarsest question
-    /// anything here asks: not how many rows each class has, and not which
-    /// rung those rows round up to either — only which classes have any
+    /// It reads the fire's whole class table and asks it the coarsest
+    /// question anything here asks: not how many rows each class has, and not
+    /// which rung those rows round up to either — only which classes have any
     /// rows at all, and in which order they stand. Every NUMBER in the key
     /// comes from the other three arguments ([`Ladder::rung`]), which are the
     /// lattice point and two load constants.
     ///
-    /// Two callers build one — the shell's `prepare`, which has to know
-    /// before it stages whether the seat is wanted, and [`Graphs::fire_body`],
-    /// which has to know which body to look up — and they hand the same
-    /// arguments off the same composition, one phase apart. That was always
-    /// the discipline; what makes it hold now is that there is nothing left
-    /// in the arguments for the two phases to have measured differently.
+    /// **NO PRODUCTION CALLER BUILDS ONE THIS WAY SINCE THE MULTI-UNIT BODIES
+    /// WAVE.** The shell's `prepare` writes the struct out with the patch pair
+    /// beside it, and [`Graphs::fire_body`] takes
+    /// [`of_axes`](BodyKey::of_axes); both hand the same arguments off the
+    /// same composition, one phase apart, which is the discipline the key has
+    /// always been under. What is left for this door is the G4 equality's
+    /// other half — `of(..) == of_axes(.., None)`, byte for byte, hash for
+    /// hash, name for name — which the tests below state in exactly those
+    /// terms and which is easier to read with both spellings in front of it
+    /// than with one of them inlined. So it is compiled under `cfg(test)`
+    /// rather than deleted or left standing as a second production entrance
+    /// that could drift from the one `prepare` writes.
+    #[cfg(test)]
     #[must_use]
     pub fn of(
         classes: &WindowTable,
@@ -1280,6 +1508,104 @@ impl BodyKey {
         BodyKey {
             bucket,
             classes: Ladder::of(classes, bucket, decoding, lane_ceiling),
+            patch: None,
+        }
+    }
+
+    /// The same key, told the fire's PATCH rectangle as well — the door a
+    /// two-unit artifact's shell takes.
+    ///
+    /// `patch` is `None` for an artifact whose plan states no patch axis, and
+    /// then this IS the token-axis key: the same bucket, the same ladder, the
+    /// same `None`, and therefore the same hash and the same name. That
+    /// equality is the G4 invariant and it is a theorem of this signature
+    /// rather than a thing to test for — though the tests below test it
+    /// anyway, because a theorem nobody checks is a comment.
+    #[must_use]
+    pub fn of_axes(
+        classes: &WindowTable,
+        bucket: u32,
+        decoding: &model_ir::ClassSet,
+        lane_ceiling: u32,
+        patch: Option<(&WindowTable, u32)>,
+    ) -> BodyKey {
+        BodyKey {
+            bucket,
+            classes: Ladder::of(classes, bucket, decoding, lane_ceiling),
+            patch: patch.map(|(classes, bucket)| AxisKey::of(classes, bucket)),
+        }
+    }
+}
+
+/// **ONE CAPTURE UNIT'S COORDINATES, FOR A UNIT THAT IS NOT THE FIRST** — the
+/// bucket its rows round up to and the ceiling each present class is carved
+/// to, which is exactly the pair a [`BodyKey`] already carried for the token
+/// rectangle.
+///
+/// **A SECOND STRUCT AND NOT TWO MORE FIELDS**, for the reason
+/// `model_exec::fire::Composition` keeps two `WindowTable`s rather than one
+/// widened one: the pair is a pair, and a `BodyKey` with `patch_bucket` and
+/// `patch_classes` spread flat beside `bucket` and `classes` is a struct in
+/// which "this artifact has no patch axis" has to be spelled as two
+/// coordinated zeroes. `Option<AxisKey>` spells it once.
+///
+/// # The rung, which is NOT [`Ladder::rung`]
+///
+/// **THE PATCH AXIS HAS NO DECODE NOTION, SO IT HAS NO SECOND RUNG
+/// FUNCTION.** The token ceiling asks whether a class is a DECODE class
+/// (`Shell::decoding`) and takes the load's seat ceiling when it is, because
+/// a decode lane is one row and the load cannot seat more lanes than it has
+/// seats. Nothing on the patch axis answers to that description: an IMAGE is
+/// this axis's lane and an image is many patch rows, there is no "one patch
+/// row per image" composition anybody calls a decode, and the ladder's own
+/// two ceilings are `PatchLadder::max_patches` and `PatchLadder::max_images`
+/// — a row bound and a lane bound, neither of which is a per-class kind.
+///
+/// So every present class of this axis is carved to the PATCH BUCKET, which
+/// is the token axis's PREFILL argument with no counterpart to split off: one
+/// image may carry every patch row the fire has, so the most patch rows a
+/// class of one key can put anywhere is the lattice point itself. The canon
+/// is [`Ladder::flat`], which [`AxisKey::of`] is the one caller of — every
+/// present class at the one number — and the number itself is
+/// `Composition::patch_bucket`, whose zero rung is where "an axis-empty fire
+/// launches no tower exec at all" is decided (`model_exec::fire::compose`'s
+/// `patch_bucket_of`). Rounding that zero up to the lattice floor would name
+/// a body for a unit that does not run, which is why the zero is taken one
+/// step earlier than the rung.
+///
+/// # And the ORDER is the patch seriation's
+///
+/// [`Ladder::of`] sorts by ascending `ClassWindow::row_offset` and the
+/// argument for it is that the order is a function of the present set alone.
+/// That argument holds one axis over verbatim — `compose_axes` filters the
+/// artifact's own PATCH `ClassOrder` by which classes have images — so this
+/// takes the same constructor over the patch table and the rungs are all the
+/// one number.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AxisKey {
+    /// The patch lattice point (`Composition::patch_bucket`), or `0` for a
+    /// fire of this artifact that carries no image — the rung that launches
+    /// no tower exec.
+    pub bucket: u32,
+    /// Which classes this fire has PATCH rows in, and the ceiling each is
+    /// carved to — all of them [`bucket`](AxisKey::bucket), which the header
+    /// argues is the only honest ceiling this axis has.
+    pub classes: Ladder,
+}
+
+impl AxisKey {
+    /// One fire's patch coordinates, off the patch window table and the patch
+    /// bucket.
+    ///
+    /// **THE RUNG IS THE BUCKET AND THE CONSTRUCTOR SAYS SO IN ONE PLACE** —
+    /// the discipline [`Ladder::rung`] is under, one axis over: the arming
+    /// pass and the fire path both reach this function, so a key armed at a
+    /// rung and a key fired at one cannot be two keys.
+    #[must_use]
+    pub fn of(classes: &WindowTable, bucket: u32) -> AxisKey {
+        AxisKey {
+            bucket,
+            classes: Ladder::flat(classes, bucket),
         }
     }
 }
@@ -1450,6 +1776,34 @@ impl Ladder {
         }
     }
 
+    /// **EVERY PRESENT CLASS AT ONE CEILING** — [`of`](Ladder::of)'s
+    /// arithmetic for an axis with no per-class kind to split on, which is the
+    /// PATCH axis and only the patch axis ([`AxisKey`] carries the argument).
+    ///
+    /// **THE TABLE STILL DECIDES THE PRESENT SET AND THE ORDER**, exactly as
+    /// it does over there, and `window.rows` is still read once as a
+    /// predicate and `window.row_offset` only to sort by. What is absent is
+    /// the call to [`rung`](Ladder::rung): there is no decode set on this axis
+    /// and no seat ceiling that means anything about images, so the ceiling is
+    /// the bucket for every class and the caller states it once.
+    #[must_use]
+    pub fn flat(classes: &WindowTable, rung: u32) -> Ladder {
+        let mut present: Vec<(u32, u32)> = classes
+            .as_slice()
+            .iter()
+            .enumerate()
+            .filter(|(_, window)| window.rows > 0)
+            .map(|(class, window)| (window.row_offset, class as u32))
+            .collect();
+        present.sort_unstable();
+        Ladder(
+            present
+                .into_iter()
+                .map(|(_, class)| (class, rung))
+                .collect(),
+        )
+    }
+
     /// The one-class ladder — `Shell::arm_bodies`'s form, where the
     /// composition is synthesized rather than composed and there is no fire's
     /// table to read a present set off.
@@ -1537,8 +1891,39 @@ impl Ladder {
 }
 
 impl core::fmt::Display for BodyKey {
+    /// **`b8[c0:8 c1:4]` FOR A TEXT KEY, AND `b8[c0:8]+p64[c0:64]` FOR A
+    /// TOWER ONE** — the first axis's name unchanged and the second's
+    /// appended behind a `+p`.
+    ///
+    /// **A TEXT-ONLY KEY'S NAME IS BYTE-FOR-BYTE WHAT IT WAS**, which is the
+    /// G4 invariant on the one surface an operator reads: a `None` patch
+    /// writes nothing at all, not an empty bracket and not a `+p0[]`. Every
+    /// boot line, every refusal sentence and every `debug_assert` message on
+    /// a text SKU says today what it said before the axis existed.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "b{}[", self.bucket)?;
+        let mut first = true;
+        for (class, rung) in self.classes.rungs() {
+            if !first {
+                f.write_str(" ")?;
+            }
+            first = false;
+            write!(f, "c{class}:{rung}")?;
+        }
+        f.write_str("]")?;
+        if let Some(patch) = &self.patch {
+            write!(f, "+{patch}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for AxisKey {
+    /// `p64[c0:64]` — the [`BodyKey`] spelling with a `p` where the `b` is,
+    /// so that a two-unit key reads as two lattice points rather than as one
+    /// long one.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "p{}[", self.bucket)?;
         let mut first = true;
         for (class, rung) in self.classes.rungs() {
             if !first {
@@ -1551,12 +1936,49 @@ impl core::fmt::Display for BodyKey {
     }
 }
 
-/// **THE LADDER BESIDE THE FIRE'S OWN CLASS TABLE** — the two readings
-/// `Run::planning` needs together to turn a window's span into the ceilings
-/// this key spells.
+/// **THE LADDERS BESIDE THE FIRE'S OWN CLASS TABLES, ONE PAIR PER ROW AXIS** —
+/// what `Run::planning` and [`launch_grid`] turn a window's span into the
+/// ceilings this key spells with.
 ///
-/// The ladder alone cannot do it: it says what each class's rung IS and not
-/// where each class's rows LIE, and a window arrives as a span
+/// **A REGION READS EXACTLY ONE ENTRY, AND ITS CAPTURE UNIT PICKS WHICH**
+/// ([`Carve::on`]). What one entry holds and why it takes three objects
+/// rather than two is [`AxisCarve`]'s header; what this type adds is the
+/// index, which is what used to be a `patch: Option<PatchCarve>` field and a
+/// two-arm match against it.
+#[derive(Clone, Copy)]
+pub struct Carve<'a> {
+    /// **ONE AXIS'S PAIR PER ROW SPACE**, or `None` on an axis this fire
+    /// carries no ladder for.
+    ///
+    /// **A REGION'S CARVE IS ITS UNIT'S CARVE, AND THE UNIT IS WHAT PICKS**
+    /// ([`Carve::on`]). Each entry is that axis's own class table beside that
+    /// axis's own ladder — a span and the table it is classified against have
+    /// to come out of the same seriation, and the ladder over that table has
+    /// to be the ladder of the same axis's key. Three objects that agree, or
+    /// three objects that quietly do not: handing a patch span to the token
+    /// prefix walk is not a wrong number, it is a walk over the wrong table,
+    /// which classifies the span against class windows that are about
+    /// different rows and answers a ceiling that means nothing.
+    ///
+    /// **`None` IS THE EAGER READING AND IS ALWAYS CORRECT**: no ceiling is
+    /// taken, the launch grids at its window's own live span, and the seat
+    /// retires nothing it did not already retire. The patch entry is `None`
+    /// for a fire of a one-unit artifact — a region that cannot exist — and
+    /// for every fire of a two-unit one off the bodies path.
+    ///
+    /// This was three fields and an `Option<PatchCarve>` beside them, which
+    /// is the mirrored pair wave B retires: the two entries hold the SAME
+    /// struct now, and the one place they differ is stated inside it
+    /// ([`AxisCarve::lane_ceiling`]) rather than by being two types.
+    pub per_axis: model_ir::PerAxis<Option<AxisCarve<'a>>>,
+}
+
+/// **ONE ROW AXIS'S HALF OF A [`Carve`]** — this fire's class table on that
+/// axis, beside the key's ladder over it, beside the lane ceiling the axis
+/// has one of.
+///
+/// The ladder alone cannot answer a ceiling: it says what each class's rung
+/// IS and not where each class's rows LIE, and a window arrives as a span
 /// (`row_offset`, `rows`) rather than as a class set. The table is what maps
 /// the one onto the other, and it is this fire's — which is exactly right,
 /// because the question is "which classes does this span cover", and the
@@ -1564,26 +1986,64 @@ impl core::fmt::Display for BodyKey {
 /// two masks resolve to the same span exactly when their present classes are
 /// the same set).
 #[derive(Clone, Copy)]
-pub struct Carve<'a> {
-    /// This fire's class table — `Composition::classes`.
+pub struct AxisCarve<'a> {
+    /// This fire's class table on this axis — `Composition::classes` on the
+    /// token axis, `Composition::patch_classes` on the patch one.
     pub classes: &'a WindowTable,
-    /// The key's ladder over it.
+    /// The key's ladder over it — [`BodyKey::classes`] on the token axis,
+    /// [`AxisKey::classes`] on the patch one.
     pub ladder: &'a Ladder,
-    /// **THE LOAD'S LANE CEILING** — `min(slots, Budget::max_lanes,
-    /// Budget::max_tokens)`, `Shell::lane_ceiling`'s one reading, which is
-    /// already an input to [`Ladder::rung`] and therefore already in the
-    /// [`BodyKey`].
+    /// **THE LOAD'S LANE CEILING, ON THE AXIS THAT HAS ONE** — `min(slots,
+    /// Budget::max_lanes, Budget::max_tokens)`, `Shell::lane_ceiling`'s one
+    /// reading, which is already an input to [`Ladder::rung`] and therefore
+    /// already in the [`BodyKey`].
     ///
-    /// Read by [`Carve::lanes`] and by nothing else. The ROW arithmetic
-    /// ([`Carve::ceiling`]) does not want it: a class of one key can put every
-    /// row of the bucket anywhere, and the seats say nothing about that. The
-    /// LANE arithmetic does, because a lane needs a seat — see
-    /// [`Ladder::lane_reach`] for why the loose reading cost a mixed key its
-    /// last class's ceiling.
-    pub lane_ceiling: u32,
+    /// Read by [`lanes`](AxisCarve::lanes) and by nothing else. The ROW
+    /// arithmetic ([`ceiling`](AxisCarve::ceiling)) does not want it: a class
+    /// of one key can put every row of the bucket anywhere, and the seats say
+    /// nothing about that. The LANE arithmetic does, because a lane needs a
+    /// seat — see [`Ladder::lane_reach`] for why the loose reading cost a
+    /// mixed key its last class's ceiling.
+    ///
+    /// **`None` ON THE PATCH AXIS, AND THAT IS A STATEMENT.** The token axis
+    /// carries one because a lane needs a SEAT and the load has a fixed
+    /// number of them, so a class's rung is a loose lane bound and
+    /// `min(rung, lane_ceiling)` is the tight one. The patch axis's lane is
+    /// an IMAGE, its bound is `PatchLadder::max_images`, and nothing on the
+    /// launch side of this shell carves an image count at a ceiling today —
+    /// the four launches that grid on requests are the chunked recurrent
+    /// scans, which are trunk ops on the token axis. So
+    /// [`lanes`](AxisCarve::lanes) answers `None` for a patch region rather
+    /// than carving one against a ceiling nothing staged (`Run::carve_lanes`
+    /// states the same thing from the launch's side), and the day a tower op
+    /// grids on images this is where its ceiling arrives.
+    ///
+    /// **AND THE ABSENCE IS WHAT RETIRES THE AXIS GATE ABOVE IT.**
+    /// `run::Standing::of` used to ask `axis == RowAxis::Tokens` before it
+    /// took the lane reading at all. It does not any more: the axis that has
+    /// no lane ceiling answers `None` from its own field, which is the same
+    /// verdict said by the object that knows it rather than by a caller
+    /// enumerating axes.
+    pub lane_ceiling: Option<u32>,
 }
 
-impl Carve<'_> {
+impl<'a> Carve<'a> {
+    /// **THIS CARVE READ ON ONE ROW AXIS** — the token pair for a TOKEN-unit
+    /// region, the patch pair for a PATCH-unit one, and `None` for a region
+    /// of an axis this fire has no ladder for.
+    ///
+    /// **AN INDEX, AND THE UNIT IS THE ONLY THING THAT PICKS.** It answers
+    /// the whole [`AxisCarve`] rather than a pair of references, which is
+    /// what keeps the table and the ladder together: a caller cannot hold the
+    /// patch ladder beside the token table, because there is no shape in this
+    /// file that lets it.
+    #[must_use]
+    pub fn on(&self, axis: model_ir::RowAxis) -> Option<AxisCarve<'a>> {
+        self.per_axis[axis]
+    }
+}
+
+impl AxisCarve<'_> {
     /// **THE CEILINGS THIS SPAN TAKES: HOW MANY ROWS STAND IN FRONT OF IT,
     /// AND HOW MANY IT MAY BE CARVED OVER** — the prefix sum of the rungs of
     /// the classes before it, and the sum of its own classes' rungs.
@@ -1607,7 +2067,7 @@ impl Carve<'_> {
     /// its `row_offset` is not a fire row at all) and the grouped one (a
     /// union with foreign rows in the gaps). Both are ISLANDS of the body
     /// rather than members of it (`Windows::admits`), so no ceiling is ever
-    /// asked for on their behalf: `Run::captured` is false there and
+    /// asked for on their behalf: `run::Standing` answers `Held::Eager` there and
     /// `launch_grid` skips them. Answering `None` rather than a number is the
     /// belt under that.
     #[must_use]
@@ -1617,7 +2077,7 @@ impl Carve<'_> {
 
     /// **THE SAME TWO NUMBERS READ AS LANES**: how many lanes may stand in
     /// front of this span, and how many it may be carved over — every rung
-    /// capped at [`Carve::lane_ceiling`] before the prefix sums are taken.
+    /// capped at [`AxisCarve::lane_ceiling`] before the prefix sums are taken.
     ///
     /// **THE CAP IS THE WHOLE DIFFERENCE, AND IT IS A TIGHTENING RATHER THAN A
     /// SECOND POLICY.** A rung bounds a class's ROWS; a lane needs a row AND a
@@ -1631,13 +2091,14 @@ impl Carve<'_> {
     /// Every consumer of the lane axis takes this one: `Run::carve_lanes`,
     /// `Run::planning`'s `Shape::num_requests`/`Shape::lane_offset`, and
     /// [`launch_grid`]'s lane column. The row axis takes
-    /// [`ceiling`](Carve::ceiling) and is untouched by it.
+    /// [`ceiling`](AxisCarve::ceiling) and is untouched by it.
     ///
-    /// `None` on the same spans [`ceiling`](Carve::ceiling) answers `None` for,
-    /// and for the same reason.
+    /// `None` on the same spans [`ceiling`](AxisCarve::ceiling) answers
+    /// `None` for — and, in front of all of them, `None` on an axis with no
+    /// lane ceiling at all, which is where the patch axis answers.
     #[must_use]
     pub fn lanes(&self, span: MaskSpan) -> Option<(u32, u32)> {
-        self.prefix(span, self.lane_ceiling)
+        self.prefix(span, self.lane_ceiling?)
     }
 
     /// The prefix walk both readings share, with each rung capped at `cap` —
@@ -1738,7 +2199,7 @@ struct Body {
     /// **CAPTURED, WHICH IS THE ONE WORD THE TIER-2 CAMPAIGN ADDED** — and it
     /// narrows the theorem below rather than weakening it. An ISLAND's
     /// launches are not in any graph: they are re-issued eagerly every fire,
-    /// gridded at that fire's own live span (`Run::captured` turns every
+    /// gridded at that fire's own live span (`run::Held::Eager` turns every
     /// ceiling off there), so there is nothing for a later fire to outgrow and
     /// nothing for this vector to describe. [`launch_grids`] skips them on the
     /// write and [`grew_past`] skips them on the read, symmetrically, because
@@ -1849,6 +2310,45 @@ struct Body {
     /// replays through the same three phases. The bit is read at exactly one
     /// line, and that line is the eviction scan.
     pinned: bool,
+    /// **WHAT THIS BODY'S EXECS TOOK OFF THE DEVICE**, in bytes, measured
+    /// where they were instantiated (the capacity wave).
+    ///
+    /// **THE ONLY HONEST BOUND ON AN ARMING PASS IS MEMORY, AND THIS IS THE
+    /// NUMBER THAT SAYS SO.** [`MAX_BODIES`] used to be the bound and it was a
+    /// count somebody chose: on the smoke SKU the four-kind enumeration wants
+    /// two hundred and forty-eight keys, sixty-four of them fit, and the boot
+    /// line's warning had to tell an operator that a hundred and eighty-four
+    /// compositions walk eagerly for the life of the load — with no sentence
+    /// about WHY sixty-four, because there was not one. A body's cost is not a
+    /// seat; it is device memory a load could otherwise page a KV cache into,
+    /// and a deployment that can afford three hundred bodies should arm three
+    /// hundred.
+    ///
+    /// **MEASURED AND NOT MODELLED**, which is this codebase's law and here it
+    /// is also the cheap answer: [`Graphs::fire_body`] brackets the
+    /// `Graph::instantiate` it was going to make anyway with
+    /// [`crate::device::nodes::free_bytes`], so weighing a body costs two
+    /// `cudaMemGetInfo` calls per exec and no extra instantiation. The
+    /// alternative — nodes times a per-node constant — needs a constant this
+    /// file would have to state for every SKU and every driver, which is the
+    /// guess the law forbids; and the probe that WOULD measure it directly
+    /// ([`crate::device::nodes::exec_footprint`]) instantiates copies nobody
+    /// launches, which a boot cannot pay per body.
+    ///
+    /// **A ZERO IS NOT A BUG.** The driver sub-allocates an exec out of a
+    /// reservation it may already hold, so one instantiation can read nothing
+    /// and the next can read a slab. The consumer is a running TOTAL
+    /// (`Shell::arm_bodies`), and the total is exact whatever the lumps do,
+    /// because the quantity being budgeted IS device free memory. A load with
+    /// no runtime to ask reads zero for every body and falls back on the count
+    /// belt, which is what [`MAX_BODIES`] is now for.
+    ///
+    /// It rides on the BODY rather than in a counter beside the map so that
+    /// the census can be a fold over the residents ([`BodyCensus::bytes`]):
+    /// eviction and replacement give the bytes back at the same line they give
+    /// the seat back, and there is no second ledger to disagree with the
+    /// first.
+    bytes: usize,
 }
 
 /// **ONE FIRE'S PER-LAUNCH GRIDS**, `(rows, lanes)` in the order
@@ -1903,77 +2403,87 @@ fn launch_grids(at: &Fire<'_>, carve: &Carve<'_>) -> Box<[(u32, u32)]> {
 /// [`launch_grids`]'s row, and the one arithmetic [`grew_past`] compares
 /// against.
 ///
-/// `Run::carve_rows` and `Run::carve_lanes` are the two answers this restates,
-/// clause for clause:
+/// **AND IT IS THE LAUNCH'S OWN ARITHMETIC, NOT A RESTATEMENT OF IT** — the
+/// two columns are `run::Standing::rows` and `run::Standing::lanes`, the same two
+/// functions `Run::carve_rows` and `Run::carve_lanes` are. This builder used
+/// to spell the clauses again from outside the walk, and a ledger whose
+/// arithmetic had to be kept in step with the launch's by hand is a ledger
+/// that describes launches nobody issued the day one of the two moves.
 ///
+/// What is still read HERE, because it is the ledger's own reading of a table
+/// and not a clause of the answer:
+///
+/// * **which axis this region counts** and therefore which total, which
+///   bucket and which ladder — a tower region's window counts PATCH rows, so
+///   a ledger that read the token numbers for it would describe a launch
+///   nobody issued and [`grew_past`] would compare against it every fire.
 /// * **no carve at all** for a fire that carries no armed bucket
-///   ([`Fire::carve_bucket`] zero) — which is now a belt rather than a path.
-///   The bodies route requires an armed pad (`Shell::prepare`'s gate), so
-///   every fire that reaches this builder carries a lattice point; the line
-///   stays because a ledger that described ceilings a launch never took would
-///   be worse than one that described live spans.
-/// * **a WHOLE-FIRE window takes the bucket.** `Run::whole_fire` is
-///   `row_offset == 0 && rows >= the fire's`, plus the two shape refusals a
-///   CAPTURED region cannot present anyway (a gathered or grouped window is
-///   `Admit::Island` and this builder is never called for one), and the fire's
-///   rows are the descriptor's.
-/// * **a WINDOWED one takes its own classes' rungs**, capped at the bucket —
-///   [`Carve::ceiling`]'s `own`, which is `Planning::rows` and `Run::cut`'s
-///   number both. It is reached only under `shifted[region]`, because that is
-///   `Run::plane_base`'s second clause and a region without it grids at its
-///   window's live rows however admissible the fire was.
-/// * **and the LANE axis moves only under `shifted[region]` too**, for the
-///   same reason and with `Run::carve_lanes`'s clamp: [`Carve::lanes`]'s
-///   `own` — the LANE reading of the rungs — less the prefix in front of this
-///   window, bounded by what step 4d actually staged. A window whose prefix
-///   consumed the staging takes its own lanes, which is what the launch does.
+///   ([`Fire::carve_bucket`] zero), or for a patch region of a fire with no
+///   patch ladder. The first is a belt rather than a path — the bodies route
+///   requires an armed pad (`Shell::prepare`'s gate) — and the second is the
+///   ONE clause the two readings do not share, argued at the line itself.
+/// * **whether the region moves its own base** — the shifting slice, which is
+///   `Admit::Captured`'s second arm and `Standing`'s `plane` clause. That the
+///   region is CAPTURED at all is the caller's: [`launch_grids`] and
+///   [`grew_past`] skip every island one line before this.
 ///
 /// The `max` against the live span at the end is the belt: a carve that could
-/// not dominate the fire is one `Run` declines to take, so the pair recorded
-/// here is never under the pair the launch used.
+/// not dominate the fire is one `Standing` declines to take, so the pair
+/// recorded here is never under the pair the launch used.
 fn launch_grid(at: &Fire<'_>, carve: &Carve<'_>, region: u32, run: u32) -> (u32, u32) {
-    let span = at.windows.at(region, run).span;
-    if at.carve_bucket == 0 {
+    let window = at.windows.at(region, run);
+    let span = window.span();
+    // **EVERY NUMBER BELOW IS THIS REGION'S OWN AXIS'S** (the multi-unit
+    // bodies wave), because `run::Standing` reads them off
+    // `run::Ceilings::pad_on` and `Carve::on` on the launch side. A tower
+    // region's window counts PATCH rows, so the total its span is judged
+    // against is the fire's patch rows, the bucket it may be gridded at is the
+    // patch lattice point, and the ladder it resolves through is the key's
+    // patch ladder. A ledger that read the token numbers for it would describe
+    // a launch nobody issued and `grew_past` would compare against it every
+    // fire.
+    let axis = at.windows.axis_of(region);
+    let totals = model_ir::PerAxis::new([at.descriptor.rows, at.descriptor.patch_rows]);
+    let buckets = model_ir::PerAxis::new([at.carve_bucket, at.carve_patch_bucket]);
+    let (total, bucket) = (totals[axis], buckets[axis]);
+    // A patch region of a fire with no patch pair takes no ceiling at all,
+    // which is the eager reading and is what `Carve::on` answers `None` for.
+    // Asked here rather than left to `Standing` because THIS is the one clause
+    // the two readings do not share: the launch side still grids a whole-fire
+    // patch region at its bucket, and a ledger that recorded a ceiling for a
+    // ladder it does not have would be describing a launch nobody issued.
+    if carve.on(axis).is_none() || bucket == 0 {
         return (span.rows, span.lanes);
     }
-    let window = at.windows.at(region, run);
-    // `Run::plane_base` and `Run::whole_fire`, restated: the shifting slice
-    // plus the two SHAPE refusals both predicates carry. A CAPTURED region
-    // cannot present a gathered or grouped window with rows in it —
-    // `Windows::admits` calls that an island and the caller skipped it one
-    // line earlier — but an EMPTY region may be either, and a ledger that read
-    // a ceiling for one would be describing a launch nobody issued.
-    let shape = window.gathered.is_none() && window.segs() == 0;
-    let moves = shape && at.shifted.get(region as usize).copied().unwrap_or(false);
-    let whole = shape && span.row_offset == 0 && span.rows >= at.descriptor.rows;
-    let ceiling = carve.ceiling(span);
-    let rows = if whole {
-        at.carve_bucket
-    } else if moves {
-        ceiling.map_or(span.rows, |(_, own)| own.min(at.carve_bucket))
-    } else {
-        span.rows
-    };
-    let lanes = if moves {
-        let staged = at
-            .windows
-            .qo_absolute()
-            .map_or(0, |bounds| bounds.rows.saturating_sub(1));
-        // **AND THE LANE COLUMN TAKES THE LANE READING OF THE LADDER**
-        // ([`Carve::lanes`]), which `Run::carve_lanes` takes beside it: a rung
-        // capped at the load's lane ceiling, because a lane needs a seat. The
-        // row column above keeps [`Carve::ceiling`]. Two readings of one
-        // ladder, and the ledger has to take the same one the launch did.
-        match carve.lanes(span).and_then(|(before, own)| {
-            let covered = staged.checked_sub(before)?;
-            Some(own.min(covered))
-        }) {
-            Some(lanes) => lanes,
-            None => span.lanes,
-        }
-    } else {
-        span.lanes
-    };
+    // **AND THE TWO COLUMNS COME OFF THE SAME RESOLUTION THE LAUNCH TOOK**
+    // (`run::Standing`), which is the whole of what this builder used to restate
+    // clause for clause: `Run::carve_rows` is `Standing::rows` and
+    // `Run::carve_lanes` is `Standing::lanes`, and the ledger now reads the same
+    // two functions instead of a second copy of their arithmetic that had to
+    // be kept in step by hand.
+    //
+    // **WHAT STAYS THE LEDGER'S OWN IS THE READING, NOT THE CLAUSE LIST** —
+    // this is taken AFTER the launch, from outside the walk, where the other
+    // two are the launch's and the host's. So the two `bool`s below are read
+    // here: `captured` is `true` because the caller skipped every island one
+    // line earlier (`Fire::island`), and `moves` is the shifting slice, which
+    // is `Windows::admits`'s second arm and `Standing`'s `plane` clause. A
+    // CAPTURED region cannot present a gathered or grouped window with rows in
+    // it, but an EMPTY region may be either, and `Standing` carries
+    // `Window::is_interval` for exactly that.
+    let standing = Standing::of(
+        window,
+        axis,
+        kernels_cuda::Pad { rows: total, bucket },
+        true,
+        at.shifted.get(region as usize).copied().unwrap_or(false),
+        Some(*carve),
+    );
+    // **AND THE `max` IS THE SAME BELT IT WAS**: a carve that could not
+    // dominate the fire is one `Standing` declines to take, and its `None` is
+    // this window's own span — the number the launch grids at when it declines.
+    let rows = standing.rows(span).unwrap_or(span.rows);
+    let lanes = standing.lanes(at.windows, span).unwrap_or(span.lanes);
     (rows.max(span.rows), lanes.max(span.lanes))
 }
 
@@ -2041,13 +2551,26 @@ fn grew_past(held: &[(u32, u32)], at: &Fire<'_>, carve: &Carve<'_>) -> bool {
     seen != held.len()
 }
 
-/// What this load's graph cache has done — **and, since the tier-2 campaign,
-/// the ONLY census it publishes.** A keyed cache's tally used to stand beside
-/// it, and the two had to be added up to answer "how many fires ran outside
-/// every graph"; there is one path and one struct now, and every way a fire
-/// can end up eager has a field here.
+/// **WHAT THIS CACHE HAS COUNTED, SINCE THE LOAD** — the accumulator
+/// [`Graphs`] holds, and one lifetime rule for twelve fields instead of twelve
+/// labels.
+///
+/// **EVERY FIELD HERE IS A MONOTONIC TOTAL.** It is incremented at the instant
+/// it names, by the one call that can see that instant, and it is never
+/// assigned, never re-derived and never reset — so two readings taken a minute
+/// apart differ by exactly what happened in that minute, and a reader may
+/// subtract them. That is the whole contract, and it is what the other two
+/// groups of [`BodyStats`] do NOT have: [`LastCapture`] is assigned and
+/// [`BodyCensus`] is recomputed, and a struct that carried all three
+/// lifetimes in one flat row made every reader work out which rule it was
+/// holding from the field's own prose.
+///
+/// **WHAT IS COUNTED IS A REASON AND SOMETIMES NOT A FIRE.** The three eager
+/// counters state their own rule where they are declared: a fire disqualified
+/// twice is counted twice, deliberately, so nothing here may be added up and
+/// called a count of fires.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BodyStats {
+pub struct BodyTally {
     /// Fires that replayed a body. **AT STEADY STATE THIS IS EVERY FIRE.**
     pub hits: u64,
     /// Fires whose key held no body yet — the warming ones and the capturing
@@ -2079,7 +2602,7 @@ pub struct BodyStats {
     /// reads the fire and should not.
     ///
     /// What it does NOT cover is a body that is too SHORT for the fire — that
-    /// is [`misses`](BodyStats::misses), the grids climbed, and
+    /// is [`misses`](BodyTally::misses), the grids climbed, and
     /// [`Body::grids`] argues why the ceilings do not silence it.
     pub reshapes: u64,
     /// Bodies captured and instantiated.
@@ -2102,14 +2625,22 @@ pub struct BodyStats {
     /// This counted the tier-1 limit — a present region that was gathered,
     /// grouped, or windowed with an op that does not read the seat's start —
     /// and every one of those is now an ISLAND inside a body that serves the
-    /// rest of its composition ([`Cut`], [`BodyStats::islands`]). What is left
-    /// here is the two refusals that are about the KEY rather than about a
+    /// rest of its composition ([`Cut`], [`LastCapture::islands`]). What is left
+    /// here is the one refusal that is about the KEY rather than about a
     /// launch, plus the one that is about the TEMPLATE:
     ///
-    /// * a MULTI-UNIT artifact (`CompiledModel::fold_refused`): a [`BodyKey`]
-    ///   names one bucket, a fire with two row axes has one per unit, and
-    ///   there is no single lattice point for the key to carry. A per-unit
-    ///   body is its own later wave;
+    /// * an artifact with more CAPTURE UNITS than a [`BodyKey`] has
+    ///   coordinates for. This read "a multi-unit artifact
+    ///   (`CompiledModel::fold_refused`): a `BodyKey` names one bucket, a fire
+    ///   with two row axes has one per unit, and there is no single lattice
+    ///   point for the key to carry" — and the multi-unit bodies wave gave the
+    ///   key a lattice point PER UNIT ([`AxisKey`]), which is what that
+    ///   sentence said was missing. So a tower artifact is named rather than
+    ///   refused, and what survives is the belt: the key carries the token
+    ///   unit and at most one other, `model_ir::RowAxis` has two variants, and
+    ///   so nothing the compiler can bake reaches this line today
+    ///   (`Shell::keyable_units`). A moving counter for THIS reason is a third
+    ///   row space having been minted;
     /// * a composition the WIDENING left no captured stretch in
     ///   ([`Uncut::Eager`]). A boundary that would fall inside a fork group or
     ///   between two arms of a conditional, or a plan builder that would land
@@ -2123,7 +2654,7 @@ pub struct BodyStats {
     /// axes, its fork groups, its conditional lowering — rather than about
     /// this wave's reach. Counted per COMPOSITION and not per fire; how often
     /// the traffic then asks for one is
-    /// [`sealed_declines`](BodyStats::sealed_declines).
+    /// [`sealed_declines`](BodyTally::sealed_declines).
     pub refusals: u64,
     /// Bodies dropped to stay under [`MAX_BODIES`].
     ///
@@ -2141,7 +2672,7 @@ pub struct BodyStats {
     pub evictions: u64,
     /// **BODIES CAPTURED BEFORE ANY FIRE ARRIVED** — the load-time arming's
     /// own tally ([`Shell::arm_bodies`](crate::Shell)), and a SUBSET of
-    /// [`captures`](BodyStats::captures) rather than a number beside it: an
+    /// [`captures`](BodyTally::captures) rather than a number beside it: an
     /// armed body is captured by the ordinary miss path, through the ordinary
     /// warm ladder, so the capture is already counted and this says how many
     /// of them nobody's traffic paid for.
@@ -2157,7 +2688,7 @@ pub struct BodyStats {
     /// between "every shape this deployment can assemble replays from its
     /// first fire" and "some of them never replay at all" — because past the
     /// seal an unarmed key does not warm toward a capture, it walks
-    /// ([`sealed_declines`](BodyStats::sealed_declines)).
+    /// ([`sealed_declines`](BodyTally::sealed_declines)).
     ///
     /// **AND IT IS ALSO THE PINNED COUNT.** The same call that moves this
     /// ([`Graphs::body_armed`]) is what marks the body exempt from
@@ -2170,8 +2701,8 @@ pub struct BodyStats {
     /// launches, arriving after [`Graphs::seal_bodies`] closed the map.
     ///
     /// Each one ran EAGERLY and was not recorded. That is
-    /// [`declines`](BodyStats::declines)'s shape and not
-    /// [`misses`](BodyStats::misses)'s: a miss is a fire warming toward its
+    /// [`declines`](BodyTally::declines)'s shape and not
+    /// [`misses`](BodyTally::misses)'s: a miss is a fire warming toward its
     /// own capture, and after the seal there is no capture to warm toward.
     ///
     /// **WHAT AN OPERATOR READS IT FOR IS THE GAP BETWEEN THE LATTICE AND THE
@@ -2211,7 +2742,7 @@ pub struct BodyStats {
     /// **AND THE OTHER DISQUALIFIER: A FIRE THAT MOVED BUFFERED RS BYTES**
     /// (design §6, "the default is the only RS shape that graph-replays").
     ///
-    /// [`eager_rotating`](BodyStats::eager_rotating)'s doctrine, on the clause
+    /// [`eager_rotating`](BodyTally::eager_rotating)'s doctrine, on the clause
     /// beside it — with one difference in what a reading MEANS. Rotation is a
     /// property of the LOAD, so a nonzero `eager_rotating` says every fire of
     /// this load walks eagerly and the boot line already said so. Buffered is
@@ -2228,30 +2759,71 @@ pub struct BodyStats {
     /// load. What no reader may do is add these two together and call the
     /// result a count of fires.
     pub eager_buffered: u64,
-    /// Nodes in the most recently captured body, summed across its execs — the
-    /// number decision #15's rebind cost would be multiplied by.
+    /// **AND THE THIRD: A FIRE THAT ASKED FOR A DIFFERENT CUT OF ITS OWN
+    /// KEY'S TEMPLATE** (the capacity wave, `Shell::segmentation`).
+    ///
+    /// **THE ONE INPUT TO THE ADMISSIBILITY RULE THAT IS NOT IN THE KEY.**
+    /// `window::Copies::enabled` is `[engine] fallback_copy` AND "did this
+    /// fire stage mask bits" — and the second half is a key function after
+    /// all, because `Fault::MaskWord` refuses any lane whose mask and whose
+    /// class disagree, so a present SET decides whether a fire is masked
+    /// (`crate::window::Windows::admits` derives it). What is left is the
+    /// KNOB, and `Shell::set_copies` moves it between fires. A key armed under
+    /// one policy and fired under the other derives a different [`Cut`] script
+    /// — the copying world calls a withdrawn region an island where the
+    /// splitting world calls it captured — and a resident body holds exactly
+    /// one script.
+    ///
+    /// **SO THE BODY SERVES ONLY THE WORLD IT WAS CAPTURED IN**, and this
+    /// counts the fires that were in the other one. They walk eagerly, which
+    /// is always correct and is what every declined fire has always done. The
+    /// alternative the shell used to take was to re-derive the table and hand
+    /// the fire a script the resident exec was not cut to — sound only as far
+    /// as a `debug_assert`, which is to say not at all in release.
+    ///
+    /// **AND WHICH WORLD A KEY IS IN IS THE ARMING SYNTHETIC'S CHOICE**, which
+    /// is what makes a nonzero reading here mean one specific thing: somebody
+    /// called `Shell::set_copies` after the load armed, on a deployment whose
+    /// lattice has a copy row. The move is to state the policy in the boot
+    /// document (`[engine] fallback_copy`) and restart, which puts every fire
+    /// in one world and gives the replays back.
+    ///
+    /// [`eager_rotating`](BodyTally::eager_rotating)'s counting rule: a REASON
+    /// and not a fire, so nothing may add these three together and call the
+    /// result a count of eager walks. Zero on any load that states its copy
+    /// policy once — which is every serving deployment — so it is worth
+    /// printing rather than worth watching.
+    pub eager_copy_world: u64,
+}
+
+/// **THE MOST RECENTLY CAPTURED BODY, MEASURED** — how big its graph is, how
+/// much of it overlaps, and how much of the composition is not in it at all.
+///
+/// **ASSIGNED, NOT ACCUMULATED, AND THAT IS THIS GROUP'S WHOLE LIFETIME
+/// RULE.** Each capture overwrites all three with its own numbers
+/// ([`Graphs::body_captured`]), so what stands here is one body's measurement
+/// and not a total over every body — subtracting two readings of these means
+/// nothing, where subtracting two readings of a [`BodyTally`] field is exactly
+/// what happened in between.
+///
+/// **AND "MOST RECENTLY CAPTURED" IS A SEALED LOAD'S LAST ARMING RUNG**, not
+/// a serving fire's: past [`Graphs::seal_bodies`] nothing captures, so these
+/// three settle at boot and stop moving. That is what makes them readable at
+/// all — a triple that followed the traffic would be a race.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LastCapture {
+    /// Nodes, summed across the body's execs — the number decision #15's
+    /// rebind cost would be multiplied by.
     pub nodes: usize,
-    /// EDGES in the most recently captured body, summed across its execs —
-    /// **the only observable a P6 fork has.** Capture lowers an event record
-    /// and the wait behind it into a dependency rather than into nodes, so a
-    /// forked graph and a sequential one hold the same nodes and a different
-    /// topology: a chain is `nodes - 1` edges and every fork/join pair adds
-    /// one.
-    ///
-    /// **AND "MOST RECENTLY CAPTURED" IS A SEALED LOAD'S LAST ARMING RUNG**,
-    /// not a serving fire's: past [`Graphs::seal_bodies`] nothing captures, so
-    /// these two settle at boot and stop moving. That is what makes them
-    /// readable at all — a pair that followed the traffic would be a race.
+    /// EDGES, summed across the body's execs — **the only observable a P6
+    /// fork has.** Capture lowers an event record and the wait behind it into
+    /// a dependency rather than into nodes, so a forked graph and a sequential
+    /// one hold the same nodes and a different topology: a chain is
+    /// `nodes - 1` edges and every fork/join pair adds one.
     pub edges: usize,
-    /// **ISLANDS IN THE MOST RECENTLY CAPTURED BODY** — how many stretches of
-    /// its template no graph holds, and the fire path re-issues eagerly
-    /// between the execs (the tier-2 campaign, [`Cut`], [`Step::Island`]).
-    ///
-    /// [`nodes`](BodyStats::nodes)' and [`edges`](BodyStats::edges)' contract
-    /// exactly: the body captured LAST, allocated rather than accumulated, and
-    /// on a sealed load a number that settles at boot and stops moving. It is
-    /// the third reading of the same capture — how big the graph is, how much
-    /// of it overlaps, and how much of the composition is not in it at all.
+    /// **ISLANDS** — how many stretches of the body's template no graph
+    /// holds, and the fire path re-issues eagerly between the execs (the
+    /// tier-2 campaign, [`Cut`], [`Step::Island`]).
     ///
     /// **ZERO IS TIER 1'S ANSWER AND IS STILL THE COMMON ONE.** Every
     /// composition a body could serve before this campaign cuts into one
@@ -2269,45 +2841,116 @@ pub struct BodyStats {
     /// layer says the op vocabulary has drifted off that list, which is a
     /// question for `crate::SHIFTED` and not for this file.
     pub islands: usize,
+}
+
+/// **WHAT STANDS IN THE MAP RIGHT NOW** — the resident bodies, counted,
+/// classified and weighed.
+///
+/// **COMPUTED AT EVERY READING AND STORED NOWHERE, WHICH IS THIS GROUP'S
+/// LIFETIME RULE.** [`Graphs::body_stats`] folds the map to build these three
+/// and the cache keeps no copy of them: `insert_body` replaces a key's body in
+/// place and the eviction order drops others, so a counter maintained at
+/// capture would drift the first time either happened. The map is the only
+/// honest reading of what stands now, and it is a scan of at most
+/// [`MAX_BODIES`] entries asked by an operator rather than by a fire.
+///
+/// These three used to sit in the accumulator beside the tallies, where they
+/// were permanently zero and were written over at the door by the fold below
+/// — which is a shape that reads as a bug until you find the `..` that hides
+/// it. They are a report type's fields now and the accumulator has no such
+/// fields at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BodyCensus {
     /// Bodies resident now.
     pub bodies: usize,
     /// **HOW MANY OF THEM ARE SEGMENTED** — resident bodies whose script holds
     /// at least one island, and therefore whose replay is not one submission
     /// (the tier-2 campaign).
     ///
-    /// [`bodies`](BodyStats::bodies)' contract and not
-    /// [`islands`](BodyStats::islands)': a CENSUS of what stands in the map
-    /// right now, computed by [`Graphs::body_stats`] rather than accumulated
-    /// by a capture. The boot line reads it to say how many of the keys this
-    /// load armed replay through an eager stretch — which is the one sentence
-    /// an operator needs in order to read a bodies load's launch count.
+    /// **NOT [`LastCapture::islands`], WHICH IS THE NEAREST NUMBER TO
+    /// MISREAD IT AS**: that one counts the stretches inside ONE body and this
+    /// counts the bodies that have any. The boot line reads this to say how
+    /// many of the keys this load armed replay through an eager stretch —
+    /// which is the one sentence an operator needs in order to read a bodies
+    /// load's launch count.
     pub segmented: usize,
+    /// **WHAT THE RESIDENT BODIES TOOK OFF THE DEVICE**, in bytes — the
+    /// census [`Body::bytes`] is summed into, and the number the arming pass
+    /// spends against `[engine] bodies_mem` (the capacity wave).
+    ///
+    /// What an operator reads here is the capacity question directly — "this
+    /// load is holding N MiB of graph execs" — and the boot line states it
+    /// beside the budget it was allowed.
+    ///
+    /// **AND A LOAD THAT CANNOT MEASURE READS ZERO**, which is honest rather
+    /// than missing: no runtime to ask means no body was weighed, and
+    /// [`MAX_BODIES`] is the bound that load ran under.
+    pub bytes: usize,
+}
+
+/// What this load's graph cache has done — **and, since the tier-2 campaign,
+/// the ONLY census it publishes.** A keyed cache's tally used to stand beside
+/// it, and the two had to be added up to answer "how many fires ran outside
+/// every graph"; there is one path and one report now, and every way a fire
+/// can end up eager has a field in it.
+///
+/// **THREE GROUPS, BECAUSE THERE ARE THREE LIFETIMES.** These eighteen numbers
+/// used to stand in one flat row and each field's prose had to say which rule
+/// it was under; the rule is the group's now and each field argues only what
+/// it MEANS. [`BodyTally`] accumulates for the life of the load,
+/// [`LastCapture`] is assigned by the last capture and stands still, and
+/// [`BodyCensus`] is refolded out of the map every time this is asked. Only
+/// the first is stored: this type is the REPORT [`Graphs::body_stats`]
+/// assembles, and the census does not exist until somebody asks for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BodyStats {
+    /// Everything counted since the load — see [`BodyTally`] for what a
+    /// reading of one of these means.
+    pub tally: BodyTally,
+    /// The last capture's three measurements — see [`LastCapture`].
+    pub last_capture: LastCapture,
+    /// The resident map, refolded for this reading — see [`BodyCensus`].
+    pub census: BodyCensus,
 }
 
 impl core::fmt::Display for BodyStats {
+    /// **THREE SEGMENTS, AND EVERY `name=value` TOKEN IS THE ONE IT ALWAYS
+    /// WAS.** Operators grep this line for single tokens — `hits=`,
+    /// `sealed_declines=`, `bytes=` — and boot-line consumers in the test
+    /// suite do the same, so the split into groups moved the PUNCTUATION
+    /// between them and not one character of any token. The labels say which
+    /// lifetime each run of tokens is under ([`BodyTally`], [`LastCapture`],
+    /// [`BodyCensus`]), which is the sentence a flat row of eighteen numbers
+    /// could not say at all.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let tally = &self.tally;
+        let last = &self.last_capture;
+        let census = &self.census;
         write!(
             f,
             "[body-stats] hits={} misses={} reshapes={} captures={} \
              declines={} refusals={} evictions={} armed_at_load={} \
              sealed_declines={} eager_rotating={} eager_buffered={} \
-             nodes={} edges={} islands={} bodies={} segmented={}",
-            self.hits,
-            self.misses,
-            self.reshapes,
-            self.captures,
-            self.declines,
-            self.refusals,
-            self.evictions,
-            self.armed_at_load,
-            self.sealed_declines,
-            self.eager_rotating,
-            self.eager_buffered,
-            self.nodes,
-            self.edges,
-            self.islands,
-            self.bodies,
-            self.segmented,
+             eager_copy_world={} | last-capture: nodes={} edges={} islands={} \
+             | resident: bodies={} segmented={} bytes={}",
+            tally.hits,
+            tally.misses,
+            tally.reshapes,
+            tally.captures,
+            tally.declines,
+            tally.refusals,
+            tally.evictions,
+            tally.armed_at_load,
+            tally.sealed_declines,
+            tally.eager_rotating,
+            tally.eager_buffered,
+            tally.eager_copy_world,
+            last.nodes,
+            last.edges,
+            last.islands,
+            census.bodies,
+            census.segmented,
+            census.bytes,
         )
     }
 }
@@ -2317,20 +2960,28 @@ impl Graphs {
     #[must_use]
     pub fn body_stats(&self) -> BodyStats {
         BodyStats {
-            bodies: self.bodies.len(),
-            // **A CENSUS, TAKEN HERE RATHER THAN COUNTED AT CAPTURE**
-            // ([`BodyStats::segmented`]). `insert_body` replaces a key's body
-            // in place and the eviction order drops others, so a counter
-            // maintained at capture would drift the first time either
+            // THE TWO STORED GROUPS, COPIED OUT AS THEY STAND.
+            tally: self.bstats,
+            last_capture: self.last_capture,
+            // **AND THE CENSUS, FOLDED HERE RATHER THAN COUNTED AT CAPTURE**
+            // ([`BodyCensus`] argues the whole rule). `insert_body` replaces a
+            // key's body in place and the eviction order drops others, so a
+            // counter maintained at capture would drift the first time either
             // happened; the map is the only honest reading of what stands
             // now, and it is a scan of at most [`MAX_BODIES`] entries asked
-            // by an operator rather than by a fire.
-            segmented: self
-                .bodies
-                .values()
-                .filter(|body| body.script.iter().any(|step| matches!(step, Step::Island(_))))
-                .count(),
-            ..self.bstats
+            // by an operator rather than by a fire. The same fold answers all
+            // three, so a body evicted or replaced gives its seat, its
+            // segmentation and its bytes back at once, without anybody having
+            // to remember to subtract them.
+            census: BodyCensus {
+                bodies: self.bodies.len(),
+                segmented: self
+                    .bodies
+                    .values()
+                    .filter(|body| body.script.iter().any(|step| matches!(step, Step::Island(_))))
+                    .count(),
+                bytes: self.bodies.values().map(|body| body.bytes).sum(),
+            },
         }
     }
 
@@ -2339,7 +2990,9 @@ impl Graphs {
     /// window table before a stream is touched.
     ///
     /// **AND SINCE THE TIER-2 CAMPAIGN THE REASONS ARE NOT SHAPES**
-    /// ([`BodyStats::refusals`] lists them): a multi-unit artifact, or a
+    /// ([`BodyTally::refusals`] lists them): an artifact with more capture
+    /// units than the key can name — which is none today, since the
+    /// multi-unit bodies wave gave the key an [`AxisKey`] per unit — or a
     /// composition the widening left nothing captured in ([`Uncut::Eager`]). A
     /// gathered window, a
     /// grouped one and a windowed one whose ops do not all read the seat's
@@ -2359,7 +3012,7 @@ impl Graphs {
 
     /// **ONE MORE BODY THE LOAD ARMED**, counted by the shell's arming loop
     /// once it has seen the key actually seated — see
-    /// [`BodyStats::armed_at_load`].
+    /// [`BodyTally::armed_at_load`].
     ///
     /// The capture itself went through [`Graphs::fire_body`] like every other
     /// one, so nothing here captures anything; this only says which of those
@@ -2460,23 +3113,50 @@ impl Graphs {
         )?;
         prepare.settle()?;
         let shape = run.schedule_shape();
-        let key = BodyKey::of(
-            &at.descriptor.classes,
+        // **THE KEY, ON EVERY AXIS THE ARTIFACT STATES** (the multi-unit
+        // bodies wave). The patch pair comes off the SAME descriptor the token
+        // pair does — `compose_axes` seriated both rectangles in one pass, so
+        // there is no second composition here to have measured something else
+        // — and `towered` is a load constant read off the bake rather than off
+        // this fire, which is what keeps a text lane of a vision SKU keying to
+        // the same `Some(AxisKey)` family as an image lane instead of
+        // collapsing into a text-only artifact's key space.
+        let key = BodyKey::of_axes(
+            at.descriptor.table(model_ir::RowAxis::Tokens),
             at.bucket,
             at.decoding,
             at.lane_ceiling,
+            at.towered.then_some((
+                at.descriptor.table(model_ir::RowAxis::Patches),
+                at.descriptor.patch_bucket,
+            )),
         );
         // **THE LADDER BESIDE THE FIRE'S OWN TABLE**, which is what turns a
         // window's span into the pair its launches were gridded at
         // ([`launch_grid`]). Built off the key that was just built rather
         // than off a second reading of the composition, because the ledger's
         // arithmetic and the lookup's have to be one arithmetic — the whole
-        // reason `Run` is handed this same pair (`Run::bodied`'s third word)
+        // reason `Run` is handed this same pair (`run::Ceilings::carve`)
         // instead of re-deriving it.
         let carve = Carve {
-            classes: &at.descriptor.classes,
-            ladder: &key.classes,
-            lane_ceiling: at.lane_ceiling,
+            // **AND THE SECOND UNIT'S PAIR OFF THE SAME KEY**, for the reason
+            // the token pair comes off it: the ledger's arithmetic and the
+            // lookup's are one arithmetic, and a patch-unit region's grid is
+            // read against the patch ladder the key just spelled. The array
+            // is filled in `RowAxis::ALL`'s order, which is the one fill site
+            // a third rectangle costs an element of.
+            per_axis: model_ir::PerAxis::new([
+                Some(AxisCarve {
+                    classes: at.descriptor.table(model_ir::RowAxis::Tokens),
+                    ladder: &key.classes,
+                    lane_ceiling: Some(at.lane_ceiling),
+                }),
+                key.patch.as_ref().map(|patch| AxisCarve {
+                    classes: at.descriptor.table(model_ir::RowAxis::Patches),
+                    ladder: &patch.classes,
+                    lane_ceiling: None,
+                }),
+            ]),
         };
 
         // 2. A hit is the whole fire path: one submission per unit, and the
@@ -2527,7 +3207,7 @@ impl Graphs {
         //    the three follows the split, which is what a bucket alone could
         //    never say.
         //
-        //    **WHICH MAKES [`BodyStats::reshapes`] AN ANOMALY COUNTER.** It
+        //    **WHICH MAKES [`BodyTally::reshapes`] AN ANOMALY COUNTER.** It
         //    was the thrash meter — a number that dominated the line whenever
         //    a load oscillated between two shapes inside one key, paying a
         //    capture and an instantiation per fire. At steady state it is now
@@ -2605,7 +3285,7 @@ impl Graphs {
             // the ones standing in an island — has written this fire's
             // schedule into its slot. What is left for the island is the
             // enqueue half, at this fire's own live geometry
-            // (`Run::captured` is `false` there, so no ceiling, no seat and no
+            // (`run::Standing` is `Held::Eager` there, so no ceiling, no seat and no
             // plane base), which is byte for byte the launch the eager path
             // would have made.
             //
@@ -2674,7 +3354,7 @@ impl Graphs {
         //
         // So the fire keeps the eager numbers it just produced and nothing is
         // recorded — counted where an operator can see it
-        // ([`BodyStats::sealed_declines`]) rather than hidden inside `misses`,
+        // ([`BodyTally::sealed_declines`]) rather than hidden inside `misses`,
         // which means "warming toward a capture" and this is not that.
         //
         // **AND THE ARMING PASS ITSELF RUNS IN FRONT OF THIS LINE**, which is
@@ -2691,7 +3371,7 @@ impl Graphs {
                 eprintln!(
                     "engine-cuda: the sealed map holds no body for {key} — \
                      this shape walks eagerly for the life of the load \
-                     (BodyStats::sealed_declines counts each such fire)"
+                     (BodyTally::sealed_declines counts each such fire)"
                 );
             }
             return Ok(());
@@ -2753,8 +3433,8 @@ impl Graphs {
         //    into another, a segmented one records each captured stretch into
         //    its own, and what an operator wants to know is how many nodes and
         //    edges the body it just captured holds and how many stretches of
-        //    it are NOT in a graph at all ([`BodyStats::nodes`],
-        //    [`BodyStats::edges`], [`BodyStats::islands`]).
+        //    it are NOT in a graph at all ([`LastCapture::nodes`],
+        //    [`LastCapture::edges`], [`LastCapture::islands`]).
         //
         //    **AND SINCE THE TIER-2 CAMPAIGN THE LOOP IS OVER CUTS AND NOT
         //    OVER UNITS** ([`Cut`], [`cuts`]). A capture unit is still a
@@ -2789,6 +3469,7 @@ impl Graphs {
         let mut nodes = 0;
         let mut edges = 0;
         let mut islands = 0usize;
+        let mut bytes = 0usize;
         for cut in script {
             if cut.island {
                 islands += 1;
@@ -2807,7 +3488,25 @@ impl Graphs {
             if graph.nodes() == 0 {
                 continue;
             }
+            // **AND THE ONE INSTANTIATION IS WEIGHED AS IT IS MADE**
+            // ([`Body::bytes`], the capacity wave). Two `cudaMemGetInfo` reads
+            // around the call this loop was making anyway, so the arming pass
+            // can spend a MEMORY budget rather than a seat count. The bracket
+            // is around the instantiate ALONE and not around the capture: a
+            // capture walk can grow a scratch slab, and a slab is shared by
+            // every body on the load, so charging one to whichever body
+            // happened to grow it would price the map by accident of order.
+            //
+            // A reading the device would not give (`None` — no runtime, or a
+            // driver that refused the query) charges nothing, which leaves the
+            // count belt as the only bound for that load. That is the safe
+            // direction for a query failure: the budget under-charges and
+            // [`MAX_BODIES`] still stops the pass.
+            let before = crate::device::nodes::free_bytes();
             let exec = graph.instantiate(at.stream)?;
+            if let (Some(before), Some(after)) = (before, crate::device::nodes::free_bytes()) {
+                bytes += before.saturating_sub(after);
+            }
             nodes += exec.nodes();
             edges += graph.edges();
             steps.push(Step::Exec(exec));
@@ -2815,14 +3514,19 @@ impl Graphs {
                 self.kept.push((key.clone(), graph));
             }
         }
-        self.bstats.nodes = nodes;
-        self.bstats.edges = edges;
-        self.bstats.islands = islands;
+        self.last_capture.nodes = nodes;
+        self.last_capture.edges = edges;
+        self.last_capture.islands = islands;
         let grids = launch_grids(at, &carve);
         let _ = self.insert_body(key, Body {
             script: steps.into_boxed_slice(),
             grids,
             shape,
+            // What the execs above actually took, summed across the body's
+            // stretches — the same census rule `nodes` and `edges` follow, and
+            // the number [`Graphs::insert_body`] hands to the map so
+            // `Shell::arm_bodies` can stop on it ([`Body::bytes`]).
+            bytes,
             launched_at: crate::settle::Airborne::NEVER,
             // **NOT PINNED FROM HERE, WHICH IS THE WHOLE OF WHERE THE BIT
             // COMES FROM.** This line is every capture there is — the load's
@@ -2834,7 +3538,7 @@ impl Graphs {
         });
         // A capture the map had no room for is not a capture at all: nothing
         // was cached, the next fire of this composition walks again, and
-        // [`BodyStats::evictions`] is where an operator reads that it
+        // [`BodyTally::evictions`] is where an operator reads that it
         // happened. The eager pass above is this fire's numbers either way,
         // which is why the refusal costs it nothing — and why there is nothing
         // for this function to hand back about it.
@@ -2888,7 +3592,7 @@ impl Graphs {
     /// enumerates the whole realizable lattice up to [`MAX_BODIES`] itself,
     /// and [`Graphs::sealed`] means traffic brings no compositions to this map
     /// at all — a key the boot did not arm is served eagerly and counted
-    /// ([`BodyStats::sealed_declines`]), never minted. A map that is all pin
+    /// ([`BodyTally::sealed_declines`]), never minted. A map that is all pin
     /// is therefore the INTENDED steady state of a sealed load rather than a
     /// corner, and the eviction order it leaves is empty because there is
     /// nothing left for it to order.
@@ -2913,7 +3617,7 @@ impl Graphs {
     /// says it happened.
     ///
     /// Answers whether the body was seated: `false` is the dead end above, and
-    /// [`BodyStats::evictions`] has already been moved, so nothing claims a
+    /// [`BodyTally::evictions`] has already been moved, so nothing claims a
     /// capture that is not in the map.
     fn insert_body(&mut self, key: BodyKey, body: Body) -> bool {
         // **A REPLACEMENT IS NOT AN INSERT.** This key already holds a body
@@ -3180,6 +3884,138 @@ mod tests {
         )
     }
 
+    // ── **G4: A TEXT-ONLY LOAD IS BYTE-FOR-BYTE UNMOVED** ───────────────
+    //
+    // The multi-unit bodies wave's oath, and the four surfaces it is made of.
+    // A `BodyKey` grew a field; the invariant is that a key with `patch: None`
+    // is the key that existed before the field did — same construction, same
+    // `Eq`, same `Hash`, same `Display` — so that every text SKU's map, boot
+    // line and refusal sentence say today what they said yesterday.
+    //
+    // Written as tests rather than as a comment because a byte-for-byte claim
+    // that nobody checks is a comment, and this one is checkable in full: the
+    // key is a value type with four observable surfaces and every one of them
+    // is asserted below.
+
+    /// **THE TEXT DOOR ANSWERS `None`, AND THE AXES DOOR ANSWERS THE SAME KEY
+    /// WHEN IT IS HANDED NO AXIS.** The two constructors are one arithmetic
+    /// and this is the line that says so — the property every text-only fire
+    /// of every deployment rides on, since `Shell::prepare` reaches the second
+    /// door unconditionally now and `Shell::towered` is what makes it the
+    /// first one.
+    #[test]
+    fn a_text_only_key_is_the_key_it_was_before_the_second_axis() {
+        let classes = table(&[(4, 4), (3, 3)]);
+        let door = BodyKey::of(&classes, 8, &prefill_only(), LANES);
+        let axes = BodyKey::of_axes(&classes, 8, &prefill_only(), LANES, None);
+        assert_eq!(door, axes, "the axes door moved a key it was handed no axis for");
+        assert_eq!(door.patch, None, "a text-only key named a patch axis");
+        // The hand-built form the shell's gate and the arming loop write, so
+        // that a literal and a constructor cannot part.
+        assert_eq!(
+            door,
+            BodyKey {
+                bucket: 8,
+                classes: Ladder::of(&classes, 8, &prefill_only(), LANES),
+                patch: None,
+            },
+        );
+    }
+
+    /// **AND ITS NAME IS UNCHANGED**, which is the surface an operator reads:
+    /// no empty bracket, no `+p0[]`, nothing at all where the second axis
+    /// would be.
+    #[test]
+    fn a_text_only_keys_name_gained_no_character() {
+        let key = BodyKey::of(&table(&[(4, 4), (3, 3)]), 8, &prefill_only(), LANES);
+        assert_eq!(key.to_string(), "b8[c0:8 c1:8]");
+        let decoding = model_ir::ClassSet::of([1usize]);
+        assert_eq!(
+            BodyKey::of(&table(&[(4, 4), (3, 3)]), 8, &decoding, LANES).to_string(),
+            "b8[c0:8 c1:4]",
+            "the decode rung's spelling moved",
+        );
+    }
+
+    /// **AND ITS HASH IS UNCHANGED**, which is the surface the map reads.
+    ///
+    /// A hash cannot be compared against a number this file can write down —
+    /// `DefaultHasher`'s output is not a stable contract — so what is asserted
+    /// is the property that actually matters: two text keys that were equal
+    /// hash equal, and a key with a patch axis does not collide into the text
+    /// key space. The first half would hold for any `Hash`; the second is what
+    /// says the new field is IN the hash, which is what keeps a tower key and
+    /// a text key of one bucket out of each other's map slot.
+    #[test]
+    fn a_patch_axis_is_in_the_hash_and_its_absence_is_the_text_key() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let of = |key: &BodyKey| {
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            hasher.finish()
+        };
+        let classes = table(&[(4, 4)]);
+        let text = BodyKey::of(&classes, 8, &prefill_only(), LANES);
+        let again = BodyKey::of(&classes, 8, &prefill_only(), LANES);
+        assert_eq!(of(&text), of(&again));
+        // An artifact with a patch axis whose fire carries no image: `Some`
+        // with a bucket of zero, which is a DIFFERENT key from a text-only
+        // artifact's and has to be, because the two are two templates.
+        let axis_empty =
+            BodyKey::of_axes(&classes, 8, &prefill_only(), LANES, Some((&table(&[]), 0)));
+        assert_ne!(text, axis_empty, "a tower load's text fire keyed as a text load's");
+        assert_ne!(of(&text), of(&axis_empty));
+        // And a fire that carries one: a different key again, which is the
+        // whole point of the second coordinate.
+        let towered =
+            BodyKey::of_axes(&classes, 8, &prefill_only(), LANES, Some((&table(&[(64, 1)]), 64)));
+        assert_ne!(axis_empty, towered);
+        assert_eq!(towered.to_string(), "b8[c0:8]+p64[c0:64]");
+    }
+
+    /// **AN `AxisKey` IS A VALUE, AND ITS `Eq` AND `Hash` ARE THE PAIR IT
+    /// CARRIES** — the second unit's half of the same discipline the first
+    /// half is under.
+    ///
+    /// Both coordinates are free and both are asserted: two patch tables with
+    /// the same present set at two rungs are two keys, and two rungs with the
+    /// same number over different present sets are two keys. Nothing else is
+    /// in it, which is what makes the patch key space a list a boot can walk.
+    #[test]
+    fn an_axis_key_is_its_bucket_and_its_present_set_and_nothing_else() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let of = |key: &AxisKey| {
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            hasher.finish()
+        };
+        // The rungs are the BUCKET and not the rows: two fires of one rung
+        // that split their patch rows differently reach one key, which is the
+        // patch axis's whole share of the key collapse.
+        let four_and_two = AxisKey::of(&table(&[(4, 1), (2, 1)]), 64);
+        let two_and_four = AxisKey::of(&table(&[(2, 1), (4, 1)]), 64);
+        assert_eq!(four_and_two, two_and_four);
+        assert_eq!(of(&four_and_two), of(&two_and_four));
+        assert_eq!(four_and_two.classes.rungs(), &[(0, 64), (1, 64)]);
+        // The rung is free.
+        assert_ne!(four_and_two, AxisKey::of(&table(&[(4, 1), (2, 1)]), 128));
+        // And so is the present set: a class with no images is not in it.
+        let first_only = AxisKey::of(&table(&[(6, 1), (0, 0)]), 64);
+        assert_ne!(four_and_two, first_only);
+        assert_eq!(first_only.classes.rungs(), &[(0, 64)]);
+        assert_eq!(first_only.to_string(), "p64[c0:64]");
+        // The axis-empty fire: no class has images, so the ladder is empty and
+        // the rung is zero — the key that launches no tower exec.
+        let empty = AxisKey::of(&table(&[(0, 0), (0, 0)]), 0);
+        assert_eq!(empty.classes.rungs(), &[] as &[(u32, u32)]);
+        assert_eq!(empty.to_string(), "p0[]");
+        assert_ne!(empty, first_only);
+    }
+
     #[test]
     fn an_empty_cache_holds_nothing_and_says_so() {
         let graphs = Graphs::new();
@@ -3266,6 +4102,7 @@ mod tests {
         let armed = BodyKey {
             bucket: 8,
             classes: Ladder::single(0, Ladder::rung(0, 8, &decoding, LANES)),
+            patch: None,
         };
         assert_eq!(armed, fired, "the armed key must be the fired key");
     }
@@ -3347,10 +4184,10 @@ mod tests {
         let decoding = model_ir::ClassSet::of([0usize]);
         let classes = table(&[(2, 2), (8, 2)]);
         let ladder = Ladder::of(&classes, 16, &decoding, LANES);
-        let carve = Carve {
+        let carve = AxisCarve {
             classes: &classes,
             ladder: &ladder,
-            lane_ceiling: LANES,
+            lane_ceiling: Some(LANES),
         };
         let span = |row_offset, rows| MaskSpan {
             row_offset,
@@ -3371,10 +4208,10 @@ mod tests {
         // the assertions above are for — and the split may now move by more
         // than a rung without moving them.
         let moved = table(&[(3, 3), (7, 2)]);
-        let carve = Carve {
+        let carve = AxisCarve {
             classes: &moved,
             ladder: &Ladder::of(&moved, 16, &decoding, LANES),
-            lane_ceiling: LANES,
+            lane_ceiling: Some(LANES),
         };
         assert_eq!(carve.ceiling(span(3, 7)), Some((4, 16)));
     }
@@ -3408,10 +4245,10 @@ mod tests {
             "and four lanes of each, because a lane needs a seat",
         );
 
-        let carve = Carve {
+        let carve = AxisCarve {
             classes: &classes,
             ladder: &ladder,
-            lane_ceiling: LANES,
+            lane_ceiling: Some(LANES),
         };
         let span = |row_offset, rows| MaskSpan {
             row_offset,
@@ -3423,7 +4260,8 @@ mod tests {
         assert_eq!(
             carve.lanes(span(2, 8)),
             Some((4, 4)),
-            "the second class's ORIGIN is four and not sixteen, which is what              leaves it a ceiling to take",
+            "the second class's ORIGIN is four and not sixteen, which is what leaves it a \
+             ceiling to take",
         );
         assert_eq!(
             carve.ceiling(span(2, 8)),
@@ -3433,7 +4271,7 @@ mod tests {
         assert_eq!(
             carve.lanes(span(1, 8)),
             None,
-            "a span that is not a whole run of classes takes no ceiling on              either axis",
+            "a span that is not a whole run of classes takes no ceiling on either axis",
         );
     }
 
@@ -3450,16 +4288,51 @@ mod tests {
     /// on the line before anyone can read it, which is what this asserts.
     #[test]
     fn a_body_whose_shape_moved_is_counted_where_the_line_can_be_read() {
-        assert_eq!(BodyStats::default().reshapes, 0);
+        assert_eq!(BodyStats::default().tally.reshapes, 0);
         let thrashing = BodyStats {
-            misses: 9,
-            reshapes: 7,
+            tally: BodyTally {
+                misses: 9,
+                reshapes: 7,
+                ..BodyTally::default()
+            },
             ..BodyStats::default()
         };
         assert_ne!(thrashing, BodyStats::default());
         assert!(
             thrashing.to_string().contains("reshapes=7"),
             "the demotion an operator has to see: {thrashing}",
+        );
+    }
+
+    /// **THE TWO NUMBERS THE CAPACITY WAVE ADDED REACH THE LINE**, on
+    /// [`a_body_whose_shape_moved_is_counted_where_the_line_can_be_read`]'s
+    /// argument and for the same reason: a counter an operator cannot read is
+    /// a counter that does not exist, and [`Display`](core::fmt::Display) is a
+    /// hand-written format string where a field can be added and its token
+    /// forgotten.
+    ///
+    /// [`BodyCensus::bytes`] is what `Shell::arm_bodies` spends against
+    /// `[engine] bodies_mem`, and [`BodyTally::eager_copy_world`] is the fires
+    /// a body could not serve because `Shell::set_copies` moved under it.
+    #[test]
+    fn the_capacity_numbers_reach_the_line_an_operator_reads() {
+        let load = BodyStats {
+            tally: BodyTally {
+                eager_copy_world: 3,
+                ..BodyTally::default()
+            },
+            census: BodyCensus {
+                bytes: 41_943_040,
+                ..BodyCensus::default()
+            },
+            ..BodyStats::default()
+        };
+        let line = load.to_string();
+        assert!(line.contains("bytes=41943040"), "{line}");
+        assert!(line.contains("eager_copy_world=3"), "{line}");
+        assert!(
+            BodyStats::default().to_string().contains("bytes=0"),
+            "an unweighed load still says so"
         );
     }
 
@@ -3475,10 +4348,19 @@ mod tests {
             // ([`Ladder::rung`]), so this hand-built ladder is one a fire
             // could actually present.
             classes: Ladder::single(0, bucket),
+            patch: None,
         }
     }
 
     fn body() -> Body {
+        weighing(0)
+    }
+
+    /// The same nobody's-body, carrying a stated device footprint — what a
+    /// capture would have measured at its instantiation ([`Body::bytes`]).
+    /// Host-side, so nothing here has ever touched a device and the number is
+    /// simply the one the census has to add up.
+    fn weighing(bytes: usize) -> Body {
         Body {
             script: Vec::new().into_boxed_slice(),
             grids: Vec::new().into_boxed_slice(),
@@ -3487,6 +4369,7 @@ mod tests {
             // the settlement clause never shadows the pin clause.
             launched_at: crate::settle::Airborne::NEVER,
             pinned: false,
+            bytes,
         }
     }
 
@@ -3512,18 +4395,70 @@ mod tests {
         for n in 0..(MAX_BODIES as u32 * 2) {
             graphs.insert_body(rung(1_000 + n), body());
         }
-        let tally = graphs.body_stats();
+        let stats = graphs.body_stats();
         for bucket in [8u32, 16] {
             assert!(
                 graphs.holds_body(&rung(bucket)),
-                "the eviction order dropped the body the load armed at {bucket}: {tally}"
+                "the eviction order dropped the body the load armed at {bucket}: {stats}"
             );
         }
         assert_eq!(
-            tally.bodies, MAX_BODIES,
-            "the pin is an exemption from eviction and not from the bound: {tally}"
+            stats.census.bodies, MAX_BODIES,
+            "the pin is an exemption from eviction and not from the bound: {stats}"
         );
-        assert_eq!(tally.armed_at_load, 2, "{tally}");
+        assert_eq!(stats.tally.armed_at_load, 2, "{stats}");
+    }
+
+    /// **THE BUDGET'S ARITHMETIC, WHICH IS A FOLD AND NOT A LEDGER** —
+    /// [`BodyCensus::bytes`], the number `Shell::arm_bodies` stops on (the
+    /// capacity wave).
+    ///
+    /// The claim under test is the one that makes the budget honest without a
+    /// second bookkeeping surface: what a load has SPENT is what its resident
+    /// bodies weigh, so a body that is replaced in place gives its bytes back
+    /// at the same line it gives its seat back, and one that is evicted takes
+    /// them with it. A counter incremented at capture would have drifted at
+    /// the first of either.
+    ///
+    /// Host-side, because none of it is about a device: [`Body::bytes`] is
+    /// whatever the instantiation measured, and this asserts the arithmetic
+    /// over it.
+    #[test]
+    fn what_a_load_has_spent_is_what_its_resident_bodies_weigh() {
+        let mut graphs = Graphs::new();
+        assert_eq!(graphs.body_stats().census.bytes, 0, "an empty map has spent nothing");
+        for (bucket, bytes) in [(8u32, 3_000usize), (16, 5_000), (32, 7_000)] {
+            assert!(graphs.insert_body(rung(bucket), weighing(bytes)));
+        }
+        assert_eq!(
+            graphs.body_stats().census.bytes,
+            15_000,
+            "the census is the sum over the residents: {}",
+            graphs.body_stats(),
+        );
+        // **A RE-CAPTURE OF ONE KEY IS A SWAP AND NOT A SECOND CHARGE.** The
+        // grid climbed, `insert_body` replaced in place, and what the map
+        // holds for that key is now the NEW body's weight — so the total moves
+        // by the difference and not by the whole.
+        assert!(graphs.insert_body(rung(16), weighing(6_000)));
+        assert_eq!(
+            graphs.body_stats().census.bytes,
+            16_000,
+            "a replacement charged twice: {}",
+            graphs.body_stats(),
+        );
+        // **AND A LOAD THAT CANNOT WEIGH SPENDS NOTHING**, which is the arm a
+        // host without a runtime takes at every capture
+        // (`device::nodes::free_bytes` answers `None`): the seats are then the
+        // only bound, which is what the count belt is for.
+        assert!(graphs.insert_body(rung(64), weighing(0)));
+        assert_eq!(
+            graphs.body_stats().census.bytes,
+            16_000,
+            "an unweighable body moved the budget: {}",
+            graphs.body_stats(),
+        );
+        assert_eq!(graphs.body_stats().census.bodies, 4, "and it still took a seat");
     }
 
     /// **AND A MAP THAT IS ALL PIN DECLINES THE CAPTURE INSTEAD OF EVICTING
@@ -3550,14 +4485,14 @@ mod tests {
         );
         let after = graphs.body_stats();
         assert!(!graphs.holds_body(&rung(9_999)));
-        assert_eq!(after.bodies, MAX_BODIES, "nothing was dropped: {after}");
+        assert_eq!(after.census.bodies, MAX_BODIES, "nothing was dropped: {after}");
         assert_eq!(
-            after.captures, before.captures,
+            after.tally.captures, before.tally.captures,
             "a declined capture must not be counted as one: {after}"
         );
         assert_eq!(
-            after.evictions,
-            before.evictions + 1,
+            after.tally.evictions,
+            before.tally.evictions + 1,
             "the refusal is counted where the doc says it is: {after}"
         );
     }
@@ -3601,14 +4536,14 @@ mod tests {
         assert!(graphs.sealed_decline());
         let after = graphs.body_stats();
         assert_eq!(
-            after.sealed_declines,
-            before.sealed_declines + 2,
+            after.tally.sealed_declines,
+            before.tally.sealed_declines + 2,
             "a sealed decline that nobody counted is indistinguishable from a hit: \
              {after}",
         );
         assert_eq!(
-            (after.misses, after.declines, after.captures),
-            (before.misses, before.declines, before.captures),
+            (after.tally.misses, after.tally.declines, after.tally.captures),
+            (before.tally.misses, before.tally.declines, before.tally.captures),
             "the seal has its own counter and must not borrow another's: {after}",
         );
         assert!(
@@ -3622,7 +4557,7 @@ mod tests {
     /// `Run::carve_rows`, asserted where no device is needed.
     ///
     /// This is grid-at-ceiling's whole claim reduced to what a host can check.
-    /// A launch in a shifting region is issued over [`Carve::ceiling`]'s `own`
+    /// A launch in a shifting region is issued over [`AxisCarve::ceiling`]'s `own`
     /// capped at the bucket, so two fires that split one bucket differently
     /// must produce the SAME pair at the same span — and each pair must
     /// dominate the live rows of the fire that produced it, because a grid
@@ -3647,10 +4582,10 @@ mod tests {
         // The prefill class's own window, in each fire: it begins where the
         // decode rows end and runs to the fire's total.
         for (classes, at, rows) in [(&small, 2u32, 8u32), (&large, 4, 6)] {
-            let carve = Carve {
+            let carve = AxisCarve {
                 classes,
                 ladder: &key.classes,
-                lane_ceiling: LANES,
+                lane_ceiling: Some(LANES),
             };
             let span = MaskSpan {
                 row_offset: at,

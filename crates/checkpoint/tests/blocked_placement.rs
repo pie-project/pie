@@ -136,7 +136,7 @@ fn a_band_of_blocked_rows_stays_block_aligned_without_a_decode() {
 
 /// llama.cpp's Q/K row order, undone directly on the blocked payload.
 ///
-/// This is the shape `crates/model/src/*/import.rs` needs for the `llama`
+/// This is the shape `crates/models/src/*/import.rs` needs for the `llama`
 /// architecture: within each head GGUF interleaves the two rope halves, so
 /// `gguf[2k]` is `hf[k]` and `gguf[2k + 1]` is `hf[hd/2 + k]`. Written as
 /// `Concat` of two `Stride`s it needs no intermediate tensor and no second

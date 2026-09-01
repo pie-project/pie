@@ -99,7 +99,7 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn budget() -> Budget {
@@ -142,11 +142,12 @@ fn ready(
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let trace = trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the SKU's import contract fits its own checkpoint");
+    let contract =
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+            .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {
@@ -174,7 +175,7 @@ fn ready(
             bodies: true,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
@@ -224,7 +225,7 @@ fn class_of(compiled: &CompiledModel, word: u64) -> usize {
 /// is unmoved by P3 for a reason rather than by hope.
 #[test]
 fn the_shells_own_artifact_holds_no_conditional_region() {
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let trace = trace(Platform::Cuda);
     // The profile `serve.rs` builds when a caller states none, with an L40S's
     // SM count in it — the one number the shell measures.
@@ -260,7 +261,7 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
     let prompt = tokenizer.encode(PROMPT);
 
     // The host half: what the composition says, off the artifact alone.
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let trace = trace(Platform::Cuda);
     let compiled = compile(
         &trace,
@@ -314,7 +315,7 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
         carried = argmax(&out[0]);
     }
     let alone = shell.body_stats();
-    let decode_nodes = alone.nodes;
+    let decode_nodes = alone.last_capture.nodes;
     let decode_ms = {
         let warm = &millis[millis.len() / 2..];
         warm.iter().sum::<f64>() / warm.len() as f64
@@ -345,16 +346,16 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
         shell.open(1).expect("slot 1 reopens");
     }
     let mixed = shell.body_stats();
-    // `BodyStats::nodes` names the MOST RECENTLY CAPTURED body, not a running
+    // `LastCapture::nodes` names the MOST RECENTLY CAPTURED body, not a running
     // total — which is exactly what this comparison wants, and why the two
     // readings are taken on either side of the second composition's capture
     // rather than differenced.
-    let mixed_nodes = mixed.nodes;
+    let mixed_nodes = mixed.last_capture.nodes;
 
     eprintln!(
         "captured bodies: all-decode {decode_nodes} nodes at {decode_ms:.3} ms/fire, \
          decode+prefill {mixed_nodes} nodes; {} resident, {} captures",
-        mixed.bodies, mixed.captures,
+        mixed.census.bodies, mixed.tally.captures,
     );
 
     // **THE RULING.** The all-decode exec holds strictly fewer nodes than the
@@ -365,11 +366,11 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
     // and the ms it would save is 0.000 by arithmetic rather than by
     // measurement.
     assert!(
-        mixed.captures >= 2,
+        mixed.tally.captures >= 2,
         "two compositions captured {} bodies between them, so the reading \
          below is one graph counted twice rather than two graphs compared: \
          {mixed}",
-        mixed.captures,
+        mixed.tally.captures,
     );
     assert!(
         decode_nodes < mixed_nodes,
@@ -406,7 +407,7 @@ fn a_conditionalized_artifact_records_its_nodes_and_replays_what_the_eager_walk_
     };
     // How many regions this profile actually conditionalizes — printed, so
     // that a run which forced NOTHING is visible rather than silently vacuous.
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let forced = {
         let trace = trace(Platform::Cuda);
         let compiled = compile(&trace, &budget(), &forcing).expect("the forced bake bakes");
@@ -418,7 +419,8 @@ fn a_conditionalized_artifact_records_its_nodes_and_replays_what_the_eager_walk_
     };
     assert!(
         forced > 0,
-        "this profile conditionalized nothing, so the gate below would pass          over an always-launch artifact and prove nothing",
+        "this profile conditionalized nothing, so the gate below would pass over an \
+         always-launch artifact and prove nothing",
     );
 
     let Some((mut shell, tokenizer)) = ready("the conditional capture", Some(forcing), budget()) else {
@@ -487,10 +489,10 @@ fn a_conditionalized_artifact_records_its_nodes_and_replays_what_the_eager_walk_
         "{forced} regions conditionalized; {} captures, {} hits, {} nodes
            eager    {eager:?}
   recorded {recorded:?}",
-        stats.captures, stats.hits, stats.nodes,
+        stats.tally.captures, stats.tally.hits, stats.last_capture.nodes,
     );
     assert!(
-        stats.captures > 0,
+        stats.tally.captures > 0,
         "no capture happened, so nothing recorded a conditional node and the \
          two arms are the same eager walk twice: {stats}",
     );
@@ -502,13 +504,14 @@ fn a_conditionalized_artifact_records_its_nodes_and_replays_what_the_eager_walk_
     // `captures` would be nonzero before the first fire and only `hits` would
     // mean anything.)
     assert!(
-        stats.hits >= 1,
+        stats.tally.hits >= 1,
         "the conditionalized body captured and never replayed, so the tokens \
          below are the eager walk twice: {stats}",
     );
     assert_eq!(
         eager, recorded,
-        "the recorded arm of a conditionalized artifact answered different          tokens from the eager one",
+        "the recorded arm of a conditionalized artifact answered different tokens from the eager \
+         one",
     );
 }
 
@@ -542,7 +545,7 @@ fn a_switch_group_records_its_arms_and_replays_what_the_eager_walk_said() {
     // What the one-lane bake actually built, asked without a device — a run
     // that grouped nothing would pass everything below over an `IF`-only
     // artifact and prove nothing new.
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let (groups, arms) = {
         let trace = trace(Platform::Cuda);
         let compiled = compile(&trace, &one_lane(), &forcing).expect("the one-lane bake bakes");
@@ -606,14 +609,14 @@ fn a_switch_group_records_its_arms_and_replays_what_the_eager_walk_said() {
         "one-lane `{SKU}`: {groups} switch groups over {arms} arms; \
          {} captures, {} hits, {} nodes\n  \
          eager    {eager:?}\n  recorded {recorded:?}",
-        stats.captures, stats.hits, stats.nodes,
+        stats.tally.captures, stats.tally.hits, stats.last_capture.nodes,
     );
     assert!(
-        stats.captures > 0,
+        stats.tally.captures > 0,
         "the recorded arm never captured, so no switch node was recorded: {stats}",
     );
     assert!(
-        stats.hits >= 1,
+        stats.tally.hits >= 1,
         "the switch-grouped body captured and never replayed, so the two token \
          streams below are one eager walk run twice: {stats}",
     );

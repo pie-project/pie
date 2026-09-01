@@ -31,8 +31,29 @@ pub struct Gpu {
     device: Vec<*mut c_void>,
 }
 
+/// **THE CACHE ROOT A TEST RUN STATES**, so that nineteen test binaries do not
+/// each pay NVRTC for the same instantiations, run after run.
+///
+/// The library reads no environment and this does not change that:
+/// `CARGO_TARGET_TMPDIR` is a COMPILE-TIME macro cargo defines for integration
+/// tests, so what the harness installs is a constant baked into this binary.
+/// It lands under `target/`, which means `cargo clean` reclaims it, it never
+/// escapes the workspace, and it cannot appear in a shipped binary — the macro
+/// is not defined for a library build at all.
+///
+/// Shared by every test that opens a device, and idempotent by
+/// [`install`](kernels_cuda::disk::install)'s own contract, so no test has to
+/// know whether it ran first.
+pub fn arm_cache() {
+    kernels_cuda::disk::install(Some(std::path::Path::new(concat!(
+        env!("CARGO_TARGET_TMPDIR"),
+        "/kernel-cache"
+    ))));
+}
+
 impl Gpu {
     pub fn open() -> Self {
+        arm_cache();
         unsafe {
             check(rt::cudaSetDevice(0), "cudaSetDevice");
             let mut stream: rt::cudaStream_t = core::ptr::null_mut();

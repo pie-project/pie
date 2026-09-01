@@ -107,9 +107,35 @@ async fn main(_input: Input) -> Result<String> {
     let keep_mask = keep_out.take_host::<Vec<i32>>().await?;
     pipeline.close();
 
-    if token != argmax(&logits) || token != argmax(&probabilities) {
-        return Err("token, logits, and probability argmax values disagree".into());
+    // **THE CLAIM IS THAT THE DEVICE PICKED *AN* ARGMAX, NOT THE SAME INDEX
+    // THIS FILE WOULD HAVE PICKED.** `reduce_argmax` keeps the FIRST maximum
+    // and `max_by` keeps the LAST, so on a tie the two indices differ while
+    // both are correct -- and this checkpoint ties: a greedy step here has
+    // **two** of 248 320 logits at 14.375, and the old index comparison read
+    // that as an engine fault. What the primitive actually owes is that the
+    // token it returned stands at the maximum, in the logits and in the
+    // probabilities alike, which is the property a sampler depends on.
+    let peak = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let peak_probability = probabilities
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let at = |values: &[f32], i: usize| values.get(i).copied().unwrap_or(f32::NAN);
+    if at(&logits, token) != peak || at(&probabilities, token) != peak_probability {
+        let ties = logits.iter().filter(|&&v| v == peak).count();
+        return Err(format!(
+            "the sampled token does not stand at the maximum: device token={token} \
+             (logit {:.9}, prob {:.9}); peak logit {peak:.9} at index {} \
+             (prob {:.9}); {ties} of {} logits equal that peak",
+            at(&logits, token),
+            at(&probabilities, token),
+            argmax(&logits),
+            at(&probabilities, argmax(&logits)),
+            logits.len()
+        )
+        .into());
     }
+
     if probabilities.len() != vocab as usize || log_probabilities.len() != vocab as usize {
         return Err("sampling output has the wrong vocabulary dimension".into());
     }

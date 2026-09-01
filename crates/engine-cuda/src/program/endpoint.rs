@@ -272,7 +272,10 @@ impl Endpoint {
             return Err(Fault::program(
                 "program::endpoint",
                 format!(
-                    "this channel already has {MAX_ATTACHMENTS} instances bound to it and                      a {taken}th asked to bind: a shared ring is ordered by the pipeline                      FIFO its attachments fire in, and design §5 states that bound at                      {MAX_ATTACHMENTS} — past it there is no ordering argument, so there                      is no ring"
+                    "this channel already has {MAX_ATTACHMENTS} instances bound to it and a \
+                     {taken}th asked to bind: a shared ring is ordered by the pipeline FIFO its \
+                     attachments fire in, and design §5 states that bound at {MAX_ATTACHMENTS} — \
+                     past it there is no ordering argument, so there is no ring"
                 ),
             ));
         }

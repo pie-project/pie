@@ -508,6 +508,117 @@ __device__ __forceinline__ __nv_bfloat162 __hmul2(__nv_bfloat162 a, __nv_bfloat1
 #endif
 }
 
+
+namespace pie_bf16_detail {
+
+/// `a*b + c` rounded ONCE to bf16, with no device fma to do it.
+///
+/// **THE SECOND ROUNDING IS THE DEFECT**, and `cuda_fp16.h`'s banner has the
+/// counterexample: the product is exact in fp32 (two eight-bit significands
+/// make sixteen, well inside fp32's twenty-four), but the ADD is not, so
+/// rounding to fp32 and then to bf16 rounds twice and can step the wrong way
+/// off a bf16 midpoint. This is that file's `fma_once` with the conversions
+/// swapped -- a 2Sum recovers the add's error exactly, and the fp32
+/// intermediate is nudged to ODD, which never moves a value across a bf16
+/// midpoint and is therefore invisible to the rounding that follows.
+///
+/// Unreachable from this crate's one caller: `linear/tiled.cuh` traps below
+/// sm_80, where the PTX arm is taken. It is written anyway because
+/// `PIE_HALFTYPE_FORCE_PORTABLE` exists to run exactly this arm on a device
+/// that would otherwise never take it.
+__device__ __forceinline__ __nv_bfloat16 fma_once(
+    __nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c) {
+    const float p = __bfloat162float(a) * __bfloat162float(b);
+    const float x = __bfloat162float(c);
+    const float s = p + x;
+    const float bp = s - x;
+    const float err = (p - bp) + (x - (s - bp));
+    unsigned int bits = __float_as_int(s);
+    const unsigned int magnitude = bits & 0x7fffffffu;
+    // Zero, infinity and NaN carry no error to recover, and an odd
+    // intermediate is already sticky.
+    if (magnitude != 0u && magnitude < 0x7f800000u && (bits & 1u) == 0u) {
+        const bool negative = (bits & 0x80000000u) != 0u;
+        if (err > 0.0f) {
+            bits += negative ? 0xffffffffu : 1u;
+        } else if (err < 0.0f) {
+            bits += negative ? 1u : 0xffffffffu;
+        }
+    }
+    return __float2bfloat16(__uint_as_float(bits));
+}
+
+/// `-v`, by the sign bit.
+__device__ __forceinline__ __nv_bfloat16 negate(__nv_bfloat16 v) {
+    __nv_bfloat16 out;
+    out.raw = static_cast<unsigned short>(v.raw ^ 0x8000u);
+    return out;
+}
+
+}  // namespace pie_bf16_detail
+
+/// `a * b + c` per lane, with ONE rounding.
+///
+/// Added 2026-08-31 for `kernels/linear/tiled.cuh`'s register fold: the
+/// tiled affine point turns a dequantized code `c` into the weight
+/// `s*c + b` inside the B fragment, and the whole reason it is bit-exact
+/// against a host fold that computes `s*c + b` wide and rounds once is that
+/// `fma.rn.bf16x2` does exactly that -- the product is kept at full width
+/// and the sum is rounded a single time. Two roundings (a `__hmul2` then an
+/// add) would answer a different number and no golden could hold both.
+///
+/// `fma.rn.bf16x2` exists from sm_80, which is why there is no sm_90 arm
+/// here and why `__hmul2` above needs three: bf16 MULTIPLY arrived at
+/// sm_90 and bf16 FMA did not.
+__device__ __forceinline__ __nv_bfloat162 __hfma2(
+    __nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c) {
+#if PIE_BF16_HAS_SM80
+    unsigned int bits;
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;"
+        : "=r"(bits)
+        : "r"(pie_bf16_detail::pack(a)), "r"(pie_bf16_detail::pack(b)),
+          "r"(pie_bf16_detail::pack(c)));
+    return pie_bf16_detail::unpack(bits);
+#else
+    __nv_bfloat162 out;
+    out.x = pie_bf16_detail::fma_once(a.x, b.x, c.x);
+    out.y = pie_bf16_detail::fma_once(a.y, b.y, c.y);
+    return out;
+#endif
+}
+
+/// `a - b` per lane.
+///
+/// Added 2026-08-31 for `kernels/linear/tiled.cuh`'s dequant: marlin's lop3
+/// trick lands the four-bit code as `128 + code` in a bf16 lane (the magic
+/// `0x4300` exponent), and this is the subtraction that takes the 128 back
+/// off. Every value that caller hands it is exact -- 128..143 all fit
+/// bf16's seven mantissa bits -- so nothing rounds there whatever body runs.
+///
+/// `sub.rn.bf16x2` is sm_90, so BOTH bodies are `a * 1 + (-b)`: the same
+/// identity, once as an FMA against `(1.0, 1.0)` with a sign flip on `b`,
+/// and once through `fma_once`, whose banner above says why a plain fp32
+/// subtract would not do.
+__device__ __forceinline__ __nv_bfloat162 __hsub2(__nv_bfloat162 a, __nv_bfloat162 b) {
+#if PIE_BF16_HAS_SM80
+    unsigned int bits;
+    // `0x3f803f80` is `(1.0, 1.0)` and `0x80008000` flips both sign bits.
+    asm("{ .reg .b32 o, m;\n"
+        "  mov.b32 o, 0x3f803f80;\n"
+        "  xor.b32 m, %2, 0x80008000;\n"
+        "  fma.rn.bf16x2 %0, %1, o, m; }"
+        : "=r"(bits)
+        : "r"(pie_bf16_detail::pack(a)), "r"(pie_bf16_detail::pack(b)));
+    return pie_bf16_detail::unpack(bits);
+#else
+    const __nv_bfloat16 one = __nv_bfloat16(static_cast<unsigned short>(0x3f80u));
+    __nv_bfloat162 out;
+    out.x = pie_bf16_detail::fma_once(a.x, one, pie_bf16_detail::negate(b.x));
+    out.y = pie_bf16_detail::fma_once(a.y, one, pie_bf16_detail::negate(b.y));
+    return out;
+#endif
+}
+
 // ===-- what is deliberately not here ------------------------------------===
 //
 // `__hmul`, `__hadd`, `__hsub`, `__hfma`, `__hmax`, `__hmin`, `__habs` and
@@ -516,6 +627,14 @@ __device__ __forceinline__ __nv_bfloat162 __hmul2(__nv_bfloat162 a, __nv_bfloat1
 // `__nv_bfloat162_raw`, `__double2bfloat16`, the comparison set, the operator
 // set, the host-side bfloat16. Zero uses each, by the same two-tree count as
 // the nine above.
+//
+// **THIS PARAGRAPH IS A CENSUS AND CENSUSES AGE.** Six of the names it lists
+// have since been asked for and are defined in this file -- five under
+// "Added for the all-reduce" below it, and `__hsub2`/`__hfma2` (packed forms
+// of two named here) immediately ABOVE it, for the tiled affine point. The
+// list is kept as written because it records what was true when the closure
+// was measured; the rule it states is the live part, and the rule is that a
+// name arrives with the site that asked for it.
 //
 // The brief's census over the WHOLE FlashInfer include tree -- not the
 // closure -- found `__high2float` 32 times, `__hmax2` 17, `__habs2` 10,

@@ -6,10 +6,7 @@
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
     "tile_map_mask": 401,
-    "native_mxfp4_moe": false,
-    "fusion_mask": 0,
-    "encode_scratch_dtype": "Bf16",
-    "block_scale_rows": 128
+    "native_mxfp4_moe": false
   },
   "passes": [
     {
@@ -105,7 +102,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -118,7 +115,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -134,7 +131,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -154,7 +151,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -174,7 +171,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -194,7 +191,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -214,7 +211,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -234,7 +231,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -254,7 +251,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -271,7 +268,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -284,7 +281,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     }
   ],
@@ -297,7 +294,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -308,7 +305,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -322,7 +319,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -340,7 +337,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -358,7 +355,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -376,7 +373,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -394,7 +391,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -412,7 +409,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -430,7 +427,7 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "Bf16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null
@@ -445,7 +442,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -456,7 +453,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     }
@@ -471,7 +468,7 @@
           256
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 131072,
@@ -487,7 +484,7 @@
           256
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 512,
@@ -506,7 +503,7 @@
         "encoding": {
           "Quant": {
             "scheme": "AwqInt4",
-            "logical_dtype": "Bf16",
+            "logical_dtype": "bf16",
             "bits_per_element": 4,
             "group_size": 32,
             "channel_axis": null
@@ -529,7 +526,7 @@
         "encoding": {
           "Quant": {
             "scheme": "AwqInt4",
-            "logical_dtype": "Bf16",
+            "logical_dtype": "bf16",
             "bits_per_element": 4,
             "group_size": 32,
             "channel_axis": null
@@ -552,7 +549,7 @@
         "encoding": {
           "Quant": {
             "scheme": "AwqInt4",
-            "logical_dtype": "Bf16",
+            "logical_dtype": "bf16",
             "bits_per_element": 4,
             "group_size": 32,
             "channel_axis": null
@@ -575,7 +572,7 @@
         "encoding": {
           "Quant": {
             "scheme": "AwqInt4",
-            "logical_dtype": "Bf16",
+            "logical_dtype": "bf16",
             "bits_per_element": 4,
             "group_size": 32,
             "channel_axis": null
@@ -598,7 +595,7 @@
         "encoding": {
           "Quant": {
             "scheme": "AwqInt4",
-            "logical_dtype": "Bf16",
+            "logical_dtype": "bf16",
             "bits_per_element": 4,
             "group_size": 32,
             "channel_axis": null
@@ -621,7 +618,7 @@
         "encoding": {
           "Quant": {
             "scheme": "AwqInt4",
-            "logical_dtype": "Bf16",
+            "logical_dtype": "bf16",
             "bits_per_element": 4,
             "group_size": 32,
             "channel_axis": null
@@ -644,7 +641,7 @@
         "encoding": {
           "Quant": {
             "scheme": "AwqInt4",
-            "logical_dtype": "Bf16",
+            "logical_dtype": "bf16",
             "bits_per_element": 4,
             "group_size": 32,
             "channel_axis": null
@@ -664,7 +661,7 @@
           256
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 512,
@@ -680,7 +677,7 @@
           256
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 512,
@@ -775,7 +772,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 0,
@@ -825,7 +822,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 1,
@@ -870,7 +867,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 2,
@@ -915,7 +912,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 3,
@@ -960,7 +957,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 4,
@@ -1005,7 +1002,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 5,
@@ -1050,7 +1047,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 6,
@@ -1095,7 +1092,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 7,
@@ -1140,7 +1137,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 8,
@@ -1185,7 +1182,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 9,
@@ -1230,7 +1227,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 10,

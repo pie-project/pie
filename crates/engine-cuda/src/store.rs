@@ -426,13 +426,13 @@ impl Seats {
     /// **The same seats, carrying this fire's recurrent verbs** (alto design
     /// §6).
     ///
-    /// Additive and the shell chooses, exactly like [`Run::quantized`]: a fire
+    /// Additive and the shell chooses, exactly like [`Run::ceilings`]: a fire
     /// never handed one folds unconditionally and truncates nothing, which is
     /// every fire in this tree that does not name `RsVerb::Buffer` or
     /// `RsVerb::FoldBuffered` — and is byte for byte the launch this shell has
     /// always made.
     ///
-    /// [`Run::quantized`]: crate::run::Run::quantized
+    /// [`Run::ceilings`]: method@crate::run::Run::ceilings
     #[must_use]
     pub fn rs(mut self, write_state: bool, mask: Tensor, commit_len: Tensor) -> Seats {
         self.write_state = write_state;

@@ -49,7 +49,7 @@ fn no_concurrent_pair_shares_a_written_value() {
     let mut wrong: Vec<String> = Vec::new();
     let (mut baked, mut two_unit) = (0usize, 0usize);
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -118,7 +118,7 @@ fn no_concurrent_pair_shares_an_arena_byte_it_writes() {
     let mut wrong: Vec<String> = Vec::new();
     let (mut baked, mut two_unit) = (0usize, 0usize);
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let Ok(compiled) = bake(&trace) else {
@@ -225,7 +225,7 @@ fn the_catalog_forks_where_it_declares_disjoint_windows() {
 
     let mut table: Vec<String> = Vec::new();
     let mut wrong: Vec<String> = Vec::new();
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         let trace = trace(Platform::Cuda);
         let compiled = bake(&trace).expect("bakes");
         let forked = compiled.regions.iter().filter(|r| r.stream != 0).count();
@@ -295,7 +295,7 @@ fn the_off_arm_bakes_what_the_pass_never_ran_and_costs_no_bytes() {
     };
     let mut wrong: Vec<String> = Vec::new();
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         for platform in PLATFORMS {
             let trace = trace(platform);
             let (Ok(on), Ok(quiet)) = (bake(&trace), bake_with(&trace, &off)) else {

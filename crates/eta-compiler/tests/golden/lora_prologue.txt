@@ -9,9 +9,9 @@ class: chan=0 FullRing
 class: chan=1 FullRing
 seed chan=0 = F32([0.5, -0.5, 1.0, -1.0])
 seed chan=1 = F32([2.0, 0.25, -2.0, -0.25])
-inputs 0: PassInputs { logits: None, mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
+inputs 0: PassInputs { logits: None, mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: None }
 step 0: committed=true missed=None sinks=1
 sink lora: stage=Prologue layer=0 args=[F32([0.5, -0.5, 1.0, -1.0]), F32([2.0, 0.25, -2.0, -0.25]), U32([11])]
-inputs 1: PassInputs { logits: None, mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
+inputs 1: PassInputs { logits: None, mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: None }
 step 1: committed=true missed=None sinks=1
 sink lora: stage=Prologue layer=0 args=[F32([0.5, -0.5, 1.0, -1.0]), F32([2.0, 0.25, -2.0, -0.25]), U32([11])]

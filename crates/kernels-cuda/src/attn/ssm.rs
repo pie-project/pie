@@ -116,7 +116,9 @@ fn seated(
         return Err(refuse(
             op,
             format!(
-                "this fire cuts a row at an interior fold boundary and `{arm}` has no seat                  for the segment's origin, so the tail would replay the head's tokens from                  the state the head just folded"
+                "this fire cuts a row at an interior fold boundary and `{arm}` has no seat for \
+                 the segment's origin, so the tail would replay the head's tokens from the state \
+                 the head just folded"
             ),
         ));
     }

@@ -112,7 +112,7 @@ fn no_catalog_text_changes_what_it_owes_when_its_facts_are_renumbered() {
     let mut moved: Vec<String> = Vec::new();
     let (mut compiled, mut with_rows) = (0usize, 0usize);
 
-    for (sku, _, trace, _) in model::catalog() {
+    for (sku, _, trace, _) in models::catalog() {
         let trace = trace(Platform::Cuda);
         let Some(before) = owes(&trace) else { continue };
         compiled += 1;

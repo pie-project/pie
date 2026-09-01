@@ -57,10 +57,28 @@ pub enum Error {
 /// zTensor's failures, mapped onto the loader's, in one place since the distinction is load-bearing and easy to lose.
 ///
 /// `Unsupported` is the one that matters: a file using a layout this build does not implement is not a malformed checkpoint, and a caller that can retry against a newer build has to be able to tell the two apart.
+///
+/// A container *version* this build does not implement is the same kind of
+/// fact, arriving by a different door. zTensor states it as
+/// `Reject { rule: Rule::Version }` rather than `Unsupported`, because from
+/// the container's side the file did violate a MUST — §8 step 2 says verify
+/// the version, and this reader cannot. From the loader's side it is the
+/// opposite of a malformed checkpoint: the bytes are whatever a newer (or
+/// older) pie wrote, faithfully, and the recovery is to re-import, not to go
+/// find a different file. Folding it into [`Error::Checkpoint`] tells every
+/// operator holding a file from another build that it is corrupt, which is
+/// both false and unactionable.
 impl From<ztensor::Error> for Error {
     fn from(err: ztensor::Error) -> Self {
         match err {
             ztensor::Error::Unsupported(_) => Self::Unsupported(err.to_string()),
+            // Vocabulary this build does not implement, not bytes that failed
+            // to deliver: the container version is the one `Reject` rule whose
+            // recovery is a different *build*, not a different file.
+            ztensor::Error::Reject {
+                rule: ztensor::Rule::Version,
+                ..
+            } => Self::Unsupported(err.to_string()),
             // A rejected file, a name that is not there, bad input on the
             // write path, an I/O failure while reading a header — from the
             // loader's side these are all "the checkpoint did not deliver".
@@ -110,5 +128,26 @@ mod ztensor_conversion {
 
         let broken = ztensor::Error::NotFound("tensor \"w\"".into());
         assert!(matches!(Error::from(broken), Error::Checkpoint(_)));
+    }
+
+    /// A container version this build cannot read arrives as a `Reject`, and
+    /// every other `Reject` rule really is "the checkpoint did not deliver".
+    /// The two have to land in different variants, because the operator's move
+    /// differs: re-import with a build that speaks this version, versus get a
+    /// file that is not broken.
+    #[test]
+    fn an_unreadable_version_is_unsupported_not_a_broken_checkpoint() {
+        let future = ztensor::Error::reject(ztensor::Rule::Version, "footer version 3");
+        assert!(matches!(Error::from(future), Error::Unsupported(_)));
+
+        // Neighbouring rules keep the old answer: these are damaged bytes.
+        for rule in [
+            ztensor::Rule::FooterMagic,
+            ztensor::Rule::ManifestHash,
+            ztensor::Rule::DenseSize,
+        ] {
+            let damaged = ztensor::Error::reject(rule, "corrupt");
+            assert!(matches!(Error::from(damaged), Error::Checkpoint(_)));
+        }
     }
 }

@@ -6,10 +6,7 @@
     "max_tile_bytes": 67108864,
     "preferred_alignment": 256,
     "tile_map_mask": 401,
-    "native_mxfp4_moe": false,
-    "fusion_mask": 0,
-    "encode_scratch_dtype": "Bf16",
-    "block_scale_rows": 128
+    "native_mxfp4_moe": false
   },
   "passes": [
     {
@@ -105,7 +102,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -118,7 +115,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -132,7 +129,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -146,7 +143,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -160,7 +157,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -174,7 +171,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -187,7 +184,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -201,7 +198,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -215,7 +212,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -229,7 +226,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -243,7 +240,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -257,7 +254,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -271,7 +268,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -285,7 +282,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -299,7 +296,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -313,7 +310,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -327,7 +324,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -341,7 +338,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -355,7 +352,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -369,7 +366,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -382,7 +379,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     },
     {
@@ -396,7 +393,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       }
     }
   ],
@@ -410,7 +407,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -423,7 +420,7 @@
         256
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -435,7 +432,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -446,7 +443,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -458,7 +455,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -470,7 +467,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -482,7 +479,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -494,7 +491,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -505,7 +502,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -517,7 +514,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -528,7 +525,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     },
@@ -540,7 +537,7 @@
         128
       ],
       "encoding": {
-        "Raw": "Bf16"
+        "Raw": "bf16"
       },
       "alignment": 256
     }
@@ -556,7 +553,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 524288,
@@ -574,7 +571,7 @@
           256
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 262144,
@@ -591,7 +588,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 65536,
@@ -607,7 +604,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 256,
@@ -624,7 +621,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 32768,
@@ -641,7 +638,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 16384,
@@ -658,7 +655,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 16384,
@@ -675,7 +672,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 32768,
@@ -691,7 +688,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 256,
@@ -708,7 +705,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 1024,
@@ -724,7 +721,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 256,
@@ -741,7 +738,7 @@
           128
         ],
         "encoding": {
-          "Raw": "Bf16"
+          "Raw": "bf16"
         }
       },
       "bytes": 65536,
@@ -842,7 +839,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 0,
@@ -880,7 +877,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 0,
@@ -918,7 +915,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 0,
@@ -956,7 +953,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 0,
@@ -994,7 +991,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 0,
@@ -1032,7 +1029,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 0,
@@ -1070,7 +1067,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 0,
@@ -1108,7 +1105,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 0,
@@ -1153,7 +1150,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 1,
@@ -1191,7 +1188,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 1,
@@ -1229,7 +1226,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 1,
@@ -1267,7 +1264,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 1,
@@ -1312,7 +1309,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 2,
@@ -1362,7 +1359,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 3,
@@ -1407,7 +1404,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 4,
@@ -1457,7 +1454,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 5,
@@ -1507,7 +1504,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 6,
@@ -1557,7 +1554,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 7,
@@ -1607,7 +1604,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 8,
@@ -1652,7 +1649,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 9,
@@ -1702,7 +1699,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 10,
@@ -1747,7 +1744,7 @@
               }
             ]
           },
-          "dtype": "Bf16"
+          "dtype": "bf16"
         },
         "dest": {
           "buffer": 11,

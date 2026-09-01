@@ -14,10 +14,14 @@
 //! WHAT IT ASSERTS, and each is a bug that does not fault:
 //!
 //! - **the nodes that ran are exactly the nodes the classes demand** — the
-//!   union, over the classes this fire has lanes in, of what those classes
-//!   run. Too few is a window silently missing from a mixed batch, which
-//!   presents as garbage tokens for the requests in the class that was
-//!   dropped; too many is a kernel reading rows that belong to somebody else;
+//!   union, over the classes this fire has lanes in ON THE NODE'S OWN ROW
+//!   AXIS, of what those classes run. Too few is a window silently missing
+//!   from a mixed batch, which presents as garbage tokens for the requests in
+//!   the class that was dropped; too many is a kernel reading rows that
+//!   belong to somebody else. The axis qualifier is what a towered text
+//!   added: its tower stands on the PATCH axis, whose present classes are the
+//!   ones that submitted an IMAGE, and a lane may set the media bit and carry
+//!   none;
 //! - **every dispatch followed the template's region order** — an engine that
 //!   dispatched a node twice would write its output rectangle twice, and the
 //!   second write is a race against the reader in between;
@@ -36,12 +40,14 @@ use model_exec::dispatch::{
     DispatchAttention, DispatchCollective, DispatchCustomCuda, DispatchElementwise, DispatchLayout,
     DispatchLinear,
 };
-use model_compiler::{Budget, DeviceProfile, Lowering, Phase, Region, compile};
+use model_compiler::{
+    Budget, Budgets, DeviceProfile, Lowering, PatchLadder, Phase, Region, compile_axes,
+};
 use model_dsl::Platform;
 use model_exec::fire::{EagerSink, EventId, FireDescriptor, Lane, Sink, compose, walk};
 use model_ir::{
     Attention, ClassTable, Collective, CustomCuda, Elementwise, Layout, Linear, Operands, Operation,
-    Trace,
+    RowAxis, Trace,
 };
 
 /// Every platform a plan can be traced at. A model text may emit a different op
@@ -91,6 +97,21 @@ fn budget() -> Budget {
 /// either way. So the count of pairs that actually got walked is asserted
 /// against the catalog's own size, and the day a SKU stops baking this file
 /// says so instead of going quiet.
+/// **THE PATCH LADDER IS PRESENT FOR THE SAME REASON `max_adapters` IS ZERO**:
+/// it is the value that seats the WHOLE catalog. The vision rows joined the
+/// catalog stating patch rows, and a `Budgets` whose `patches` is `None`
+/// refuses every one of them at `compile` — forty pairs went quiet and the
+/// non-vacuity guard below said so, which is the guard doing its one job. A
+/// ladder on a text that states no patch rows is inert (`patch_axis` returns
+/// before reading it), so one `Budgets` serves the whole walk.
+fn budgets() -> Budgets {
+    Budgets::of(budget()).with_patches(PatchLadder {
+        max_patches: 4096,
+        buckets: vec![64, 256, 1024, 4096],
+        max_images: 8,
+    })
+}
+
 fn no_pair_was_skipped(walked: usize, of: usize) {
     assert_eq!(
         walked, of,
@@ -318,17 +339,40 @@ fn mixes(classes: &ClassTable) -> Vec<(String, Vec<Lane>)> {
 #[test]
 fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
     let mut wrong: Vec<String> = Vec::new();
-    let catalog = model::catalog();
+    let catalog = models::catalog();
     let pairs = catalog.len() * PLATFORMS.len();
     let mut walked = 0usize;
 
     for (sku, _, trace, _) in catalog {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
+            let Ok(compiled) = compile_axes(&trace, &budgets(), &DeviceProfile::default()) else {
                 continue; // `model-compiler`'s own catalog test is what says so.
             };
             walked += 1;
+
+            // **WHERE EACH NODE STANDS, ONCE PER ARTIFACT** — which region
+            // holds it, and which ROW AXIS that region's capture unit counts
+            // in. Both readings below are per-node and a catalog template is
+            // hundreds of regions long, so scanning it per node per mix was
+            // the one thing in this loop with a product in it.
+            //
+            // A node no region holds cannot run, and `RowAxis::PRIMARY` is
+            // what [`walk`] itself reads for a unit past the table — the same
+            // answer said in the same place, so the two cannot drift.
+            let mut region_of: Vec<Option<usize>> = vec![None; trace.nodes.len()];
+            let mut axis_of: Vec<RowAxis> = vec![RowAxis::PRIMARY; trace.nodes.len()];
+            for (at, region) in compiled.template().iter().enumerate() {
+                let axis = compiled
+                    .units
+                    .get(compiled.unit_of(at) as usize)
+                    .copied()
+                    .unwrap_or(RowAxis::PRIMARY);
+                for node in region.nodes.clone() {
+                    region_of[node as usize] = Some(at);
+                    axis_of[node as usize] = axis;
+                }
+            }
 
             for (name, lanes) in mixes(&compiled.classes) {
                 let fire = match compose(&compiled, &budget(), &lanes) {
@@ -339,6 +383,13 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                     }
                 };
                 let present: BTreeSet<usize> = fire.present().iter().map(|&c| c as usize).collect();
+                // The same question on the other row axis, and it is a
+                // different answer: a class with token rows may carry no
+                // image at all (`compose`'s second seriation), so this set is
+                // a SUBSET of the one above and empty for every text-only
+                // fire.
+                let patched: BTreeSet<usize> =
+                    fire.patch_present().iter().map(|&c| c as usize).collect();
                 let descriptor = FireDescriptor::of(&fire);
 
                 let mut dispatch = MockDispatch::new(&trace);
@@ -362,13 +413,8 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
                 // about, is that the walk followed the TEMPLATE: the region a
                 // dispatch belongs to never goes backwards.
                 let ran = dispatch.nodes();
-                let region_of = |node: u32| {
-                    compiled
-                        .template()
-                        .iter()
-                        .position(|region| region.nodes.contains(&node))
-                };
-                let visited: Vec<Option<usize>> = ran.iter().map(|&n| region_of(n)).collect();
+                let visited: Vec<Option<usize>> =
+                    ran.iter().map(|&n| region_of[n as usize]).collect();
                 if !visited.windows(2).all(|pair| pair[0] <= pair[1]) {
                     wrong.push(format!(
                         "`{sku}` as {platform:?} [{name}]: the dispatches did not follow the \
@@ -379,10 +425,47 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
 
                 // What the artifact says should run: every node some present
                 // class demands, plus every collective, always (decision #5).
+                //
+                // **PRESENT ON THE NODE'S OWN ROW AXIS, AND THAT QUALIFIER IS
+                // THE WHOLE OF THE SECOND AXIS IN THIS FILE.** "The classes
+                // this fire has lanes in" was one question while every plan
+                // had one row space; a towered text has two, and a node's
+                // window is its capture unit's axis's window — which is what
+                // `walk_units` reads and therefore what a demand set has to
+                // ask. Said the old way, the ten vision SKUs demanded their
+                // whole tower — 534 nodes on gemma, 203 on qwen — of every
+                // fire whose lanes merely SET the media bit, and the walk
+                // rightly ran none of it, because those lanes submitted no
+                // image and an axis-empty fire has no patch rows.
+                //
+                // That is not the walk being lenient, it is the design's own
+                // free-when-unused property, and the model texts state it in
+                // as many words: the media bit "guards the merge and nothing
+                // else", the tower needs no bit at all because "every
+                // rectangle in `tower` is `Dim::Patches`, so an axis-empty
+                // fire has zero patch rows and the walk skips the whole unit"
+                // (`models::qwen_3::forward::Facts::media`,
+                // `models::gemma_4::forward::Facts::media`). A demand set that
+                // reads one axis's presence for both nodes' worth of the plan
+                // is a claim about a one-axis artifact, asked of a two-axis
+                // one.
+                //
+                // WHAT THAT LEAVES UNWALKED, SAID OUT LOUD: no mix here
+                // submits an image, so `patched` is empty on every fire in
+                // this file and a tower's nodes are demanded by nothing —
+                // the census asserts the tower does NOT run, which is the
+                // half of the claim it can make from `compose` alone. The
+                // other half is the shell's, and it is already pinned there
+                // (`engine-cuda`, `engine-metal`:
+                // `a_tower_region_reads_the_patch_window`), whose own header
+                // says the launch on real patch rows waits on a text wave.
                 let mut demanded: BTreeSet<u32> = (0..trace.nodes.len() as u32)
                     .filter(|&node| {
-                        present
-                            .iter()
+                        let here = match axis_of[node as usize] {
+                            RowAxis::Tokens => &present,
+                            RowAxis::Patches => &patched,
+                        };
+                        here.iter()
                             .any(|&class| compiled.classes.node_mask[node as usize].contains(class))
                     })
                     .collect();
@@ -444,14 +527,14 @@ fn every_sku_walks_exactly_the_nodes_its_composition_demands() {
 #[test]
 fn every_sku_shows_the_sink_its_whole_template_every_fire() {
     let mut wrong: Vec<String> = Vec::new();
-    let catalog = model::catalog();
+    let catalog = models::catalog();
     let pairs = catalog.len() * PLATFORMS.len();
     let mut walked = 0usize;
 
     for (sku, _, trace, _) in catalog {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
+            let Ok(compiled) = compile_axes(&trace, &budgets(), &DeviceProfile::default()) else {
                 continue;
             };
             walked += 1;
@@ -532,14 +615,14 @@ fn every_sku_shows_the_sink_its_whole_template_every_fire() {
 #[test]
 fn no_sku_bakes_a_prepare_region_behind_the_graph_that_reads_its_slots() {
     let mut wrong: Vec<String> = Vec::new();
-    let catalog = model::catalog();
+    let catalog = models::catalog();
     let pairs = catalog.len() * PLATFORMS.len();
     let mut walked = 0usize;
 
     for (sku, _, trace, _) in catalog {
         for platform in PLATFORMS {
             let trace = trace(platform);
-            let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
+            let Ok(compiled) = compile_axes(&trace, &budgets(), &DeviceProfile::default()) else {
                 continue;
             };
             walked += 1;
@@ -583,13 +666,13 @@ fn a_composition_is_the_only_thing_that_changes_between_fires() {
     // wildly different batches must never need a second `compile` — and the
     // windows those batches produce must tile their rows exactly, every time.
     let mut wrong: Vec<String> = Vec::new();
-    let catalog = model::catalog();
+    let catalog = models::catalog();
     let pairs = catalog.len();
     let mut walked = 0usize;
 
     for (sku, _, trace, _) in catalog {
         let trace = trace(Platform::Cuda);
-        let Ok(compiled) = compile(&trace, &budget(), &DeviceProfile::default()) else {
+        let Ok(compiled) = compile_axes(&trace, &budgets(), &DeviceProfile::default()) else {
             continue;
         };
         walked += 1;

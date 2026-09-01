@@ -59,7 +59,7 @@
 //!
 //! | variable | what it moves |
 //! |---|---|
-//! | `PIE_PROBE_SKUS` | which rows run — `u4`, `gptoss`, `qwen36`, `gemma4`, `a3b`, `a4b`, comma separated |
+//! | `PIE_PROBE_SKUS` | which rows run — `u4`, `gptoss`, `qwen36`, `gemma4`, `a3b`, `a4b`, `dsv4u2`, `qwen38u2`, comma separated |
 //! | `PIE_PROBE_LANES` | the ladder, comma separated |
 //! | `PIE_PROBE_STEPS` | decode fires in one warm window |
 //! | `PIE_PROBE_TUNING` | `[metal.tuning]` keys, `key=value` comma separated, for A/B-ing a crossover |
@@ -135,7 +135,7 @@ const U4: Sku = Sku {
     sku: "qwen35-d0.8b-mlxu4-kv-bf16",
     env: "PIE_U4_SNAPSHOT",
     repo: "models--mlx-community--Qwen3.5-0.8B-4bit",
-    word: |query_len| model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word(),
+    word: |query_len| models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word(),
     bos: None,
     by_default: true,
     ceiling: 32,
@@ -151,7 +151,7 @@ const GPT_OSS: Sku = Sku {
     sku: "gptoss-20b-mlxu4-mxfp4-kv-bf16",
     env: "PIE_GPTOSS_SNAPSHOT",
     repo: "models--mlx-community--gpt-oss-20b-MXFP4-Q4",
-    word: |query_len| model::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word(),
+    word: |query_len| models::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word(),
     bos: None,
     by_default: true,
     ceiling: 16,
@@ -165,7 +165,7 @@ const QWEN36: Sku = Sku {
     sku: "qwen36-27b-mlxu4-kv-bf16",
     env: "PIE_QWEN36_SNAPSHOT",
     repo: "models--mlx-community--Qwen3.6-27B-4bit",
-    word: |query_len| model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word(),
+    word: |query_len| models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word(),
     bos: None,
     by_default: false,
     ceiling: 16,
@@ -185,7 +185,7 @@ const QWEN_A3B: Sku = Sku {
     sku: "qwen36-35b-a3b-mlxu4-kv-bf16",
     env: "PIE_QWEN36_A3B_SNAPSHOT",
     repo: "models--mlx-community--Qwen3.6-35B-A3B-4bit",
-    word: |query_len| model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word(),
+    word: |query_len| models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word(),
     bos: None,
     by_default: false,
     ceiling: 16,
@@ -198,7 +198,7 @@ const GEMMA4: Sku = Sku {
     sku: "gemma4-31b-mlxu4-kv-bf16",
     env: "PIE_GEMMA4_SNAPSHOT",
     repo: "models--mlx-community--gemma-4-31b-it-4bit",
-    word: |query_len| model::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word(),
+    word: |query_len| models::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word(),
     // `<bos>`, id 2 — `session_c_first_light::Family::bos` is the measurement.
     bos: Some(2),
     by_default: false,
@@ -218,12 +218,68 @@ const GEMMA4_A4B: Sku = Sku {
     sku: "gemma4-26b-a4b-mlxu4-kv-bf16",
     env: "PIE_GEMMA4_A4B_SNAPSHOT",
     repo: "models--mlx-community--gemma-4-26b-a4b-it-4bit",
-    word: |query_len| model::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word(),
+    word: |query_len| models::gemma_4::forward::Facts::of(&Request::new(query_len, false)).word(),
     // `<bos>`, id 2 — `session_c_first_light::Family::bos` is the measurement.
     bos: Some(2),
     by_default: false,
     ceiling: 16,
     routed: Some((128, 8)),
+};
+
+/// **THE DSV4 2-BIT MINIATURE**, `mini-l5-e16` — five layers, sixteen experts
+/// routed six ways. `two_bit_moe_first_light` asks whether it loads and
+/// returns finite logits and `what_a_two_bit_prefill_costs` prices its
+/// prefill; this row is the third question, which is what its DECODE does as
+/// lanes are added.
+///
+/// [`Sku::by_default`] is off here for a different reason than it is off on
+/// the two big rows: 1.6 GiB is not a memory fact on this box, it is only a
+/// row nobody asked for. The ceiling is the ladder's full sixteen.
+///
+/// **There is no comparator for this row and there cannot be one here.**
+/// `mlx_lm` 0.31.3 dynamically imports an architecture module named by
+/// `config.json`'s `model_type` and ships no `deepseek_v4` (upstream issue
+/// #1281, open); llama.cpp's V4 support (PR #24162) is CUDA and CPU only and
+/// lands no Metal path. A blank cell would read as "not measured"; the reason
+/// is that the other two engines cannot run the file at all.
+const DSV4_U2: Sku = Sku {
+    name: "dsv4u2",
+    sku: "dsv4-flash-mlxu2-kv-bf16",
+    env: "PIE_U2_SNAPSHOT",
+    repo: "models--mlx-community--DeepSeek-V4-Flash-2bit-DQ",
+    word: |query_len| {
+        models::deepseek_v4::forward::Facts::of(&Request::new(query_len, false)).word()
+    },
+    // `bos_token_id` is 0 in the miniature's own `config.json`, and the
+    // decode arm here compares continuations across lanes.
+    bos: Some(0),
+    by_default: false,
+    ceiling: 16,
+    routed: Some((16, 6)),
+};
+
+/// **THE QWEN3.8 2-BIT MINIATURE**, `mini-l4-e16-p8` — four layers, sixteen
+/// experts routed ten ways, the n-gram PLE split eight parts.
+///
+/// The twin of [`DSV4_U2`] and carrying the same "no comparator" note, with
+/// its own spelling of the first half: `mlx_lm` 0.31.3 has no `qwen4_exp`
+/// module for its dynamic import to find.
+///
+/// Its PLE keeps an n-gram id history and a dilated convolution history
+/// ACROSS fires — `qwen4_two_bit_first_light::STEPS` is the paragraph — so the
+/// decode window here is doing more per step than a plain stack would, and a
+/// ladder is the only place that shows up under concurrency.
+const QWEN38_U2: Sku = Sku {
+    name: "qwen38u2",
+    sku: "qwen38-flash-mlxu2-kv-bf16",
+    env: "PIE_QWEN4_U2_SNAPSHOT",
+    repo: "models--Sawfwair--Qwen3.8-Flash-Next-MLX-Mixed-2bit",
+    word: |query_len| models::qwen_4::forward::Facts::of(&Request::new(query_len, false)).word(),
+    // `text_config.bos_token_id`, from the miniature's own `config.json`.
+    bos: Some(248044),
+    by_default: false,
+    ceiling: 16,
+    routed: Some((16, 10)),
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -277,6 +333,26 @@ const WARMUP: usize = 8;
 /// arena is cut once, so a second fire measures the same rectangle.
 const PREFILL: u32 = 512;
 
+/// **THE PREFILL LENGTH THIS RUN MEASURES**, [`PREFILL`] unless
+/// `PIE_PROBE_PREFILL` names another.
+///
+/// The length is a knob and not a constant because the term this arm is
+/// pointed at is QUADRATIC and 512 is below the knee. The verify queue's
+/// sdpa `_lse` A/B says it outright: `.wiki/macos-bench.md` §17 prices the
+/// scalar attention at 4.6% of a 512-row fire and the `sdpa_paged_mma`
+/// docstring records 35.8% at 2048, so an A/B run at 512 measures the
+/// launch and reports that the arm is worth nothing. A test's own
+/// environment is the right door for this — it moves what this PROCESS
+/// measures and never what an engine decides, which is `[metal.tuning]`'s
+/// job and stays there.
+fn prefill_rows() -> u32 {
+    std::env::var("PIE_PROBE_PREFILL")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|rows| *rows > 0)
+        .unwrap_or(PREFILL)
+}
+
 /// Prefill fires one timed window measures, and the throwaways before it.
 ///
 /// Fewer than a decode window's because each one is two orders of magnitude
@@ -284,6 +360,11 @@ const PREFILL: u32 = 512;
 /// of them is a measurement and thirty-two would be a coffee break.
 const PREFILLS: usize = 5;
 const PREFILL_WARMUP: usize = 2;
+
+/// Greedy decodes printed after the timed window, for A/B-ing what the fire
+/// SAID and not only how fast it said it. Sixteen because that is the depth
+/// the verify queue asks the sdpa `_lse` arm to be compared at.
+const CONTINUATION: usize = 16;
 
 /// The ladder, unless `PIE_PROBE_LANES` says otherwise. Clipped per row by
 /// [`Sku::ceiling`].
@@ -408,6 +489,17 @@ fn steps() -> usize {
 ///     pin it — `999` takes the vector point at every rung and `2` takes the
 ///     tile at every rung. That is the A/B the before/after tables on
 ///     `act_x_wt` and on `BM_RUNGS` were measured with.
+///   * `qmv_rows_packs` — **AND THIS ONE IS NOT A CROSSOVER, WHICH IS WHY IT
+///     WENT UNREAD FOR TWO CAMPAIGNS.** Pinning `qmm_min_batch` to 999 puts
+///     every rung on "the vector point", and the vector point is TWO kernels:
+///     `affine_qmv_fast` at two weight packs a thread, and `affine_qmv_rows`
+///     at `DeviceTuning::qmv_rows_packs` — selected by whether the fire's row
+///     count has a fold rung that divides it, with no crossover to pin. The
+///     pack width IS how k is dealt out to a simdgroup's thirty-two lanes, so
+///     the two round differently, and a run that pinned the tile crossover and
+///     read its own tuning line back saw nothing about it because [`resolved`]
+///     did not print it. It does now. See
+///     [`gemma4_26b_a4b_decodes_on_many_lanes_at_once`].
 ///
 /// **ONE ANSWER PER PROCESS, WHICH IS WHY THIS IS A RUN AND NOT AN ARM.**
 /// `kernels_metal::tuning` folds the device row and the document at the first
@@ -455,8 +547,11 @@ fn stated_tuning() -> Option<String> {
 fn resolved() -> String {
     let t = kernels_metal::tuning::current();
     format!(
-        "qmm_min_batch {} (moe {}, emulated {}), moe_batch_min_per_expert {}, \
+        "qmv_rows_max {} (packs {}), qmm_min_batch {} (moe {}, emulated {}), \
+         moe_batch_min_per_expert {}, \
          moe_tile_mid_per {}, sdpa_tile_min_rows_per_request {}",
+        t.qmv_rows_max,
+        t.qmv_rows_packs,
         t.qmm_min_batch,
         t.qmm_min_batch_moe,
         t.qmm_min_batch_emulated,
@@ -599,11 +694,11 @@ fn ready_at(
         eprintln!("skipping {sku}: this machine publishes no Metal device");
         return None;
     }
-    let Some(trace) = model::trace_of(sku) else {
+    let Some(trace) = models::trace_of(sku) else {
         eprintln!("skipping {sku}: the catalog ships no row by that name");
         return None;
     };
-    let Some(import) = model::import_of(sku) else {
+    let Some(import) = models::import_of(sku) else {
         eprintln!("skipping {sku}: the catalog ships no import for that row");
         return None;
     };
@@ -639,7 +734,10 @@ fn ready_at(
 
     let files = containers(&snapshot);
     let source = ztensor_compat::index_all(&files).expect("the checkpoint's shards open as one");
-    let contract = import(&source)
+    // Read for this shell (§J4c): a family's text may state a `Dtype`
+    // PLACEMENT, and a contract read under a different setup than the trace
+    // below describes different planes. See `four_bit_first_light::ready`.
+    let contract = models::placing_for(Platform::Metal, || import(&source))
         .unwrap_or_else(|why| panic!("{sku}'s import contract does not fit {snapshot:?}: {why}"));
     drop(source);
 
@@ -657,7 +755,14 @@ fn ready_at(
         trace: trace(Platform::Metal),
         contract: &contract,
         checkpoint: &snapshot,
+        // §M-4c, as `serve_smoke` states it: an unstamped snapshot proceeds,
+        // and the deployment's facts are stated honestly all the same.
+        tp_size: 1,
+        precision: models::precision_of(sku)
+            .expect("the catalog states this row's precision")
+            .to_string(),
         budget: Budget::new(widest, widest.max(longest).max(tokens.unwrap_or(0))),
+        patches: None,
         profile: None,
         page_size: 16,
         context,
@@ -710,6 +815,7 @@ fn submit(shell: &mut Shell, lanes: &[Seated<'_>]) -> Landed {
     let prepared = FramePhases::prepare(
         shell,
         StepView {
+            media: &[],
             lanes,
             attachments: &[],
             done: None,
@@ -1189,16 +1295,17 @@ fn prefill(row: &Sku) {
     // One slot, and a context with room for the prompt plus the row the fire
     // lands. `Budget::max_tokens` is the prompt itself, which is what makes
     // this a 512-row fire rather than a 512-step decode.
-    let Some((mut shell, prompts)) = ready_at(row, 1, PREFILL + 64, Some(PREFILL)) else {
+    let rows = prefill_rows();
+    let Some((mut shell, prompts)) = ready_at(row, 1, rows + 64, Some(rows)) else {
         return;
     };
-    let mut tokens: Vec<u32> = Vec::with_capacity(PREFILL as usize);
+    let mut tokens: Vec<u32> = Vec::with_capacity(rows as usize);
     tokens.extend(row.bos);
     'fill: loop {
         for prompt in &prompts {
             for &id in prompt.iter().skip(usize::from(row.bos.is_some())) {
                 tokens.push(id);
-                if tokens.len() == PREFILL as usize {
+                if tokens.len() == rows as usize {
                     break 'fill;
                 }
             }
@@ -1217,7 +1324,7 @@ fn prefill(row: &Sku) {
         let landed = shell
             .fire(&[Lane {
                 slot: 0,
-                word: (row.word)(PREFILL),
+                word: (row.word)(rows),
                 tokens: &tokens,
             }])
             .unwrap_or_else(|why| panic!("{sku}'s prefill fires: {why}"));
@@ -1236,9 +1343,9 @@ fn prefill(row: &Sku) {
     let best = each.iter().copied().fold(f64::INFINITY, f64::min);
     let worst = each.iter().copied().fold(0.0f64, f64::max);
     eprintln!(
-        "\n{sku} — prefill of {PREFILL} tokens, one lane, {PREFILLS} fires: {:.1} tok/s \
+        "\n{sku} — prefill of {rows} tokens, one lane, {PREFILLS} fires: {:.1} tok/s \
          ({:.1} ms mean, {:.1} best, {:.1} worst, {:.1}% spread), {} encodes",
-        f64::from(PREFILL) / mean,
+        f64::from(rows) / mean,
         mean * 1000.0,
         best * 1000.0,
         worst * 1000.0,
@@ -1250,10 +1357,45 @@ fn prefill(row: &Sku) {
     // a fire that fell to the vector point at every projection, which is the
     // one failure a printed table cannot show on its own.
     assert!(
-        f64::from(PREFILL) / mean > 1.0,
-        "{sku}: a {PREFILL}-token prefill turned in {:.2} tok/s",
-        f64::from(PREFILL) / mean
+        f64::from(rows) / mean > 1.0,
+        "{sku}: a {rows}-token prefill turned in {:.2} tok/s",
+        f64::from(rows) / mean
     );
+
+    // **AND WHAT THE FIRE SAID**, which is the other half of an A/B and the
+    // half a rate cannot carry. `PIE_PROBE_TUNING` moves a kernel and a
+    // kernel that answered faster and differently has not been shown to be
+    // the same kernel; the verify queue's sdpa `_lse` entry asks for exactly
+    // this beside the two rates. Greedy, from the prefill's own last row, so
+    // the ids below are comparable across two runs of this binary that
+    // differ only in the table. The arm changes attention ARITHMETIC, so
+    // divergence eventually is expected and the first handful with their
+    // margins is what is worth reading — not byte identity.
+    shell.open(0).expect("the slot re-opens");
+    let seeded = shell
+        .fire(&[Lane {
+            slot: 0,
+            word: (row.word)(rows),
+            tokens: &tokens,
+        }])
+        .unwrap_or_else(|why| panic!("{sku}'s continuation prefill fires: {why}"));
+    let mut said = vec![top2(&seeded[0])];
+    for step in 0..CONTINUATION {
+        let fed = [said.last().expect("a step feeds the last token back").0];
+        let decode = shell
+            .fire(&[Lane {
+                slot: 0,
+                word: (row.word)(1),
+                tokens: &fed,
+            }])
+            .unwrap_or_else(|why| panic!("{sku}'s continuation step {step} fires: {why}"));
+        finite(&decode[0], "the continuation");
+        said.push(top2(&decode[0]));
+    }
+    let ids: Vec<u32> = said.iter().map(|(id, _)| *id).collect();
+    let margins: Vec<String> = said.iter().map(|(_, m)| format!("{m:.3}")).collect();
+    eprintln!("{sku} — continuation after {rows}: {ids:?}");
+    eprintln!("{sku} — argmax margins:            [{}]", margins.join(", "));
 }
 
 /// **THE VEHICLE'S PREFILL.**
@@ -1279,6 +1421,20 @@ fn qwen36_27b_prefills_five_hundred_tokens() {
 #[test]
 fn gemma4_31b_prefills_five_hundred_tokens() {
     prefill(&GEMMA4);
+}
+
+/// **THE DSV4 MINIATURE'S PREFILL**, opt-in — the same rectangle
+/// `what_a_two_bit_prefill_costs` prices, taken through this file's ladder so
+/// the 2-bit row can be read beside the 4-bit ones in one table.
+#[test]
+fn dsv4_flash_two_bit_prefills_five_hundred_tokens() {
+    prefill(&DSV4_U2);
+}
+
+/// **THE QWEN3.8 MINIATURE'S PREFILL**, opt-in.
+#[test]
+fn qwen38_flash_two_bit_prefills_five_hundred_tokens() {
+    prefill(&QWEN38_U2);
 }
 
 /// **QWEN3.6-35B-A3B'S PREFILL**, opt-in.
@@ -1320,35 +1476,160 @@ fn gemma4_31b_decodes_on_many_lanes_at_once() {
 /// # Why this row is `#[ignore]` and the other four are not
 ///
 /// **THE LADDER AND ARTICLE 1 ARE GREEN; [`batching_is_polymorphic`] IS
-/// NOT — AND WHAT IT CATCHES IS NOT THIS MODEL.** Measured on an M1 Max at
-/// eight lanes, first decode step, batched logits against the same lane's
-/// logits alone:
+/// NOT.** At eight lanes this model's batched logits do not reproduce its
+/// solo ones, and lanes part at steps neither arm had tied.
+///
+/// # WHAT IT IS: THE VECTOR POINT'S PACK WIDTH, WHICH IS A K PARTITION
+///
+/// **THE SEED IS `DeviceTuning::qmv_rows_packs`, AND IT IS PROVEN AT THE BIT
+/// LEVEL.** `linear::quant::act_x_wt`'s vector arm is two kernels, not one:
+/// `affine_qmv_fast` — `qmv_fast_impl`'s only stamp, at `packs_per_thread = 2`
+/// — and `affine_qmv_rows` at [`DeviceTuning::qmv_rows_packs`], which is 1 on
+/// this machine. The pack width is how k is dealt out to a simdgroup's
+/// thirty-two lanes (`block_size = pack_factor * packs_per_thread *
+/// SIMD_SIZE`), so the two points compute the same products in a different
+/// thirty-two partial sums. `qmv_rows_fold` offers a rung that DIVIDES the
+/// batch, so which of the two runs is a fact about the fire's row count with
+/// no crossover anywhere to see it by:
 ///
 /// ```text
-///                              max |Δ| logit   cosine        token gate
-///   a4b, fp16_qmm = false        0.00000       1.000000000   8 of 8
-///   gemma4-31b, fp16_qmm on      0.39 – 1.38   0.99866 …     8 of 8
-///   a4b,        fp16_qmm on      0.84 – 6.59   0.99825 …     2 of 8
+///   gemma-4-26b-a4b, four IDENTICAL lanes against the same lane alone,
+///   worst |delta| over the logit row, by decode step
+///
+///     width 1   0.0000  0.0000  0.0000  0.0000 ...   the one-row point
+///     width 2   0.0000  2.4062  8.4141  2.1875 ...   the fold, r=2 p=1
+///     width 3   0.0000  0.0000  0.0000  0.0000 ...   no rung divides three
+///     width 4   0.0000  2.4062  8.4141  2.1875 ...   the fold, r=2 p=1
 /// ```
 ///
-/// The first row is the finding: with the FP16 staged GEMM off, a batched
-/// fire and a solo fire of this model agree **BIT FOR BIT**, every logit of
-/// every lane. So nothing about eight lanes is wrong — the window, the page
-/// table, the mask and the kv extents are all exact, which is the list
-/// [`batching_is_polymorphic`] exists to separate.
+/// One and three are bit-identical to the solo fire and two and four are not,
+/// which is `qmv_rows_fold`'s divisibility rule and nothing else. Both of the
+/// boot document lines that take the second arm away —
+/// `PIE_PROBE_TUNING=qmv_rows_packs=2` (fold at the one-row point's own
+/// partition) and `qmv_rows_max=1` (no fold at any width) — make all four
+/// widths **0.0000 at every step**, bit for bit.
 ///
-/// What differs is which GEMM ran. A solo decode is one row and takes the
-/// GEMV; eight lanes is eight rows, which is past
-/// [`DeviceTuning::qmm_min_batch`] — and the arm it crosses into
-/// dequantizes the 4-bit affine bank to `half` (11 mantissa bits) where the
-/// GEMV and the plain stamped GEMM dequantize it to `bfloat` (8). Those are
-/// different functions of the same weights at the third decimal place, and
-/// the second row above says the shell ALREADY carries that difference on a
-/// model in the catalog: gemma4-31b's batched logits sit up to 1.38 away
-/// from its own solo logits and clear the gate on the width of its margins
-/// rather than on agreement.
+/// At the kernel, `affine_floor::the_folded_vector_point_lands_the_one_row_bits`
+/// measures the seed itself: at `packs = 2` the fold lands the one-row point's
+/// bits exactly, and at `packs = 1` **one element in eight thousand parts by
+/// one bfloat16 ulp**. This checkpoint lands about eight hundred thousand dense
+/// projection elements a decode row — 552k over the thirty layers and 262k more
+/// at the lm head — and routes eight of 128 experts on them thirty times over,
+/// so a handful of ulps become a different expert and then a different token.
 ///
-/// **THIS MODEL IS THE FIRST ONE HERE THAT AMPLIFIES IT.** Its router picks
+/// # THE GATE, AND WHERE IT NOW STANDS
+///
+/// ```text
+///   lanes  tuning                                  agree   aggregate tok/s
+///       4  stock                                   2 of 4            129.2
+///       4  qmv_rows_packs=2                        4 of 4            114.5
+///       8  qmv_rows_packs=2                        2 of 8            166.6
+///       8  qmm_min_batch=999,qmv_rows_packs=2      8 of 8            123.6
+/// ```
+///
+/// **Four lanes is bit-exact for one boot document line, and eight lanes is
+/// bit-exact for two.** The second line is the tile: at eight rows `m` clears
+/// `qmm_min_batch` and the fire takes the stamped GEMM where the solo fire
+/// takes the vector point, and those two are a different computation rather
+/// than a different order (`act_x_wt`'s own header, and the owner's ruling
+/// that waives it). So the residual red at eight lanes is the ruled-acceptable
+/// ladder crossing, amplified by this row's router; the red at four was not,
+/// because nothing was supposed to switch there at all.
+///
+/// **THIS ROW STAYS `#[ignore]`d** because the default ladder is the fast one
+/// (campaign ruling: fast ladders default, deterministic knob opt-in) and this
+/// gate asks for bit-level agreement that the default does not promise. What
+/// changed is that the knob which buys it is now named, printed by
+/// [`resolved`], and measured.
+///
+/// # IT IS NOT A WINDOW, A PAGE TABLE OR A KV EXTENT
+///
+/// The suspicion this doc used to hold open is dead, and each half was
+/// measured rather than argued:
+///
+///   * **the slot is not the seat.** The same prompt fired ALONE in slots 0,
+///     1, 2 and 3 lands bit-identical logits at every step, so no page table
+///     row, no `last_page_len` and no write offset is lane-indexed wrong;
+///   * **a lane does not read its neighbours.** Four identical lanes in one
+///     fire are bit-identical to each other at every step; and lane 0's row in
+///     a four-lane fire is the same beside three copies of itself as it is
+///     beside three prompts of three different lengths, so nothing crosses
+///     between lanes and no extent is taken from the widest;
+///   * **and the signature is arithmetic, not geometry.** A window read at the
+///     wrong row does not switch itself off at three lanes and back on at
+///     four.
+///
+/// # IT IS NOT THE DEQUANTIZATION WIDTH EITHER, AND THIS DOC USED TO SAY IT WAS
+///
+/// The sentence this replaces said the arm an eight-lane fire crosses into
+/// "dequantizes the 4-bit affine bank to `half` (11 mantissa bits) where the
+/// GEMV and the plain stamped GEMM dequantize it to `bfloat` (8)", and
+/// concluded that "the honest fix is to make ONE dequantization width serve
+/// every arm". **It is wrong twice, and the fix it asks for is the state the
+/// tree is already in.** `.wiki/macos-bench.md` §22 is the measurement:
+///
+///   * **The GEMV does not dequantize at bfloat.** It never materializes a
+///     weight at sixteen bits at all — `quant_qmv.metal` is
+///     `typedef float U` with `qdot<U, ...>` throughout, and
+///     `quant_qmv_rows.metal`'s fold is `qdot_staged<U = float>`.
+///   * **Neither does the plain stamped GEMM.** `affine_qmm_t_aligned` calls
+///     `qmm_t_aligned_half_impl` — `threadgroup half`, loader `D = half` —
+///     not the bfloat `qmm_t_aligned_impl` beside it in the same file, whose
+///     one caller is `affine_qmm_t_routed`.
+///
+/// So `half` ALREADY serves every tile arm this ladder can pick, and the
+/// vector point is wider still; `affine_floor`'s fingerprint matrix gates
+/// exactly that and is green. There was never a width to unify here.
+///
+/// **AND REMOVING EVERY WIDTH DIFFERENCE DOES NOT FIX THIS TEST.** Pinning
+/// the whole quantized ladder to the vector point — `qmm_min_batch`,
+/// `qmm_min_batch_moe` and `qmm_min_batch_emulated` all at 999, so the solo
+/// fire and the eight-lane fire run ONE kernel at ONE f32 dequantization,
+/// prefill and lm head included — still fails, and by MORE than stock. At
+/// `a17481707`, eight lanes, medians of three and bit-reproducible across
+/// them:
+///
+/// ```text
+///   arm                                ms/fire   agree   worst non-tie parting
+///   stock                                48.36   2 of 8   0.375
+///   no tile anywhere (GEMV, f32)         58.28   3 of 8   1.375
+///   fp16_qmm=false, tile forced at 8     50.63   3 of 8   1.0
+/// ```
+///
+/// Every matmul in this checkpoint's text path is banked — the router
+/// included; the only unquantized `language_model` tensors in the snapshot
+/// are layernorms.
+///
+/// **AND THAT MIDDLE ROW IS WHERE THE HUNT WENT WRONG, BECAUSE "ONE KERNEL"
+/// WAS NEVER TRUE.** "The vector point" is two kernels selected by the fire's
+/// row count, and `qmm_min_batch = 999` pins neither of them: it sends the
+/// solo fire to `affine_qmv_fast` at two packs and the eight-lane fire to
+/// `affine_qmv_rows` at one, which is a different k partition. So the arm that
+/// was read as "one kernel on both sides of the comparison" had the seed in
+/// it, still, and untiled — which is exactly why it came out WORSE than stock
+/// rather than clean. Adding the one line that arm was missing closes it:
+///
+/// ```text
+/// PIE_PROBE_SKUS=a4b PIE_PROBE_LANES=8 \
+/// PIE_PROBE_TUNING=qmm_min_batch=999,qmm_min_batch_emulated=999,qmv_rows_packs=2 \
+/// cargo test -p engine-metal --release --test throughput_probe \
+///     gemma4_26b_a4b_decodes -- --ignored --nocapture
+///
+///   -> 8 of 8 lanes said token for token what they say alone
+/// ```
+///
+/// At four lanes the tile never fires at all (`m = 4` is under
+/// `qmm_min_batch = 5`), so `qmv_rows_packs=2` alone is the whole of it and
+/// the gate reads 4 of 4.
+///
+/// The dense control says the same from the other side: gemma4-31b is **8 of
+/// 8 in BOTH arms**, three runs each, tightest decided step won by 0.1250 in
+/// both — turning the width knob neither improved its agreement nor moved
+/// its margin, and cost 3.1% of its decode and 20.9% of its prefill.
+///
+/// # The router still amplifies — but not this
+///
+/// **THIS MODEL IS THE FIRST ONE HERE THAT AMPLIFIES ANYTHING.** Its router picks
 /// eight of 128 experts by top-k, which is a DISCONTINUOUS function of the
 /// residual stream: a difference too small to see in a logit is enough to
 /// swap the eighth expert, and that layer's routed branch is then a
@@ -1358,26 +1639,46 @@ fn gemma4_31b_decodes_on_many_lanes_at_once() {
 /// gpt-oss picks four of 32, qwen35-a3b eight of 256 beside a shared expert
 /// that carries most of the FFN — and both clear the gate.
 ///
-/// So the red is a `kernels-metal` numerics finding about
-/// `affine_qmm_t_fp16_precast` and the `qmm_min_batch` default, not a fact
-/// about `gemma_4`, and fixing it is a decision that moves every model's
-/// numbers (the honest fix is to make ONE dequantization width serve every
-/// arm). Behind `#[ignore]` rather than left failing so the ladder stays
-/// runnable by name:
+/// **AND WHAT IT AMPLIFIES IS NOW KNOWN**: one `bfloat16` ulp in one dense
+/// projection element in eight thousand, from the pack width above. The
+/// amplifier is not the defect and never was — gemma4-31b runs the same fold
+/// at the same pack width and is 8 of 8, because a dense stack has nothing to
+/// turn an ulp into an expert. Behind `#[ignore]` rather than left failing so
+/// the ladder stays runnable by name:
 ///
 /// ```text
 /// PIE_PROBE_SKUS=a4b cargo test -p engine-metal --release \
 ///     --test throughput_probe gemma4_26b_a4b -- --ignored --nocapture
 /// ```
 ///
-/// and it passes whole under
-/// `PIE_PROBE_TUNING=fp16_qmm=false`.
+/// # `fp16_qmm = false` was never a workaround, and never a unification
+///
+/// This doc used to carry `a4b, fp16_qmm = false -> 0.00000 max |delta|,
+/// cosine 1.000000000, 8 of 8` and read it as the width fix working. That
+/// flag sends [`DeviceTuning::qmm_min_batch`] through its `!fp16_gemm` door,
+/// which answers `qmm_min_batch_emulated = 12` against the stock 5 — and
+/// eight rows is under twelve, so **it stopped the tile firing**, and a
+/// comparison whose two halves are both the vector point is bit-exact for a
+/// reason that has nothing to do with dequantization. Forcing the tile at
+/// eight rows under that flag is the third row of the table above: 3 of 8.
+/// `.wiki/macos-bench.md` §20e's retraction — 6 of 16 against stock's 7 at
+/// sixteen lanes, where the crossover no longer hides the tile, at 1.8% of
+/// the decode — is the same fact one rung up. The timings §20e reports are
+/// the stock arm for that reason.
+///
+/// **`qmm_min_batch_moe` IS INERT**, whatever [`resolved`] prints beside it:
+/// the only caller of `qmm_min_batch(routed, fp16_gemm)` is
+/// `linear::quant::act_x_wt`, which passes `routed: false` unconditionally.
+/// Do not reason from the "moe 8" in this file's own tuning line.
 ///
 /// [`DeviceTuning::qmm_min_batch`]: kernels_metal::tuning::DeviceTuning::qmm_min_batch
+/// [`DeviceTuning::qmv_rows_packs`]: kernels_metal::tuning::DeviceTuning::qmv_rows_packs
 #[test]
-#[ignore = "the FP16 staged GEMM's dequantization width, amplified by a \
-            128-expert top-k router — see this test's own doc for the \
-            measurement and the reproduction"]
+#[ignore = "a lane's tokens depend on the crowd on this model, and the seed is \
+            the vector point's PACK WIDTH: `qmv_rows_packs=2` makes four lanes \
+            bit-exact and, with the tile pinned off, eight lanes 8 of 8. The \
+            default ladder does not promise that. See this test's own doc and \
+            `.wiki/macos-bench.md` §23"]
 fn gemma4_26b_a4b_decodes_on_many_lanes_at_once() {
     probe(&GEMMA4_A4B);
 }
@@ -1386,4 +1687,18 @@ fn gemma4_26b_a4b_decodes_on_many_lanes_at_once() {
 #[test]
 fn qwen36_35b_a3b_decodes_on_many_lanes_at_once() {
     probe(&QWEN_A3B);
+}
+
+/// **THE DSV4 2-BIT MINIATURE**, opt-in: `PIE_PROBE_SKUS=dsv4u2`. See
+/// [`DSV4_U2`] for why this row's table has no llama.cpp or mlx-lm column.
+#[test]
+fn dsv4_flash_two_bit_decodes_on_many_lanes_at_once() {
+    probe(&DSV4_U2);
+}
+
+/// **THE QWEN3.8 2-BIT MINIATURE**, opt-in: `PIE_PROBE_SKUS=qwen38u2`. See
+/// [`QWEN38_U2`].
+#[test]
+fn qwen38_flash_two_bit_decodes_on_many_lanes_at_once() {
+    probe(&QWEN38_U2);
 }

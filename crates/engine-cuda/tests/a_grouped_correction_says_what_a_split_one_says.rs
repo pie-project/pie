@@ -58,8 +58,8 @@
 //! The region is an `Admit::Island`, and an island no longer refuses its
 //! composition: `record::cuts` cuts the body around it, the stretches on
 //! either side are captured, and the correction is re-issued by the eager walk
-//! between the execs. So the tiered arm must REPLAY (`BodyStats::hits` moves),
-//! its body must be SEGMENTED (`BodyStats::islands` is nonzero), and it must
+//! between the execs. So the tiered arm must REPLAY (`BodyTally::hits` moves),
+//! its body must be SEGMENTED (`LastCapture::islands` is nonzero), and it must
 //! still answer the eager walk's tokens exactly — the identity being the
 //! load-bearing half, because the island is precisely the stretch a segmented
 //! body could get wrong.
@@ -176,7 +176,7 @@ fn budget(seats: u32) -> Budget {
 /// The lane word the model's own `Classify` computes — the three facts this
 /// composition varies, and no second opinion about any of them.
 fn word(query_len: u32, adapted: bool, captures: bool) -> u64 {
-    model::qwen_3::forward::Facts::of(
+    models::qwen_3::forward::Facts::of(
         &Request::new(query_len, false)
             .adapted(adapted)
             .capturing_scores(captures),
@@ -405,7 +405,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let seats = trace
         .params
         .iter()
@@ -414,7 +414,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         .min()
         .expect("the SKU declares adapter banks");
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
 
@@ -476,7 +476,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         ordinal: 0,
         graphs: Graphs::Off,
         knobs,
-        program_cache_dir: None,
+        cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.
@@ -565,7 +565,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
     // is what says a fire found its body and launched it.
     let stats = shell.body_stats();
     assert!(
-        stats.hits >= 1,
+        stats.tally.hits >= 1,
         "{what}: a fire of this composition replayed nothing. Its correction \
          window is an island the body is cut around, not a refusal: {stats}",
     );
@@ -574,7 +574,7 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
     // or `r` windows under an op that reads no seat start — which is the
     // corruption `Windows::admits` exists to refuse.
     assert!(
-        stats.islands >= 1,
+        stats.last_capture.islands >= 1,
         "{what}: the body that served this composition holds no island, so the \
          correction's window reached a graph: {stats}",
     );

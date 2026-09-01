@@ -189,5 +189,9 @@ if __name__ == "__main__":
     run_tests(
         [test_trackb_crossover],
         "Track B crossover benchmark",
-        requires=("attn_score", "attn_page_mask"),
+        # attn_score only: every inferlet here enforces through the mask door
+        # (KvGeometry.mask -> Port::AttnMask), not the attn_page_mask sink --
+        # gating on the sink skipped this bench before booting for a
+        # capability it never uses (.wiki/alto/attn-score.md section 7).
+        requires=("attn_score",),
     )

@@ -81,6 +81,18 @@ half = "2"
 # zstd-sys, whose build script is the single most expensive C compile in the
 # tree. It stays on under `[dev-dependencies]`, where a test needs to *write*
 # a compressed part to prove the refusal.
+# One call: `statvfs`, for `file/emit.rs`'s free-space refusal. The paragraph
+# above says this crate is `dtype`, `half`, `ztensor`, `serde` and `thiserror`
+# in every configuration, and this is the one addition to that list. It is
+# `engine-cuda/src/weight_cache.rs`'s own reasoning -- free space is one
+# `statvfs` and a multiply, and the standard library has no answer for it at
+# all -- and it is
+# a leaf with no build script, no toolkit and no platform beyond the unix this
+# crate already reads files on, so nothing about the toolkit-free build
+# changes. The span door of the serving reader needed no such thing: it maps
+# through `ztensor`'s own store, which is the same twelve lines this crate
+# would otherwise have written.
+libc = "0.2"
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true, features = [
     "safetensors",

@@ -11,7 +11,7 @@
         256
       ],
       "encoding": {
-        "Raw": "BF16"
+        "Raw": "bf16"
       }
     },
     {
@@ -23,7 +23,7 @@
         256
       ],
       "encoding": {
-        "Raw": "BF16"
+        "Raw": "bf16"
       }
     },
     {
@@ -43,11 +43,11 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null,
-          "scale_dtype": "BF16",
+          "scale_dtype": "bf16",
           "zero_point_dtype": null,
           "block_shape": []
         }
@@ -70,11 +70,11 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null,
-          "scale_dtype": "BF16",
+          "scale_dtype": "bf16",
           "zero_point_dtype": null,
           "block_shape": []
         }
@@ -97,11 +97,11 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null,
-          "scale_dtype": "BF16",
+          "scale_dtype": "bf16",
           "zero_point_dtype": null,
           "block_shape": []
         }
@@ -124,11 +124,11 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null,
-          "scale_dtype": "BF16",
+          "scale_dtype": "bf16",
           "zero_point_dtype": null,
           "block_shape": []
         }
@@ -151,11 +151,11 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null,
-          "scale_dtype": "BF16",
+          "scale_dtype": "bf16",
           "zero_point_dtype": null,
           "block_shape": []
         }
@@ -178,11 +178,11 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null,
-          "scale_dtype": "BF16",
+          "scale_dtype": "bf16",
           "zero_point_dtype": null,
           "block_shape": []
         }
@@ -205,11 +205,11 @@
       "encoding": {
         "Quant": {
           "scheme": "AwqInt4",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": null,
-          "scale_dtype": "BF16",
+          "scale_dtype": "bf16",
           "zero_point_dtype": null,
           "block_shape": []
         }
@@ -224,7 +224,7 @@
         256
       ],
       "encoding": {
-        "Raw": "BF16"
+        "Raw": "bf16"
       }
     },
     {
@@ -236,7 +236,7 @@
         256
       ],
       "encoding": {
-        "Raw": "BF16"
+        "Raw": "bf16"
       }
     }
   ]

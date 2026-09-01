@@ -69,10 +69,7 @@ use model_ir::Dtype;
 
 use checkpoint::error::Error;
 use checkpoint::executor::arena::{ArenaBacking, TileMapOp};
-use checkpoint::plan::passes::tile::{
-    CUDA_CAST_FP32_TO_BF16, CUDA_QUANTIZE_BF16_TO_FP8, CUDA_QUANTIZE_BF16_TO_MXFP4,
-    CUDA_SCALE_ROWS_BF16,
-};
+use checkpoint::plan::passes::tile::{CUDA_CAST_FP32_TO_BF16, CUDA_SCALE_ROWS_BF16};
 
 /// How much pinned host memory one staging slot holds, absent a
 /// caller-stated budget. Only a ceiling: [`CudaArena::new`] pins the
@@ -416,8 +413,9 @@ impl ArenaBacking for CudaArena {
         match op.kernel {
             CUDA_CAST_FP32_TO_BF16 => self.cast(op),
             CUDA_SCALE_ROWS_BF16 => self.scale(op),
-            CUDA_QUANTIZE_BF16_TO_MXFP4 => self.encode_mxfp4(op),
-            CUDA_QUANTIZE_BF16_TO_FP8 => self.encode_fp8(op),
+            // **AND TWO QUANTIZE ROWS STOOD HERE** — bf16 to MXFP4 and bf16
+            // to FP8, the load-time encode §M-3 shut. The table is the two
+            // rows a serving load still needs: a cast and a row scale.
             other => Err(Error::Contract(format!(
                 "the plan names kernel `{other}`, which this build has no \
                  launcher for"
@@ -503,72 +501,12 @@ impl CudaArena {
         declined(CUDA_SCALE_ROWS_BF16, fired)
     }
 
-    /// `quant::quantize_bf16_to_mxfp4_e2m1_per_block`: `w.rows` sizes the
-    /// grid, `w.width` is read directly by the packer. The device text
-    /// divides `cols` into 32-element groups internally -- exact, since the
-    /// plan has already refused a `cols` that is not a whole number of them.
-    ///
-    /// The two destinations are HALF-WIDTH and GROUP-WIDTH, and they are
-    /// stated rather than derived: `packed` holds two e2m1 codes per byte
-    /// (`cols / 2`), `scales` one e8m0 byte per 32-element group
-    /// (`cols / 32`). Both travel as `U8` because that is what the bank
-    /// convention on the other side reads them as (`linear::moe`
-    /// debug-asserts exactly that of an mxfp4 bank's two planes); the byte
-    /// content is what the dtype would have named anyway.
-    fn encode_mxfp4(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
-        let (rows, cols) = self.extent_2d(op)?;
-        let scales = self.encode_scales(op)?;
-        let w = Tensor::new(self.device_ptr(op.src.offset), rows, cols, Dtype::Bf16);
-        let mut packed = Tensor::new(self.device_ptr(op.dst.offset), rows, cols / 2, Dtype::U8);
-        let mut scale_bytes =
-            Tensor::new(self.device_ptr(scales.offset), rows, cols / 32, Dtype::U8);
-        let fired = quant::quantize_bf16_to_mxfp4_e2m1_per_block(
-            &self.ctx(),
-            w,
-            &mut packed,
-            &mut scale_bytes,
-        );
-        declined(CUDA_QUANTIZE_BF16_TO_MXFP4, fired)
-    }
-
-    /// `quant::quantize_bf16_to_fp8_e4m3_per_channel`: a per-row absmax
-    /// reduction, `Launch::per_row(rows, 256)` with 32 bytes of shared memory
-    /// sized to that fixed block width; `w.width` stays an operand the
-    /// reduction does not otherwise need.
-    ///
-    /// ONE `f32` INVERSE SCALE PER ROW, and the entry debug-asserts the
-    /// dtype: `[rows, 1]`, `Dtype::F32`.
-    fn encode_fp8(&mut self, op: &TileMapOp<'_>) -> Result<(), Error> {
-        let (rows, cols) = self.extent_2d(op)?;
-        let scales = self.encode_scales(op)?;
-        let w = Tensor::new(self.device_ptr(op.src.offset), rows, cols, Dtype::Bf16);
-        let mut fp8 = Tensor::new(self.device_ptr(op.dst.offset), rows, cols, Dtype::E4m3);
-        let mut scale_inv = Tensor::new(self.device_ptr(scales.offset), rows, 1, Dtype::F32);
-        let fired =
-            quant::quantize_bf16_to_fp8_e4m3_per_channel(&self.ctx(), w, &mut fp8, &mut scale_inv);
-        declined(CUDA_QUANTIZE_BF16_TO_FP8, fired)
-    }
-
     /// The 2-D extent every row above takes, in the plan's own units.
     /// An `Err` rather than a decline: the plan chose a row that needs
     /// a shape, so its absence here means the two disagree.
     fn extent_2d(&self, op: &TileMapOp<'_>) -> Result<(u32, u32), Error> {
         op.shape
             .ok_or_else(|| plan_disagrees("the row takes a 2-D extent"))
-    }
-
-    /// `Encode`'s second destination, bounds-checked along with the first.
-    fn encode_scales(
-        &self,
-        op: &TileMapOp<'_>,
-    ) -> Result<checkpoint::executor::arena::ArenaSpan, Error> {
-        let scales = op
-            .dst_scales
-            .ok_or_else(|| plan_disagrees("an Encode publishes payload AND scales"))?;
-        self.bounds(op.src.offset, op.src.len)?;
-        self.bounds(op.dst.offset, op.dst.len)?;
-        self.bounds(scales.offset, scales.len)?;
-        Ok(scales)
     }
 }
 
@@ -605,10 +543,7 @@ fn declined(symbol: &str, fired: Result<(), kernels_cuda::Error>) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use checkpoint::plan::passes::tile::{
-        CUDA_CAST_FP32_TO_BF16, CUDA_QUANTIZE_BF16_TO_FP8, CUDA_QUANTIZE_BF16_TO_MXFP4,
-        CUDA_SCALE_ROWS_BF16,
-    };
+    use checkpoint::plan::passes::tile::{CUDA_CAST_FP32_TO_BF16, CUDA_SCALE_ROWS_BF16};
 
     /// Every symbol the compiler may name is a PATH this build calls.
     ///
@@ -628,20 +563,16 @@ mod tests {
     /// registry the routine layer carried. The registry is deleted; the
     /// question it was asked survives, and the compiler answers more of it.
     ///
-    /// ALL FOUR ARE CHECKED NOW, where two used to be. The other two were
-    /// exempted as "not launches at all — plain `unsafe fn`s whose names the
-    /// COMPILER checks at `encode_mxfp4`/`encode_fp8`". Both halves of that
-    /// went away with the rewrite: the quantisers are ordinary safe entries
-    /// that fire through `Ctx` like the other two, and the four constants are
-    /// uniformly the LOADER's own vocabulary — the word a plan carries from
-    /// `tile` to this file's dispatch, resolved against no registry
-    /// anywhere. So they all get the same one-line binding.
+    /// **IT CHECKED FOUR AND CHECKS TWO** (§M-3). The other two were the
+    /// quantisers — bf16 to MXFP4 and bf16 to FP8 — and they went with the
+    /// load-time encode door: no device mask carries an encode, so no plan
+    /// can name their words, and a build with no launcher for a word no plan
+    /// carries has nothing to drift from.
     ///
     /// THE STRINGS SAY `quant::`, THE PATHS SAY `linear::quant::`, AND THAT
     /// IS DELIBERATE. The entries moved namespace when the kernel plane was
-    /// re-cut; the strings did not, because one of them is written into a
-    /// checked-in plan (`tests/golden/llama_dense_cuda_runtime_fp8.json`) and
-    /// a plan's kernel word is a name this crate owns, not a Rust path it
+    /// re-cut; the strings did not, because a plan's kernel word is a name
+    /// this crate owns and writes into checked-in goldens, not a Rust path it
     /// mirrors. The macro therefore takes the path and the spelling
     /// separately, and this test is what holds them to each other.
     #[test]
@@ -656,13 +587,5 @@ mod tests {
         }
         assert_eq!(CUDA_CAST_FP32_TO_BF16, spelled!(quant::cast_fp32_to));
         assert_eq!(CUDA_SCALE_ROWS_BF16, spelled!(quant::scale_rows));
-        assert_eq!(
-            CUDA_QUANTIZE_BF16_TO_MXFP4,
-            spelled!(quant::quantize_bf16_to_mxfp4_e2m1_per_block)
-        );
-        assert_eq!(
-            CUDA_QUANTIZE_BF16_TO_FP8,
-            spelled!(quant::quantize_bf16_to_fp8_e4m3_per_channel)
-        );
     }
 }

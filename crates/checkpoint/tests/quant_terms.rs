@@ -194,6 +194,20 @@ fn the_mlx_row_has_one_truth_and_two_doors() {
         Some(Dtype::U4g32.repr()),
         "a row too narrow for 64 is the same scheme, the other spec field over"
     );
+    // THE THIRD WIDTH IS A DOOR TOO. The DQ stacks quantize their expert
+    // banks to two bits at three groups, and each of the three is a `Dtype`
+    // the engine lands. A width missing here is not a narrower answer: it is
+    // `term()` answering `None`, which is `affine_point()` answering `None`,
+    // which is `engine-metal` refusing the bank for carrying scale factors
+    // with nothing to be factors of.
+    for (group, d) in [(32, Dtype::U2g32), (64, Dtype::U2g64), (128, Dtype::U2g128)] {
+        assert_eq!(
+            sized(scheme, 2, group).term().as_ref(),
+            Some(d.repr()),
+            "MlxAffineU4 at two bits and {group} is what {d:?} names"
+        );
+        assert_eq!(sized(scheme, 2, group).affine_point(), Some((group, 2)));
+    }
 }
 
 /// **SERVED IS `of_fmt` SAYING SO.** The bridge's terms fall in two piles:

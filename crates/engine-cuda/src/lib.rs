@@ -124,6 +124,7 @@ mod error;
 /// budget decides, the pinned host copy of every expert, the device slab of a
 /// few of them, and the indirection table that lets a captured graph read
 /// either without knowing which.
+pub mod checkpoint_serving;
 pub mod experts;
 pub mod exports;
 pub mod inputs;
@@ -364,7 +365,7 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 /// the safe direction: an op wrongly absent costs a body that could have been
 /// replayed, and an op wrongly present costs the right number of rows read
 /// from the wrong place, silently.
-pub const SHIFTED: [&str; 81] = [
+pub const SHIFTED: [&str; 84] = [
     // ── attention: the arms this tree owns — the linear-attention scans, the
     //    mla prologue and its naive selected engine, the index and pool
     //    readers, and the two lse folds — and, since chunk 2c-b, the five FA2
@@ -394,7 +395,7 @@ pub const SHIFTED: [&str; 81] = [
     //    fire's own and the ceiling are ones no work item is emitted for, and
     //    the payload numbers are therefore a function of the
     //    `record::BodyKey` and the load. `record::Graphs::fire_body`'s demotion stays, and what it
-    //    means has inverted: `record::BodyStats::reshapes` is an anomaly
+    //    means has inverted: `record::BodyTally::reshapes` is an anomaly
     //    counter now, and a nonzero one names a builder whose hashed image
     //    still follows the fire rather than a batch that will not sit still.
     "attention.decode",
@@ -468,7 +469,8 @@ pub const SHIFTED: [&str; 81] = [
     "layout.split_qkv",
     "layout.split_rows",
     // ── linear: the fused activations, the moe routers and folds, and the
-    //    routed bf16 select. Not the dense GEMMs — see the exclusions above.
+    //    routed selects, bf16 and packed. Not the dense GEMMs — see the
+    //    exclusions above.
     //
     //    **THE ROUTERS AND THE SELECT ARE THE MOE WAVE'S**, and between them
     //    a windowed MoE region is admissible whole: the four routers are
@@ -479,13 +481,35 @@ pub const SHIFTED: [&str; 81] = [
     //    space (`linear/moe.cuh` states the conversion, and it is the same
     //    token axis `moe_weighted_sum` folds back onto).
     //
-    //    **AND THE TWO MXFP4 SELECT NAMES STAY OFF, FOR A REASON THAT IS NOT
-    //    ABOUT THEM.** `linear.moe_matmul_select_bias` and
-    //    `linear.moe_matmul_select_quant` fire `linear/quant.cuh`, which is
-    //    not seated; a name admits ALL of its instantiations, so one unseated
-    //    kernel under a name keeps the name off. A quantized MoE's region is
-    //    therefore still refused, and what it is owed is the quant plane's own
-    //    seat and not a word here.
+    //    **AND THE TWO PACKED SELECT NAMES ARE HERE NOW, BECAUSE THE QUANT
+    //    PLANE PAID WHAT IT OWED.** `linear.moe_matmul_select_bias` and
+    //    `linear.moe_matmul_select_quant` fire `linear/quant.cuh`, whose two
+    //    select entries — `moe_matmul_select_mxfp4` and its affine twin
+    //    `moe_matmul_select_mlxu4` — were the one unseated pair under those
+    //    names, and a name admits ALL of its instantiations. Both take the
+    //    seat unconditionally now and both read the whole pair on
+    //    `moe_matmul_select`'s terms: the grid counts ROUTES, so the guard is
+    //    `win[0] * top_k` and the plane ordinal is `route + win[1] * top_k`,
+    //    and `top_k` rides beside the seat because those entries carried only
+    //    an `act_div` and could not derive it on the down leg. Their
+    //    neighbour `matmul_affine` in the same file is NOT this, and that is
+    //    the distinction the exclusion bullet above draws: it is guard-only
+    //    by design, which is why `linear.matmul` stays off. A quantized MoE's
+    //    windowed region is admissible whole.
+    //
+    //    **AND THE LOOKUP ROUTER IS THE FIFTH ROUTER ON THIS LIST.**
+    //    `linear.moe_hash_route` fires `linear/moe_route.cuh`, whose one
+    //    entry is the only router here that reads no logits: its planes are
+    //    the token ids, the routes and the weights, and the `[vocab, top_k]`
+    //    table it gathers from is a BANK, addressed by the id the ids plane
+    //    yields — the same division `layout.embed` draws between its id
+    //    stream and its table, and the reason the table does not move. Its
+    //    grid is the one thing that had to be argued: it counts (token row,
+    //    slot) PAIRS, so the seat's words are not the grid's units. But
+    //    `top_k` divides the lane index exactly, the row is `idx / top_k`,
+    //    and the guard and the shift are then stated in token rows like every
+    //    other row entry's — a weaker conversion than `moe_matmul_select`'s,
+    //    and the same one.
     "linear.mlp_geglu_tanh",
     "linear.mlp_geglu_tanh_packed",
     "linear.mlp_gelu_tanh",
@@ -494,7 +518,10 @@ pub const SHIFTED: [&str; 81] = [
     "linear.mlp_swiglu_clamp",
     "linear.mlp_swiglu_clamp_alpha",
     "linear.moe_bias_sum",
+    "linear.moe_hash_route",
     "linear.moe_matmul_select",
+    "linear.moe_matmul_select_bias",
+    "linear.moe_matmul_select_quant",
     "linear.moe_sigmoid_gate_add",
     "linear.moe_topk_sigmoid",
     "linear.moe_topk_softmax",
@@ -519,7 +546,7 @@ pub const PLANNED: [&str; 2] = ["attention.plan_decode", "attention.plan_prefill
 pub use error::{Fault, Result};
 pub use mask::{LaneMask, Staged as StagedMask};
 pub use program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
-pub use record::{BodyKey, BodyStats, Graphs as GraphCache};
+pub use record::{AxisKey, BodyCensus, BodyKey, BodyStats, BodyTally, Graphs as GraphCache, LastCapture};
 pub use run::{
     CacheGeometry, CachePlanning, CachePool, CacheTable, FireBindings, FireTables, Planning,
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
@@ -527,7 +554,8 @@ pub use run::{
 pub use api::{ContractFor, Cuda, DeviceBoot};
 pub use boot::open;
 pub use serve::{
-    Boot, DEFAULT_GPU_MEM_UTILIZATION, FireCost, Graphs, Knobs, Lane, Media, Seated, Shell,
+    Boot, DEFAULT_BODIES_MEGABYTES, DEFAULT_GPU_MEM_UTILIZATION, FireCost, Graphs, Knobs, Lane,
+    Media, Seated, Shell,
 };
 
 /// What a capturing lane's fire hands back, one entry per exported attention
@@ -540,4 +568,4 @@ pub use blob::{
     site_of,
 };
 pub use weights::{AdapterPlane, BankSeat};
-pub use window::{Cursor, Window, Windows};
+pub use window::{Cursor, Window, WindowShape, Windows};

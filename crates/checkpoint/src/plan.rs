@@ -44,8 +44,6 @@ pub const TILE_MAP_REPACK: u32 = 1 << 6;
 pub const TILE_MAP_SCALE: u32 = 1 << 7;
 pub const TILE_MAP_BIAS: u32 = 1 << 8;
 
-/// Transform chains a backend can collapse into one kernel.
-pub const FUSION_FP8_TO_MXFP4: u32 = 1 << 0;
 
 /// Compile a contract into the plan that satisfies it.
 ///
@@ -56,6 +54,58 @@ pub fn compile(
     contract: &crate::contract::ModelContract,
     target: StorageTarget,
 ) -> Result<LoadPlan> {
+    compile_through(metadata, contract, target, pass::run_all)
+}
+
+/// Compile the same contract for an execution that has **no arena** —
+/// [`Execution::streaming`](crate::executor::Execution::streaming), where
+/// every buffer is an owned allocation freed at its last use.
+///
+/// Same contract, same target, same transforms, same finalized bytes. What
+/// differs is the SCHEDULE, and only by the two passes that exist to serve an
+/// arena (see [`pass::Pass::for_arena`]):
+///
+/// ```text
+///   coalesce-persistent-arena-writes  emits `BulkExtentWrite`, which
+///                                     addresses an arena by offset and which
+///                                     a streaming execution refuses outright
+///   hoist-bulk-arena-writes           pulls every `Allocate` to the head of
+///                                     the schedule, which makes "freed at its
+///                                     last use" free nothing until the whole
+///                                     model is live at once
+/// ```
+///
+/// **THE TARGET IS NOT WEAKENED TO SAY THIS.** Compiling against
+/// [`BackendKind::Unknown`] would also suppress the coalescing — that is what
+/// the pass's own guard tests — but it would change `tile_map_mask`,
+/// `fusion_mask` and `encode_scratch_dtype` with it, which is a different
+/// lowering and therefore possibly different bytes. A caller streaming a
+/// device load wants the device's plan and the host's memory shape, which is
+/// this: the backend it names, minus two schedule rewrites.
+///
+/// **AND IT IS NOT A KEY.** The plan a warm-cache identity hashes is the one
+/// [`compile`] returns; this one is compiled beside it, executed, and dropped.
+/// Nothing downstream may hash it, because a plan that differed by how its
+/// caller intends to run it would make the same deployment key two ways.
+///
+/// # Errors
+///
+/// As [`compile`].
+pub fn compile_streaming(
+    metadata: &crate::file::Metadata,
+    contract: &crate::contract::ModelContract,
+    target: StorageTarget,
+) -> Result<LoadPlan> {
+    compile_through(metadata, contract, target, pass::run_arenaless)
+}
+
+/// The pipeline both entry points are, over the pass list each one names.
+fn compile_through(
+    metadata: &crate::file::Metadata,
+    contract: &crate::contract::ModelContract,
+    target: StorageTarget,
+    passes: fn(&mut LoadPlan) -> Result<Vec<pass::PassStats>>,
+) -> Result<LoadPlan> {
     let rewritten =
         crate::contract::rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
     let mut plan = build::build(metadata, &rewritten, target.clone())?;
@@ -63,10 +113,15 @@ pub fn compile(
     // observable in a state where its tiling, fusion and kernel fields are
     // still placeholders — and the validators after it get to see what it
     // decided.
-    plan.passes = pass::run_all(&mut plan)?;
+    plan.passes = passes(&mut plan)?;
     // Compiled from the *unrewritten* contract, because `groups` is not what
     // the row-shard rewrite looks at; each group is rewritten on its own inside
     // `group::compile_all`, where the sub-contract it applies to exists.
+    //
+    // ALWAYS THE WHOLE PIPELINE, whichever one ran above: a group plan is a
+    // self-contained program the ENGINE runs against a destination of its own
+    // choosing, never this load's arena, so how this load intends to execute
+    // the resident schedule says nothing about it.
     plan.groups = group::compile_all(metadata, contract, &target)?;
     Ok(plan)
 }
@@ -121,30 +176,6 @@ pub struct StorageTarget {
     pub preferred_alignment: u32,
     pub tile_map_mask: u32,
     pub native_mxfp4_moe: bool,
-    /// Which fused transform chains the backend has kernels for.
-    ///
-    /// A capability, not a preference: the engine both knows whether the fused
-    /// kernels are built and owns the opt-out that used to be
-    /// `PIE_CUDA_DISABLE_FUSED_TRANSCODE`. Reading it here rather than in the
-    /// executor is what makes the choice part of the plan, and therefore part
-    /// of the plan hash (`architecture.md` §8.1).
-    pub fusion_mask: u32,
-    /// The dtype this target's encode kernels dequantize *through*.
-    ///
-    /// An Encode that does not have a direct kernel goes source → scratch →
-    /// destination, and the scratch width is what decides how many rows fit in
-    /// the tile budget. CUDA's is BF16. It is a device fact — it is which
-    /// kernels were compiled — so it is stated, not assumed.
-    pub encode_scratch_dtype: DType,
-    /// Row granularity of the block scales this target's encode path consumes,
-    /// or `0` if it has none.
-    ///
-    /// A block-scaled source carries one scale per `[block_scale_rows, N]`
-    /// tile, so slicing the dequant by an arbitrary row count would cut a scale
-    /// block in half. Rather than round the tile down to a multiple — which
-    /// would be a second rule to keep in sync with the kernel — such a source is
-    /// simply not tiled.
-    pub block_scale_rows: u32,
 }
 
 impl StorageTarget {
@@ -165,10 +196,13 @@ impl StorageTarget {
     /// lands: it decides which plans compile, and it owns the host fallback
     /// every claimed transform has to have.
     ///
-    /// The fields NOT here are the ones a caller genuinely varies:
-    /// `native_mxfp4_moe` and `fusion_mask` are per-request capabilities, and
-    /// `block_scale_rows` belongs to an encode path. Each starts at the
-    /// conservative answer and is set by the caller that knows better.
+    /// The field NOT set from the backend is the one a caller genuinely
+    /// varies: `native_mxfp4_moe` is a per-request capability, starting at
+    /// the conservative answer and set by the caller that knows better.
+    /// `fusion_mask`, `encode_scratch_dtype` and `block_scale_rows` stood
+    /// beside it and were an ENCODE PATH's three numbers; §M-3 shut that
+    /// door, and a field only a dead lowering ever read is not a target
+    /// fact.
     #[must_use]
     pub fn for_backend(backend: BackendKind, tp_rank: u32, tp_size: u32) -> Self {
         Self {
@@ -188,12 +222,6 @@ impl StorageTarget {
             // work this tree did not port. An engine whose GEMM reads the stored
             // banks directly wants the other branch, which is this one.
             native_mxfp4_moe: false,
-            // No fused transcode kernels in this tree.
-            fusion_mask: 0,
-            // The dtype the encode kernels dequantize through, which decides
-            // how many rows of scratch fit in the tile budget.
-            encode_scratch_dtype: DType::Bf16,
-            block_scale_rows: 0,
         }
     }
 }
@@ -208,9 +236,6 @@ impl Default for StorageTarget {
             preferred_alignment: 1,
             tile_map_mask: HOST_TILE_MAP_MASK,
             native_mxfp4_moe: false,
-            fusion_mask: 0,
-            encode_scratch_dtype: DType::Bf16,
-            block_scale_rows: 0,
         }
     }
 }
@@ -400,29 +425,6 @@ impl TileMapKind {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TileSpec {
     pub max_tile_bytes: u64,
-    /// Rows of the output the engine transforms per launch; `0` means the whole
-    /// tensor in one pass.
-    ///
-    /// A *decision*, unlike `max_tile_bytes`, which is only a budget. The engine
-    /// used to turn the budget into a row count while executing
-    /// (`transcode_engine.hpp::encode_rows_per_tile`), which left the plan
-    /// silent about how it would actually run. Filled in by
-    /// [`crate::plan::passes::tile::lower`].
-    pub rows_per_tile: u32,
-}
-
-/// A transform chain the backend collapsed into one kernel.
-///
-/// Recorded rather than inferred: fusing FP8 → MXFP4 skips a BF16 round-trip
-/// through HBM, and while it is bit-identical to the two-step path, it is a
-/// different kernel sequence. A plan that does not say which one it means
-/// cannot claim to determine execution (`architecture.md` §8.1).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TransformFusion {
-    #[default]
-    None,
-    /// Encode an FP8 source directly to MXFP4.
-    Fp8ToMxfp4,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -436,7 +438,6 @@ pub struct TransformSpec {
     /// standing for that is a value every reader has to know to disbelieve.
     pub repack: Option<RepackSpec>,
     pub scratch_bytes: u64,
-    pub fusion: TransformFusion,
     /// The checkpoint tensor holding this transform's *input* block scales.
     ///
     /// A block-scaled FP8 source is two tensors on disk: the payload and a
@@ -539,6 +540,30 @@ pub enum StorageInstr {
         source: SourceExtent,
         dest_offset: u64,
     },
+    /// The gather lowering: read `source` whole, permute it block by block on
+    /// the way through, write `dest` dense.
+    ///
+    /// The one instruction whose source and destination are the same bytes in
+    /// a different order rather than the same bytes at a different address.
+    /// [`StorageInstr::ExtentWrite`] can say "skip in the source, stay dense in
+    /// the destination" — that is a shard — and it cannot say "take block 512,
+    /// then block 3, then block 1027", because an [`Extent`] is strides and a
+    /// permutation is a list. See
+    /// [`GatherList`](crate::contract::compile::GatherList) for why a list is
+    /// sometimes the only affordable spelling.
+    ///
+    /// It executes on the host, in
+    /// [`executor::walk`](crate::executor::walk), between the read and the
+    /// write that every load already does. That is not a compromise for want
+    /// of a kernel: the bytes pass through host memory on their way to any
+    /// device, the permutation is one pass over them, and the tensors that
+    /// need one are megabytes against a load measured in gigabytes.
+    GatherWrite {
+        id: InstrId,
+        source: SourceExtent,
+        dest: DestExtent,
+        gather: GatherSpec,
+    },
     TileMap {
         id: InstrId,
         kind: TileMapKind,
@@ -560,6 +585,34 @@ pub enum StorageInstr {
         tensor: BufferId,
         name: String,
     },
+}
+
+/// The table a [`StorageInstr::GatherWrite`] walks.
+///
+/// Destination block `i` of every row reads source block `indices[i]` of that
+/// row. The table is stated once and repeated over `rows`, which is what makes
+/// it small: a `[768, 1536]` element permutation is 1536 numbers, not 1.18M.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatherSpec {
+    /// Source block per destination block, in blocks. Not bytes: an index list
+    /// scaled by an element width is an index list that no longer indexes
+    /// anything.
+    pub indices: Vec<i64>,
+    /// Bytes in one block. One element's worth when the gather is on the
+    /// innermost axis, which is the case that could not be a copy list.
+    pub block_bytes: u64,
+    /// How many times the table repeats.
+    pub rows: u64,
+    /// Bytes between consecutive source rows.
+    pub src_row_bytes: u64,
+}
+
+impl GatherSpec {
+    /// Bytes between consecutive destination rows. Derived: a destination row
+    /// IS the table, and a stored copy could disagree with it.
+    pub fn dst_row_bytes(&self) -> u64 {
+        self.indices.len() as u64 * self.block_bytes
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -665,7 +718,7 @@ impl LoadPlan {
     /// a way the binding survives, so it is the one every family follows. It
     /// It is a method here rather than a helper in an engine because an engine
     /// asking the question had to spell `shared_embedding.weight` to ask it
-    /// — a name four contract authors in `crates/model` produce and no
+    /// — a name four contract authors in `crates/models` produce and no
     /// engine owns. See [`TIED_EMBEDDING_NAME`] for what this does and does
     /// not close.
     #[must_use]
@@ -825,7 +878,7 @@ impl LoadPlan {
 /// The one name a contract publishes when the embedding and the output
 /// projection are the same tensor.
 ///
-/// **This crate does not emit it.** Four contract authors in `crates/model`
+/// **This crate does not emit it.** Four contract authors in `crates/models`
 /// do — `llama_3`, `qwen_3` and `gemma_4` each `format!` it — and the
 /// dependency runs `model` → `checkpoint`, so nothing links their spelling
 /// to this one. A constant here does not fix that; what it fixes is the

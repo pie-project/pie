@@ -36,7 +36,7 @@ use alloc::string::String;
 /// forgotten. Without one, a shell that had already answered "this guest
 /// program does not compile here" for a ranking or scanning program would keep
 /// answering it from memory for the life of the process.
-pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 24;
+pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 25;
 
 /// The kernel this backend compiles for one region of a stage.
 ///

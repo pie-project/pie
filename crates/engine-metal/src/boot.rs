@@ -71,7 +71,57 @@ pub fn open(config_bytes: &[u8], contract_for: ContractFor) -> Result<Metal, Str
         .parse()
         .map_err(|error| format!("the metal boot config is not TOML: {error}"))?;
     tuning(&doc);
-    Ok(Metal::new(DeviceBoot::default(), contract_for))
+    Ok(Metal::new(
+        DeviceBoot {
+            gpu_mem_utilization: gpu_mem_utilization(&doc),
+            adapter_dir: adapter_dir(&doc),
+        },
+        contract_for,
+    ))
+}
+
+/// Where `[model] adapter_dir` says this deployment keeps its shared adapters
+/// (alto adapter §3.3).
+///
+/// **THE MOUNT, AND IT IS A DIRECTORY AND NOT A REGISTRY.** What lives under
+/// it is one subdirectory per adapter, each holding an `adapter.toml` and the
+/// plane files that manifest names ([`crate::blob`]). Adding one is writing
+/// files; nothing here is a catalog, and the banks' seats bound how many can
+/// be RESIDENT at once, not how many may exist.
+///
+/// Absent or empty is `None`: the feature is off, a shared bind refuses by
+/// name, and an adapter seeded from a guest's own channel still works — which
+/// is what makes this key optional rather than a floor.
+///
+/// Read here rather than from the environment for the reason the tuning table
+/// below gives, and spelled exactly as the CUDA door spells it, because it is
+/// one deployment fact and not two.
+fn adapter_dir(doc: &toml::Table) -> Option<std::path::PathBuf> {
+    doc.get("model")
+        .and_then(toml::Value::as_table)
+        .and_then(|model| model.get("adapter_dir"))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// `[metal] gpu_mem_utilization`: the fraction of `recommendedMaxWorkingSetSize`
+/// this device may hold resident, read into [`DeviceBoot`].
+///
+/// **ADVISORY LIKE `[metal.tuning]`, AND FOR THE SAME REASON.** A boot document
+/// is shared across roles; a missing key, a non-float value, or a fraction
+/// outside `(0, 1]` leaves the CUDA-matching 0.90 default standing rather than
+/// refusing a boot that has nothing else wrong with it. The one thing this knob
+/// cannot do is silently widen the ceiling past the whole card, which is why an
+/// out-of-range value is dropped rather than clamped to it.
+fn gpu_mem_utilization(doc: &toml::Table) -> f64 {
+    doc.get("metal")
+        .and_then(toml::Value::as_table)
+        .and_then(|metal| metal.get("gpu_mem_utilization"))
+        .and_then(toml::Value::as_float)
+        .filter(|fraction| fraction.is_finite() && *fraction > 0.0 && *fraction <= 1.0)
+        .unwrap_or(crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION)
 }
 
 /// `[metal.tuning]`: the kernel-selection crossovers, swept.
@@ -169,6 +219,39 @@ mod tests {
     #[test]
     fn a_boot_document_that_is_not_toml_is_refused_at_the_door() {
         assert!(open(b"this is not = = toml", nothing).is_err());
+    }
+
+    #[test]
+    fn gpu_mem_utilization_reads_the_fraction_or_keeps_the_default() {
+        let of = |src: &str| super::gpu_mem_utilization(&src.parse::<toml::Table>().unwrap());
+        let default = crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION;
+        // A silent document, a stated fraction, and the two advisory drops.
+        assert_eq!(of(""), default, "silence keeps the CUDA-matching default");
+        assert_eq!(of("[metal]\ngpu_mem_utilization = 0.75\n"), 0.75);
+        assert_eq!(
+            of("[metal]\ngpu_mem_utilization = 1.5\n"),
+            default,
+            "a fraction over one is dropped, not clamped to it"
+        );
+        assert_eq!(
+            of("[metal]\ngpu_mem_utilization = \"most\"\n"),
+            default,
+            "a value of the wrong type leaves the default standing"
+        );
+    }
+
+    /// The shared-adapter mount, read the same way the CUDA door reads it and
+    /// off by the same absence (alto adapter §3.3).
+    #[test]
+    fn the_shared_adapter_directory_is_read_and_an_empty_one_is_off() {
+        let read = |text: &str| adapter_dir(&text.parse::<toml::Table>().expect("valid TOML"));
+        assert_eq!(
+            read("[model]\nadapter_dir = \"/srv/pie/shared\""),
+            Some(std::path::PathBuf::from("/srv/pie/shared"))
+        );
+        assert_eq!(read("[model]\nadapter_dir = \"  \""), None, "empty is off");
+        assert_eq!(read("[model]"), None, "and so is absent");
+        assert_eq!(read(""), None);
     }
 
     #[test]

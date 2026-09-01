@@ -92,7 +92,7 @@ fn snapshot() -> Option<PathBuf> {
 /// by the same string every other column is.
 fn word(query_len: u32) -> u64 {
     let classify = runtime::engine::load::classify(SKU).expect("this build ships the smoke's SKU");
-    classify(&model::Request::new(query_len, false))
+    classify(&models::Request::new(query_len, false))
 }
 
 /// Greedy: the highest logit.

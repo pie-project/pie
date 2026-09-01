@@ -558,15 +558,23 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
             // is the published KV pitch the capture arm wrote at and so is
             // the only width that binds.
             //
-            // **THE METAL HALF OF THIS PIN FLIPPED, AND IT IS THE ONE THING
-            // THIS CASE EXISTS TO WATCH.** It used to record a refusal --
-            // one intrinsic buffer and it was the logits -- and it records
-            // emitted MSL now: the M2 slot table gives the id an argument
-            // index of its own and the runtime's `0xA0` arm gathers `float`
-            // for it (`.wiki/alto/attn-score.md` §4). The GROUPED column is
-            // still a refusal and stays one, because a grouped kernel binds
-            // no per-intrinsic buffer at all; that half is the honest
-            // remainder rather than an oversight.
+            // **BOTH METAL HALVES OF THIS PIN HAVE NOW FLIPPED, AND WATCHING
+            // THEM FLIP IS WHY THIS CASE EXISTS.** The single-lane column
+            // recorded a refusal first -- one intrinsic buffer and it was the
+            // logits -- and records emitted MSL since the M2 slot table gave
+            // the id an argument index of its own and the runtime's `0xA0`
+            // arm learned to gather `float` for it
+            // (`.wiki/alto/attn-score.md` §4).
+            //
+            // The GROUPED column was the honest remainder: that form binds no
+            // per-intrinsic buffer at all, so the rectangle had to arrive as
+            // an ADDRESS, and `lane.logits_base` was the only one the record
+            // carried -- while the slab is `engine_metal::scores`'s own
+            // reservation, which no displacement off the readout reaches. The
+            // record carries `attn_score_base` now, so this column is emitted
+            // MSL too. What is left unequal between the two forms is only the
+            // CEILING they read it under: on the M2 form the rectangle costs
+            // two of the twelve argument slots the channels grow into.
             "extended_attn_score",
             staged(
                 Stage::Epilogue,

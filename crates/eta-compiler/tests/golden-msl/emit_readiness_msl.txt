@@ -2,7 +2,15 @@
 # source of truth: compiler/codegen/src/metal/ (the C++ oracle this was dumped from is deleted)
 # emitter_version: 33
 # @runtime: bytes=39611 fnv1a64=0x310a2f7d72f22fd5
-# @grouped: bytes=970 fnv1a64=0xa8ab9e1ebf8714d9
+# @grouped: bytes=1043 fnv1a64=0x429904221e8e963f
+# @grouped was bytes=970 fnv1a64=0xa8ab9e1ebf8714d9 through emitter 41. The lane
+#   record grew `attn_score_base` and `attn_score_row_stride` (+73 bytes of struct
+#   text, no field before them moved), which is the grouped form's route to the
+#   attention-score rectangle: that form binds no per-intrinsic buffer, so a
+#   rectangle it must reach arrives as an address on the record. Unlike @runtime,
+#   this prefix is not kernel-side text an `oracle-inputs/` copy could stand in
+#   for -- `codegen::layout` declares the table and prints it, so the bytes are
+#   the emitter's and the move belongs in the diff.
 # cases: 45
 # re-blessed: the C++ oracle (crates/engine-metal/csrc/src/pipeline/m1_codegen.cpp) is
 #   deleted, so these bytes can no longer be re-derived from it. Three cases
@@ -34,12 +42,12 @@
 #   value, which in the sampler's graph was a vocabulary-wide round trip through
 #   device memory for nothing.
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above
-#   reason: reshape elision now recognises a prefix view, so the sampler's vocabulary-wide reshape and its logits gather both fuse away
+#   reason: metal emitter 41->42, and the shared lane record is what moved. The GROUPED (M3) form binds no per-intrinsic buffer -- every rectangle it reads arrives as an address on the lane record -- so `attn_score` was the one id its table refused: the observability slab is the shell's own reservation (engine_metal::scores), not the readout arena, and no row displacement off lane.logits_base reaches it. LaneRecord now carries attn_score_base and attn_score_row_stride (appended, so every field before them keeps its offset; the record is 96 -> 112 bytes), emit_grouped_fused_region gathers the F32 planes from that base, and m3_intrinsic_bindable stops declining the id. What moved in these dumps is exactly the +73 bytes of struct text the two fields add to the M1 and M3 preambles, plus the emitter version spelled into ptir_m3_generic_{ready,commit}_v42. No emitted logic changed for any corpus case: the base corpus reads no score rectangle, so no kernel body here grew an arm. The bump is load-bearing rather than hygienic -- a library cached under 41 reads the 96-byte record, so lane 1 of any grouped table would start sixteen bytes early -- and CUDA bumps 24 -> 25 for the same reason on its own copy of the struct. The reason the record grew at all is the M2 ceiling: the score rectangle costs two of the twelve argument slots the channels grow into, so a ten-channel guest reading scores (trackb-h2o) was refused by a limit that had nothing to do with what it asked for.
 === empty
 function_name: ptir_m1_empty_ready
 channels: 0
 ok: true
-source: bytes=1501 prefix=none tail_bytes=1501
+source: bytes=1574 prefix=none tail_bytes=1574
 
 #include <metal_stdlib>
 using namespace metal;
@@ -64,6 +72,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -85,7 +96,7 @@ function_name: ptir_m1_flags_0_ready
 channels: 1
 channel[0]: requires_full=0 requires_empty=0 take=0 put=0 capacity=1
 ok: true
-source: bytes=1953 prefix=none tail_bytes=1953
+source: bytes=2026 prefix=none tail_bytes=2026
 
 #include <metal_stdlib>
 using namespace metal;
@@ -110,6 +121,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -139,7 +153,7 @@ function_name: ptir_m1_flags_1_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=0 put=0 capacity=1
 ok: true
-source: bytes=2028 prefix=none tail_bytes=2028
+source: bytes=2101 prefix=none tail_bytes=2101
 
 #include <metal_stdlib>
 using namespace metal;
@@ -164,6 +178,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -194,7 +211,7 @@ function_name: ptir_m1_flags_2_ready
 channels: 1
 channel[0]: requires_full=0 requires_empty=1 take=0 put=0 capacity=1
 ok: true
-source: bytes=2034 prefix=none tail_bytes=2034
+source: bytes=2107 prefix=none tail_bytes=2107
 
 #include <metal_stdlib>
 using namespace metal;
@@ -219,6 +236,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -249,7 +269,7 @@ function_name: ptir_m1_flags_3_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=1 take=0 put=0 capacity=1
 ok: true
-source: bytes=2109 prefix=none tail_bytes=2109
+source: bytes=2182 prefix=none tail_bytes=2182
 
 #include <metal_stdlib>
 using namespace metal;
@@ -274,6 +294,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -305,7 +328,7 @@ function_name: ptir_m1_flags_4_ready
 channels: 1
 channel[0]: requires_full=0 requires_empty=0 take=1 put=0 capacity=1
 ok: true
-source: bytes=1953 prefix=none tail_bytes=1953
+source: bytes=2026 prefix=none tail_bytes=2026
 
 #include <metal_stdlib>
 using namespace metal;
@@ -330,6 +353,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -359,7 +385,7 @@ function_name: ptir_m1_flags_5_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=0 capacity=1
 ok: true
-source: bytes=2028 prefix=none tail_bytes=2028
+source: bytes=2101 prefix=none tail_bytes=2101
 
 #include <metal_stdlib>
 using namespace metal;
@@ -384,6 +410,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -414,7 +443,7 @@ function_name: ptir_m1_flags_6_ready
 channels: 1
 channel[0]: requires_full=0 requires_empty=1 take=1 put=0 capacity=1
 ok: true
-source: bytes=2034 prefix=none tail_bytes=2034
+source: bytes=2107 prefix=none tail_bytes=2107
 
 #include <metal_stdlib>
 using namespace metal;
@@ -439,6 +468,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -469,7 +501,7 @@ function_name: ptir_m1_flags_7_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=1 take=1 put=0 capacity=1
 ok: true
-source: bytes=2109 prefix=none tail_bytes=2109
+source: bytes=2182 prefix=none tail_bytes=2182
 
 #include <metal_stdlib>
 using namespace metal;
@@ -494,6 +526,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -525,7 +560,7 @@ function_name: ptir_m1_flags_8_ready
 channels: 1
 channel[0]: requires_full=0 requires_empty=0 take=0 put=1 capacity=1
 ok: true
-source: bytes=2090 prefix=none tail_bytes=2090
+source: bytes=2163 prefix=none tail_bytes=2163
 
 #include <metal_stdlib>
 using namespace metal;
@@ -550,6 +585,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -580,7 +618,7 @@ function_name: ptir_m1_flags_9_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=0 put=1 capacity=1
 ok: true
-source: bytes=2165 prefix=none tail_bytes=2165
+source: bytes=2238 prefix=none tail_bytes=2238
 
 #include <metal_stdlib>
 using namespace metal;
@@ -605,6 +643,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -636,7 +677,7 @@ function_name: ptir_m1_flags_10_ready
 channels: 1
 channel[0]: requires_full=0 requires_empty=1 take=0 put=1 capacity=1
 ok: true
-source: bytes=2172 prefix=none tail_bytes=2172
+source: bytes=2245 prefix=none tail_bytes=2245
 
 #include <metal_stdlib>
 using namespace metal;
@@ -661,6 +702,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -692,7 +736,7 @@ function_name: ptir_m1_flags_11_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=1 take=0 put=1 capacity=1
 ok: true
-source: bytes=2247 prefix=none tail_bytes=2247
+source: bytes=2320 prefix=none tail_bytes=2320
 
 #include <metal_stdlib>
 using namespace metal;
@@ -717,6 +761,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -749,7 +796,7 @@ function_name: ptir_m1_flags_12_ready
 channels: 1
 channel[0]: requires_full=0 requires_empty=0 take=1 put=1 capacity=1
 ok: true
-source: bytes=2091 prefix=none tail_bytes=2091
+source: bytes=2164 prefix=none tail_bytes=2164
 
 #include <metal_stdlib>
 using namespace metal;
@@ -774,6 +821,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -804,7 +854,7 @@ function_name: ptir_m1_flags_13_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=1
 ok: true
-source: bytes=2166 prefix=none tail_bytes=2166
+source: bytes=2239 prefix=none tail_bytes=2239
 
 #include <metal_stdlib>
 using namespace metal;
@@ -829,6 +879,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -860,7 +913,7 @@ function_name: ptir_m1_flags_14_ready
 channels: 1
 channel[0]: requires_full=0 requires_empty=1 take=1 put=1 capacity=1
 ok: true
-source: bytes=2172 prefix=none tail_bytes=2172
+source: bytes=2245 prefix=none tail_bytes=2245
 
 #include <metal_stdlib>
 using namespace metal;
@@ -885,6 +938,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -916,7 +972,7 @@ function_name: ptir_m1_flags_15_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=1 take=1 put=1 capacity=1
 ok: true
-source: bytes=2247 prefix=none tail_bytes=2247
+source: bytes=2320 prefix=none tail_bytes=2320
 
 #include <metal_stdlib>
 using namespace metal;
@@ -941,6 +997,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -973,7 +1032,7 @@ function_name: ptir_m1_capacity_0_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=0
 ok: true
-source: bytes=2168 prefix=none tail_bytes=2168
+source: bytes=2241 prefix=none tail_bytes=2241
 
 #include <metal_stdlib>
 using namespace metal;
@@ -998,6 +1057,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1029,7 +1091,7 @@ function_name: ptir_m1_capacity_1_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=1
 ok: true
-source: bytes=2168 prefix=none tail_bytes=2168
+source: bytes=2241 prefix=none tail_bytes=2241
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1054,6 +1116,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1085,7 +1150,7 @@ function_name: ptir_m1_capacity_2_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=2
 ok: true
-source: bytes=2168 prefix=none tail_bytes=2168
+source: bytes=2241 prefix=none tail_bytes=2241
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1110,6 +1175,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1141,7 +1209,7 @@ function_name: ptir_m1_capacity_3_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=3
 ok: true
-source: bytes=2168 prefix=none tail_bytes=2168
+source: bytes=2241 prefix=none tail_bytes=2241
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1166,6 +1234,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1197,7 +1268,7 @@ function_name: ptir_m1_capacity_7_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=7
 ok: true
-source: bytes=2168 prefix=none tail_bytes=2168
+source: bytes=2241 prefix=none tail_bytes=2241
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1222,6 +1293,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1253,7 +1327,7 @@ function_name: ptir_m1_capacity_64_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=64
 ok: true
-source: bytes=2170 prefix=none tail_bytes=2170
+source: bytes=2243 prefix=none tail_bytes=2243
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1278,6 +1352,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1309,7 +1386,7 @@ function_name: ptir_m1_capacity_65535_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=65535
 ok: true
-source: bytes=2176 prefix=none tail_bytes=2176
+source: bytes=2249 prefix=none tail_bytes=2249
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1334,6 +1411,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1365,7 +1445,7 @@ function_name: ptir_m1_capacity_4294967295_ready
 channels: 1
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=4294967295
 ok: true
-source: bytes=2186 prefix=none tail_bytes=2186
+source: bytes=2259 prefix=none tail_bytes=2259
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1390,6 +1470,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1422,7 +1505,7 @@ channels: 2
 channel[0]: requires_full=0 requires_empty=0 take=0 put=0 capacity=1
 channel[1]: requires_full=1 requires_empty=1 take=1 put=1 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1447,6 +1530,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1488,7 +1574,7 @@ channels: 2
 channel[0]: requires_full=1 requires_empty=0 take=0 put=0 capacity=1
 channel[1]: requires_full=0 requires_empty=1 take=1 put=1 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1513,6 +1599,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1554,7 +1643,7 @@ channels: 2
 channel[0]: requires_full=0 requires_empty=1 take=0 put=0 capacity=1
 channel[1]: requires_full=1 requires_empty=0 take=1 put=1 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1579,6 +1668,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1620,7 +1712,7 @@ channels: 2
 channel[0]: requires_full=1 requires_empty=1 take=0 put=0 capacity=1
 channel[1]: requires_full=0 requires_empty=0 take=1 put=1 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1645,6 +1737,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1686,7 +1781,7 @@ channels: 2
 channel[0]: requires_full=0 requires_empty=0 take=1 put=0 capacity=1
 channel[1]: requires_full=1 requires_empty=1 take=0 put=1 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1711,6 +1806,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1752,7 +1850,7 @@ channels: 2
 channel[0]: requires_full=1 requires_empty=0 take=1 put=0 capacity=1
 channel[1]: requires_full=0 requires_empty=1 take=0 put=1 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1777,6 +1875,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1818,7 +1919,7 @@ channels: 2
 channel[0]: requires_full=0 requires_empty=1 take=1 put=0 capacity=1
 channel[1]: requires_full=1 requires_empty=0 take=0 put=1 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1843,6 +1944,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1884,7 +1988,7 @@ channels: 2
 channel[0]: requires_full=1 requires_empty=1 take=1 put=0 capacity=1
 channel[1]: requires_full=0 requires_empty=0 take=0 put=1 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1909,6 +2013,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -1950,7 +2057,7 @@ channels: 2
 channel[0]: requires_full=0 requires_empty=0 take=0 put=1 capacity=1
 channel[1]: requires_full=1 requires_empty=1 take=1 put=0 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -1975,6 +2082,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2016,7 +2126,7 @@ channels: 2
 channel[0]: requires_full=1 requires_empty=0 take=0 put=1 capacity=1
 channel[1]: requires_full=0 requires_empty=1 take=1 put=0 capacity=3
 ok: true
-source: bytes=2695 prefix=none tail_bytes=2695
+source: bytes=2768 prefix=none tail_bytes=2768
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2041,6 +2151,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2082,7 +2195,7 @@ channels: 2
 channel[0]: requires_full=0 requires_empty=1 take=0 put=1 capacity=1
 channel[1]: requires_full=1 requires_empty=0 take=1 put=0 capacity=3
 ok: true
-source: bytes=2696 prefix=none tail_bytes=2696
+source: bytes=2769 prefix=none tail_bytes=2769
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2107,6 +2220,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2148,7 +2264,7 @@ channels: 2
 channel[0]: requires_full=1 requires_empty=1 take=0 put=1 capacity=1
 channel[1]: requires_full=0 requires_empty=0 take=1 put=0 capacity=3
 ok: true
-source: bytes=2696 prefix=none tail_bytes=2696
+source: bytes=2769 prefix=none tail_bytes=2769
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2173,6 +2289,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2214,7 +2333,7 @@ channels: 2
 channel[0]: requires_full=0 requires_empty=0 take=1 put=1 capacity=1
 channel[1]: requires_full=1 requires_empty=1 take=0 put=0 capacity=3
 ok: true
-source: bytes=2696 prefix=none tail_bytes=2696
+source: bytes=2769 prefix=none tail_bytes=2769
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2239,6 +2358,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2280,7 +2402,7 @@ channels: 2
 channel[0]: requires_full=1 requires_empty=0 take=1 put=1 capacity=1
 channel[1]: requires_full=0 requires_empty=1 take=0 put=0 capacity=3
 ok: true
-source: bytes=2696 prefix=none tail_bytes=2696
+source: bytes=2769 prefix=none tail_bytes=2769
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2305,6 +2427,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2346,7 +2471,7 @@ channels: 2
 channel[0]: requires_full=0 requires_empty=1 take=1 put=1 capacity=1
 channel[1]: requires_full=1 requires_empty=0 take=0 put=0 capacity=3
 ok: true
-source: bytes=2696 prefix=none tail_bytes=2696
+source: bytes=2769 prefix=none tail_bytes=2769
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2371,6 +2496,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2412,7 +2540,7 @@ channels: 2
 channel[0]: requires_full=1 requires_empty=1 take=1 put=1 capacity=1
 channel[1]: requires_full=0 requires_empty=0 take=0 put=0 capacity=3
 ok: true
-source: bytes=2696 prefix=none tail_bytes=2696
+source: bytes=2769 prefix=none tail_bytes=2769
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2437,6 +2565,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2481,7 +2612,7 @@ channel[2]: requires_full=0 requires_empty=0 take=1 put=1 capacity=4
 channel[3]: requires_full=0 requires_empty=1 take=0 put=0 capacity=8
 channel[4]: requires_full=1 requires_empty=1 take=1 put=1 capacity=16
 ok: true
-source: bytes=4475 prefix=none tail_bytes=4475
+source: bytes=4548 prefix=none tail_bytes=4548
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2506,6 +2637,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2601,7 +2735,7 @@ channel[25]: requires_full=0 requires_empty=0 take=0 put=0 capacity=26
 channel[26]: requires_full=1 requires_empty=1 take=1 put=0 capacity=27
 channel[27]: requires_full=0 requires_empty=1 take=1 put=1 capacity=28
 ok: true
-source: bytes=18371 prefix=none tail_bytes=18371
+source: bytes=18444 prefix=none tail_bytes=18444
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2626,6 +2760,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;
@@ -2941,7 +3078,7 @@ channel[26]: requires_full=1 requires_empty=1 take=1 put=0 capacity=27
 channel[27]: requires_full=0 requires_empty=1 take=1 put=1 capacity=28
 channel[28]: requires_full=1 requires_empty=0 take=1 put=0 capacity=29
 ok: true
-source: bytes=18904 prefix=none tail_bytes=18904
+source: bytes=18977 prefix=none tail_bytes=18977
 
 #include <metal_stdlib>
 using namespace metal;
@@ -2966,6 +3103,9 @@ struct M1LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M1LaneChannelSlot {
   ulong committed_cell;

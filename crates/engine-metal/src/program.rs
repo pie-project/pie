@@ -101,8 +101,10 @@ pub mod compile;
 pub mod launch;
 pub mod ports;
 pub mod session;
+pub mod shared;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use engine::program::ProgramRegistration;
 use eta_exec::adopt_launch_package;
@@ -116,7 +118,8 @@ use crate::error::{Fault, Result};
 pub use compile::{Cache, Compiled, Module, Region, Stage, Target};
 pub use launch::{ChannelShape, Cursor, Prepared, Rings};
 pub use ports::Envelope;
-pub use session::{Fired, Launched, Session, seeds_of};
+pub use session::{Blocked, Fired, Launched, Session, seeds_of};
+pub use shared::{MAX_ATTACHMENTS, SharedRing};
 
 /// One registered program: what the host planned, and what compiled from it.
 #[derive(Debug)]
@@ -157,6 +160,22 @@ pub struct Plane {
     programs: BTreeMap<u64, Program>,
     by_hash: BTreeMap<u64, u64>,
     instances: BTreeMap<u64, Bound>,
+    /// **The device-only rings that belong to their CHANNEL** (design §5),
+    /// keyed by the id the runtime's registration minted.
+    ///
+    /// Keyed by the CALLER's channel id, because the caller names channels by
+    /// id and a program names them by dense slot — and one shared channel
+    /// sits at a different dense slot in every instance that binds it, which
+    /// is exactly why no instance's own table could be this one.
+    /// [`InstanceBinding::channels`](engine::program::InstanceBinding) is
+    /// where the two numberings meet.
+    ///
+    /// Only [`HostRole::None`](eta_ir::container::HostRole::None) channels
+    /// are here. A host-visible channel's ring is the RUNTIME's — this plane
+    /// publishes no mirror and the cells cross through
+    /// `publish_channel`/`take_channel` — so there is nothing to register and
+    /// `api::register_channel` still refuses one by name.
+    channels: BTreeMap<u64, Arc<SharedRing>>,
     next_program: u64,
     next_instance: u64,
 }
@@ -185,6 +204,7 @@ impl Plane {
             programs: BTreeMap::new(),
             by_hash: BTreeMap::new(),
             instances: BTreeMap::new(),
+            channels: BTreeMap::new(),
             next_program: 1,
             next_instance: 1,
         }
@@ -266,11 +286,21 @@ impl Plane {
     /// is made BY a device object, and binding an instance is where the
     /// rings and every stage's fire-path buffers are reserved.
     ///
+    /// **`channels` NAMES THIS INSTANCE'S CHANNELS BY GLOBAL ID**, in the
+    /// package's declaration order — the one place a caller's channel id and
+    /// a program's dense slot meet. A slot naming a channel this plane
+    /// registered adopts that channel's SHARED ring (design §5), so two
+    /// passes that name one id meet on one ring however differently their
+    /// packages number it; every other slot has its ring cut inside the
+    /// session, which is what every ring on this plane used to be. A caller
+    /// with nothing registered passes `&[]`.
+    ///
     /// # Errors
     ///
     /// [`Fault::Program`] for an unknown program, a seed naming a channel the
-    /// instance does not carry, or a seed of the wrong width; and whatever the
-    /// allocations said.
+    /// instance does not carry, a seed of the wrong width, a shared ring past
+    /// its [`MAX_ATTACHMENTS`] seats or cut at a geometry this instance does
+    /// not declare; and whatever the allocations said.
     pub fn bind(
         &mut self,
         context: &Context,
@@ -278,12 +308,29 @@ impl Plane {
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         geometry: GeometryClass,
+        channels: &[u64],
     ) -> Result<u64> {
         let program = self
             .programs
             .get(&program_id)
             .ok_or_else(|| Fault::program("program::plane", format!("no program {program_id}")))?;
-        let session = Session::bind(context, &program.compiled, &program.plan, seeds, extents)?;
+        let adopted = self.seats_for(&program.plan, channels)?;
+        let session = match Session::bind(
+            context,
+            &program.compiled,
+            &program.plan,
+            seeds,
+            extents,
+            &adopted,
+        ) {
+            Ok(session) => session,
+            Err(why) => {
+                // Same rule as a refused `seats_for`: an instance that did not
+                // bind holds no seat.
+                release_seats(&adopted);
+                return Err(why);
+            }
+        };
         let id = self.next_instance;
         self.next_instance += 1;
         self.instances.insert(
@@ -292,9 +339,142 @@ impl Plane {
                 program_id,
                 session,
                 geometry,
+                shared: adopted,
             },
         );
         Ok(id)
+    }
+
+    /// **Cut the one ring a device-only channel owns** (design §5), keyed by
+    /// the id the caller minted for it.
+    ///
+    /// This is the whole of "the ring belongs to the channel": the slab and
+    /// the two cursors are cut ONCE, here, and every instance that names this
+    /// id in its binding attaches to the same [`SharedRing`] instead of
+    /// carving a copy inside its own [`Session`]. Registering a channel
+    /// nothing ever binds costs one `capacity + 1`-cell reservation and no
+    /// seat.
+    ///
+    /// A second registration of the same id is refused: two rings under one
+    /// name would put the attachments bound before it on one and the ones
+    /// after it on the other, which is the defect this call exists to close,
+    /// re-opened by a caller instead of by the plane.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an id already registered, and whatever the
+    /// reservation said.
+    pub fn register_channel(
+        &mut self,
+        context: &Context,
+        id: u64,
+        shape: ChannelShape,
+    ) -> Result<()> {
+        if self.channels.contains_key(&id) {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "channel {id} is already registered, and a second ring under one \
+                     name would leave the instances bound before it addressing \
+                     different cells from the ones bound after"
+                ),
+            ));
+        }
+        self.channels
+            .insert(id, Arc::new(SharedRing::open(context, shape)?));
+        Ok(())
+    }
+
+    /// Forget channel `id`'s registration.
+    ///
+    /// **THE ENTRY GOES; THE RING DOES NOT NECESSARILY GO WITH IT.** A shared
+    /// ring is an `Arc` every attached instance also holds, so it is freed
+    /// when the LAST holder drops — which is after this call AND every
+    /// attachment's close, in either order. That is the property a shared
+    /// ring needs and a per-session ring never had: it outlives any one
+    /// instance's close, so a pipeline may close its prefill pass while its
+    /// decode pass is still reading the ring the prefill filled.
+    ///
+    /// Answers whether there was one, so that `api::close_channel` can tell a
+    /// device-only channel it registered from a host-visible one it never
+    /// did.
+    pub fn close_channel(&mut self, id: u64) -> bool {
+        self.channels.remove(&id).is_some()
+    }
+
+    /// **Which other instances share a ring with one of `instances`** — the
+    /// set a fence has to widen to (design §5).
+    ///
+    /// A shared ring's counters advance at [`Session::settle_launched`], one
+    /// frame after the fire whose command buffer carried the pass. On this
+    /// plane the CONSUMER resolves its descriptor ports on the host, at
+    /// `serve::stage` — so when a decode pass reads this ring's committed
+    /// cell, the producer's put may still be inside a command buffer that has
+    /// not landed, and the answer would be the cell before it or no cell at
+    /// all. The existing fence lands the flights that hold THESE instances;
+    /// what it has to also land is the flights that hold whoever else can
+    /// move this ring, and that is this set.
+    ///
+    /// Answers only the instances NOT already asked about, and empty for the
+    /// overwhelmingly common case of an instance whose rings are its own —
+    /// so a fire with no shared ring in it pays one map lookup per
+    /// attachment and nothing else.
+    #[must_use]
+    pub fn cohort(&self, instances: &[u64]) -> Vec<u64> {
+        let held: Vec<&Arc<SharedRing>> = instances
+            .iter()
+            .filter_map(|id| self.instances.get(id))
+            .flat_map(|bound| bound.shared.iter().flatten())
+            .collect();
+        if held.is_empty() {
+            return Vec::new();
+        }
+        let mut cohort = Vec::new();
+        for (id, bound) in &self.instances {
+            if instances.contains(id) {
+                continue;
+            }
+            // Identity and not equality: two rings are the same ring when
+            // they are the same allocation, which is what `Arc::ptr_eq` asks.
+            if bound.shared.iter().flatten().any(|mine| {
+                held.iter().any(|theirs| Arc::ptr_eq(mine, theirs))
+            }) {
+                cohort.push(*id);
+            }
+        }
+        cohort
+    }
+
+    /// Take one seat on every shared ring this binding names, in the dense
+    /// order the program declares its channels in.
+    ///
+    /// A refusal gives back the seats taken before it, so a bind that does
+    /// not happen holds no seat and the eight-seat bound is not walked up one
+    /// failed attempt at a time.
+    fn seats_for(
+        &self,
+        plan: &ExecPlan,
+        channels: &[u64],
+    ) -> Result<Vec<Option<Arc<SharedRing>>>> {
+        let mut adopted: Vec<Option<Arc<SharedRing>>> =
+            Vec::with_capacity(plan.package.channels.len());
+        for dense in 0..plan.package.channels.len() {
+            // **A CHANNEL THIS PLANE NEVER REGISTERED GETS `None`**, and that
+            // is the shape a caller driving `Plane::bind` directly is in —
+            // the parity fixtures, the first-light gates — as well as every
+            // host-visible channel, whose ring is the runtime's. Its ring is
+            // cut inside the session exactly as it always was.
+            let Some(ring) = channels.get(dense).and_then(|id| self.channels.get(id)) else {
+                adopted.push(None);
+                continue;
+            };
+            if let Err(why) = ring.attach() {
+                release_seats(&adopted);
+                return Err(why);
+            }
+            adopted.push(Some(Arc::clone(ring)));
+        }
+        Ok(adopted)
     }
 
     /// What instance `id`'s descriptor ports resolve to right now, or `None`
@@ -393,10 +573,11 @@ impl Plane {
     }
 
     /// The first channel of instance `id` whose declared requirement a fire
-    /// right now would not meet, or `None` when it is ready.
+    /// right now would not meet — with the direction, depth and capacity that
+    /// decided it — or `None` when it is ready.
     ///
     /// **THE GATE, ASKED BEFORE THE MODEL FIRE.** See
-    /// [`Session::blocked_channel`]: an epilogue attachment is fired after the
+    /// [`Session::readiness`]: an epilogue attachment is fired after the
     /// forward has written the lane's KV, so the caller has to know BEFORE it
     /// launches anything whether every attached instance can commit.
     ///
@@ -404,7 +585,7 @@ impl Plane {
     ///
     /// [`Fault::Program`] for an unknown instance, or one whose program is
     /// gone.
-    pub fn ready(&self, id: u64) -> Result<Option<u32>> {
+    pub fn ready(&self, id: u64) -> Result<Option<session::Blocked>> {
         let bound = self
             .instances
             .get(&id)
@@ -418,7 +599,7 @@ impl Plane {
                 ),
             )
         })?;
-        Ok(bound.session.blocked_channel(&program.plan))
+        Ok(bound.session.readiness(&program.plan))
     }
 
     /// Fire instance `id` once: readiness, then every stage's regions, then
@@ -623,10 +804,14 @@ impl Plane {
     /// [`Fault::Program`] when there is no such instance — closing twice is a
     /// caller's bug, not a no-op.
     pub fn close_instance(&mut self, id: u64) -> Result<()> {
-        self.instances
+        let bound = self
+            .instances
             .remove(&id)
-            .map(|_| ())
-            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))
+            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
+        // The seats go back; the RINGS do not necessarily go with them — see
+        // [`Plane::close_channel`], and [`release_seats`]' own note.
+        release_seats(&bound.shared);
+        Ok(())
     }
 
     /// Drop program `id`, dropping this plane's share of its libraries.
@@ -691,4 +876,29 @@ struct Bound {
     /// reaches here: the shell's own instance-binding entry refuses it by
     /// name.
     geometry: GeometryClass,
+    /// **This instance's share of every ring that belongs to a channel**, in
+    /// the program's dense declaration order and `None` for the channels
+    /// whose ring is its own.
+    ///
+    /// Kept for two things. Closing the instance gives its SEATS back
+    /// ([`release_seats`]); and [`Plane::cohort`] reads it to find who else
+    /// can move a ring this instance reads, which is what widens the fence in
+    /// `serve::fence_instances` to the flight that holds the producer.
+    shared: Vec<Option<Arc<SharedRing>>>,
+}
+
+/// **Give back every seat this instance's channels hold** — the inverse of
+/// the `attach` in [`Plane::seats_for`].
+///
+/// # Who owns a shared ring's lifetime (design §5)
+///
+/// The ring is an `Arc` held by [`Plane::channels`] and by every instance
+/// bound to it, so it is freed when the LAST holder drops. The SEAT is
+/// separate bookkeeping and is given back here, so that a pipeline which
+/// closes and rebuilds passes does not walk its ring up to the eight-seat
+/// bound one rebuild at a time.
+fn release_seats(shared: &[Option<Arc<SharedRing>>]) {
+    for ring in shared.iter().flatten() {
+        ring.detach();
+    }
 }

@@ -88,7 +88,7 @@ fn budget() -> Budget {
 }
 
 fn trace() -> Trace {
-    let (_, _, trace, _) = model::catalog()
+    let (_, _, trace, _) = models::catalog()
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
@@ -325,7 +325,7 @@ fn the_default_bake_seats_the_correction_and_the_two_arms_withdraw_it_together()
     let shipped = bake(&trace, &shipped());
     for &node in &corrections {
         assert!(
-            fallback::answers(&shipped, node..node + 1).is_empty(),
+            fallback::answers(&shipped, model_ir::RowAxis::Tokens, node..node + 1).is_empty(),
             "the shipped bake owes node {node} an answer, so the scaffold below is \
              no longer describing a change",
         );
@@ -369,8 +369,9 @@ fn the_default_bake_seats_the_correction_and_the_two_arms_withdraw_it_together()
 
     // And they differ in exactly the way the names say.
     for &node in &corrections {
-        let said_split = fallback::answers(&split, node..node + 1);
-        let said_grouped = fallback::answers(&grouped, node..node + 1);
+        let said_split = fallback::answers(&split, model_ir::RowAxis::Tokens, node..node + 1);
+        let said_grouped =
+            fallback::answers(&grouped, model_ir::RowAxis::Tokens, node..node + 1);
         assert!(
             said_split
                 .iter()
@@ -378,8 +379,14 @@ fn the_default_bake_seats_the_correction_and_the_two_arms_withdraw_it_together()
             "node {node} in the split arm answers {said_split:?}",
         );
         assert_eq!(said_grouped, vec![Fallback::Grouped], "node {node}");
-        assert!(!fallback::grouped(&split, node..node + 1), "node {node}");
-        assert!(fallback::grouped(&grouped, node..node + 1), "node {node}");
+        assert!(
+            !fallback::grouped(&split, model_ir::RowAxis::Tokens, node..node + 1),
+            "node {node}"
+        );
+        assert!(
+            fallback::grouped(&grouped, model_ir::RowAxis::Tokens, node..node + 1),
+            "node {node}"
+        );
     }
 
     // NOBODY ELSE CHANGED HANDS — stated as the property, because the list it
@@ -437,13 +444,13 @@ fn the_default_bake_seats_the_correction_and_the_two_arms_withdraw_it_together()
              know about",
         );
         assert_eq!(
-            fallback::answers(&split, node..node + 1),
-            fallback::answers(&grouped, node..node + 1),
+            fallback::answers(&split, model_ir::RowAxis::Tokens, node..node + 1),
+            fallback::answers(&grouped, model_ir::RowAxis::Tokens, node..node + 1),
             "the capture window answers differently in the two arms, so the gate \
              below would be counting more than the correction",
         );
         assert!(
-            !fallback::answers(&shipped, node..node + 1).is_empty(),
+            !fallback::answers(&shipped, model_ir::RowAxis::Tokens, node..node + 1).is_empty(),
             "node {node} is withdrawn only under the scaffold, so it is the \
              scaffold's doing and not the class set's",
         );

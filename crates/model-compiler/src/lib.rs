@@ -86,7 +86,7 @@ pub use compiled::{
     Phase, Region,
 };
 pub use budget::{
-    Budget, Budgets, DeviceProfile, FamilyCosts, PATCH_LATTICE_FLOOR, PatchLadder,
+    Budget, Budgets, DeviceProfile, FamilyCosts, Ladder, PATCH_LATTICE_FLOOR, PatchLadder,
 };
 /// The row-axis discriminator, re-exported UNDER ITS OWN NAME from the IR
 /// that owns it. A second spelling here would be a second answer to "which
@@ -159,7 +159,7 @@ pub fn compile_axes(
     // it was built in. It is asked off `node_mask` — the sweep's own answer,
     // before regions exist — because a region is a maximal run of nodes with
     // EQUAL masks, so the two readings are the same predicate and this one
-    // needs no pass to have run. The authoring net in `crates/model/tests`
+    // needs no pass to have run. The authoring net in `crates/models/tests`
     // asks it in the same vocabulary against `resolve_classes` alone, which
     // is the earliest and cheapest instant a straddling model text can be
     // told; this is the front door's own restatement, on the load path.
@@ -230,7 +230,8 @@ pub fn compile_axes(
         trace,
         &regions_on(&regions, &units_of, &units, RowAxis::Tokens),
         &classes,
-        budget,
+        &budget.buckets,
+        budget.max_tokens,
         profile,
     );
     let patches = patch_axis(trace, &regions, &units_of, &units, &classes, budgets, profile);
@@ -283,12 +284,17 @@ fn regions_on(
 /// P4 on the patch axis, or `None` for a plan that states no patch row.
 ///
 /// THE LADDER IT MEASURES AGAINST IS THE PATCH LADDER. `layout::menu` reads a
-/// bucket lattice and a ceiling off the budget it is handed, and the answer it
-/// writes is bucket-dependent by construction (copy below the crossover, split
-/// above it) — so handing it the TOKEN ladder would key the tower's fallback
-/// rows to the trunk's rungs. It is handed the patch axis's own numbers in the
-/// budget's own shape instead; nothing else of a `Budget` is read here, and
-/// this one never leaves the function.
+/// bucket lattice and a ceiling, and the answer it writes is bucket-dependent
+/// by construction (copy below the crossover, split above it) — so handing it
+/// the TOKEN ladder would key the tower's fallback rows to the trunk's rungs.
+/// It is handed the patch axis's own two numbers instead.
+///
+/// **AND THEY GO IN AS TWO NUMBERS**, which is one wave's worth of correction:
+/// a whole `Budget` was FABRICATED here to carry them, with `max_adapters: 0`
+/// and a cloned lattice, because that was the shape `seriate` took. Four
+/// fields to carry two, and two of the four were lies — a patch axis has no
+/// adapter pool and its `max_lanes` is images, not requests. `seriate` takes
+/// the lattice and the ceiling now, so there is nothing to fabricate.
 fn patch_axis(
     trace: &Trace,
     regions: &[Region],
@@ -298,25 +304,24 @@ fn patch_axis(
     budgets: &Budgets,
     profile: &DeviceProfile,
 ) -> Option<AxisPlan> {
-    let ladder = budgets.patches.as_ref()?;
+    let ladder = budgets.ladder(RowAxis::Patches)?;
     if !units.contains(&RowAxis::Patches) {
         return None;
     }
     let on_axis = regions_on(regions, units_of, units, RowAxis::Patches);
-    // THE PATCH AXIS'S OWN LANE COUNT IS IMAGES, and it is stated rather
-    // than borrowed from the token axis: a lane may submit three images or
-    // none, so `Budget::max_lanes` is not this number and reading it here
-    // would size the tower's `images + 1` indptr by an argument about
-    // requests. `accept` has already refused a ladder that admits more
-    // images than patch rows, so this pair is coherent by the time it is
-    // read.
-    let ceiling = Budget {
-        max_lanes: ladder.max_images,
-        max_tokens: ladder.max_patches,
-        buckets: ladder.buckets.clone(),
-        max_adapters: 0,
-    };
-    let (order, fallback) = layout::seriate(trace, &on_axis, classes, &ceiling, profile);
+    // THE TWO NUMBERS ARE THIS AXIS'S OWN, off this axis's own ladder — the
+    // rungs a tower fire lands on and the ceiling above them. `accept` has
+    // already refused a lattice that does not ascend or that names a rung
+    // past that ceiling, on this axis by the same walk it refused the token
+    // one by, so the pair is coherent by the time it is read.
+    let (order, fallback) = layout::seriate(
+        trace,
+        &on_axis,
+        classes,
+        ladder.buckets,
+        ladder.max_rows,
+        profile,
+    );
     Some(AxisPlan {
         axis: RowAxis::Patches,
         order,
@@ -344,70 +349,16 @@ fn accept(trace: &Trace, budgets: &Budgets, profile: &DeviceProfile) -> Result<(
         return Err(Error::TooManyFacts { facts });
     }
 
-    if budget.max_lanes == 0 {
-        return Err(Error::Budget {
-            what: "admit no lanes, so no fire can be assembled",
-        });
-    }
-    if budget.max_tokens == 0 {
-        return Err(Error::Budget {
-            what: "admit no token rows, so every rectangle is empty",
-        });
-    }
-    if budget.max_lanes > budget.max_tokens {
-        return Err(Error::Budget {
-            what: "admit more lanes than token rows, and a lane carries at least one row",
-        });
-    }
-    let mut previous = 0u32;
-    for &bucket in &budget.buckets {
-        if bucket <= previous {
-            return Err(Error::Budget {
-                what: "list a bucket lattice that does not strictly ascend",
-            });
-        }
-        if bucket > budget.max_tokens {
-            return Err(Error::Budget {
-                what: "list a bucket past the token ceiling",
-            });
-        }
-        previous = bucket;
-    }
-
-    // THE SECOND AXIS'S CEILING, CHECKED IN THE SAME VOCABULARY (multimodal
-    // §5.5). A ladder is a ladder whichever axis it climbs, so the same three
-    // refusals apply — and they are stated here rather than folded into the
-    // loop above so that a reader can see there are two ladders and that
-    // neither is derived from the other.
-    if let Some(ladder) = &budgets.patches {
-        if ladder.max_patches == 0 {
-            return Err(Error::Budget {
-                what: "admit a patch axis with no patch rows, so every tower                        rectangle is empty",
-            });
-        }
-        if ladder.max_images == 0 {
-            return Err(Error::Budget {
-                what: "admit a patch axis with no images, and a patch row is a row                        of one",
-            });
-        }
-        if ladder.max_images > ladder.max_patches {
-            return Err(Error::Budget {
-                what: "admit more images than patch rows, and an image carries at                        least one patch row",
-            });
-        }
-        let mut previous = 0u32;
-        for &bucket in &ladder.buckets {
-            if bucket <= previous {
-                return Err(Error::Budget {
-                    what: "list a patch lattice that does not strictly ascend",
-                });
-            }
-            if bucket > ladder.max_patches {
-                return Err(Error::Budget {
-                    what: "list a patch bucket past the patch ceiling",
-                });
-            }
-            previous = bucket;
+    // **THE LADDERS, ONE PER ROW AXIS THE DEPLOYMENT STATES** — the same five
+    // refusals over both, said once (`accept_ladder`). A ladder is a ladder
+    // whichever axis it climbs; what differs between them is the WORDS a
+    // refusal is spelled with, and those are the only per-axis thing left.
+    // The token axis is always stated; the patch one is stated by a
+    // deployment that admits patch rows and skipped, refusal-free, by every
+    // other, which is what makes the second ladder free for a text-only load.
+    for axis in RowAxis::ALL {
+        if let Some(ladder) = budgets.ladder(axis) {
+            accept_ladder(&ladder, axis)?;
         }
     }
 
@@ -418,11 +369,7 @@ fn accept(trace: &Trace, budgets: &Budgets, profile: &DeviceProfile) -> Result<(
     // sizes no ceiling for has a rectangle with no height, and a carve at zero
     // rows computes over somebody else's bytes rather than faulting.
     for axis in unit::axes_stated(trace) {
-        let sized = match axis {
-            RowAxis::Tokens => true,
-            RowAxis::Patches => budgets.patches.is_some(),
-        };
-        if !sized {
+        if budgets.ladder(axis).is_none() {
             return Err(Error::Unsized { axis });
         }
     }
@@ -472,6 +419,93 @@ fn accept(trace: &Trace, budgets: &Budgets, profile: &DeviceProfile) -> Result<(
 
     Ok(())
 }
+
+/// **THE FIVE THINGS A LADDER MAY NOT SAY, ON ANY ROW AXIS** — P0's ceiling
+/// checks, stated once and called per axis.
+///
+/// **THEY WERE STATED TWICE, AND THE SECOND COPY WAS THE POINT OF THE
+/// EXERCISE.** The token block and the patch block asked the same five
+/// questions of the same three numbers under different field names, so the
+/// day one grew a clause the other did not was a day one axis admitted a
+/// ladder the other refuses — with no compiler complaint, because the two
+/// blocks share no type. [`Ladder`] is the type they now share, and this is
+/// the block they now share.
+///
+/// **WHAT IS GENUINELY PER-AXIS IS THE PROSE, AND ONLY THE PROSE.** A refusal
+/// is read by a human deploying a model, so "no lanes" and "no images" are
+/// two different sentences about two different things a deployment got wrong.
+/// [`LadderWords`] carries them, indexed by the axis, which is one table with
+/// one row per axis rather than one block per axis.
+///
+/// # Errors
+///
+/// [`Error::Budget`] with the axis's own sentence for: a ladder that admits
+/// no lanes, one that admits no rows, one that admits more lanes than rows (a
+/// lane carries at least one row on either rectangle), a lattice that does
+/// not strictly ascend, and a lattice with a rung past the ceiling.
+fn accept_ladder(ladder: &Ladder<'_>, axis: RowAxis) -> Result<(), Error> {
+    let words = LADDER_WORDS[axis];
+    if ladder.max_lanes == 0 {
+        return Err(Error::Budget { what: words.no_lanes });
+    }
+    if ladder.max_rows == 0 {
+        return Err(Error::Budget { what: words.no_rows });
+    }
+    if ladder.max_lanes > ladder.max_rows {
+        return Err(Error::Budget {
+            what: words.lanes_past_rows,
+        });
+    }
+    let mut previous = 0u32;
+    for &bucket in ladder.buckets {
+        if bucket <= previous {
+            return Err(Error::Budget {
+                what: words.unsorted,
+            });
+        }
+        if bucket > ladder.max_rows {
+            return Err(Error::Budget {
+                what: words.past_ceiling,
+            });
+        }
+        previous = bucket;
+    }
+    Ok(())
+}
+
+/// The five sentences [`accept_ladder`] refuses with, for one row axis.
+///
+/// Each one completes "this deployment would " — which is what `Error::Budget`
+/// prints — so they are written as verb phrases and not as nouns.
+#[derive(Debug, Clone, Copy)]
+struct LadderWords {
+    no_lanes: &'static str,
+    no_rows: &'static str,
+    lanes_past_rows: &'static str,
+    unsorted: &'static str,
+    past_ceiling: &'static str,
+}
+
+/// One row of [`LadderWords`] per row axis, in [`RowAxis::ALL`]'s order — the
+/// whole of what an axis contributes to an acceptance refusal, and the array
+/// a third rectangle costs one more entry of.
+const LADDER_WORDS: model_ir::PerAxis<LadderWords> = model_ir::PerAxis::new([
+    LadderWords {
+        no_lanes: "admit no lanes, so no fire can be assembled",
+        no_rows: "admit no token rows, so every rectangle is empty",
+        lanes_past_rows: "admit more lanes than token rows, and a lane carries at least one row",
+        unsorted: "list a bucket lattice that does not strictly ascend",
+        past_ceiling: "list a bucket past the token ceiling",
+    },
+    LadderWords {
+        no_lanes: "admit a patch axis with no images, and a patch row is a row of one",
+        no_rows: "admit a patch axis with no patch rows, so every tower rectangle is empty",
+        lanes_past_rows: "admit more images than patch rows, and an image carries at least one \
+                          patch row",
+        unsorted: "list a patch lattice that does not strictly ascend",
+        past_ceiling: "list a patch bucket past the patch ceiling",
+    },
+]);
 
 /// P1's acceptance check: no `Struct` value may be read outside the window it
 /// was built in.

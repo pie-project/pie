@@ -141,7 +141,7 @@ impl Run<'_> {
             region: self.at_region(),
             ..CopyPlan::default()
         };
-        let rows = self.window().span.rows;
+        let rows = self.window().span().rows;
         let mut at = 0u64;
         let mut note = |plan: &mut CopyPlan, id: ValueId, written: bool| {
             let Some(decl) = self.values().get(id.0 as usize) else {

@@ -363,7 +363,7 @@ pub struct Lane {
     /// (`engine_cuda::Fault::DraftWord`), which is [`Lane::mask`]'s rule and
     /// [`Lane::adapter`]'s rule for the third time.
     ///
-    /// **THE ROW ALIGNMENT IS THE CALLER'S** (`model::qwen_3`'s own note): the
+    /// **THE ROW ALIGNMENT IS THE CALLER'S** (`models::qwen_3`'s own note): the
     /// head was trained on `(hidden at p, token at p+1)` and is fed `(x, tok)`
     /// at one row, so a drafting lane's row `r` must carry the token one
     /// position past the hidden the trunk leaves at `r`. The contract states
@@ -505,7 +505,7 @@ impl Lane {
             && stated != self.tokens.len()
         {
             return Err(Error::Invalid(format!(
-                "lane in slot {} states {stated} per-row masks for the {} rows it                  carries",
+                "lane in slot {} states {stated} per-row masks for the {} rows it carries",
                 self.slot,
                 self.rows()
             )));
@@ -775,15 +775,24 @@ pub struct StepMedia {
     /// `rows.iter().sum()` rows of the plan's declared patch width, in the
     /// order the front-end laid them (merge- or pool-block-major, by statute).
     pub patches: Vec<f32>,
-    /// Where each payload row's tower output lands in the TOKEN rectangle —
-    /// one entry per payload row, as an offset into THIS LANE's token rows.
+    /// Where this lane's tower output lands in the TOKEN rectangle — one
+    /// entry per payload row, as an offset into THIS LANE's token rows.
+    ///
+    /// **THE LIVE PREFIX IS FOLD-SPACE AND SPANS THE WHOLE LANE.** A route is
+    /// read at the FOLD's output row: a plan that merges `side²` payload rows
+    /// into one answers `payload_rows / fold` rows, and an engine pairs output
+    /// row `j` with `routes[j]`. So the addresses are the lane's spans'
+    /// `token_count`s CONCATENATED — span 0's, then span 1's, back to back,
+    /// with no per-span padding between them — and the `-1` tail is ONE tail
+    /// at the end of the lane, padding the vector out to the
+    /// `[Dim::Patches]` rectangle's own length. Per-span padding is the same
+    /// vector for one span and drops every span after the first.
     ///
     /// **LANE-RELATIVE, AND REBASED BY THE ENGINE.** A submission cannot know
     /// the seriated fire it will land in, so a route says "my seventh token
-    /// row" and the shell adds the lane's own row offset. `-1` is the
-    /// fold-space tail — a merge that folds four payload rows into one token
-    /// spends the surplus on rows that go nowhere — and an engine admits it
-    /// only for a plan that declares an op honouring it.
+    /// row" and the shell adds the lane's own row offset. `-1` names no row,
+    /// so it is NOT rebased, and an engine admits it only for a plan that
+    /// declares an op honouring it.
     pub routes: Vec<i32>,
     /// **THE TOWER'S ROTATION STREAM**: three `i32` per payload row — each
     /// row's own `(t, h, w)` in its span's grid, in [`patches`](StepMedia::patches)'
@@ -967,7 +976,8 @@ impl Step {
                 .any(|earlier| earlier.instance == attachment.instance)
             {
                 return Err(Error::Invalid(format!(
-                    "instance {} is attached twice to one fire, at attachment {index};                      a program's stages are one pass with one commit",
+                    "instance {} is attached twice to one fire, at attachment {index}; a \
+                     program's stages are one pass with one commit",
                     attachment.instance
                 )));
             }

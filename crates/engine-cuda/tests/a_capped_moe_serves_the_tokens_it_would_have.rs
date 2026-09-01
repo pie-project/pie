@@ -42,6 +42,28 @@
 //! whole, on one tier. `experts.rs`' header argues it; this file measures the
 //! result.
 //!
+//! # The capped load is a WARM load now, and the prepare is how it got there
+//!
+//! §M wave M-3 made the streamed serve warm-only: under `Intent::Serve` a plan
+//! that streams reads a prepared serving artifact — `<key>.tiers` under the
+//! weight cache directory — or it is REFUSED before the pinned tier is
+//! allocated, and `Shell::prepare` is the only door in the process that writes
+//! one. So the capped boot below is preceded by a prepare into a scratch
+//! directory, at the SAME plan and the SAME `Boot` document: the key is a
+//! function of the whole document, and two documents would name two files.
+//!
+//! It used to read `weight_cache_dir: None`, over a comment saying the cache
+//! was off for a gate — a test that shared one would be asserting about the
+//! last run — and that a streamed load formed no key anyway. The first half
+//! is still true and is why the directory is a fresh one per run that removes
+//! itself. The second half was a fact about §K's engine and M-3 deleted it:
+//! this load forms a key and has exactly one place to read.
+//!
+//! **THE UNCAPPED GOLDEN IS UNTOUCHED.** A fully-resident load lands out of
+//! the checkpoint exactly as it always did, looks for no artifact and is given
+//! no directory, which is what keeps (b) a comparison between a cold reference
+//! and a warm subject rather than between two readings of one file.
+//!
 //! ```text
 //! cargo test -p engine-cuda --features cuda-13 \
 //!     --test a_capped_moe_serves_the_tokens_it_would_have -- --ignored --nocapture
@@ -49,10 +71,14 @@
 //!
 //! # Gating
 //!
-//! `#[ignore]`d: it wants a CUDA device with ~15 GiB free AND the gpt-oss-20b
-//! snapshot on disk, and it loads the model TWICE (sequentially — the first
-//! shell is dropped before the second is built). Skips with a sentence when
-//! either is missing, the same convention `masked_axis.rs` uses.
+//! `#[ignore]`d: it wants a CUDA device with ~15 GiB free, the gpt-oss-20b
+//! snapshot on disk, and — since §M-3 — room under `TMPDIR` for this
+//! deployment's serving artifact, which carries one image per plane of the
+//! whole ~13.8 GiB table. It lands the model THREE times, sequentially: the
+//! uncapped golden, the prepare, and the capped boot that reads what the
+//! prepare wrote, each dropped before the next is built. Skips with a
+//! sentence when the device or the snapshot is missing, the same convention
+//! `masked_axis.rs` uses.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -92,7 +118,27 @@ fn serialized() -> MutexGuard<'static, ()> {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
+}
+
+/// A temporary directory that removes itself, however the test leaves —
+/// including the serving artifact the prepare puts in it, which is the whole
+/// table's worth of images.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(what: &str) -> Scratch {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let dir = std::env::temp_dir().join(format!("pie-{what}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a temporary directory");
+    Scratch(dir)
 }
 
 fn snapshot() -> Option<PathBuf> {
@@ -155,9 +201,9 @@ fn rig(what: &str) -> Option<Rig> {
     }
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index_all(&shards).expect("the checkpoint's shards open as one");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
     Some(Rig {
@@ -168,9 +214,13 @@ fn rig(what: &str) -> Option<Rig> {
     })
 }
 
-/// A shell over the rig, at a stated residency.
-fn load(rig: &Rig, residency: Plan) -> engine_cuda::Result<Shell> {
-    Shell::load(Boot {
+/// **ONE DOCUMENT, TWO DOORS** (§M-3). The prepare and the boot that reads
+/// what it wrote have to describe the same deployment in every field or they
+/// name two different files — the artifact's key is a function of the trace,
+/// the recipe and the ranking — so the document is stated once and handed to
+/// both.
+fn doc<'a>(rig: &'a Rig, residency: Plan, cache: Option<&'a Path>) -> Boot<'a> {
+    Boot {
         trace: rig.trace.clone(),
         contract: &rig.contract,
         checkpoint: &rig.checkpoint,
@@ -183,14 +233,28 @@ fn load(rig: &Rig, residency: Plan) -> engine_cuda::Result<Shell> {
         ordinal: 0,
         graphs: Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
-        // The warm-boot artifact cache is off for a gate — a test that shared
-        // one would be asserting about the last run — and a streamed load
-        // forms no key anyway.
-        weight_cache_dir: None,
+        // **THE STREAMED LOAD'S ONLY ROAD** (§M-3), and a scratch one per run:
+        // sharing a directory between runs would be asserting about the last
+        // one. `None` is the uncapped golden's, which reads no artifact and is
+        // the load it was before any of this.
+        weight_cache_dir: cache,
         residency,
-    })
+    }
+}
+
+/// A shell over the rig, at a stated residency, reading whatever `cache` says.
+fn load(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result<Shell> {
+    Shell::load(doc(rig, residency, cache))
+}
+
+/// **THE WRITER**, and since §M-3 the only one in the process. `pie model
+/// import --prepare-only` reaches it through `Cuda::prepare`; this gate
+/// reaches it directly, because what the capped boot needs is the file and
+/// not the plumbing.
+fn prepare(rig: &Rig, residency: Plan, cache: &Path) -> engine_cuda::Result<()> {
+    Shell::prepare(doc(rig, residency, Some(cache)))
 }
 
 /// A prefill and `STEPS` greedy decodes, feeding the argmax back. Answers the
@@ -256,8 +320,9 @@ fn finite(logits: &[f32], what: &str) {
 /// reserved a byte — then capped to `CAP/OF` of the table, which puts whole
 /// mxfp4 banks on the pinned tier.
 #[test]
-#[ignore = "real-hardware: needs a CUDA device with ~15 GiB free and a local \
-            gpt-oss-20b snapshot; run it with `-- --ignored`"]
+#[ignore = "real-hardware: needs a CUDA device with ~15 GiB free, a local \
+            gpt-oss-20b snapshot and room under TMPDIR for one serving \
+            artifact; run it with `-- --ignored`"]
 fn a_capped_moe_serves_the_tokens_it_would_have() {
     let _one = serialized();
     let Some(rig) = rig("the capped-MoE gate") else {
@@ -282,8 +347,10 @@ fn a_capped_moe_serves_the_tokens_it_would_have() {
         .device_demand();
     eprintln!("gpt-oss-20b: {full} bytes of weight table, whole");
 
-    // ── THE GOLDEN, UNCAPPED. Everything on the device; no tier opened.
-    let mut resident = load(&rig, Plan::default()).expect("the uncapped shell loads");
+    // ── THE GOLDEN, UNCAPPED. Everything on the device; no tier opened; no
+    //    cache directory, because a resident load neither reads one nor —
+    //    since §M-3 — is refused for wanting one.
+    let mut resident = load(&rig, Plan::default(), None).expect("the uncapped shell loads");
     assert!(
         resident.weights_resident(),
         "an uncapped load holds the whole table"
@@ -338,10 +405,32 @@ fn a_capped_moe_serves_the_tokens_it_would_have() {
         plan.host_demand(),
     );
 
-    let mut streamed = load(&rig, plan).expect("the capped shell loads");
+    // ── THE PREPARE. Since §M-3 this is where a streamed load's weights come
+    //    from and there is nowhere else: the boot under it would refuse
+    //    against an empty directory, by name, before it reserved a byte.
+    //    `a_prepare_writes_the_tiers_a_bare_boot_refuses` is where that pair
+    //    is the subject; here it is the cost of admission, and it is one more
+    //    landing of the same table at the same plan.
+    let cache = scratch("capped-moe");
+    prepare(&rig, plan.clone(), &cache.0).expect("the prepare writes this seat's artifact");
+    assert_eq!(
+        std::fs::read_dir(&cache.0)
+            .expect("the cache directory")
+            .flatten()
+            .count(),
+        1,
+        "one prepare, one serving artifact, and no `.part` left beside it"
+    );
+
+    let mut streamed = load(&rig, plan, Some(&cache.0)).expect("the capped shell loads");
     assert!(
         !streamed.weights_resident(),
         "a streamed load says so rather than claiming the table"
+    );
+    assert!(
+        streamed.weights_from_cache(),
+        "and its bytes came off the artifact the prepare wrote — the host-side \
+         transform pipeline runs in a prepare now, never in a serve"
     );
     // The tier reports the packed banks at zero device slots, which is the
     // truth: their planes are on the pinned tier whole.

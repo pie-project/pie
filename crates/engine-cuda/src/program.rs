@@ -185,7 +185,7 @@ pub struct Plane {
 
 impl Default for Plane {
     /// A plane that caches no cubin. Where they are kept is the DEPLOYMENT's
-    /// answer, arriving on `Boot::program_cache_dir` (article 9: shells read
+    /// answer, arriving on `Boot::cache_dir` (article 9: shells read
     /// no environment) — so a plane made without one stores nothing rather
     /// than going looking, and pays NVRTC instead. Every failure of that cache
     /// is a miss and never an error.

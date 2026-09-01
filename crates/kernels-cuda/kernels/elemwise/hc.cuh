@@ -7,6 +7,61 @@ namespace pie::elemwise {
 
 constexpr int MAX_HC_MULT = 8;
 
+// `mixes[n, o] = dot(normed[n, :], hc_fn[o, :])` — the per-token mix row
+// `hc_gates` below splits, projected out of the weightless-RMS-normed stream
+// row by the layer's own `{attn,ffn}_hc.fn` plane (`[2M + M*M, M*H]`).
+//
+// **A GEMM, AND NOT `linear.matmul`**: both operands are f32 (the sinkhorn
+// downstream is f32 by design and `hc_rmsnorm_f32` widens for that reason)
+// and the dense gemm points are bf16. The rectangle is also the smallest in
+// this tree — `2M + M*M` is twenty-four columns at `hc_mult 4` — so one block
+// per `(row, column)` reducing `M*H` is the shape the arithmetic has.
+//
+// The point is ONE-DIMENSIONAL and the `(row, column)` pair is derived, which
+// is `attn/hc.metal`'s twin exactly: that plane's position attributes must
+// all be scalars, and the two shaders index one arithmetic.
+template <int BLOCK = 256>
+__global__ void hc_project(
+    const float* __restrict__ normed,
+    const float* __restrict__ hc_fn,
+    float* __restrict__ mixes,
+    int fan_in,
+    int mix_hc,
+    const u32* __restrict__ win)
+{
+    const int o = static_cast<int>(blockIdx.x) % mix_hc;
+    const int n = static_cast<int>(blockIdx.x) / mix_hc;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `normed` and `mixes` are
+    // both row planes handed at their base.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const int tid = threadIdx.x;
+    const float* src = normed + static_cast<long long>(row) * fan_in;
+    const float* w = hc_fn + static_cast<long long>(o) * fan_in;
+
+    float local_sum = 0.f;
+    for (int d = tid; d < fan_in; d += blockDim.x) {
+        local_sum += src[d] * w[d];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, offset);
+
+    __shared__ float warp_sums[BLOCK / 32];
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = local_sum;
+    __syncthreads();
+
+    if (tid == 0) {
+        float total = 0.f;
+        const int nwarps = (blockDim.x + 31) / 32;
+        for (int i = 0; i < nwarps; ++i) total += warp_sums[i];
+        mixes[static_cast<long long>(row) * mix_hc + o] = total;
+    }
+}
+
 template <class T, int BLOCK = 256>
 __global__ void hc_gates(
     const float* __restrict__ mixes,

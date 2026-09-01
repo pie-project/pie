@@ -525,30 +525,113 @@ fn the_vector_point_computes_the_affine_product_the_host_computes() {
     agrees("qmv", &got, &reference(rows));
 }
 
-/// **THE FOLDED VECTOR POINT LANDS THE ONE-ROW POINT'S BITS, EXACTLY.**
+/// **THE FOLDED VECTOR POINT LANDS THE ONE-ROW POINT'S BITS AT ONE PACK
+/// WIDTH, AND AT EXACTLY ONE.**
 ///
-/// This is the one arm of the ladder whose two speeds ARE two speeds of one
-/// kernel, and it is worth a bit-for-bit gate where the tile-versus-vector
-/// parting is not. `quant_qmv_rows.metal`'s `qdot_staged` is
-/// `quant_qmv.metal`'s `qdot` with its pack handed in rather than read in:
-/// same term order, same `float` accumulator, same `scale * SUM + bias * sum`
-/// factoring, same `simd_sum` fold over the same thirty-two lanes. Nothing
-/// about the fold touches the arithmetic — it changes who FETCHES, not who
-/// adds.
+/// This case used to say the fold was bit-identical FULL STOP, and to conclude
+/// that `qmv_rows_max` is "a pure performance knob rather than a second
+/// numerical policy beside `qmm_min_batch`". **Both sentences were wrong, and
+/// the second one cost a campaign** — see `throughput_probe`'s
+/// `gemma4_26b_a4b_decodes_on_many_lanes_at_once` and `.wiki/macos-bench.md`
+/// §23.
 ///
-/// So `act_x_wt` may move a width between the two without moving a token,
-/// which is what makes `qmv_rows_max` a pure performance knob rather than a
-/// second numerical policy beside `qmm_min_batch`. An edit that made the
-/// folded point cheaper by reassociating its sum would take that away, and
-/// this is where it would be caught.
+/// # What is true, and where the line falls
 ///
-/// Run over [`Bank::Rough`] at [`DEEP_K`] for `the_fingerprint_matrix`'s
-/// reason: the exact bank rounds nowhere, so it would report every arm
-/// identical and prove nothing.
+/// `quant_qmv_rows.metal`'s `qdot_staged` IS `quant_qmv.metal`'s `qdot` with
+/// its pack handed in rather than read in — same accumulator, same
+/// `scale * SUM + bias * sum` factoring, same `simd_sum` over the same
+/// thirty-two lanes. What the two files do NOT share is how k is dealt out to
+/// those thirty-two lanes, because that is
+/// `block_size = pack_factor * packs_per_thread * SIMD_SIZE` and the pack
+/// width is a template parameter on both:
+///
+/// ```text
+///   affine_qmv_fast      packs_per_thread = 2, always (qmv_fast_impl's default)
+///   affine_qmv_rows      packs_per_thread = DeviceTuning::qmv_rows_packs
+/// ```
+///
+/// At four bits `pack_factor` is 8, so the one-row point gives every lane a
+/// SIXTEEN-code slice of a 512-code block and the fold at one pack gives it an
+/// EIGHT-code slice of a 256-code one. Every product is the same; which lane
+/// adds it up is not, and `simd_sum` folds thirty-two different partial sums.
+/// So the fold reassociates whenever `qmv_rows_packs != 2` — which is the
+/// M1 Max's own table, where it is 1.
+///
+/// # Why nobody saw it, and it is a SAMPLE SIZE
+///
+/// A reassociation of a few thousand f32 terms is worth about one f32 ulp, and
+/// eight mantissa bits round that away — unless the exact value happens to sit
+/// within an f32 ulp of a `bfloat16` rounding boundary, which is roughly one
+/// element in eight thousand. This case fired 256 to 1024 elements at a time,
+/// so it expected to see nothing and saw nothing. It now fires 8192, and the
+/// measurement is:
+///
+/// ```text
+///   K=1024  r=2,4,8  p=1  over 64 rows   1 of 8192 elements parts
+///   K=2816  r=2,4,8  p=1  over 64 rows   1 of 8192, worst |delta| 0.000061
+///   every p=2 rung, both depths          0 of 8192
+/// ```
+///
+/// **ONE BF16 ULP IN ONE ELEMENT IN EIGHT THOUSAND IS THE WHOLE OF THE SEED**,
+/// and it is enough: gemma-4-26b-a4b lands about eight hundred thousand dense
+/// projection elements per decode row — 552k over the thirty layers and 262k
+/// more at the lm head — and routes eight of 128 experts on them thirty times
+/// over, so a handful of ulps become a different expert and then a different
+/// token. See §23.
+///
+/// # What is gated
+///
+///   * at `packs = 2` — the one-row point's own width — the fold is
+///     BIT-IDENTICAL, at every rung and both depths, and that is asserted;
+///   * at any other pack width it is a REASSOCIATION and not a wrong answer,
+///     so what is asserted is the size: the two arms stay inside
+///     [`REASSOCIATED`] of the answer's own rms. A fold that read a nibble at
+///     the wrong end or indexed a scale by the wrong group lands two orders
+///     above that. The parting COUNT is printed rather than asserted, because
+///     it is a property of the bank and the machine; what must not move is the
+///     bound and the p=2 identity.
+///
+/// Run over [`Bank::Rough`] for `the_fingerprint_matrix`'s reason: the exact
+/// bank rounds nowhere, so it would report every arm identical and prove
+/// nothing.
 #[test]
 fn the_folded_vector_point_lands_the_one_row_bits() {
     let _serial = serialized();
-    let Some(mut floor) = Floor::staged("the folded vector point", Bank::Rough, DEEP_K) else {
+    for depth in [DEEP_K, FOLD_K] {
+        the_fold_against_the_one_row_point(depth);
+    }
+}
+
+/// The pack width `affine_qmv_fast` is stamped at, and the whole of what
+/// decides whether the fold is a rounding-free selection.
+///
+/// It is `qmv_fast_impl`'s `packs_per_thread_` default and there is no second
+/// stamp of the one-row point, so a fold selected at any other width walks a
+/// different block of k. See
+/// [`DeviceTuning::qmv_rows_packs`](kernels_metal::tuning::DeviceTuning::qmv_rows_packs).
+const ONE_ROW_PACKS: i32 = 2;
+
+/// **A CONTRACTION DEEP ENOUGH THAT A REASSOCIATION SURVIVES `bfloat16`.**
+///
+/// 2816 is gemma-4-26b-a4b's hidden width — the checkpoint whose crowd this
+/// case's blind spot was chased through for two campaigns — and 44 whole
+/// groups of 64. It is also 5.5 of the one-row point's 512-code blocks, so the
+/// two partitions differ in their tail as well as in their stride.
+const FOLD_K: u32 = 2816;
+
+/// How far the reassociated fold may sit from the one-row point, as a fraction
+/// of the answer's own rms.
+///
+/// Half a percent is about one `bfloat16` ulp — eight mantissa bits is 0.39% —
+/// which is the largest a reassociation of the SAME products can be after the
+/// store rounds. The measured worst over both depths and all thirteen rungs is
+/// 0.001%. What the bound separates is that from a fold that read the wrong
+/// nibble or indexed a scale by the wrong group, which lands two orders above
+/// it, and [`TOLERANCE`] is where that would be caught against the host.
+const REASSOCIATED: f32 = 0.005;
+
+fn the_fold_against_the_one_row_point(depth: u32) {
+    let Some(mut floor) = Floor::staged("the folded vector point", Bank::Rough, depth) else {
         return;
     };
     let (k, n) = (floor.k as i32, N as i32);
@@ -609,6 +692,8 @@ fn the_folded_vector_point_lands_the_one_row_bits() {
     // Every fold this file can mint, at a batch it divides — including the
     // rungs the M1 Max's table declines to select, because the gate is on
     // the KERNEL and not on which rung a machine happens to want.
+    let mut matched = 0usize;
+    let mut reassociated = 0usize;
     for &(rows, r, p) in &[
         (2u32, 2i32, 1i32),
         (2, 2, 2),
@@ -619,19 +704,56 @@ fn the_folded_vector_point_lands_the_one_row_bits() {
         (8, 4, 1),
         (8, 8, 1),
         (8, 8, 2),
+        (64, 2, 1),
+        (64, 4, 1),
+        (64, 8, 1),
+        (64, 8, 2),
     ] {
         let want = floor.fired(rows, one_row(rows));
         let got = floor.fired(rows, folded(rows, r, p));
-        assert_eq!(
-            fingerprint(&got),
-            fingerprint(&want),
-            "the fold at r={r} p={p} over {rows} rows parts from the one-row point: {:?}",
+        if p == ONE_ROW_PACKS {
+            matched += 1;
+            assert_eq!(
+                fingerprint(&got),
+                fingerprint(&want),
+                "the fold at r={r} p={p} over {rows} rows parts from the one-row point at \
+                 ITS OWN pack width, where the two deal k out to the thirty-two lanes \
+                 identically: {:?}",
+                first_parting(&got, &want),
+            );
+            continue;
+        }
+        reassociated += 1;
+        let rms = (want.iter().map(|v| v * v).sum::<f32>() / want.len() as f32).sqrt();
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let parted = got
+            .iter()
+            .zip(&want)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        eprintln!(
+            "  K={depth} r={r} p={p} over {rows} rows: {parted} of {} elements part from the \
+             one-row point, worst |delta| {worst:.6} against an rms of {rms:.4} ({:.3}%)",
+            want.len(),
+            100.0 * worst / rms,
+        );
+        assert!(
+            worst <= REASSOCIATED * rms,
+            "the fold at r={r} p={p} over {rows} rows is {:.3}% of the answer's own \
+             magnitude away from the one-row point, which is past a reassociation: {:?}",
+            100.0 * worst / rms,
             first_parting(&got, &want),
         );
     }
     eprintln!(
-        "the folded vector point: nine (rows, fold, pack) triples, all bit-identical to \
-         `affine_qmv_fast` over {DEEP_K} terms of the rough bank"
+        "the folded vector point at K={depth}: {matched} triples at the one-row point's own \
+         pack width, bit-identical; {reassociated} at a pack width that reassociates, all \
+         inside {:.1}% of the answer's rms",
+        100.0 * REASSOCIATED,
     );
 }
 

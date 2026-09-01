@@ -25,5 +25,6 @@ pub use ops::{
 };
 pub use trace::{CacheRow, Node, Param, ParamSource, Platform, Seam, Shard, Trace};
 pub use value::{
-    Def, Dim, Dtype, GeomKind, RowAxis, RuntimeInput, StructKind, Ty, ValueDecl, ValueId,
+    Def, Dim, Dtype, GeomKind, PerAxis, RowAxis, RuntimeInput, StructKind, TILED_BAND,
+    TILED_STEP, Ty, ValueDecl, ValueId,
 };

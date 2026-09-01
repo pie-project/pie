@@ -82,16 +82,22 @@ pub fn intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitEr
     unbindable_intrinsic(ops, region, metal_intrinsic_supported)
 }
 
-/// [`intrinsics_bindable`]'s GROUPED twin, and it is one id narrower.
+/// [`intrinsics_bindable`]'s GROUPED twin, and the two now name the same set.
 ///
-/// A grouped kernel binds no per-intrinsic buffer: it reads
-/// `lane.logits_base` off the lane record and hands that one address to every
-/// `INTRINSIC_VAL` op. The score slab is a different allocation entirely — the
-/// shell's, not the arena's — so no displacement off that base reaches it, and
-/// a grouped region reading `attn_score` would be emitted pointing at the
-/// trunk's logits. That is precisely the silent mis-binding the whitelist
-/// exists to keep out, so the grouped path keeps the refusal the single-lane
-/// path just gave up. See [`super::intrinsics::m3_intrinsic_bindable`].
+/// A grouped kernel binds no per-intrinsic buffer: every rectangle it reads
+/// arrives as an ADDRESS on the lane record. That is why this was one id
+/// narrower for as long as `lane.logits_base` was the only such address — the
+/// score slab is a different allocation entirely, the shell's rather than the
+/// arena's, so no displacement off the readout reaches it and a grouped region
+/// reading `attn_score` would have been emitted pointing at the trunk's
+/// logits. The record carries `attn_score_base` now, so the rectangle has an
+/// address of its own and the refusal has nothing left to protect.
+///
+/// It stays a separate function rather than collapsing into
+/// [`intrinsics_bindable`]: the two forms answer this question from two tables
+/// and the day they diverge again — a new id with an argument index and no
+/// lane-record word — the shape of the answer should not have to be
+/// reinvented. See [`super::intrinsics::m3_intrinsic_bindable`].
 pub fn grouped_intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
     unbindable_intrinsic(ops, region, super::intrinsics::m3_intrinsic_bindable)
 }

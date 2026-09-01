@@ -489,6 +489,159 @@ template <typename T, int group_size, int bits, int BM, int BK, int BN>
       loader_w);
 }
 
+// ── the routed MXFP4 tile loader, in vectors ────────────────────────────────
+//
+// The same values in the same places as `mlx::steel::Mxfp4BlockLoader`, which
+// is vendored and stays as it is: a thread still owns `n_reads` consecutive
+// bytes of one weight row, still reads the one E8M0 exponent those bytes
+// share, and still multiplies each nibble by it before staging. Nothing about
+// the k order or the rounding moves, so this lands the SAME BITS as the
+// loader it replaces and the quant tile family's fingerprint is untouched.
+//
+// **WHAT MOVES IS THE SHAPE OF THE TWO MEMORY ACCESSES AROUND THAT
+// MULTIPLY.** The vendored loader spells its read `src[i]` over `n_reads` and
+// its write `dst[2 * i]`, `dst[2 * i + 1]` — eight one-byte device loads and
+// sixteen two-byte threadgroup stores per thread per k step at the 64-column
+// tile. Both runs are contiguous and both are aligned; NEITHER FACT IS
+// AVAILABLE TO THE COMPILER, because `src` is a `uint8_t*` whose alignment is
+// one by declaration, so the eight loads cannot be merged and are not.
+//
+// The alignment is the CALLER's property and is stated here rather than
+// assumed. `src` reaches a thread as `e * N * K / 2 + y_col * K / 2` plus
+// `bi * K / 2 + bj`, and the k loop steps it by `BCOLS_PACKED`, which is 16.
+// `qmm_grid` refuses to launch unless `K % BK == 0` at `BK = 32`, so every
+// row offset is a multiple of 16 bytes; `bj` is a multiple of `n_reads` by
+// construction. So each address is `n_reads`-aligned and the read is one
+// vector. `dst` lands at `bi * BK_padded + 2 * bj` with `BK_padded = BK + 8`,
+// a multiple of four halves both ways, so the store is one `vec<D, 4>`.
+//
+// Measured on an M1 Max over gpt-oss-20b's two expert shapes at 2048 sorted
+// rows, the shipped 32x64 tile: 12.29 → 12.12 ms on gate/up and 6.19 → 6.09
+// on down, +1.4% and +1.6%. It is a small number because the loader was never
+// what bound this kernel — see the note under the stamps — and it is kept
+// because it is free and because eight byte loads of an eight-byte aligned
+// run is a defect whatever it costs.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size,
+    typename D = T>
+struct Mxfp4VecLoader {
+  static_assert(BCOLS == 32, "MXFP4 blocks are exactly 32 values");
+  MLX_MTL_CONST short pack_factor = 2;
+  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  MLX_MTL_CONST short n_reads =
+      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
+  // The widest byte vector that divides a thread's run. Over the stamped
+  // column tiles at this family's 128 lanes `n_reads` is 8, 4 or 2, so this
+  // is 4 or 2 and never 1.
+  MLX_MTL_CONST short VEC = (n_reads % 4 == 0) ? 4 : n_reads;
+  static_assert(VEC == 2 || VEC == 4, "a thread reads two or four bytes");
+
+  const int src_ld;
+  const int tile_stride;
+  const int group_stride;
+  const short thread_idx;
+  const short bi;
+  const short bj;
+  threadgroup D* dst;
+  const device uint8_t* src;
+  const device uint8_t* exponents;
+
+  Mxfp4VecLoader(
+      const device uint8_t* src_,
+      const device uint8_t* exponents_,
+      const int src_ld_,
+      threadgroup D* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]])
+      : src_ld(src_ld_),
+        tile_stride(reduction_dim ? BCOLS_PACKED : BROWS * src_ld / pack_factor),
+        group_stride(BROWS * src_ld / 32),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads * thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(src_ + bi * src_ld / pack_factor + bj),
+        exponents(exponents_ + bi * src_ld / 32) {}
+
+  void load_unsafe() const {
+    const D scale = D(mxfp4_block_scale(*exponents));
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < n_reads; i += VEC) {
+      const vec<uint8_t, VEC> run =
+          *((const device vec<uint8_t, VEC>*)(src + i));
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < VEC; j += 2) {
+        const uint8_t lo = run[j];
+        const uint8_t hi = run[j + 1];
+        *((threadgroup vec<D, 4>*)(dst + 2 * (i + j))) = vec<D, 4>(
+            scale * D(mxfp4_lo(lo)), scale * D(mxfp4_hi(lo)),
+            scale * D(mxfp4_lo(hi)), scale * D(mxfp4_hi(hi)));
+      }
+    }
+  }
+
+  void next() {
+    src += tile_stride;
+    if (reduction_dim == 1)
+      ++exponents;
+    else
+      exponents += group_stride;
+  }
+};
+
+// ── the routed MXFP4 GEMM, biased and not ──────────────────────────────────
+//
+// **BOTH FORMS ARE STAMPED, AND THE SECOND ONE IS WHY THIS IS A `_impl`.**
+// gpt-oss is the family that ships mxfp4, and it biases its gate/up
+// projection and does NOT bias its down projection: `down_bias` is folded
+// after the weighted reduce, where a tensor-parallel split can still add it
+// once, so the down GEMM itself reaches this file with no bias plane. When
+// only the biased form existed, `batched_point` answered `None` for that
+// half of every mixture layer and the driver fell through to the MATVEC arm
+// -- one simdgroup per (row, four columns), reading each expert's down slice
+// once per ROUTED ROW instead of once per tile. Measured on an M1 Max at 512
+// prompt tokens that was 9.0 GB of weight traffic a layer against the tiled
+// arm's 0.53. Stamping this form measures 1547.0 -> 784.9 ms, 331.0 -> 652.4
+// tok/s. See `.wiki/macos-bench.md` section 18.
+template <typename T, int BM, int BK, int BN, bool WITH_BIAS>
+METAL_FUNC void mxfp4_qmm_t_routed_impl(
+    const device uint32_t* w,
+    const device uint8_t* exponents,
+    const device T* x,
+    device T* y,
+    const constant int& K,
+    const constant int& N,
+    const device T* bias,
+    const device int* tile_expert,
+    threadgroup half* Xs,
+    threadgroup half* Ws,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  const int e = tile_expert[tid.y];
+  if (e < 0) return;
+
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  constexpr int tgp_size = qmm_tgp<BM>();
+  const int y_col = int(tid.x) * BN;
+  const size_t expert_w = size_t(e) * size_t(N) * size_t(K) / 2;
+  const size_t expert_s = size_t(e) * size_t(N) * size_t(K / 32);
+  const device uint8_t* wb = (const device uint8_t*)w + expert_w + y_col * K / 2;
+  const device uint8_t* sb = exponents + expert_s + y_col * (K / 32);
+
+  using loader_w_t = Mxfp4VecLoader<T, BN, BK, BK_padded, 1, tgp_size, half>;
+  loader_w_t loader_w(wb, sb, K, Ws, simd_gid, simd_lid);
+  qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, WITH_BIAS>(
+      x, y,
+      WITH_BIAS ? bias + size_t(e) * size_t(N) + y_col : (const device T*)nullptr,
+      Xs, Ws, K, N, tid, simd_gid, simd_lid, loader_w);
+}
+
 template <typename T, int BM, int BK, int BN>
 [[kernel]] void mxfp4_qmm_t_routed_bias(
     const device uint32_t* w [[buffer(0)]],
@@ -502,25 +655,36 @@ template <typename T, int BM, int BK, int BN>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  const int e = tile_expert[tid.y];
-  if (e < 0) return;
-
   constexpr int BK_padded = BK + 16 / sizeof(half);
-  constexpr int tgp_size = qmm_tgp<BM>();
-  const int y_col = int(tid.x) * BN;
-  const size_t expert_w = size_t(e) * size_t(N) * size_t(K) / 2;
-  const size_t expert_s = size_t(e) * size_t(N) * size_t(K / 32);
-  const device uint8_t* wb = (const device uint8_t*)w + expert_w + y_col * K / 2;
-  const device uint8_t* sb = exponents + expert_s + y_col * (K / 32);
-
   threadgroup half Xs[BM * BK_padded];
   threadgroup half Ws[BN * BK_padded];
-  using loader_w_t =
-      mlx::steel::Mxfp4BlockLoader<T, BN, BK, BK_padded, 1, tgp_size, half>;
-  loader_w_t loader_w(wb, sb, K, Ws, simd_gid, simd_lid);
-  qmm_t_cast_loaded_impl<T, loader_w_t, BM, BK, BN, true>(
-      x, y, bias + size_t(e) * size_t(N) + y_col, Xs, Ws, K, N, tid, simd_gid,
-      simd_lid, loader_w);
+  mxfp4_qmm_t_routed_impl<T, BM, BK, BN, true>(
+      w, exponents, x, y, K, N, bias, tile_expert, Xs, Ws, tid, simd_gid,
+      simd_lid);
+}
+
+// The unbiased form does not DECLARE buffer 7. The driver binds a nil buffer
+// at every seat the family leaves unbound, and a seat that is declared and
+// never read is the trap this file already warns about one point down; not
+// naming it is how the trap is avoided rather than tolerated.
+template <typename T, int BM, int BK, int BN>
+[[kernel]] void mxfp4_qmm_t_routed(
+    const device uint32_t* w [[buffer(0)]],
+    const device uint8_t* exponents [[buffer(1)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const device int* tile_expert [[buffer(12)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK_padded = BK + 16 / sizeof(half);
+  threadgroup half Xs[BM * BK_padded];
+  threadgroup half Ws[BN * BK_padded];
+  mxfp4_qmm_t_routed_impl<T, BM, BK, BN, false>(
+      w, exponents, x, y, K, N, (const device T*)nullptr, tile_expert, Xs, Ws,
+      tid, simd_gid, simd_lid);
 }
 
 #define PIE_STAMP_qmm_t_routed(entry, gs, b, bm, bk, bn)                       \
@@ -568,6 +732,24 @@ instantiate_mxfp4_qmm_t_routed(32, 64)
 instantiate_mxfp4_qmm_t_routed(64, 16)
 instantiate_mxfp4_qmm_t_routed(64, 32)
 instantiate_mxfp4_qmm_t_routed(64, 64)
+
+#define instantiate_mxfp4_qmm_t_routed_plain(bm, bn)                        \
+  template [[host_name("mxfp4_qmm_t_routed_bfloat16_bm_" #bm                \
+                       "_bn_" #bn)]]                                        \
+  [[kernel]] void mxfp4_qmm_t_routed<bfloat, bm, 32, bn>(                   \
+      const device uint32_t*, const device uint8_t*, const device bfloat*,   \
+      device bfloat*, const constant int&, const constant int&,              \
+      const device int*, uint3, uint, uint);
+
+instantiate_mxfp4_qmm_t_routed_plain(16, 16)
+instantiate_mxfp4_qmm_t_routed_plain(16, 32)
+instantiate_mxfp4_qmm_t_routed_plain(16, 64)
+instantiate_mxfp4_qmm_t_routed_plain(32, 16)
+instantiate_mxfp4_qmm_t_routed_plain(32, 32)
+instantiate_mxfp4_qmm_t_routed_plain(32, 64)
+instantiate_mxfp4_qmm_t_routed_plain(64, 16)
+instantiate_mxfp4_qmm_t_routed_plain(64, 32)
+instantiate_mxfp4_qmm_t_routed_plain(64, 64)
 
 #define instantiate_qmm_t_routed_fp16(bm, bn)                                 \
   template [[host_name("affine_qmm_t_routed_fp16_bfloat16_gs_64_b_4_bm_"      \

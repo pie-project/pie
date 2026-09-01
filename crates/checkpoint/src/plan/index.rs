@@ -62,6 +62,7 @@ pub(crate) fn instr_id_of(instr: &StorageInstr) -> InstrId {
         | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
+        | StorageInstr::GatherWrite { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Finalize { id, .. } => *id,
@@ -74,6 +75,7 @@ pub(crate) fn set_instr_id(instr: &mut StorageInstr, new_id: InstrId) {
         | StorageInstr::Fill { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
         | StorageInstr::BulkExtentWrite { id, .. }
+        | StorageInstr::GatherWrite { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Finalize { id, .. } => *id = new_id,

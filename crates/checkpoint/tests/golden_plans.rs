@@ -30,7 +30,7 @@ use checkpoint::file::{File, Metadata, RawTensor};
 use checkpoint::contract::ModelContract;
 use checkpoint::plan::compile as compile_load_plan;
 use checkpoint::plan::{
-    CUDA_TILE_MAP_MASK, FUSION_FP8_TO_MXFP4, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
+    CUDA_TILE_MAP_MASK, HOST_TILE_MAP_MASK, LoadPlan, StorageTarget,
     TILE_MAP_REPACK,
 };
 use checkpoint::types::{
@@ -383,13 +383,6 @@ fn target(backend: BackendKind, tp_rank: u32, tp_size: u32) -> StorageTarget {
             _ => HOST_TILE_MAP_MASK,
         },
         native_mxfp4_moe: false,
-        fusion_mask: if backend == BackendKind::Cuda {
-            FUSION_FP8_TO_MXFP4
-        } else {
-            0
-        },
-        encode_scratch_dtype: DType::Bf16,
-        block_scale_rows: 128,
     }
 }
 
@@ -724,13 +717,10 @@ fn awq_dense_cuda_tp1_of_2() {
     );
 }
 
-/// Runtime quantization rewrites the encoding of the tensors it applies to and
-/// leaves the rest alone, so the plan has to carry both.
-#[test]
-fn llama_dense_cuda_runtime_fp8() {
-    check(
-        "llama_dense_cuda_runtime_fp8",
-        &llama_checkpoint(),
-        target(BackendKind::Cuda, 0, 1),
-    );
-}
+// **`llama_dense_cuda_runtime_fp8` STOOD HERE** — the one golden written for
+// runtime quantization, a bf16 llama checkpoint whose contract cast every
+// projection to FP8 on the way in. §M-3 shut that door: no device target
+// carries an encode, so the contract no longer compiles for CUDA and the
+// plan it pinned cannot exist. Its golden and its contract fixture went with
+// it. What replaced the coverage is `plan/passes/validate`'s refusal, which
+// is the behaviour that matters now.

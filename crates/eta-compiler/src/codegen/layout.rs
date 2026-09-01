@@ -277,6 +277,9 @@ pub const LANE_RECORD: DeviceStruct = DeviceStruct {
         Field::u64("row_valid"),
         Field::u32("row_valid_offset"),
         Field::u32("reserved0"),
+        Field::u64("attn_score_base"),
+        Field::u32("attn_score_row_stride"),
+        Field::u32("reserved1"),
     ],
 };
 
@@ -397,6 +400,9 @@ mod static_assertions {
         row_valid,
         row_valid_offset,
         reserved0,
+        attn_score_base,
+        attn_score_row_stride,
+        reserved1,
     );
 
     pin_layout!(

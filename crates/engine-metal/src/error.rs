@@ -65,6 +65,27 @@ pub enum Fault {
         have: u64,
     },
 
+    /// **A LANE WHOSE MEDIA GEOMETRY AND MEDIA PAYLOAD DISAGREE**
+    /// (multimodal §5.1, media-door §6).
+    ///
+    /// Every length here is a function of the lane's payload row count AND a
+    /// number only this shell holds — the plan's declared patch row width, its
+    /// position-table tap count, this fire's own token rows — which is exactly
+    /// the set `engine::fire::StepMedia::validate` cannot check and
+    /// deliberately does not. So the contract checks what it can and this
+    /// names the rest, with the vector it was: a submission that disagrees
+    /// with itself is refused before a row is seriated.
+    PatchPayload {
+        /// Which lane of the submission.
+        lane: u32,
+        /// Which of its vectors.
+        what: &'static str,
+        /// What that vector carries.
+        have: u64,
+        /// What its own geometry owes.
+        want: u64,
+    },
+
     /// The compiler refused to bake the plan against these budgets.
     Bake(model_compiler::Error),
 
@@ -293,6 +314,37 @@ pub enum Fault {
         why: String,
     },
 
+    /// A shared adapter the mount, the manifest or the model text refuses.
+    ///
+    /// **THE DEPLOYMENT'S REFUSAL, AND NOT THE REGISTRATION'S.**
+    /// [`Fault::Adapter`] is about planes a caller built and handed over;
+    /// this is about FILES — a name that leaves the mount or is not in it, a
+    /// directory with no `adapter.toml`, a manifest naming a plane that is
+    /// not there or an orientation this shell will not repack, a plane whose
+    /// length is not the banks' rectangle. Every one of them is fixed by
+    /// writing different files, which is why they carry the adapter's name as
+    /// the bind spelled it rather than a bank's.
+    Blob {
+        /// The adapter, as the bind spelled it.
+        path: String,
+        /// What is wrong with it.
+        why: String,
+    },
+
+    /// Every adapter slot this load's banks seat is pinned by a live bind.
+    ///
+    /// **A REFUSAL AND NOT AN EVICTION.** A slot's contents are read by a
+    /// fire that may be in flight, so taking one back from under a live bind
+    /// would answer somebody else's adapter under this one's name — the
+    /// silently-wrong answer the whole axis is written against. Capacity is
+    /// the model text's ([`Weights::adapter_seats`](crate::Weights)), so the
+    /// fix is a text that seats more, or a caller that closes the instances
+    /// it is done with.
+    AdapterSlots {
+        /// How many slots the banks seat.
+        seats: u32,
+    },
+
     /// A quantity the ICB would have to rewrite per fire, and no affine law
     /// over the descriptor's own numbers predicts it.
     ///
@@ -384,6 +436,86 @@ pub enum Fault {
         /// Whether the word's class runs the capture arm.
         runs_capture_arm: bool,
     },
+
+    // W-b — appended, so every prior variant keeps its ordinal.
+    /// **A streamed load whose host source has nothing behind it**
+    /// (`crate::host_source`).
+    ///
+    /// The source a seat is copied FROM is a mapping of an unlinked temporary
+    /// file, so that the kernel may write its pages back and reclaim them
+    /// instead of holding a whole routed bank in anonymous memory. Three OS
+    /// calls stand between the plan and that mapping, and each fails for its
+    /// own deployment reason: a temporary directory that is read-only or out
+    /// of descriptors (`open`), one with no room for the source (`size`), an
+    /// address space that will not take the span (`map`).
+    ///
+    /// Named rather than folded into [`Fault::Load`] because the checkpoint is
+    /// innocent: the artifact is fine, the contract is fine, and what refused
+    /// is the machine the load is running ON. The message says which call and
+    /// what the OS said, because that is the whole of the fix.
+    Backing {
+        /// Which call refused: `open`, `size` or `map`.
+        step: &'static str,
+        /// How many bytes of streamed source the plan asked to back.
+        bytes: u64,
+        /// The OS's own sentence.
+        why: String,
+    },
+
+    // M-1 — appended, so every prior variant keeps its ordinal.
+    /// **An artifact this shell could not map, could not bind zero-copy, or
+    /// was asked to write through** (`crate::mapping`).
+    ///
+    /// The warm-read path hands Metal the artifact's own mapped pages rather
+    /// than a copy of them, and the ways that refuses are all about the
+    /// machine and the file rather than about the checkpoint's contents: an
+    /// artifact that has moved or that this process may not read (`open`),
+    /// one whose size cannot be learned or is zero (`stat`, `size`), an
+    /// address space with no room for it (`map`), a device that declined the
+    /// span (`bind`).
+    ///
+    /// The last shape is not a failure at all but a REFUSAL, and it is
+    /// stated here because it is the same subject: a mapped reservation is
+    /// `PROT_READ`, so `write` and `zero_span` on one are a fault the type
+    /// catches before the page fault does.
+    Mapped {
+        /// Which call refused — `open`, `stat`, `size`, `map`, `bind` — or
+        /// the method a read-only reservation refused: `write`, `zero_span`.
+        step: &'static str,
+        /// The artifact, as the caller named it.
+        what: String,
+        /// The OS's, Metal's, or this shell's own sentence.
+        why: String,
+    },
+
+    // M-4c — appended, so every prior variant keeps its ordinal.
+    /// **A SERVING ARTIFACT THIS DEPLOYMENT IS NOT THE ONE FOR** — the
+    /// `pie.serving/1` stamp gate, refused at the load's first instant and
+    /// before a byte of the device is reserved
+    /// (`Weights::resident`](crate::weights::Weights)).
+    ///
+    /// A serving artifact IS the model on this machine: its planes were
+    /// compiled under one recipe — a backend, a tensor-parallel degree, a SKU,
+    /// a precision, a layout revision — and landing them under another does not
+    /// fail, it answers nonsense at full speed. `checkpoint::serving::Stamp`
+    /// is the recipe, written into the file by `pie model import` and compared
+    /// FIELD BY FIELD here, so the sentence an operator reads names the fact
+    /// that differs rather than saying only *different*.
+    ///
+    /// **It carries a sentence rather than fields**, for [`Fault::Residency`]'s
+    /// reason one step further out: the sentence is not this crate's to write.
+    /// `checkpoint::serving::Mismatch::refuse` is the ONE place the refusal is
+    /// spelled — what disagreed, that nothing here rewrote or deleted the file,
+    /// and the `pie model import --force` that would write it again — and the
+    /// CUDA shell forwards the same string from the same call. A struct here
+    /// would be a second author for one paragraph.
+    ///
+    /// The one sentence this crate does write into it is the caller's own bug:
+    /// a load that landed a serving artifact while the door stated no
+    /// deployment stamp. That is an assembly failure upstream, not an
+    /// operator's file, and it is refused rather than skipped — a skip is
+    /// exactly the silent cross-recipe landing the stamp exists to prevent.
+    Recipe(String),
 }
 
 impl Fault {
@@ -417,6 +549,16 @@ impl fmt::Display for Fault {
             Self::Ceiling { what, need, have } => write!(
                 f,
                 "this fire asks for {need} {what} and the load reserved {have}"
+            ),
+            Self::PatchPayload {
+                lane,
+                what,
+                have,
+                want,
+            } => write!(
+                f,
+                "lane {lane}'s media carries {have} {what} and its own geometry owes \
+                 {want} — its spans and its payload disagree"
             ),
             Self::Bake(refusal) => write!(f, "the plan does not bake: {refusal}"),
             Self::Load(error) => write!(f, "the checkpoint does not land: {error}"),
@@ -552,7 +694,32 @@ impl fmt::Display for Fault {
                     )
                 }
             }
+            Self::Backing { step, bytes, why } => write!(
+                f,
+                "this load streams {bytes} bytes of routed experts and the temporary file \
+                 that would hold them does not `{step}`: {why}"
+            ),
+            Self::Mapped { step, what, why } => write!(
+                f,
+                "the artifact `{what}` is served from its own mapped pages and does not \
+                 `{step}`: {why}"
+            ),
+            // Forwarded whole, with no framing of this crate's own: the string
+            // is `serving::Mismatch::refuse`'s three-part paragraph and it
+            // already names its own subject ("checkpoint: the serving artifact
+            // …"). Wrapping it would give an operator two prefixes for one
+            // sentence and let the two shells' spellings drift apart.
+            Self::Recipe(refusal) => f.write_str(refusal),
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),
+            Self::Blob { path, why } => write!(f, "the shared adapter `{path}` {why}"),
+            Self::AdapterSlots { seats } => write!(
+                f,
+                "this load's banks seat {seats} adapters and every slot is pinned by a \
+                 live bind; a slot is never taken back from under one, because a fire \
+                 reading it would answer another instance's adapter under this one's \
+                 name. Close an instance that is done, or state a model text that seats \
+                 more"
+            ),
             Self::Compile(failure) => write!(
                 f,
                 "the guest program does not compile: {}",

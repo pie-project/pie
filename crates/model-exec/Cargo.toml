@@ -79,5 +79,5 @@ model-ir = { path = "../model-ir" }
 #
 # A DEV EDGE ONLY, AND IT DOES NOT CYCLE: `model` reads `model-dsl`,
 # `checkpoint` and `tokenizer`, and none of the three names this crate.
-model = { path = "../model" }
+models = { path = "../models" }
 model-dsl = { path = "../model-dsl" }

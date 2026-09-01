@@ -42,8 +42,8 @@
 //! handful of distinct words, and `ClassTable::class_of` is a scan over the
 //! sweep's dedup'd word lists rather than a hash.
 
-use model_compiler::{ArenaMap, Budget, Budgets, CompiledModel, Extent, PatchLadder};
-use model_ir::{ClassSet, RowAxis, ValueId};
+use model_compiler::{ArenaMap, Budget, Budgets, ClassOrder, CompiledModel, Extent, PatchLadder};
+use model_ir::{ClassSet, PerAxis, RowAxis, ValueId};
 
 use crate::fire::Fault;
 use crate::{Error, Result};
@@ -103,6 +103,30 @@ impl Lane {
             patches,
         }
     }
+
+    /// **WHAT THIS REQUEST CONTRIBUTES TO ONE ROW SPACE** — `(rows, lanes)`,
+    /// where "lanes" is that rectangle's own request count.
+    ///
+    /// **THE ONE PLACE THE SUBMISSION'S FOUR NUMBERS MEET THE AXIS INDEX.**
+    /// A `Lane` names its counts because the SUBMISSION does — a runtime
+    /// writes `rows` and `images` from two different facts about the request
+    /// — and every pass downstream wants them per axis instead. So the pair
+    /// is read here, once, and `seriate_axis` does the same arithmetic over
+    /// both without knowing which it is doing.
+    ///
+    /// **A TOKEN LANE IS ALWAYS ONE LANE AND A PATCH LANE IS ZERO OR MORE
+    /// IMAGES**, which is the whole asymmetry of the two axes stated as two
+    /// expressions rather than as two loops: `1` is what makes the token
+    /// axis's merged prefix sum work (a request is a request), and
+    /// `self.images` is what makes the patch axis's not (a request may be no
+    /// images at all).
+    #[must_use]
+    pub fn on(self, axis: RowAxis) -> (u32, u32) {
+        match axis {
+            RowAxis::Tokens => (self.rows, 1),
+            RowAxis::Patches => (self.patches, self.images),
+        }
+    }
 }
 
 /// One class's place in the seriated fire.
@@ -137,15 +161,6 @@ pub struct ClassWindow {
     pub lane_offset: u32,
     /// How many lanes it has.
     pub lanes: u32,
-}
-
-/// A contiguous run of token rows — what one windowed launch covers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RowSpan {
-    /// First row.
-    pub offset: u32,
-    /// How many.
-    pub rows: u32,
 }
 
 /// The one row-and-lane interval a class mask covers in a fire.
@@ -351,28 +366,6 @@ impl WindowTable {
         out.truncate(open);
     }
 
-    /// The maximal contiguous row runs this mask covers, ascending.
-    ///
-    /// ONE SPAN IS THE ANSWER P4 IS FOR. A mask whose classes are an interval
-    /// of the fire's class order comes back as a single [`RowSpan`] and its
-    /// consumer is one launch over pointer+extent; a mask that straddles a
-    /// class it does not contain comes back as two, and the consumer is two
-    /// launches — `Fallback::Split { r }`, which is the row P4 wrote for it.
-    ///
-    /// The row half of [`spans`](WindowTable::spans), and derived from it
-    /// rather than computed again: a second implementation of "where does
-    /// this window break" is a second answer waiting to disagree with the one
-    /// the launches are cut at.
-    #[must_use]
-    pub fn segments(&self, mask: &ClassSet) -> Vec<RowSpan> {
-        self.spans(mask)
-            .into_iter()
-            .map(|span| RowSpan {
-                offset: span.row_offset,
-                rows: span.rows,
-            })
-            .collect()
-    }
 }
 
 /// One lane, placed.
@@ -421,15 +414,55 @@ pub struct LaneRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Composition {
     lanes: Vec<LaneRow>,
-    classes: WindowTable,
-    order: Vec<u32>,
-    rows: u32,
-    bucket: u32,
-    patch_classes: WindowTable,
-    patch_order: Vec<u32>,
-    patch_rows: u32,
-    images: u32,
-    patch_bucket: u32,
+    /// **ONE [`AxisComposition`] PER ROW SPACE, ADDRESSED BY THE AXIS.**
+    ///
+    /// This used to be five fields and their five `patch_`-prefixed mirrors,
+    /// and the accessors below are what is left of them — thin forwards, so
+    /// that a consumer holding `patch_classes()` holds the same table it
+    /// always did. What the array buys is that the two entries are now ONE
+    /// derivation: `seriate_axis` fills each of them and no line of this
+    /// file states the patch axis's arithmetic a second time.
+    ///
+    /// A text-only fire's patch entry is the ZERO SERIATION — one zero
+    /// window per class of the artifact, an empty order, no rows, no lanes
+    /// and the zero rung. Zero windows and not NO windows: every reader
+    /// indexes the table by class, so an absent table would be a special case
+    /// at each of them, and the G4 invariant is precisely that there is none.
+    axes: PerAxis<AxisComposition>,
+}
+
+/// **ONE ROW SPACE'S WHOLE COMPOSITION** — its window table, the order its
+/// classes stand in, its two totals and the rung they round up to.
+///
+/// **THE FIVE NUMBERS A SERIATION PRODUCES, AND EXACTLY THOSE.** They were
+/// five fields of [`Composition`] and five more beside them with `patch_` in
+/// front, kept in step by hand: a `patch_classes` for every `classes`, a
+/// `patch_bucket` for every `bucket`. The pairing was the bug surface — two
+/// fields that must agree about one rectangle and nothing making them — and
+/// this is the pairing collapsed into one struct that the axis indexes.
+///
+/// **`rows` AND `lanes` ARE THAT AXIS'S OWN, WHICH IS WHY THEY ARE NOT
+/// NAMED FOR EITHER.** On the token axis `rows` are token rows and `lanes`
+/// are requests; on the patch axis `rows` are patch rows and `lanes` are
+/// IMAGES. The arithmetic that produced them does not know the difference —
+/// [`Lane::on`] is the one place it is stated — and neither does anything
+/// that reads them back through the axis.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AxisComposition {
+    /// One [`ClassWindow`] per class of the artifact, indexed by class — this
+    /// rectangle's seriation.
+    pub classes: WindowTable,
+    /// The classes this fire has rows in on this axis, in the order their
+    /// rows stand.
+    pub order: Vec<u32>,
+    /// This rectangle's total rows.
+    pub rows: u32,
+    /// This rectangle's total lanes — requests on the token axis, images on
+    /// the patch one.
+    pub lanes: u32,
+    /// The rung `rows` rounds up to, out of this axis's own lattice — which
+    /// recorded graph this fire's unit launches.
+    pub bucket: u32,
 }
 
 impl Composition {
@@ -440,16 +473,36 @@ impl Composition {
         &self.lanes
     }
 
+    /// **THIS FIRE'S COMPOSITION ON ONE ROW AXIS** — the table, the order and
+    /// the three counts, in one piece.
+    ///
+    /// **THE ONE READ, AND EVERY ACCESSOR BELOW IS IT WITH AN AXIS SPELLED.**
+    /// A caller that already holds a region's axis (the walk, the window
+    /// table, the shells' arming passes) asks this and is done; a caller that
+    /// means the token rectangle in particular says so by name, which is what
+    /// keeps every pre-campaign call site in the tree spelled the way it was.
+    #[must_use]
+    pub fn axis(&self, axis: RowAxis) -> &AxisComposition {
+        &self.axes[axis]
+    }
+
+    /// This fire's window table on one axis — [`axis`](Composition::axis)'s
+    /// table half, which is what the window pass and the descriptor take.
+    #[must_use]
+    pub fn table(&self, axis: RowAxis) -> &WindowTable {
+        &self.axes[axis].classes
+    }
+
     /// How many lanes this fire carries.
     #[must_use]
     pub fn lane_count(&self) -> u32 {
-        self.lanes.len() as u32
+        self.axes[RowAxis::Tokens].lanes
     }
 
     /// The window table, indexed by class.
     #[must_use]
     pub fn classes(&self) -> &WindowTable {
-        &self.classes
+        self.table(RowAxis::Tokens)
     }
 
     /// The classes this fire has lanes in, in the order their rows stand.
@@ -458,13 +511,13 @@ impl Composition {
     /// non-empty in a fire" is exactly this list.
     #[must_use]
     pub fn present(&self) -> &[u32] {
-        &self.order
+        &self.axes[RowAxis::Tokens].order
     }
 
     /// Total token rows.
     #[must_use]
     pub fn rows(&self) -> u32 {
-        self.rows
+        self.axes[RowAxis::Tokens].rows
     }
 
     /// The shape bucket these rows round up to — which recorded graph this
@@ -472,7 +525,7 @@ impl Composition {
     /// the budget lists no lattice.
     #[must_use]
     pub fn bucket(&self) -> u32 {
-        self.bucket
+        self.axes[RowAxis::Tokens].bucket
     }
 
     /// How many PATCH rows this fire carries — the second row axis's count,
@@ -483,13 +536,13 @@ impl Composition {
     /// submitted no image has no patch rows.
     #[must_use]
     pub fn patch_rows(&self) -> u32 {
-        self.patch_rows
+        self.axes[RowAxis::Patches].rows
     }
 
     /// How many IMAGES this fire carries — the patch axis's lane count.
     #[must_use]
     pub fn images(&self) -> u32 {
-        self.images
+        self.axes[RowAxis::Patches].lanes
     }
 
     /// The PATCH window table, indexed by class.
@@ -505,14 +558,14 @@ impl Composition {
     /// is what makes a text-only fire's second table free rather than absent.
     #[must_use]
     pub fn patch_classes(&self) -> &WindowTable {
-        &self.patch_classes
+        self.table(RowAxis::Patches)
     }
 
     /// The classes this fire has IMAGES in, in the order their patch rows
     /// stand.
     #[must_use]
     pub fn patch_present(&self) -> &[u32] {
-        &self.patch_order
+        &self.axes[RowAxis::Patches].order
     }
 
     /// The PATCH rung these patch rows round up to — which tower exec this
@@ -520,17 +573,26 @@ impl Composition {
     /// the ladder lists no rungs, exactly as the token bucket is.
     #[must_use]
     pub fn patch_bucket(&self) -> u32 {
-        self.patch_bucket
+        self.axes[RowAxis::Patches].bucket
     }
 
     /// This fire's four counts, as the carve's arithmetic takes them.
+    ///
+    /// **THE ONE PLACE THE AXIS INDEX GOES BACK TO NAMES**, because
+    /// `FireRows` is the compiler's record and its four fields are the four
+    /// SYMBOLS the arena sizes (`Dim::Tokens`, `Dim::Lanes`, `Dim::Patches`,
+    /// `Dim::Images`) rather than two axes' worth of a pair. Read off the
+    /// array so that the two rectangles' counts cannot part from the tables
+    /// they were summed with.
     #[must_use]
     pub fn fire_rows(&self) -> model_compiler::FireRows {
+        let tokens = &self.axes[RowAxis::Tokens];
+        let patches = &self.axes[RowAxis::Patches];
         model_compiler::FireRows {
-            tokens: u64::from(self.rows),
-            lanes: u64::from(self.lane_count()),
-            patches: u64::from(self.patch_rows),
-            images: u64::from(self.images),
+            tokens: u64::from(tokens.rows),
+            lanes: u64::from(tokens.lanes),
+            patches: u64::from(patches.rows),
+            images: u64::from(patches.lanes),
         }
     }
 
@@ -620,14 +682,14 @@ fn seriate(
     let count = compiled.classes.classes.len();
     let mut memo: Vec<(u64, u32)> = Vec::new();
     let mut of_lane: Vec<u32> = Vec::with_capacity(lanes.len());
-    let mut tally: Vec<(u64, u32)> = vec![(0, 0); count];
-    let mut rows: u64 = 0;
-    // The second axis's tallies, in the first's shape: patch rows and images
-    // per class. Both stay all-zero for a text-only fire, and the passes
-    // below read that as "no class is present on this axis" without a branch.
-    let mut patch_tally: Vec<(u64, u32)> = vec![(0, 0); count];
-    let mut patches: u64 = 0;
-    let mut images: u64 = 0;
+    // **THE TALLIES, ONE SET PER ROW AXIS** — `(rows, lanes)` per class, on
+    // each rectangle. The patch entry stays all-zero for a text-only fire,
+    // and the passes below read that as "no class is present on this axis"
+    // without a branch, exactly as the hand-kept second vector did.
+    let mut tally: PerAxis<Vec<(u64, u32)>> = PerAxis::from_fn(|_| vec![(0, 0); count]);
+    // Each rectangle's `(rows, lanes)` total, in `u64` because the ceilings
+    // below are what turn a sum into a `u32`.
+    let mut totals: PerAxis<(u64, u64)> = PerAxis::from_fn(|_| (0, 0));
     // Whether this ARTIFACT has anywhere for a patch row to go. Read off the
     // bake rather than off the budget: a deployment may admit a patch ladder
     // for a text-only model (and pay nothing for it, which is the G4
@@ -680,20 +742,24 @@ fn seriate(
         };
         // `class_of` answers a position in `classes.classes`, so this index is
         // in range by construction; the tally is sized from the same list.
-        tally[class as usize].0 += u64::from(lane.rows);
-        tally[class as usize].1 += 1;
-        rows += u64::from(lane.rows);
-        // The same two sums on the other axis. A class's patch rows are the
-        // patch rows of the lanes that resolved to it, and its "lanes" are
-        // their images — which is where the two axes stop agreeing, because a
-        // class with lanes may have no images at all.
-        patch_tally[class as usize].0 += u64::from(lane.patches);
-        patch_tally[class as usize].1 += lane.images;
-        patches += u64::from(lane.patches);
-        images += u64::from(lane.images);
+        //
+        // **AND THE TWO SUMS ARE ONE SUM SAID PER AXIS.** A class's rows are
+        // the rows the lanes that resolved to it contribute on that
+        // rectangle, and its "lanes" are their requests of it — [`Lane::on`]
+        // is where a token lane's `1` and a patch lane's image count part
+        // company, which is where the two axes stop agreeing and the only
+        // place this file says so.
+        for axis in RowAxis::ALL {
+            let (rows, images) = lane.on(axis);
+            tally[axis][class as usize].0 += u64::from(rows);
+            tally[axis][class as usize].1 += images;
+            totals[axis].0 += u64::from(rows);
+            totals[axis].1 += u64::from(images);
+        }
         of_lane.push(class);
     }
 
+    let rows = totals[RowAxis::Tokens].0;
     if rows > u64::from(budget.max_tokens) {
         return Err(Fault::TooManyRows {
             rows,
@@ -708,6 +774,7 @@ fn seriate(
     // and the comparison is free — and stating them unconditionally is what
     // keeps "a text-only fire is refused by the same code that admits it"
     // true rather than a claim about a branch not taken.
+    let (patches, images) = totals[RowAxis::Patches];
     let (max_patches, max_images) = ladder.map_or((0, 0), |l| (l.max_patches, l.max_images));
     if patches > u64::from(max_patches) {
         return Err(Fault::TooManyPatches {
@@ -724,9 +791,139 @@ fn seriate(
         .into());
     }
     let patches = patches as u32;
-    let images = images as u32;
 
-    // The classes this fire has lanes in, in the order their rows will stand.
+    // The rungs, one per axis, taken BEFORE the seriations for the reason
+    // they were taken inside the struct literal that used to stand at the
+    // bottom of this function: nothing between here and there can fail, and
+    // the token refusal is owed before the patch one either way.
+    let buckets = PerAxis::new([bucket_of(budget, rows)?, patch_bucket_of(ladder, patches)?]);
+
+    // Where each SUBMITTED lane's rows land ON EACH AXIS, computed in that
+    // axis's own order and read back in the token one. A side table rather
+    // than a lane list per axis: the permutation is one permutation, and two
+    // lists indexed by two orders is how a `source` comes to be read against
+    // the wrong record.
+    let mut placed: Vec<PerAxis<(u32, u32)>> = vec![PerAxis::from_fn(|_| (0, 0)); lanes.len()];
+
+    // Both rectangles' totals, narrowed — every one of the four has just been
+    // admitted by the ceiling it is owed to, which is the only thing that
+    // makes the cast a conversion rather than a truncation. The token
+    // entry's lane count IS `lanes.len()`, because a request is one request
+    // of the token rectangle ([`Lane::on`]); reading it out of the same
+    // tally the patch entry comes out of is what keeps the pair one
+    // derivation (`Lane::on`).
+    let checked: PerAxis<(u32, u32)> =
+        PerAxis::from_fn(|axis| (totals[axis].0 as u32, totals[axis].1 as u32));
+
+    // **PASS TWO, ONCE PER ROW AXIS.** The prefix sums and the lane
+    // placement, over that axis's own baked order and its own tallies —
+    // `seriate_axis` is the whole of it and this loop is the whole of what
+    // "the patch axis costs the token axis nothing" means now: the second
+    // entry is the first function called again, not a second copy of it.
+    let axes = PerAxis::from_fn(|axis| {
+        seriate_axis(
+            compiled.order_for(axis),
+            axis,
+            &tally[axis],
+            lanes,
+            &of_lane,
+            checked[axis],
+            buckets[axis],
+            &mut placed,
+        )
+    });
+
+    // Pass three: the lane records, assembled. Class by class in the TOKEN
+    // fire order, and INSIDE a class in submission order — that inner
+    // stability is not decoration. The runtime's order is the order its
+    // per-lane buffers are written in, and a fire that reshuffles lanes it had
+    // no reason to reshuffle churns every pointer the previous fire had warm.
+    //
+    // **AND EVERY OFFSET IN A RECORD IS READ OUT OF `placed` RATHER THAN
+    // RE-ACCUMULATED HERE**, which is what makes the token axis's placement
+    // the same arithmetic as the patch axis's instead of a second one that
+    // happens to agree.
+    let mut seriated: Vec<LaneRow> = Vec::with_capacity(lanes.len());
+    for &class in &axes[RowAxis::Tokens].order {
+        for (i, lane) in lanes.iter().enumerate() {
+            if of_lane[i] != class {
+                continue;
+            }
+            let token = placed[i][RowAxis::Tokens];
+            let patch = placed[i][RowAxis::Patches];
+            seriated.push(LaneRow {
+                source: i as u32,
+                word: lane.word,
+                class,
+                row_offset: token.0,
+                rows: lane.rows,
+                patch_offset: patch.0,
+                patches: lane.patches,
+                image_offset: patch.1,
+                images: lane.images,
+            });
+        }
+    }
+
+    Ok(Composition {
+        lanes: seriated,
+        axes,
+    })
+}
+
+/// **ONE ROW AXIS'S SERIATION** — the prefix sums that place its classes and
+/// the walk that places its lanes inside them, over the order this artifact
+/// baked for THAT axis.
+///
+/// **ONE FUNCTION AND NOT TWO LOOPS, WHICH IS THE WHOLE OF WAVE B HERE.**
+/// The token pass and the patch pass were two blocks of this arithmetic, and
+/// they had already drifted into two SHAPES: the token pass summed its
+/// classes and then placed its lanes in a third pass over the same order,
+/// while the patch pass placed its lanes INSIDE the sum. Neither shape was
+/// wrong; two of them is what is wrong, because the day one grows a clause
+/// the other does not is a day the two rectangles' offsets stop describing
+/// one submission.
+///
+/// The patch pass's "extra step" was exactly that inlining plus one clause —
+/// **it skips a lane with no lanes of its own** — and the clause survives
+/// here as a parameter of the arithmetic rather than as a second body: a lane
+/// contributing zero requests to this rectangle is not placed in it, which on
+/// the token axis never fires (a lane is one request always, and a lane of no
+/// rows is [`Fault::EmptyLane`] one pass earlier) and on the patch axis is
+/// every text lane in the batch.
+///
+/// **AN ABSENT PLAN IS THE ZERO SERIATION AND NOT A BRANCH AT THE CALLER.**
+/// An artifact that states no patch axis has no order for it, and what that
+/// answers is a table of zero windows, an empty present-set and the totals it
+/// was handed — which are themselves zero, because a lane that carried an
+/// image against such an artifact was refused as [`Fault::Towerless`] before
+/// this was reached.
+#[allow(clippy::too_many_arguments)]
+fn seriate_axis(
+    plan: Option<&ClassOrder>,
+    axis: RowAxis,
+    tally: &[(u64, u32)],
+    lanes: &[Lane],
+    of_lane: &[u32],
+    totals: (u32, u32),
+    bucket: u32,
+    placed: &mut [PerAxis<(u32, u32)>],
+) -> AxisComposition {
+    let count = tally.len();
+    let mut classes = vec![ClassWindow::default(); count];
+    let (rows, lane_total) = totals;
+    let Some(plan) = plan else {
+        return AxisComposition {
+            classes: WindowTable::new(classes),
+            order: Vec::new(),
+            rows,
+            lanes: lane_total,
+            bucket,
+        };
+    };
+
+    // The classes this fire has rows in on this axis, in the order their rows
+    // will stand.
     //
     // **ONE BAKED ANSWER, FILTERED, AND NOT A TABLE WITH A ROW PER
     // COMPOSITION.** There are `2^classes` compositions and one C1P instance;
@@ -734,7 +931,9 @@ fn seriate(
     // set consecutive, so dropping the absent classes out of the global order
     // is the whole per-fire computation (design §3). P4 owns that filter —
     // this asks it rather than re-deriving it from the tree, because a second
-    // reading of one answer is a second answer waiting to disagree.
+    // reading of one answer is a second answer waiting to disagree. And P4
+    // solved the instance ONCE PER AXIS, because the consumers it has to seat
+    // are different consumers, which is why the plan is an argument here.
     //
     // `prev` IS LAST FIRE'S ORDER, AND THIS PASSES `None` BECAUSE THERE IS
     // NOTHING TO PASS YET. v1's `class_order` ignores the argument; when the
@@ -749,15 +948,12 @@ fn seriate(
     // never a truncation, and a fire that could ever reach one has already
     // been turned away upstream.
     let present = ClassSet::of((0..count).filter(|&class| tally[class].1 > 0));
-    let order: Vec<u32> = compiled
-        .order
+    let order: Vec<u32> = plan
         .class_order(&present, None)
         .into_iter()
         .map(u32::from)
         .collect();
 
-    // Pass two: prefix sums in that order. This is the window table.
-    let mut classes = vec![ClassWindow::default(); count];
     let (mut row_at, mut lane_at) = (0u32, 0u32);
     for &class in &order {
         let (class_rows, class_lanes) = tally[class as usize];
@@ -767,98 +963,70 @@ fn seriate(
             lane_offset: lane_at,
             lanes: class_lanes,
         };
-        row_at += class_rows as u32;
-        lane_at += class_lanes;
-    }
-
-    // **THE SECOND SERIATION**, and it is the first one again over a
-    // different order. The classes are the same classes; which of them are
-    // PRESENT is a different question (a class with lanes may carry no
-    // image), and the order they stand in is the artifact's own patch
-    // `ClassOrder` rather than the token one — P4 solved the C1P instance
-    // twice, once per axis, because the consumers it has to seat are
-    // different consumers.
-    let mut patch_classes = vec![ClassWindow::default(); count];
-    let mut patch_order: Vec<u32> = Vec::new();
-    // Where each SUBMITTED lane's images land, computed in the patch order
-    // and read back in the token one. A side table rather than a second lane
-    // list: the permutation is one permutation, and two lists indexed by two
-    // orders is how a `source` comes to be read against the wrong record.
-    let mut placed_patch: Vec<(u32, u32)> = vec![(0, 0); lanes.len()];
-    if let Some(patch_plan) = compiled.order_for(RowAxis::Patches) {
-        let present = ClassSet::of((0..count).filter(|&class| patch_tally[class].1 > 0));
-        patch_order = patch_plan
-            .class_order(&present, None)
-            .into_iter()
-            .map(u32::from)
-            .collect();
-        let (mut patch_at, mut image_at) = (0u32, 0u32);
-        for &class in &patch_order {
-            let (class_patches, class_images) = patch_tally[class as usize];
-            patch_classes[class as usize] = ClassWindow {
-                row_offset: patch_at,
-                rows: class_patches as u32,
-                lane_offset: image_at,
-                lanes: class_images,
-            };
-            // Inside a class, submission order — the same inner stability the
-            // token pass keeps, and for the same reason: the runtime wrote
-            // this lane's images in the order it submitted them.
-            let mut lane_patch_at = patch_at;
-            let mut lane_image_at = image_at;
-            for (i, lane) in lanes.iter().enumerate() {
-                if of_lane[i] != class || lane.images == 0 {
-                    continue;
-                }
-                placed_patch[i] = (lane_patch_at, lane_image_at);
-                lane_patch_at += lane.patches;
-                lane_image_at += lane.images;
-            }
-            patch_at += class_patches as u32;
-            image_at += class_images;
-        }
-    }
-
-    // Pass three: place the lanes. Class by class in fire order, and INSIDE a
-    // class in submission order — that inner stability is not decoration. The
-    // runtime's order is the order its per-lane buffers are written in, and a
-    // fire that reshuffles lanes it had no reason to reshuffle churns every
-    // pointer the previous fire had warm.
-    let mut seriated: Vec<LaneRow> = Vec::with_capacity(lanes.len());
-    for &class in &order {
-        let mut row_at = classes[class as usize].row_offset;
+        // Inside a class, submission order — the same inner stability the
+        // fire order keeps between classes, and for the same reason: the
+        // runtime wrote this lane's rows in the order it submitted them.
+        let (mut lane_row_at, mut lane_lane_at) = (row_at, lane_at);
         for (i, lane) in lanes.iter().enumerate() {
             if of_lane[i] != class {
                 continue;
             }
-            let (patch_offset, image_offset) = placed_patch[i];
-            seriated.push(LaneRow {
-                source: i as u32,
-                word: lane.word,
-                class,
-                row_offset: row_at,
-                rows: lane.rows,
-                patch_offset,
-                patches: lane.patches,
-                image_offset,
-                images: lane.images,
-            });
-            row_at += lane.rows;
+            let (lane_rows, lane_lanes) = lane.on(axis);
+            // The header's one clause: a request that is no request of THIS
+            // rectangle is not placed in it, and its offsets stay the zero
+            // they were built at.
+            if lane_lanes == 0 {
+                continue;
+            }
+            placed[i][axis] = (lane_row_at, lane_lane_at);
+            lane_row_at += lane_rows;
+            lane_lane_at += lane_lanes;
         }
+        row_at += class_rows as u32;
+        lane_at += class_lanes;
     }
 
-    Ok(Composition {
-        lanes: seriated,
+    AxisComposition {
         classes: WindowTable::new(classes),
         order,
         rows,
-        bucket: bucket_of(budget, rows)?,
-        patch_classes: WindowTable::new(patch_classes),
-        patch_order,
-        patch_rows: patches,
-        images,
-        patch_bucket: patch_bucket_of(ladder, patches)?,
-    })
+        lanes: lane_total,
+        bucket,
+    }
+}
+
+/// **THE SMALLEST PATCH RUNG THAT HOLDS THESE PATCH ROWS** — [`bucket_of`]'s
+/// question on the second row axis, out of the lattice that axis declared
+/// (`PatchLadder::buckets`).
+///
+/// THREE CLAUSES, AND THEY ARE `bucket_of`'S THREE WITH ONE IN FRONT:
+///
+/// * **no ladder at all** is an artifact with no patch axis, and `0` is the
+///   only honest rung for a row space that does not exist;
+/// * **no patch rows** is the clause the token axis has no counterpart for. A
+///   fire always has token rows — a lane of none is [`Fault::EmptyLane`] — but
+///   a fire of a towered artifact may perfectly well carry no image, and an
+///   axis-empty fire simply does not launch that unit's exec (multimodal §1).
+///   Rounding its zero up to the lattice floor would name a rung for a tower
+///   that does not run, so zero rows is the zero rung;
+/// * **past the top rung** is [`Fault::NoPatchBucket`], for the reason
+///   `bucket_of` refuses past the budget's top: the lattice is what the load
+///   carved against, and a fire above it has no ceiling to be admitted under.
+///
+/// Everything below that is [`rung_of`], as it is over there — one derivation
+/// with two doors, so the two axes cannot come to round differently. An empty
+/// `buckets` vector falls through the same `_` arm and quantizes nothing.
+fn patch_bucket_of(ladder: Option<&PatchLadder>, patches: u32) -> Result<u32> {
+    let Some(ladder) = ladder else {
+        return Ok(0);
+    };
+    if patches == 0 {
+        return Ok(0);
+    }
+    match ladder.buckets.last().copied() {
+        Some(top) if patches > top => Err(Error::Fire(Fault::NoPatchBucket { patches, top })),
+        _ => Ok(rung_of(&ladder.buckets, patches)),
+    }
 }
 
 /// The smallest bucket that holds these rows.
@@ -868,33 +1036,11 @@ fn seriate(
 /// fire of `rows` rows is then `rows` itself — one graph per size, which is
 /// what a golden-path eager walk wants and what a test builds with
 /// `Budget::new`.
-/// The smallest PATCH rung that holds these patch rows.
 ///
-/// The token ladder's rule, one axis over and with its own vector: an empty
-/// ladder is a deployment that chose no patch lattice, and a fire with no
-/// patch rows rounds to zero rung and launches no tower exec at all — which
-/// is what "an axis-empty fire simply does not launch that unit's exec"
-/// (multimodal §1) means arithmetically.
-fn patch_bucket_of(ladder: Option<&PatchLadder>, patches: u32) -> Result<u32> {
-    let Some(ladder) = ladder else {
-        return Ok(0);
-    };
-    if patches == 0 || ladder.buckets.is_empty() {
-        return Ok(patches);
-    }
-    ladder
-        .buckets
-        .iter()
-        .copied()
-        .find(|rung| *rung >= patches)
-        .ok_or_else(|| {
-            Error::Fire(Fault::NoPatchBucket {
-                patches,
-                top: ladder.buckets.last().copied().unwrap_or(0),
-            })
-        })
-}
-
+/// PAST THE TOP RUNG IS [`Fault::NoBucket`], and it is the fire's TOTAL that
+/// is being judged: the budget's top is what the load carved every ceiling
+/// against, so a fire above it is refused rather than quantized to something
+/// nothing reserved for. The rounding itself is [`rung_of`].
 fn bucket_of(budget: &Budget, rows: u32) -> Result<u32> {
     match budget.buckets.last().copied() {
         Some(top) if rows > top => Err(Error::Fire(Fault::NoBucket { rows, top })),
@@ -917,10 +1063,18 @@ fn bucket_of(budget: &Budget, rows: u32) -> Result<u32> {
 /// **AND THE SAME LATTICE, DELIBERATELY.** The rungs quantize arithmetic
 /// drift wherever rows are COUNTED — that is what
 /// [`Composition::bucket`](Composition::bucket) means and it is not a claim
-/// about the fire's total in particular — so a per-class ladder built on a
-/// second, coarser ladder would be a second answer to the same question. The
-/// caller that reads this is `engine_cuda::record::Ladder`, which puts one
-/// rung per present class into the body key.
+/// about the fire's total in particular — so a second, coarser ladder built
+/// beside this one would be a second answer to the same question.
+///
+/// **THE CALLERS ARE [`bucket_of`] AND [`patch_bucket_of`], AND THAT IS THE
+/// WHOLE LIST.** This doc used to name `engine_cuda::record::Ladder` as the
+/// reader, and it was true when a body key's rung was this function over a
+/// class's LIVE rows. It is not true since the canon: `Ladder::rung` answers
+/// from the key's own coordinates — the bucket, and whether the class is a
+/// decode class — because a number the fire MEASURED inside the key the fire
+/// is looked up by is what made four decode rows and seven decode rows two
+/// captures. So `Ladder` deliberately does not read this, and the one place a
+/// count still meets the lattice is a fire's own TOTAL, on either axis.
 #[must_use]
 pub fn rung_of(buckets: &[u32], rows: u32) -> u32 {
     buckets
@@ -941,12 +1095,6 @@ mod tests {
     /// A deployment small enough to state in an assert: 8 lanes, 64 rows, no
     /// bucket lattice.
     fn budget() -> Budget {
-        Budget::new(8, 64)
-    }
-
-    /// The same, said from inside a test that shadowed the name with a
-    /// lattice of its own.
-    fn budgets_without_a_lattice() -> Budget {
         Budget::new(8, 64)
     }
 
@@ -1121,7 +1269,7 @@ mod tests {
             Lane::new(0b11, 1),
         ];
         let fire = compose(&compiled, &budget(), &all).expect("composes");
-        let spans = fire.classes().segments(&region.mask);
+        let spans = fire.classes().spans(&region.mask);
         assert_eq!(fire.classes().rows_of(&region.mask), 2);
         assert_eq!(
             spans.iter().map(|s| s.rows).sum::<u32>(),
@@ -1132,16 +1280,16 @@ mod tests {
         assert!(
             spans
                 .windows(2)
-                .all(|p| p[0].offset + p[0].rows < p[1].offset),
+                .all(|p| p[0].row_offset + p[0].rows < p[1].row_offset),
             "maximal runs would have been merged: {spans:?}",
         );
 
         let only = [Lane::new(0b01, 2), Lane::new(0b11, 3)];
         let fire = compose(&compiled, &budget(), &only).expect("composes");
-        let spans = fire.classes().segments(&region.mask);
+        let spans = fire.classes().spans(&region.mask);
         assert_eq!(
-            spans,
-            vec![RowSpan { offset: 0, rows: 5 }],
+            spans.iter().map(|s| (s.row_offset, s.rows)).collect::<Vec<_>>(),
+            vec![(0, 5)],
             "with the classes between them absent, the window is one launch",
         );
     }
@@ -1209,7 +1357,9 @@ mod tests {
 
         // A budget with no lattice is a deployment that has not chosen one,
         // and then the bucket is the fire's own size.
-        let open = super::tests::budgets_without_a_lattice();
+        // `budget` is shadowed above by this test's lattice, so the plain
+        // one is named through the module.
+        let open = super::tests::budget();
         let compiled = compile(&b.trace, &open, &DeviceProfile::default()).expect("bakes");
         let fire = compose(&compiled, &open, &[Lane::new(0, 5)]).expect("composes");
         assert_eq!(fire.bucket(), 5);
@@ -1335,5 +1485,78 @@ mod tests {
         assert_eq!(fire.lane_count(), 0);
         assert!(fire.present().is_empty());
         assert_eq!(rows_of(&compiled, &fire, SHARED), 0);
+    }
+
+    /// **G4, ON THE COMPOSITION'S OWN SURFACE.** A text-only fire's every
+    /// public answer is the answer a hand-built expectation states — the
+    /// token half unmoved by the axis array, the patch half the zero
+    /// rectangle rather than an absent one.
+    ///
+    /// The point is not that the numbers are these numbers; the diagram test
+    /// above already says that. It is that the accessors that used to read
+    /// ten named fields and now read a `PerAxis` of two records answer
+    /// IDENTICALLY, field for field, including the ones a text-only fire is
+    /// only entitled to because the second entry is a real zero.
+    #[test]
+    fn a_text_only_compositions_public_answers_are_the_hand_built_ones() {
+        let (b, _) = diagram();
+        let compiled = compile(&b.trace, &budget(), &DeviceProfile::default()).expect("bakes");
+        let lanes = [Lane::new(0, 7), Lane::new(0, 3), Lane::new(1, 1)];
+        let fire = compose(&compiled, &budget(), &lanes).expect("composes");
+
+        // The token half, stated by hand off the submission.
+        assert_eq!(fire.rows(), 11, "7 + 3 + 1");
+        assert_eq!(fire.lane_count(), 3);
+        assert_eq!(fire.bucket(), 11, "no lattice, so the bucket is the count");
+        assert_eq!(fire.classes().len(), compiled.classes.classes.len());
+        assert_eq!(fire.present().len(), 2, "one prefill class, one decode");
+        assert_eq!(
+            fire.classes().rows_of(&ClassSet::of(fire.present().iter().map(|&c| c as usize))),
+            11,
+            "the present classes tile the fire",
+        );
+        assert_eq!(fire.lanes().len(), 3);
+        assert_eq!(
+            fire.lanes().iter().map(|lane| lane.rows).sum::<u32>(),
+            11,
+        );
+
+        // The patch half: the ZERO rectangle, entry for entry.
+        assert_eq!(fire.patch_rows(), 0);
+        assert_eq!(fire.images(), 0);
+        assert_eq!(fire.patch_bucket(), 0, "no ladder, no tower exec");
+        assert!(fire.patch_present().is_empty());
+        assert_eq!(
+            fire.patch_classes().as_slice(),
+            vec![ClassWindow::default(); compiled.classes.classes.len()],
+            "every class's patch window is the zero window",
+        );
+        for lane in fire.lanes() {
+            assert_eq!(
+                (lane.patch_offset, lane.patches, lane.image_offset, lane.images),
+                (0, 0, 0, 0),
+                "a text lane is placed on no patch rectangle",
+            );
+        }
+
+        // And the two doors onto the array agree with the two named halves,
+        // which is what makes the forwards forwards.
+        assert_eq!(fire.axis(RowAxis::Tokens).classes, *fire.classes());
+        assert_eq!(fire.axis(RowAxis::Tokens).rows, fire.rows());
+        assert_eq!(fire.axis(RowAxis::Tokens).lanes, fire.lane_count());
+        assert_eq!(fire.axis(RowAxis::Tokens).bucket, fire.bucket());
+        assert_eq!(fire.table(RowAxis::Patches), fire.patch_classes());
+        // **AND THE PATCH ENTRY IS THE ZERO SERIATION, NOT AN ABSENT ONE** —
+        // a table of `count` zero windows rather than a table of none, which
+        // is what makes a text-only fire's second axis free rather than a
+        // special case at every reader.
+        let patches = fire.axis(RowAxis::Patches);
+        assert_eq!((patches.rows, patches.lanes, patches.bucket), (0, 0, 0));
+        assert!(patches.order.is_empty());
+        assert_eq!(patches.classes.len(), compiled.classes.classes.len());
+
+        // The counts the carve takes are the same four numbers.
+        let rows = fire.fire_rows();
+        assert_eq!((rows.tokens, rows.lanes, rows.patches, rows.images), (11, 3, 0, 0));
     }
 }

@@ -80,7 +80,7 @@ fn serialized() -> MutexGuard<'static, ()> {
 /// The lane word the model's own `Classify` computes — the facts qwen
 /// declares, and no third opinion about any of them.
 fn word(query_len: u32, captures: bool) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false).capturing_scores(captures))
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).capturing_scores(captures))
         .word()
 }
 
@@ -365,7 +365,7 @@ fn two_capturing_lanes_observe_their_own_rows() {
 /// artifact: the walk issues and forgets, and the only external count of what
 /// a fire ran is the node census of something RECORDED. So this test — alone
 /// in this file — puts the shell in the tiered mode and states `bodies`, and
-/// the count it compares is `BodyStats::nodes`.
+/// the count it compares is `LastCapture::nodes`.
 ///
 /// **AND THAT MAKES THE CLAIM STRONGER THAN THE SUBTRACTION IT REPLACES.**
 /// The version of this test written against the keyed cache read
@@ -406,12 +406,12 @@ fn a_fire_no_lane_captured_pays_the_observability_axis_nothing() {
     }
     let armed = shell.body_stats();
     assert!(
-        armed.captures >= 1,
+        armed.tally.captures >= 1,
         "the plain composition was never captured, so there is no graph whose \
          launches this test could count and nothing below asserts anything. A \
          moved `refusals` says the admissibility rule turned it away: {armed}"
     );
-    let plain_nodes = armed.nodes;
+    let plain_nodes = armed.last_capture.nodes;
     assert!(
         mass[0].is_empty(),
         "a lane that captured nothing was handed {} columns",
@@ -441,9 +441,9 @@ fn a_fire_no_lane_captured_pays_the_observability_axis_nothing() {
 
     assert_eq!(
         (
-            after.hits - before_again.hits,
-            after.captures - before_again.captures,
-            after.reshapes - before_again.reshapes,
+            after.tally.hits - before_again.tally.hits,
+            after.tally.captures - before_again.tally.captures,
+            after.tally.reshapes - before_again.tally.reshapes,
         ),
         (1, 0, 0),
         "the plain fire that followed a capturing one on another lane did not \
@@ -453,17 +453,17 @@ fn a_fire_no_lane_captured_pays_the_observability_axis_nothing() {
          — and a zero hit says it walked instead: before {before_again} / \
          after {after}"
     );
-    // `BodyStats::nodes` names the MOST RECENTLY CAPTURED body, so this says
+    // `LastCapture::nodes` names the MOST RECENTLY CAPTURED body, so this says
     // two things at once: nothing captured across the capturing fire and the
     // plain fire after it, and the census still describes the plain
     // composition's own graph.
     assert_eq!(
-        after.nodes, plain_nodes,
+        after.last_capture.nodes, plain_nodes,
         "the last captured body holds {} launches where the plain composition \
          was recorded with {plain_nodes}; something minted a graph after the \
          slab had been written, and the observability axis is not free when \
          off",
-        after.nodes,
+        after.last_capture.nodes,
     );
     assert_eq!(
         plain[0], again[0],
@@ -526,9 +526,9 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
 
@@ -555,7 +555,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
             bodies: true,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         weight_cache_dir: None,
     })

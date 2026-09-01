@@ -148,6 +148,27 @@ host C++,
 and it is written up there rather than here because the removal is in
 FlashInfer's bytes and this page is about ours.
 
+## Added for the tiled affine point, 2026-08-31
+
+`kernels/linear/tiled.cuh` — the W4A16 post-affine tiled GEMM (§J4 hybrid,
+phase A) — is the first device text in this crate to do bf16 arithmetic on a
+PACKED pair for a numeric reason rather than a convenience one, and it asked
+for **two names in one existing file**. Both were found the way this page says
+to find them: by compiling, reading the error, and adding the name it asked
+for.
+
+| file | what was added | the site that asked |
+| --- | --- | --- |
+| `cuda_bf16.h` | `__hfma2` | `linear/tiled.cuh`'s `fold_post` — `w = s·c + b` folded into the B fragment. `fma.rn.bf16x2` from sm_80, and the ONE rounding is the whole point: the tiled point's golden is a host fold that computes `s·c + b` wide and rounds once, so a `__hmul2` plus an add would answer a different number and could not be held against it |
+| `cuda_bf16.h` | `__hsub2` | `linear/tiled.cuh`'s `dequant_u4_bf16x2` epilogue — marlin's lop3 lands a four-bit code as `128 + code` (the `0x4300` magic exponent) and this takes the 128 back off. Exact for every input it sees: 128..143 all fit bf16's seven mantissa bits. `sub.rn.bf16x2` is sm_90, so the sm_80 body is a sign-flip and an FMA against `(1.0, 1.0)` |
+
+**`__hneg2` and `__halves2bfloat162` were NOT added**, though the §J4 recon
+predicted all four. The recon was reading marlin's `scale_and_sub`, which
+negates a zero point before folding it; this point folds a post-offset bias
+and ADDS it, so the negation never happens, and the pair broadcast it needs is
+one shift and one or (`splat` in that file, over `raw` bits) rather than a
+conversion. A name with no asking site does not come in.
+
 ## `-iquote`, never `-I`, and this one is silent to get wrong
 
 Under NVRTC there is one resolver and the carried set answers both `"…"` and

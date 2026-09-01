@@ -153,24 +153,16 @@ fn entry_by_name(
     }
 }
 
+/// This instantiation's cubin, under the deployment's stated cache root.
+///
+/// **THE THREE `env::var` CALLS STOOD HERE** and resolved
+/// `$XDG_CACHE_HOME/pie/kernels`, else `$HOME/.cache/pie/kernels` — a
+/// directory outside `$PIE_HOME` that `pie cache list` could not see. The root
+/// is a deployment fact now and arrives through [`crate::disk`]; `None` is a
+/// process that stated none, and every instantiation then compiles.
 fn disk_path(key: &str) -> Option<PathBuf> {
-    let base = std::env::var("XDG_CACHE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|home| PathBuf::from(home).join(".cache"))
-        })?;
-
     let digest = crate::source::fnv1a64(key.as_bytes());
-    Some(
-        base.join("pie")
-            .join("kernels")
-            .join(format!("{digest:016x}.cubin")),
-    )
+    Some(crate::disk::dir(crate::disk::CUBINS)?.join(format!("{digest:016x}.cubin")))
 }
 
 fn read_disk(key: &str) -> Option<(Vec<u8>, String)> {

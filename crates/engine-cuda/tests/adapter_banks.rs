@@ -66,7 +66,7 @@ fn serialized() -> MutexGuard<'static, ()> {
 /// The lane word the model's own `Classify` computes — the two facts qwen
 /// declares, and no third opinion about either.
 fn word(query_len: u32, adapter: bool) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false).adapted(adapter)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).adapted(adapter)).word()
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -701,7 +701,7 @@ fn registering_another_adapter_captures_nothing() {
     let (first, _) = solo(&mut shell, 0, &prompt, Some(0), 4);
     let after_first = shell.body_stats();
     assert!(
-        after_first.captures > 0,
+        after_first.tally.captures > 0,
         "nothing captured, so a no-recapture assertion would be vacuous. A \
          moved `refusals` says the adapted composition was turned away from \
          the body path, which for a SINGLE adapted lane would be a finding \
@@ -715,14 +715,14 @@ fn registering_another_adapter_captures_nothing() {
         let built = loud_adapter(&shell, id as usize);
         register(&mut shell, id, &built);
     }
-        let before = shell.body_stats().captures;
+        let before = shell.body_stats().tally.captures;
         let (said, _) = solo(&mut shell, 0, &prompt, Some(0), 4);
         let after = shell.body_stats();
         assert_eq!(
-            after.captures, before,
+            after.tally.captures, before,
             "registering adapter {id} cost {} capture(s); a bank's contents are \
              not in the body key",
-            after.captures - before
+            after.tally.captures - before
         );
         assert_eq!(
             said, first,
@@ -736,15 +736,15 @@ fn registering_another_adapter_captures_nothing() {
     let end = shell.body_stats();
     eprintln!(
         "eight adapters registered: captures {} -> {}; {end}",
-        after_first.captures, end.captures,
+        after_first.tally.captures, end.tally.captures,
     );
     assert_eq!(
-        end.captures, after_first.captures,
+        end.tally.captures, after_first.tally.captures,
         "seven registrations cost {} capture(s) between them",
-        end.captures - after_first.captures
+        end.tally.captures - after_first.tally.captures
     );
     assert!(
-        end.hits > after_first.hits,
+        end.tally.hits > after_first.tally.hits,
         "no fire replayed after the registrations, so the counter is watching \
          nothing: {end}"
     );
@@ -891,8 +891,8 @@ fn an_adapter_and_a_word_that_disagree_are_refused() {
 /// # What is asserted, and why `hits` rather than `captures`
 ///
 /// ```text
-/// (1) the composition REPLAYS  — `BodyStats::hits` moves
-/// (2) its body is SEGMENTED    — `BodyStats::islands` is nonzero
+/// (1) the composition REPLAYS  — `BodyTally::hits` moves
+/// (2) its body is SEGMENTED    — `LastCapture::islands` is nonzero
 /// (3) and every lane says what it said on the eager walk, token for token
 /// ```
 ///
@@ -901,7 +901,7 @@ fn an_adapter_and_a_word_that_disagree_are_refused() {
 /// load-bearing half: the correction is exactly the stretch a segmented body
 /// could get wrong, because its launches are re-issued from the host every
 /// fire and a ceiling taken there would grid them past the rows the grouped
-/// window actually owns (`Run::captured` is the one gate that stands them
+/// window actually owns (`run::Held::Eager` is the one answer that stands them
 /// down).
 ///
 /// **THIS LOAD ARMS NOTHING**, like its neighbour above: it states
@@ -978,12 +978,12 @@ fn a_mixed_adapted_fire_replays_around_its_correction() {
     eprintln!("the segmented adapted body: {stats}");
 
     assert!(
-        stats.hits >= 1,
+        stats.tally.hits >= 1,
         "the mixed adapted composition replayed nothing. Its correction window \
          is an island the body is cut around, not a refusal: {stats}"
     );
     assert!(
-        stats.islands >= 1,
+        stats.last_capture.islands >= 1,
         "the body that served a grouped correction holds no island, so a \
          segmented window reached a graph — which is what `Windows::admits` \
          exists to refuse: {stats}"
@@ -1053,7 +1053,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let seats = trace
         .params
         .iter()
@@ -1062,7 +1062,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         .min()
         .expect("the SKU declares adapter banks");
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
 
@@ -1092,7 +1092,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
             bodies: true,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.

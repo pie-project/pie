@@ -57,7 +57,104 @@ const QMM_STAMP: &str = "PIE_STAMP_qmm_t";
 const GROUPS: [i32; 3] = [32, 64, 128];
 
 /// Bit widths they instantiate.
-const WIDTHS: [i32; 2] = [4, 8];
+///
+/// **TWO IS ON THIS LIST BECAUSE IT WAS MEASURED ONTO IT, NOT BECAUSE THE
+/// GATE OPENED.** It used to end at `[4, 8]`, on the reading that listing two
+/// would force every 2-bit point to compile at boot before the loader could
+/// produce a single 2-bit fire. Both halves of that reading were checked
+/// against the machine once both 2-bit SKUs had first light, and the cost
+/// half of it was not true.
+///
+/// # The boot half: zero, because nothing warms a census
+///
+/// [`composed`] has no caller. `engine_metal::device::Pipelines` compiles
+/// LAZILY through its own cache and the shell warms nothing ahead of a fire —
+/// `what_a_two_bit_prefill_costs` reads `Shell::compiled()` straight after
+/// `Shell::load` and gets **0 points under either list**, with the same 0.5 s
+/// load either way. The list's length moves the census from 114 points to
+/// 171, and the census is a function nobody calls.
+///
+/// What IS paid is the jit stamp at first fire, and it is five points: a
+/// 512-token 2-bit prefill mints 33 pipelines under `[4, 8]` and 38 under
+/// `[2, 4, 8]`. Warm — every point already in Metal's on-disk shader cache —
+/// that first prefill costs 1144.5 ms against 981.3 ms, so the five extra
+/// points do not even pay for themselves out of the first fire. Cold, the
+/// first 2-bit prefill a machine ever runs pays ~3.7 s for them, once, ever.
+///
+/// # The prefill half: 15% off, at every length measured
+///
+/// `linear::moe::batched_point` answers `Some` for a 2-bit routed bank once
+/// the width is stamped, so a 2-bit prefill takes the sorted tile family
+/// instead of falling through to the per-row matvec. dsv4-flash 2-bit DQ
+/// (`mini-l5-e16`, sixteen routed experts) on an M1 Max, medians of three
+/// warm prefills in one loaded shell, `what_a_two_bit_prefill_costs`:
+///
+/// ```text
+///   prompt      matvec [4, 8]        tiled [2, 4, 8]      delta
+///    128     244.3 ms  524 tok/s   208.4 ms  614 tok/s   -14.7%
+///    256     501.8 ms  510 tok/s   422.0 ms  607 tok/s   -15.9%
+///    512    1087.8 ms  471 tok/s   923.1 ms  555 tok/s   -15.1%
+/// ```
+///
+/// The tile family's narrow-M deficiency is real and is not contradicted
+/// here: it is why [`crate::tuning::DeviceTuning::qmm_min_batch`] exists, and
+/// 2-bit DECODE still takes the matvec through the same crossover every other
+/// width takes. A prefill is wide-M and this is the side of the crossover the
+/// tiles were written for.
+///
+/// **AND THE DECODE ROW IS THE CONTROL THAT SAYS SO.** Both 2-bit first
+/// lights, ms/fire warm over eight single-token decodes, medians of three
+/// loads apiece — a decode's `pairs` is one row's fan-out and never clears
+/// `should_batch`, so this arm should not move and does not:
+///
+/// ```text
+///   dsv4-flash mlxu2      8.47 -> 8.44 ms/fire
+///   qwen38-flash mlxu2    7.57 -> 7.54 ms/fire
+/// ```
+///
+/// # What the width does NOT get, and why that is the ruling
+///
+/// **No 2-bit precast.** The staged-`half` arms are gated on their own by
+/// [`crate::tuning::DeviceTuning::fp16_gemm_format`] (`bits == 4 && group ==
+/// 64`) and [`qmm_precast_name`] spells `gs_64_b_4` into the symbol, so a
+/// 2-bit bank takes the plain `affine_qmm_t_aligned` and the ladder needs no
+/// new arm to say so.
+///
+/// **No 2-bit `qmm_min_batch`.** The crossover is a fact about rows, not
+/// codes: both arms read the same bank once per launch and the sweep behind
+/// the five found the same rung on four checkpoints. A width-keyed crossover
+/// would be a second table to re-sweep whenever the GEMM changes, bought with
+/// no measurement.
+///
+/// # The dense side was UNSERVICEABLE, and that is the part with no trade
+///
+/// [`act_x_wt`] reaches [`qmm_point`], [`qmv_rows_point`] and [`qmv_point`]
+/// with `?`, and all three [`check`] this list — so before the flip a dense
+/// 2-bit `linear.matmul` FAULTED at every rung of the ladder rather than
+/// falling anywhere. No SKU in the catalog fires one (both first lights would
+/// have been red), which is the only reason that was survivable.
+const WIDTHS: [i32; 3] = [2, 4, 8];
+
+/// Whether the tiled qmm family is stamped at `bits` — [`WIDTHS`] asked as a
+/// question instead of walked into an error.
+///
+/// A caller that can FALL BACK wants to know before it asks: `linear::moe`'s
+/// batched arm has a matvec beside it that serves every width, so an unstamped
+/// one is a decline and not a fault, and a decline has to be spelled without
+/// constructing the error that says otherwise. One list either way — a second
+/// `matches!(bits, ...)` at the call site would be this constant copied to
+/// the one place that must not disagree with it.
+///
+/// **THE DECLINE OUTLIVED THE WIDTH IT WAS WRITTEN FOR.** It arrived because
+/// a 2-bit routed bank faulted the prefill here, and 2 is now on [`WIDTHS`] —
+/// see that constant for the measurement that put it there. What the arm
+/// still answers `false` for is every width the affine templates were never
+/// instantiated at (3, 5, 6 among them, which `dequantize`'s own
+/// `static_assert` names), and a checkpoint carrying one is a checkpoint the
+/// matvec serves rather than one that faults.
+pub(crate) fn qmm_stamps_width(bits: u32) -> bool {
+    i32::try_from(bits).is_ok_and(|bits| WIDTHS.contains(&bits))
+}
 
 /// Column tiles the qmm point is stamped at, WIDEST FIRST, because the
 /// selection takes the first that divides the rectangle. Also the ROW tiles
@@ -205,19 +302,34 @@ const QMV_ROW_RUNGS: [i32; 3] = [2, 4, 8];
 /// The pack widths the multi-row point is stamped at — one weight pack per
 /// thread per k step, or two.
 ///
-/// Two is the one-row point's (`packs_per_thread = 2` in `quant_qmv.metal`)
-/// and is what a fold of one or two rows can afford; a wider fold holds more
-/// activation slices live and may want one. See
-/// [`crate::tuning::DeviceTuning::qmv_rows_packs`].
+/// **TWO IS THE ONE-ROW POINT'S, AND THAT MAKES THIS AXIS A NUMERICAL ONE.**
+/// `quant_qmv.metal`'s `qmv_fast_impl` carries `packs_per_thread_ = 2` and has
+/// no second stamp, and the pack width IS the k partition — `block_size =
+/// pack_factor * packs_per_thread * SIMD_SIZE`, dealt out sixteen codes a lane
+/// at two packs and eight at one. So a fold minted at 1 computes the same
+/// products in a different thirty-two partial sums, and only a fold minted at
+/// 2 lands the one-row point's bits. See
+/// [`crate::tuning::DeviceTuning::qmv_rows_packs`] for the price of each and
+/// `affine_floor`'s `the_folded_vector_point_lands_the_one_row_bits` for the
+/// measurement.
 const QMV_PACK_RUNGS: [i32; 2] = [1, 2];
 
-/// Every point this plane may fire, ready to compile — the driver's warm-up
-/// census and the gate that the stamps still name entries the compiler will
-/// mint.
+/// Every point this plane may fire, ready to compile — the gate that the
+/// stamps still name entries the compiler will mint.
 ///
 /// [`Fire`]s and not names, because a qmm point IS its stamp: handed the
 /// entry alone the driver compiles the shipped source, finds no such symbol,
 /// and refuses a point that is in fact reachable.
+///
+/// **IT IS NOT ON THE BOOT PATH AND NOTHING WARMS IT.** The header of the
+/// entry that got there first calls this "the driver's warm-up census"; no
+/// driver has ever iterated it. `engine_metal::device::Pipelines` compiles on
+/// demand and caches, so the points a load reaches are minted at first fire —
+/// `what_a_two_bit_prefill_costs` reads `Shell::compiled()` as 0 immediately
+/// after `Shell::load` and 33-38 after one prefill. What this list is FOR is
+/// a probe or a test that wants the whole reachable set in one place:
+/// `what_a_two_bit_prefill_costs` compiles it to price [`WIDTHS`], and
+/// anything asking whether the stamps still mint has it to ask over.
 #[must_use]
 pub fn composed() -> Vec<Fire> {
     let mut out = Vec::new();
@@ -625,13 +737,31 @@ pub fn routed_fp16_point(op: &'static str, bm: i32, bn: i32) -> Result<&'static 
     )))
 }
 
-/// The routed tiled point for an mxfp4 bank. Only the biased form is stamped,
-/// because the one family that ships mxfp4 biases every routed projection.
-pub fn mxfp4_routed_point(op: &'static str, bm: i32, bn: i32) -> Result<&'static str, Error> {
+/// The routed tiled point for an mxfp4 bank, in the two forms the one family
+/// that ships mxfp4 actually asks for.
+///
+/// **BOTH FORMS, AND THE SECOND ONE IS A FIX AND NOT A COMPLETION.** This
+/// used to stamp `_bias` alone, on the reading that a mixture which biases
+/// its experts biases all of them. gpt-oss does not: its `down_bias` is
+/// folded after the weighted reduce so a tensor-parallel split can add it
+/// once, and the down GEMM therefore arrives here with no bias plane. With
+/// only the biased form stamped, [`moe::batched_point`] answered `None` for
+/// that half of every mixture layer and the driver fell through to the matvec
+/// arm, which reads each expert's slice once per ROUTED ROW rather than once
+/// per tile. Stamping it measures a gpt-oss prefill of 512 tokens at
+/// 1547.0 -> 784.9 ms on an M1 Max (`.wiki/macos-bench.md` §18).
+///
+/// [`moe::batched_point`]: crate::linear::moe
+pub fn mxfp4_routed_point(
+    op: &'static str,
+    form: &str,
+    bm: i32,
+    bn: i32,
+) -> Result<&'static str, Error> {
     check(op, &TILES, bm, "row tile")?;
     check(op, &TILES, bn, "column tile")?;
     Ok(symbol(&format!(
-        "mxfp4_qmm_t_routed_bias_bfloat16_bm_{bm}_bn_{bn}"
+        "mxfp4_qmm_t_routed{form}_bfloat16_bm_{bm}_bn_{bn}"
     )))
 }
 
@@ -815,11 +945,33 @@ pub fn lm_head(
 ///
 /// where "folded where it may be" is [`qmv_rows_fold`]: `affine_qmv_rows` at
 /// a row group that divides the batch and still fills the machine, and
-/// `affine_qmv_fast` — one row per threadgroup — everywhere else. The two
-/// are BIT-IDENTICAL (`affine_floor`'s
-/// `the_folded_vector_point_lands_the_one_row_bits`), so the fold is a pure
-/// performance selection and not a second numerical policy beside the
-/// crossover below.
+/// `affine_qmv_fast` — one row per threadgroup — everywhere else.
+///
+/// **THE FOLD IS A SECOND NUMERICAL ARM AND THIS PARAGRAPH USED TO DENY IT.**
+/// It said the two points are bit-identical and concluded that the fold is "a
+/// pure performance selection and not a second numerical policy beside the
+/// crossover below". They are bit-identical at ONE pack width and the M1 Max
+/// does not select it. `block_size = pack_factor * packs_per_thread *
+/// SIMD_SIZE` is how k is dealt out to a simdgroup's thirty-two lanes, and
+/// `packs_per_thread` is 2 in `qmv_fast_impl` — its only stamp — against
+/// [`crate::tuning::DeviceTuning::qmv_rows_packs`] in the fold, which is 1
+/// here. At four bits that is an eight-code slice of a 256-code block against
+/// a sixteen-code slice of a 512-code one: the same products, a different
+/// thirty-two partial sums, a different `simd_sum`. `affine_floor`'s
+/// `the_folded_vector_point_lands_the_one_row_bits` now measures both sides —
+/// bit-identical at `packs = 2`, and one `bfloat16` ulp in one element in
+/// eight thousand at `packs = 1`.
+///
+/// **SO A FIRE'S ROW COUNT MOVES THE ARITHMETIC TWICE, NOT ONCE**, and the
+/// second one is invisible in every ladder table because it has no crossover
+/// of its own: 1 and 3 rows take the one-row point (nothing to fold, and no
+/// rung divides three), 2 and 4 take the fold. On a dense stack that is one
+/// ulp and nothing follows it; on gemma-4-26b-a4b, which routes eight of 128
+/// experts thirty times over, it is a different expert and then a different
+/// token. `.wiki/macos-bench.md` §23 is the measurement and
+/// `throughput_probe`'s `gemma4_26b_a4b_decodes_on_many_lanes_at_once` is what
+/// it explains; `qmv_rows_packs = 2` and `qmv_rows_max = 1` are the two boot
+/// document lines that take the second arm away.
 ///
 ///   1. **[`mb_block`]** picks the row block and pads the launch up to it,
 ///      bounded by `capacity_rows`. It is not an arm — it is what makes the

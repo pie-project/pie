@@ -17,8 +17,23 @@
 //! THEN PINNED — the first run of this shell against this artifact is what
 //! the expectation records.
 //!
+//! # And it PREPARES before it boots, because this SKU streams (§M wave M-3)
+//!
+//! `PIE_QWEN4_TIER_DIR` used to be an opt-in: point it somewhere and the
+//! streamed load would write its tiers on the way past, leave it unset and the
+//! load would stream, transform and serve without leaving anything behind.
+//! There is no such road any more. A serving load that streams is served out
+//! of a prepared serving artifact or it is REFUSED
+//! (`engine_cuda::weights::Intent`), and this SKU's ~68 GiB table under a
+//! 38 GiB device budget streams by construction — so the variable is a
+//! REQUIREMENT, and the gate runs `Shell::prepare` against that directory
+//! before it runs `Shell::load`. The first run of the gate pays the cold
+//! landing in the prepare; every later run finds the artifact and pays a cut
+//! and a verify.
+//!
 //! ```text
-//! PIE_COMPILER_LAUNCHER=env cargo test -p engine-cuda --features cuda-13 \
+//! PIE_COMPILER_LAUNCHER=env PIE_QWEN4_TIER_DIR=/scratch/qwen4-tiers \
+//!   cargo test -p engine-cuda --features cuda-13 \
 //!   --release --test qwen4_flash_first_light -- --ignored --nocapture
 //! ```
 
@@ -43,6 +58,13 @@ const PROMPT: &str = "The capital of France is";
 /// in `weights::packed`) the same boot walks on through ` Italy is Rome.
 /// The capital of Spain is Madrid.` at 8.5 tok/s, loading in ~590 s where
 /// the dequantizing load took ~820.
+///
+/// **THOSE LOAD SECONDS ARE THE PREPARE'S NOW** (§M-3). The ~590 s was the
+/// cold landing — the source walk, the transforms, the sink — and that work
+/// has moved to `Shell::prepare`, which is the only door that still runs it.
+/// The `Shell::load` timed below is a restore out of the artifact the prepare
+/// left, so what it prints is a cut and a verify and nothing else. The TOKENS
+/// are the pin, and they do not move with either.
 const EXPECTED: &str = " Paris.";
 
 const STEPS: usize = 24;
@@ -82,7 +104,7 @@ fn shards(snapshot: &Path) -> Vec<PathBuf> {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::qwen_4::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_4::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -143,7 +165,9 @@ fn run(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, Vec<f64>) {
 }
 
 #[test]
-#[ignore = "real-hardware: needs a CUDA device and the ~99 GiB Qwen3.8-Flash-Next 4-bit snapshot; run with `-- --ignored`"]
+#[ignore = "real-hardware: needs a CUDA device, the ~99 GiB Qwen3.8-Flash-Next 4-bit \
+            snapshot, and PIE_QWEN4_TIER_DIR pointing at ~102 GiB of scratch to prepare \
+            the serving artifact into; run with `-- --ignored`"]
 fn the_flash_artifact_prefills_decodes_and_says_something() {
     if !engine_cuda::device::present() {
         eprintln!("skipping qwen4 first light: no CUDA device on this machine");
@@ -162,9 +186,9 @@ fn the_flash_artifact_prefills_decodes_and_says_something() {
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index_all(&shards).expect("the checkpoint's shards open as one");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits the shipped artifact");
     drop(source);
 
@@ -188,10 +212,33 @@ fn the_flash_artifact_prefills_decodes_and_says_something() {
     )
     .expect("the capped load plans");
 
-    let booted = Instant::now();
-    let mut shell = Shell::load(Boot {
+    // **THE TIER DIRECTORY IS A REQUIREMENT NOW, NOT AN OPT-IN** (§M-3). It
+    // used to read "point PIE_QWEN4_TIER_DIR at a directory with ~102 GiB free
+    // and the streamed load writes (then reuses) its tiers", and every word of
+    // that described the cold serving path this wave deleted. This plan
+    // streams — 68 GiB of table against a 38 GiB budget — so with no directory
+    // there is nothing for `Shell::load` to be served out of and nowhere for
+    // `Shell::prepare` to write one. That is a SKIP and not a failure: the box
+    // has the snapshot and the card, and what it is missing is a hundred
+    // gigabytes of scratch, which is the same kind of missing as the snapshot
+    // itself.
+    let Some(tier_dir) = std::env::var("PIE_QWEN4_TIER_DIR").ok().map(PathBuf::from) else {
+        eprintln!(
+            "skipping qwen4 first light: this SKU streams its expert banks at a \
+             {:.0} GiB device budget, and since §M-3 a streamed load serves only out \
+             of a prepared serving artifact — set PIE_QWEN4_TIER_DIR to a directory \
+             with ~102 GiB free for the gate to prepare into",
+            DEVICE as f64 / (1u64 << 30) as f64,
+        );
+        return;
+    };
+
+    // Everything the prepare and the boot have to agree on, stated once: the
+    // artifact's key is a function of the trace, the recipe and the ranking,
+    // and two documents that differ in any field name two different files.
+    let doc = |residency: Plan| Boot {
         residency,
-        trace,
+        trace: trace.clone(),
         contract: &contract,
         checkpoint: &checkpoint,
         budget: Budget::new(4, 256),
@@ -203,11 +250,27 @@ fn the_flash_artifact_prefills_decodes_and_says_something() {
         ordinal: 0,
         graphs: Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
-        weight_cache_dir: None,
-    })
-    .expect("the shell loads");
+        weight_cache_dir: Some(tier_dir.as_path()),
+    };
+
+    // ── THE PREPARE, AND IT IS THE ONLY WRITER THERE IS. It runs the bake and
+    //    the landing `Shell::load` used to run on its way to serving, writes
+    //    the `.tiers` file and keeps nothing — no arena, no pools, no shell.
+    //    Against a directory that already holds this deployment's artifact it
+    //    opens it, cuts it and VERIFIES it instead, which is why running this
+    //    gate twice costs a cold landing once.
+    let prepared = Instant::now();
+    Shell::prepare(doc(residency.clone())).expect("the flash deployment prepares");
+    eprintln!(
+        "prepared into {} in {:.1}s",
+        tier_dir.display(),
+        prepared.elapsed().as_secs_f64(),
+    );
+
+    let booted = Instant::now();
+    let mut shell = Shell::load(doc(residency)).expect("the shell loads");
     let (weights, arena, pools, inputs) = shell.footprint();
     eprintln!(
         "loaded in {:.1}s — weights {:.2} GiB, arena {:.1} MiB, pools {:.1} MiB, \

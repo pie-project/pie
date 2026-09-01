@@ -42,5 +42,5 @@ thiserror = "2.0"
 # `model-ir` and knows nothing of baking. Nothing in `[dependencies]` above
 # names either, so the cycle a reader worries about — model -> compiler ->
 # model — has no first edge to close.
-model = { path = "../model" }
+models = { path = "../models" }
 model-dsl = { path = "../model-dsl" }

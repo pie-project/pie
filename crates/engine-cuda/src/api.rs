@@ -33,7 +33,7 @@
 //!   runtime (links `model`)                     engine-cuda (links no family)
 //!   -----------------------                     -----------------------------
 //!   fn contract_for(trace, path) -> Contract ──▶ Cuda::new(boot, contract_for)
-//!     model::import_of(trace.name)                  … load(request) calls it
+//!     models::import_of(trace.name)                  … load(request) calls it
 //! ```
 //!
 //! One pointer, resolved by the party that already links the catalog, and no
@@ -133,16 +133,25 @@ pub struct DeviceBoot {
     /// for a deployment that named no directory — the feature is off, no
     /// artifact is read and none is written.
     pub weight_cache_dir: Option<std::path::PathBuf>,
-    /// **Where this deployment keeps the guest-program plane's compiled
-    /// cubins**, from the boot document's `[cache] dir`.
+    /// **Where this deployment keeps its caches**, from the boot document's
+    /// `[cache] dir`. The ROOT: each consumer joins its own subdirectory.
     ///
     /// A deployment fact beside [`DeviceBoot::weight_cache_dir`], and typed
     /// for its reason: `program::compile::Disk` used to resolve
     /// `$PIE_HOME/cache/ptir-cuda` itself, which was the last environment read
-    /// in the shell (article 9). `None` is the feature off — every program
-    /// compiles through NVRTC and nothing is stored, which costs time and
-    /// never an answer.
-    pub program_cache_dir: Option<std::path::PathBuf>,
+    /// in the shell (article 9).
+    ///
+    /// **IT IS THE ROOT AND NOT A LEAF BECAUSE THERE ARE THREE CONSUMERS.**
+    /// The guest-program plane's cubins and `kernels-cuda`'s share
+    /// [`kernels_cuda::disk::CUBINS`] — one directory, because both hold the
+    /// same kind of thing and a name taken from either producer would misname
+    /// the other's half — and the measured cuBLASLt table takes
+    /// [`kernels_cuda::disk::GEMM_ALGOS`] beside them. Handing a leaf down
+    /// would make this the second place a subdirectory name is spelled.
+    ///
+    /// `None` is the feature off — every kernel compiles through NVRTC and
+    /// nothing is stored, which costs time and never an answer.
+    pub cache_dir: Option<std::path::PathBuf>,
     /// **Where this deployment keeps its shared adapters** (alto adapter
     /// §3.3), from `[model] adapter_dir`.
     ///
@@ -166,7 +175,7 @@ impl Default for DeviceBoot {
             graphs: Graphs::default(),
             knobs: Knobs::default(),
             weight_cache_dir: None,
-            program_cache_dir: None,
+            cache_dir: None,
             adapter_dir: None,
         }
     }
@@ -320,6 +329,206 @@ impl Cuda {
     // time before handing the shell a `&mut` to fire with. The question is
     // asked once now, inside the shell's own prepare phase, so nothing on
     // this side needs the shell without needing to drive it.
+
+    /// **RUN THE COLD HALF OF A LOAD AND KEEP ONLY THE FILE** (§M wave M-1:
+    /// `.wiki/alto/zt-as-serving-artifact.md`).
+    ///
+    /// The engine-side door `pie model import` reaches through, so that the
+    /// tier artifact §K/§L reads on a warm boot is written by the IMPORT
+    /// rather than by the first serve — which is where it used to be written,
+    /// and why the first serve after an import paid the whole cold load.
+    ///
+    /// **AND SINCE §M-3 IT IS NOT A SHORTCUT BUT THE SUPPLY.** [`Engine::load`]
+    /// passes `Intent::Serve`, under which a streamed load with no artifact to
+    /// cut refuses instead of landing cold, so this is the only call in the
+    /// process that can produce one. `pie model import --prepare-only` reaches
+    /// it with nothing else attached, which is what makes the refusals'
+    /// printed remedy true.
+    ///
+    /// It takes the same [`LoadRequest`] a load takes and settles it the same
+    /// way ([`Cuda::settle`]), then hands a [`Boot`] to [`Shell::prepare`],
+    /// which bakes and lands and tears the device down without arming
+    /// anything. This engine is left EXACTLY as it was: no shell is stored,
+    /// no capabilities are answered, and a later [`Engine::load`] on the same
+    /// value is the load it would have been.
+    ///
+    /// **NOT A CONTRACT VERB, AND DELIBERATELY.** `Engine` is the SERVING
+    /// surface — every verb on it is about a load that happened — and
+    /// preparing is a command-line errand that produces no engine state. A
+    /// trait method would also owe every other shell an answer, and what a
+    /// shell with no artifact format should say is nothing rather than
+    /// `Unsupported`. The one caller reaches this concretely, through
+    /// `runtime::engine::backend::open`'s own door.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Load`] for a `Checkpoint::None`, for a checkpoint this build
+    /// has no import contract for, or for whatever the bake and the landing
+    /// refused; [`Error::Impossible`] for a budget pair no plan meets.
+    pub fn prepare(&self, request: LoadRequest) -> EngineResult<()> {
+        let LoadRequest {
+            trace,
+            checkpoint,
+            budgets,
+            residency,
+            ordinal,
+            frames_in_flight,
+            tp_size,
+            precision,
+        } = request;
+        // The same refusal `load` makes one screen down, and for the same
+        // reason: `Weights::resident` is what materializes a store, and there
+        // is no weightless path through it to write an artifact from.
+        let Checkpoint::Path(path) = checkpoint else {
+            return Err(Error::Load(
+                "the cuda shell lands a checkpoint or nothing runs; \
+                 `Checkpoint::None` has nothing to prepare"
+                    .into(),
+            ));
+        };
+        let path = PathBuf::from(path);
+        // **§M-4c, AND IT IS THE FIRST THING DONE WITH THE PATH.** Before the
+        // settle, before a plan, before any buffer: an artifact written for
+        // another shell or another degree is refused by the field that
+        // disagrees, not discovered by the tokens it produces.
+        refuse_an_artifact_for_another_deployment(
+            &path,
+            trace.platform.backend(),
+            &trace.name,
+            tp_size,
+            &precision,
+        )?;
+        let (contract, plan) = self.settle(&trace, &path, &residency)?;
+        let patches = patch_ladder(&trace, &budgets);
+        // Every field is the one `load` states, read off the same two places:
+        // the request for what this model asks, the boot document for what
+        // this machine is. `graphs` is the only one that could not matter —
+        // nothing is captured here — and it is stated rather than invented,
+        // because a `Boot` that disagreed with the serving one in ANY field
+        // would be a second description of this deployment.
+        Shell::prepare(Boot {
+            trace,
+            contract: &contract,
+            checkpoint: &path,
+            budget: bake_budgets(&budgets),
+            patches,
+            profile: None::<DeviceProfile>,
+            page_size: budgets.page_size,
+            context: budgets.max_context,
+            slots: budgets.slots,
+            ordinal: if ordinal >= 0 { ordinal } else { self.boot.ordinal },
+            graphs: self.boot.graphs,
+            knobs: self.boot.knobs,
+            weight_cache_dir: self.boot.weight_cache_dir.as_deref(),
+            cache_dir: self.boot.cache_dir.as_deref(),
+            runahead: engine::runahead::Runahead::of(frames_in_flight),
+            residency: plan,
+        })
+        .map_err(fault)
+    }
+
+    /// **WHAT A LOAD SETTLES BEFORE IT BINDS A DEVICE** — the model's own
+    /// load contract, and the residency plan the two budgets decided, with
+    /// the tier admission that plan is checked against.
+    ///
+    /// Extracted at §M wave M-1 so [`Cuda::prepare`] settles it the same way
+    /// [`Engine::load`] does. Nothing here touches a device and nothing here
+    /// allocates: `prospect` costs one metadata parse and one plan compile,
+    /// which is the price of asking the question at all.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Load`] for a checkpoint this build has no import contract
+    /// for, and [`Error::Impossible`] for a budget pair no plan meets.
+    fn settle(
+        &self,
+        trace: &Trace,
+        path: &Path,
+        residency: &engine::Residency,
+    ) -> EngineResult<(ModelContract, crate::experts::Plan)> {
+        let contract = (self.contract_for)(trace, path).map_err(Error::Load)?;
+        // ── RESIDENCY, BEFORE A BYTE IS ALLOCATED (alto design §7).
+        //    This shell has TWO tiers now, and which of them a plane can live
+        //    in is a property of the plane rather than a setting:
+        //
+        //      routed expert banks   a device slab of `n < experts` slots over
+        //                            a pinned host copy of all of them, behind
+        //                            a device-resident indirection table
+        //      everything else       resident, whole, as it always was
+        //
+        //    `Plan::of` reads the budget against the trace ALONE — no device
+        //    is bound and no byte is allocated — and answers the residency
+        //    this load will actually have: the empty plan for an uncapped
+        //    budget or one that covers the whole table (dev's `place_all`),
+        //    a per-bank slot count for one that does not, and
+        //    `Fault::Residency` -> `Error::Impossible` for a budget under the
+        //    dense planes, which do not stream in this wave.
+        //
+        //    `Residency::admit` is then asked with what the PLAN demands
+        //    rather than with what the checkpoint holds — the device demand
+        //    it fits by construction, and the host demand is the real
+        //    question, because the pinned tier holds every expert of every
+        //    streamed bank and a `host_weight_budget` under it is a load this
+        //    machine cannot hold either.
+        //    **AND THE PLAN IS READ OFF THE LOAD PLAN'S PAIRINGS TOO**, not
+        //    off the trace alone: a QUANTIZED bank is codes beside factors,
+        //    two params under one `Def::Weight`, and a residency decision that
+        //    moved one of them would leave the other reading somebody else's
+        //    expert (`crate::experts`'s header states it whole). The pairing
+        //    is the loader's own record; `weights::prospect` reads it for one
+        //    metadata parse and one plan compile, and no tensor bytes.
+        //
+        //    **AND THERE IS A THIRD TIER NOW** (alto streaming §2, wave W-1).
+        //    Both budgets reach the planner, so a packed bank neither of them
+        //    holds is planned onto the MAPPED artifact rather than refusing
+        //    the load. Whether that artifact exists is a question about a file
+        //    and is answered here, once, by opening it; `admit_tiers` is the
+        //    statute that turns "spilled bytes, no source" into an
+        //    `Impossible` naming the one thing an operator can do about it.
+        //
+        //    **AND THE BUDGET ONLY ENTERS AT THE CUT** (§M.3). `prospect`
+        //    answers with the RANKING — which planes may move, in what order,
+        //    and what the serving artifact therefore holds — and none of that
+        //    mentions a budget. `Plan::cut` is the one call that reads
+        //    `residency`, so this method is the whole of the shell's
+        //    budget -> plan chain and the artifact's name is formed above it
+        //    rather than out of it.
+        let prospect = crate::weights::prospect(trace, &contract, path).map_err(fault)?;
+        let plan = crate::experts::Plan::cut(
+            &prospect.ranking,
+            crate::experts::Budgets {
+                device: residency.device_weight_budget,
+                host: residency.host_weight_budget,
+            },
+        )
+        .map_err(fault)?;
+        //    **AND THERE IS ONE FILE THAT CAN BE THAT SOURCE** (§M-4d step
+        //    3). It was two — the whole-table artifact an uncapped boot wrote
+        //    and the tier artifact a prepare left behind — and both were a
+        //    SECOND COPY of the model on the disk, which is the cost §M-4
+        //    exists to stop paying. Since §M-4b the model's own `.zt` holds
+        //    every plane of the trace, so it is the source, and the two doors
+        //    were measured equal within noise before either was removed.
+        //
+        //    **THIS PREDICATE AND `weights::resident`'s SELECTION MUST ASK
+        //    THE SAME QUESTION**, and that is the whole reason this comment
+        //    is long. `admit_tiers` refuses a spilled load with no source;
+        //    the selection decides what the source IS. If they disagree, a
+        //    load is admitted here and then finds nothing there — spilled
+        //    planes with no file to read them out of, which is the one shape
+        //    neither door is built to survive. So both ask exactly
+        //    `Serving::open`, and a checkpoint that is not a serving artifact
+        //    is refused HERE, by name, rather than discovered later.
+        let sourced = plan.spill_demand() > 0
+            && crate::checkpoint_serving::Serving::open(path, trace).is_some();
+        residency.admit_tiers(engine::load::Tiers {
+            device: plan.device_demand(),
+            host: plan.host_demand(),
+            spilled: plan.spill_demand(),
+            sourced,
+        })?;
+        Ok((contract, plan))
+    }
 
     fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
         self.shell.as_mut().ok_or_else(|| {
@@ -833,6 +1042,8 @@ impl Engine for Cuda {
             residency,
             ordinal,
             frames_in_flight,
+            tp_size,
+            precision,
         } = request;
 
         // Serving eagerly is a choice a deployment may make — for a bisect,
@@ -863,68 +1074,18 @@ intended for diagnostics, not serving",
             ));
         };
         let path = PathBuf::from(path);
-        let contract = (self.contract_for)(&trace, &path).map_err(Error::Load)?;
-
-        // ── RESIDENCY, BEFORE A BYTE IS ALLOCATED (alto design §7).
-        //    This shell has TWO tiers now, and which of them a plane can live
-        //    in is a property of the plane rather than a setting:
-        //
-        //      routed expert banks   a device slab of `n < experts` slots over
-        //                            a pinned host copy of all of them, behind
-        //                            a device-resident indirection table
-        //      everything else       resident, whole, as it always was
-        //
-        //    `Plan::of` reads the budget against the trace ALONE — no device
-        //    is bound and no byte is allocated — and answers the residency
-        //    this load will actually have: the empty plan for an uncapped
-        //    budget or one that covers the whole table (dev's `place_all`),
-        //    a per-bank slot count for one that does not, and
-        //    `Fault::Residency` -> `Error::Impossible` for a budget under the
-        //    dense planes, which do not stream in this wave.
-        //
-        //    `Residency::admit` is then asked with what the PLAN demands
-        //    rather than with what the checkpoint holds — the device demand
-        //    it fits by construction, and the host demand is the real
-        //    question, because the pinned tier holds every expert of every
-        //    streamed bank and a `host_weight_budget` under it is a load this
-        //    machine cannot hold either.
-        //    **AND THE PLAN IS READ OFF THE LOAD PLAN'S PAIRINGS TOO**, not
-        //    off the trace alone: a QUANTIZED bank is codes beside factors,
-        //    two params under one `Def::Weight`, and a residency decision that
-        //    moved one of them would leave the other reading somebody else's
-        //    expert (`crate::experts`'s header states it whole). The pairing
-        //    is the loader's own record; `weights::prospect` reads it for one
-        //    metadata parse and one plan compile, and no tensor bytes.
-        //
-        //    **AND THERE IS A THIRD TIER NOW** (alto streaming §2, wave W-1).
-        //    Both budgets reach the planner, so a packed bank neither of them
-        //    holds is planned onto the MAPPED artifact rather than refusing
-        //    the load. Whether that artifact exists is a question about a file
-        //    and is answered here, once, by opening it; `admit_tiers` is the
-        //    statute that turns "spilled bytes, no source" into an
-        //    `Impossible` naming the one thing an operator can do about it.
-        let prospect = crate::weights::prospect(&trace, &contract, &path).map_err(fault)?;
-        let plan = crate::experts::Plan::of(
-            &trace,
-            &prospect.planes,
-            crate::experts::Budgets {
-                device: residency.device_weight_budget,
-                host: residency.host_weight_budget,
-            },
-        )
-        .map_err(fault)?;
-        let sourced = plan.spill_demand() > 0
-            && crate::weights::spill_source(
-                self.boot.weight_cache_dir.as_deref(),
-                prospect.resident_key,
-            )
-            .is_some();
-        residency.admit_tiers(engine::load::Tiers {
-            device: plan.device_demand(),
-            host: plan.host_demand(),
-            spilled: plan.spill_demand(),
-            sourced,
-        })?;
+        // **§M-4c, AND IT IS THE FIRST THING DONE WITH THE PATH.** Before the
+        // settle, before a plan, before any buffer: an artifact written for
+        // another shell or another degree is refused by the field that
+        // disagrees, not discovered by the tokens it produces.
+        refuse_an_artifact_for_another_deployment(
+            &path,
+            trace.platform.backend(),
+            &trace.name,
+            tp_size,
+            &precision,
+        )?;
+        let (contract, plan) = self.settle(&trace, &path, &residency)?;
 
         // Derived BEFORE the trace moves into the boot — the ladder is a
         // reading of the plan, so it is taken while the plan is still here.
@@ -962,7 +1123,7 @@ intended for diagnostics, not serving",
             weight_cache_dir: self.boot.weight_cache_dir.as_deref(),
             // The deployment's cubin cache, unchanged per load — every program
             // this engine ever compiles keys its own file inside it.
-            program_cache_dir: self.boot.program_cache_dir.as_deref(),
+            cache_dir: self.boot.cache_dir.as_deref(),
             // **THE DEPTH CROSSES ONCE AND IS DERIVED FROM HERE ON** (article
             // 8). `Runahead::of` clamps what the free-slot word cannot carry;
             // the deployment's config layer refuses an out-of-range depth by
@@ -2429,5 +2590,273 @@ mod tests {
     fn a_stated_lattice_is_kept_and_an_unstated_one_is_filled() {
         assert_eq!(lattice(vec![4, 9, 33], 64), vec![4, 9, 33], "stated wins");
         assert_eq!(lattice(Vec::new(), 64), default_lattice(64));
+    }
+}
+
+/// **THE ARTIFACT MUST BE FOR THIS DEPLOYMENT, AND IT IS ASKED BEFORE A PLANE
+/// LANDS** (§M-4c).
+///
+/// The failure this stops was measured on the sibling shell: a `.zt` converted
+/// for cuda and served on metal loaded in 0.1 s and answered
+/// `"一时的وات**!.energy…"`. A repack moves no value, so the two artifacts have
+/// the same object names, the same shapes, the same spans and the same part
+/// digests — `experts::tests::a_tiled_row_and_a_row_major_one_rank_to_the_same_spans`
+/// measures exactly that — and NOTHING ABOUT THE BYTES CAN TELL THEM APART.
+/// The stamp is the only thing that can.
+///
+/// # Two absences, two meanings
+///
+/// **The ARTIFACT stating no stamp is not an error.** It is an ordinary
+/// checkpoint — a raw safetensors snapshot, a GGUF, a `.zt` that was never a
+/// serving artifact — and serving one is the path this shell has always had.
+/// That is `serve::stamp_of`'s `Ok(None)` and it is the ONLY answer that
+/// proceeds: a file stating `pie.serving/<n>` whose stamp does not read is a
+/// broken artifact, not an unstamped one, and it refuses.
+///
+/// **The REQUEST stating no precision is.** `runtime::engine::load::request_of`
+/// fills it unconditionally, so an empty one means the runtime could not
+/// assemble the facts — and an artifact that passes because nobody said what
+/// to compare it to is the silent failure this whole profile exists to end.
+///
+/// # Before a plane lands, and that is asserted rather than assumed
+///
+/// This runs on the path's NAME, through `serve::read_head`, which reads the
+/// footer and the manifest with positioned reads and opens no mapping. No
+/// device buffer, no host mapping, no scratch reservation has happened when it
+/// refuses.
+fn refuse_an_artifact_for_another_deployment(
+    path: &std::path::Path,
+    backend: &str,
+    sku: &str,
+    tp_size: u64,
+    precision: &str,
+) -> EngineResult<()> {
+    if precision.is_empty() {
+        return Err(Error::Load(format!(
+            "this load states no precision, so nothing here can check that {} was \
+             written for it; `runtime::engine::load::request_of` fills that field \
+             and a request without one did not come through it",
+            path.display(),
+        )));
+    }
+    // **THREE OUTCOMES, AND THEY ARE ASKED AS THREE.** This read
+    // `read_head(..)` and treated every `Error::Checkpoint` as "not a serving
+    // artifact, proceed" — which is right for a file with no serving key and
+    // WRONG for one that states `pie.serving/1` and has a rotted member.
+    // `Stamp::decode` spends two error variants on three answers, so that
+    // reading served a file claiming to be servable, silently, as if it had
+    // never claimed anything. `serve::stamp_of` is the split, and the
+    // mac-engine session found this by reading it from the other shell.
+    let stamp = match checkpoint::file::serve::stamp_of(path) {
+        // An ordinary checkpoint — no serving key at all. The path this shell
+        // has always had.
+        Ok(None) => return Ok(()),
+        Ok(Some(stamp)) => stamp,
+        Err(why) => return Err(Error::Load(why.to_string())),
+    };
+    let deployment = checkpoint::serving::Stamp::of(backend, tp_size, sku, precision, None);
+    stamp.check(&deployment).map_err(|mismatch| {
+        Error::Load(mismatch.refuse(&path.display().to_string(), stamp.model_id.as_deref()))
+    })
+}
+
+#[cfg(test)]
+mod serving_stamp_tests {
+    use super::refuse_an_artifact_for_another_deployment as refuse;
+    use checkpoint::file::emit::{self, Object, Part, Payload};
+    use checkpoint::serving::Stamp;
+    use std::collections::BTreeMap;
+
+    fn artifact(dir: &std::path::Path, backend: &str, tp_size: u64) -> std::path::PathBuf {
+        let path = dir.join(format!("{backend}-tp{tp_size}.zt"));
+        let bytes = vec![7u8; 8192];
+        emit::write(
+            &path,
+            &Stamp::of(backend, tp_size, "qwen_3", "mlxu4", Some("q/q3".into())),
+            &BTreeMap::new(),
+            4096,
+            &[Object {
+                name: "embed",
+                shape: vec![8192],
+                layout: "dense",
+                attributes: None,
+                parts: vec![Part {
+                    name: "data",
+                    dtype: ztensor::DType::U8,
+                    logical: None,
+                    payload: Payload::Whole(&bytes),
+                }],
+            }],
+            |o, p, _| panic!("{o}/{p} is not streamed here"),
+        )
+        .expect("the fixture artifact writes");
+        path
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cuda_stamp_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// **THE SHELL REFUSES AN ARTIFACT WRITTEN FOR ANOTHER ONE**, by the field
+    /// that disagrees, on the path's NAME — no mapping, no buffer, no plan.
+    #[test]
+    fn an_artifact_for_another_shell_is_refused_before_anything_is_opened() {
+        let dir = tmp("cross");
+        let foreign = artifact(&dir, "metal", 1);
+        let why = refuse(&foreign, "cuda", "qwen_3", 1, "mlxu4")
+            .expect_err("a metal artifact is not servable here");
+        let said = format!("{why}");
+        for wanted in ["backend", "\"metal\"", "\"cuda\"", "pie model import --force"] {
+            assert!(said.contains(wanted), "the refusal does not say {wanted:?}: {said}");
+        }
+        // Its own deployment takes it.
+        refuse(&artifact(&dir, "cuda", 1), "cuda", "qwen_3", 1, "mlxu4")
+            .expect("a cuda artifact serves on cuda");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A STAMPED ARTIFACT WITH A ROTTED MEMBER IS NOT AN UNSTAMPED ONE**,
+    /// and this is the distinction that was collapsed.
+    ///
+    /// `Stamp::decode` answers three outcomes with two error variants, so a
+    /// call site reading only the `Result` cannot tell "no serving key" from
+    /// "serving key, broken member" — both are `Error::Checkpoint`. This
+    /// shell's check treated that as "not a serving artifact, proceed", which
+    /// SERVED a file that claims to be servable and is not: the exact silent
+    /// pass the stamp exists to end, and a quieter cousin of the two schemes
+    /// that shared a discriminator in `file/zt.rs::affine_group_scheme`.
+    ///
+    /// The fixture is a WELL-FORMED container whose serving block states a
+    /// `tp_size` of zero — `Stamp::decode` refuses it as "must be at least 1",
+    /// and every other byte of the file is what the writer produced. Editing
+    /// a good file's bytes instead does not test this: the container's own
+    /// manifest hash catches that first, which is correct and is a different
+    /// refusal.
+    ///
+    /// Found by the mac-engine session reading the split from the other shell.
+    #[test]
+    fn a_stamped_artifact_whose_stamp_is_broken_does_not_pass_as_unstamped() {
+        let dir = tmp("rotted");
+        let path = dir.join("rotted.zt");
+        let bytes = vec![7u8; 8192];
+        let broken = Stamp {
+            tp_size: 0,
+            ..Stamp::of("cuda", 1, "qwen_3", "mlxu4", Some("q/q3".into()))
+        };
+        emit::write(
+            &path,
+            &broken,
+            &BTreeMap::new(),
+            4096,
+            &[Object {
+                name: "embed",
+                shape: vec![8192],
+                layout: "dense",
+                attributes: None,
+                parts: vec![Part {
+                    name: "data",
+                    dtype: ztensor::DType::U8,
+                    logical: None,
+                    payload: Payload::Whole(&bytes),
+                }],
+            }],
+            |o, p, _| panic!("{o}/{p} is not streamed here"),
+        )
+        .expect("a stamp this build will not read back still writes");
+
+        let why = refuse(&path, "cuda", "qwen_3", 1, "mlxu4")
+            .expect_err("an artifact that claims a serving profile and cannot read it back");
+        assert!(
+            format!("{why}").contains("tp_size"),
+            "the refusal should name the member that did not read: {why}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **WHAT A BOOT IS ACTUALLY HANDED IS USUALLY NOT A CONTAINER AT ALL**,
+    /// and treating that as a refusal made every ordinary checkpoint
+    /// unbootable.
+    ///
+    /// A safetensors SNAPSHOT DIRECTORY is the common case — it is what
+    /// `pie serve` points at for any model that has not been imported — and
+    /// `manifest_of` answers it with `io error: Is a directory`. `stamp_of`
+    /// returned that as `Err` and this shell turned it into `Error::Load`, so
+    /// the boot refused a directory for failing to be a serving artifact it
+    /// had never claimed to be.
+    ///
+    /// **NOTHING HOST-SIDE CAUGHT IT.** Every fixture in this crate and in
+    /// `checkpoint` is already a container, because they are all written by
+    /// the writer under test; the shape that breaks is the one no format test
+    /// has a reason to build. `cuda_boot_smoke` on a device found it, which
+    /// is the argument for running that gate on a change that touches the
+    /// load door even when the change looks like it cannot reach a device.
+    ///
+    /// So the three shapes below are all `Ok(())`: a directory, a file that
+    /// is not a container, and a file that does not exist. None of them says
+    /// anything about serving, and a path that claims nothing cannot be
+    /// serving-refused.
+    #[test]
+    fn a_path_that_is_not_a_container_claims_nothing() {
+        let dir = tmp("noncontainer");
+        std::fs::create_dir_all(dir.join("snapshot")).unwrap();
+        std::fs::write(dir.join("snapshot/model.safetensors"), b"not a zt file").unwrap();
+        std::fs::write(dir.join("loose.safetensors"), b"nor is this").unwrap();
+
+        for path in [
+            dir.join("snapshot"),
+            dir.join("snapshot/model.safetensors"),
+            dir.join("loose.safetensors"),
+            dir.join("absent.zt"),
+        ] {
+            refuse(&path, "cuda", "qwen_3", 1, "mlxu4").unwrap_or_else(|why| {
+                panic!("{} is not a serving artifact and was refused as one: {why}", path.display())
+            });
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The degree is the other half of a recipe, and is caught the same way.
+    #[test]
+    fn an_artifact_cut_for_another_degree_is_refused() {
+        let dir = tmp("degree");
+        let one = artifact(&dir, "cuda", 1);
+        let why = refuse(&one, "cuda", "qwen_3", 2, "mlxu4")
+            .expect_err("a tp1 artifact does not serve a tp2 deployment");
+        assert!(format!("{why}").contains("tp_size"), "{why}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A CHECKPOINT THAT IS NOT A SERVING ARTIFACT PROCEEDS**, which is the
+    /// path this shell has always had and the one §M-4d retires. The two
+    /// absences are different facts: the ARTIFACT stating no stamp is an
+    /// ordinary checkpoint; the REQUEST stating no precision is a runtime that
+    /// could not assemble the comparison, and that one refuses.
+    #[test]
+    fn an_ordinary_checkpoint_passes_and_a_factless_request_does_not() {
+        let dir = tmp("plain");
+        let plain = dir.join("plain.zt");
+        let mut writer =
+            checkpoint::file::write::Writer::create(&plain, &BTreeMap::new()).unwrap();
+        let decl = checkpoint::types::TensorDecl {
+            id: checkpoint::types::TensorId(0),
+            name: "w".to_string(),
+            shape: vec![16],
+            encoding: checkpoint::types::Encoding::Raw(checkpoint::types::DType::U8),
+            alignment: 256,
+            visibility: checkpoint::types::Visibility::default(),
+        };
+        writer.add_tensor(&decl, &[0u8; 16]).unwrap();
+        writer.finish().unwrap();
+
+        refuse(&plain, "cuda", "qwen_3", 1, "mlxu4")
+            .expect("an ordinary checkpoint is not a cross-recipe artifact");
+
+        let why = refuse(&plain, "cuda", "qwen_3", 1, "")
+            .expect_err("a request that states no precision cannot check anything");
+        assert!(format!("{why}").contains("states no precision"), "{why}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

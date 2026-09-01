@@ -135,6 +135,40 @@ pub struct FireTables {
     pub mask_stride: u32,
 }
 
+/// The dsv4 compressor state `attention.pool_gather` reads beside its cache —
+/// the engine side of the `MENLO-SEAM` marker at
+/// `kernels_metal::attn::pool::gather`.
+///
+/// **NOT A FIELD OF [`FireTables`], AND THE CUDA SIBLING'S SEAT IS WHERE IT
+/// WOULD HAVE GONE.** `engine_cuda::FireTables` carries a
+/// `pool_state: Option<PoolSlabs>` because on that plane the shell binds the
+/// slabs into every fire's tables. This plane already has the shape for a
+/// state slab no op names and no fire stages: [`crate::scratch`]'s `index`
+/// role, reserved at load iff the trace names the op that reads it and minted
+/// at the node that does. The pool state is that same noun — bytes the shell
+/// owns, addressed by the paged slot and not by a fire row — so it is
+/// reserved the same way, and a fire whose plan has no pooled layer pays it
+/// no handle row and no bytes.
+///
+/// **AND WHAT IS INSIDE THEM IS WRITTEN NOW.** The two slabs are the
+/// `wkv`/`wgate` projections' outputs, and for as long as no node computed
+/// either the shell reserved the room the addressing needs and the room held
+/// zeros — the gather fired and pooled nothing.
+/// `attention.pool_state_write` is the writer: the model text projects the
+/// compressor's two planes per token and scatters them into the source
+/// cache's own cell, which is why this reservation is now ONE PLANE PER
+/// POOLED SPACE (`crate::scratch`'s `pool` field) rather than one for the
+/// artifact.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolSlabs {
+    /// The rolling kv window: `[the source pool's cells, coff * head_dim]`,
+    /// in the pooled entry's element.
+    pub state_kv: Tensor,
+
+    /// The rolling gate logits, at `state_kv`'s shape and element.
+    pub state_score: Tensor,
+}
+
 /// What the engine binds each fire, owned by the [`Run`] for its lifetime.
 ///
 /// `tokens`, `positions`, and `geometry` are the op-visible inputs —
@@ -175,6 +209,42 @@ pub struct FireBindings {
     /// walk skips it.
     pub adapter_routes: Option<Tensor>,
 
+    // patch — the second row axis's six inputs plus the trunk's triple, kept
+    // contiguous for `adapter_routes`' reason: every one is a declared
+    // `RuntimeInput` an op names, and every one is `None` for a fire whose
+    // lanes carried no image.
+    /// `RuntimeInput::Patches`: `[patch rows, C·T·P²]` in the plan's element.
+    pub patches: Option<Tensor>,
+
+    /// `RuntimeInput::PatchSegments`: `i32`, `[images + 1]` — the patch
+    /// axis's own indptr, which `attention.dense` reads its image boundaries
+    /// out of.
+    pub patch_segments: Option<Tensor>,
+
+    /// `RuntimeInput::PatchRoutes`: `i32`, `[patch rows]`, one destination
+    /// TOKEN row per tower row, `-1` for a row the fold spends and nothing
+    /// places.
+    ///
+    /// **THE ONE VECTOR THAT CROSSES THE TWO AXES**, and therefore the one
+    /// the shell has to check host-side: an entry past the fire's token rows
+    /// is an out-of-bounds device write no arena faults on.
+    pub patch_routes: Option<Tensor>,
+
+    /// `RuntimeInput::PatchPositions`: `i32`, `[patch rows, 3]`.
+    pub patch_positions: Option<Tensor>,
+
+    /// `RuntimeInput::PatchEmbedRows`: `i32`, `[patch rows, taps]`, `None`
+    /// for a plan that reads the learned position table on its native grid.
+    pub patch_embed_rows: Option<Tensor>,
+
+    /// `RuntimeInput::PatchEmbedWeights`: `f32`, `[patch rows, taps]`.
+    pub patch_embed_weights: Option<Tensor>,
+
+    /// `RuntimeInput::MropePositions`: `i32`, `[rows, 3]` — the TRUNK's
+    /// triple-wide stream, on the TOKEN axis and staged for every fire of a
+    /// plan that declares the rotation, image or no image.
+    pub mrope_positions: Option<Tensor>,
+
     /// Per cache space, aligned with `Trace::caches`:
     /// `RuntimeInput::Geometry { space, kind }` routes to that space.
     pub geometry: Vec<CacheGeometry>,
@@ -211,8 +281,10 @@ pub enum StructSlot {
     /// `StructKind::AttnPrefillPlan`.
     Prefill(PrefillPlan),
 
-    /// `StructKind::MlaPlan` — declared for shape; the metal builder refuses
-    /// before one exists, so this variant is never stored.
+    /// `StructKind::MlaPlan` — an empty payload: this plane's mla flash engine
+    /// reads the fire's position/owning-request tables and the pool page walk
+    /// at each attention arm, so the plan carries no device state and is stored
+    /// only to give decode and prefill the struct value they name.
     Mla(MlaPlan),
 }
 
@@ -619,28 +691,26 @@ impl<'c> Run<'c> {
         let Ty::Tensor { shape, .. } = &self.values[at].ty else {
             return handle;
         };
-        let window = self.window().span;
+        let seated = self.window();
+        let window = seated.span;
+        // **THE SECOND ROW AXIS, CUT AT ITS OWN WINDOW** (multimodal §5.1).
+        // `Window::patch` is this region's mask read against the PATCH table
+        // — patch rows where `span` has token rows and IMAGES where it has
+        // lanes — so a tower rectangle is cut by the seriation that placed it
+        // and never by the token one. The two pairs are carried separately
+        // rather than chosen between, because the embed merge is a TOKEN
+        // region that reads a patch column and needs both in the same
+        // resolution.
+        let patch = seated.patch;
         let (skip, keep) = match shape.first() {
             Some(Dim::Tokens) => (window.row_offset, window.rows),
             Some(Dim::TokensTimes(k)) => (window.row_offset * k, window.rows * k),
             Some(Dim::Lanes) => (window.lane_offset, window.lanes),
             Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
             Some(Dim::Const(_)) | None => return handle,
-            // THE SECOND ROW AXIS, WHICH THIS PLANE HAS NO WINDOW FOR AND NO
-            // KERNEL BEHIND. `window.span` is the token rectangle's pair, and
-            // patches do not break where tokens do (multimodal §5.1), so
-            // cutting a patch column at a token row offset would hand a launch
-            // the wrong rows — and handing it over whole is only right when
-            // every class is present, which is a composition and not an
-            // invariant. Refused by name rather than left partial, and the
-            // same sentence stands one method down where the axis's own
-            // `RuntimeInput` resolves: this mirror serves no tower op, so a
-            // patch-carrying plan is a plan this plane cannot run.
-            Some(Dim::Patches | Dim::Images | Dim::ImagesPlus(_)) => panic!(
-                "value {at} is a patch-axis rectangle and this plane binds no patch \
-                 window; the metal mirror carries no tower kernel, and no model text \
-                 states a patch row before wave M3"
-            ),
+            Some(Dim::Patches) => (patch.row_offset, patch.rows),
+            Some(Dim::Images) => (patch.lane_offset, patch.lanes),
+            Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
         };
         self.slice(handle, skip, keep)
     }
@@ -760,36 +830,72 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            // THE SECOND ROW AXIS IS NOT SERVED HERE EITHER, AND FOR THE
-            // ADAPTER AXIS'S REASON. This plane binds no patch seat and
-            // carries no tower kernel, so nothing can reach this id: no model
-            // text states a patch row yet (wave M3), and a plan that stated
-            // one is refused at the bake against budgets that size no patch
-            // ceiling. Resolving a bare zero here would point every tower
-            // launch at whatever the arena's base holds.
-            Def::Input(
-                RuntimeInput::Patches
-                | RuntimeInput::PatchSegments
-                | RuntimeInput::PatchRoutes
-                | RuntimeInput::PatchPositions
-                | RuntimeInput::PatchEmbedRows
-                | RuntimeInput::PatchEmbedWeights,
-            ) => panic!(
-                "value {at} reads the fire's patch rows, which this plane binds no seat                  for; the metal mirror serves no vision tower"
-            ),
+            // **THE SECOND ROW AXIS'S SIX INPUTS**, on the adapter axis's
+            // terms one arm up: bound only when a lane of this fire carried
+            // an image, and a fire none did stages nothing. Nothing can reach
+            // these arms then either — the tower's capture unit has zero
+            // patch rows, and the walk skips a zero-row region before it
+            // dispatches a node — so each panic is the same "unbound seat"
+            // statement the mask and the adapter make, and never a hole.
+            //
+            // Named one per input rather than as one arm, because a plan that
+            // reached one of them is a plan that reached exactly one and the
+            // message should say which.
+            Def::Input(RuntimeInput::Patches) => self.fire.patches.unwrap_or_else(|| {
+                panic!("value {at} reads this fire's patch rows, which no lane of it submitted")
+            }),
+            Def::Input(RuntimeInput::PatchSegments) => {
+                self.fire.patch_segments.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's image boundaries, which no lane of \
+                         it submitted"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::PatchRoutes) => self.fire.patch_routes.unwrap_or_else(|| {
+                panic!(
+                    "value {at} reads where this fire's tower rows land, which no lane \
+                     of it submitted"
+                )
+            }),
+            Def::Input(RuntimeInput::PatchPositions) => {
+                self.fire.patch_positions.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's patch grid positions, which no lane \
+                         of it submitted"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::PatchEmbedRows) => {
+                self.fire.patch_embed_rows.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's position-table taps, and this load \
+                         stages none — the plan reads the table on its native grid"
+                    )
+                })
+            }
+            Def::Input(RuntimeInput::PatchEmbedWeights) => {
+                self.fire.patch_embed_weights.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads this fire's interpolation weights, and this load \
+                         stages none — the plan reads the table on its native grid"
+                    )
+                })
+            }
             // **THE TRUNK'S TRIPLE-WIDE POSITION STREAM** (multimodal §6.3),
-            // on the FIRST axis and refused for the same reason the four
-            // above it are: this plane stages one scalar per token row and
-            // reserves no triple, so resolving a bare zero here would point
-            // the rotation at whatever the arena's base holds. Its consumer
-            // — `elementwise.rope_mrope` under
-            // [`MropeForm::Blocked`](model_ir::MropeForm::Blocked) — is
-            // already a named refusal one file over, and the interleaved arm
-            // that does forward can only be reached by a plan that declares
-            // this input.
-            Def::Input(RuntimeInput::MropePositions) => panic!(
-                "value {at} reads the fire's (t, h, w) token positions, and this plane                  stages one scalar per row"
-            ),
+            // on the FIRST axis and therefore staged for EVERY fire of a plan
+            // that declares it — image or no image. A lane that submitted no
+            // stream of its own gets the scalar reading `(p, p, p)`, which is
+            // what makes a text-only fire of a `-vision-` row rotate exactly
+            // as its plain twin does.
+            Def::Input(RuntimeInput::MropePositions) => {
+                self.fire.mrope_positions.unwrap_or_else(|| {
+                    panic!(
+                        "value {at} reads the fire's (t, h, w) token positions, and this \
+                         load reserved no triple — the plan declares no multimodal rotation"
+                    )
+                })
+            }
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 let space = *space as usize;
                 let seat = self.fire.geometry.get(space).unwrap_or_else(|| {
@@ -933,6 +1039,75 @@ impl<'c> Run<'c> {
                 .routed(self.handles)?
                 .unwrap_or_else(|fault| {
                     panic!("the routed scratch this load reserved does not mint: {fault}")
+                }),
+        )
+    }
+
+    /// The NSA indexer's score slab, minted into this fire.
+    ///
+    /// `None` when the load reserved none — a trace with no
+    /// `attention.index_topk` — and the arm answering `None` refuses by name,
+    /// because there is no selection arithmetic that does not need it.
+    ///
+    /// A mint that fails is an INTEGRITY failure and not a refusal, for
+    /// [`Run::routed_scratch`]'s reason.
+    pub(crate) fn index_scores(&self) -> Option<Tensor> {
+        Some(
+            self.scratch
+                .index_scores(self.handles)?
+                .unwrap_or_else(|fault| {
+                    panic!("the index score slab this load reserved does not mint: {fault}")
+                }),
+        )
+    }
+
+    /// The rolling compressor state of the SPACE `pages` names, minted into
+    /// this fire.
+    ///
+    /// One plane per pooled space, so the argument is the cache id the asking
+    /// op walks: the gather and the state write of one layer resolve to the
+    /// same space and therefore to the same two slabs, and a second pooled
+    /// layer resolves to its own.
+    ///
+    /// `None` when the load reserved none for that space — a trace with no
+    /// `attention.pool_gather` over it — and the arm answering `None` refuses
+    /// by name, because there is no gated pool that does not read the state.
+    ///
+    /// A mint that fails is an INTEGRITY failure and not a refusal, for
+    /// [`Run::index_scores`]'s reason.
+    pub(crate) fn pool_state(&self, pages: ValueId) -> Option<PoolSlabs> {
+        let at = pages.0 as usize;
+        let Some(Def::Cache(space)) = self.values.get(at).map(|v| &v.def) else {
+            panic!("value {at} is not a cache space; the pooled state is keyed by one")
+        };
+        Some(
+            self.scratch
+                .pool_state(self.handles, *space)?
+                .unwrap_or_else(|fault| {
+                    panic!("the compressor state this load reserved does not mint: {fault}")
+                }),
+        )
+    }
+
+    /// qwen4's PLE hash constants, minted into this fire.
+    ///
+    /// `None` when the load wrote no plane for THESE constants — a trace with
+    /// no `attention.ple_ngram_ids` — and the arm answering `None` refuses by
+    /// name, because there is no hashing that does not read its own primes.
+    ///
+    /// A mint that fails is an INTEGRITY failure and not a refusal, for
+    /// [`Run::index_scores`]'s reason.
+    pub(crate) fn ple_hash(
+        &self,
+        mults: &[u64],
+        primes: &[u64],
+        offsets: &[u64],
+    ) -> Option<Tensor> {
+        Some(
+            self.scratch
+                .ple_hash(self.handles, mults, primes, offsets)?
+                .unwrap_or_else(|fault| {
+                    panic!("the PLE hash plane this load wrote does not mint: {fault}")
                 }),
         )
     }

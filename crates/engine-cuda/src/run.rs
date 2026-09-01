@@ -13,12 +13,12 @@
 //! are integrity failures of the shell or the compiler, and they panic with
 //! a sentence instead of dressing up as a backend refusal.
 //!
-//! # And one word decides whether a region is being RECORDED
+//! # And ONE resolution decides what a region's launches are allowed
 //!
-//! A `Run` is built by the router with three facts the fire path cannot
-//! recompute — `bodied`, the load's `shifted` slice and this composition's
-//! [`Admit`] table ([`Run::bodied`]) — and every ceiling in this file hangs
-//! off the single predicate they resolve to, [`Run::captured`]:
+//! A `Run` is built by the router with six facts the fire path cannot
+//! recompute — [`Ceilings`], handed in one piece by one builder — and
+//! every ceiling in this file is a reading of the ONE answer they resolve to,
+//! [`Standing`] ([`Run::standing`], resolved once per `(region, run)`):
 //!
 //! ```text
 //! tier 1/2, a CAPTURED region   the key's grid (carve_rows, carve_lanes),
@@ -35,9 +35,17 @@
 //! a graph could not hold was refused admission outright, so `bodied` alone
 //! was a region-level answer by accident of the gate above it; a body is cut
 //! around its islands now, so the question every ceiling actually wants is
-//! per REGION. The predicate is only ever NARROWER than what stood before it
-//! ([`Run::captured`] argues that clause by clause), so no composition tier 1
-//! could already serve computes anything different.
+//! per REGION. [`Held::Eager`] is that answer and [`Held::Captured`] is the
+//! other, and the enum is only ever NARROWER than what stood before it, so no
+//! composition tier 1 could already serve computes anything different.
+//!
+//! **AND D4'S PAD IS NOT ON THAT LADDER**, which is the one thing the bundle
+//! must not blur: [`Run::here`] reads [`Standing::pad`] and [`Standing::whole`] on
+//! EVERY fire, including the padded eager one that has no [`Held::Captured`]
+//! anywhere in it. The pads live inside [`Ceilings`] because they are armed at
+//! the same instant by the same caller; they are read outside [`Held`] because
+//! the question they answer is about a window and a lattice and never about a
+//! graph.
 //!
 //! [`KernelError`]: model_exec::KernelError
 
@@ -49,6 +57,7 @@ use kernels_cuda::attn::plan::{
 use kernels_cuda::linear::lora::Segments;
 use kernels_cuda::linear::moe::{ExpertTable, GroupSeat};
 use kernels_cuda::{Ctx, KvPool, Pad, RaggedTensor, RecurrentPool, Tensor};
+use model_exec::fire::MaskSpan;
 use model_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
 
 use crate::dispatch::copy::CopyPlan;
@@ -83,6 +92,26 @@ pub enum WeightRow {
         /// itself (mxfp4).
         biases: Option<Tensor>,
         seat: GroupSeat,
+        /// **WHETHER THESE PLANES ARE IN FRAGMENT ORDER** (§J4b) — `true`
+        /// for the three rectangles `pie model import` wrote through
+        /// `kernels_cuda::linear::tiled`'s relabelling, `false` for the
+        /// row-major triplet every other landing seats.
+        ///
+        /// **IT IS A WITNESS AND NOT A CHOICE**, exactly as
+        /// [`seat`](WeightRow::Planes::seat) is: the trace declared the
+        /// weight `Dtype::U4g64tiled`, `weights.rs` read that declaration off
+        /// the plane's own `Place`, and dispatch spends it. Nothing here
+        /// decides to repack anything.
+        ///
+        /// **AND IT HAS TO BE HERE BECAUSE THE RECTANGLES DO NOT DIFFER.**
+        /// A repacked code plane is the same rows of the same bytes as the
+        /// row-major one — the repack is size-preserving up to the band
+        /// padding, which is already in the shape — so a reader handed the
+        /// wrong order cannot refuse: it answers nonsense. This bit is the
+        /// only thing that tells the two apart, which is why
+        /// `Run::maybe_planes` hands back none of them and
+        /// `Run::maybe_tiled_planes` hands back only these.
+        repacked: bool,
     },
 
     /// **A STREAMED ROUTED-EXPERT BANK** (alto design §7, wave D2): a device
@@ -690,6 +719,377 @@ pub enum StructSlot {
     Mla(MlaPlan),
 }
 
+/// **THE FACTS A `Run` CANNOT RECOMPUTE FROM A FIRE**, handed in one piece by
+/// one builder — D4's pad pair PER ROW AXIS, this fire's `bodied` word, the
+/// load's `shifted` slice, this composition's [`Admit`] table and the key's
+/// carve.
+///
+/// **THEY ARE ONE BUNDLE BECAUSE THEY ANSWER ONE QUESTION**, and the question
+/// is [`Standing`]: what this region's launches are allowed. Split across a
+/// field each the answer was a predicate each, and a consumer that picked the
+/// wrong one got a launch gridded past what the fire brought or a ceiling
+/// baked into a region the graph re-issues. Nothing outside [`Standing::of`]
+/// and [`Ceilings::admit`] reads a field of this.
+///
+/// **AND THE DEFAULT IS THE EAGER ARM ON EVERY AXIS AT ONCE.** `Pad::default()`
+/// is `rows == bucket == 0`, which no extent equals, so nothing is padded; an
+/// empty `shifted` reads as "this region does not move its own base" and an
+/// empty `admits` as "no graph holds this region", which is
+/// `exports::regions_shifting`'s own rule and
+/// [`Windows::admits`](crate::window::Windows::admits)'s; and a `carve` of
+/// `None` takes no ceiling at all. That is byte for byte the walk this file
+/// made before any of these fields existed.
+#[derive(Clone, Copy, Default)]
+pub struct Ceilings<'c> {
+    /// **D4'S TWO NUMBERS, ONCE PER ROW AXIS** (`.wiki/palo/cuda-abi.md` §3,
+    /// refined form): each rectangle's total rows and the lattice point above
+    /// them. Must be the COMPOSITION's counts and not a window's —
+    /// [`Standing`] compares a window's span against them and that comparison
+    /// is the whole safety argument.
+    ///
+    /// **A REGION PADS AND CARVES ON ITS OWN AXIS, AND THE UNIT IS WHAT
+    /// PICKS** ([`Windows::axis_of`](crate::window::Windows::axis_of),
+    /// [`Ceilings::pad_on`]). A tower region's window counts PATCH rows, so
+    /// judging its span against the TOKEN pair compares two different row
+    /// spaces and rounding its GEMM `M` up to the token bucket rounds a patch
+    /// count up to a token lattice point. Neither is a number that means
+    /// anything. This was two named fields and a two-arm match at the pick;
+    /// it is one array and an index, so the third rectangle costs an element
+    /// at the fill and nothing at the read.
+    ///
+    /// The patch entry is `Pad::default()` for every one-unit artifact and
+    /// for every fire off the bodies path, which is what keeps a text-only
+    /// load byte for byte the load it was.
+    ///
+    /// **HELD HERE RATHER THAN STAMPED ON THE CONTEXT ONCE PER FIRE**, because
+    /// the question padding turns on is not "which fire" but "which REGION" —
+    /// see [`Run::ctx`]. A pad the shell wrote onto the context at the top of
+    /// the fire would still be there when the walk stepped into a windowed
+    /// region, and the entry would then be left inferring from an extent
+    /// whether its launch owns the fire's tail. An extent cannot answer that:
+    /// a window's rows and a fire's rows are both `u32`, and they can be
+    /// equal. The window can answer it, and the walk is holding one.
+    pub pads: model_ir::PerAxis<Pad>,
+
+    /// **IS THIS FIRE A BODY'S?** (the bodies design's chunk 2b-ii) — the
+    /// shell's `Prepared::bodied`, carried in rather than re-asked, because
+    /// the answer decided in `prepare` is the same answer that put the
+    /// live-rows words into the staging slot.
+    ///
+    /// `false` is every fire the EAGER path serves, and it is the SHORT
+    /// CIRCUIT of [`Ceilings::admit`]: a fire that staged no seat resolves
+    /// exactly the pointers it always resolved, so the eager walk is byte for
+    /// byte the walk it was.
+    pub bodied: bool,
+
+    /// **WHICH REGIONS ADDRESS OFF THE SEAT'S START** — `exports::regions_shifting`
+    /// read once at load (`Shell::shifted`), one entry per TEMPLATE REGION:
+    /// `true` when every op in it is named by [`crate::SHIFTED`] and therefore
+    /// computes over plane rows `[start, start + count)` given the plane's own
+    /// base pointers.
+    pub shifted: &'c [bool],
+
+    /// **WHICH REGIONS THIS FIRE'S BODY ACTUALLY HOLDS** —
+    /// [`Windows::admits`](crate::window::Windows::admits) as `prepare`
+    /// computed it, one entry per TEMPLATE REGION (the tier-2 campaign).
+    ///
+    /// **THE CORRECTNESS HEART OF SEGMENTED CAPTURE, AND IT IS ONE SLICE.**
+    /// A body no longer needs every region to be replayable: the stretches
+    /// that are get captured, and the ISLANDS between them are re-issued
+    /// eagerly on the same stream, fire after fire. An island's launches are
+    /// therefore this fire's launches — they plan, grid and address at the
+    /// live geometry the walk is standing in — and every ceiling machine in
+    /// this file has to STAND DOWN in one, because a ceiling is a promise
+    /// about a key and an island keeps no such promise. [`Held::Eager`] is
+    /// that standing-down, and it is one variant rather than six `if`s.
+    pub admits: &'c [Admit],
+
+    /// **WHAT THIS FIRE'S BODY KEY SAYS EACH CLASS MAY BE CARVED OVER** — the
+    /// key's [`Ladder`](crate::record::Ladder) beside this fire's own class
+    /// table (the ceiling design's Option B).
+    ///
+    /// `None` for every fire off the bodies path, and then [`Standing`] takes no
+    /// ceiling at all — which is what keeps the EAGER path byte for byte the
+    /// path it was. Decided at the same instant as `bodied` and for the same
+    /// fire: `prepare` builds the key, and the ladder in the key is the ladder
+    /// the launches are carved on.
+    pub carve: Option<Carve<'c>>,
+}
+
+impl<'c> Ceilings<'c> {
+    /// **THIS REGION'S OWN AXIS'S PAD PAIR** — the token pair for a trunk
+    /// region, the patch pair for a tower one (the multi-unit bodies wave).
+    ///
+    /// A region whose pad came from one axis and whose span was judged against
+    /// the other is exactly the silent misclassification
+    /// `Windows::admits_axes` retired on the host side, so the launch side
+    /// reads the axis from the same object the host did — the WINDOW TABLE,
+    /// which is what was cut from the template and what the walk is standing
+    /// in.
+    fn pad_on(&self, axis: model_ir::RowAxis) -> Pad {
+        self.pads[axis]
+    }
+
+    /// **THIS REGION'S ADMISSION**, or `None` for a fire no body holds.
+    ///
+    /// `bodied` is asked FIRST and answers for the whole fire, so an eager
+    /// fire never indexes the table at all; an out-of-range region reads as
+    /// absent, which every caller spends in the safe direction.
+    fn admit(&self, region: u32) -> Option<Admit> {
+        self.bodied
+            .then(|| self.admits.get(region as usize).copied())
+            .flatten()
+    }
+}
+
+/// **WHAT ONE REGION'S LAUNCHES ARE ALLOWED**, resolved once per `(region,
+/// run)` the cursor visits ([`Run::standing`]) — the single answer the ceiling
+/// family used to spell as six predicates over six fields.
+///
+/// **THE TWO HALVES ARE NOT THE SAME QUESTION AND THAT IS WHY THEY ARE TWO
+/// FIELDS.** [`pad`](Standing::pad) and [`whole`](Standing::whole) are D4's, and
+/// D4 knows nothing about bodies: `Run::here` reads them on EVERY fire,
+/// including the eager one that has no [`Held::Captured`] anywhere in it, and
+/// a `Standing` that hid them behind the body's arm would turn every padded
+/// eager GEMM back into an unpadded one. [`held`](Standing::held) is the bodies
+/// path's, and it is the whole of what an ISLAND stands down.
+///
+/// **AND `whole` AND `plane` ARE NOT EACH OTHER'S NEGATION**, which is why
+/// they are a `bool` and a variant field rather than two variants. A
+/// whole-fire window has `row_offset == 0` and shifts by nothing either way,
+/// so a region can satisfy both; `Run::live_at` arms on their UNION,
+/// `Run::carve_rows` prefers `whole` for the row extent, and every absolute
+/// reading in this file (`Run::pool_absolute`, `Run::windowed`,
+/// `Run::mask_indptr`, `Run::ragged_q`, `Run::planning`'s origins) asks
+/// `plane` alone. Collapsing them would answer a whole-fire unshifted region
+/// as though its ops read the seat's start.
+#[derive(Clone, Copy)]
+pub(crate) struct Standing {
+    /// This region's own axis's pad pair, armed or not — the one field an
+    /// EAGER fire still reads.
+    pad: Pad,
+
+    /// **IS THIS RUN'S WINDOW THE WHOLE FIRE, ON THAT AXIS?** —
+    /// [`Window::is_whole`] against `pad.rows`.
+    ///
+    /// **ASKED WITHOUT ASKING [`held`](Standing::held), AND THE PRECONDITION
+    /// LIVES AT EACH READER.** The clause is only MEANINGFUL against an armed
+    /// pair — against `Pad::default()` every offset-zero window is vacuously
+    /// whole — so `Run::here` asks it only after `pad.bucket > pad.rows` and
+    /// `Run::carve_rows` only under [`Held::Captured`], which implies
+    /// `bodied`, which implies `Shell::prepare`'s gate, which requires the
+    /// pad. A `debug_assert` used to stand in for that argument at a shared
+    /// `whole_fire`; there is no shared reading to assert about any more.
+    whole: bool,
+
+    /// What a body grants this region, or [`Held::Eager`].
+    held: Held,
+}
+
+/// **MAY A GRAPH HOLD THIS REGION'S LAUNCHES, AND WHAT DOES THAT BUY?** —
+/// [`Standing`]'s bodies half.
+#[derive(Clone, Copy)]
+enum Held {
+    /// **NO CEILING, NO SEAT, NO PLANE BASE.** A tier-3 eager fire, or an
+    /// [`Admit::Island`] of a segmented body — and the two are ONE answer,
+    /// which is the whole of what tier 2 cost this file. An island's launches
+    /// plan, grid and address at the live geometry the walk is standing in,
+    /// which is byte for byte the launch the eager walk makes.
+    Eager,
+
+    /// **A GRAPH HOLDS THEM**, so every number here may be the KEY's rather
+    /// than this fire's.
+    Captured {
+        /// **DOES THIS REGION GET ITS PLANE'S BASE INSTEAD OF ITS WINDOW'S?**
+        /// — `shifted[region]` AND the window IS an interval.
+        ///
+        /// `whole` is the question "is there nothing to shift"; this is the
+        /// question "may the shift be left to the DEVICE". The shape clause is
+        /// [`Window::is_interval`]'s: the staged `(count, start)` seat has a
+        /// word for an interval and no word for a gathered rectangle numbered
+        /// from its own zero or a grouped union with foreign rows in the gaps.
+        plane: bool,
+
+        /// **HOW MANY ROWS STAND IN FRONT OF THIS SPAN AND HOW MANY IT MAY BE
+        /// CARVED OVER** — `Carve::ceiling` on this region's own axis, and
+        /// `None` for a fire with no ladder or a span the ladder cannot
+        /// resolve (a gathered or grouped one).
+        ceiling: Option<(u32, u32)>,
+
+        /// **THE SAME LADDER READ AS LANES** — `Carve::lanes`, and `None` off
+        /// the TOKEN axis.
+        ///
+        /// **THE PATCH AXIS TAKES NO LANE CEILING, WHICH IS A STATEMENT AND
+        /// NOT AN OMISSION** (the multi-unit bodies wave). The four launches
+        /// that grid on REQUESTS are the chunked recurrent scans, and every one
+        /// of them is a trunk op on the token axis; the vector this ceiling is
+        /// clamped by — `Windows::qo_absolute`, the fire-wide TOKEN qo
+        /// boundaries, padded by `serve::prepare` step 4d — describes no image
+        /// at all. So a tower region grids at its window's own image count,
+        /// which is what the eager walk does and is always correct.
+        /// `record::AxisCarve::lane_ceiling` carries the same sentence from the
+        /// key's side, and it is what answers `None` here.
+        lanes: Option<(u32, u32)>,
+    },
+}
+
+impl Standing {
+    /// **THE ONE RESOLUTION**, for the two parties that take it: `Run`
+    /// halfway through the walk, and `record::launch_grid` writing the ledger
+    /// down afterwards.
+    ///
+    /// `captured` and `moves` are the caller's own readings of one table each
+    /// — the [`Admit`] table and the `shifted` slice — because the two
+    /// callers stand at different instants and reach them differently; what
+    /// they share is everything below this line.
+    pub(crate) fn of(
+        window: &Window,
+        axis: model_ir::RowAxis,
+        pad: Pad,
+        captured: bool,
+        moves: bool,
+        carve: Option<Carve<'_>>,
+    ) -> Self {
+        let held = if captured {
+            let span = window.span();
+            Held::Captured {
+                plane: moves && window.is_interval(),
+                ceiling: carve
+                    .and_then(|carve| carve.on(axis))
+                    .and_then(|carve| carve.ceiling(span)),
+                // **AND THE LANE READING IS THE SAME PAIR ASKED THE OTHER
+                // QUESTION.** It used to be gated here by `axis ==
+                // RowAxis::Tokens`, because the lane ceiling was a field of
+                // the whole `Carve` and the patch half had none. It is a
+                // field of the AXIS's half now (`record::AxisCarve::
+                // lane_ceiling`), absent on the patch axis, so the object
+                // that knows there is no image ceiling is the one that
+                // answers `None` — and this line no longer enumerates axes to
+                // say it.
+                lanes: carve
+                    .and_then(|carve| carve.on(axis))
+                    .and_then(|carve| carve.lanes(span)),
+            }
+        } else {
+            Held::Eager
+        };
+        Self {
+            pad,
+            whole: window.is_whole(pad.rows),
+            held,
+        }
+    }
+
+    /// Does this region address off its plane's base?
+    fn plane(&self) -> bool {
+        matches!(self.held, Held::Captured { plane: true, .. })
+    }
+
+    /// **DOES THIS REGION OWN A RETIREMENT?** — the union `Run::live_at` arms
+    /// the staged seat over, and the union `Run::carve_rows` answers `Some`
+    /// for. A region a graph holds whose window is the whole fire OR whose ops
+    /// read the seat's start; nothing else, on any path.
+    fn armed(&self) -> bool {
+        match self.held {
+            Held::Eager => false,
+            Held::Captured { plane, .. } => self.whole || plane,
+        }
+    }
+
+    /// The row ceiling as `Run::planning` wants it: the raw `(before, own)`
+    /// pair, gated on the region being one a graph holds and on nothing else.
+    fn ceiling(&self) -> Option<(u32, u32)> {
+        match self.held {
+            Held::Eager => None,
+            Held::Captured { ceiling, .. } => ceiling,
+        }
+    }
+
+    /// The lane ceiling's raw pair, on the same terms — `Run::planning`
+    /// clamps it by the staged kv vectors as well, which is why this is the
+    /// pair and not [`lanes`](Standing::lanes)' number.
+    fn lane_carve(&self) -> Option<(u32, u32)> {
+        match self.held {
+            Held::Eager => None,
+            Held::Captured { lanes, .. } => lanes,
+        }
+    }
+
+    /// **HOW MANY ROWS A LAUNCH IN THIS REGION IS GRIDDED OVER**, or `None`
+    /// for the window's own row count — `Run::carve_rows`'s number and
+    /// `record::launch_grid`'s row column, which is the point of both taking
+    /// it from here.
+    ///
+    /// **A WHOLE-FIRE WINDOW TAKES `pad.bucket`** — the same number
+    /// [`Ctx::opaque_rows`](kernels_cuda::Ctx) has padded its GEMMs to — and a
+    /// SHIFTING one takes its own classes' rungs capped at that bucket,
+    /// because a window's carve and its grid have to be the same rectangle.
+    /// A region that is neither takes nothing: it has no retirement, and a
+    /// launch gridded past what the fire brought with nothing to retire it is
+    /// a launch that reads bytes nobody wrote.
+    ///
+    /// The filter is the belt: a ceiling UNDER this window's own rows would be
+    /// a launch that stopped short of the fire, which is the one direction
+    /// that is not merely wasteful.
+    pub(crate) fn rows(&self, span: MaskSpan) -> Option<u32> {
+        let Held::Captured {
+            plane, ceiling, ..
+        } = self.held
+        else {
+            return None;
+        };
+        debug_assert!(
+            self.pad.bucket >= self.pad.rows,
+            "a bodied fire carries an armed pad, and an armed bucket holds the \
+             fire's {} rows; this one spells {}",
+            self.pad.rows,
+            self.pad.bucket,
+        );
+        let rows = if self.whole {
+            self.pad.bucket
+        } else if plane {
+            let (_, own) = ceiling?;
+            own.min(self.pad.bucket)
+        } else {
+            return None;
+        };
+        (rows >= span.rows).then_some(rows)
+    }
+
+    /// **HOW MANY REQUESTS A LANE-GRIDDED LAUNCH IN THIS REGION IS GRIDDED
+    /// OVER**, or `None` for the window's own lane count —
+    /// [`rows`](Standing::rows)'s twin on the other axis.
+    ///
+    /// **AND THE CEILING IS READ BACK OFF WHAT WAS STAGED, NOT RECOMPUTED
+    /// FROM THE LADDER.** `serve::prepare` step 4d padded the fire-wide qo
+    /// vector out to `min(ladder lane reach, max_lanes)`, so the number of
+    /// boundaries it actually holds IS that reach — and taking the ceiling
+    /// this way means the grid can never name a lane the staging did not
+    /// define. A source that somehow fell short leaves the launch at the
+    /// window's own lanes, which reads nothing wrong and costs a reshape.
+    pub(crate) fn lanes(&self, windows: &Windows, span: MaskSpan) -> Option<u32> {
+        let Held::Captured {
+            plane: true, lanes, ..
+        } = self.held
+        else {
+            return None;
+        };
+        let (before, own) = lanes?;
+        let staged = windows
+            .qo_absolute()
+            .map_or(0, |bounds| bounds.rows.saturating_sub(1));
+        let lanes = own.min(staged.checked_sub(before)?);
+        debug_assert!(
+            u64::from(lanes) + 1 <= windows.slots().stride(),
+            "a ceiling grid of {lanes} requests wants {} boundary words, and a window \
+             slot holds {}",
+            lanes + 1,
+            windows.slots().stride(),
+        );
+        (lanes >= span.lanes).then_some(lanes)
+    }
+}
+
 /// One fire's dispatch state: the stream context, the resolution tables,
 /// the fire bindings, and the plan payloads this fire builds. The shell
 /// constructs one per fire and drives the substrate's walk
@@ -743,16 +1143,49 @@ pub struct Run<'c> {
     /// allocations per fire, where this is one. The width is
     /// [`Windows::max_runs`] — `1` for every artifact P4 seated whole, which
     /// is the layout this table had before the split existed.
-    structs: Vec<Option<StructSlot>>,
-    /// **WHICH REGION BUILT EACH SLOT** — parallel to
-    /// [`structs`](Run::structs), written by the one writer ([`Run::put`]),
-    /// `u32::MAX` for a slot nothing built. [`Run::schedule_shape`] is the
-    /// one reader: an ISLAND region's plan is rebuilt every fire and consumed
-    /// only by island launches (the mask-family weld — `record::widen`'s
-    /// third rule — is what makes "only" a theorem), so its numbers reach no
-    /// captured launch and hashing them would demote a body for a difference
-    /// no replay can see.
-    struct_region: Vec<u32>,
+    ///
+    /// # The [`Admit`] beside the payload, and why it is resolved at the write
+    ///
+    /// **WHAT THE SLOT CARRIES IS THE ADMISSION OF THE REGION THAT BUILT
+    /// IT**, taken at [`put`](Run::put) — the instant the cursor is on that
+    /// builder — rather than a region NUMBER to be resolved later against a
+    /// table the reader also has to remember to consult under `bodied`. It
+    /// used to be a parallel `Vec<u32>` with a `u32::MAX` sentinel and the
+    /// resolution written out at the one reader; a sentinel that means
+    /// "nothing built this" beside an `Option` that already means exactly that
+    /// is two encodings of one fact, and the second one was the one the
+    /// reader had to get right.
+    ///
+    /// [`Run::schedule_shape`] is the one reader, and what it does with the
+    /// answer is skip an [`Admit::Island`] builder's plan: such a plan is
+    /// rebuilt every fire and consumed only by island launches, so its numbers
+    /// reach no captured launch and hashing them would demote a body for a
+    /// difference no replay can see.
+    ///
+    /// **AND "ONLY" IS A THEOREM WITH THREE STEPS, WORTH WRITING OUT BECAUSE
+    /// THE SKIP IS THE ONLY THING IN THIS FILE THAT LEAVES A NUMBER
+    /// UNHASHED.** The slot's readers are attention launches consuming the
+    /// value the builder defined; `model_exec::store::check::no_schedule_straddles_its_readers`
+    /// refuses at LOAD, by name, any bake where a reader's mask differs from
+    /// its builder's, so every reader stands in the builder's mask family; and
+    /// `record::widen`'s third rule floods that family, so a builder this
+    /// field marks an island has no captured reader at all. The skip is
+    /// therefore not "island plans are cheap to ignore" — it is "nothing a
+    /// graph holds can read one".
+    ///
+    /// It is the BUILDER's admission and not a reader's on purpose: it is the
+    /// answer [`planning`](Run::planning) read [`Standing`] for at that same
+    /// cursor when it decided whether to carve at the key's ceiling, so the two
+    /// are one answer taken at one instant. Writing it where the resolution is
+    /// asked is what keeps them from parting.
+    ///
+    /// **AND BOTH FALLBACKS RESOLVE TO [`Admit::Captured`]**, which is the
+    /// not-skipped direction. An EAGER fire has no body for the hash to be
+    /// about and an `admits` slice that may be empty, so every built slot is
+    /// hashed exactly as it was before islands existed; and a region the table
+    /// does not describe reads as captured, which costs a reshape at worst and
+    /// can never leave a captured reader unwatched.
+    structs: Vec<Option<(Admit, StructSlot)>>,
     /// How many values one run's slice of [`structs`](Run::structs) holds.
     values_wide: usize,
 
@@ -811,84 +1244,26 @@ pub struct Run<'c> {
     /// the slice it always was.
     copy: CopyPlan,
 
-    /// **D4'S TWO NUMBERS, AND THE WALK IS WHERE THEY ARE GATED**
-    /// (`.wiki/palo/cuda-abi.md` §3, refined form): this fire's total rows and
-    /// the lattice point above them. `Pad::default()` — a bucket that is not
-    /// above the rows — is a shell that padded nothing, which is
-    /// `PIE_CUDA_PAD=off`, a deployment with no lattice, and every `Run` built
-    /// before this field existed.
+    /// **THE SIX FACTS THE FIRE PATH CANNOT RECOMPUTE**, in one piece
+    /// ([`Ceilings`]) because one caller decides all six at
+    /// one instant and one reading spends them ([`Standing`]).
     ///
-    /// **HELD HERE RATHER THAN STAMPED ON THE CONTEXT ONCE PER FIRE**, because
-    /// the question padding turns on is not "which fire" but "which REGION" —
-    /// see [`Run::ctx`]. A pad the shell wrote onto the context at the top of
-    /// the fire would still be there when the walk stepped into a windowed
-    /// region, and the entry would then be left inferring from an extent
-    /// whether its launch owns the fire's tail. An extent cannot answer that:
-    /// a window's rows and a fire's rows are both `u32`, and they can be
-    /// equal. The window can answer it, and the walk is holding one.
-    pad: Pad,
+    /// `Ceilings::default()` is the eager arm on every axis at once — no
+    /// lattice, no body, no ladder — and it is what a `Run` nobody told
+    /// answers.
+    ceilings: Ceilings<'c>,
 
-    /// **IS THIS FIRE A BODY'S?** (the bodies design's chunk 2b-ii) — the
-    /// shell's `Prepared::bodied`, carried in rather than re-asked, because
-    /// the answer decided in `prepare` is the same answer that put the
-    /// live-rows words into the staging slot.
+    /// **THIS REGION'S RESOLUTION, RESOLVED ONCE** — [`Standing`] for the
+    /// `(region, run)` [`place`](Run::place) currently names, memoised so
+    /// that the dozen readings a dispatched node takes of it resolve one
+    /// window and read one ladder between them.
     ///
-    /// `false` is every fire the EAGER path serves, and it is the SHORT
-    /// CIRCUIT of [`Run::plane_base`]: a fire that staged no seat resolves
-    /// exactly the pointers it always resolved, so the eager walk is byte for
-    /// byte the walk it was.
-    bodied: bool,
-
-    /// **WHICH REGIONS ADDRESS OFF THE SEAT'S START** — `exports::regions_shifting`
-    /// read once at load (`Shell::shifted`), one entry per TEMPLATE REGION:
-    /// `true` when every op in it is named by [`crate::SHIFTED`] and therefore
-    /// computes over plane rows `[start, start + count)` given the plane's own
-    /// base pointers.
-    ///
-    /// Empty is the safe reading and is what a `Run` nobody told answers: an
-    /// out-of-range region reads as NOT shifting, which is
-    /// `exports::regions_shifting`'s own rule and
-    /// [`Windows::admits`](crate::window::Windows::admits)'s.
-    shifted: &'c [bool],
-
-    /// **WHICH REGIONS THIS FIRE'S BODY ACTUALLY HOLDS** —
-    /// [`Windows::admits`](crate::window::Windows::admits) as `prepare`
-    /// computed it, one entry per TEMPLATE REGION (the tier-2 campaign).
-    ///
-    /// **THE CORRECTNESS HEART OF SEGMENTED CAPTURE, AND IT IS ONE SLICE.**
-    /// A body no longer needs every region to be replayable: the stretches
-    /// that are get captured, and the ISLANDS between them are re-issued
-    /// eagerly on the same stream, fire after fire. An island's launches are
-    /// therefore this fire's launches — they plan, grid and address at the
-    /// live geometry the walk is standing in — and every ceiling machine in
-    /// this file has to STAND DOWN in one, because a ceiling is a promise
-    /// about a key and an island keeps no such promise.
-    ///
-    /// [`captured`](Run::captured) is the one gate that spends it, and every
-    /// consumer asks that rather than [`bodied`](Run::bodied) directly:
-    /// [`plane_base`](Run::plane_base), [`live_at`](Run::live_at),
-    /// [`carve_rows`](Run::carve_rows), [`carve_lanes`](Run::carve_lanes) and
-    /// [`planning`](Run::planning)'s two ceilings. An island that took a
-    /// ceiling would bake what must move; an island that armed a seat would
-    /// retire rows the launch owns.
-    ///
-    /// Empty is the safe reading and is what a `Run` nobody told answers: an
-    /// out-of-range region is NOT captured, which turns every ceiling off and
-    /// leaves the walk exactly the eager walk. It is the same rule
-    /// [`shifted`](Run::shifted) above states, in the same direction.
-    admits: &'c [Admit],
-
-    /// **WHAT THIS FIRE'S BODY KEY SAYS EACH CLASS MAY BE CARVED OVER** — the
-    /// key's [`Ladder`](crate::record::Ladder) beside this fire's own class
-    /// table (the ceiling design's Option B).
-    ///
-    /// `None` for every fire off the bodies path, and then [`Run::planning`]
-    /// takes no ceiling at all — which is what keeps the EAGER path byte for
-    /// byte the path it was. Set beside
-    /// [`bodied`](Run::bodied) and by the same builder, because it is decided
-    /// at the same instant and for the same fire: `prepare` builds the key,
-    /// and the ladder in the key is the ladder the launches are carved on.
-    carve: Option<Carve<'c>>,
+    /// A cache with no invalidation problem: everything [`Standing`] is a
+    /// function of is the window table, the [`Ceilings`] bundle and the
+    /// cursor's `(region, run)` — the first two are borrowed immutable for
+    /// the fire and the third is the key, so a hit is the answer this pair
+    /// would compute again.
+    stood: Cell<Option<(u32, u32, Standing)>>,
 }
 
 impl<'c> Run<'c> {
@@ -913,7 +1288,6 @@ impl<'c> Run<'c> {
             arena,
             caches,
             structs: vec![None; values.len() * windows.max_runs() as usize],
-            struct_region: vec![u32::MAX; values.len() * windows.max_runs() as usize],
             values_wide: values.len(),
             fire,
             rs: None,
@@ -923,108 +1297,70 @@ impl<'c> Run<'c> {
             stream: &place.region,
             body: None,
             copy: CopyPlan::default(),
-            pad: Pad::default(),
-            bodied: false,
-            shifted: &[],
-            admits: &[],
-            carve: None,
+            ceilings: Ceilings::default(),
+            stood: Cell::new(None),
         }
     }
 
-    /// The same `Run`, told this fire's row count and the bucket it rounds up
-    /// to — D4's quantization, armed.
+    /// **The same `Run`, told the six facts the fire path cannot recompute**
+    /// — D4's two pad pairs, this fire's `bodied` word, the load's `shifted`
+    /// slice, this composition's [`Admit`] table and the key's ladder.
     ///
-    /// ADDITIVE, AND THE SHELL CHOOSES: a `Run` never handed one pads nothing,
-    /// which is the `PIE_CUDA_PAD=off` arm and every caller that predates the
-    /// design. `pad.rows` must be the COMPOSITION's rows, not a window's —
-    /// [`Run::ctx`] compares a window's span against it and the comparison is
-    /// the whole safety argument.
+    /// ADDITIVE, AND THE SHELL CHOOSES: a `Run` never handed one pads
+    /// nothing, carves nothing, arms no seat and pre-shifts every windowed
+    /// operand, which is the `[engine] pad = off` arm, the whole of the eager
+    /// path, and every caller that predates any of this.
+    ///
+    /// **ONE BUILDER FOR SIX FACTS, BECAUSE THEY ARE DECIDED AT ONE INSTANT
+    /// BY ONE CALLER.** They were three builders — `quantized`, `patched`,
+    /// `bodied` — and the split said the three could be armed apart, which no
+    /// caller has ever done and which no reading here could survive: every
+    /// ceiling in this file is a function of the pad pair AND the admission
+    /// AND the ladder together, and a `Run` holding two of the three is a
+    /// `Run` whose answers are not about any fire. [`Ceilings`] carries what
+    /// each field must be; [`Standing`] is the one thing that reads them.
     #[must_use]
-    pub fn quantized(mut self, pad: Pad) -> Self {
-        self.pad = pad;
+    pub fn ceilings(mut self, ceilings: Ceilings<'c>) -> Self {
+        self.ceilings = ceilings;
         self
     }
 
-    /// **The same `Run`, told that this fire is a BODY'S, which of its regions
-    /// a graph actually holds, and which of them can move their own base** —
-    /// the launch-plane half of the bodies design's chunk 2b (its gate half is
-    /// `Windows::admits`).
+    /// **WHAT THE REGION THE WALK IS STANDING IN IS ALLOWED** — [`Standing`]
+    /// for this `(region, run)`, resolved once and held in
+    /// [`stood`](Run::stood).
     ///
-    /// ADDITIVE, AND THE SHELL CHOOSES, on [`quantized`](Run::quantized)'s
-    /// terms: a `Run` never handed this pre-shifts every windowed operand and
-    /// arms the seat only where [`whole_fire`](Run::whole_fire) holds, which
-    /// is what every path but the bodies one wants and what every caller that
-    /// predates this chunk got.
-    ///
-    /// **FOUR FACTS AND NOT ONE**, because they are answered at four
-    /// different instants. `bodied` is this FIRE's — `Prepared::bodied`,
-    /// decided in `prepare` beside the staging that wrote the seat's words.
-    /// `shifted` is the LOAD's, one entry per template region, read once when
-    /// the artifact was baked. `admits` is this COMPOSITION's — the same
-    /// `Windows::admits` table the gate above was decided on, which is what
-    /// tells the walk which regions the body will actually hold and which ones
-    /// it will re-issue eagerly ([`captured`](Run::captured), the tier-2
-    /// campaign). Handing them together is what makes the gate's question and
-    /// the launch's the same question: the shell cuts a body on
-    /// `admits(rows, shifted)` and the walk carves, seats and shifts on the
-    /// same two slices, so a region the gate says a graph holds is a region
-    /// the walk moves — and a region it calls an ISLAND is one the walk leaves
-    /// exactly where the eager path leaves it.
-    ///
-    /// `carve` is the KEY's — `Prepared::ladder`, built in `prepare` off the
-    /// same composition the key was built off — and it is handed here for the
-    /// same reason: the ceilings [`planning`](Run::planning) carves at have to
-    /// be the ceilings the key spells, and a second reading of the lattice on
-    /// this side is a second answer waiting to disagree with the one the
-    /// cache is keyed on. `None` beside `bodied == false` is the only
-    /// combination any caller states, and both halves short-circuit the same
-    /// block.
-    #[must_use]
-    pub fn bodied(
-        mut self,
-        bodied: bool,
-        shifted: &'c [bool],
-        admits: &'c [Admit],
-        carve: Option<Carve<'c>>,
-    ) -> Self {
-        self.bodied = bodied;
-        self.shifted = shifted;
-        self.admits = admits;
-        self.carve = carve;
-        self
-    }
-
-    /// **MAY THE REGION THE WALK IS STANDING IN BE HELD BY A GRAPH?** — this
-    /// fire's `bodied` word AND this region's
-    /// [`Admit`](crate::window::Admit), and the one gate every ceiling in
-    /// this file hangs off (the tier-2 campaign).
-    ///
-    /// **IT IS `bodied` PER REGION, AND THAT IS THE WHOLE CHANGE.** Until
-    /// tier 2 a fire was a body's or it was not, because a composition with
-    /// one unrecordable region was refused admission outright — so `bodied`
-    /// alone was a region-level answer by accident of the gate above it. It
-    /// is not any more: a body is captured in SEGMENTS around its islands,
-    /// and an island's launches are re-issued eagerly every fire. So the
-    /// question every ceiling actually wants is this one, and asking
-    /// `bodied` would hand an island the key's grid, the key's schedule
-    /// carve and an armed seat — a launch gridded past what the fire brought,
-    /// over a scratch rectangle sized at what it brought, with a seat telling
-    /// the kernel to start somewhere the gather did not put anything.
-    ///
-    /// **AND IT IS ONLY EVER NARROWER THAN THE PREDICATES BELOW IT.** A
-    /// region [`plane_base`](Run::plane_base) admits is Captured by
-    /// construction — its window is not gathered, carries no segment list and
-    /// its region shifts, which is `Admit::Captured`'s second arm — and so is
-    /// one [`whole_fire`](Run::whole_fire) admits. So this clause changes no
-    /// answer on any composition tier 1 could already serve, and turns every
-    /// ceiling off on exactly the regions tier 2 newly admits INTO a body
-    /// without being able to record them.
-    fn captured(&self) -> bool {
-        self.bodied
-            && matches!(
-                self.admits.get(self.place.region.get() as usize),
-                Some(Admit::Captured)
-            )
+    /// Every ceiling below is a reading of this and of nothing else:
+    /// [`here`](Run::here), [`live_at`](Run::live_at),
+    /// [`plane_base`](Run::plane_base), [`carve_rows`](Run::carve_rows),
+    /// [`carve_lanes`](Run::carve_lanes) and [`planning`](Run::planning)'s
+    /// two ceilings. They used to be six predicates over six fields, and what
+    /// that cost was a consumer picking the wrong one of six — which is a
+    /// launch gridded past what the fire brought, or a ceiling baked into a
+    /// region the graph re-issues.
+    fn standing(&self) -> Standing {
+        let region = self.place.region.get();
+        let run = self.place.run.get();
+        if let Some((at_region, at_run, standing)) = self.stood.get()
+            && at_region == region
+            && at_run == run
+        {
+            return standing;
+        }
+        let axis = self.windows.axis_of(region);
+        let standing = Standing::of(
+            self.windows.at(region, run),
+            axis,
+            self.ceilings.pad_on(axis),
+            matches!(self.ceilings.admit(region), Some(Admit::Captured)),
+            self.ceilings
+                .shifted
+                .get(region as usize)
+                .copied()
+                .unwrap_or(false),
+            self.ceilings.carve,
+        );
+        self.stood.set(Some((region, run, standing)));
+        standing
     }
 
     /// **The buffered-activation plane, for a fire that carries one** (alto
@@ -1066,7 +1402,7 @@ impl<'c> Run<'c> {
         let Some(plane) = seat.buffers.planes().of(id) else {
             return Ok(());
         };
-        let span = self.window().span;
+        let span = self.window().span();
         let bounds = self.qo_indptr_host();
         // **AND THE RECTANGLE IS THE WINDOW'S, EVEN WHERE THE OP'S IS NOT**
         // (the chunked-arm wave). `bounds` is the window-REBASED CSR and
@@ -1208,52 +1544,37 @@ impl<'c> Run<'c> {
     /// column, and under `ArenaMap::co_tenants` or a merge those are somebody's
     /// real bytes. Padding one is a clobber that computes and never faults.
     ///
-    /// So a region pads only if its window IS the whole fire:
+    /// So a region pads only if its window IS the whole fire, which is
+    /// [`Window::is_whole`]'s three clauses — offset zero, at least the fire's
+    /// rows, and an interval, because a gathered rectangle is cut to the rows
+    /// it gathered and past them is the next thing in the slab, and a grouped
+    /// union's span covering the fire says nothing about the rows it owns.
     ///
-    /// * **`row_offset == 0` and `rows >= the fire's`** — the mask covers every
-    ///   class that has rows, read off the window the shell built FROM the
-    ///   mask (`Windows::of`). This is the clause the entry could not make: it
-    ///   compares a window's span against the composition, where an entry can
-    ///   only compare one extent against another.
-    /// * **not gathered** — a `Fallback::Copy` compacted its rows into a
-    ///   scratch slab cut to the rows it gathered, so past them is the next
-    ///   thing in the slab rather than a reserved tail. (A gathered window
-    ///   cannot span the whole fire anyway — gathering needs two intervals and
-    ///   two intervals need a gap — but the clause is written because that is
-    ///   an argument, and this is a bounds check.)
-    /// * **no segment list** — a `Fallback::Grouped` window's span is the UNION
-    ///   of its intervals and the gaps hold foreign rows, so its span covering
-    ///   the fire says nothing about the rows it owns.
+    /// **AND THIS IS THE ONE READING THAT ASKS NOTHING ABOUT BODIES.** The
+    /// armed test comes FIRST and is what makes the clause meaningful: against
+    /// `Pad::default()` every offset-zero window is vacuously whole, so a
+    /// `Run` nobody quantized returns the default pair before it ever looks at
+    /// the window — and a PADDED EAGER fire, which has no
+    /// [`Held::Captured`] anywhere in it, still pads exactly what it padded
+    /// before [`Standing`] existed.
     ///
     /// A region that fails any clause gets `Pad::default()`, which
     /// [`Ctx::opaque_rows`] answers with the extent it was handed.
     fn here(&self) -> Pad {
-        if self.pad.bucket <= self.pad.rows {
+        let standing = self.standing();
+        let pad = standing.pad;
+        if pad.bucket <= pad.rows {
             return Pad::default();
         }
-        if self.whole_fire() { self.pad } else { Pad::default() }
+        if standing.whole { pad } else { Pad::default() }
     }
 
-    /// **IS THIS REGION'S WINDOW THE WHOLE FIRE?** — the three clauses
-    /// [`here`](Run::here) argues, on their own because two callers ask them.
-    ///
-    /// A predicate about the WINDOW and not about the pad: the bucket
-    /// precondition stays in `here`, where it belongs, because whether a
-    /// deployment declared a lattice has nothing to do with whether this
-    /// launch owns the fire's tail.
-    fn whole_fire(&self) -> bool {
-        let window = self.window();
-        window.span.row_offset == 0
-            && window.span.rows >= self.pad.rows
-            && window.gathered.is_none()
-            && window.segs() == 0
-    }
 
     /// **DOES THIS REGION GET ITS PLANE'S BASE INSTEAD OF ITS WINDOW'S?** —
     /// the bodies design's chunk 2b-ii, and the ONE predicate the two halves
     /// of that chunk share.
     ///
-    /// [`whole_fire`](Run::whole_fire) is the question "is there nothing to
+    /// [`Standing::whole`] is the question "is there nothing to
     /// shift"; this is the question "may the shift be left to the DEVICE". The
     /// two are answered at the same instant off the same window and they are
     /// deliberately not each other's negation: a whole-fire window has
@@ -1262,7 +1583,7 @@ impl<'c> Run<'c> {
     ///
     /// **FOUR CLAUSES, AND EVERY ONE OF THEM IS LOAD-BEARING.**
     ///
-    /// * **this region is one a graph HOLDS** ([`captured`](Run::captured)).
+    /// * **this region is one a graph HOLDS** ([`Held::Captured`]).
     ///   The seat's words are only in the staging slot for a fire the shell
     ///   routed to a body (`inputs::Fire::live`), and a launch handed a plane
     ///   base under a DISARMED seat reads `win == nullptr`, takes the whole
@@ -1279,31 +1600,21 @@ impl<'c> Run<'c> {
     ///   guard-only op in the region and the whole region's launches want the
     ///   pre-shifted pointer, which is why `exports::regions_shifting` asks
     ///   ALL and why a region index this slice does not hold reads as `false`.
-    /// * **not gathered** — a `Fallback::Copy`'s rows were compacted into a
-    ///   scratch slab and numbered from ITS zero. There is no offset into the
-    ///   fire's plane that names them, so `start + r` has nothing to mean.
-    /// * **no segment list** — a `Fallback::Grouped` window's span is a UNION
-    ///   with foreign rows in the gaps, and `(count, start)` describes one
-    ///   interval, which a union of intervals is not.
+    /// * **the window IS an interval**
+    ///   ([`crate::window::Window::is_interval`]) — a gathered rectangle's
+    ///   rows were compacted into a scratch slab and numbered from ITS zero,
+    ///   and a grouped span is a UNION with foreign rows in the gaps. There
+    ///   is no offset into the fire's plane that names either, so `start + r`
+    ///   would have nothing to mean.
     ///
-    /// The last two are `Windows::admits`'s two SHAPE refusals, spelled again
-    /// here rather than inherited, because this is the launch's reading and
-    /// that is the host's — and the day they disagreed this one would be the
-    /// one that ran.
+    /// The last clause is `Windows::admits`'s SHAPE refusal, ASKED again here
+    /// rather than inherited, because this is the launch's reading and that is
+    /// the host's — and the day they disagreed this one would be the one that
+    /// ran. What the two share since this wave is the clause list
+    /// ([`crate::window::WindowShape`]), which is a fact about the window;
+    /// the reading, the instant and the tie-break stay here.
     fn plane_base(&self) -> bool {
-        if !self.captured() {
-            return false;
-        }
-        if !self
-            .shifted
-            .get(self.place.region.get() as usize)
-            .copied()
-            .unwrap_or(false)
-        {
-            return false;
-        }
-        let window = self.window();
-        window.gathered.is_none() && window.segs() == 0
+        self.standing().plane()
     }
 
     /// **WHERE THIS REGION'S LIVE ROW COUNT IS READ FROM**, or `0` — the
@@ -1342,7 +1653,7 @@ impl<'c> Run<'c> {
     /// **THE SAME STAGED WORDS EITHER WAY**, which is why one address serves
     /// both arms: `Windows::live` writes the window's own `[rows, row_offset,
     /// lanes, lane_offset]` at every (region, run), and for a whole-fire
-    /// window both offsets are zero — so a region admitted by `whole_fire`
+    /// window both offsets are zero — so a region admitted by [`Standing::whole`]
     /// reads a start of 0 on either axis and addresses exactly the plane rows
     /// and the fire lanes its pre-shifted-by-nothing pointers already named.
     /// Nothing about the whole-fire arm moves.
@@ -1354,7 +1665,7 @@ impl<'c> Run<'c> {
         let at = self
             .windows
             .live_at(self.place.region.get(), self.place.run.get());
-        if at == 0 || !self.captured() || !(self.whole_fire() || self.plane_base()) {
+        if at == 0 || !self.standing().armed() {
             0
         } else {
             at
@@ -1386,7 +1697,7 @@ impl<'c> Run<'c> {
     /// `kernels_cuda::Ctx::arm_stage`), so a block standing above the fire's
     /// count returns before it addresses anything. What makes that available
     /// exactly here is [`live_at`](Run::live_at): the seat is armed for a
-    /// region that is [`whole_fire`](Run::whole_fire) or
+    /// region that is [`Standing::whole`] or
     /// [`plane_base`](Run::plane_base) and for no other, which is precisely
     /// the gate below. The two are one predicate written twice on purpose —
     /// the day they part, a launch would be gridded past a count nothing
@@ -1394,7 +1705,7 @@ impl<'c> Run<'c> {
     ///
     /// **THREE CLAUSES, AND THE THIRD IS WHERE THE NUMBER COMES FROM.**
     ///
-    /// * **this region is one a graph HOLDS** ([`captured`](Run::captured)).
+    /// * **this region is one a graph HOLDS** ([`Held::Captured`]).
     ///   Nothing else staged a seat it may read, so nothing else has a
     ///   retirement; the EAGER path grids exactly what it always gridded, and
     ///   so does an ISLAND of a segmented body, which is the same statement
@@ -1412,8 +1723,7 @@ impl<'c> Run<'c> {
     ///   disarming its ceilings made its grids and its schedules follow its
     ///   own split — which is precisely what this wave exists to stop, and it
     ///   is the split `Shell::arm_bodies` synthesizes by construction.
-    /// * **and the region owns a retirement**, which is `whole_fire ||
-    ///   plane_base` above.
+    /// * **and the region owns a retirement**, which is [`Standing::armed`].
     ///
     /// **THE NUMBER ITSELF IS THE CARVE'S, AND IT IS TWO ANSWERS BECAUSE A
     /// WINDOW IS TWO THINGS.** A WHOLE-FIRE window takes `pad.bucket` — the
@@ -1444,28 +1754,7 @@ impl<'c> Run<'c> {
     /// that is not merely wasteful, so a carve that cannot dominate the span
     /// is not taken at all.
     fn carve_rows(&self) -> Option<u32> {
-        if !self.captured() {
-            return None;
-        }
-        debug_assert!(
-            self.pad.bucket >= self.pad.rows,
-            "a bodied fire carries an armed pad, and an armed bucket holds the \
-             fire's {} rows; this one spells {}",
-            self.pad.rows,
-            self.pad.bucket,
-        );
-        let whole = self.whole_fire();
-        if !(whole || self.plane_base()) {
-            return None;
-        }
-        let span = self.window().span;
-        let rows = if whole {
-            self.pad.bucket
-        } else {
-            let (_, own) = self.carve.and_then(|carve| carve.ceiling(span))?;
-            own.min(self.pad.bucket)
-        };
-        (rows >= span.rows).then_some(rows)
+        self.standing().rows(self.window().span())
     }
 
     /// **HOW MANY REQUESTS A LANE-GRIDDED LAUNCH IN THIS REGION IS GRIDDED
@@ -1504,39 +1793,56 @@ impl<'c> Run<'c> {
     /// fire left; the `debug_assert` below is what says the widening cannot
     /// walk out of this window's slot into the next one's.
     ///
-    /// **THE NUMBER IS `Run::planning`'S LANE CEILING, EXPRESSION FOR
-    /// EXPRESSION**, and it has to be: a schedule carved at one lane count
-    /// and a scan gridded at another would be two readings of one key. So the
-    /// ladder's `own` — [`record::Carve::lanes`](crate::record::Carve::lanes),
-    /// the LANE reading of the rungs, each one capped at the load's lane
-    /// ceiling because a lane needs a seat — is capped again by what step 4d
-    /// actually STAGED (`min(lane reach, max_lanes)`, read back off the padded
-    /// vector rather than recomputed) less the prefix in front of this window.
-    /// A window whose prefix already consumed the staging takes no ceiling and
-    /// grids at its own lanes; that costs nothing arithmetically and it is a
-    /// SEALED load's silent thrash, because a grid that follows the batch is a
-    /// hashed plan payload that follows the batch — see
+    /// **THE NUMBER IS `Run::planning`'S LANE CEILING WITH THE SCHEDULE'S OWN
+    /// CLAMPS LEFT OFF**, and both halves of that sentence are load-bearing: a
+    /// schedule carved at one lane count and a scan gridded at another would
+    /// be two readings of one key, so the SHARED part has to be one
+    /// expression — and the part `planning` adds is about a schedule, which is
+    /// a thing no consumer of this number reads.
+    ///
+    /// The shared part is the ladder's `own` —
+    /// [`record::Carve::lanes`](crate::record::Carve::lanes), the LANE reading
+    /// of the rungs, each one capped at the load's lane ceiling because a lane
+    /// needs a seat — capped again by what step 4d actually STAGED
+    /// (`min(lane reach, max_lanes)`, read back off the padded fire-wide qo
+    /// vector rather than recomputed) less the prefix in front of this window,
+    /// and admitted only where it dominates the window's own lanes. A window
+    /// whose prefix already consumed the staging takes no ceiling and grids at
+    /// its own lanes; that costs nothing arithmetically and it is a SEALED
+    /// load's silent thrash, because a grid that follows the batch is a hashed
+    /// plan payload that follows the batch — see
     /// [`record::Ladder::lane_reach`](crate::record::Ladder::lane_reach) for
     /// the deployment inequality that keeps it out of reach.
+    ///
+    /// **AND THIS DOC USED TO SAY "EXPRESSION FOR EXPRESSION", WHICH WAS NOT
+    /// TRUE.** [`planning`](Run::planning) narrows the same number in three
+    /// more places, and every one of them exists because a launch reading an
+    /// ATTENTION SCHEDULE addresses tables this one never touches:
+    ///
+    /// * **two more clamps on the staged reach** — the page CSR's own length
+    ///   (`seat.kv_indptr.len() - 1`) and the kv-length vector's
+    ///   (`seat.kv_len.len()`). Step 4d pads all three vectors to the same
+    ///   number, so the shortest IS that number; taking all three is what
+    ///   keeps a carve from naming a lane one of the sources did not define;
+    /// * **a second filter conjunct** — `before + lanes >= span.lane_offset +
+    ///   span.lanes`, which says the carve still reaches as far into the fire
+    ///   as this window does. `fa2_abi`'s protective page bound is
+    ///   `lane_offset + num_requests`, so a carve that fell short would clamp
+    ///   a legitimate page to page zero.
+    ///
+    /// **THE FOUR CONSUMERS OF THIS NUMBER READ NO ATTENTION SCHEDULE AT
+    /// ALL**, which is why none of the three follows it here. The chunked
+    /// recurrent scans take their request count off the length of the boundary
+    /// vector they are handed and address the activation planes and the
+    /// per-lane tables through `win[1]`/`win[3]`; there is no `paged_kv`
+    /// bound, no page CSR and no kv-length vector anywhere in their reach. So
+    /// the two extra clamps are clamps by vectors they never index, and the
+    /// extra filter conjunct protects a page bound they never compute — and
+    /// the `debug_assert` below is what stands in for all three, because the
+    /// one thing a WIDER declared vector can outrun here is the window slot it
+    /// is staged in.
     fn carve_lanes(&self) -> Option<u32> {
-        if !self.captured() || !self.plane_base() {
-            return None;
-        }
-        let span = self.window().span;
-        let (before, own) = self.carve.and_then(|carve| carve.lanes(span))?;
-        let staged = self
-            .windows
-            .qo_absolute()
-            .map_or(0, |bounds| bounds.rows.saturating_sub(1));
-        let lanes = own.min(staged.checked_sub(before)?);
-        debug_assert!(
-            u64::from(lanes) + 1 <= self.windows.slots().stride(),
-            "a ceiling grid of {lanes} requests wants {} boundary words, and a window \
-             slot holds {}",
-            lanes + 1,
-            self.windows.slots().stride(),
-        );
-        (lanes >= span.lanes).then_some(lanes)
+        self.standing().lanes(self.windows, self.window().span())
     }
 
     /// The fire bindings, for the plan-building arms' seam.
@@ -1694,7 +2000,7 @@ impl<'c> Run<'c> {
     /// ([`Windows::qo_absolute_host`](crate::window::Windows::qo_absolute_host));
     /// the DEVICE reading beside it is the one a fire has to have staged.
     pub(crate) fn qo_indptr_absolute_host(&self) -> &'c [i32] {
-        let span = self.window().span;
+        let span = self.window().span();
         let first = span.lane_offset as usize;
         let last = first + span.lanes as usize;
         self.windows
@@ -1706,7 +2012,7 @@ impl<'c> Run<'c> {
     /// How many token rows this window carries — the `total_num_rows` the
     /// prefill builders take.
     pub(crate) fn total_tokens(&self) -> u32 {
-        self.window().span.rows
+        self.window().span().rows
     }
 
     /// The mask span table this window's schedule should carry, or `None`
@@ -1731,7 +2037,7 @@ impl<'c> Run<'c> {
         if self.plane_base() {
             return self.fire.tables.mask_indptr;
         }
-        let span = self.window().span;
+        let span = self.window().span();
         self.fire
             .tables
             .mask_indptr
@@ -1797,23 +2103,67 @@ impl<'c> Run<'c> {
             return handle;
         };
         let seated = self.window();
-        let window = seated.span;
-        let patch = seated.patch;
+        let window = seated.span();
         // **THE PLANE BASE, FOR A REGION THAT MOVES ITS OWN** (bodies design,
         // chunk 2b-ii). Asked once, before the match, because it is a fact
         // about the REGION and not about the value: `plane_base` short-circuits
-        // on `bodied`, so a fire on any other path pays one `bool` test here.
+        // on `Held::Eager`, so a fire on any other path pays one `bool` test.
         let plane = self.plane_base();
         // **AND HOW MANY ROWS THE LAUNCH BESIDE IT IS GRIDDED OVER** — the
         // KEY's ceiling for a region that owns a retirement, and `None` (this
         // window's own rows) for every other fire and every other region. Asked
         // once here for the same reason and on the same terms: it is a fact
-        // about the REGION, `carve_rows` short-circuits on `bodied`, and the
+        // about the REGION, `carve_rows` short-circuits on `Held::Eager`, and the
         // three other paths pay one `bool` test. [`carve_rows`](Run::carve_rows)
         // carries the whole argument, seat and all.
         let ceiling = self.carve_rows();
         let rows = ceiling.unwrap_or(window.rows);
-        let (skip, keep) = match shape.first() {
+
+        // **WHICH RECTANGLE THIS COLUMN IS CUT AT IS READ OFF ITS OWN DIM**
+        // (`model_ir::Dim::axis`), and the window's interval on that axis is
+        // an INDEX (`Window::spans`). This used to be one match arm per
+        // symbol against one named field per row space — `window.*` for the
+        // four token symbols, `patch.*` for the three patch ones — so a third
+        // rectangle would have cost three arms here and a field over there.
+        // It costs neither now: the arms below are about the SHAPE of the
+        // column, which is a fact about the dim rather than about its axis.
+        //
+        // A `Dim::Const` column (a weight plane, a bias) is not fire-aligned
+        // and belongs to no axis, which is exactly what `Dim::axis` answers
+        // `None` for; it is handed over whole, as is a value with no shape at
+        // all.
+        let Some(&dim) = shape.first() else {
+            return handle;
+        };
+        let Some(axis) = dim.axis() else {
+            return handle;
+        };
+        let span = seated.on(axis);
+
+        // **A ROW COLUMN**: one entry per row of this rectangle, `times` wide
+        // in rows where the dim says so (`Dim::TokensTimes` is the MoE
+        // ladder's routed rectangle).
+        //
+        // **THE CEILING AND THE PLANE BASE ARE THE PRIMARY AXIS'S ALONE**, and
+        // that is a statement rather than an oversight. Both are facts about
+        // the LAUNCH — how many rows its grid was carved at, and whether its
+        // ops address off the plane's base — and the two machines that
+        // produce them are the token rectangle's: `crate::SHIFTED` names no op
+        // that reads a patch seat, and no launch on the second axis is gridded
+        // at a carved ceiling today (`record::AxisCarve::lane_ceiling` states
+        // the twin of this on the lane side). So a tower rectangle is cut
+        // where it always was — at its own window, whole — and the day an op
+        // on that axis reads a seat is the day this clause becomes an index
+        // too.
+        //
+        // The LANE axis is not here either, and that is `crate::SHIFTED`'s own
+        // caveat: the ops on that list index their per-lane tables by the
+        // launch-local ordinal, so those stay sliced at `lane_offset` — with
+        // ONE family excepted, whose request number is a staged datum rather
+        // than a grid coordinate and which therefore asks for its tables
+        // through [`Run::pool_absolute`] instead. Nothing about THIS
+        // resolution changes either way.
+        let row = |times: u32| {
             // **THE EXTENT IS THE LAUNCH'S, THE POINTER IS THE PLANE'S, AND
             // `win[1]` IS THE BRIDGE.** A shifting region's ops address
             // `start + r` off whatever base they are handed, so the base has
@@ -1821,59 +2171,37 @@ impl<'c> Run<'c> {
             // what grids and loops are sized at. Hand it a shifted pointer and
             // `win[1]` would shift it twice.
             //
-            // **AND THE ROW COUNT IS THE KEY'S CEILING SINCE THE
-            // GRID-AT-CEILING WAVE, NOT THIS WINDOW'S LIVE SPAN** — which is
-            // the one sentence in this arm that changed and the whole of what
-            // makes `record::Body::grids` a function of the key. The extent
-            // used to be `window.rows` on the argument that "a bigger extent
-            // would admit rows the launch does not own"; that argument was
-            // about a launch with nothing to retire it, and this region has
-            // something: `Run::live_at` armed the seat, every seated entry
-            // opens with `r >= win[0]`, and the blocks between the fire's rows
-            // and the ceiling return before they address a byte.
-            // [`carve_rows`](Run::carve_rows) is that number and carries the
-            // argument in full; `None` from it puts this arm back on
-            // `window.rows` exactly, which is every fire off the bodies path
-            // and every deployment with no lattice.
-            //
-            // The LANE axis is not here, and that is [`crate::SHIFTED`]'s own
-            // caveat: the ops on that list index their per-lane tables by the
-            // launch-local ordinal, so those stay sliced at `lane_offset` —
-            // with ONE family excepted, whose request number is a staged
-            // datum rather than a grid coordinate and which therefore asks
-            // for its tables through [`Run::pool_absolute`] instead. Nothing
-            // about THIS resolution changes either way: the lane pairs below
-            // are the sliced reading on every path, and a caller that wants
-            // the other one names it. Only the ROW axis moves here. The patch
-            // pair below is untouched for
-            // the same reason with a second name: nothing on the list reads a
-            // patch seat, so a tower rectangle is cut where it always was.
-            Some(Dim::Tokens) if plane => (0, rows),
-            Some(Dim::TokensTimes(k)) if plane => (0, rows * k),
             // **AND THE WHOLE-FIRE ARM TAKES THE SAME CEILING WITHOUT TAKING
-            // THE PLANE BASE**, which is why `rows` is computed above the
-            // match rather than inside the `plane` arms. A region whose window
-            // IS the fire skips nothing anyway (`whole_fire` has
-            // `row_offset == 0`), so the two arms differ in the OFFSET and not
-            // in the extent — and `carve_rows` answers `Some` for exactly the
-            // union of the two, because that is the union `Run::live_at` arms
-            // the seat over.
-            Some(Dim::Tokens) => (window.row_offset, rows),
-            Some(Dim::TokensTimes(k)) => (window.row_offset * k, rows * k),
-            Some(Dim::Lanes) => (window.lane_offset, window.lanes),
-            Some(Dim::LanesPlus(k)) => (window.lane_offset, window.lanes + k),
-            Some(Dim::Const(_)) | None => return handle,
-            // **THE SECOND ROW AXIS, CUT AT ITS OWN WINDOW** (multimodal
-            // §5.1). `Window::patch` is this region's mask read against the
-            // PATCH table — patch rows where `span` has token rows and IMAGES
-            // where it has lanes — so a tower rectangle is cut by the
-            // seriation that placed it and never by the token one. The two
-            // pairs are carried separately rather than chosen between,
-            // because the embed merge is a TOKEN region that reads a patch
-            // column and needs both in the same resolution.
-            Some(Dim::Patches) => (patch.row_offset, patch.rows),
-            Some(Dim::Images) => (patch.lane_offset, patch.lanes),
-            Some(Dim::ImagesPlus(k)) => (patch.lane_offset, patch.lanes + k),
+            // THE PLANE BASE**, which is why `rows` is computed above rather
+            // than inside the `plane` clause. A region whose window IS the
+            // fire skips nothing anyway (`Standing::whole` has `row_offset ==
+            // 0`), so the two readings differ in the OFFSET and not in the
+            // extent — and `carve_rows` answers `Some` for exactly the union
+            // of the two, because that is the union `Run::live_at` arms the
+            // seat over. `None` from it puts this back on the window's own
+            // rows exactly, which is every fire off the bodies path and every
+            // deployment with no lattice.
+            let primary = axis == model_ir::RowAxis::PRIMARY;
+            let extent = if primary { rows } else { span.rows };
+            let offset = if primary && plane { 0 } else { span.row_offset };
+            (offset * times, extent * times)
+        };
+        // **A LANE COLUMN**: one entry per request of this rectangle —
+        // requests on the token axis, IMAGES on the patch one — plus the `k`
+        // an indptr-shaped dim closes with.
+        let lane = |plus: u32| (span.lane_offset, span.lanes + plus);
+
+        let (skip, keep) = match dim {
+            // `Dim::Const` is already gone above, with the values that name
+            // no shape at all.
+            Dim::Const(_) => return handle,
+            Dim::Tokens => row(1),
+            Dim::TokensTimes(k) => row(k),
+            Dim::Patches => row(1),
+            Dim::Lanes => lane(0),
+            Dim::LanesPlus(k) => lane(k),
+            Dim::Images => lane(0),
+            Dim::ImagesPlus(k) => lane(k),
         };
         if skip == 0 && keep >= handle.rows {
             return handle;
@@ -2013,7 +2341,7 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::AdapterRoutes) => {
                 self.fire.adapter_routes.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads this fire's adapter ids, which no lane of it                          carried"
+                        "value {at} reads this fire's adapter ids, which no lane of it carried"
                     )
                 })
             }
@@ -2030,41 +2358,46 @@ impl<'c> Run<'c> {
             // `Fault::Towerless`, refused before a byte is staged.
             Def::Input(RuntimeInput::Patches) => self.fire.patches.unwrap_or_else(|| {
                 panic!(
-                    "value {at} reads this fire's patch rows, which no lane of it                      submitted"
+                    "value {at} reads this fire's patch rows, which no lane of it submitted"
                 )
             }),
             Def::Input(RuntimeInput::PatchSegments) => {
                 self.fire.patch_segments.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads this fire's image boundaries, which no lane of                          it submitted"
+                        "value {at} reads this fire's image boundaries, which no lane of it \
+                         submitted"
                     )
                 })
             }
             Def::Input(RuntimeInput::PatchRoutes) => {
                 self.fire.patch_routes.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads where this fire's tower rows land, and no lane                          of it submitted an image"
+                        "value {at} reads where this fire's tower rows land, and no lane of it \
+                         submitted an image"
                     )
                 })
             }
             Def::Input(RuntimeInput::PatchEmbedRows) => {
                 self.fire.patch_embed_rows.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads which position-table rows this fire's patches gather,                          and no lane of it submitted an image"
+                        "value {at} reads which position-table rows this fire's patches gather, \
+                         and no lane of it submitted an image"
                     )
                 })
             }
             Def::Input(RuntimeInput::PatchEmbedWeights) => {
                 self.fire.patch_embed_weights.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads this fire's interpolation weights, which a                          native-grid plan declares none of"
+                        "value {at} reads this fire's interpolation weights, which a native-grid \
+                         plan declares none of"
                     )
                 })
             }
             Def::Input(RuntimeInput::PatchPositions) => {
                 self.fire.patch_positions.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads where this fire's patches sit in their grids,                          and no lane of it submitted an image"
+                        "value {at} reads where this fire's patches sit in their grids, and no \
+                         lane of it submitted an image"
                     )
                 })
             }
@@ -2078,7 +2411,8 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::MropePositions) => {
                 self.fire.mrope_positions.unwrap_or_else(|| {
                     panic!(
-                        "value {at} reads this fire's (t, h, w) token positions, which this                          load reserved no stream for"
+                        "value {at} reads this fire's (t, h, w) token positions, which this load \
+                         reserved no stream for"
                     )
                 })
             }
@@ -2214,7 +2548,7 @@ impl<'c> Run<'c> {
     /// door both readings rather than by removing it (`attn::lanes_carry`).
     ///
     /// The fallback is unreachable rather than defensive: `plane_base`
-    /// short-circuits on `bodied`, and a bodied fire is exactly the fire that
+    /// short-circuits on `Held::Eager`, and a bodied fire is exactly the fire that
     /// staged the absolute vector (`inputs::Fire::qo_absolute`).
     pub(crate) fn ragged_q(&self, id: ValueId) -> RaggedTensor {
         let indptr = if self.plane_base() {
@@ -2289,9 +2623,108 @@ impl<'c> Run<'c> {
                 scales,
                 biases,
                 seat,
+                repacked: false,
             }) => Some((codes, scales, biases, seat)),
             _ => None,
         }
+    }
+
+    /// **THE SAME TRIPLET IN FRAGMENT ORDER** (§J4b) — `Some` for a row
+    /// whose planes `pie model import` wrote through
+    /// `kernels_cuda::linear::tiled`'s relabelling, `None` for every other
+    /// row including the row-major triplet above.
+    ///
+    /// **THE TWO RESOLUTIONS ARE DISJOINT, AND THAT IS THE SAFETY.** A
+    /// repacked plane has the same dtype, the same rows and the same width
+    /// as a row-major one, so a reader handed the wrong order does not
+    /// refuse — it answers nonsense. Splitting the door is what makes the
+    /// mistake unreachable rather than unlikely: an op that reads the
+    /// row-major order asks [`Run::maybe_planes`] and gets `None` for a
+    /// repacked row, which sends it to [`Run::tensor`] and a named panic
+    /// rather than to a wrong number.
+    ///
+    /// The biases are NOT optional here. The tiled point serves exactly one
+    /// row of the affine matrix — four-bit codes, a bf16 (scale, bias) pair,
+    /// the post-offset fold — so a repacked row with no offset plane is a
+    /// landing that cannot be served, and answering `None` sends it to the
+    /// same named panic.
+    pub(crate) fn maybe_tiled_planes(
+        &self,
+        id: ValueId,
+    ) -> Option<(Tensor, Tensor, Tensor, GroupSeat)> {
+        let at = id.0 as usize;
+        let Def::Weight(w) = &self.values[at].def else {
+            return None;
+        };
+        match self.weights.0.get(*w as usize).copied().flatten() {
+            Some(WeightRow::Planes {
+                codes,
+                scales,
+                biases: Some(biases),
+                seat,
+                repacked: true,
+            }) => Some((codes, scales, biases, seat)),
+            _ => None,
+        }
+    }
+
+    /// **A WEIGHT SEATED AS ONE STORED QUANTIZATION BLOCK**, re-badged as the
+    /// byte rectangle a decode-in-dot entry reads — `Some` for a
+    /// [`WeightRow::Dense`] whose DECLARATION is a [`Dtype::Quant`] term, and
+    /// `None` for every other row, so a dense arm can ask before it commits.
+    ///
+    /// **THE TERM TRAVELS TO EXACTLY ONE READER, AND THIS IS IT.** The weight
+    /// table binds a stored block at its declared dtype rather than at `U8`,
+    /// which is the opposite of what a split-plane bank does — an mxfp4
+    /// plane's codes bind as bytes because the kernel does its own block
+    /// arithmetic and nothing downstream needs to know which scheme it is.
+    /// Here the scheme is the whole question: the model text declared
+    /// `Dtype::U4g32k` precisely so that a
+    /// dispatch arm could tell a stored q4_k from the dense bf16 rectangle
+    /// beside it, and the declaration is the only place that fact lives.
+    ///
+    /// **AND THEN IT IS SPENT.** The handle this hands back says `U8`, because
+    /// that is what the plane holds and what `linear::kquant`'s own
+    /// `debug_assert` names: `rows` weight rows of `width` bytes, one row per
+    /// column the projection lands, `width` a whole number of ggml
+    /// super-blocks (`model_dsl::Weight::planes` folded the logical `k`
+    /// through `Dtype::row_bytes`). Nothing past this point re-derives the
+    /// scheme from the term — the entry reads it back off the row's own byte
+    /// width, which is a total discrimination and carries its own argument.
+    pub(crate) fn maybe_stored(&self, id: ValueId) -> Option<Tensor> {
+        let at = id.0 as usize;
+        let Def::Weight(w) = &self.values[at].def else {
+            return None;
+        };
+        let Some(WeightRow::Dense(handle)) = self.weights.0.get(*w as usize).copied().flatten()
+        else {
+            return None;
+        };
+        // **THE DISCRIMINATOR IS "IS THIS BRAIDED?"** — a stored super-block
+        // carries its factors inside one plane, which is what makes a dense
+        // row of it servable as stored. The affine families are not here:
+        // their factors ride companion planes and a different seat reads them.
+        if !matches!(
+            handle.dtype,
+            model_ir::Dtype::U2g16k
+                | model_ir::Dtype::I3g16k
+                | model_ir::Dtype::U4g32k
+                | model_ir::Dtype::U5g32k
+                | model_ir::Dtype::I6g16k
+        ) {
+            return None;
+        }
+        // Through `cut` like every other resolution, and answering the same
+        // rectangle it always does: a weight's leading dim is `Dim::Const`,
+        // so the window walk hands it back whole. Going around it would be
+        // the one resolution on this shell that does.
+        let seated = self.cut(id, handle);
+        Some(Tensor::new(
+            seated.ptr,
+            seated.rows,
+            seated.width,
+            model_ir::Dtype::U8,
+        ))
     }
 
     pub(crate) fn planes(&self, id: ValueId) -> (Tensor, Tensor, Option<Tensor>, GroupSeat) {
@@ -2306,6 +2739,7 @@ impl<'c> Run<'c> {
                 scales,
                 biases,
                 seat,
+                repacked: _,
             }) => (codes, scales, biases, seat),
             Some(WeightRow::Dense(_) | WeightRow::Streamed { .. }) => panic!(
                 "value {at} is weight {row}, bound as one dense handle, and this op reads \
@@ -2368,7 +2802,7 @@ impl<'c> Run<'c> {
     pub(crate) fn pool(&self, id: ValueId) -> KvPool {
         match self.cache(id) {
             CachePool::Kv { space, pool } => {
-                let window = self.window().span;
+                let window = self.window().span();
                 // **A GATHERED WINDOW'S TABLES ARE RE-CUT, NOT SLICED**, and
                 // the page-id list is the reason: gathered lanes own spans of
                 // it with other lanes' pages standing between them, and no
@@ -2467,7 +2901,7 @@ impl<'c> Run<'c> {
         if !self.plane_base() {
             return handle;
         }
-        let window = self.window().span;
+        let window = self.window().span();
         skip(handle, window.row_offset, window.rows)
     }
 
@@ -2581,7 +3015,7 @@ impl<'c> Run<'c> {
     fn recurrent_cut(&self, id: ValueId, absolute: bool) -> RecurrentPool {
         match self.cache(id) {
             CachePool::Recurrent(pool) => {
-                let window = self.window().span;
+                let window = self.window().span();
                 // **ONE PREDICATE FOR ALL FOUR VECTORS**, because a launch
                 // reads them at ONE index: `slot_ids`, the fold predicate, the
                 // commit length and the segment origin are all `[r]` in
@@ -2683,7 +3117,7 @@ impl<'c> Run<'c> {
                 )
             });
         let window = self.window();
-        let span = window.span;
+        let span = window.span();
         // **AND HOW WIDE THIS SCHEDULE MAY BE CARVED** — the KEY's ceilings
         // for any plan the bodies path can serve, and `None` (this window's
         // own lanes and rows) for every other fire. The plan-at-bucket-ceiling
@@ -2712,10 +3146,13 @@ impl<'c> Run<'c> {
         // sum of its own classes' rungs), and how many lanes.
         // `Carve::ceiling` is that arithmetic on the ROW axis, and the line
         // under it is the same walk read as LANES.
-        let carve = self
-            .captured()
-            .then(|| self.carve.and_then(|carve| carve.ceiling(span)))
-            .flatten();
+        // **ON THIS REGION'S OWN AXIS** (the multi-unit bodies wave): a
+        // tower region's span is a patch interval and the rungs that bound it
+        // are the key's PATCH ladder's. `Carve::on` is the read, and it
+        // answers `None` for a patch region of a fire with no patch pair —
+        // which takes no ceiling at all, exactly as the eager path does.
+        let standing = self.standing();
+        let carve = standing.ceiling();
         // **AND THE SAME ARITHMETIC READ AS LANES**, which is a second number
         // and not a second call of the first: a rung is a ROW ceiling, and the
         // most LANES a class of this key can bring is that rung AND the seats
@@ -2725,10 +3162,12 @@ impl<'c> Run<'c> {
         // is in either — and taking the tighter one on the lane axis is what
         // keeps a mixed key's prefix from consuming the whole of what step 4d
         // could stage and leaving the class behind it with no ceiling at all.
-        let carve_lanes = self
-            .captured()
-            .then(|| self.carve.and_then(|carve| carve.lanes(span)))
-            .flatten();
+        // **AND THE LANE READING IS THE TOKEN AXIS'S ALONE**, for
+        // [`carve_lanes`](Run::carve_lanes)' reason: what the ceiling is
+        // clamped by below is the fire-wide TOKEN qo vector and the token page
+        // CSR, neither of which describes an image. A patch region takes its
+        // window's own lane pair, which is the eager reading.
+        let carve_lanes = standing.lane_carve();
         // **HOW MANY LANES, AND WHERE THEY COUNT FROM.** `(origin, count)`, or
         // `None` for this window's own pair.
         //
@@ -2757,7 +3196,7 @@ impl<'c> Run<'c> {
         // the lanes between them are the padded ones step 4d wrote.
         //
         // * **this REGION is one a graph holds, and the ladder resolved this
-        //   span** ([`captured`](Run::captured)). Nothing off the bodies path
+        //   span** ([`Held::Captured`]). Nothing off the bodies path
         //   staged a padded lane table at all, so there is no ceiling to carve
         //   at and the EAGER path answers exactly what it answered before this
         //   block existed — and neither has an ISLAND of a segmented body,
@@ -2799,8 +3238,8 @@ impl<'c> Run<'c> {
         // origin a prefix sum of LANE counts, and a lane carries at least one
         // row, so the first dominates the second. Clamped by a short source it
         // could, and the filter is what says so.
-        let ceiling: Option<(u32, u32)> = self
-            .plane_base()
+        let ceiling: Option<(u32, u32)> = standing
+            .plane()
             .then_some(carve_lanes)
             .flatten()
             .and_then(|(before, own)| {
@@ -2872,7 +3311,7 @@ impl<'c> Run<'c> {
         //   `num_blks_x`/`num_blks_y`. Both of those are hashed
         //   (`Run::schedule_shape`), and both are what chunk 5 freezes.
         // * **and this REGION is one a graph holds**
-        //   ([`captured`](Run::captured)) — which is what guarantees the
+        //   ([`Held::Captured`]) — which is what guarantees the
         //   fold's `win` seat is armed (`Run::live_at` arms every region a
         //   body was admitted on, `Windows::admits`), and therefore that the
         //   fold's bound is live rather than the baked ceiling. **AND IT IS
@@ -2912,14 +3351,17 @@ impl<'c> Run<'c> {
         // needed both ceilings. A windowed class now takes all three numbers
         // off the ladder: its rows here, its lanes and its lane origin above.
         // Its hashed image is a function of the `record::BodyKey` and the
-        // load, which is what `record::BodyStats::reshapes` being an anomaly
+        // load, which is what `record::BodyTally::reshapes` being an anomaly
         // counter finally means for every kind rather than for the whole-fire
         // ones only.
-        let rows_ceiling: Option<u32> = (self.captured()
-            && !matches!(kind, StructKind::AttnDecodePlan))
+        let rows_ceiling: Option<u32> = (!matches!(kind, StructKind::AttnDecodePlan))
             .then_some(carve)
             .flatten()
-            .map(|(_, own)| own.min(self.pad.bucket))
+            // **AND THE CAP IS THIS REGION'S OWN AXIS'S BUCKET** (the
+            // multi-unit bodies wave): a tower schedule's rows are patch
+            // rows, and the number that holds the whole of that rectangle is
+            // the PATCH lattice point.
+            .map(|(_, own)| own.min(standing.pad.bucket))
             .filter(|rows| *rows >= span.rows);
         // **A GATHERED WINDOW'S TWINS ARE THE ONES RE-CUT WITH ITS LANES.**
         // The comment on `Planning` says a slice is the whole adaptation
@@ -3018,15 +3460,15 @@ impl<'c> Run<'c> {
             // in `sched_prefill::schedule` says it is.
             lane_offset: match ceiling {
                 Some((first, _)) => first,
-                None if self.plane_base() => span.lane_offset,
+                None if standing.plane() => span.lane_offset,
                 None => 0,
             },
             ..schedule.shape
         };
         let live = Live {
             requests: span.lanes,
-            lane_offset: if self.plane_base() { span.lane_offset } else { 0 },
-            row_offset: if self.plane_base() { span.row_offset } else { 0 },
+            lane_offset: if standing.plane() { span.lane_offset } else { 0 },
+            row_offset: if standing.plane() { span.row_offset } else { 0 },
             // `Run::total_tokens` IS `span.rows`, and it is what this fire
             // brought. The carved ROW count beside it is
             // [`Planning::rows`] — equal to this everywhere but on the row
@@ -3099,7 +3541,7 @@ impl<'c> Run<'c> {
     /// somebody else's arithmetic, and this is the fire path checking it
     /// rather than believing it. A disagreement DEMOTES the body: the fire
     /// walks eagerly, produces its own numbers and re-captures the key at the
-    /// shape that arrived (`record::BodyStats::reshapes`), which is a counter
+    /// shape that arrived (`record::BodyTally::reshapes`), which is a counter
     /// naming a builder rather than a slightly wrong logit.
     ///
     /// The Debug image is the hashed form on purpose: it covers every field
@@ -3119,21 +3561,32 @@ impl<'c> Run<'c> {
         }
 
         let mut sink = Sink(DefaultHasher::new());
-        for (at, slot) in self.structs.iter().enumerate() {
-            let Some(slot) = slot else { continue };
+        for (at, held) in self.structs.iter().enumerate() {
+            let Some((admit, slot)) = held else { continue };
             // **AN ISLAND REGION'S PLAN IS NOT IN THE HASH.** Its builder
-            // stood down from every ceiling (`Run::captured`), so its numbers
-            // follow the fire — and its readers are islands too (the
-            // mask-family weld), re-issued eagerly off THIS fire's payload,
-            // so no capture holds a stale copy for the hash to catch. Hashing
-            // it would reshape a body once per split for a difference no
-            // replay reads.
-            if self.bodied
-                && matches!(
-                    self.admits.get(self.struct_region[at] as usize),
-                    Some(crate::window::Admit::Island)
-                )
-            {
+            // stood down from every ceiling (`Held::Eager`), so its numbers
+            // follow the fire — and its readers are islands too, re-issued
+            // eagerly off THIS fire's payload, so no capture holds a stale
+            // copy for the hash to catch. Hashing it would reshape a body once
+            // per split for a difference no replay reads.
+            //
+            // **"ITS READERS ARE ISLANDS TOO" IS THE LOAD-BEARING CLAUSE AND
+            // IT IS PROVED ELSEWHERE**, in two places that have to hold
+            // together: the bake-time refusal that puts a schedule's readers
+            // in its builder's mask
+            // (`model_exec::store::check::no_schedule_straddles_its_readers`)
+            // and the weld that gives one mask family one admission
+            // (`record::widen`'s third rule, whose own doc derives why the
+            // builder cannot leave it). `Run::structs` states the chain.
+            //
+            // **AND IT IS ONE FIELD READ, BECAUSE THE ANSWER WAS RESOLVED AT
+            // THE WRITE.** This used to re-derive it — the `bodied` word and then
+            // an index into `admits` by a region number held in a parallel
+            // vector — which asked at the READER a question whose only honest
+            // instant is the writer's. `Run::put` takes it where the cursor is
+            // on the builder, and both fallbacks land on `Captured`, so an
+            // eager fire hashes every built slot exactly as it always did.
+            if *admit == Admit::Island {
                 continue;
             }
             let _ = write!(sink, "{at}:");
@@ -3181,7 +3634,7 @@ impl<'c> Run<'c> {
                 //
                 // The consequence is deliberate: a resident body whose fire
                 // flips `causal` is re-captured rather than replayed off the
-                // other reading's graph, and `record::BodyStats::reshapes`
+                // other reading's graph, and `record::BodyTally::reshapes`
                 // says it happened. A counted demotion is the answer this hash
                 // exists to give.
                 StructSlot::Mla(p) => write!(
@@ -3203,17 +3656,27 @@ impl<'c> Run<'c> {
     /// another. The shell reads this before it captures, and stays eager when
     /// it is false.
     pub(crate) fn capturable(&self) -> bool {
-        self.structs.iter().flatten().all(|slot| match slot {
+        self.structs.iter().flatten().all(|(_, slot)| match slot {
             StructSlot::Prefill(plan) => plan.graph_capturable,
             _ => true,
         })
     }
 
-    /// Store a plan payload a prepare-phase arm just built.
+    /// Store a plan payload a prepare-phase arm just built, with the
+    /// admission of the region that built it.
+    ///
+    /// **THIS IS WHERE THE ADMISSION IS RESOLVED, BECAUSE THIS IS WHERE THE
+    /// CURSOR IS ON THE BUILDER** — the same instant and the same slice
+    /// [`Standing`] reads for [`planning`](Run::planning)'s ceilings.
+    /// [`structs`](Run::structs) carries the argument in full, including why
+    /// both fallbacks answer [`Admit::Captured`].
     pub(crate) fn put(&mut self, id: ValueId, built: StructSlot) {
         let at = self.struct_at(id);
-        self.structs[at] = Some(built);
-        self.struct_region[at] = self.place.region.get();
+        let admit = self
+            .ceilings
+            .admit(self.place.region.get())
+            .unwrap_or(Admit::Captured);
+        self.structs[at] = Some((admit, built));
     }
 
     /// One built slot, whichever kind it holds — for the arm that routes on
@@ -3221,7 +3684,7 @@ impl<'c> Run<'c> {
     /// single-kind reads.
     pub(crate) fn slot(&self, id: ValueId) -> &StructSlot {
         let at = self.struct_at(id);
-        self.structs[at].as_ref().unwrap_or_else(|| {
+        self.structs[at].as_ref().map(|(_, slot)| slot).unwrap_or_else(|| {
             panic!(
                 "value {} holds no plan payload for run {} of its window; its plan \
                  op has not fired, and the prepare phase runs first",

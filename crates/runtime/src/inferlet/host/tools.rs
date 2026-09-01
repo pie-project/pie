@@ -5,9 +5,9 @@
 
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
-use ::model::template::{ToolDecoder, ToolEvent};
 use anyhow::Result;
 use grammar::matcher::GrammarMatcher;
+use models::template::{ToolDecoder, ToolEvent};
 use std::collections::VecDeque;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;

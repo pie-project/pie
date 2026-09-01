@@ -37,7 +37,7 @@ pub use forward::*;
 /// forward pass used to name a geometry kind to ask the runtime for a vector,
 /// and now it names the kv row instead ([`Input::write_page`]), so the name
 /// left the door. `Attention`, `CacheRow`, `Def`, `Linear`, `Trace` and
-/// `ValueId` are what `model::deployment` reads a traced plan with;
+/// `ValueId` are what `models::deployment` reads a traced plan with;
 /// `Dtype` is what a catalog row and a load contract
 /// are written in;
 /// `Platform` is what a trace is taken at; `Param` and `Shard` are the plan's
@@ -80,7 +80,7 @@ pub type ClassifyFn = fn(&Request) -> u64;
 ///
 /// TP IS A COLUMN BECAUSE IT IS A FACT ABOUT THE ROW. It was reachable only by
 /// reading the model expression's arguments — or, worse, by tracing the whole
-/// forward pass and looking for an `AllReduce`, which is how `model::identify`
+/// forward pass and looking for an `AllReduce`, which is how `models::identify`
 /// used to tell one rank of a world from a whole model. A name is a name; the
 /// world size a row was built for is a number, and it belongs beside the name
 /// that promises it.
@@ -91,13 +91,35 @@ pub type ClassifyFn = fn(&Request) -> u64;
 /// family's `Facts` can write. The catalog is where the family's type is last
 /// visible, so it is where the call is closed over; everywhere downstream
 /// holds a SKU string and a [`ClassifyFn`].
+///
+/// **AND THE MODEL EXPRESSION IS BUILT FOR A SETUP, NOT IN A VACUUM.** `$m`
+/// is constructed INSIDE the trace closure — it always was, once per call —
+/// but it was constructed before anything told it which shell was asking, so
+/// a text that wanted to state a `Dtype` PLACEMENT had to state one answer
+/// for every platform. [`placing_for`] is what closes that, and it closes it
+/// without threading a name: `$m` comes from the caller's syntax context and
+/// macro hygiene means it cannot see the `platform` binding here, so a
+/// redesign that passed the word as an ARGUMENT would have to rewrite every
+/// family's constructor across eight texts. Wrapping the construction instead
+/// costs one line, reaches every family at once, and — because the same
+/// wrapper is what a family's `import` is read under — makes the trace's
+/// answer and the load contract's the same answer by construction.
+///
+/// The CLASSIFY column is deliberately NOT wrapped. A lane's fact word is a
+/// function of the request and the model's shape; no `Classify::of` has ever
+/// read a weight's dtype, let alone its arrangement, and there is no platform
+/// at that call site to wrap it with — a fire path holds a SKU string. `$m`
+/// there resolves with no setup stated, which is [`place`]'s identity case.
 #[macro_export]
 macro_rules! catalog {
     ($( ($name:literal, $tp:literal, $trace:path, $m:expr $(,)?) ),+ $(,)?) => {
         &[ $( (
             $name,
             $tp,
-            (|platform| $trace($name, &$m, platform)) as _,
+            (|platform| {
+                let model = $crate::placing_for(platform, || $m);
+                $trace($name, &model, platform)
+            }) as _,
             (|request: &$crate::Request| $crate::word_of(|| $m, request)) as _,
         ) ),+ ]
     };

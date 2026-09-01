@@ -38,7 +38,9 @@ use model_ir::{ClassSet, Operands, Trace};
 /// A slot table generously above every hand-built fire below — the tests ask
 /// about window semantics, not the carve, so the ceiling only has to hold.
 fn test_slots() -> engine_cuda::window::Slots {
-    engine_cuda::window::Slots::new(8, 512, 8, 1)
+    // The three new arguments are one gathered payload's ceiling — rows,
+    // kv spaces, pages — generous the same way the first four are.
+    engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 2, 512)
 }
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -88,7 +90,7 @@ fn arms() -> (DeviceProfile, DeviceProfile) {
 }
 
 fn sku() -> (Trace, CompiledModel, CompiledModel) {
-    let (_, _, trace, _) = model::catalog()
+    let (_, _, trace, _) = models::catalog()
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
         .unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
@@ -164,9 +166,9 @@ fn the_grouped_region_gets_one_window_whose_segments_are_the_splits_own_spans() 
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
     let boundaries = indptr(&rows);
 
-    let split_windows = Windows::of(&plan, &split, fire.classes(), fire.patch_classes(), &boundaries, Copies::off(), test_slots())
+    let split_windows = Windows::of(&plan, &split, model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]), &boundaries, Copies::off(), test_slots())
         .expect("a fragmented window is a slow path, not a fault");
-    let grouped_windows = Windows::of(&plan, &grouped, fire.classes(), fire.patch_classes(), &boundaries, Copies::off(), test_slots())
+    let grouped_windows = Windows::of(&plan, &grouped, model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]), &boundaries, Copies::off(), test_slots())
         .expect("a grouped window is one window");
 
     let mut checked = 0usize;
@@ -189,7 +191,7 @@ fn the_grouped_region_gets_one_window_whose_segments_are_the_splits_own_spans() 
         let first = spans[0];
         let last = *spans.last().expect("more than one span");
         assert_eq!(
-            held.span,
+            held.span(),
             MaskSpan {
                 row_offset: first.row_offset,
                 rows: last.row_offset + last.rows - first.row_offset,
@@ -204,8 +206,8 @@ fn the_grouped_region_gets_one_window_whose_segments_are_the_splits_own_spans() 
         assert_eq!(held.segs() as usize, spans.len(), "region {at}");
         let mut want: Vec<i32> = Vec::new();
         for run in 0..split_windows.runs(at) {
-            let cut = split_windows.at(at, run).span;
-            want.push((cut.row_offset - held.span.row_offset) as i32);
+            let cut = split_windows.at(at, run).span();
+            want.push((cut.row_offset - held.span().row_offset) as i32);
             want.push(cut.rows as i32);
         }
         assert_eq!(held.segments_host, want, "region {at}");
@@ -216,7 +218,7 @@ fn the_grouped_region_gets_one_window_whose_segments_are_the_splits_own_spans() 
             .segments_host
             .chunks_exact(2)
             .flat_map(|pair| {
-                let base = held.span.row_offset + pair[0] as u32;
+                let base = held.span().row_offset + pair[0] as u32;
                 base..base + pair[1] as u32
             })
             .collect();
@@ -264,7 +266,7 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
     let lanes = one_lane_per_class(&grouped);
     let fire = compose(&grouped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
-    let mut windows = Windows::of(&plan, &grouped, fire.classes(), fire.patch_classes(), &indptr(&rows), Copies::off(), test_slots()).expect("the windows");
+    let mut windows = Windows::of(&plan, &grouped, model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]), &indptr(&rows), Copies::off(), test_slots()).expect("the windows");
 
     let packed = windows.packed();
     // A base that is not zero, so an implementation that forgot to add it
@@ -340,7 +342,7 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
 /// stated below as the four things it always meant.
 #[test]
 fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
-    let (_, _, trace, _) = model::catalog()
+    let (_, _, trace, _) = models::catalog()
         .into_iter()
         .find(|(sku, ..)| *sku == SKU)
         .expect("the catalog ships the SKU");
@@ -403,7 +405,8 @@ fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
             continue;
         }
         assert!(
-            fallback::answers(&plain, row.node..row.node + 1).is_empty(),
+            fallback::answers(&plain, model_ir::RowAxis::Tokens, row.node..row.node + 1)
+                .is_empty(),
             "node {} was already withdrawn before its op was named groupable, \
              so naming it moved nothing",
             row.node,
@@ -420,7 +423,7 @@ fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
             .template()
             .iter()
             .filter(|region| {
-                fallback::answers(compiled, region.nodes.clone())
+                fallback::answers(compiled, model_ir::RowAxis::Tokens, region.nodes.clone())
                     .iter()
                     .any(|answer| *answer != Fallback::Grouped)
             })
@@ -444,14 +447,18 @@ fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
     let fire = compose(&shipped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
     let windows =
-        Windows::of(&trace, &shipped, fire.classes(), fire.patch_classes(), &indptr(&rows), Copies::off(), test_slots())
+        Windows::of(&trace, &shipped, model_ir::PerAxis::new([fire.classes(), fire.patch_classes()]), &indptr(&rows), Copies::off(), test_slots())
             .expect("the windows");
     // A segment list where the artifact answered `Grouped` and NOWHERE ELSE:
     // one window, `r` segments; and every region the table said nothing about
     // still gets the ordinary window it always got.
     let (mut grouped_regions, mut split_regions) = (0usize, 0usize);
     for at in 0..shipped.template().len() as u32 {
-        let owed = fallback::grouped(&shipped, shipped.template()[at as usize].nodes.clone());
+        let owed = fallback::grouped(
+            &shipped,
+            model_ir::RowAxis::Tokens,
+            shipped.template()[at as usize].nodes.clone(),
+        );
         for run in 0..windows.runs(at) {
             let segs = windows.at(at, run).segs();
             if owed {

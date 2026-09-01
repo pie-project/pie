@@ -33,8 +33,15 @@
 //!   `mask_enabled`/`mask_stride` no op names.
 
 pub mod abi;
+/// The `lora` sink, read: which channels an adapter's planes are, what one
+/// seeded cell means as bank bytes, and which slot it lands in.
+pub mod adapter;
 pub mod api;
 pub mod arena;
+/// The shared-adapter store: the deployment's mount, the `adapter.toml`
+/// grammar, the single-flight host byte cache, and the per-layer resolver
+/// that turns one blob's files into one plane per bank.
+pub mod blob;
 /// Reading a boot document — this crate's half of it, in this crate.
 pub mod boot;
 pub mod device;
@@ -42,6 +49,7 @@ mod dispatch;
 pub mod encode;
 mod error;
 pub mod experts;
+pub mod host_source;
 /// The indirect command buffer — Metal-only, and the one module of this
 /// crate that is.
 ///
@@ -55,6 +63,7 @@ pub mod experts;
 pub mod icb;
 pub mod rebind;
 pub mod inputs;
+pub mod mapping;
 pub mod mask;
 pub mod program;
 pub mod record;
@@ -85,8 +94,8 @@ pub use inputs::Inputs;
 pub use program::{Fired, Launched, Plane as ProgramPlane, Session as ProgramSession};
 pub use record::{Arg, Point, Recording, Slot, Tape};
 pub use run::{
-    CacheGeometry, CachePool, CacheTable, FireBindings, FireTables, Run, SlotTable, StructSlot,
-    WeightRow, WeightTable,
+    CacheGeometry, CachePool, CacheTable, FireBindings, FireTables, PoolSlabs, Run, SlotTable,
+    StructSlot, WeightRow, WeightTable,
 };
 pub use scores::ScoreSeat;
 pub use scratch::Scratch;
@@ -95,5 +104,9 @@ pub use serve::{
 };
 pub use settle::{Airborne, Arms, Done};
 pub use store::Pools;
-pub use weights::{AdapterPlane, Weights};
+pub use adapter::{
+    Binding as AdapterBinding, Key as AdapterKey, Role as AdapterRole, Site, Source as AdapterSource,
+};
+pub use blob::{Layout as AdapterLayout, Manifest as AdapterManifest, Stamp as AdapterStamp};
+pub use weights::{AdapterPlane, BankSeat, Weights};
 pub use window::{Copies, Cursor, Gathered, GatheredSpace, Window, Windows};

@@ -156,7 +156,7 @@ fn run(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, Vec<f64>) {
 /// The lane word the model's own `Classify` computes — runtime-side work, done
 /// here because this test IS the runtime for the length of one fire.
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn finite(logits: &[f32], what: &str) {
@@ -233,7 +233,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
 
     // The runtime's half: trace the row, state the load contract. Neither is
     // the shell's — `Trace` crosses the boundary, `CompiledModel` never does.
-    let trace = model::trace_of(SKU).expect("the catalog ships the smoke's SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the smoke's SKU");
     let trace = trace(Platform::Cuda);
     // A stock safetensors snapshot, projected into the one object model the
     // contract algebra speaks. `Source::open` would refuse it — that door is
@@ -244,8 +244,9 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     // stock hugging-face snapshot needs. `Model::load` is the other door —
     // the same publication under the plan's names, read out of a canonical
     // `.zt` this deployment does not have.
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the SKU's import contract fits its own checkpoint");
+    let contract =
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+            .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let booted = Instant::now();
@@ -277,7 +278,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         // keying moved into the bodies gate.)
         graphs: engine_cuda::Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.

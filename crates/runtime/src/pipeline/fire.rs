@@ -1036,7 +1036,7 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
 /// a class and therefore into the row WINDOW every guarded node runs over
 /// (palo design §0, decision 18). Both lane-construction sites left it at
 /// zero — the all-false class — so every decode lane went out composed as a
-/// prefill one; the runtime could not do better while `model::catalog()` shipped
+/// prefill one; the runtime could not do better while `models::catalog()` shipped
 /// three columns, because a plan's `Guard::Fact(bit)` numbers its bits and no
 /// reader outside a family's own module can say which one `qo_one` is. The
 /// catalog carries a `ClassifyFn` now and `crate::model::Model::word` calls

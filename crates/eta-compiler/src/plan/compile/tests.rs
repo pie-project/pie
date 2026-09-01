@@ -1089,10 +1089,23 @@ fn plan_rendering_is_deterministic_and_self_describing() {
     );
 }
 
+/// The three struct sizes, as literals.
+///
+/// A literal rather than a computation, because the point is that these
+/// numbers only move on purpose: every one of them is a stride some emitted
+/// kernel walks the table with, and a stride nobody meant to change is a
+/// kernel reading the field before the one the host wrote.
+///
+/// `LaneRecord` moved 96 -> 112 once, for the grouped Metal form's score
+/// rectangle: that form binds no per-intrinsic buffer, so `attn_score_base`
+/// and its pitch had to arrive on the record. They were APPENDED, so every
+/// field before them kept its offset and both emitter versions were bumped —
+/// the size is the stride between lanes, and a kernel cached against 96 reads
+/// lane 1 sixteen bytes early.
 #[test]
 fn lane_layout_is_stable() {
     assert_eq!(core::mem::size_of::<LaneTableHeader>(), 16);
-    assert_eq!(core::mem::size_of::<LaneRecord>(), 96);
+    assert_eq!(core::mem::size_of::<LaneRecord>(), 112);
     assert_eq!(core::mem::size_of::<LaneChannelSlot>(), 32);
 }
 

@@ -39,11 +39,33 @@ pub enum Stage {
 /// pass has ever had state of its own, and a trait with one implementor buys
 /// dispatch nobody calls for. Keeping it concrete makes [`super::passes::all`] a
 /// `static` the compiler lays out once, instead of nine boxes built per compile.
+#[derive(Clone, Copy)]
 pub struct Pass {
     pub name: &'static str,
 
     /// Whether this pass may rewrite, or may only refuse.
     pub stage: Stage,
+
+    /// Whether this pass exists FOR the arena — the one allocation a plan's
+    /// persistent buffers and its staging region are laid out in.
+    ///
+    /// True of exactly the two that rewrite buffer-relative writes into
+    /// arena-ABSOLUTE ones and hoist them to the front of the schedule. Both
+    /// are the right rewrite for a load staging a device image and the wrong
+    /// one for a load with no arena at all: the executor refuses the
+    /// instruction the first emits ([`Residency::Streaming`]), and the second
+    /// pulls every `Allocate` to the head of the schedule, which is the one
+    /// arrangement under which "freed at its last use" frees nothing until the
+    /// whole model is live.
+    ///
+    /// So [`crate::plan::compile_streaming`] runs the pipeline without them,
+    /// and this field is what says which. Stated per pass rather than matched
+    /// on a list of names elsewhere, because a name is a thing a rename can
+    /// silently take out of such a list — where a field added here does not
+    /// compile until whoever adds the next pass decides its answer.
+    ///
+    /// [`Residency::Streaming`]: crate::executor::Residency::Streaming
+    pub for_arena: bool,
 
     /// Rewrite the plan, returning how many rewrites were made.
     ///
@@ -73,6 +95,21 @@ pub struct PassStats {
 /// rewrite is not a check.
 pub fn run_all(plan: &mut LoadPlan) -> Result<Vec<PassStats>> {
     run_passes(plan, super::passes::all())
+}
+
+/// The same pipeline with the arena's own passes left out — see
+/// [`Pass::for_arena`] and [`crate::plan::compile_streaming`].
+///
+/// Filtered from [`super::passes::all`] rather than written out a second time:
+/// two lists would be two places to add a pass to, and the one somebody forgot
+/// would differ from the other in a way no test names.
+pub fn run_arenaless(plan: &mut LoadPlan) -> Result<Vec<PassStats>> {
+    let pipeline: Vec<Pass> = super::passes::all()
+        .iter()
+        .copied()
+        .filter(|pass| !pass.for_arena)
+        .collect();
+    run_passes(plan, &pipeline)
 }
 
 /// Run a pipeline. Split out from [`run_all`] so the ordering rule can be

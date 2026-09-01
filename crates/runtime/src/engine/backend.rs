@@ -223,6 +223,35 @@ pub mod open {
         }
     }
 
+    /// **RUN THE COLD HALF OF A LOAD AND KEEP ONLY THE FILE IT WRITES** (§M
+    /// wave M-1: `.wiki/alto/zt-as-serving-artifact.md`).
+    ///
+    /// The door `pie model import` reaches the CUDA shell through. It opens a
+    /// device from the SAME boot document [`cuda`] above is given, runs the
+    /// cold half of a load — bake, land, write the tier artifact — and tears
+    /// the device down without arming a thing. No engine is registered and
+    /// nothing is returned: what survives the call is the file in `[model]
+    /// weight_cache_dir`, which is what makes the deployment's first real
+    /// serve a warm one.
+    ///
+    /// It sits in this module rather than beside `Engine`'s verbs because
+    /// preparing is not one: there is no load to be a verb ABOUT. It is the
+    /// same shape as `cuda` — a boot document in, a device errand run — and
+    /// the same argument makes it live here, in the crate that links both the
+    /// shell and the catalog the load door reads.
+    ///
+    /// # Errors
+    ///
+    /// No device, a boot config the shell refuses, a checkpoint no SKU
+    /// claims, or whatever the bake and the landing said. The sentence is the
+    /// shell's, in an `anyhow` skin, for [`cuda`]'s reason.
+    #[cfg(feature = "_engine-cuda")]
+    pub fn prepare_cuda(config_bytes: &[u8], request: engine::LoadRequest) -> Result<()> {
+        let engine = engine_cuda::open(config_bytes, crate::engine::load::contract_for)
+            .map_err(::anyhow::Error::msg)?;
+        engine.prepare(request).map_err(::anyhow::Error::from)
+    }
+
     /// Open the system's default Metal device.
     ///
     /// **THERE IS NO DEVICE KEY TO READ**, where the CUDA door reads

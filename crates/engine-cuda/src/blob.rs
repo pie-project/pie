@@ -380,7 +380,7 @@ impl Manifest {
 /// compare.
 ///
 /// **THE SPELLING IS THE CONTRACT AND IT IS WRITTEN IN THREE PLACES** — the
-/// guest's `Site`, the model text's [`model::adapter::Site`], and this one —
+/// guest's `Site`, the model text's [`models::adapter::Site`], and this one —
 /// for exactly the reason `lora_a` is: a name crosses a crate boundary as a
 /// string, and the three crates cannot depend on each other in a circle. What
 /// keeps them one vocabulary is that a spelling nobody here knows is REFUSED

@@ -498,6 +498,24 @@ pub struct Pinned {
     host: *mut u8,
     device: u64,
     bytes: usize,
+    /// Which door made these bytes, and therefore which one gives them back.
+    /// The two are not interchangeable: `cudaFreeHost` on a mapping this
+    /// process made itself is a fault, and `munmap` on a `cudaHostAlloc`
+    /// leaks the driver's own bookkeeping.
+    origin: Origin,
+}
+
+/// **HOW A [`Pinned`] CAME TO BE PAGE-LOCKED**, which is the whole of what
+/// [`Pinned::drop`] needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// `cudaHostAlloc` made the allocation and page-locked it in one call.
+    Allocated,
+    /// This process mapped the pages and `cudaHostRegister` locked them —
+    /// [`Pinning`], and its doc says why an image ever takes that road.
+    /// Unreachable without a runtime, where `Pinning::lock` is a refusal.
+    #[cfg_attr(not(feature = "_cuda"), allow(dead_code))]
+    Registered,
 }
 
 // SAFETY: a `Pinned` is an allocation and a length. What makes concurrent
@@ -522,11 +540,84 @@ impl Pinned {
     /// [`Fault::Runtimeless`] without a CUDA runtime, [`Fault::Device`] for
     /// whatever `cudaHostAlloc` said.
     pub fn mapped(bytes: usize) -> Result<Pinned> {
+        Pinned::alloc(bytes, true)
+    }
+
+    /// **THE SAME ALLOCATION WITHOUT THE MEMSET** — for a caller that will
+    /// overwrite every byte before it reads one (§K.4).
+    ///
+    /// [`Pinned::mapped`]'s `write_bytes(0)` is a serving cost nobody has
+    /// named until now: the weight tier of a streamed deployment is TENS OF
+    /// GIGABYTES of page-locked memory, and zeroing it costs tens of seconds
+    /// of memory bandwidth on EVERY boot — including the warm one whose whole
+    /// promise is that it does not touch the bytes twice. A tier restored
+    /// from the artifact reads its whole image in over itself, so the zeros
+    /// it is written on top of are pure loss.
+    ///
+    /// **WHAT THE CALLER OWES.** Every byte of this allocation is
+    /// indeterminate until the caller writes it, and the doors that hand the
+    /// bytes out ([`Pinned::read`], [`Pinned::view`]) do not know that. So a
+    /// caller may take this only when it can point at the write that covers
+    /// the WHOLE length — not the parts an index names, the whole length,
+    /// padding and alignment gaps included — and only when that write happens
+    /// before any read, any digest and any kernel launch. It is a safe
+    /// signature for the reason [`Pinned::read`] is one: this type's
+    /// discipline is stated and checked by its callers rather than by its
+    /// borrows (see the `unsafe impl Sync` above), and a second convention
+    /// here would not make the first one true.
+    ///
+    /// **The streamed COLD load is not such a caller and does not take it.**
+    /// The landing sink writes each plane's published bytes; the tier seats
+    /// each plane at `reserved`, which is those bytes rounded up to
+    /// [`weights::ALIGN`](crate::weights::ALIGN) — so up to 255 bytes per
+    /// plane, plus the gap that aligns the groups behind the banks, are never
+    /// written by anything. Zeroed, they are a deterministic image the
+    /// artifact can carry; unzeroed, they are whatever the kernel handed out,
+    /// which a write path would hash and publish.
+    ///
+    /// # Errors
+    ///
+    /// As [`Pinned::mapped`].
+    pub fn mapped_uninit(bytes: usize) -> Result<Pinned> {
+        Pinned::alloc(bytes, false)
+    }
+
+    /// **The memset [`Pinned::mapped_uninit`] did not do, done late.**
+    ///
+    /// The other half of that door's contract, and the reason it can be taken
+    /// at all. A caller takes `mapped_uninit` on a PLAN to overwrite the whole
+    /// allocation — the serving artifact's warm boot plans exactly that — and
+    /// a plan can fail: one of the images it reads can hash to something other
+    /// than what the file's block table states, or the disk can refuse a read
+    /// halfway through one. What is left then is a mixture of restored bytes and bytes the
+    /// kernel handed out, and the load that falls through to the cold path is
+    /// about to write only the spans an index names.
+    ///
+    /// So this is called on exactly that fall-through, and it puts the
+    /// allocation back into the state [`Pinned::mapped`] would have handed
+    /// over — which is what makes the padding between spans a deterministic
+    /// image again, and therefore what keeps the artifact the cold path is
+    /// about to write from carrying bytes nobody wrote.
+    ///
+    /// **Sound where [`Pinned::write`] is sound**, and no wider: the span is
+    /// the whole allocation, so a caller may take it only where the discipline
+    /// says the whole allocation is its own.
+    pub fn zero(&self) {
+        if self.host.is_null() || self.bytes == 0 {
+            return;
+        }
+        // SAFETY: the span is the allocation, which outlives the write; what
+        // makes it writable AT ALL is the discipline the doc above states.
+        unsafe { core::ptr::write_bytes(self.host, 0, self.bytes) }
+    }
+
+    fn alloc(bytes: usize, zeroed: bool) -> Result<Pinned> {
         if bytes == 0 {
             return Ok(Pinned {
                 host: core::ptr::null_mut(),
                 device: 0,
                 bytes: 0,
+                origin: Origin::Allocated,
             });
         }
         #[cfg(feature = "_cuda")]
@@ -541,7 +632,9 @@ impl Pinned {
                     "cudaHostAlloc",
                     rt::cudaHostAlloc(&raw mut host, bytes, rt::cudaHostAllocMapped),
                 )?;
-                core::ptr::write_bytes(host.cast::<u8>(), 0, bytes);
+                if zeroed {
+                    core::ptr::write_bytes(host.cast::<u8>(), 0, bytes);
+                }
             }
             let mut device: *mut core::ffi::c_void = core::ptr::null_mut();
             // SAFETY: `host` is the allocation just made and mapped.
@@ -555,11 +648,12 @@ impl Pinned {
                 host: host.cast(),
                 device: device as u64,
                 bytes,
+                origin: Origin::Allocated,
             })
         }
         #[cfg(not(feature = "_cuda"))]
         {
-            let _ = bytes;
+            let _ = (bytes, zeroed);
             Err(Fault::Runtimeless)
         }
     }
@@ -598,6 +692,43 @@ impl Pinned {
         unsafe { core::slice::from_raw_parts(self.host.add(offset).cast_const(), len).to_vec() }
     }
 
+    /// **BORROW A SPAN OF THE PAGE-LOCKED BYTES**, or `None` for one this
+    /// allocation does not hold.
+    ///
+    /// [`Pinned::read`]'s window, and the difference is the whole reason it
+    /// exists: `read` COPIES, and the caller that needs this one is the tier
+    /// artifact's writer, whose image is tens of gigabytes and whose chunk is
+    /// 64 MiB. Asking `read` for it would allocate the tier a second time on
+    /// the host, to hand it to a `write_all` that copies it again (§K.3).
+    ///
+    /// **THE SPSC CAVEAT IS `read`'s, AND IT IS LONGER HERE.** These bytes
+    /// are the same bytes a device kernel and a guest thread may be storing
+    /// through, and nothing about a `&[u8]` says otherwise. So this is sound
+    /// exactly where the discipline above says the span is the caller's — and
+    /// for a borrow, for as long as the borrow lives, not for the instant of
+    /// a copy. The writer that takes it holds it across one `write_all` of
+    /// one chunk, on the load thread, after the landing and before the first
+    /// fire: no kernel is enqueued and no guest exists.
+    ///
+    /// An `at` or a `len` past the allocation is `None` rather than a clamp,
+    /// because a short span silently written into a file is the failure this
+    /// door is on the path of.
+    #[must_use]
+    pub fn view(&self, at: u64, len: u64) -> Option<&[u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        let at = usize::try_from(at).ok()?;
+        let len = usize::try_from(len).ok()?;
+        if self.host.is_null() || at.checked_add(len)? > self.bytes {
+            return None;
+        }
+        // SAFETY: the span is inside this allocation, which outlives the
+        // borrow; what makes the bytes readable AT ALL is the discipline the
+        // doc above states, exactly as for `Pinned::read`.
+        Some(unsafe { core::slice::from_raw_parts(self.host.add(at).cast_const(), len) })
+    }
+
     /// Store `bytes` at `offset`, answering `false` when they would not fit.
     ///
     /// As [`Pinned::read`]: sound where the discipline says the span is the
@@ -614,13 +745,195 @@ impl Pinned {
 
 impl Drop for Pinned {
     fn drop(&mut self) {
-        #[cfg(feature = "_cuda")]
-        if !self.host.is_null() {
-            // SAFETY: the pointer came from this structure's own
-            // `cudaHostAlloc` and is freed exactly once.
-            unsafe {
-                let _ = cudarc::runtime::sys::cudaFreeHost(self.host.cast());
+        if self.host.is_null() {
+            return;
+        }
+        match self.origin {
+            #[cfg(feature = "_cuda")]
+            Origin::Allocated => {
+                // SAFETY: the pointer came from this structure's own
+                // `cudaHostAlloc` and is freed exactly once.
+                unsafe {
+                    let _ = cudarc::runtime::sys::cudaFreeHost(self.host.cast());
+                }
             }
+            // **UNREGISTER, THEN UNMAP, AND THE ORDER IS THE ORDER**: the
+            // driver's page-lock is a claim on pages this process owns, so
+            // dropping the pages first would leave the claim pointing at
+            // whatever the address range becomes next.
+            Origin::Registered => {
+                #[cfg(feature = "_cuda")]
+                // SAFETY: the span is the one this structure registered.
+                unsafe {
+                    let _ = cudarc::runtime::sys::cudaHostUnregister(self.host.cast());
+                }
+                // SAFETY: unmapping the mapping `Pinning::uninit` made, once.
+                unsafe {
+                    libc::munmap(self.host.cast(), self.bytes.max(1));
+                }
+            }
+            #[cfg(not(feature = "_cuda"))]
+            Origin::Allocated => {}
+        }
+    }
+}
+
+/// **AN IMAGE THAT IS FILLED FIRST AND PAGE-LOCKED LAST** — the road a
+/// sixty-gigabyte tier takes, and the measurement that put it here.
+///
+/// `cudaHostAlloc` holds the CUDA runtime's memory-manager lock for the whole
+/// of a large allocation, and *every* other CUDA call on every other thread
+/// waits behind it — not just another allocation. Measured on this box at
+/// 40 GiB: one `cudaHostAlloc` runs 23.7 s and stalls a one-megabyte
+/// `cudaMalloc` and a pre-allocated `cudaMemcpyAsync` for all 23.7 s of it.
+/// That is hazard H1 (§L.7), and at qwen4's 60 GiB it was ~48 s of a warm
+/// deferred boot: the load's own remaining allocations, and any fire the seat
+/// was supposed to be serving during the window, sat behind the page-lock of
+/// an image nobody was waiting for.
+///
+/// **The lock is not the pages, it is the CALL.** So the image is made the
+/// way the kernel makes any other sixty gigabytes — an anonymous mapping,
+/// advised into huge pages, faulted in BY THE READ THAT FILLS IT, which takes
+/// no CUDA lock at all — and one `cudaHostRegister` locks the finished thing
+/// at the end. Same box, same 40 GiB: 7.2 s in total with a 4.2 s stall, and
+/// at qwen4's 60 GiB the register itself is **3.4 s** (17.7 GiB/s) where the
+/// `cudaHostAlloc` it replaces was ~36. The huge pages are why: locking is
+/// per-page work, and `MADV_HUGEPAGE` gives the driver five hundred times
+/// fewer of them to walk.
+///
+/// **CHUNKING THE REGISTER WAS THE OTHER CANDIDATE AND IT IS WORSE**, which
+/// is worth saying because §L.7 named it: registering the same 40 GiB in
+/// 256 MiB pieces took 45.8 s (128.4 s at 64 MiB) and still stalled a
+/// neighbouring `cudaMalloc` for 28.6 s, because the registering thread
+/// re-takes the lock faster than anyone else can win it. One call over huge
+/// pages beats many calls over small ones twice over.
+///
+/// **AND THE ADDRESS IS THE SAME NUMBER ON BOTH SIDES**, as it is for
+/// `cudaHostAlloc(cudaHostAllocMapped)`: [`Pinning::lock`] asks
+/// `cudaHostGetDevicePointer` rather than assuming it, so an image whose two
+/// bases disagree is a refusal and not a wrong address.
+#[derive(Debug)]
+pub struct Pinning {
+    host: *mut u8,
+    bytes: usize,
+}
+
+// SAFETY: as `Pinned`'s — an address and a length, whose sole writer is the
+// thread that holds it. `Pinning` hands out no aliases at all: `host` is the
+// one door, and `lock` consumes the value.
+unsafe impl Send for Pinning {}
+
+impl Pinning {
+    /// **Map `bytes` of pages nothing has written yet**, advised into huge
+    /// pages so that the page-lock at the end of the fill is cheap.
+    ///
+    /// Uninitialized in the sense [`Pinned::mapped_uninit`] is — the kernel
+    /// hands out zeros, and a caller takes this door only on a plan to
+    /// overwrite every byte before reading one.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Device`] naming `mmap`, for a mapping the kernel refused.
+    pub fn uninit(bytes: usize) -> Result<Pinning> {
+        // SAFETY: a fresh private anonymous mapping of a stated length; no fd
+        // and no offset are involved, and the pages belong to nobody else.
+        let at = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                bytes.max(1),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return Err(Fault::Device {
+                call: "mmap",
+                code: -1,
+            });
+        }
+        // Advisory in both directions: a kernel that will not give huge pages
+        // says nothing and the image is locked page by page instead, which is
+        // the cost `Pinning`'s doc measures and not a failure.
+        // SAFETY: the range is the mapping this call just made.
+        unsafe { libc::madvise(at, bytes.max(1), libc::MADV_HUGEPAGE) };
+        Ok(Pinning {
+            host: at.cast(),
+            bytes,
+        })
+    }
+
+    /// The base of the mapping, for the reader that fills it.
+    #[must_use]
+    pub fn host(&self) -> *mut u8 {
+        self.host
+    }
+
+    /// **PAGE-LOCK THE FINISHED IMAGE** — one `cudaHostRegister` over the
+    /// whole mapping, and the device address asked for rather than assumed.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Runtimeless`] without a CUDA runtime, [`Fault::Device`] for
+    /// whatever `cudaHostRegister` or `cudaHostGetDevicePointer` said. **The
+    /// mapping is returned to the kernel on every one of them**, so a refusal
+    /// leaves nothing behind.
+    pub fn lock(self) -> Result<Pinned> {
+        #[cfg(feature = "_cuda")]
+        {
+            use cudarc::runtime::sys as rt;
+
+            if self.bytes == 0 {
+                return Pinned::mapped(0);
+            }
+            // SAFETY: the span is this structure's own mapping, live until
+            // the `forget` below hands it to the `Pinned`.
+            let locked = unsafe {
+                crate::device::ctx::check(
+                    "cudaHostRegister",
+                    rt::cudaHostRegister(self.host.cast(), self.bytes, rt::cudaHostRegisterMapped),
+                )
+            };
+            locked?;
+            let mut device: *mut core::ffi::c_void = core::ptr::null_mut();
+            // SAFETY: `host` is the mapping just registered.
+            let asked = unsafe {
+                crate::device::ctx::check(
+                    "cudaHostGetDevicePointer",
+                    rt::cudaHostGetDevicePointer(&raw mut device, self.host.cast(), 0),
+                )
+            };
+            if asked.is_err() {
+                // SAFETY: undoing the registration this call just made.
+                unsafe { let _ = rt::cudaHostUnregister(self.host.cast()); }
+                asked?;
+            }
+            let host = self.host;
+            let bytes = self.bytes;
+            // The mapping belongs to the `Pinned` from here on, and its `Drop`
+            // is the one that unregisters and unmaps it.
+            core::mem::forget(self);
+            Ok(Pinned {
+                host,
+                device: device as u64,
+                bytes,
+                origin: Origin::Registered,
+            })
+        }
+        #[cfg(not(feature = "_cuda"))]
+        {
+            Err(Fault::Runtimeless)
+        }
+    }
+}
+
+impl Drop for Pinning {
+    fn drop(&mut self) {
+        // SAFETY: unmapping the mapping `Pinning::uninit` made, exactly once —
+        // `lock` forgets the value rather than reaching here.
+        unsafe {
+            libc::munmap(self.host.cast(), self.bytes.max(1));
         }
     }
 }

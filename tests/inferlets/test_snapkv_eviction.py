@@ -45,7 +45,22 @@ ANSWER = "banana"
 #: the model's recall limit and not the policy's (the inferlet's `filler` doc
 #: argues it); `depth: 0.6` lands the needle wholly inside one middle page,
 #: away from both regions a keep-set gets for free.
-COMMON = {"filler": 6, "depth": 0.6}
+COMMON = {"filler": int(os.environ.get("SNAPKV_FILLER", "6")), "depth": 0.6}
+
+#: **THE HAYSTACK IS SIZED IN TOKENS AND THE BUDGET IS SPENT IN PAGES**, and
+#: the two are only commensurable through a number neither this file nor the
+#: inferlet chooses: the deployment's kv page size. At 16-token pages the
+#: default `filler: 6` spans seven pages against a five-page budget and the
+#: two cuts below are real cuts. On a plane that pages at 32 the SAME prompt
+#: is four pages, `KEEPS` is bigger than the whole haystack, and the two gates
+#: that need something to evict fail saying so rather than passing vacuously
+#: — which is the right failure, and not one a bigger tolerance should hide.
+#: `SNAPKV_FILLER` re-sizes the haystack for such a plane. It is a knob on the
+#: FIXTURE and not on the policy: what it moves is how long the prompt is, and
+#: the claims are unchanged. Raising it trades against the model's recall (the
+#: inferlet's `filler` doc argues the limit), so a run that raises it should
+#: check the needle is still answered from the WHOLE cache before reading
+#: anything into the evicted arm.
 
 #: The budget that keeps the needle's page, and the one that does not. Both
 #: are cuts; only one of them is a cut the answer survives.

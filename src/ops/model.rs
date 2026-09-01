@@ -51,13 +51,16 @@ pub enum ModelCmd {
     },
 }
 
-pub fn run(cmd: ModelCmd) -> Result<Answer> {
+pub fn run(cmd: ModelCmd, global: &bootstrap::GlobalArgs) -> Result<Answer> {
     match cmd {
         ModelCmd::List => list(),
         ModelCmd::Info { name } => info(name),
         // `download` and `convert` were both "make this servable", so they are
         // one verb now; `import` fetches when the source is remote.
-        ModelCmd::Import(args) => import::run(args),
+        //
+        // The only arm that takes the globals: it reads the serving config to
+        // prepare the weight tiers of what it just imported (§M wave M-1).
+        ModelCmd::Import(args) => import::run(args, global),
         ModelCmd::Remove { name, yes } => remove(name, yes),
     }
 }
@@ -100,9 +103,9 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
 ///
 /// # And it asks it through the door serving asks it through
 ///
-/// It read the snapshot itself — `model::snapshot::Snapshot::at`, a
+/// It read the snapshot itself — `models::snapshot::Snapshot::at`, a
 /// safetensors header parser lifted out of a baker harness — and handed
-/// `model::identify` a `&dyn Fn(&str) -> Option<shape>` closure over it. Both
+/// `models::identify` a `&dyn Fn(&str) -> Option<shape>` closure over it. Both
 /// are gone (menlo M18/M19), and what replaced them is not a rename: the
 /// runtime's [`identify`](runtime::engine::load::identify) does not match tensor
 /// NAMES, it compiles each candidate's load contract against the checkpoint's
@@ -148,10 +151,17 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     }
     // The plane picks an alignment and a tile budget, neither of which can
     // change whether a tensor's SHAPE is the one a contract declares — which
-    // is the only question a listing asks — so the door's own note applies:
-    // one platform is as good as any, and this listing is a host-side answer
-    // about files, not about a device this machine has.
-    match runtime::engine::load::identify(&snap, runtime::engine::load::Platform::Cuda) {
+    // is the only question a listing asks.
+    //
+    // **BUT ONE PLATFORM IS NO LONGER AS GOOD AS ANY**, and the paragraph
+    // that said so stood here while `Platform::Cuda` was written in (§J4c). A
+    // family's text may declare a `Dtype` PLACEMENT, and a contract read for a
+    // shell that does not serve the arrangement states a `Repack` no device
+    // target carries — so this cell came back "no SKU" for every 4-bit MLX
+    // qwen_3 snapshot on a Metal box, which is a fact about the reading and
+    // not about the file. `this_box` is the setup this binary would serve,
+    // which is the only setup a listing on this machine is about.
+    match runtime::engine::load::identify(&snap, runtime::engine::load::this_box()) {
         Ok(sku) => (true, sku.to_string()),
         // One line, because this is a table cell. The full per-candidate
         // account is what `pie model import` prints when the load is
@@ -174,6 +184,28 @@ pub struct ModelList {
     snapshots_dir: std::path::PathBuf,
     snapshots: Vec<Snapshot>,
     snapshot_bytes: u64,
+    /// **WHAT §M-4 MADE DEAD**, if this box has any of it.
+    ///
+    /// The weight cache held two files per deployment — a `<key>.tiers` a
+    /// prepare wrote and a `<key>.weights` an uncapped boot left behind — and
+    /// since §M-4d a boot reads its planes out of the model's own `.zt` and
+    /// opens neither. They are not stale, not corrupt, and not a cache: they
+    /// are the previous design, and nothing will ever read them again.
+    ///
+    /// Reported because nobody would otherwise find out. These are the largest
+    /// files pie writes — a copy of the model apiece — and an operator who
+    /// upgraded across this wave has them sitting on the disk with no line
+    /// anywhere saying what they are. The disk cost is the whole reason §M-4
+    /// says one artifact.
+    dead: Option<DeadWeight>,
+}
+
+/// The weight-cache files §M-4 retired, and what they cost.
+#[derive(serde::Serialize)]
+struct DeadWeight {
+    dir: std::path::PathBuf,
+    files: usize,
+    bytes: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -304,7 +336,50 @@ impl crate::ui::Report for ModelList {
             ));
         }
         table.print(palette);
+
+        // **AND WHAT NOTHING WILL READ AGAIN.** Last, because it is not a
+        // thing to act on so much as a thing to know: the command names the
+        // directory and the number, and says plainly that deleting it takes
+        // nothing away. It does NOT delete — a hundred gigabytes is not
+        // something a listing removes on its owner's behalf.
+        if let Some(dead) = &self.dead {
+            println!(
+                "\nDead weight ({}, {}):",
+                dead.dir.display(),
+                crate::ui::bytes(dead.bytes)
+            );
+            println!(
+                "  {} file(s) from before the artifact became the serving file. \
+                 A boot reads its planes out of the model's own `.zt` now and \
+                 opens none of these — they are safe to delete, and nothing here \
+                 deletes them.",
+                dead.files,
+            );
+        }
     }
+}
+
+/// The retired weight-cache files on this box, if the directory has any.
+///
+/// `~/.pie/cache/weights` is the default and the only one a listing can know
+/// without a serving config; a deployment that pointed `[model]
+/// weight_cache_dir` somewhere else keeps its own files and this says nothing
+/// about them, which is the honest limit of a command that reads no config.
+fn dead_weight() -> Option<DeadWeight> {
+    let dir = bootstrap::paths::pie_home().join("cache").join("weights");
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(&dir).ok()?.filter_map(|it| it.ok()) {
+        let path = entry.path();
+        let dead = path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("tiers") || extension.eq_ignore_ascii_case("weights")
+        });
+        if dead && path.is_file() {
+            files += 1;
+            bytes += entry.metadata().map_or(0, |meta| meta.len());
+        }
+    }
+    (files > 0).then_some(DeadWeight { dir, files, bytes })
 }
 
 fn list() -> Result<Answer> {
@@ -356,6 +431,7 @@ fn list() -> Result<Answer> {
         snapshots_dir: hub,
         snapshot_bytes: snapshots.iter().map(|s| s.bytes).sum(),
         snapshots,
+            dead: dead_weight(),
     }))
 }
 

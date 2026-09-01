@@ -412,14 +412,37 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             // `GeomKind::RowValid`; this row read i32 only because it was
             // copied off the positions port beside it.
             Attention::PoolBoundaryDecode { .. } | Attention::PoolBoundaryPrefill { .. } => {
-                &[(In(0), I32), (In(1), U8), (Out(0), I32), (Out(1), I32)]
+                &[
+                    (In(0), I32),
+                    (In(1), U8),
+                    (Out(0), I32),
+                    (Out(1), I32),
+                    // The compressed row's rope position, an index like the
+                    // two beside it.
+                    (Out(2), I32),
+                ]
             }
-            Attention::PoolGather { .. } => &[(In(0), I32), (In(1), I32), (In(2), CACHE)],
+            // The state write scatters by the source cache's own write
+            // descriptors, exactly as the appenders beside it do.
+            Attention::PoolStateWrite { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
+            // `ape` rides at In(3) when the compressor states one, so the
+            // three ports above it keep the indices they have always had.
+            Attention::PoolGather { ape: None, .. } => {
+                &[(In(0), I32), (In(1), I32), (In(2), CACHE)]
+            }
+            Attention::PoolGather { ape: Some(_), .. } => {
+                &[(In(0), I32), (In(1), I32), (In(2), CACHE), (In(3), F32)]
+            }
             Attention::PoolKvAppend { .. } => {
                 &[(In(1), I32), (In(2), I32), (In(3), CACHE), (In(4), I32), (In(5), I32)]
             }
             Attention::PoolLse { .. } => {
                 &[(In(1), I32), (In(2), I32), (In(3), CACHE), (Out(1), F32)]
+            }
+            // The selected twin seats the compressed-row ids between the fire
+            // tables and the cache, so the pool space stays the last input.
+            Attention::PoolLseSelected { .. } => {
+                &[(In(1), I32), (In(2), I32), (In(3), I32), (In(4), CACHE), (Out(1), F32)]
             }
             // The hasher reads ids and writes ids; its window cache is the
             // state slab between them.
@@ -432,6 +455,10 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MoeTopkSoftmaxScaled { .. }
             | Linear::MoeTopkSigmoid { .. }
             | Linear::MoeTopkSqrtSoftplus { .. } => &[(Out(0), I32), (Out(1), F32)],
+            // The lookup router lands the same pair off a token-id column and
+            // an I64 table: the ids are the fire's own `RuntimeInput::Tokens`
+            // stream, i32 like every other id column in this table.
+            Linear::MoeHashRoute { .. } => &[(In(0), I32), (Out(0), I32), (Out(1), F32)],
             Linear::MoeMatmulSelect { .. } => &[(In(2), I32)],
             Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
             // The bias-free quantized twin carries no bias port, so `routes`
@@ -453,6 +480,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Linear::MlpSwiglu { .. }
             | Linear::MlpSwigluClamp { .. }
             | Linear::MlpSwigluClampAlpha { .. }
+            | Linear::MlpSwigluClampSplit { .. }
             | Linear::MlpGegluTanh { .. }
             | Linear::MlpGeluTanh { .. }
             | Linear::MlpGegluTanhPacked { .. }
@@ -468,7 +496,10 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
                 &[(In(1), I32)]
             }
             Elementwise::HcRmsnormF32 { .. } => &[(Out(0), F32)],
-            Elementwise::HcGates { .. } => &[(Out(1), F32), (Out(2), F32)],
+            // The mix projection is f32 end to end — the operand the norm
+            // widened, the dynamic plane, and the row the sinkhorn splits.
+            Elementwise::HcProject { .. } => &[(In(0), F32), (In(1), F32), (Out(0), F32)],
+            Elementwise::HcGates { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
             // Per-token math with nothing pinned: the norms, the residual and
             // scaling arithmetic, and the gate take and return the activation
             // dtype they are given.
@@ -485,6 +516,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::RmsnormGatedBy { .. }
             | Elementwise::ResidualAdd { .. }
             | Elementwise::AddBias { .. }
+            | Elementwise::Standardize { .. }
             | Elementwise::MulScalar { .. }
             | Elementwise::Scale { .. }
             | Elementwise::ResBlend { .. }

@@ -166,6 +166,23 @@ fn split_shard_name(path: &Path) -> Option<(String, u32, u32)> {
 }
 
 /// The single `.zt` checkpoint for a snapshot directory, if present.
+///
+/// **TWO SPELLINGS, BECAUSE THE STORE WRITES THE SECOND ONE.** `model.zt` is
+/// this reader's own name for a converted snapshot, and it is what a hand-made
+/// directory holds. `archive.zt` is what `pie model import` puts on disk —
+/// `$PIE_HOME/models/<name>/archive.zt` is the store's whole layout — so a
+/// directory that IS a store entry held a checkpoint this function could not
+/// see, and `discover` fell through to the safetensors arm and answered "no
+/// model.safetensors[.index.json] in <the directory holding the artifact>".
+/// Naming a store entry by its directory is what a `[model].model` path does
+/// when it is not a store NAME, so the miss was reachable from the config file
+/// and not only from a test.
+///
+/// `model.zt` is asked first: a directory holding both is one someone
+/// converted by hand beside a store entry, and the hand-made name is the more
+/// specific statement.
+const ZT_NAMES: [&str; 2] = ["model.zt", "archive.zt"];
+
 fn discover_zt_file(snapshot_dir: &Path) -> Option<PathBuf> {
     if snapshot_dir.is_file()
         && snapshot_dir
@@ -174,8 +191,53 @@ fn discover_zt_file(snapshot_dir: &Path) -> Option<PathBuf> {
     {
         return Some(snapshot_dir.to_path_buf());
     }
-    let named = snapshot_dir.join("model.zt");
-    named.is_file().then_some(named)
+    if let Some(named) = ZT_NAMES
+        .iter()
+        .map(|name| snapshot_dir.join(name))
+        .find(|named| named.is_file())
+    {
+        return Some(named);
+    }
+    // **AND THEN THE SPECIALIZED NAMES** (§M-4). `pie model import` names a
+    // servable artifact for what it is —
+    // `<slug>.<sku>.<backend>-tp<n>.<precision>.zt` — because one model at two
+    // quantizations, or converted for two shells, is two files that must be
+    // able to sit in one directory. There is no fixed name to look for, so the
+    // directory is read.
+    //
+    // **EXACTLY ONE, OR NONE.** Coexistence is the whole point of the naming,
+    // so a directory holding two specializations is the case this was built
+    // for and picking one of them would be answering a question the operator
+    // has not been asked. `[model] model` takes a path as readily as a store
+    // name, so naming the file is the operator's move and this refuses to make
+    // it for them.
+    let mut found = specialized_zt_files(snapshot_dir);
+    (found.len() == 1).then(|| found.remove(0))
+}
+
+/// Every `*.zt` in `snapshot_dir` that is not one of [`ZT_NAMES`], sorted.
+///
+/// Split out from [`discover_zt_file`] so the AMBIGUOUS case can be named
+/// rather than fallen through. A directory with two specializations in it is
+/// the case the naming exists FOR, and answering it with "no
+/// model.safetensors" — which is what the next arm says — tells an operator
+/// their model is missing when it is present twice.
+fn specialized_zt_files(snapshot_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(snapshot_dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zt"))
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 /// Parse a checkpoint's headers into a [`Metadata`]. Only headers are read;
@@ -251,6 +313,31 @@ enum Discovered {
 fn discover(snapshot_dir: &Path) -> Result<Discovered, Error> {
     if let Some(zt) = discover_zt_file(snapshot_dir) {
         return Ok(Discovered::One(zt));
+    }
+    // **TWO SPECIALIZATIONS IS THE CASE THE NAMING EXISTS FOR, AND IT IS
+    // NAMED** (§M-4). `pie model import` writes
+    // `<slug>.<sku>.<backend>-tp<n>.<precision>.zt` precisely so one model at
+    // two quantizations, or converted for two shells, can sit in one
+    // directory. Picking one of them would answer a question the operator has
+    // not been asked, and falling through to the arm below answers it with
+    // "no model.safetensors" — telling them the model is missing when it is
+    // present twice.
+    let specialized = specialized_zt_files(snapshot_dir);
+    if specialized.len() > 1 {
+        return Err(Error::Checkpoint(format!(
+            "{} holds {} serving artifacts and this load names none of them: {}. \
+             Two artifacts of one model is what the naming is for — a different \
+             backend, degree or precision — so `[model] model` has to name the \
+             file rather than the directory.",
+            snapshot_dir.display(),
+            specialized.len(),
+            specialized
+                .iter()
+                .filter_map(|path| path.file_name())
+                .map(|name| format!("`{}`", name.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )));
     }
     if snapshot_dir.is_file() {
         // A file names itself; detection is the projections' job, not a
@@ -420,6 +507,24 @@ mod tests {
                 dir.join("model-00002.safetensors"),
             ]
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **THE NAME `pie model import` ACTUALLY WRITES.** A store entry is a
+    /// directory holding `archive.zt` and nothing else, so a directory named
+    /// as a checkpoint had to find that file or fall through to the
+    /// safetensors arm and report the artifact's own directory as holding no
+    /// model.
+    #[test]
+    fn a_store_entrys_archive_is_the_directorys_checkpoint() {
+        let dir = tmpdir("store_archive");
+        std::fs::write(dir.join("archive.zt"), b"ZT").unwrap();
+        assert_eq!(discover_zt_file(&dir), Some(dir.join("archive.zt")));
+        // And the hand-made name still wins where both are present: someone
+        // who converted a snapshot beside a store entry meant the one they
+        // named.
+        std::fs::write(dir.join("model.zt"), b"ZT").unwrap();
+        assert_eq!(discover_zt_file(&dir), Some(dir.join("model.zt")));
         std::fs::remove_dir_all(&dir).ok();
     }
 

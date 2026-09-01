@@ -231,9 +231,9 @@ fn ready(what: &str) -> Option<(PathBuf, PathBuf)> {
 
 /// One load, through the same door production comes through.
 fn load(checkpoint: &Path, container: &Path, cache_dir: Option<&Path>) -> Shell {
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index(container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
     Shell::load(Boot {
@@ -254,7 +254,7 @@ fn load(checkpoint: &Path, container: &Path, cache_dir: Option<&Path>) -> Shell 
         // and recording a graph would only cost the gate time.
         graphs: Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         weight_cache_dir: cache_dir,
     })

@@ -23,7 +23,7 @@
 //! disagreed about is not expressible.
 
 use crate::error::{Error, OrOverflow};
-use crate::types::{Axis, DType, Encoding, RepackLayout, RepackSpec};
+use crate::types::{Axis, DType, Encoding, RepackLayout, RepackSpec, TILED_BAND, TILED_STEP};
 
 use super::compile;
 use super::{BiasBy, Expr, Partition, ScaleFactor, TensorType, local_range, resolve_extents};
@@ -940,6 +940,16 @@ pub(crate) fn repack_spec(
     layout: RepackLayout,
     to: &TensorType,
 ) -> Result<RepackSpec, Error> {
+    // **THE RANK A `to` CARRIES, WHICH IS THE LAYOUT'S AND NOT THE ALGEBRA'S.**
+    // The two marlin rows repack an EXPERT BANK, so their declaration is
+    // `[batch, rows, cols]` and the leading extent is the bank. The two tiled
+    // affine rows repack a DENSE PROJECTION, which has no such axis; a leading
+    // `1` there would be a dimension a contract and a plan could disagree
+    // about, so their declaration is the `[rows, cols]` the weight already is.
+    let to_rank: usize = match layout {
+        RepackLayout::MarlinMxfp4Weight | RepackLayout::MarlinMxfp4Scale => 3,
+        RepackLayout::TiledAffineU4Weight | RepackLayout::TiledAffineFactor => 2,
+    };
     // What each layout's operand looks like, and how many columns that is. The
     // column count is the logical one -- MXFP4 groups of 32 for a weight -- so
     // that a target's padding is comparable to it.
@@ -962,25 +972,78 @@ pub(crate) fn repack_spec(
             }
             (3, ty.shape[2])
         }
+        // **THE CONTRACTION IS A WHOLE NUMBER OF STEPS**, which is the one
+        // geometric fact the kernel cannot pad its way out of: it walks `k`
+        // sixty-four at a time with no tail step, and the repacked plane
+        // groups its words by the same sixty-four. Every projection width a
+        // serving checkpoint brings is a multiple of it.
+        RepackLayout::TiledAffineU4Weight => {
+            if ty.rank() != 2 {
+                return Err(Error::Contract(format!(
+                    "TiledAffineU4Weight Repack operand must be [rows, k], got {:?}",
+                    ty.shape
+                )));
+            }
+            if ty.shape[1] % i64::from(TILED_STEP) != 0 {
+                return Err(Error::Contract(format!(
+                    "TiledAffineU4Weight Repack reads a {}-wide row, which is not a whole \
+                     number of {TILED_STEP}-wide contraction steps",
+                    ty.shape[1]
+                )));
+            }
+            (2, ty.shape[1])
+        }
+        RepackLayout::TiledAffineFactor => {
+            if ty.rank() != 2 {
+                return Err(Error::Contract(format!(
+                    "TiledAffineFactor Repack operand must be [rows, groups], got {:?}",
+                    ty.shape
+                )));
+            }
+            (2, ty.shape[1])
+        }
     };
     debug_assert_eq!(ty.rank(), want_rank);
-    if to.rank() != 3 {
+    if to.rank() != to_rank {
         return Err(Error::Contract(format!(
-            "Repack declares {:?}; a repack produces [batch, rows, cols]",
-            to.shape
+            "Repack declares {:?}; a {layout:?} repack produces {}",
+            to.shape,
+            if to_rank == 3 { "[batch, rows, cols]" } else { "[rows, cols]" }
         )));
     }
-    let (batch, rows) = (ty.shape[0], ty.shape[1]);
-    if to.shape[0] != batch {
+    let (batch, rows) = if to_rank == 3 {
+        (ty.shape[0], ty.shape[1])
+    } else {
+        (1, ty.shape[0])
+    };
+    if to_rank == 3 && to.shape[0] != batch {
         return Err(Error::Contract(format!(
             "Repack operand has batch {batch} but declares {:?}",
             to.shape
         )));
     }
+    // The two trailing extents, wherever the layout put them.
+    let (to_rows, to_cols) = (to.shape[to_rank - 2], to.shape[to_rank - 1]);
+    // **AND THE PADDING IS THE BAND QUANTUM, EXACTLY.** A tiled affine plane
+    // pads its rows up to a whole 16-column mma band and not one row further:
+    // the kernel carves its grid off the target's row count, so a target
+    // larger than the band quantum would launch blocks reading codes nothing
+    // wrote.
+    if to_rank == 2 {
+        let banded = rows
+            .checked_add(i64::from(TILED_BAND) - 1)
+            .map_or(rows, |up| up / i64::from(TILED_BAND) * i64::from(TILED_BAND));
+        if to_rows != banded {
+            return Err(Error::Contract(format!(
+                "{layout:?} Repack of {rows} rows lands {banded} -- the next whole \
+                 {TILED_BAND}-column band -- and declares {to_rows}"
+            )));
+        }
+    }
     // Padding only. A target smaller than its source is a truncation the
     // algebra can say -- `Expr::Slice` on the operand -- so a kernel doing it
     // silently would be the same fact stated twice, and wrong once.
-    if to.shape[1] < rows || to.shape[2] < cols {
+    if to_rows < rows || to_cols < cols {
         return Err(Error::Contract(format!(
             "Repack declares {:?}, smaller than the [{batch}, {rows}, {cols}] it \
              reads; narrow the operand instead",
@@ -999,7 +1062,7 @@ pub(crate) fn repack_spec(
     // shape was checked just above and whose element width was not. A repack
     // naming a wider encoding over-allocated in silence; one naming a narrower
     // encoding under-allocated and the kernel wrote past the end.
-    let source_bits = row_bits(&ty.shape[2..], &ty.encoding, "Repack operand")?;
+    let source_bits = row_bits(&ty.shape[to_rank - 1..], &ty.encoding, "Repack operand")?;
     let target_bits = element_bits(&to.encoding).ok_or_else(|| {
         Error::Contract(format!(
             "Repack declares {:?}, which has no fixed element width",
@@ -1019,9 +1082,9 @@ pub(crate) fn repack_spec(
         layout,
         batch: dim_u32(batch, "Repack batch")?,
         source_rows: dim_u32(rows, "Repack source rows")?,
-        target_rows: dim_u32(to.shape[1], "Repack target rows")?,
+        target_rows: dim_u32(to_rows, "Repack target rows")?,
         source_cols: dim_u32(cols, "Repack source columns")?,
-        target_cols: dim_u32(to.shape[2], "Repack target columns")?,
+        target_cols: dim_u32(to_cols, "Repack target columns")?,
     })
 }
 

@@ -64,7 +64,7 @@
 //!
 //! So: a typed decline at the router beats a wrong graph at the replay, and
 //! the EAGER walk serves these loads today — counted, not silent
-//! (`record::BodyStats::eager_rotating`, and the boot line `Shell::load`
+//! (`record::BodyTally::eager_rotating`, and the boot line `Shell::load`
 //! prints when a load arms a rotor under a recording mode).
 //!
 //! # What is NOT rotated, and why that is not a failure
@@ -794,7 +794,7 @@ mod tests {
     /// The W-2 rig's own model and its own budget: two fifths of the table,
     /// which is what `a_spilled_dense_model_says_what_it_said` loads.
     fn rig() -> (model_ir::Trace, model_compiler::CompiledModel, Plan) {
-        let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+        let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
         let compiled = compile_axes(
             &trace,
             &Budgets {

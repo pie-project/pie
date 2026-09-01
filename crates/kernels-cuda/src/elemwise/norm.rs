@@ -460,6 +460,62 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> 
     )
 }
 
+/// `out = (out - bias) * scale` per row, in place on `out`, both planes
+/// `[width]` — `vision_config.standardize`'s own line.
+///
+/// The difference is taken and scaled in f32 and rounded once, at the store:
+/// the pooler's `√hidden` has already expanded the magnitude and this is what
+/// brings it back, so where `out` and `bias` nearly cancel the surviving
+/// number is many ulps of what a composed spelling would have rounded away.
+///
+/// # Errors
+///
+/// [`Error::DtypeUnsupported`] for anything but bf16 and f16; a refusal for a
+/// plane that is not one row of the rectangle's own width and element, for an
+/// empty rectangle, and for an extent past a 32-bit launch.
+pub fn standardize(
+    ctx: &Ctx,
+    bias: Tensor,
+    scale: Tensor,
+    out: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.standardize";
+    let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    nonzero(OP, "rows", out.rows)?;
+    let width = stated(OP, nonzero(OP, "the standardized row's width", out.width)?)?;
+    // **BOTH PLANES ARE PER-COLUMN**, which is the whole difference from
+    // `scale`'s one device-held scalar — so a plane of the wrong width is a
+    // silent misread of every column past the first, and gets a refusal.
+    for (what, plane) in [("bias", bias), ("scale", scale)] {
+        if plane.dtype != out.dtype {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the {what} plane is {:?} and the rows it standardizes are {:?}; \
+                     both planes ride the activation's element",
+                    plane.dtype, out.dtype
+                ),
+            ));
+        }
+        if plane.elements() != u64::from(out.width) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "the {what} plane is a {} x {} plane, and this row reads one \
+                     scalar per column of a {}-wide rectangle",
+                    plane.rows, plane.width, out.width
+                ),
+            ));
+        }
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::standardize<{t}>")))
+            .apply(route_rows(out.rows, out.width)),
+        &[out.arg(), bias.arg(), scale.arg(), width.arg()],
+    )
+}
+
 /// `x *= s` for a plan-stated scalar, in place on `x`.
 /// `silu(s * x)`, in place.
 pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {

@@ -66,6 +66,16 @@ model-compiler = { path = "../model-compiler" }
 # `plan::compile` and the `Execution` that runs it against the checkpoint.
 checkpoint = { path = "../checkpoint" }
 
+# `mmap`/`munmap`/`msync`/`madvise`/`fstat`, for `host_source.rs` alone — the
+# streamed tier's source is a mapping of an unlinked temporary file so that the
+# kernel may reclaim it, and there is no std spelling of any of those five.
+# NOT target-gated the way the Metal crates below are: this is POSIX and not
+# Apple, and the whole point of the module is a property (a file-backed page is
+# reclaimable, an anonymous one is only swappable) that Linux and darwin state
+# the same way — so the module type-checks and its unit gates run on the
+# workspace sweep, on the box that has no GPU.
+libc = "0.2"
+
 # Metal itself, and the two crates it is spoken through. TARGET-gated rather
 # than feature-gated, which is the one place this manifest diverges from
 # `engine-cuda`'s and for a reason that is not a preference: a CUDA runtime
@@ -118,12 +128,18 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 # The smoke's catalog row and its load contract. A DEV dependency on purpose:
 # the runtime traces and hands a `Plan` and a `ModelContract` across (design
 # §7, decision #18), so the shell itself must not know a model family.
-model = { path = "../model" }
+models = { path = "../models" }
 # `Platform`, and the `Facts`/`Request` pair the smoke computes each lane's
 # word with — `Classify::of`, runtime-side in production.
 model-dsl = { path = "../model-dsl" }
 # The prompt in, the continuation out.
 tokenizer = { path = "../tokenizer" }
+# ONE reader: `two_bit_moe_first_light` parses the DQ snapshot's safetensors
+# header so its census is held against the artifact's own rectangles rather
+# than against a table typed beside the assertion. A dev dependency for the
+# same reason `model` is one — the shell reads checkpoints through a contract
+# and never a header.
+serde_json = "1"
 # The checkpoint container the import contract is checked against, and the
 # projection that lets a stock safetensors snapshot BE one.
 ztensor = { workspace = true }

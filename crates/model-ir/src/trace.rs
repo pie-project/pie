@@ -16,6 +16,99 @@ pub enum Platform {
     Vulkan,
 }
 
+impl Platform {
+    /// **THE ONE SPELLING OF THIS SHELL'S NAME**, for everything that writes
+    /// it down or compares it as text.
+    ///
+    /// `checkpoint::serving::Stamp::backend` is a STRING and it is compared
+    /// field by field, so an import that wrote `"cuda"` against a boot that
+    /// expected `"Cuda"` would refuse every artifact this build ever wrote,
+    /// and the refusal would name a field neither side chose. Two callers
+    /// spelling one enum is exactly the disagreement `Stamp::of` exists to
+    /// stop for the policy fields, and the backend is the same hazard one
+    /// level down.
+    ///
+    /// Lowercase because that is what the artifacts already on disk say and
+    /// what `serving::Name` puts in a filename, where a capital would be
+    /// unusual and a `-tp1` neighbour makes case matter.
+    #[must_use]
+    pub fn backend(self) -> &'static str {
+        match self {
+            Platform::Cuda => "cuda",
+            Platform::Metal => "metal",
+            Platform::Wgpu => "wgpu",
+            Platform::Vulkan => "vulkan",
+        }
+    }
+
+    /// **A PLACEMENT IS RESOLVED AGAINST THE SETUP THAT WILL READ IT** — this
+    /// dtype for a platform whose kernels read the arrangement, and the
+    /// [`canonical`](Dtype::canonical) sibling for one that does not.
+    ///
+    /// **WHY IT IS A FUNCTION AND NOT A DECLARATION.** `Dtype::placed` names
+    /// a variant whose identity is an ARRANGEMENT of some other variant's
+    /// bytes — same algebra, same group, same companions, different order
+    /// (`dtype::Dtype::U4g64tiled`). A model text states the arrangement it
+    /// wants because only a text knows WHICH weights the arrangement is legal
+    /// on: `U4g64tiled` serves `y = act x W^T` over a two-dimensional weight
+    /// and nothing else, so the embedding's gather, the routed expert banks
+    /// and the MTP draft slices are left row-major by name. But a text does
+    /// not know which SHELL is about to serve, and the arrangement is only an
+    /// arrangement — a kernel that cannot read it computes finite,
+    /// deterministic nonsense off the same bytes. So the text says WHICH
+    /// weights may be placed and this says WHETHER, and the two answers meet
+    /// at the one moment a `Platform` and a `Weight` are both in hand
+    /// (`model_dsl::place`).
+    ///
+    /// **AND THAT IS §M's OWN RULING ONE STEP FURTHER IN.** A `.zt` artifact
+    /// is setup-specific — "a tier key is a function of the RECIPE — backend,
+    /// tensor parallelism, precision" — so a CUDA import legitimately writes
+    /// tiled where a Metal import writes row-major, off ONE model text. This
+    /// is the function that makes them differ.
+    ///
+    /// **THE TABLE, AND WHERE EACH ROW'S FACT LIVES.**
+    ///
+    /// - `Cuda` reads `U4g64tiled`: `kernels_cuda::linear::tiled` is the point
+    ///   written for it, and `dtype`'s `TILED_BAND`/`TILED_STEP` mirror its
+    ///   `BAND` and contraction step beside the variant that names the layout.
+    /// - `Metal` does not: `kernels_metal::linear::quant`'s qmm and qmv arms
+    ///   index an affine bank ROW-MAJOR and have no fragment-order twin, which
+    ///   `engine_metal::weights::readable_plane_orders` states as a refusal
+    ///   for anything that reaches it anyway.
+    /// - `Wgpu` and `Vulkan` do not: neither shell has an affine point at all,
+    ///   let alone a placed one.
+    ///
+    /// A dtype that is not placed is returned unchanged for every platform,
+    /// which is every dtype but one today — so this is the identity on the
+    /// whole catalog except where a text asked for an arrangement. **THE
+    /// MATCH IS PER PLACED VARIANT AND ITS TAIL ASSERTS THAT**: the next
+    /// placed variant added to `Dtype` trips the `debug_assert` below in
+    /// every test run rather than defaulting to "every shell reads it", which
+    /// is the one wrong answer that is silent.
+    #[must_use]
+    pub fn reads_placement(self, dtype: Dtype) -> bool {
+        match dtype {
+            Dtype::U4g64tiled => matches!(self, Platform::Cuda),
+            other => {
+                debug_assert!(!other.placed(), "{other:?} is placed and has no row here");
+                true
+            }
+        }
+    }
+
+    /// [`reads_placement`](Platform::reads_placement) as the resolution it
+    /// exists for: the dtype a declaration of `dtype` RESOLVES TO on this
+    /// platform.
+    #[must_use]
+    pub fn placement(self, dtype: Dtype) -> Dtype {
+        if self.reads_placement(dtype) {
+            dtype
+        } else {
+            dtype.canonical()
+        }
+    }
+}
+
 /// How a param is laid out across ranks. Traces are SPMD; `Cut` carries the
 /// per-rank segment lengths along the cut axis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

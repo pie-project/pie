@@ -9,7 +9,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/pool.cuh";
@@ -42,13 +42,23 @@ fn pooling_ratio(op: &'static str, ratio: u32) -> Result<i32, Error> {
     count(op, "the pooling ratio this statement states", ratio)
 }
 
-/// The boundary kernels' rope-position side channel: token-shaped scratch
-/// no later op reads back host-side.
-fn boundary_rope(ctx: &Ctx, op: &'static str, rows: u32) -> Result<ArgValue, Error> {
-    let bytes = rows as usize * core::mem::size_of::<i32>();
-    Ok(ArgValue::Ptr(
-        ctx.scratch(op, "attn.pool_boundary_rope", bytes)? as usize as u64,
-    ))
+/// The boundary kernels' third column: the compressed row's rope position,
+/// `(p / ratio) * ratio` — the block's FIRST token, which is where
+/// `compressor_prefill` ropes the pooled entry (`rows = arange(0, cutoff,
+/// ratio)`), and NOT `boundary_pos`'s closing cell. This plane computed it
+/// from the day the kernels landed and dropped it into scratch, because the
+/// op published no seat for it; it publishes one now, so the column is an
+/// operand and the model text ropes at it.
+fn boundary_rope_table(op: &'static str, boundary_pos: &Tensor, boundary_rope: &Tensor) {
+    debug_assert_eq!(
+        boundary_rope.dtype,
+        Dtype::I32,
+        "`{op}` writes i32 compressed-row rope positions"
+    );
+    debug_assert_eq!(
+        boundary_pos.rows, boundary_rope.rows,
+        "`{op}`'s rope column is one entry per token row"
+    );
 }
 
 fn boundary_tables(op: &'static str, boundary_pos: &Tensor, boundary_req: &Tensor) {
@@ -71,6 +81,7 @@ fn boundary_tables(op: &'static str, boundary_pos: &Tensor, boundary_req: &Tenso
 /// Marks which decode rows close a pooling boundary. `row_valid` (the
 /// CUDA-graph padding mask) is the op's own named input now — the seam that
 /// used to smuggle it in from fire state is closed.
+#[allow(clippy::too_many_arguments)]
 pub fn boundary_decode(
     ctx: &Ctx,
     positions: Tensor,
@@ -78,12 +89,13 @@ pub fn boundary_decode(
     ratio: u32,
     boundary_pos: &mut Tensor,
     boundary_req: &mut Tensor,
+    boundary_rope: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.pool_boundary_decode";
     boundary_tables(OP, boundary_pos, boundary_req);
+    boundary_rope_table(OP, boundary_pos, boundary_rope);
     let ratio = pooling_ratio(OP, ratio)?;
     let rows = count(OP, "rows", boundary_pos.rows)?;
-    let out_rope = boundary_rope(ctx, OP, boundary_pos.rows)?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::pool_boundary_decode<::pie::i32>")
@@ -92,7 +104,7 @@ pub fn boundary_decode(
             positions.arg(),
             boundary_pos.arg(),
             boundary_req.arg(),
-            out_rope,
+            boundary_rope.arg(),
             rows.arg(),
             ratio.arg(),
             row_valid.arg(),
@@ -103,6 +115,7 @@ pub fn boundary_decode(
 /// The prefill twin: boundaries within each request's ragged span, the
 /// op-named `row_valid` masking as in `boundary_decode`; the fire indptr
 /// rides in `positions`.
+#[allow(clippy::too_many_arguments)]
 pub fn boundary_prefill(
     ctx: &Ctx,
     positions: RaggedTensor,
@@ -110,13 +123,14 @@ pub fn boundary_prefill(
     ratio: u32,
     boundary_pos: &mut Tensor,
     boundary_req: &mut Tensor,
+    boundary_rope: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.pool_boundary_prefill";
     boundary_tables(OP, boundary_pos, boundary_req);
+    boundary_rope_table(OP, boundary_pos, boundary_rope);
     let ratio = pooling_ratio(OP, ratio)?;
     let rows = count(OP, "rows", boundary_pos.rows)?;
     let num_requests = kv::lanes_of(OP, positions.indptr)?;
-    let out_rope = boundary_rope(ctx, OP, boundary_pos.rows)?;
     ctx.fire(
         OP,
         Fire::at(FILE, "::pie::attn::pool_boundary_prefill<::pie::i32>")
@@ -126,7 +140,7 @@ pub fn boundary_prefill(
             positions.indptr.arg(),
             boundary_pos.arg(),
             boundary_req.arg(),
-            out_rope,
+            boundary_rope.arg(),
             rows.arg(),
             num_requests.arg(),
             ratio.arg(),
@@ -135,10 +149,78 @@ pub fn boundary_prefill(
     )
 }
 
+/// **THE ROLLING STATE'S WRITER.** `kv` is the compressor's `wkv · x` and
+/// `score` its `wgate · x`, both `[rows, coff * head_dim]`; each row is
+/// scattered into the cell `write_page`/`write_offset` name for it — the
+/// SOURCE cache's own slot, which is the cell the latent appender writes in
+/// the same fire.
+///
+/// **THIS IS THE OP THAT MAKES [`gather`] POOL SOMETHING**: the two state
+/// slabs are a seam the shell owns and no IR value names, and until this
+/// entry existed nothing wrote a byte of either.
+///
+// MENLO-SEAM: as `gather` below — the slabs stay seam arguments, because
+// they are addressed by the cache's cell and not by the fire's row.
+#[allow(clippy::too_many_arguments)]
+pub fn state_write(
+    ctx: &Ctx,
+    kv: Tensor,
+    score: Tensor,
+    pages: &KvPool,
+    write_page: Tensor,
+    write_offset: Tensor,
+    head_dim: u32,
+    ratio: u32,
+    state_kv: Tensor,
+    state_score: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attention.pool_state_write";
+    dtype_dispatch!(OP, kv.dtype, { Bf16 => () });
+    let ratio = pooling_ratio(OP, ratio)?;
+    let coff = compressor_coff(ratio);
+    let head_dim = count(OP, "the head width this compressor states", head_dim)?;
+    let width = head_dim * coff;
+    if kv.width != width.unsigned_abs() || score.width != width.unsigned_abs() {
+        return Err(refuse(
+            OP,
+            format!(
+                "a ratio-{ratio:?} compressor projects coff x head width = {width} \
+                 columns; the pair handed over is {} and {}",
+                kv.width, score.width
+            ),
+        ));
+    }
+    let pitch = count(OP, "the state plane's row pitch", state_kv.width)?;
+    if state_score.width != state_kv.width {
+        return Err(refuse(
+            OP,
+            "the two state slabs are one plane laid at one pitch",
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(FILE, "::pie::attn::pool_state_write<::pie::bf16>")
+            .apply(route_rows(kv.rows, width.unsigned_abs())),
+        &[
+            kv.arg(),
+            score.arg(),
+            state_kv.arg(),
+            state_score.arg(),
+            write_page.arg(),
+            write_offset.arg(),
+            width.arg(),
+            pages.page_size.arg(),
+            pitch.arg(),
+        ],
+    )
+}
+
 /// Pools the closing window out of the kv cache into per-boundary entries.
 ///
-// MENLO-SEAM: the pooled compressor state (`state_kv`, `state_score`, `ape`)
-// has no IR seat; the engine binds the slabs it staged for this cache.
+// MENLO-SEAM: the pooled compressor state (`state_kv`, `state_score`) has no
+// IR seat; the engine binds the slabs it staged for this cache. `ape` DOES
+// have one now — it is a checkpoint plane and not shell scratch — and the
+// arm hands over the shell's absent seat when the compressor states none.
 #[allow(clippy::too_many_arguments)]
 pub fn gather(
     ctx: &Ctx,
@@ -184,6 +266,9 @@ pub fn gather(
             ratio.arg(),
             coff.arg(),
             pages.page_size.arg(),
+            // The plane's ROW PITCH, which is not always this gather's own
+            // `coff * head_dim` — see the shader's note.
+            count(OP, "the state plane's row pitch", state_kv.width)?.arg(),
         ],
     )
 }

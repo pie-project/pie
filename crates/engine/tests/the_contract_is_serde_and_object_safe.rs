@@ -157,12 +157,13 @@ fn every_noun_round_trips() {
     assert_eq!(
         per_row.lanes[0].mask.as_ref().and_then(|m| m.of_row(3)),
         Some(&windowed[3]),
-        "row 3 reads row 3's mask, and the silent row-zero substitution this          form replaced is exactly what that must not be"
+        "row 3 reads row 3's mask, and the silent row-zero substitution this form replaced is \
+         exactly what that must not be"
     );
     assert_eq!(
         Masking::Extent(Mask::new(vec![0, 5], 5)).of_row(4),
         Some(&Mask::new(vec![0, 5], 5)),
-        "an extent mask describes every row, which is what `over the extent`          means"
+        "an extent mask describes every row, which is what `over the extent` means"
     );
 
     // And a count that is not the lane's row count is the one thing about a
@@ -305,6 +306,8 @@ fn every_noun_round_trips() {
 #[test]
 fn the_plan_crosses_the_boundary() {
     let request = LoadRequest {
+        tp_size: 1,
+        precision: "bf16".to_string(),
         trace: model_ir::Trace {
             name: "qwen3-0.8b".into(),
             platform: model_ir::Platform::Cuda,
@@ -364,6 +367,8 @@ fn residency_is_two_budgets_and_uncapped_is_the_default() {
     // deleting the key, so the shape is the contract's own rather than a
     // hand-written guess at it.
     let request = LoadRequest {
+        tp_size: 1,
+        precision: "bf16".to_string(),
         trace: model_ir::Trace {
             name: "qwen3-0.8b".into(),
             platform: model_ir::Platform::Cuda,

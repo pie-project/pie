@@ -12,7 +12,10 @@
 //! are the typed IR, this crate is the pen that writes in it.
 
 use checkpoint::contract::{Expr, ModelContract, Scales, TensorContract, TensorType};
-use checkpoint::types::{Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, ScaleForm};
+use checkpoint::types::{
+    Axis, DType, Encoding, QuantGranularity, QuantScheme, QuantSpec, RepackLayout, ScaleForm,
+    TILED_BAND,
+};
 use model_dsl::{Dtype, Shard, Weight};
 
 /// Why a read refused: the checkpoint lacks the name, states it in terms no
@@ -78,6 +81,14 @@ impl<'a> Builder<'a> {
     /// stores whole weights and each rank reads its band. The other verbs
     /// read foreign checkpoints, which are imported whole: they refuse
     /// `tp > 1`.
+    ///
+    /// "The other verbs" is a statement about what a verb DOES and not about
+    /// which one was called. Each of them first asks
+    /// [`holds_the_landed_plane`](Builder::holds_the_landed_plane), and a
+    /// file that already holds the weight under its own name is read own —
+    /// so one `Builder` reads a foreign checkpoint and a native artifact in
+    /// the same pass, weight by weight, which is exactly what an artifact
+    /// holding SOME landed planes and copying the rest through requires.
     #[must_use]
     pub fn new(src: &'a ztensor::Source, tp: u32) -> Builder<'a> {
         Builder {
@@ -100,13 +111,16 @@ impl<'a> Builder<'a> {
     /// **THE TRIPLET IS REQUIRED, NOT PREFERRED.** A weight declared `U4g64`
     /// against a checkpoint that ships bf16 could instead let the LOADER
     /// encode — which is a real and wanted path through `read_own`, and a
-    /// disaster through `model::identify`: the u4 SKU would claim every bf16
+    /// disaster through `models::identify`: the u4 SKU would claim every bf16
     /// checkpoint of its own family, and being listed ahead of the bf16 row
     /// (which it must be, see `qwen_3::IMPORTS`) it would claim it first. An
     /// import states what the FILE holds, so a missing `.scales` is a miss
     /// and the next row gets its turn.
     pub fn read(&mut self, w: &Weight, from: impl Into<String>) -> Result<(), Error> {
-        self.whole_checkpoint(w);
+        if self.holds_the_landed_plane(w) {
+            return self.read_own(w);
+        }
+        self.whole_checkpoint(w)?;
         let read = planes(self.src, w, from)?;
         self.tensors.extend(read);
         Ok(())
@@ -125,7 +139,10 @@ impl<'a> Builder<'a> {
         w: &Weight,
         parts: impl IntoIterator<Item = String>,
     ) -> Result<(), Error> {
-        self.whole_checkpoint(w);
+        if self.holds_the_landed_plane(w) {
+            return self.read_own(w);
+        }
+        self.whole_checkpoint(w)?;
         let read = planes_fused(self.src, w, parts)?;
         self.tensors.extend(read);
         Ok(())
@@ -150,7 +167,10 @@ impl<'a> Builder<'a> {
         from: impl Into<String>,
         stored: Dtype,
     ) -> Result<(), Error> {
-        self.whole_checkpoint(w);
+        if self.holds_the_landed_plane(w) {
+            return self.read_own(w);
+        }
+        self.whole_checkpoint(w)?;
         let read = dequant_planes(self.src, w, vec![from.into()], stored)?;
         self.tensors.extend(read);
         Ok(())
@@ -165,8 +185,65 @@ impl<'a> Builder<'a> {
         parts: impl IntoIterator<Item = String>,
         stored: Dtype,
     ) -> Result<(), Error> {
-        self.whole_checkpoint(w);
+        if self.holds_the_landed_plane(w) {
+            return self.read_own(w);
+        }
+        self.whole_checkpoint(w)?;
         let read = dequant_planes(self.src, w, parts.into_iter().collect(), stored)?;
+        self.tensors.extend(read);
+        Ok(())
+    }
+
+    /// **READ AN MLX AFFINE TRIPLET AND RELAY IT** (§J4b) — the same three
+    /// planes [`read`](Builder::read) binds, put into the m16n8k16 fragment
+    /// order `kernels_cuda::linear::tiled` reads before they are written.
+    ///
+    /// The one verb that states an [`Expr::Repack`], and it is an IMPORT
+    /// verb: no device mask admits one, so a contract carrying this compiles
+    /// at the conversion target and is refused, with the layout and the
+    /// command named, on any serving load that reaches it. What runs it is
+    /// `pie model import`, once per weight.
+    ///
+    /// `w` must be declared [`Dtype::U4g64tiled`] — the declaration is what
+    /// says which order the artifact will hold, and stating a repack over a
+    /// weight declared row-major would write bytes no reader of that
+    /// declaration can read.
+    ///
+    /// # Errors
+    ///
+    /// [`read`](Builder::read)'s, plus a weight not declared tiled.
+    pub fn read_repack(&mut self, w: &Weight, from: impl Into<String>) -> Result<(), Error> {
+        if self.holds_the_landed_plane(w) {
+            return self.read_own(w);
+        }
+        self.whole_checkpoint(w)?;
+        let read = tiled_planes(self.src, w, vec![from.into()])?;
+        self.tensors.extend(read);
+        Ok(())
+    }
+
+    /// [`read_repack`](Builder::read_repack) over parts, joined at the
+    /// weight's declared seams before the relabelling —
+    /// [`read_concat`](Builder::read_concat)'s rule, relaid.
+    ///
+    /// The join comes FIRST and the repack second, which is the only order
+    /// that means anything: the fragment map is a function of the whole
+    /// bank's column count, so repacking two legs and concatenating the
+    /// answers would interleave two lane maps.
+    ///
+    /// # Errors
+    ///
+    /// [`read_repack`](Builder::read_repack)'s.
+    pub fn read_repack_concat(
+        &mut self,
+        w: &Weight,
+        parts: impl IntoIterator<Item = String>,
+    ) -> Result<(), Error> {
+        if self.holds_the_landed_plane(w) {
+            return self.read_own(w);
+        }
+        self.whole_checkpoint(w)?;
+        let read = tiled_planes(self.src, w, parts.into_iter().collect())?;
         self.tensors.extend(read);
         Ok(())
     }
@@ -180,8 +257,54 @@ impl<'a> Builder<'a> {
     /// agree on one stored representation, and the conversion between stored
     /// and declared walks the same ladder [`read`](Builder::read) walks.
     pub fn read_expr(&mut self, w: &Weight, expr: Expr) -> Result<(), Error> {
-        self.whole_checkpoint(w);
+        if self.holds_the_landed_plane(w) {
+            return self.read_own(w);
+        }
+        self.whole_checkpoint(w)?;
         let read = declare(self.src, w, expr)?;
+        self.tensors.push(read);
+        Ok(())
+    }
+
+    /// [`read_expr`](Builder::read_expr), for an expression that must ASK THE
+    /// CHECKPOINT before it can be written down.
+    ///
+    /// **EVERY OTHER VERB HERE CONSULTS
+    /// [`holds_the_landed_plane`](Builder::holds_the_landed_plane) FIRST, AND
+    /// `read_expr` CONSULTS IT TOO — ONE STEP TOO LATE.** It takes an `Expr`
+    /// already made, so the making happens at the CALL SITE, which is before
+    /// this builder is reached. For an expression assembled out of names and
+    /// constants that costs nothing and the ordering never shows. For one
+    /// that reads the source to decide its own shape it is fatal: the helper
+    /// returns [`Error::Missing`] for a plane that is not under the source's
+    /// spelling, the `?` fires at the call site, and the import fails on a
+    /// weight whose landed plane was sitting right there.
+    ///
+    /// Two helpers in the model texts are of that kind and four call sites
+    /// use them — `squeezed`, which asks which of the two depthwise conv1d
+    /// spellings a file uses, and `flattened`, which reads the stored extents
+    /// to check an element count. Each one takes `&Source` and each one can
+    /// answer `Missing`, which is exactly the answer a promoted artifact
+    /// gives and exactly the answer this verb exists to not ask for.
+    ///
+    /// So the expression arrives as a THUNK and is forced on the far side of
+    /// the check. Nothing else differs, which is why this is a sibling and
+    /// not a replacement: a call site whose expression cannot fail says so by
+    /// using [`read_expr`](Builder::read_expr).
+    ///
+    /// # Errors
+    ///
+    /// The builder's own, and [`read_expr`](Builder::read_expr)'s.
+    pub fn read_derived(
+        &mut self,
+        w: &Weight,
+        build: impl FnOnce() -> Result<Expr, Error>,
+    ) -> Result<(), Error> {
+        if self.holds_the_landed_plane(w) {
+            return self.read_own(w);
+        }
+        self.whole_checkpoint(w)?;
+        let read = declare(self.src, w, build()?)?;
         self.tensors.push(read);
         Ok(())
     }
@@ -226,15 +349,89 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// **DOES THE FILE ALREADY HOLD THIS WEIGHT'S LANDED PLANE?** (§M-4a) —
+    /// the one question every foreign verb asks before it does anything, and
+    /// the door `pie model import` was widened to make reachable.
+    ///
+    /// A checkpoint spells a weight the way its own format spells it:
+    /// `model.layers.7.self_attn.q_proj.weight`, `blk.7.attn_q.weight`. A
+    /// tensor sitting under `layer.7.qg_proj` — the name THIS TEXT declares —
+    /// is therefore not a checkpoint's tensor at all. It is an artifact
+    /// `pie model import` wrote out of this very contract: the fusion has been
+    /// performed, the codes have been lifted out of their words, the repack
+    /// has run, and the plane is the one the engine binds. So the read is
+    /// [`read_own`](Builder::read_own) and there is nothing left to convert.
+    ///
+    /// **ASKED HERE AND NOT IN SEVEN FAMILY TEXTS.** Two families wrote this
+    /// arm by hand — `qwen_3::import`'s `projection` and `kimi_k3`'s
+    /// `expert_bank` — over the handful of weights whose transform they knew
+    /// import would take. §M-4a promotes the WHOLE landing, so the property
+    /// has to hold for every weight a text reads, and the texts read them
+    /// through some two hundred `b.read*` lines. The verbs are the one place
+    /// all two hundred pass through, so the arm goes here and the property is
+    /// structural rather than remembered.
+    ///
+    /// **AND IT IS ASKED BEFORE [`whole_checkpoint`](Builder::whole_checkpoint).**
+    /// That assert says a foreign checkpoint is imported whole, which is why
+    /// the foreign verbs refuse `tp > 1`; `read_own` is the tp-aware verb and
+    /// carries no such refusal. A file holding this plane under its own name
+    /// is not the foreign case, so the assert is not the one that applies —
+    /// which is the two-door shape the assert was written against.
+    ///
+    /// **A NAME, WHICH IS A BELIEF AND NOT A CHECK.** Nothing here proves the
+    /// tensor was written by this build from this contract; a checkpoint that
+    /// happened to publish `layer.7.qg_proj` would be taken at its word. The
+    /// collision is implausible in every format this tree reads — the two
+    /// spellings above share no prefix with a declared plane name — and the
+    /// honest answer to it is §M-4c's stamp, which makes the artifact SAY what
+    /// it is for instead of being recognised by its names. Until that lands
+    /// this is the fact the artifact states, and it is the fact the two
+    /// hand-written arms this replaces were already resting on.
+    fn holds_the_landed_plane(&self, w: &Weight) -> bool {
+        self.src.get(&w.name).is_some()
+    }
+
     /// The foreign verbs read a checkpoint nothing has banded, so a sharded
     /// deployment cannot import — the rule the six families each stated as
     /// their own assert, now stated once.
-    fn whole_checkpoint(&self, w: &Weight) {
-        assert!(
-            self.tp == 1,
-            "`{}`: an import states the whole checkpoint; build the model at tp = 1",
-            w.name,
-        );
+    ///
+    /// **AND IT IS A REFUSAL AND NOT AN ASSERT**, which it was. `models::imports`
+    /// publishes every row with the width its catalog row names, and `ImportFn`
+    /// takes that width as an argument, so a caller reaching tp > 1 here has
+    /// done nothing a type or a doc forbade — it walked the public table and
+    /// handed a published row its own published number. A panic is the answer
+    /// to a caller that broke an invariant it could see; this one could not.
+    ///
+    /// It went unnoticed because the witness sniff refused first: every arm
+    /// was gated on a name, a stranger checkpoint failed the gate, and no
+    /// contract was ever built at a sharded width. The moment the arms started
+    /// being CHOSEN BY BUILDING THEM, every row reached this line, and
+    /// `every_import_row_reads_the_checkpoint_it_is_handed` — which hands all
+    /// of them one tensor no model reads — stopped being a list of refusals
+    /// and became a panic on the first tp2 row. It would have panicked on a
+    /// real sharded import all along.
+    ///
+    /// [`Error::Illegible`] rather than a new variant: from the caller's side
+    /// this IS the file being unreadable by this row, and the row that can
+    /// read it at that width does not exist yet. §M-4's ruling is that a
+    /// sharded artifact gets BUILT — degree in the stamp, rank cut at load —
+    /// and when the banded import lands it is this refusal that it replaces.
+    fn whole_checkpoint(&self, w: &Weight) -> Result<(), Error> {
+        if self.tp != 1 {
+            return Err(Error::Illegible {
+                name: w.name.clone(),
+                detail: format!(
+                    "an import states the WHOLE checkpoint and this contract is \
+                     built for {} ranks; nothing has banded the file it is \
+                     reading, so there is no rank {}'s share of `{}` in it to \
+                     land",
+                    self.tp,
+                    self.tp - 1,
+                    w.name,
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -252,8 +449,9 @@ fn group_of(dtype: Dtype) -> u32 {
         // Both affine widths group sixty-four CODES, not sixty-four bytes:
         // the group is a property of the scheme and the width is a property
         // of the code. See `dtype::Dtype::U8g64`.
-        Dtype::U4g64 | Dtype::U8g64 => 64,
-        Dtype::U4g32 => 32,
+        Dtype::U4g64 | Dtype::U8g64 | Dtype::U2g64 | Dtype::U4g64tiled => 64,
+        Dtype::U4g32 | Dtype::U2g32 => 32,
+        Dtype::U2g128 => 128,
         other => panic!("`{other:?}` blocks no axis; only a packed bank has groups"),
     }
 }
@@ -291,7 +489,13 @@ struct Claim {
 #[must_use]
 fn claim(w: &Weight, tp: u32) -> Claim {
     let (encoding, scales) = match w.dtype {
-        Dtype::Mxfp4 | Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => {
+        Dtype::Mxfp4 | Dtype::U4g64
+        | Dtype::U8g64
+        | Dtype::U4g32
+        | Dtype::U4g64tiled
+        | Dtype::U2g32
+        | Dtype::U2g64
+        | Dtype::U2g128 => {
             (grouped(w), Some(scaling(w)))
         }
         Dtype::Bf16
@@ -309,33 +513,61 @@ fn claim(w: &Weight, tp: u32) -> Claim {
         | Dtype::U64
         | Dtype::U16
         | Dtype::Bool => (encoding(w.dtype), None),
+        // **A SELF-CONTAINED TERM CLAIMS ONE TENSOR AND NO COMPANIONS.** Its
+        // factors live inside its payload, so there are no `.scales` and no
+        // `.biases` to pair in — which is what puts it on the plain arm's
+        // side of this match with a quantized encoding, and what makes
+        // serving it AS STORED a claim with nothing on either side of it.
+        Dtype::U2g16k
+        | Dtype::I3g16k
+        | Dtype::U4g32k
+        | Dtype::U5g32k
+        | Dtype::I6g16k => (encoding(w.dtype), None),
         Dtype::E2m1 => panic!(
             "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
-        // Served formats no model text declares yet — they reach the engine
-        // through an import plan, never through a load contract's weight
-        // declaration, so a claim naming one has no encoding story here.
-        Dtype::Nvfp4
-        | Dtype::U2g16k
-        | Dtype::I3g16k
-        | Dtype::U4g32k
-        | Dtype::U5g32k
-        | Dtype::I6g16k
-        | Dtype::E4m3row
-        | Dtype::E4m3tile128 => panic!(
-            "`{:?}` is served but not yet a weight representation a load \
-             contract declares",
+        // Served, but no load contract declares one yet — the same
+        // statement `model_dsl::Weight::planes` makes, one crate over.
+        Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
+            "a {:?} weight is served but no load contract declares one",
             w.dtype
         ),
     };
     Claim {
         name: w.name.clone(),
-        shape: whole(w, tp),
+        shape: banded_rows(w, whole(w, tp)),
         bands: banding(w, tp),
         encoding,
         scales,
     }
+}
+
+/// **A TILED AFFINE WEIGHT CLAIMS THE RECTANGLE IT WAS REPACKED INTO**, which
+/// is its output columns rounded up to a whole mma band (§J4b).
+///
+/// Every other row claims the shape the text declared, and this one cannot:
+/// `model_dsl::Weight::planes` publishes the PADDED rectangle — the tail is
+/// zero codes beside zero factors, which decodes to a zero weight the kernel
+/// does not store — and a contract that claimed the unpadded one would
+/// declare a tensor shorter than the plane the trace interned. The engine
+/// checks an arriving tensor against `plane_bytes`, so the two shapes must be
+/// the same shape, and [`TILED_BAND`] is the one number that says so.
+///
+/// The companions follow for free: `interned` divides the LAST axis to size
+/// them, so a `[rows, k]` that has been banded gives a `[rows, groups]` that
+/// has been banded too.
+fn banded_rows(w: &Weight, shape: Vec<i64>) -> Vec<i64> {
+    if w.dtype != Dtype::U4g64tiled {
+        return shape;
+    }
+    let mut shape = shape;
+    let band = i64::from(TILED_BAND);
+    let rows = shape.first_mut().unwrap_or_else(|| {
+        panic!("`{}` is a tiled affine weight declared with no rows", w.name)
+    });
+    *rows = (*rows + band - 1) / band * band;
+    shape
 }
 
 /// One claim, checked against the source and stated as the one, two or
@@ -430,7 +662,12 @@ fn planes(
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
     match w.dtype {
-        Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => affine_planes(src, w, vec![from]),
+        Dtype::U4g64
+        | Dtype::U8g64
+        | Dtype::U4g32
+        | Dtype::U2g32
+        | Dtype::U2g64
+        | Dtype::U2g128 => affine_planes(src, w, vec![from]),
         _ => Ok(vec![copy(src, w, from)?]),
     }
 }
@@ -442,7 +679,12 @@ fn planes_fused(
 ) -> Result<Vec<TensorContract>, Error> {
     let parts: Vec<String> = parts.into_iter().collect();
     match w.dtype {
-        Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => affine_planes(src, w, parts),
+        Dtype::U4g64
+        | Dtype::U8g64
+        | Dtype::U4g32
+        | Dtype::U2g32
+        | Dtype::U2g64
+        | Dtype::U2g128 => affine_planes(src, w, parts),
         _ => Ok(vec![fused(src, w, parts)?]),
     }
 }
@@ -504,6 +746,112 @@ fn affine_planes(
         factors(src, model_dsl::biases_name(&w.name), &biases, counted, axis)?
             .offsetting(w.name.clone()),
     ])
+}
+
+/// **THE SAME TRIPLET, RELAID** — [`affine_planes`]'s three entries with an
+/// [`Expr::Repack`] on the end of each.
+///
+/// The codes take [`RepackLayout::TiledAffineU4Weight`] and both companions
+/// take [`RepackLayout::TiledAffineFactor`], and every one of them declares
+/// the SAME target rows: the weight's own, rounded up to a whole
+/// [`TILED_BAND`]. That is the rectangle `model_dsl::Weight::planes` publishes
+/// and the rectangle [`claim`] claims, so the three statements of it are one
+/// number.
+///
+/// **THE PADDING IS ZERO CODES BESIDE ZERO FACTORS**, which decodes to a zero
+/// weight — the kernels walk a padded band with the others, accumulate zero,
+/// and the epilogue does not write those columns. So the tail is not a value
+/// anybody has to know about downstream; it is a column that is not there.
+fn tiled_planes(
+    src: &ztensor::Source,
+    w: &Weight,
+    parts: Vec<String>,
+) -> Result<Vec<TensorContract>, Error> {
+    if w.dtype != Dtype::U4g64tiled {
+        return Err(Error::Illegible {
+            name: w.name.clone(),
+            detail: format!(
+                "it is declared {:?} and this verb states a repack; a relabelled plane \
+                 is declared `U4g64tiled`, because the declaration is what says which \
+                 order the artifact holds",
+                w.dtype
+            ),
+        });
+    }
+    let axis = if parts.len() > 1 { pack_axis(w) } else { 0 };
+    let mut codes = Vec::new();
+    let mut scales = Vec::new();
+    let mut biases = Vec::new();
+    for part in &parts {
+        let stem = part
+            .strip_suffix(".weight")
+            .ok_or_else(|| Error::Illegible {
+                name: w.name.clone(),
+                detail: format!(
+                    "`{part}` holds MLX affine codes, whose scales and biases \
+                     are named beside a `.weight`, and it does not end in one"
+                ),
+            })?;
+        let unpacked = unpacked_extents(src, w, part)?;
+        codes.push(Expr::src(part.clone()).transmute(TensorType::new(unpacked, grouped(w))));
+        scales.push(model_dsl::scales_name(stem));
+        biases.push(model_dsl::biases_name(stem));
+    }
+    let pairing = scaling(w);
+    // The row-major rectangle the legs join into, and the banded one they are
+    // relaid into. `divided` sizes the companions off whichever it is handed,
+    // so the factor planes band exactly as the codes do.
+    let flat = extents(w);
+    let landed = banded_rows(w, flat.clone());
+    let counted = divided(&landed, pairing.channel_axis, pairing.group_size, &w.name);
+    let factor_target = |shape: Vec<i64>| TensorType::new(shape, encoding(Dtype::Bf16));
+    Ok(vec![
+        TensorContract::inferred(
+            w.name.clone(),
+            joined(axis, codes).repack(
+                RepackLayout::TiledAffineU4Weight,
+                TensorType::new(landed, grouped(w)),
+            ),
+            grouped(w),
+        ),
+        relaid(
+            src,
+            model_dsl::scales_name(&w.name),
+            &scales,
+            counted.clone(),
+            axis,
+            factor_target(counted.clone()),
+        )?
+        .scaling(pairing),
+        relaid(
+            src,
+            model_dsl::biases_name(&w.name),
+            &biases,
+            counted.clone(),
+            axis,
+            factor_target(counted),
+        )?
+        .offsetting(w.name.clone()),
+    ])
+}
+
+/// [`factors`] with the relabelling on the end — one companion plane, joined
+/// at its seams and then put into band order.
+fn relaid(
+    src: &ztensor::Source,
+    name: String,
+    legs: &[String],
+    shape: Vec<i64>,
+    axis: u8,
+    to: TensorType,
+) -> Result<TensorContract, Error> {
+    let plane = factors(src, name.clone(), legs, shape.clone(), axis)?;
+    Ok(TensorContract::new(
+        name,
+        plane.expr.repack(RepackLayout::TiledAffineFactor, to),
+        shape,
+        encoding(Dtype::Bf16),
+    ))
 }
 
 /// The same triplet, landed DENSE: the codes joined and decoded through a
@@ -858,7 +1206,13 @@ fn seams_clear_the_blocked_axis(
 pub fn scaling(w: &Weight) -> Scales {
     let form = match w.dtype {
         Dtype::Mxfp4 => ScaleForm::RawE8M0,
-        Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => ScaleForm::Bf16AffineFactors,
+        Dtype::U4g64
+        | Dtype::U8g64
+        | Dtype::U4g32
+        | Dtype::U4g64tiled
+        | Dtype::U2g32
+        | Dtype::U2g64
+        | Dtype::U2g128 => ScaleForm::Bf16AffineFactors,
         other => panic!(
             "`{}` is {other:?}, which pairs with nothing; only a packed bank \
              has scales",
@@ -921,6 +1275,11 @@ fn as_axis(axis: u32, name: &str) -> u8 {
 /// The stored representation each weight [`Dtype`] declares -- raw of
 /// itself for everything that stores itself verbatim, and the quantization
 /// spec of the scheme for a packed bank's codes.
+///
+/// # Panics
+///
+/// On a [`Dtype::Quant`] whose term no self-contained scheme in this tree's
+/// checkpoint vocabulary has -- see [`checkpoint::spec_of_term`].
 pub fn encoding(dtype: Dtype) -> Encoding {
     match dtype {
         Dtype::Bf16 => Encoding::Raw(DType::Bf16),
@@ -986,22 +1345,77 @@ pub fn encoding(dtype: Dtype) -> Encoding {
             group_size: 32,
             channel_axis: None,
         }),
+        // **AND THE SAME SCHEME AGAIN, WITH ITS BYTES SOMEWHERE ELSE**
+        // (§J4b). A repack moves no value: `U4g64tiled` holds `U4g64`'s codes
+        // under `U4g64`'s factors, in the order a tensor-core lane's fragment
+        // reads them. So the stored ENCODING is `U4g64`'s, letter for letter,
+        // and the layout is said where the other placement facts are said —
+        // on the `Dtype`, which is what selected this arm. A spec that
+        // differed here would be a scheme claiming a permutation changed the
+        // arithmetic.
+        Dtype::U4g64tiled => Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::MlxAffineU4,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 4,
+            group_size: 64,
+            channel_axis: None,
+        }),
+        // **AND THE SAME SCHEME AT TWO BITS, OVER ITS THREE GROUPS.** The two
+        // fields that have carried every MLX affine row — `bits_per_element`
+        // and `group_size` — carry these as well; nothing about the arithmetic
+        // is new, which is the whole reason `MlxAffineU4` did not have to grow
+        // a sibling. A DQ checkpoint spends its bits per tensor and writes all
+        // three groups, so all three are spellable (`dtype::Dtype::U2g32`).
+        Dtype::U2g32 => Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::MlxAffineU4,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 2,
+            group_size: 32,
+            channel_axis: None,
+        }),
+        Dtype::U2g64 => Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::MlxAffineU4,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 2,
+            group_size: 64,
+            channel_axis: None,
+        }),
+        Dtype::U2g128 => Encoding::Quant(QuantSpec {
+            scheme: QuantScheme::MlxAffineU4,
+            logical_dtype: DType::Bf16,
+            bits_per_element: 2,
+            group_size: 128,
+            channel_axis: None,
+        }),
         Dtype::E2m1 => panic!(
             "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
         ),
-        // See `claim`: served, but no load contract declares one yet, so no
-        // encoding is theirs to have here.
-        Dtype::Nvfp4
-        | Dtype::U2g16k
+        // Served, but no load contract declares one yet — the same
+        // statement `model_dsl::Weight::planes` makes, one crate over.
+        Dtype::Nvfp4 | Dtype::E4m3row | Dtype::E4m3tile128 => panic!(
+            "a {:?} weight is served but no load contract declares one",
+            dtype
+        ),
+        // **THE TERM IS THE DECLARATION AND THE SCHEME IS THE LOOKUP.** The
+        // rows above spell a scheme's numbers out because their `Dtype`
+        // variant is a NAME and the numbers had to come from somewhere; this
+        // one carries the arithmetic itself, so the only thing left to find
+        // is which of the checkpoint's block schemes has it. `qnf` is that
+        // door, and asking it here is what keeps this file from being a
+        // second place a `q4_k` is defined.
+        Dtype::U2g16k
         | Dtype::I3g16k
         | Dtype::U4g32k
         | Dtype::U5g32k
-        | Dtype::I6g16k
-        | Dtype::E4m3row
-        | Dtype::E4m3tile128 => panic!(
-            "`{dtype:?}` is served but not yet a weight representation a load \
-             contract declares"
+        | Dtype::I6g16k => Encoding::Quant(
+            checkpoint::spec_of_term(dtype.repr()).unwrap_or_else(|| {
+                panic!(
+                    "`{dtype}` is not the arithmetic of any self-contained scheme this \
+                     checkpoint vocabulary knows; a term whose factors live in \
+                     companion planes is declared by the variant that names them"
+                )
+            }),
         ),
     }
 }

@@ -147,7 +147,7 @@ _cuda = ["dep:cudarc"]
 # The smoke's catalog row and its load contract. A DEV dependency on purpose:
 # the runtime traces and hands a `Plan` and a `ModelContract` across (design
 # §7, decision #18), so the shell itself must not know a model family.
-model = { path = "../model" }
+models = { path = "../models" }
 # `Platform`, and the `Facts`/`Request` pair the smoke computes each lane's word
 # with — `Classify::of`, runtime-side in production.
 model-dsl = { path = "../model-dsl" }
@@ -159,3 +159,8 @@ tokenizer = { path = "../tokenizer" }
 # owns the container format, `ztensor-compat` owns the foreign projections.
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
+# The load-contract builder a synthetic text states its own claims through --
+# `a_stored_k_quant_row_serves_as_stored.rs` declares a model nobody ships and
+# so cannot borrow a family's `Model::load`. DEV only, for the same reason
+# `model` is: the shell must not know how a contract is written.
+checkpoint-dsl = { path = "../checkpoint-dsl" }

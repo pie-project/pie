@@ -36,28 +36,26 @@ use checkpoint::executor::Execution;
 use checkpoint::executor::arena::{ArenaBacking, TileMapOp};
 use checkpoint::executor::sink::MemorySink;
 use checkpoint::plan::compile as compile_load_plan;
-use checkpoint::plan::passes::tile::{CUDA_QUANTIZE_BF16_TO_FP8, CUDA_SCALE_ROWS_BF16};
+use checkpoint::plan::passes::tile::CUDA_CAST_FP32_TO_BF16;
 use checkpoint::plan::{CUDA_TILE_MAP_MASK, LoadPlan, StorageInstr, StorageTarget, TileMapKind};
-use checkpoint::types::{
-    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
-};
+use checkpoint::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 
 // ── The fixture
 //
-// One MXFP4 payload with per-row exponents, dequantized to bf16 and then
-// re-encoded to FP8. It is `storage_compiler.rs`'s
-// `a_quantized_tensor_is_re_encoded_through_a_decoded_intermediate` reduced
-// to its operands: the smallest contract that produces BOTH kinds a device
-// claims, a `Scale` (the dequant's multiply) and an `Encode`.
+// **IT WAS A DEQUANT AND A RE-ENCODE**, and §M-3 shut the encode door: no
+// device mask carries one, so a contract that stated it no longer compiles
+// for a CUDA target and the fixture would have tested nothing. What the file
+// is about is unchanged, and it is restated over the one row the CUDA table
+// still has — an F32 to BF16 cast — because the question was never which
+// transform it is. It is WHERE THE OPERANDS ARE.
 //
-// The two are here because they land on opposite sides of the delegation
-// question, and the file is about where that line falls:
+// So there are two casts, and they land on opposite sides of the line:
 //
-// * the `Scale` reads the checkpoint. Its bytes are on disk, not in the
-//   arena, so no backing can be handed it and `cuda_kernel` names no row.
-// * the `Encode` reads `w`, which the contract publishes. Published means
-//   placed, placed means arena-resident, and a bf16 -> FP8 quantize over a
-//   2-D shape is a row the CUDA table has. It is the offer.
+// * `v` casts the CHECKPOINT. Its bytes are on disk, not in the arena, so no
+//   backing can be handed it and `lower_tile_map` names no row for it.
+// * `w` casts `d`, which the contract publishes. Published means placed,
+//   placed means arena-resident, and F32 to BF16 over a 2-D shape is the row
+//   the CUDA table has. It is the offer.
 
 fn raw(
     id: u32,
@@ -87,68 +85,41 @@ fn metadata() -> Metadata {
             format: CheckpointFormat::Safetensors,
         }],
         tensors: vec![
-            raw(0, "w", 0, 64, &[4, 16], DType::U8),
-            raw(1, "s", 64, 4, &[4, 1], DType::U8),
+            raw(0, "w32", 0, 128, &[4, 8], DType::F32),
+            raw(1, "v32", 128, 128, &[4, 8], DType::F32),
         ],
     }
 }
 
-fn mxfp4() -> QuantSpec {
-    QuantSpec {
-        scheme: QuantScheme::Mxfp4E2M1E8M0,
-        logical_dtype: DType::Bf16,
-        bits_per_element: 4,
-        group_size: 32,
-        channel_axis: Some(Axis(1)),
-    }
-}
-
-fn fp8() -> QuantSpec {
-    QuantSpec {
-        scheme: QuantScheme::Fp8E4M3,
-        logical_dtype: DType::Bf16,
-        bits_per_element: 8,
-        group_size: 32,
-        channel_axis: Some(Axis(1)),
-    }
-}
-
 fn contract() -> ModelContract {
-    let fp8_encoding = Encoding::Quant(fp8());
     ModelContract {
         alignment: 256,
         tensors: vec![
+            // The cast that reads the checkpoint, and is therefore not
+            // delegable however good a row the table has for its dtypes.
             TensorContract::new(
-                "scales",
-                Expr::src("s").transmute(TensorType {
-                    shape: vec![4, 1],
-                    encoding: Encoding::Raw(DType::E8m0),
-                }),
-                vec![4, 1],
-                Encoding::Raw(DType::E8m0),
-            ),
-            // The decoded weight. PUBLISHED, not internal, and that is the
-            // point of the fixture: a published tensor is placed in the
-            // arena, so the re-encode below reads arena bytes and is a
-            // candidate for delegation. An internal intermediate is a host
-            // scratch buffer, and a transform reading one can never be
-            // offered to a backing that cannot see it.
-            TensorContract::new(
-                "w",
-                Expr::src("w")
-                    .transmute(TensorType {
-                        shape: vec![4, 32],
-                        encoding: Encoding::Quant(mxfp4()),
-                    })
-                    .scale_per_block(Expr::out("scales")),
-                vec![4, 32],
+                "v",
+                Expr::src("v32").cast(Encoding::Raw(DType::Bf16)),
+                vec![4, 8],
                 Encoding::Raw(DType::Bf16),
             ),
+            // The staged operand. PUBLISHED, not internal, and that is the
+            // point of the fixture: a published tensor is placed in the
+            // arena, so the cast below reads arena bytes and is a candidate
+            // for delegation. An internal intermediate is a host scratch
+            // buffer, and a transform reading one can never be offered to a
+            // backing that cannot see it.
             TensorContract::new(
-                "w_fp8",
-                Expr::out("w").cast(fp8_encoding.clone()),
-                vec![4, 32],
-                fp8_encoding,
+                "d",
+                Expr::src("w32"),
+                vec![4, 8],
+                Encoding::Raw(DType::F32),
+            ),
+            TensorContract::new(
+                "w",
+                Expr::out("d").cast(Encoding::Raw(DType::Bf16)),
+                vec![4, 8],
+                Encoding::Raw(DType::Bf16),
             ),
         ],
         groups: Vec::new(),
@@ -157,7 +128,8 @@ fn contract() -> ModelContract {
 
 fn plan() -> LoadPlan {
     // A CUDA target, because the default one is `BackendKind::Unknown` and
-    // refuses `Encode` — and an Encode is half of what this file is about.
+    // names no kernel at all — and a named row is half of what this file is
+    // about.
     let target = StorageTarget {
         backend: BackendKind::Cuda,
         tile_map_mask: CUDA_TILE_MAP_MASK,
@@ -291,10 +263,9 @@ impl ArenaBacking for Recording {
 /// The bytes are raw at the offsets `metadata()` declares — the executor
 /// reads `file_offset..file_offset + span_bytes` from the plan and does not
 /// re-parse a safetensors header — so the payload is anything, as long as it
-/// is there. `w` is 64 bytes of MXFP4 at 0 and `s` is 4 E8M0 exponents at 64.
-/// The exponents are 127 (2^0) so the dequantized values stay small enough to
-/// re-encode without saturating, which keeps the int8 output a function of the
-/// input rather than of the clamp.
+/// is there. `w32` is 128 bytes of F32 at 0 and `v32` is 128 more at 128.
+/// The pattern is written rather than zeroed so `the_fixture_actually_runs`
+/// can tell a completed load from an untouched arena.
 fn checkpoint() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "pie_arena_transforms_{}_{}",
@@ -306,10 +277,12 @@ fn checkpoint() -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&dir).expect("fixture dir");
     let mut bytes = vec![0u8; 256];
-    for (i, byte) in bytes[..64].iter_mut().enumerate() {
-        *byte = (i as u8).wrapping_mul(17);
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        // A small positive F32 in every lane: the exponent byte is the third
+        // of each little-endian quad, so a pattern in the low bytes stays
+        // finite whatever the mantissa says.
+        *byte = if i % 4 == 3 { 0x3E } else { (i as u8).wrapping_mul(17) };
     }
-    bytes[64..68].fill(127);
     std::fs::write(dir.join("model.safetensors"), bytes).expect("fixture file");
     dir
 }
@@ -317,7 +290,11 @@ fn checkpoint() -> std::path::PathBuf {
 /// Execute the fixture against a backing that does or does not run kernels.
 fn run(runs_kernels: bool) -> Recording {
     let plan = plan();
-    let len = usize::try_from(plan.memory.persistent_bytes).expect("fits");
+    // The WHOLE allocation, staging included: the fixture's file-reading cast
+    // stages its source, and the plan's offsets are all measured from one
+    // base — which is the fact `the_executor_allocates_an_arena_its_own_plan_
+    // fits_in` below is about.
+    let len = usize::try_from(plan.memory.arena_bytes()).expect("fits");
     let mut arena = Recording::new(len.max(1), runs_kernels);
     let mut sink = MemorySink::default();
     let dir = checkpoint();
@@ -332,10 +309,10 @@ fn run(runs_kernels: bool) -> Recording {
 }
 
 #[test]
-fn the_fixture_produces_the_two_kinds_a_device_claims() {
+fn the_fixture_produces_the_two_transforms_the_line_runs_between() {
     assert_eq!(
         kinds(&plan()),
-        vec![TileMapKind::Scale, TileMapKind::Encode],
+        vec![TileMapKind::Cast, TileMapKind::Cast],
         "the delegation tests are only meaningful over these two"
     );
 }
@@ -385,8 +362,8 @@ fn only_an_instruction_the_plan_named_a_row_for_is_offered() {
     let arena = run(true);
     assert!(
         !arena.offers.is_empty(),
-        "the fixture's Encode is a row `cuda_kernel` names; if this is empty \
-         the delegation stopped happening and the tests below are vacuous"
+        "the fixture's staged cast is a row `cuda_kernel` names; if this is \
+         empty the delegation stopped happening and the tests below are vacuous"
     );
     for offer in &arena.offers {
         assert!(
@@ -397,68 +374,58 @@ fn only_an_instruction_the_plan_named_a_row_for_is_offered() {
     }
 }
 
-/// The one delegable instruction is the `Encode`, and the `Scale` is not.
+/// The one delegable instruction is the cast off the ARENA, and the cast off
+/// the FILE is not.
 ///
-/// Both halves matter. The `Encode` is offered because every operand is a
-/// span of the arena and the compiler named a row for it. The `Scale` is not
+/// Both halves matter. The first is offered because every operand is a span
+/// of the arena and the compiler named a row for it. The second is not
 /// offered because its input is the CHECKPOINT — bytes on disk, which a
-/// backing handed nothing but offsets cannot read — and `cuda_kernel` agrees,
-/// naming no row for it.
+/// backing handed nothing but offsets cannot read — and `lower_tile_map`
+/// agrees, naming no row for it.
 ///
-/// This replaces `a_transform_reading_a_host_scratch_buffer_is_not_offered`,
-/// which asserted the same exclusion for the wrong reason: it read the old
-/// fixture, whose decoded intermediate was `.internal()` and therefore host
-/// scratch, and concluded that no `Encode` can ever be delegated. What that
-/// test had actually found was a property of ITS CONTRACT. Publish the
-/// intermediate and the same `Encode` is delegable, which is what the fixture
-/// now does.
+/// The exclusion is a property of WHERE THE OPERANDS ARE and not of which
+/// transform it is, which is why both instructions here are the same kind
+/// with the same dtypes and only one of them is an offer.
 #[test]
 fn the_offer_is_the_transform_whose_operands_are_all_in_the_arena() {
     let arena = run(true);
     let kernels: Vec<&str> = arena.offers.iter().map(|o| o.kernel.as_str()).collect();
     assert_eq!(
         kernels,
-        vec![CUDA_QUANTIZE_BF16_TO_FP8],
-        "exactly the re-encode, which reads the published `w` and writes two \
-         placed tensors"
-    );
-    assert!(
-        !arena
-            .offers
-            .iter()
-            .any(|o| o.kernel == CUDA_SCALE_ROWS_BF16),
-        "the dequantizing Scale reads the checkpoint; offering it would hand \
-         a backing an arena offset for bytes that are still on disk"
+        vec![CUDA_CAST_FP32_TO_BF16],
+        "exactly the cast that reads the published `d` and writes a placed \
+         tensor"
     );
 }
 
-/// An `Encode` offer carries the second destination it writes.
-///
-/// A quantizing row produces two tensors — the payload and its scale factors
-/// — and a backing that got only the payload span would write half the
-/// result and leave the other half zero. Nothing downstream detects that: the
-/// bytes are present, the shapes are right, and the weights are wrong.
+/// **AN `Encode` OFFER TEST STOOD HERE** — that a quantizing row carried the
+/// second destination it writes, because a backing handed only the payload
+/// span would write half the result and leave the scales zero. §M-3 shut the
+/// door and there is no quantizing row left to offer, so what survives of it
+/// is the half that is still checkable: an offer carries its shape, and it
+/// carries no operand it does not read.
 #[test]
-fn an_encode_offer_carries_both_destinations_and_its_shape() {
+fn an_offer_carries_its_shape_and_nothing_it_does_not_read() {
     let arena = run(true);
-    let encode = arena
+    let cast = arena
         .offers
         .iter()
-        .find(|o| o.kernel == CUDA_QUANTIZE_BF16_TO_FP8)
-        .expect("the fixture's re-encode is delegable and must be offered");
+        .find(|o| o.kernel == CUDA_CAST_FP32_TO_BF16)
+        .expect("the fixture's staged cast is delegable and must be offered");
     assert!(
-        encode.has_dst_scales,
-        "an FP8 encode publishes a scale tensor beside its payload"
+        !cast.has_dst_scales,
+        "a cast publishes one tensor; a second destination is an operand it \
+         would never write"
     );
     assert!(
-        !encode.has_factors,
+        !cast.has_factors,
         "and it READS no factors; `factors` is the blocked-Scale operand, and \
          a row that reads what it should write is the confusion the shrunken \
          `TileMapOp` exists to prevent"
     );
     assert_eq!(
-        encode.shape,
-        Some((4, 32)),
+        cast.shape,
+        Some((4, 8)),
         "the row takes a 2-D extent, read from the tensor's declaration and \
          not recomputed from the extent's dims"
     );
@@ -570,32 +537,18 @@ fn a_failed_load_does_not_finish_the_arena() {
 
 /// A plan whose arena is NOT all persistent.
 ///
-/// Everything above reads `Expr::out(..)`, so every operand is already a
-/// published tensor and the staging region is empty -- which is why
-/// `persistent_bytes` and `arena_bytes()` are the same number for the fixture
-/// and why nothing here could tell them apart. A tensor cast straight off the
-/// FILE has to stage the source first, and that is the region the two
-/// disagree about.
+/// A tensor cast straight off the FILE has to stage the source first, and
+/// that is the region `persistent_bytes` and `arena_bytes()` disagree about.
+/// One tensor rather than the fixture's three, so the two numbers differ by a
+/// span this test can name.
 fn scratch_plan() -> LoadPlan {
-    // Per-channel (group_size 0) rather than the shared `fp8()`, whose
-    // group of 32 does not divide this fixture's 8-wide axis. The 64 source
-    // bytes are read as BF16, which is 32 elements: [4, 8].
-    let quant = Encoding::Quant(QuantSpec {
-        group_size: 0,
-        ..fp8()
-    });
     let contract = ModelContract {
         alignment: 256,
         tensors: vec![TensorContract::new(
-            "w_q",
-            Expr::src("w")
-                .transmute(TensorType {
-                    shape: vec![4, 8],
-                    encoding: Encoding::Raw(DType::Bf16),
-                })
-                .cast(quant.clone()),
+            "v",
+            Expr::src("v32").cast(Encoding::Raw(DType::Bf16)),
             vec![4, 8],
-            quant,
+            Encoding::Raw(DType::Bf16),
         )],
         groups: Vec::new(),
     };

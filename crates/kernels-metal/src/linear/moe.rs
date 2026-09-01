@@ -335,6 +335,73 @@ pub fn topk_sqrt_softplus(
     )
 }
 
+/// The hash router: layers `0..num_hash_layers` route by a per-token LOOKUP,
+/// not a learned gate over the router's logits.
+///
+/// `tid2eid` is `[vocab, top_k]` I64 — for every token id it names `top_k`
+/// expert ids, at uniform weight `1/top_k`. This gathers the row the token id
+/// selects and lays that pair down in the SAME layout [`topk_softmax`] writes
+/// (`routes` I32, `weights` F32, both `[tokens, top_k]` row-major), so its
+/// output is drop-in for the same sorted-MoE path — [`matmul_select`],
+/// [`weighted_sum`] — with no router logits computed at all.
+///
+/// **THE TABLE IS I64 AND THE ROUTES ARE I32.** `tid2eid` is a lookup and not
+/// a weight-representation dtype the trace can intern; the narrowing is the
+/// gather's, in the one place the 64-bit table meets the 32-bit route plane
+/// every downstream kernel already reads an expert id as. An expert count
+/// never approaches `2^31`.
+///
+/// **THE TOKEN IDS ARE A 32-BIT COLUMN AND THE SHADER READS `uint`.** The
+/// fire's own id stream is i32 (`RuntimeInput::Tokens`) and carries the same
+/// bits, so either spelling seats; an out-of-range id falls to row 0 exactly
+/// as `embed.metal`'s gather does, so a boundary token reads the first table
+/// row rather than off the end.
+pub fn hash_route(
+    ctx: &Ctx<'_>,
+    ids: Tensor,
+    tid2eid: Tensor,
+    vocab: u32,
+    top_k: u32,
+    routes: Tensor,
+    weights: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_hash_route";
+    debug_assert!(
+        matches!(ids.dtype, Dtype::U32 | Dtype::I32),
+        "`{OP}` gathers by a 32-bit token id column"
+    );
+    debug_assert_eq!(
+        tid2eid.dtype,
+        Dtype::I64,
+        "`{OP}` reads the i64 hash table"
+    );
+    debug_assert_eq!(
+        tid2eid.width, top_k,
+        "the hash table names `top_k` experts per token id"
+    );
+    // The route/weight planes carry the same shape and element a softmax
+    // router lands, so the sorted-MoE path behind them cannot tell the two
+    // apart.
+    ranked_planes(OP, routes, top_k, routes, weights);
+    debug_assert_eq!(
+        ids.rows, routes.rows,
+        "the token ids handed over are the rows this route lands"
+    );
+    let top_k = nonzero(OP, "the fan-out this router states", top_k)?;
+    nonzero(OP, "the vocabulary this table spans", vocab)?;
+    ctx.fire(
+        Fire::at(ROUTE_FILE, "hash_route_gather").apply(route_rows(OP, top_k, routes.rows)?),
+        &[
+            ids.arg(),
+            tid2eid.arg(),
+            routes.arg_mut(),
+            weights.arg_mut(),
+            vocab.arg(),
+            top_k.arg(),
+        ],
+    )
+}
+
 /// The routed fan a selected matmul walks: `tokens x top_k` result rows, the
 /// activation read either once per token or once per route.
 struct Selected {
@@ -466,13 +533,27 @@ fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static s
     match (bank.affine(), bank.group, bank.bits) {
         (true, 64, 4) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_64_b_4"),
         (true, 64, 4) => Ok("affine_qmv_routed_bfloat16_gs_64_b_4"),
+        // The 2-bit routed decode arm: `quant_qmv.metal` instantiates its
+        // group-parametric `AffineU2` codec at all three groups the 2-bit
+        // artifacts carry, because a 2-bit checkpoint keeps its expert banks in
+        // this same routed path — Qwen3.8-Flash at group 128, DeepSeek-V4-Flash
+        // at group 32 (with one layer's gate at 64). The routed impl reads the
+        // group off the codec for every scale/bias index, so each group is its
+        // own point rather than a 64-code assumption riding a mislabeled name.
+        (true, 64, 2) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_64_b_2"),
+        (true, 64, 2) => Ok("affine_qmv_routed_bfloat16_gs_64_b_2"),
+        (true, 32, 2) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_32_b_2"),
+        (true, 32, 2) => Ok("affine_qmv_routed_bfloat16_gs_32_b_2"),
+        (true, 128, 2) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_128_b_2"),
+        (true, 128, 2) => Ok("affine_qmv_routed_bfloat16_gs_128_b_2"),
         (false, MXFP4_BLOCK, 4) if biased => Ok("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4"),
         (false, MXFP4_BLOCK, 4) => Ok("mxfp4_qmv_routed_bfloat16_gs_32_b_4"),
         (affine, group, bits) => Err(refuse(
             op,
             format!(
                 "the bank is {} at {bits} bits in groups of {group}, and `quant_qmv.metal` \
-                 instantiates the routed shapes at affine/64/4 and mxfp4/32/4 only",
+                 instantiates the routed shapes at affine/{{32,64,128}}/2, affine/64/4 \
+                 and mxfp4/32/4 only",
                 if affine { "affine" } else { "symmetric" }
             ),
         )),
@@ -619,11 +700,19 @@ pub struct RoutedScratch {
 /// The routed tiled point one bank and one tile arrive at, or `None` when the
 /// shader stamps none for that combination.
 ///
-/// Three families are stamped and the fourth and fifth are absent on purpose,
-/// as they are in the reference: `affine_qmm_t_routed` carries no bias seat
-/// and `mxfp4_qmm_t_routed_bias` requires one, so an affine bank WITH a
-/// per-expert bias and an mxfp4 bank WITHOUT one both take the matvec arm.
-/// Answering either with the point beside it would read an unbound buffer.
+/// Four families are stamped and the fifth is absent on purpose:
+/// `affine_qmm_t_routed` carries no bias seat, so an affine bank WITH a
+/// per-expert bias still takes the matvec arm, and answering it with the
+/// point beside it would read an unbound buffer.
+///
+/// **THE MXFP4 PAIR USED TO BE HALF A FAMILY AND THAT WAS A DEFECT.** Only
+/// `_bias` was stamped, on the reading that a mixture which biases its
+/// experts biases all of them; gpt-oss biases its gate/up projection and not
+/// its down one. So this arm answered `None` once a layer, the driver fell
+/// through to the matvec, and the down projection read each expert's slice
+/// once per routed row — 9.0 GB of weight traffic a layer against the tiled
+/// arm's 0.53. Widening this arm measures 1547.0 -> 784.9 ms at 512 prompt
+/// tokens on an M1 Max, 331.0 -> 652.4 tok/s (`.wiki/macos-bench.md` §18).
 fn batched_point(
     op: &'static str,
     bank: Bank,
@@ -642,17 +731,43 @@ fn batched_point(
             entry: crate::linear::quant::routed_fp16_point(op, bm, bn)?,
             stamp: "",
         })),
-        (true, group, bits, false) => Ok(Some(crate::linear::quant::qmm_point(
-            op,
-            "_routed",
-            "PIE_STAMP_qmm_t_routed",
-            stated(op, group)?,
-            stated(op, bits)?,
-            bm,
-            bn,
-        )?)),
-        (false, MXFP4_BLOCK, 4, true) => Ok(Some(crate::linear::quant::Point {
-            entry: crate::linear::quant::mxfp4_routed_point(op, bm, bn)?,
+        // **AN UNSTAMPED WIDTH IS A DECLINE, NOT A FAULT.** This arm used to
+        // walk every affine bank into `qmm_point`, whose `check` against
+        // `quant::WIDTHS` returns an ERROR for a width the tiled family is not
+        // stamped at — so a bank at such a width faulted the prefill instead
+        // of falling through to the matvec arm beside it, which serves every
+        // width. Every other refusal on this path answers `Ok(None)` and lets
+        // `matmul_select_batched` return `false` (the tile, the column and the
+        // `QMM_BK` checks just above it); this one now does too.
+        //
+        // **TWO IS NO LONGER ONE OF THEM**, and the measurement that put it on
+        // `quant::WIDTHS` is written down there: a 2-bit routed bank now takes
+        // this tiled arm at prefill and is ~15% faster for it at every prompt
+        // length measured. The 2-bit DECODE arm is reached the way it always
+        // was, through `routed_point`'s own `(2, {32, 64, 128})` rows — this
+        // arm is only asked once `tile_rows` has already said the batch is
+        // wide enough to sort.
+        (true, group, bits, false) if crate::linear::quant::qmm_stamps_width(bits) => {
+            Ok(Some(crate::linear::quant::qmm_point(
+                op,
+                "_routed",
+                "PIE_STAMP_qmm_t_routed",
+                stated(op, group)?,
+                stated(op, bits)?,
+                bm,
+                bn,
+            )?))
+        }
+        // Both bias forms, because gpt-oss uses both in the same layer: the
+        // gate/up projection carries a per-expert bias and the down one does
+        // not, its `down_bias` being folded after the weighted reduce.
+        (false, MXFP4_BLOCK, 4, biased) => Ok(Some(crate::linear::quant::Point {
+            entry: crate::linear::quant::mxfp4_routed_point(
+                op,
+                if biased { "_bias" } else { "" },
+                bm,
+                bn,
+            )?,
             stamp: "",
         })),
         _ => Ok(None),
@@ -957,6 +1072,131 @@ pub fn sigmoid_gate_add(
 mod tests {
     use super::*;
     use crate::DeviceTuning;
+    use crate::encode::ArgValue;
+    use crate::probe::Probe;
+
+    /// The regression that cost gpt-oss half its prefill: an mxfp4 bank with
+    /// NO bias plane has to reach a tiled point, because gpt-oss's expert
+    /// down projection is exactly that — `down_bias` is folded after the
+    /// weighted reduce. When this arm answered `None`, the driver fell
+    /// through to the matvec and read every expert's slice once per routed
+    /// row: 1547 -> 785 ms at 512 prompt tokens once it stopped.
+    #[test]
+    fn an_mxfp4_bank_reaches_a_tiled_point_with_or_without_a_bias() {
+        let bank = Bank {
+            codes: Tensor::new(0, 2880, 2880, Dtype::U4g64),
+            scales: Tensor::new(1, 2880, 2880 / 32, Dtype::E8m0),
+            biases: None,
+            group: MXFP4_BLOCK,
+            bits: 4,
+        };
+        let biased = batched_point("t", bank, true, 32, 64, false)
+            .expect("the biased form answers")
+            .expect("and it is stamped");
+        assert_eq!(biased.entry, "mxfp4_qmm_t_routed_bias_bfloat16_bm_32_bn_64");
+        let plain = batched_point("t", bank, false, 32, 64, false)
+            .expect("the unbiased form answers")
+            .expect("and it is stamped too — this is the whole fix");
+        assert_eq!(plain.entry, "mxfp4_qmm_t_routed_bfloat16_bm_32_bn_64");
+    }
+
+    /// The 2-bit routed decode arm: an affine two-bit bank names the
+    /// group-parametric `AffineU2` routed points `quant_qmv.metal` instantiates
+    /// beside the four-bit one, in both bias forms, at every group the 2-bit
+    /// artifacts carry — group 32 (DeepSeek-V4-Flash), group 64 (its one
+    /// odd-layer gate), and group 128 (Qwen3.8-Flash). This is the matvec half
+    /// of a 2-bit mixture's decode; the tiled batched half is group- and
+    /// width-parametric already (`batched_point` JIT-stamps `qmm_t_routed`).
+    #[test]
+    fn a_two_bit_affine_bank_names_the_routed_arm() {
+        let bank = Bank {
+            codes: Tensor::new(0, 2048, 2048, Dtype::U4g64),
+            scales: Tensor::new(1, 2048, 2048 / 64, Dtype::Bf16),
+            biases: Some(Tensor::new(2, 2048, 2048 / 64, Dtype::Bf16)),
+            group: 64,
+            bits: 2,
+        };
+        for group in [32, 64, 128] {
+            let b = Bank { group, ..bank };
+            assert_eq!(
+                routed_point("t", b, false).expect("the unbiased 2-bit arm resolves"),
+                format!("affine_qmv_routed_bfloat16_gs_{group}_b_2")
+            );
+            assert_eq!(
+                routed_point("t", b, true).expect("the biased 2-bit arm resolves"),
+                format!("affine_qmv_routed_bias_bfloat16_gs_{group}_b_2")
+            );
+        }
+        // A group the artifacts do not carry still refuses — the routed codec is
+        // instantiated only at {32,64,128}.
+        let g16 = Bank { group: 16, ..bank };
+        assert!(routed_point("t", g16, false).is_err());
+    }
+
+    /// **AND THE TILED HALF TAKES THE SAME BANK, AT EVERY GROUP.**
+    ///
+    /// Two is on `quant::WIDTHS` — the prefill measurement that put it there
+    /// is written at the constant — so a 2-bit routed bank at any of the three
+    /// groups the artifacts carry answers `Some` here and takes the sorted
+    /// tile family. This is the unit half of that flip: the device half is
+    /// `engine-metal`'s `what_a_two_bit_prefill_costs`, and this is what says
+    /// the arm is reached at group 32 and 128 as well as at 64, which no SKU
+    /// in the catalog exercises all three of.
+    ///
+    /// **THE DECLINE IS STILL A DECLINE, for a width that is genuinely not
+    /// stamped.** `batched_point` walked every affine bank into `qmm_point`,
+    /// which checks `bits` against `quant::WIDTHS` and returns an ERROR for an
+    /// unstamped one — so such a bank would, at prefill, take the batched door
+    /// and come back an Err, a fault on a path with a working arm beside it.
+    /// The answer a caller needs is `None`: `matmul_select_batched` reads it
+    /// as "not this way" and returns `false`, and the driver falls through to
+    /// the matvec. Three bits stands for that case here because
+    /// `dequantize`'s own `static_assert` names it as one the templates
+    /// refuse.
+    #[test]
+    fn a_two_bit_bank_takes_the_batched_arm_and_an_unstamped_width_declines_it() {
+        let bank = Bank {
+            codes: Tensor::new(0, 2048, 2048, Dtype::U4g64),
+            // `Some`, because `Bank::affine` IS the biases plane: a bank
+            // without one is the mxfp4 family and never reaches the arm under
+            // test.
+            scales: Tensor::new(1, 2048, 2048 / 64, Dtype::Bf16),
+            biases: Some(Tensor::new(2, 2048, 2048 / 64, Dtype::Bf16)),
+            group: 64,
+            bits: 2,
+        };
+        for group in [32, 64, 128] {
+            let b = Bank { group, ..bank };
+            let point = batched_point("t", b, false, 32, 64, false)
+                .expect("a stamped width resolves")
+                .unwrap_or_else(|| panic!("the 2-bit bank at group {group} takes the tiled arm"));
+            assert_eq!(
+                point.entry,
+                format!("affine_qmm_t_routed_bfloat16_gs_{group}_b_2_bm_32_bn_64")
+            );
+            assert!(
+                point.stamp.starts_with("PIE_STAMP_qmm_t_routed("),
+                "the tiled routed point is jit-stamped: {}",
+                point.stamp
+            );
+        }
+        // The stamped width still answers, so the decline below is the
+        // width's and not every affine bank's.
+        let four = Bank { bits: 4, ..bank };
+        assert!(
+            batched_point("t", four, false, 32, 64, false)
+                .expect("four bits resolves")
+                .is_some(),
+            "the four-bit bank still takes the tiled arm"
+        );
+        let three = Bank { bits: 3, ..bank };
+        assert_eq!(
+            batched_point("t", three, false, 32, 64, false)
+                .expect("an unstamped width is not a fault"),
+            None,
+            "a width the templates refuse DECLINES the tiled arm"
+        );
+    }
 
     #[test]
     fn a_fleet_batches_where_a_single_decode_does_not() {
@@ -1008,5 +1248,119 @@ mod tests {
         assert_eq!(tile_cols(1024), Some(64));
         assert_eq!(tile_cols(48), Some(16));
         assert_eq!(tile_cols(100), None);
+    }
+
+    /// **THE HASH ROUTER GATHERS, IT DOES NOT SCORE.** Its (routes, weights)
+    /// are the pair a softmax router lands — `int` routes and `float` weights,
+    /// `[tokens, top_k]` row-major — so the fire names the gather point in
+    /// `moe_route.metal`, launches one thread per (slot, token row), and
+    /// marshals the table, the vocab and the fan-out in the order the shader
+    /// reads them. That is what makes it drop-in for the same sorted-MoE path.
+    #[test]
+    fn the_hash_route_fires_the_gather_at_one_thread_per_slot() {
+        let probe = Probe::default();
+        // DeepSeek-V4-Flash's hash layers: top-6 over a per-token table.
+        let ids = Tensor::new(0, 8, 1, Dtype::U32);
+        let tid2eid = Tensor::new(1, 129_280, 6, Dtype::I64);
+        let routes = Tensor::new(2, 8, 6, Dtype::I32);
+        let weights = Tensor::new(3, 8, 6, Dtype::F32);
+        hash_route(&probe, ids, tid2eid, 129_280, 6, routes, weights)
+            .expect("the hash route enqueues");
+        let (f, a) = probe.only();
+        assert_eq!(f.file, "linear/moe_route.metal");
+        assert_eq!(f.entrypoint, "hash_route_gather");
+        // One thread per (slot, token row), the fan-out its own group.
+        assert_eq!(f.lanes, [6, 8, 1]);
+        assert_eq!(f.group, [6, 1, 1]);
+        assert_eq!(a[0], ArgValue::Buffer(0)); // token ids
+        assert_eq!(a[1], ArgValue::Buffer(1)); // the i64 hash table
+        assert_eq!(a[2], ArgValue::BufferMut(2)); // routes, drop-in for a router's
+        assert_eq!(a[3], ArgValue::BufferMut(3)); // weights, drop-in for a router's
+        assert_eq!(a[4], ArgValue::U32(129_280)); // vocab
+        assert_eq!(a[5], ArgValue::U32(6)); // top_k
+    }
+
+    /// A route plane that is not the i32 the sorted-MoE path reads, or a table
+    /// whose width is not the stated fan-out, is a mismatch the entry catches
+    /// before any fire — the same plane checks a softmax router's [`ranked`]
+    /// makes, on the pair a hash router lands instead of scores.
+    ///
+    /// **AND IT CATCHES IT WHERE THE GUARD IS COMPILED, WHICH IS WHY THIS
+    /// TEST IS TOO.** `ranked_planes` states the marshalling contract with
+    /// `debug_assert`, the way all ~170 of this crate's shape and dtype
+    /// guards do, so in a release build there is no panic here to expect:
+    /// a `should_panic` without this `cfg` was a debug-profile claim asserted
+    /// in both, and it failed under `--release` for the one reason release is
+    /// different. The split is not an oversight to be promoted away. A route
+    /// plane's element is fixed by the IR value the compiler carved the
+    /// buffer from — `dispatch::linear` resolves `routes` by `ValueId` and
+    /// hands it straight over — so a bf16 one is a bug in the caller, never
+    /// something a deployment can ask for. The class this crate spends
+    /// `Error` on is the value-dependent one a deployment CAN reach (a zero
+    /// fan-out, an expert count over the lane cap), and `refuse` answers that
+    /// one in every profile.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "lands i32 routes")]
+    fn a_route_plane_that_is_not_i32_trips_the_debug_guard() {
+        let probe = Probe::default();
+        let ids = Tensor::new(0, 4, 1, Dtype::U32);
+        let tid2eid = Tensor::new(1, 32, 6, Dtype::I64);
+        // The routes plane is bf16, not the i32 `route_sort` reads.
+        let routes = Tensor::new(2, 4, 6, Dtype::Bf16);
+        let weights = Tensor::new(3, 4, 6, Dtype::F32);
+        let _ = hash_route(&probe, ids, tid2eid, 32, 6, routes, weights);
+    }
+
+    /// **THE REFERENCE THE DEVICE POINT ANSWERS TO**, computed on the host so
+    /// the numeric contract is pinned where no GPU is: `routes[t, s] =
+    /// tid2eid[token_id[t], s]` exactly (i64 → i32, no dedup), every weight
+    /// `1/top_k`. The device dispatch and readback live on the engine-metal
+    /// device floor, which compares the shader against exactly this gather;
+    /// here the semantics and their edges are locked in-crate — a token id at
+    /// the vocab boundary reads the LAST row, and a row that names an expert
+    /// twice keeps BOTH.
+    #[test]
+    fn the_host_gather_pins_the_contract_and_its_edges() {
+        const VOCAB: usize = 5;
+        const K: usize = 6;
+        // A synthetic table where row `v` names experts `(v + s) mod 7`, so
+        // the last valid id `VOCAB - 1` exercises the boundary read.
+        let mut tid2eid = vec![0i64; VOCAB * K];
+        for v in 0..VOCAB {
+            for s in 0..K {
+                tid2eid[v * K + s] = ((v + s) % 7) as i64;
+            }
+        }
+        // A deliberate duplicate in one row: the hash may repeat, and the
+        // uniform fold weights every slot alike, so the gather keeps both.
+        tid2eid[2 * K + 1] = tid2eid[2 * K];
+
+        // Ids include the boundary (`VOCAB - 1`) and the duplicate row (`2`).
+        let token_ids = [0u32, VOCAB as u32 - 1, 2, 0];
+        let gather = |t: usize| -> ([i64; K], [f32; K]) {
+            let raw = token_ids[t] as usize;
+            let v = if raw < VOCAB { raw } else { 0 }; // embed.metal's guard
+            let mut e = [0i64; K];
+            let mut w = [0f32; K];
+            for s in 0..K {
+                e[s] = tid2eid[v * K + s];
+                w[s] = 1.0 / K as f32;
+            }
+            (e, w)
+        };
+
+        // A boundary id reads the last table row, byte-for-byte, at 1/k.
+        let (e1, w1) = gather(1);
+        assert_eq!(e1[..], tid2eid[(VOCAB - 1) * K..VOCAB * K]);
+        assert!(w1.iter().all(|&x| (x - 1.0 / K as f32).abs() < 1e-9));
+
+        // Row 2's duplicate survives the gather — both slots name it.
+        let (e2, _) = gather(2);
+        assert_eq!(e2[0], e2[1], "a repeated expert is copied, not deduped");
+
+        // Every in-range id gathers its own row exactly.
+        let (e0, _) = gather(0);
+        assert_eq!(e0[..], tid2eid[0..K]);
     }
 }

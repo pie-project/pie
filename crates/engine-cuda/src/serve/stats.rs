@@ -272,6 +272,33 @@ impl Shell {
         }
     }
 
+    /// **CLOSE THE DEFERRED SEAT'S WINDOW NOW** — the gate's door onto §L's
+    /// background promotion, and nothing in the serving path calls it.
+    ///
+    /// [`Shell::promote_group`]'s twin, and it exists for that method's
+    /// reason said one wave later: the install rides the inter-fire gap, so a
+    /// shell nobody is firing never takes it and a gate cannot observe a
+    /// promotion by waiting for one (§L, hazard H5). This joins the fill
+    /// thread and installs synchronously; the production path polls a channel
+    /// between two fires and never waits.
+    ///
+    /// Answers whether an image was installed — `false` for a load that was
+    /// never deferred, one already promoted, one whose fill failed (which is
+    /// counted and named where it happened, and leaves the seat serving), and
+    /// a fully-resident load, which has no tier at all.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Device`](crate::error::Fault) for a copy or an event the
+    /// runtime refused.
+    pub fn settle_tier_refill(&mut self) -> Result<bool> {
+        let (compute, notify) = (self.device.stream(), self.device.notify_stream());
+        match self.weights.experts_mut() {
+            None => Ok(false),
+            Some(tier) => tier.settle_refill(compute, notify),
+        }
+    }
+
     /// How many bytes the buffered-activation pool holds, and `0` for a plan
     /// with no chunked recurrence to buffer.
     #[must_use]
@@ -326,18 +353,35 @@ impl Shell {
     /// while the key itself cannot tell the two answers apart.
     ///
     /// **SO IT IS A BOOT-TIME A/B AND NOT A BETWEEN-FIRES ONE, ON A LOAD
-    /// WHOSE LATTICE HAS A COPY ROW.** State it before `Shell::load` arms
+    /// WHOSE LATTICE HAS A COPY ROW — AND SINCE THE CAPACITY WAVE FLIPPING IT
+    /// ANYWAY IS SAFE, MERELY EXPENSIVE.** State it before `Shell::load` arms
     /// (`[engine] fallback_copy`) and everything below is consistent: the
     /// arming pass derives one segmentation per key and every replay wants
-    /// that one. Flip it between fires and a key that already holds a body
-    /// keeps a script cut for the OTHER policy — `Shell::segments` re-derives
-    /// the table, because it stores the word beside it, but the resident
-    /// exec is what it is. `record::Graphs::fire_body`'s island `debug_assert`
-    /// is what catches that, by name, and closing it means either putting the
-    /// word in the key or standing bodies down for the fire that disagrees.
-    /// Until then: on a load with no copy row this word is still the pure
-    /// walk-shape A/B it was, and on one with a copy row it belongs in the
-    /// boot document.
+    /// that one.
+    ///
+    /// Flip it between fires and every key this load armed is now in the
+    /// OTHER world from the fires arriving. `Shell::segments` stores the word
+    /// beside each memoized table, `Shell::segmentation` reports the
+    /// disagreement instead of re-deriving over it, and the bodies gate stands
+    /// the body down: the fires walk eagerly and are counted
+    /// (`record::BodyTally::eager_copy_world`). What used to happen is that
+    /// the memo re-derived, the resident exec stayed cut for the old policy,
+    /// and an island `debug_assert` — compiled out of a release build — was
+    /// the only thing between that and a wrong answer.
+    ///
+    /// So the reading is: on a load with no copy row this word is still the
+    /// pure walk-shape A/B it always was; on one with a copy row, flipping it
+    /// mid-load costs every replay until the load is restarted, which the
+    /// counter says out loud, and it belongs in the boot document.
+    ///
+    /// **AND THIS IS THE WHOLE OF WHAT CAN PUT A FIRE OUT OF ITS KEY'S
+    /// WORLD**, which is worth stating here because the counter is otherwise
+    /// unexplained: the other half of `window::Copies::enabled` — did the fire
+    /// stage mask bits — is decided by the fire's present SET
+    /// (`Fault::MaskWord`), which is in the key.
+    /// `crate::window::Windows::admits` derives it. So a nonzero
+    /// `record::BodyTally::eager_copy_world` names this method and nothing
+    /// else.
     ///
     /// What it still moves, and safely, is the WALK — `Windows`,
     /// `FireCost::copied`, `Shell::last_fire_cost` — which is the whole of
@@ -379,8 +423,16 @@ impl Shell {
     /// **WHAT THIS LOAD'S GRAPH CACHE HAS DONE — THE WHOLE CENSUS, ON ONE
     /// SURFACE.** There used to be three (`graph_stats`, `fold_stats` and this
     /// one) and an operator had to add up two of them to ask "how many fires
-    /// ran outside every graph"; there is one recorded path now and one struct
+    /// ran outside every graph"; there is one recorded path now and one report
     /// that answers for it.
+    ///
+    /// **AND THE REPORT SAYS WHICH OF ITS NUMBERS MEANS WHAT.**
+    /// [`record::BodyStats`] is three groups by LIFETIME:
+    /// `tally` accumulates for the life of the load and may be subtracted
+    /// between two readings, `last_capture` is the last capture's own
+    /// measurement and stands still, and `census` is refolded out of the
+    /// resident map every time this is called. A caller that reads the wrong
+    /// one gets a number that is honest about something else.
     ///
     /// **INCLUDING THE TWO NUMBERS THIS CACHE DID NOT DO**:
     /// `eager_rotating` and `eager_buffered` count fires the ROUTER walked
@@ -388,7 +440,7 @@ impl Shell {
     /// recurrent fire — and they ride here rather than a surface of their own
     /// for exactly that reason. Zero under `Graphs::Off` and `Graphs::Shaped`
     /// by construction: eagerness is what those modes ARE. See
-    /// [`record::BodyStats::eager_rotating`].
+    /// [`record::BodyTally::eager_rotating`].
     #[must_use]
     pub fn body_stats(&self) -> record::BodyStats {
         self.cache.body_stats()

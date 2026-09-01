@@ -128,19 +128,19 @@ fn argmax(logits: &[f32]) -> u32 {
 /// The lane word the model's own `Classify` computes — runtime-side work,
 /// done here because this test IS the runtime for the length of one fire.
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 /// The same word, with the `masked` fact set — which is what puts a lane in
 /// the class whose window runs `attention.masked`.
 fn masked_word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, true)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, true)).word()
 }
 
 /// The same word with the `has_adapter` fact set — which is what puts a lane
 /// in a class whose window runs `linear.lora_correct` (design §8, fact bit 1).
 fn adapted_word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false).adapted(true)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).adapted(true)).word()
 }
 
 fn finite(logits: &[f32], what: &str) {
@@ -220,11 +220,12 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
 
     // The runtime's half: trace the row, state the load contract. Neither is
     // the shell's — `Trace` crosses the boundary, `CompiledModel` never does.
-    let trace = model::trace_of(SKU).expect("the catalog ships the smoke's SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the smoke's SKU");
     let trace = trace(Platform::Metal);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the SKU's import contract fits its own checkpoint");
+    let contract =
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+            .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let booted = Instant::now();
@@ -232,10 +233,20 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
+        // §M-4c: this gate lands a raw snapshot, which carries no
+        // `pie.serving/1` stamp and proceeds — but the deployment's own facts
+        // are stated honestly all the same, because an empty precision means
+        // "the runtime never assembled them" and is refused rather than
+        // skipped (`weights::serves_this_deployment`).
+        tp_size: 1,
+        precision: models::precision_of(SKU)
+            .expect("the catalog states this row's precision")
+            .to_string(),
         // Small on purpose: the arena reserves `max_tokens` rows of a
         // 248320-wide logit column, and this test needs a prompt, not a
         // batch. Sized for a 32 GiB unified machine.
         budget: Budget::new(4, 256),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,
@@ -984,6 +995,278 @@ fn a_registration_the_banks_cannot_seat_is_refused_by_name() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The shared-adapter mount, on the device (alto adapter §3.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// This test's own mount, unique per process and per nanosecond.
+fn scratch(what: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or(0);
+    let at =
+        std::env::temp_dir().join(format!("pie-metal-mount-{what}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&at).expect("a scratch directory");
+    at
+}
+
+/// f32 to bf16, round-to-nearest-even — the loader's own conversion, stated
+/// here because a truncating fixture would be writing a slightly different
+/// adapter than the one it describes.
+fn bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounding = 0x7fff + ((bits >> 16) & 1);
+    ((bits + rounding) >> 16) as u16
+}
+
+/// What the load's banks say one role's `[layers, rank, hidden]` source is.
+fn geometry(seats: &[engine_metal::BankSeat], role: &str) -> (u64, u64, u64) {
+    let banks: Vec<&engine_metal::BankSeat> = seats
+        .iter()
+        .filter(|seat| engine_metal::adapter::role_of(&seat.name) == role)
+        .collect();
+    let seat = banks.first().expect("this SKU declares this role's banks");
+    (
+        banks.len() as u64,
+        seat.rows.min(seat.cols),
+        seat.rows.max(seat.cols),
+    )
+}
+
+/// **WRITE ONE ADAPTER DIRECTORY INTO THE MOUNT.**
+///
+/// A manifest and two plane files, in the orientations §6.3's statute fixes:
+/// `A` rank-major `[layers, rank, hidden]`, `B` out-major
+/// `[layers, hidden, rank]`. The bytes are the bank's own dtype, because a
+/// blob is prepared once by an operator rather than seeded live by a guest.
+fn write_adapter(mount: &Path, name: &str, seats: &[engine_metal::BankSeat], amplitude: f32) {
+    let dir = mount.join(name);
+    std::fs::create_dir_all(&dir).expect("an adapter directory");
+    let (layers, rank, hidden) = geometry(seats, "lora_a");
+    let plane = |salt: u32, amp: f32, count: u64| -> Vec<u8> {
+        (0..count)
+            .flat_map(|at| {
+                let mixed = (at as u32).wrapping_mul(2_654_435_761).wrapping_add(salt);
+                let value = ((mixed % 2_000) as f32 / 1_000.0 - 1.0) * amp;
+                bf16_bits(value).to_le_bytes()
+            })
+            .collect()
+    };
+    std::fs::write(
+        dir.join("lora_a.bin"),
+        plane(0x0a0a_a0a0, 0.05, layers * rank * hidden),
+    )
+    .expect("the A plane writes");
+    std::fs::write(
+        dir.join("lora_b.bin"),
+        plane(0x0b0b_b0b0, amplitude, layers * hidden * rank),
+    )
+    .expect("the B plane writes");
+    std::fs::write(
+        dir.join("adapter.toml"),
+        format!(
+            "rank = {rank}\n\n\
+             [[plane]]\nrole = \"lora_a\"\nfile = \"lora_a.bin\"\nlayout = \"rank_major\"\n\n\
+             [[plane]]\nrole = \"lora_b\"\nfile = \"lora_b.bin\"\nlayout = \"out_major\"\n"
+        ),
+    )
+    .expect("the manifest writes");
+}
+
+/// **THE SHARED-ADAPTER MOUNT'S DEVICE HALF** (alto adapter §3.3, §6.1).
+///
+/// `blob.rs`'s own pins judge the whole host side with no GPU in the machine —
+/// the manifest grammar, the identity, the single flight, the slicing and
+/// every refusal — by never landing anything. That leaves exactly the claims
+/// that are about bytes which really arrived on a device, and they are these:
+///
+/// ```text
+/// (a) ONE SLOT, ONE COPY. Two binds naming one mounted adapter answer one
+///     slot; the second lands nothing and the fire under it is unchanged.
+/// (b) THE SAME ANSWER AS THE PRIVATE PATH. A byte-seeded bind of the SAME
+///     A and B gets a slot of its own and fires to the same logits, bit for
+///     bit — so what the mount changed is WHERE the bytes came from and
+///     nothing else.
+/// (c) AND IT IS NOT A NO-OP. Both differ from the base model's row, which is
+///     what keeps (b) from being two ways of adding zero.
+/// (d) A FILE DROP SERVES, and a release frees at the last hold.
+/// ```
+#[test]
+fn two_instances_of_one_mounted_adapter_share_one_slot_and_one_copy() {
+    let _serial = serialized();
+    let Some((mut shell, tokenizer)) = ready("the shared-adapter mount") else {
+        return;
+    };
+    let seats = shell.bank_seats();
+    assert!(
+        !seats.is_empty(),
+        "this SKU declares adapter banks; a load with none has nowhere to put one"
+    );
+
+    // The mount, stated AFTER the load — §3.3's whole posture: where the
+    // shared adapters live is the deployment's, not the bake's.
+    let mount = scratch("share");
+    write_adapter(&mount, "alice-v2", &seats, 0.5);
+    shell.mount_adapters(Some(mount.clone()));
+
+    // ── (a) ONE SLOT. The first bind lands; the second joins it.
+    let first = shell
+        .bind_adapter(engine_metal::AdapterSource::Shared { name: "/alice-v2" })
+        .expect("the mount serves the adapter it holds");
+    assert!(first.shared, "a name in the mount is a shared source");
+    assert!(first.landed, "the first bind is the one that pays");
+    let second = shell
+        .bind_adapter(engine_metal::AdapterSource::Shared { name: "alice-v2" })
+        .expect("a second instance names the same adapter");
+    assert_eq!(
+        second.slot, first.slot,
+        "two instances naming ONE blob must land on ONE slot (alto adapter §3.3): the \
+         whole point of keying residency by blob identity is that the second tenant of \
+         an adapter costs the device nothing — and the two spellings are one file, so \
+         the sharing claim is about bytes and not about strings"
+    );
+    assert!(
+        !second.landed,
+        "the second bind paid a landing; it should have joined the one already resident"
+    );
+    assert_eq!(
+        shell.adapter_slots().live(),
+        1,
+        "one adapter, one resident slot"
+    );
+    assert_eq!(
+        shell.blob_store().blobs().loads(),
+        2,
+        "one read per plane FILE, and the second bind re-read nothing"
+    );
+
+    // ── The fire, under the shared slot.
+    let prompt = tokenizer.encode(PROMPT);
+    let rows = prompt.len() as u32;
+    shell.open(0).expect("slot 0 opens");
+    let shared_says = shell
+        .fire_seated(&[Seated::adapted(
+            Lane {
+                slot: 0,
+                word: adapted_word(rows),
+                tokens: &prompt,
+            },
+            first.slot,
+        )])
+        .expect("the corrected prefill fires")[0]
+        .clone();
+    finite(&shared_says, "the shared adapter's prefill");
+
+    // ── (b) THE PRIVATE PATH, WITH THE SAME A AND B. The resolver's own
+    //    planes are what the shared landing wrote, so handing them to the
+    //    byte-seeded verb is the same adapter arriving by the other door.
+    let (built, _fingerprint) = shell
+        .blob_store()
+        .planes("alice-v2", &seats)
+        .expect("the resolver reads the adapter this test wrote");
+    let planes: Vec<AdapterPlane<'_>> = built
+        .iter()
+        .map(|(bank, bytes)| AdapterPlane {
+            bank: bank.as_str(),
+            bytes,
+        })
+        .collect();
+    let private = shell
+        .bind_adapter(engine_metal::AdapterSource::Own {
+            instance: 77,
+            planes: &planes,
+        })
+        .expect("a private adapter lands from the caller's own bytes");
+    assert!(!private.shared, "bytes are not a name in the mount");
+    assert!(private.landed, "a private adapter always pays its own landing");
+    assert_ne!(
+        private.slot, first.slot,
+        "a byte-seeded instance gets a slot of its OWN: content-hash dedup across \
+         private adapters is a later optimization, and sharing one here would put one \
+         tenant's fine-tune under another tenant's rows"
+    );
+
+    shell.open(1).expect("slot 1 opens");
+    let private_says = shell
+        .fire_seated(&[Seated::adapted(
+            Lane {
+                slot: 1,
+                word: adapted_word(rows),
+                tokens: &prompt,
+            },
+            private.slot,
+        )])
+        .expect("the private prefill fires")[0]
+        .clone();
+    assert_eq!(
+        shared_says, private_says,
+        "one adapter arriving by two doors answered two different rows; the mount is \
+         supposed to change WHERE the bytes came from and nothing else"
+    );
+
+    // ── (c) AND IT IS NOT A NO-OP.
+    shell.open(2).expect("slot 2 opens");
+    let base_says = shell
+        .fire(&[Lane {
+            slot: 2,
+            word: word(rows),
+            tokens: &prompt,
+        }])
+        .expect("the uncorrected prefill fires")[0]
+        .clone();
+    assert_ne!(
+        shared_says, base_says,
+        "the corrected row is the base model's, so this whole test is comparing two \
+         ways of adding zero"
+    );
+
+    // ── (d) A FILE DROP SERVES, and the mount was never re-stated.
+    write_adapter(&mount, "bob-v1", &seats, 0.25);
+    let dropped = shell
+        .bind_adapter(engine_metal::AdapterSource::Shared { name: "bob-v1" })
+        .expect(
+            "an adapter written into the mount while the box serves must bind: §3.3 \
+             makes adding a LoRA a file drop, so a refusal here would mean the catalog \
+             was snapshotted at boot after all",
+        );
+    assert!(dropped.landed, "a name nobody has bound before pays a landing");
+    assert_ne!(dropped.slot, first.slot, "a different adapter is a different identity");
+    assert_ne!(dropped.slot, private.slot, "and it is not the private one's either");
+
+    // A name nobody wrote is still an absence, and it says so.
+    let why = shell
+        .bind_adapter(engine_metal::AdapterSource::Shared { name: "carol-v9" })
+        .expect_err("a name nobody wrote is not in the mount")
+        .to_string();
+    assert!(why.contains("carol-v9"), "the refusal names the adapter: {why}");
+
+    // ── THE RELEASE, AND IT TAKES BOTH HOLDS. A slot two instances of one
+    //    blob hold stays pinned until both are gone, which is what keeps a
+    //    shared adapter from being taken out from under a fire.
+    let held = shell.adapter_slots().live();
+    shell.release_adapter(&first);
+    assert_eq!(
+        shell.adapter_slots().live(),
+        held,
+        "one of two holds went and the slot is still pinned"
+    );
+    shell.release_adapter(&second);
+    assert_eq!(
+        shell.adapter_slots().live(),
+        held - 1,
+        "the last release frees the shared slot"
+    );
+    shell.release_adapter(&private);
+    shell.release_adapter(&dropped);
+    assert_eq!(
+        shell.adapter_slots().live(),
+        0,
+        "every bind was given back, so the table this test leaves behind is empty"
+    );
+    let _ = std::fs::remove_dir_all(&mount);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Guest programs at the fire's epilogue (design §9)
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -1169,6 +1452,9 @@ fn guest_instance_in(
                 ..eta_exec::Extents::default()
             },
             geometry,
+            // No registered channels: this fixture's rings are its own, which
+            // is what `&[]` says.
+            &[],
         )
         .unwrap_or_else(|error| panic!("{name} does not bind: {error}"));
     (instance, channel)
@@ -2123,6 +2409,7 @@ fn bind_device_geometry(
                 ..eta_exec::Extents::default()
             },
             eta_ir::registry::GeometryClass::DeviceGeometry,
+            &[],
         )
         .unwrap_or_else(|error| panic!("the device-geometry fixture does not bind: {error}"));
     // ANY CHANNEL A BIND CANNOT SEAT. A pooled pass declares none today — its

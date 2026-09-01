@@ -674,15 +674,26 @@ pub struct ModelConfig {
     /// is the right answer whenever exactly one row fits — and there is one
     /// family where several do. A vision checkpoint holds a text trunk AND a
     /// tower, so it fits the text-only row and the vision row both, and the
-    /// text row is deliberately first: a two-unit load stands the fold down
-    /// and cost 14.9% of throughput when it was tried the other way round
-    /// (`model::qwen_3`'s own measurement). So the default is the cheap row
-    /// and an operator who wants the tower NAMES it.
+    /// text row is deliberately first: a tower load carries a second capture
+    /// unit's weights, launches its execs, and cost 14.9% of throughput when
+    /// it was tried the other way round (`models::qwen_3`'s own measurement).
+    /// So the default is the cheap row and an operator who wants the tower
+    /// NAMES it.
+    ///
+    /// **THE SENTENCE THIS USED TO CARRY IS RETIRED, AND WITH IT ONE OF THE
+    /// TWO COSTS.** It read "a two-unit load arms no bodies (the engine's
+    /// `BodyKey` names one bucket and a second row axis has its own)", which
+    /// was true and is not: the engine's key carries a lattice point PER
+    /// CAPTURE UNIT now, so a vision load arms bodies for its text keys and
+    /// its tower keys alike and replays them like any other. What remains is
+    /// the plain arithmetic of a bigger model — the tower's weights, its
+    /// launches — which is the reason a deployment that will never send an
+    /// image should not load one, and is why the default stays where it is.
     ///
     /// It is a `[model]` key rather than an engine option because it is a fact
     /// about the load, and it is a SKU string rather than a boolean because
     /// the id space is the catalog's own — `pie model list` prints it and
-    /// `model::catalog()` is the only table that defines it.
+    /// `models::catalog()` is the only table that defines it.
     #[serde(default)]
     pub sku: Option<String>,
     /// Which backend runs the model, on what devices.
@@ -703,6 +714,25 @@ pub struct ModelConfig {
     /// declines a write it has no room for rather than filling the disk.
     #[serde(default)]
     pub weight_cache_dir: String,
+    /// **WHERE THIS DEPLOYMENT'S SHARED ADAPTERS LIVE** (alto adapter §3.3),
+    /// or empty for a deployment that mounts none.
+    ///
+    /// A read-only directory holding one subdirectory per adapter, each with
+    /// an `adapter.toml` and the plane files it names. An instance that names
+    /// one of them binds it; N instances that name the SAME one land on one
+    /// bank slot and the device holds one copy, because residency is keyed by
+    /// the blob's identity rather than by the instance.
+    ///
+    /// Empty is the feature off, not a default to derive: a shared bind then
+    /// refuses by name and an adapter seeded from a guest's own channel is
+    /// unaffected. Adding an adapter is writing files into the directory —
+    /// there is no registration verb and no restart, which is why this is a
+    /// mount and not a catalog.
+    ///
+    /// Written into the engine's boot document as `[model] adapter_dir`, and
+    /// read back by `engine_metal::boot` / `engine_cuda::boot`.
+    #[serde(default)]
+    pub adapter_dir: String,
     /// Dtype weights are materialized in. Separate from `activation_dtype`:
     /// narrower weights and wider compute is a normal combination.
     ///
@@ -953,6 +983,16 @@ impl ModelConfig {
             "model.weight_cache_dir must be an absolute path (got {:?}); \
              leave it empty for $PIE_HOME/cache/weights",
             self.weight_cache_dir
+        );
+        // The mount, by the same argument and refused the same way: a
+        // relative mount would resolve against a working directory nobody
+        // chose, and a mount that pointed somewhere else than the operator
+        // meant is a namespace of adapters they did not write.
+        ensure!(
+            self.adapter_dir.is_empty() || Path::new(&self.adapter_dir).is_absolute(),
+            "model.adapter_dir must be an absolute path (got {:?}); \
+             leave it empty to mount no shared adapters at all",
+            self.adapter_dir
         );
         // A ceiling of zero bytes admits no plan at all, so it is a typo
         // rather than a policy -- and it is refused HERE, by the key's own
@@ -1288,11 +1328,27 @@ impl EngineConfig {
                 opts.validate()?;
                 validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
-            // NOTHING TO CHECK, because there is no schema left to check
-            // against: the three option tables went with the engines that
-            // read them. The kind itself is still refused, by name and
-            // once, at `engine_ffi::Flavor::from_kind`.
-            EngineKind::Metal | EngineKind::Vulkan | EngineKind::Wgpu => {}
+            // The Metal engine grew one device knob worth refusing a bad value
+            // for: `gpu_mem_utilization`, the fraction of the wired ceiling pie
+            // claims (the same check the CUDA arm makes above). Read straight
+            // off the options table rather than through a full deserialize so an
+            // otherwise-valid `[model.engine.options]` is not refused for a key
+            // this arm does not police. Absent means the engine's 0.90 default.
+            EngineKind::Metal => {
+                if let Some(fraction) = self
+                    .options
+                    .get("gpu_mem_utilization")
+                    .and_then(toml::Value::as_float)
+                {
+                    ensure!(
+                        fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
+                        "engine.gpu_mem_utilization must be finite and in (0.0, 1.0]"
+                    );
+                }
+            }
+            // NOTHING TO CHECK for the two that ship no shell: the kind itself
+            // is refused, by name and once, at `engine_ffi::Flavor::from_kind`.
+            EngineKind::Vulkan | EngineKind::Wgpu => {}
         }
         Ok(())
     }
@@ -1615,6 +1671,27 @@ pub struct CudaNativeEngineOptions {
     /// stated them is unaffected; one that did is refused by name here
     /// (`deny_unknown_fields`) rather than silently ignored.
     pub bodies: Option<bool>,
+    /// **HOW MANY MEGABYTES OF GRAPH EXEC THE ARMING PASS MAY TAKE OFF THE
+    /// CARD.** **Omit for the shell's own default**, which is 1024 MiB.
+    ///
+    /// Under `bodies`, the load walks every composition its lattice can
+    /// realize and captures one exec per key, ascending bucket order. This is
+    /// what STOPS it: each capture is weighed as it is instantiated and the
+    /// pass ends when the budget is spent, so a card with room arms its whole
+    /// key space and one without arms the small buckets — the shapes traffic
+    /// assembles most often — and walks the rest.
+    ///
+    /// A count used to stop it instead, and the boot line had to tell
+    /// operators that N compositions walk eagerly with nothing to say about
+    /// why that N. The boot line now reports megabytes spent against
+    /// megabytes allowed, which is the number to size this from.
+    ///
+    /// `0` arms nothing and, having armed nothing, does not seal the map: the
+    /// load warms bodies from traffic instead, one capture on the first fire
+    /// of each composition. That is the A/B arm for measuring what the arming
+    /// pass buys, where `bodies = false` is the arm for measuring what bodies
+    /// buy.
+    pub bodies_mem: Option<u32>,
     /// **`Fallback::Copy` WHERE THE COMPILER'S TABLE ASKS FOR ONE.** Below the
     /// copy/split crossover — every bucket a decode fire lands in — a copy
     /// measured 1.07x the ideal against a split's 1.82x. **Omit for on.**
@@ -1691,6 +1768,7 @@ impl Default for CudaNativeEngineOptions {
             graphs: None,
             pad: None,
             bodies: None,
+            bodies_mem: None,
             fallback_copy: None,
             grouped: None,
             side_streams: None,
@@ -1751,12 +1829,23 @@ pub struct MetalEngineOptions {
     ///
     /// The same knob, spelled the same way, as the CUDA engine's -- because it
     /// is the same decision: a residency trade the operator makes about a
-    /// model. What the two backends *do* with it differs (CUDA copies through
-    /// a bounded slab, Metal binds over a file-backed mapping and lets the
-    /// kernel evict), which is a backend's business and not the operator's.
+    /// model. What the two backends *do* with it differs, and the Metal side of
+    /// that sentence USED TO BE WRONG: it claimed Metal "binds over a
+    /// file-backed mapping and lets the kernel evict". It does not, and cannot.
+    /// On Apple Silicon a GPU-touched `StorageModeShared` page — a mapped one
+    /// included — is WIRED, and the pager never evicts a wired page even as free
+    /// memory collapses toward zero (measured, `.wiki/alto/streaming.md` "mmap
+    /// residency measurement, M1 Max"). So a mapping bounds NOTHING here. Both
+    /// backends bound residency the same way: they copy each mixture segment's
+    /// experts through a bounded slab (`engine_metal::experts::Tier`), the GPU
+    /// wires exactly that slab, and the previous segment's wiring is reclaimed
+    /// when the slab's seats are overwritten in place. The lever that sizes the
+    /// slab, and the only mechanism that bounds resident weight on this plane,
+    /// is `device_weight_budget` / `expert_slab_bytes` — not this flag and not
+    /// the pager.
     ///
-    /// Off by default: it trades resident memory for page faults, which only
-    /// pays when the weights do not comfortably fit.
+    /// Off by default: it trades resident memory for a submit-and-wait per
+    /// mixture layer, which only pays when the weights do not comfortably fit.
     pub stream_routed_experts: bool,
     /// How many bytes the routed experts may occupy on the device, or `None`
     /// to keep the whole bank resident.
@@ -1779,6 +1868,25 @@ pub struct MetalEngineOptions {
     /// one feature that admits an oversized model reachable only from a test
     /// binary's environment variable.
     pub expert_slab_bytes: Option<u64>,
+    /// **Fraction of the device's recommended working set pie may hold
+    /// resident** — weights, kv pool and scratch. The Metal twin of the CUDA
+    /// engine's `gpu_mem_utilization`, and 0.90 by default exactly as that one
+    /// is.
+    ///
+    /// It exists because on Apple Silicon a GPU-touched `StorageModeShared`
+    /// page is WIRED and the pager never evicts it, so `recommendedMaxWorking-
+    /// SetSize` is a HARD ceiling and not a hint: a load whose resident weights
+    /// plus kv pool cross it does not page, it resets the box. This fraction is
+    /// how much of that ceiling pie claims, and the engine refuses — or streams
+    /// the weight tier down through `device_weight_budget` — a load that would
+    /// exceed it (`engine_metal::store::accounting`).
+    ///
+    /// Unlike the CUDA key it is `[model.engine.options]` rather than
+    /// `[engine]`, because the Metal engine has no separate `[engine]` table on
+    /// the wire — its device knobs ride the options block the runtime already
+    /// writes for it, reaching the shell as `[metal] gpu_mem_utilization` in the
+    /// boot document.
+    pub gpu_mem_utilization: f64,
     /// Metal device string, e.g. `"metal:0"`. Populated from
     /// `model.engine.device` rather than written here.
     #[serde(skip)]
@@ -1802,6 +1910,7 @@ impl Default for MetalEngineOptions {
             kv_cache_dtype: "auto".to_string(),
             stream_routed_experts: false,
             expert_slab_bytes: None,
+            gpu_mem_utilization: 0.90,
             device: "metal:0".to_string(),
             verbose: false,
         }

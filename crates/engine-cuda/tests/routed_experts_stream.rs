@@ -21,6 +21,9 @@
 //!     resident set changes — and the logits do not move with it
 //! (d) the refusals: a budget under the dense planes, and a budget under the
 //!     pinned tier
+//! (e) and the refusal §M-3 added: a streamed load offered no weight cache
+//!     directory does not serve, and its sentence names the field to set and
+//!     the command to run
 //! ```
 //!
 //! # (b) is a claim about a call graph, and this is where it is stated
@@ -46,6 +49,28 @@
 //! keeps going — which is exactly what article 2 asks for and exactly what
 //! `d(a)` measures the *result* of.
 //!
+//! # (a) boots THREE times now, and the middle one is a prepare
+//!
+//! §M wave M-3 made the streamed load WARM-ONLY. Under `Intent::Serve` a plan
+//! that streams is served out of a prepared serving artifact — `<key>.tiers`
+//! under the weight cache directory — or it is REFUSED before the pinned tier
+//! is allocated; `Shell::prepare` is the only door in the process that writes
+//! one. The fully-resident load is untouched, so the golden below is the load
+//! it always was.
+//!
+//! This file used to hand its streamed boot `weight_cache_dir: None` over a
+//! comment saying the cache was off for a gate and a streamed load formed no
+//! key anyway. The first half was a choice; the second was a fact about §K's
+//! engine, and M-3 is exactly the wave that deleted it. An unkeyed streamed
+//! load is now the loudest refusal in the loader, and it is (e).
+//!
+//! So (a) prepares into a scratch directory and boots warm out of it, at the
+//! SAME plan and the SAME `Boot` document — the artifact's key is a function
+//! of the whole document, so two documents would name two files and the warm
+//! boot would refuse against the one it just wrote. The cost is one extra
+//! landing of a 58 MiB synthetic checkpoint, which is why this claim can be
+//! made here and not beside the gpt-oss gates.
+//!
 //! # The fixture, and why it is not a catalog SKU
 //!
 //! `Model::a3b_micro` is `qwen35-a3b`'s own text at a size two loads of which
@@ -65,7 +90,11 @@
 //!
 //! As `serve_smoke.rs`: skipped at run time when the machine has no device,
 //! rather than `#[ignore]`d — an ignored test on the one box that could run it
-//! is a test nobody runs. Nothing here needs a checkpoint on disk.
+//! is a test nobody runs. Nothing here needs a checkpoint on disk either: the
+//! one it reads it writes itself, as it does the serving artifact §M-3 now
+//! requires of a streamed boot — tens of megabytes under `TMPDIR`, removed
+//! however the test leaves, which is small enough that this file states no
+//! disk condition.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -96,7 +125,7 @@ fn serialized() -> MutexGuard<'static, ()> {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn argmax(logits: &[f32]) -> u32 {
@@ -123,18 +152,33 @@ fn finite(logits: &[f32], what: &str) {
 // ── the fixture ──────────────────────────────────────────────────────────
 
 /// The reduced routed text, traced for this shell.
-fn micro() -> (model::qwen_3::model::Model, Trace) {
-    let m = model::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16, 1);
+fn micro() -> (models::qwen_3::model::Model, Trace) {
+    let m = models::qwen_3::model::Model::a3b_micro(Dtype::Bf16, Dtype::Bf16, 1);
     let trace = model_dsl::trace_hybrid("qwen35-a3b-micro", &m, Platform::Cuda);
     (m, trace)
 }
 
-/// A scratch directory of this process's own.
-fn scratch(what: &str) -> PathBuf {
+/// A scratch directory of this process's own, which removes itself however
+/// the test leaves.
+///
+/// It used to be a bare `PathBuf` and the only thing that ever collected it
+/// was the NEXT run's `remove_dir_all` below — acceptable while all it held
+/// was a 58 MiB fixture checkpoint. Since §M-3 it also holds the serving
+/// artifact the streamed boot is prepared out of, which is one image per
+/// plane of the whole table, so it is worth a `Drop`.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(what: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!("pie-d2-{what}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap_or_else(|why| panic!("{}: {why}", dir.display()));
-    dir
+    Scratch(dir)
 }
 
 /// **A checkpoint for a text nobody ships**, written from the trace's own
@@ -215,20 +259,30 @@ fn f16_bits(value: f32) -> u16 {
     sign | ((exponent as u16) << 10) | mantissa
 }
 
-/// The fixture, built once per test: the trace, the contract, and the
-/// container both loads read.
+/// The fixture, built once per test: the trace, the contract, the container
+/// both loads read, and the directory a prepare writes this deployment's
+/// serving artifact into.
 struct Fixture {
     trace: Trace,
     contract: ModelContract,
     container: PathBuf,
+    /// **Where the streamed boot's weights come from** (§M-3). Empty until a
+    /// test calls `prepare`, and a streamed `Shell::load` against it while it
+    /// is empty refuses — which is (e)'s neighbour claim and what
+    /// `a_prepare_writes_the_tiers_a_bare_boot_refuses` states in full.
+    cache: PathBuf,
+    /// Held for its `Drop` and read by nothing: the checkpoint and the
+    /// artifact both live under it and neither outlives its test.
     #[allow(dead_code)]
-    dir: PathBuf,
+    dir: Scratch,
 }
 
 fn fixture(what: &str) -> Fixture {
     let (m, trace) = micro();
     let dir = scratch(what);
-    let container = dir.join("micro.zt");
+    let container = dir.0.join("micro.zt");
+    let cache = dir.0.join("tiers");
+    std::fs::create_dir_all(&cache).unwrap_or_else(|why| panic!("{}: {why}", cache.display()));
     write_checkpoint(&container, &trace);
     let source = ztensor::Source::open(&container).expect("the fixture opens");
     let contract = m.load(&source).expect("the text lands its own checkpoint");
@@ -237,6 +291,7 @@ fn fixture(what: &str) -> Fixture {
         trace,
         contract,
         container,
+        cache,
         dir,
     }
 }
@@ -248,9 +303,12 @@ fn full_demand(trace: &Trace) -> u64 {
         .device_demand()
 }
 
-/// A shell over the fixture, at a stated residency.
-fn load(fixture: &Fixture, residency: Plan) -> engine_cuda::Result<Shell> {
-    Shell::load(Boot {
+/// **ONE DOCUMENT, TWO DOORS** (§M-3). The prepare and the boot it feeds have
+/// to describe the same deployment in every field or they name two different
+/// files: the artifact's key is a function of the trace, the recipe and the
+/// ranking. So the document is stated once here and handed to both.
+fn doc<'a>(fixture: &'a Fixture, residency: Plan, cache: Option<&'a Path>) -> Boot<'a> {
+    Boot {
         trace: fixture.trace.clone(),
         contract: &fixture.contract,
         checkpoint: &fixture.container,
@@ -263,13 +321,33 @@ fn load(fixture: &Fixture, residency: Plan) -> engine_cuda::Result<Shell> {
         ordinal: 0,
         graphs: Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
-        // The warm-boot artifact cache is off for a gate, and a streamed load
-        // forms no key anyway.
-        weight_cache_dir: None,
+        // **NOT A CACHE ANY MORE — THE ROAD** (§M-3). This field read `None`
+        // unconditionally, over a comment saying the warm-boot cache was off
+        // for a gate and a streamed load formed no key anyway. It forms one
+        // now and it has nowhere else to read: a serving load that streams
+        // opens a prepared artifact or it refuses. `None` is still what the
+        // uncapped golden is given — the fully-resident path never looks for
+        // a file — and it is what (e) stands on.
+        weight_cache_dir: cache,
         residency,
-    })
+    }
+}
+
+/// A shell over the fixture, at a stated residency, reading whatever `cache`
+/// says: `None` for a resident load or for a refusal, the fixture's own
+/// directory for a streamed one that has been prepared into it.
+fn load(fixture: &Fixture, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result<Shell> {
+    Shell::load(doc(fixture, residency, cache))
+}
+
+/// **THE WRITER**, and since §M-3 the only one in the process. `pie model
+/// import --prepare-only` reaches it through `Cuda::prepare`; this file
+/// reaches it directly, because what the boot below needs is the file and not
+/// the plumbing.
+fn prepare(fixture: &Fixture, residency: Plan) -> engine_cuda::Result<()> {
+    Shell::prepare(doc(fixture, residency, Some(&fixture.cache)))
 }
 
 /// A prefill and `STEPS` greedy decodes, feeding the argmax back.
@@ -323,7 +401,7 @@ fn a_half_resident_load_says_what_a_fully_resident_one_says() {
     // ── THE GOLDEN. Uncapped: the whole table on the device, the tier never
     //    opened, the select kernels handed two nulls — the fire this shell
     //    fired before D2 existed.
-    let mut resident = load(&fixture, Plan::default()).expect("the resident shell loads");
+    let mut resident = load(&fixture, Plan::default(), None).expect("the resident shell loads");
     assert!(
         resident.weights_resident(),
         "an uncapped load holds the whole table"
@@ -338,7 +416,8 @@ fn a_half_resident_load_says_what_a_fully_resident_one_says() {
     // ── THE STREAMED LOAD. A budget sized so that the slab can hold roughly
     //    half the experts: the dense planes whole, plus half the expert bytes.
     let budget = full - expert_bytes(&fixture.trace) / 2;
-    let planned = Plan::of(&fixture.trace, &Attachments::new(), Budgets::device(budget)).expect("half the experts stream");
+    let planned = Plan::of(&fixture.trace, &Attachments::new(), Budgets::device(budget))
+        .expect("half the experts stream");
     assert!(planned.streams(), "half the table cannot be held whole");
     let arity = planned.banks()[0].experts;
     let seated = planned.banks()[0].resident;
@@ -353,10 +432,33 @@ fn a_half_resident_load_says_what_a_fully_resident_one_says() {
         planned.host_demand(),
     );
 
-    let mut streamed = load(&fixture, planned).expect("the streamed shell loads");
+    // ── THE PREPARE, WHICH IS WHERE THE STREAMED LOAD'S BYTES NOW COME FROM
+    //    (§M-3). Not a warm-boot optimization measured here — that is
+    //    `a_second_streamed_boot_maps_the_tiers_it_wrote`'s subject — but the
+    //    only road there is: a serving load at this plan refuses against an
+    //    empty directory, which is what (e) below stands on. It costs one
+    //    more landing of the 58 MiB fixture, and it lands the same table at
+    //    the same plan, so the parity claim under it is unmoved.
+    prepare(&fixture, planned.clone()).expect("the prepare writes this seat's artifact");
+    assert_eq!(
+        std::fs::read_dir(&fixture.cache)
+            .expect("the cache directory")
+            .flatten()
+            .count(),
+        1,
+        "one prepare, one serving artifact, and no `.part` left beside it"
+    );
+
+    let mut streamed =
+        load(&fixture, planned, Some(&fixture.cache)).expect("the prepared streamed shell loads");
     assert!(
         !streamed.weights_resident(),
         "a streamed load says so rather than claiming the table"
+    );
+    assert!(
+        streamed.weights_from_cache(),
+        "and it came off the artifact the prepare wrote — since §M-3 there is \
+         no other place a streamed serve can have got them"
     );
     let banks = streamed.expert_residency();
     assert!(!banks.is_empty(), "and reports the tier it opened");
@@ -445,7 +547,7 @@ fn expert_bytes(trace: &Trace) -> u64 {
         .sum()
 }
 
-// ── (d) the refusals ─────────────────────────────────────────────────────
+// ── (d) and (e) the refusals ───────────────────────────────────────────────
 
 #[test]
 fn a_budget_under_the_planes_that_cannot_move_is_refused_by_name() {
@@ -469,7 +571,8 @@ fn a_budget_under_the_planes_that_cannot_move_is_refused_by_name() {
 fn a_host_budget_under_the_pinned_tier_is_refused_by_name() {
     let (_, trace) = micro();
     let full = full_demand(&trace);
-    let plan = Plan::of(&trace, &Attachments::new(), Budgets::device(full * 3 / 4)).expect("three quarters streams");
+    let plan = Plan::of(&trace, &Attachments::new(), Budgets::device(full * 3 / 4))
+        .expect("three quarters streams");
     assert!(plan.streams());
     let residency = engine::load::Residency {
         device_weight_budget: Some(full * 3 / 4),
@@ -494,5 +597,52 @@ fn an_uncapped_budget_opens_no_tier_at_all() {
         plan.host_demand(),
         0,
         "a fully-resident load pins nothing — dev's `place_all` allocates no host tier"
+    );
+}
+
+/// **A streamed load with nowhere to have been prepared does not serve**
+/// (§M-3, claim (e)).
+///
+/// The load refused here is the load THIS FILE USED TO PERFORM: until M-3 the
+/// streamed boot above was handed `weight_cache_dir: None`, streamed the
+/// checkpoint, ran the landing transforms and served — and the comment over
+/// that field said a streamed load formed no key anyway. Both halves are
+/// gone. It forms a key, it has exactly one place to read, and when the
+/// deployment names no directory it cannot even say which file is missing —
+/// so the sentence it refuses with is about the CONFIG, and it names the
+/// field to set and the command to fill it.
+///
+/// `Fault::Residency`, which `Cuda` renders as `engine::Error::Impossible`:
+/// nothing the deployment frees changes the answer. And it costs nothing —
+/// the refusal is raised before the pinned tier is allocated and before a
+/// byte of the checkpoint is read — which is why the claim lives beside the
+/// cheap synthetic fixture rather than behind an `--ignored` gpt-oss gate.
+#[test]
+fn a_streamed_load_with_no_cache_directory_is_refused_by_name() {
+    let _one = serialized();
+    if !ready("a_streamed_load_with_no_cache_directory_is_refused_by_name") {
+        return;
+    }
+    let fixture = fixture("unkeyed");
+    let budget = full_demand(&fixture.trace) - expert_bytes(&fixture.trace) / 2;
+    let planned = Plan::of(&fixture.trace, &Attachments::new(), Budgets::device(budget))
+        .expect("half the experts stream");
+    assert!(
+        planned.streams(),
+        "a resident load reads no artifact and there would be nothing here to refuse"
+    );
+
+    let why = load(&fixture, planned, None)
+        .err()
+        .expect("a streamed serve with no weight cache directory does not load");
+    let said = format!("{why:?}");
+    eprintln!("the unkeyed streamed load refused: {said}");
+    assert!(
+        said.contains("weight_cache_dir"),
+        "the refusal names the field an operator has to state: {said}"
+    );
+    assert!(
+        said.contains("pie model import --prepare-only"),
+        "and the command that fills the directory it names: {said}"
     );
 }

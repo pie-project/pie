@@ -292,7 +292,7 @@ async def test_snapkv_enforces_its_keep_set(client, args):
     assert tight["text"].strip(), tight
     # (4) The keep-set has to reach the kernel, not just the JSON.
     assert wide["text"] != tight["text"], (
-        "attn_page_mask is not enforced for SnapKV: a 1-page budget produced "
+        "the page-mask door is not enforced for SnapKV: a 1-page budget produced "
         "the same continuation as an all-page one"
     )
     assert wide["text"] == base["text"], (

@@ -17,9 +17,28 @@ inline constexpr short get_bytes_per_pack() {
 
 template <typename T, typename U, int values_per_thread, int bits>
 inline U load_vector(const device T* x, thread U* x_thread) {
-  static_assert(bits == 4 || bits == 8, "port covers the two widths mlx_lm ships");
+  static_assert(bits == 2 || bits == 4 || bits == 8,
+                "port covers the widths mlx affine ships this box");
   U sum = 0;
-  if (bits == 4) {
+  if (bits == 2) {
+    // EIGHT two-bit codes ride one uint16, at bit offsets 0,2,..,14, and
+    // `qdot` reads them UNSHIFTED — code j comes back as `code << 2j`, i.e.
+    // multiplied by 4^j. So the activation is pre-divided by 4^j here, the
+    // two-bit twin of the nibble point's {1,16,256,4096}. The eight divisors
+    // are {1,4,16,64,256,1024,4096,16384}, one per code of the packed word.
+    for (int i = 0; i < values_per_thread; i += 8) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+          x[i + 6] + x[i + 7];
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1] / 4.0f;
+      x_thread[i + 2] = x[i + 2] / 16.0f;
+      x_thread[i + 3] = x[i + 3] / 64.0f;
+      x_thread[i + 4] = x[i + 4] / 256.0f;
+      x_thread[i + 5] = x[i + 5] / 1024.0f;
+      x_thread[i + 6] = x[i + 6] / 4096.0f;
+      x_thread[i + 7] = x[i + 7] / 16384.0f;
+    }
+  } else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
       sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
       x_thread[i] = x[i];
@@ -43,9 +62,26 @@ inline U qdot(
     U scale,
     U bias,
     U sum) {
-  static_assert(bits == 4 || bits == 8, "port covers the two widths mlx_lm ships");
+  static_assert(bits == 2 || bits == 4 || bits == 8,
+                "port covers the widths mlx affine ships this box");
   U accum = 0;
-  if (bits == 4) {
+  if (bits == 2) {
+    // Eight codes per uint16 word: two bits apiece, masked in place so the
+    // pre-division `load_vector` did cancels the `<< 2j` the mask leaves on.
+    // The masks are {0x0003,0x000c,0x0030,0x00c0,0x0300,0x0c00,0x3000,0xc000}.
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 8); i++) {
+      accum +=
+          (x_thread[8 * i] * (ws[i] & 0x0003) +
+           x_thread[8 * i + 1] * (ws[i] & 0x000c) +
+           x_thread[8 * i + 2] * (ws[i] & 0x0030) +
+           x_thread[8 * i + 3] * (ws[i] & 0x00c0) +
+           x_thread[8 * i + 4] * (ws[i] & 0x0300) +
+           x_thread[8 * i + 5] * (ws[i] & 0x0c00) +
+           x_thread[8 * i + 6] * (ws[i] & 0x3000) +
+           x_thread[8 * i + 7] * (ws[i] & 0xc000));
+    }
+  } else if (bits == 4) {
     const device uint16_t* ws = (const device uint16_t*)w;
     for (int i = 0; i < (values_per_thread / 4); i++) {
       accum +=
@@ -241,6 +277,16 @@ instantiate_qmv_fast(bfloat16, bfloat, 128, 4)
 instantiate_qmv_fast(bfloat16, bfloat, 64, 8)
 instantiate_qmv_fast(bfloat16, bfloat, 32, 8)
 instantiate_qmv_fast(bfloat16, bfloat, 128, 8)
+// The 2-bit affine one-row point, at all three groups. Stamped in source
+// beside the 4/8 twins even though `linear::quant::WIDTHS` does not yet list
+// two — these are the directly-fired arms the 2-bit unit floor binds, ahead of
+// the WIDTHS flip that would put them on the default warm-up ladder. At gs=32
+// the point runs packs_per_thread=2 (its fixed default), giving
+// values_per_thread=32=group and scale_step_per_thread=1, the tight edge of
+// the format and still one whole group a thread.
+instantiate_qmv_fast(bfloat16, bfloat, 64, 2)
+instantiate_qmv_fast(bfloat16, bfloat, 32, 2)
+instantiate_qmv_fast(bfloat16, bfloat, 128, 2)
 
 #define instantiate_qmv_fast_residual(name, itype, gs, b)                       \
   template [[host_name("affine_qmv_fast_residual_" #name "_gs_" #gs "_b_" #b)]] \
@@ -255,6 +301,9 @@ instantiate_qmv_fast_residual(bfloat16, bfloat, 128, 4)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 64, 8)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 32, 8)
 instantiate_qmv_fast_residual(bfloat16, bfloat, 128, 8)
+instantiate_qmv_fast_residual(bfloat16, bfloat, 64, 2)
+instantiate_qmv_fast_residual(bfloat16, bfloat, 32, 2)
+instantiate_qmv_fast_residual(bfloat16, bfloat, 128, 2)
 
 constant float kMxfp4Lut[16] = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
                                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
@@ -265,12 +314,12 @@ inline float mxfp4_hi(uint8_t byte) { return kMxfp4Lut[byte >> 4]; }
 inline float mxfp4_block_scale(uint8_t code) {
   return code == 0xff ? NAN : metal::ldexp(1.0f, int(code) - 127);
 }
-template <typename T, int BITS>
+template <typename T, int BITS, int GROUP = 64>
 struct AffineQ {
   typedef T scale_t;
   MLX_MTL_CONST int bits = BITS;
 
-  MLX_MTL_CONST int group_size = 64;
+  MLX_MTL_CONST int group_size = GROUP;
   MLX_MTL_CONST bool zero_point = true;
   static METAL_FUNC float scale_of(scale_t s) { return float(s); }
   template <typename U, int VPT>
@@ -286,6 +335,18 @@ struct AffineQ {
 
 template <typename T> using AffineU4 = AffineQ<T, 4>;
 template <typename T> using AffineU8 = AffineQ<T, 8>;
+// The two-bit affine codec, for the routed decode arm — now group-parametric,
+// because the 2-bit expert banks this box runs are not uniform in their group.
+// `AffineQ`'s third parameter is the group, defaulting to 64 so the four- and
+// eight-bit twins above are unchanged. Qwen3.8-Flash keeps its 2-bit banks at
+// group 128, DeepSeek-V4-Flash at group 32 (with one layer's gate at 64), so
+// the routed matvec instantiates the codec at all three groups the artifacts
+// carry. The routed impl reads the group straight off `Codec::group_size` for
+// every scale/bias index, so the group IS the codec — the `gs` suffix on the
+// host name below only names the point, it no longer silently rides 64.
+template <typename T> using AffineU2 = AffineQ<T, 2, 64>;
+template <typename T> using AffineU2_gs32 = AffineQ<T, 2, 32>;
+template <typename T> using AffineU2_gs128 = AffineQ<T, 2, 128>;
 
 template <typename T>
 struct Mxfp4 {
@@ -443,6 +504,23 @@ instantiate_gptoss_qmv(affine_qmv_tail, qmv_tail, AffineU4, bfloat16, bfloat, 64
 instantiate_gptoss_qmv(affine_qmv_tail_bias, qmv_tail_bias, AffineU4, bfloat16, bfloat, 64, 4)
 instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU4, bfloat16, bfloat, 64, 4)
 instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU4, bfloat16, bfloat, 64, 4)
+
+// The 2-bit routed arms — the switch_mlp expert banks the 2-bit checkpoints
+// keep in the routed path, at all three groups the artifacts carry.
+// `linear::moe::routed_point` names these for a bank that is affine, two bits,
+// and one of {32,64,128}. PPT is 1 (the routed rung), so `pack_factor` is 16
+// and `values_per_thread` is 16 = two packed uint16 words a thread, which
+// `qdot`'s two-bit arm folds eight codes at a time. Sixteen values a thread
+// divide 32, 64 and 128 alike, so a thread's span never straddles a group and
+// `g = base / group_size` names the one scale/bias the span wants — the routed
+// path carries no `scale_step_per_thread`, one group per thread-chunk instead,
+// so the gs=32 packs-to-one edge the dense fast point rides does not arise here.
+instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU2, bfloat16, bfloat, 64, 2)
+instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU2, bfloat16, bfloat, 64, 2)
+instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU2_gs32, bfloat16, bfloat, 32, 2)
+instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU2_gs32, bfloat16, bfloat, 32, 2)
+instantiate_gptoss_qmv(affine_qmv_routed_bias, qmv_routed_bias, AffineU2_gs128, bfloat16, bfloat, 128, 2)
+instantiate_gptoss_qmv(affine_qmv_routed, qmv_routed, AffineU2_gs128, bfloat16, bfloat, 128, 2)
 
 instantiate_gptoss_qmv(mxfp4_qmv_routed_bias, qmv_routed_bias, Mxfp4, bfloat16, bfloat, 32, 4)
 instantiate_gptoss_qmv(mxfp4_qmv_routed, qmv_routed, Mxfp4, bfloat16, bfloat, 32, 4)

@@ -9,7 +9,13 @@
 //! The two escape hatches ([`Expr::Repack`], [`Expr::Cast`]) are rejected
 //! here by design: they need a kernel, so they are the planner's problem.
 //!
-//! See `loader/spec.md` §3.1 and §3.3.
+//! [`Expr::Gather`] is the one node with a second answer. A permutation of
+//! single elements has no contiguous stretches to find, so the copy list is
+//! 1.18M runs of length one for the case that motivated it; where that
+//! happens, [`Lowering::Gather`] states the table instead. The copy list is
+//! still tried first, always — see [`compile`].
+//!
+//! See `loader/spec.md` §3.1, §3.3 and §3.4.
 
 use std::collections::HashMap;
 
@@ -44,7 +50,7 @@ impl Leaf {
 /// `dst_elem` in the output.
 ///
 /// Offsets are in *logical elements*, not bytes, because the element width
-/// depends on the encoding. Use [`Lowering::byte_runs`] to convert.
+/// depends on the encoding. Use [`CopyList::byte_runs`] to convert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
     pub source: RunSource,
@@ -54,16 +60,224 @@ pub struct Run {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunSource {
-    /// Index into [`Lowering::leaves`], plus an element offset into that leaf.
+    /// Index into [`CopyList::leaves`], plus an element offset into that leaf.
     Leaf { leaf: usize, src_elem: i64 },
     /// A hole: a coordinate no source reaches, left as the zero the
     /// destination was filled with. Introduced by [`Expr::Fill`].
     Zero,
 }
 
-/// The compiled form of one affine expression.
+/// What one expression compiles to.
+///
+/// The refusal this enum replaced named both members: an expression that breaks
+/// into more stretches than the walker will hold "needs a gather lowering, not
+/// a copy list". Those are the two, and they are not two encodings of one
+/// thing — they are the two shapes an executor can be asked for.
+///
+/// * A [`CopyList`] is stretches of *addresses*. It folds into rectangles, it
+///   prices as [`CopyList::cost`] strided copies, and a cost of one is a copy
+///   that need not happen at all.
+/// * A [`GatherList`] is a table of *indices*. It never folds, it always costs
+///   one pass over the bytes, and the pass is element-granular: the executor
+///   walks the table while the bytes are in host memory on their way to the
+///   device.
+///
+/// Which one an expression gets is not a policy knob. Every expression that
+/// can be a copy list is one — [`compile`] tries that first and only falls
+/// back when the list would exceed `max_runs`, so nothing that lowers today
+/// lowers differently tomorrow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lowering {
+    Copy(CopyList),
+    Gather(GatherList),
+}
+
+impl Lowering {
+    /// Leaves in first-use order, whichever form this is.
+    pub fn leaves(&self) -> &[Leaf] {
+        match self {
+            Lowering::Copy(copies) => &copies.leaves,
+            Lowering::Gather(gather) => &gather.leaves,
+        }
+    }
+
+    /// Total elements in the output.
+    pub fn elements(&self) -> i64 {
+        match self {
+            Lowering::Copy(copies) => copies.elements,
+            Lowering::Gather(gather) => gather.elements,
+        }
+    }
+
+    /// What this expression costs to execute, in the units of
+    /// [`CopyList::cost`]: a gather is one pass over the destination, so it
+    /// costs one — the same as a whole-tensor copy, and for the same reason.
+    /// It is the *element* count that differs, and no cost model this layer
+    /// has ever charged for elements.
+    pub fn cost(&self) -> usize {
+        match self {
+            Lowering::Copy(copies) => copies.cost(),
+            Lowering::Gather(_) => 1,
+        }
+    }
+
+    /// The copy list, or `None` for a gather.
+    ///
+    /// For callers that only ever see the affine fragment — the reference
+    /// oracle's own fixtures, and this module's tests.
+    pub fn as_copy(&self) -> Option<&CopyList> {
+        match self {
+            Lowering::Copy(copies) => Some(copies),
+            Lowering::Gather(_) => None,
+        }
+    }
+}
+
+/// One leaf, one index table: `out[r, i, j] = src[r, indices[i], j]`, with
+/// `j` ranging over a [`block`](Self::block) of elements and `r` over
+/// [`rows`](Self::rows).
+///
+/// This is the lowering the copy list cannot express *affordably*. Every
+/// gather is also a copy list — one run per index, or fewer where the indices
+/// happen to run consecutively — and for a permutation of rows that list is
+/// the better answer, which is why [`compile`] still produces it. What breaks
+/// is a permutation whose blocks are single elements: the MLX patch-embed
+/// bank is a `[768, 1536]` stride-3 deinterleave, which is 1.18M runs of one
+/// element each, folding to 3069 rectangles that no engine wants to issue.
+/// The same permutation is 1536 indices.
+///
+/// The table is stated once and repeated over `rows`, because that is what a
+/// gather along an axis *is*: the axes outside it are untouched, and writing
+/// their product into the table would be the same 1.18M numbers again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GatherList {
+    /// Leaves in first-use order, as [`CopyList::leaves`] is. A gather reads
+    /// exactly one of them; the vector is kept whole so that the two forms
+    /// answer [`Lowering::leaves`] the same way.
+    pub leaves: Vec<Leaf>,
+    /// Which leaf, indexing [`leaves`](Self::leaves).
+    pub leaf: usize,
+    /// Destination block `i` reads source block `indices[i]`.
+    pub indices: Vec<i64>,
+    /// Elements in one block: the operand's extent below the gathered axis.
+    /// One, when the gather is on the innermost axis.
+    pub block: i64,
+    /// How many times the table repeats: the operand's extent above the
+    /// gathered axis.
+    pub rows: i64,
+    /// Elements between consecutive source rows.
+    pub src_row: i64,
+    /// Total elements in the output.
+    pub elements: i64,
+}
+
+impl GatherList {
+    /// Elements between consecutive destination rows. Derived, not stored: a
+    /// destination row is exactly the table, and a second field could disagree.
+    pub fn dst_row(&self) -> i64 {
+        self.indices.len() as i64 * self.block
+    }
+
+    /// Elements the gather reads. The whole operand, because a table may name
+    /// any of its blocks and the executor reads once.
+    pub fn source_elements(&self) -> i64 {
+        self.rows * self.src_row
+    }
+
+    /// The table's geometry in bytes, under the encoding the tensor is stored
+    /// in.
+    ///
+    /// The conversion lives here because [`ByteScale`] does: a blocked payload
+    /// carries its scale inside the block, so "how many bytes is one gathered
+    /// block" is a question only this module answers correctly, and it is the
+    /// same answer [`CopyList::byte_pieces`] gets. A gather whose blocks do
+    /// not land on block boundaries is refused there rather than rounded here
+    /// — though `infer` has already refused a gather on a quantized axis, so
+    /// reaching that requires a gather on an axis *outside* the blocked one
+    /// with a partial block below it.
+    pub fn byte_geometry(&self, encoding: &Encoding) -> Result<GatherBytes, Error> {
+        let scale = ByteScale::of(encoding);
+        Ok(GatherBytes {
+            block_bytes: scale.extent(self.block, "gather block")?,
+            rows: u64::try_from(self.rows)
+                .map_err(|_| Error::Internal("gather has a negative row count".to_string()))?,
+            src_row_bytes: scale.extent(self.src_row, "gather source row")?,
+        })
+    }
+
+    /// The same mapping written as one rectangle per index.
+    ///
+    /// Not what an executor runs — that is the table, walked once — but what
+    /// the mapping MEANS, in the vocabulary the affine fragment already has.
+    /// The reference oracle replays these, so a gather is checked by the same
+    /// scatter that checks every copy list, and `indices.len()` rectangles is
+    /// a cost only a test pays.
+    pub fn byte_rects(&self, encoding: &Encoding) -> Result<Vec<Rect>, Error> {
+        let scale = ByteScale::of(encoding);
+        let block = scale.extent(self.block, "gather block")?;
+        let src_row = scale.stride(self.src_row, "gather source row")?;
+        let dst_row = scale.stride(self.dst_row(), "gather destination row")?;
+        self.indices
+            .iter()
+            .enumerate()
+            .map(|(at, index)| {
+                let mut dims = Vec::with_capacity(2);
+                if self.rows > 1 {
+                    dims.push(Dim {
+                        count: self.rows,
+                        src_stride: src_row,
+                        dst_stride: dst_row,
+                    });
+                }
+                dims.push(Dim {
+                    count: block as i64,
+                    src_stride: 1,
+                    dst_stride: 1,
+                });
+                Ok(Rect {
+                    leaf: self.leaf,
+                    src_offset: scale.offset(
+                        index
+                            .checked_mul(self.block)
+                            .or_overflow("gather source offset overflows")?,
+                        "gather source",
+                    )?,
+                    dst_offset: scale.offset(
+                        (at as i64)
+                            .checked_mul(self.block)
+                            .or_overflow("gather destination offset overflows")?,
+                        "gather destination",
+                    )?,
+                    dims,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A [`GatherList`]'s geometry in bytes. `indices` stays in blocks, because a
+/// block is the unit the table names and scaling it twice is how an index
+/// list stops meaning anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GatherBytes {
+    /// Bytes in one gathered block.
+    pub block_bytes: u64,
+    /// How many times the table repeats.
+    pub rows: u64,
+    /// Bytes between consecutive source rows.
+    pub src_row_bytes: u64,
+}
+
+impl GatherBytes {
+    /// Bytes the gather reads: the whole operand.
+    pub fn source_bytes(&self) -> u64 {
+        self.rows.saturating_mul(self.src_row_bytes)
+    }
+}
+
+/// The copy-list form of a lowering: maximal contiguous stretches.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Lowering {
+pub struct CopyList {
     /// Leaves in first-use order; [`RunSource::Leaf`] indexes this.
     pub leaves: Vec<Leaf>,
     pub runs: Vec<Run>,
@@ -71,16 +285,16 @@ pub struct Lowering {
     pub elements: i64,
 }
 
-impl Lowering {
+impl CopyList {
     /// How many separate copies this expression costs.
     ///
     /// This is the cost model of `spec.md` §3.3: few long runs lower to DMA,
     /// many short ones to a gather kernel. It is known before any I/O happens.
     ///
-    /// Count [`Lowering::pieces`] instead when the executor can issue strided
+    /// Count [`CopyList::pieces`] instead when the executor can issue strided
     /// copies — a row shard is thousands of runs but one piece.
     ///
-    /// Nothing on the load path reads this: [`Lowering::cost`] is what picks a
+    /// Nothing on the load path reads this: [`CopyList::cost`] is what picks a
     /// lowering. It is here so this module's own tests can state the shape they
     /// expect — "a row shard of a fused bank is 2048 runs averaging 3072
     /// elements" is a claim about the algebra, and asserting it directly is how
@@ -92,7 +306,7 @@ impl Lowering {
 
     /// Mean run length in elements, or 0 for an empty lowering.
     ///
-    /// Test observability, as [`Lowering::run_count`] is.
+    /// Test observability, as [`CopyList::run_count`] is.
     pub fn mean_run_elements(&self) -> i64 {
         if self.runs.is_empty() {
             0
@@ -135,7 +349,7 @@ impl Lowering {
     /// It does *not* decide whether to slab-scatter. That choice weighs one
     /// over-read against many small reads, so its inputs are the gaps between
     /// source ranges and the ratio of span to payload — and it coalesces
-    /// *across tensors*, sorted by file offset. A `Lowering` is one tensor's
+    /// *across tensors*, sorted by file offset. A `CopyList` is one tensor's
     /// expression and has neither, which is why the decision lives in
     /// `plan/passes/rewrite.rs` after the offsets are assigned, and why
     /// `spec.md` §3.3 calls its thresholds a loader policy rather than a
@@ -167,7 +381,7 @@ impl Lowering {
     }
 
     /// Whether the destination has holes, and so must be zeroed before the
-    /// copies in [`Lowering::copy_pieces`] run.
+    /// copies in [`CopyList::copy_pieces`] run.
     pub fn needs_zero_fill(&self) -> bool {
         self.runs.iter().any(|run| run.source == RunSource::Zero)
     }
@@ -487,13 +701,21 @@ pub fn bits_per_element(encoding: &Encoding) -> u32 {
     }
 }
 
-/// Compile `expr` into runs, using the types the resolver
-/// already resolved for it.
+/// Compile `expr` into the lowering that satisfies it, using the types the
+/// resolver already resolved for it.
 ///
 /// `max_runs` bounds the walker's own output so a pathological expression
 /// cannot make the compiler allocate without limit. It is *not* the cost
 /// model — a row shard is thousands of runs and one copy. Ask
-/// [`Lowering::cost`] what the expression actually costs.
+/// [`CopyList::cost`] what the expression actually costs.
+///
+/// It is also the seam between the two lowerings. A copy list is tried first,
+/// always, and the cap is the point past which one stops being an answer: a
+/// list that long folds into thousands of rectangles at best, and every one of
+/// them is an instruction some engine has to issue. Where the expression is a
+/// [`Expr::Gather`] over a whole tensor, the same mapping is an index table
+/// instead; where it is not, there is nothing better to fall back to and the
+/// refusal stands.
 pub fn compile(expr: &Expr, checked: &Checked, max_runs: usize) -> Result<Lowering, Error> {
     let mut builder = Builder {
         checked,
@@ -502,7 +724,7 @@ pub fn compile(expr: &Expr, checked: &Checked, max_runs: usize) -> Result<Loweri
         leaf_index: HashMap::new(),
     };
     let root = builder.build(expr)?;
-    builder.walk(root, max_runs)
+    builder.lower(root, max_runs)
 }
 
 /// A node of the flattened, shape-annotated expression.
@@ -759,9 +981,70 @@ impl Builder<'_> {
         }
     }
 
+    /// Pick a lowering: the copy list if it fits, the index table if the
+    /// expression has one, and the refusal if it has neither.
+    fn lower(&mut self, root: usize, max_runs: usize) -> Result<Lowering, Error> {
+        if let Some(runs) = self.walk(root, max_runs)? {
+            return Ok(Lowering::Copy(CopyList {
+                leaves: std::mem::take(&mut self.leaves),
+                runs,
+                elements: self.nodes[root].elements,
+            }));
+        }
+        let Some(gather) = self.gather(root)? else {
+            return Err(Error::Contract(format!(
+                "expression breaks into more than {max_runs} contiguous \
+                 stretches; only a Gather over a whole tensor has a lowering \
+                 that is not a copy list, and this is not one"
+            )));
+        };
+        Ok(gather)
+    }
+
+    /// The index-table lowering, when the root is a [`Expr::Gather`] whose
+    /// operand is a whole tensor.
+    ///
+    /// Only then. A gather over a computed operand would have to materialize
+    /// the operand first, which is a second instruction and a second buffer —
+    /// a plan, not a lowering — and no contract asks for one. A gather nested
+    /// *inside* other placement is likewise out: the table addresses the leaf
+    /// directly, and it can only do that when nothing sits between them.
+    fn gather(&mut self, root: usize) -> Result<Option<Lowering>, Error> {
+        let Kind::Gather { src, axis, indices } = &self.nodes[root].kind else {
+            return Ok(None);
+        };
+        let (src, axis, indices) = (*src, *axis, indices.clone());
+        let Kind::Leaf(leaf) = self.nodes[src].kind else {
+            return Ok(None);
+        };
+        let node = &self.nodes[root];
+        let block = node.strides[axis];
+        let dst_row = node
+            .shape[axis]
+            .checked_mul(block)
+            .or_overflow("gather destination row overflows i64")?;
+        if dst_row <= 0 {
+            return Ok(None);
+        }
+        let src_row = self.nodes[src].shape[axis]
+            .checked_mul(block)
+            .or_overflow("gather source row overflows i64")?;
+        Ok(Some(Lowering::Gather(GatherList {
+            leaves: std::mem::take(&mut self.leaves),
+            leaf,
+            indices,
+            block,
+            rows: node.elements / dst_row,
+            src_row,
+            elements: node.elements,
+        })))
+    }
+
     /// Walk the output in flat order, emitting one run per maximal contiguous
-    /// stretch.
-    fn walk(&mut self, root: usize, max_runs: usize) -> Result<Lowering, Error> {
+    /// stretch. `None` when the list would exceed `max_runs`, which is the
+    /// walker declining rather than failing: [`Builder::lower`] is where that
+    /// becomes an answer or an error.
+    fn walk(&mut self, root: usize, max_runs: usize) -> Result<Option<Vec<Run>>, Error> {
         let total = self.nodes[root].elements;
         let mut runs: Vec<Run> = Vec::new();
         let mut flat = 0_i64;
@@ -781,10 +1064,7 @@ impl Builder<'_> {
                 Some(last) if adjacent(last, source, flat) => last.len += span,
                 _ => {
                     if runs.len() >= max_runs {
-                        return Err(Error::Contract(format!(
-                            "expression breaks into more than {max_runs} contiguous \
-                             stretches; it needs a gather lowering, not a copy list"
-                        )));
+                        return Ok(None);
                     }
                     runs.push(Run {
                         source,
@@ -795,11 +1075,7 @@ impl Builder<'_> {
             }
             flat += span;
         }
-        Ok(Lowering {
-            leaves: std::mem::take(&mut self.leaves),
-            runs,
-            elements: total,
-        })
+        Ok(Some(runs))
     }
 
     /// Resolve one output position and report how far the mapping stays
@@ -1036,9 +1312,18 @@ mod tests {
         resolver.into_checked()
     }
 
-    fn lower(expr: Expr, checkpoint: &dyn CheckpointTypes) -> Lowering {
+    /// The copy list an expression lowers to. Every case in this module but
+    /// the gather ones is affine, so a gather here is the test's own mistake.
+    fn lower(expr: Expr, checkpoint: &dyn CheckpointTypes) -> CopyList {
+        lower_to(expr, checkpoint, 1_000_000)
+            .as_copy()
+            .expect("expected a copy list")
+            .clone()
+    }
+
+    fn lower_to(expr: Expr, checkpoint: &dyn CheckpointTypes, max_runs: usize) -> Lowering {
         let (_, checked) = infer_type(&expr, checkpoint).expect("type check failed");
-        compile(&expr, &checked, 1_000_000).expect("lowering failed")
+        compile(&expr, &checked, max_runs).expect("lowering failed")
     }
 
     fn qwen3() -> Fake {
@@ -1049,7 +1334,7 @@ mod tests {
         ])
     }
 
-    fn srcs(lowering: &Lowering) -> Vec<i64> {
+    fn srcs(lowering: &CopyList) -> Vec<i64> {
         lowering
             .runs
             .iter()
@@ -1239,6 +1524,7 @@ mod tests {
         };
         let checked = resolve(&contract, &qwen3());
         let view = compile(&contract.tensors[1].expr, &checked, 1024).unwrap();
+        let view = view.as_copy().expect("a band is a copy list");
         assert_eq!(view.leaves, vec![Leaf::Contract("qkv".to_string())]);
         assert_eq!(
             view.runs,
@@ -1330,9 +1616,16 @@ mod tests {
         let checkpoint = Fake::new(&[("w", &[64, 64])]);
         let expr = Expr::src("w").slice(1, 0, 32);
         let (_, checked) = infer_type(&expr, &checkpoint).unwrap();
-        assert_eq!(compile(&expr, &checked, 64).unwrap().run_count(), 64);
+        assert_eq!(
+            compile(&expr, &checked, 64)
+                .unwrap()
+                .as_copy()
+                .unwrap()
+                .run_count(),
+            64
+        );
         let err = compile(&expr, &checked, 16).unwrap_err();
-        assert!(err.to_string().contains("gather lowering"));
+        assert!(err.to_string().contains("not a copy list"));
     }
 
     #[test]
@@ -1619,7 +1912,7 @@ mod tests {
         out
     }
 
-    fn expand_runs(lowering: &Lowering) -> Vec<(Option<usize>, i64, i64)> {
+    fn expand_runs(lowering: &CopyList) -> Vec<(Option<usize>, i64, i64)> {
         let mut out = Vec::new();
         for run in &lowering.runs {
             for step in 0..run.len {
@@ -1634,7 +1927,7 @@ mod tests {
         out
     }
 
-    fn assert_fold_preserves(lowering: &Lowering) -> Vec<Piece> {
+    fn assert_fold_preserves(lowering: &CopyList) -> Vec<Piece> {
         let pieces = lowering.pieces();
         assert_eq!(
             pieces.iter().map(Piece::elements).sum::<i64>(),
@@ -1904,6 +2197,7 @@ mod tests {
             .iter()
             .map(|entry| {
                 let out = compile(&entry.expr, &checked, 16).unwrap();
+                let out = out.as_copy().expect("a band is a copy list");
                 assert_eq!(out.run_count(), 1);
                 assert_eq!(out.leaves, vec![Leaf::Contract("bank".to_string())]);
                 match out.runs[0].source {

@@ -53,12 +53,36 @@
 //!     --test a_promoted_group_answers_the_bytes_it_answered -- --ignored --nocapture
 //! ```
 //!
+//! # Where the file the ladder walks comes from (§M wave M-3)
+//!
+//! It used to come from the three-tier boot itself: the uncapped boot wrote
+//! the whole-table `.weights` artifact, and the capped boot mapped its own
+//! spilled planes out of that bootstrap while it landed the rest cold. A
+//! serving load that streams cannot land cold any more
+//! (`engine_cuda::weights::Intent`), so a `Shell::prepare` sits between the
+//! two boots and it is the call that reads the bootstrap now.
+//!
+//! ```text
+//!   uncapped boot   lands the checkpoint, writes `<resident>.weights`
+//!   prepare         reads that bootstrap for its spilled planes, writes
+//!                   `<tier>.tiers` — the ONLY writer of one in the process
+//!   three-tier boot cuts the `.tiers` by these two budgets, serves, counts
+//!                   and climbs
+//! ```
+//!
+//! Not one of (a), (b) or (c) is about that file's author, and none of them
+//! moved: the ladder still lifts a group off a mapping and drops another one
+//! onto it, and the bytes on both sides are the bytes the uncapped load
+//! answered.
+//!
 //! # Gating and cost
 //!
 //! `#[ignore]`d, and it wants what W-1 wants: a CUDA device reporting
 //! `pageableMemoryAccess` with ~15 GiB free, the gpt-oss-20b snapshot, and
-//! ~15 GiB of scratch disk for the artifact it writes. It loads the model
-//! twice, sequentially. Skips with a sentence when any of that is missing.
+//! ~30 GiB of scratch disk for the two artifacts it writes — the `.weights`
+//! bootstrap and the `.tiers` the prepare cuts out of it. It lands the model
+//! THREE times, sequentially: the uncapped boot, the prepare and the
+//! three-tier boot. Skips with a sentence when any of that is missing.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -96,7 +120,7 @@ fn serialized() -> MutexGuard<'static, ()> {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::gpt_oss::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn snapshot() -> Option<PathBuf> {
@@ -171,9 +195,9 @@ fn rig(what: &str) -> Option<Rig> {
     }
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index_all(&shards).expect("the checkpoint's shards open as one");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
     Some(Rig {
@@ -184,8 +208,12 @@ fn rig(what: &str) -> Option<Rig> {
     })
 }
 
-fn load(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result<Shell> {
-    Shell::load(Boot {
+/// **ONE DOCUMENT, TWO DOORS** (§M-3). The prepare and the boot have to
+/// describe the same deployment in every field or they name two different
+/// files — the serving artifact's key is a function of the trace, the recipe
+/// and the ranking — so the gate states it once and hands it to both.
+fn doc<'a>(rig: &'a Rig, residency: Plan, cache: Option<&'a Path>) -> Boot<'a> {
+    Boot {
         trace: rig.trace.clone(),
         contract: &rig.contract,
         checkpoint: &rig.checkpoint,
@@ -197,12 +225,24 @@ fn load(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result
         ordinal: 0,
         graphs: Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         patches: None,
         weight_cache_dir: cache,
         residency,
-    })
+    }
+}
+
+fn load(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result<Shell> {
+    Shell::load(doc(rig, residency, cache))
+}
+
+/// **THE WRITER OF A SERVING ARTIFACT**, and since §M-3 the only one there is.
+/// `pie model import --prepare-only` reaches it through `Cuda::prepare`; the
+/// gate reaches it directly, because what it needs is the file the three-tier
+/// boot below cuts and not the plumbing.
+fn prepare(rig: &Rig, residency: Plan, cache: Option<&Path>) -> engine_cuda::Result<()> {
+    Shell::prepare(doc(rig, residency, cache))
 }
 
 /// A prefill and `STEPS` greedy decodes from a freshly opened slot, feeding
@@ -300,11 +340,12 @@ fn groups(shell: &Shell) -> Vec<(String, Held, u32)> {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// **(a), (b) and (c).** One uncapped boot to write the artifact and set the
-/// golden, one three-tier boot that serves, counts, climbs, and serves again.
+/// **(a), (b) and (c).** One uncapped boot to write the `.weights` bootstrap
+/// and set the golden, one prepare to cut the serving artifact out of it, and
+/// one three-tier boot that serves, counts, climbs, and serves again.
 #[test]
 #[ignore = "real-hardware: needs a CUDA device with HMM and ~15 GiB free, a local \
-            gpt-oss-20b snapshot, and ~15 GiB of scratch disk; run it with `-- --ignored`"]
+            gpt-oss-20b snapshot, and ~30 GiB of scratch disk; run it with `-- --ignored`"]
 fn a_promoted_group_answers_the_bytes_it_answered() {
     let _one = serialized();
     let Some(rig) = rig("the B7 ladder gate") else {
@@ -347,8 +388,16 @@ fn a_promoted_group_answers_the_bytes_it_answered() {
         plan.groups().iter().filter(|g| g.held == Held::Mapped).count(),
     );
 
-    // ── THE GOLDEN, UNCAPPED — and the boot that WRITES the artifact the
-    //    three-tier boot maps and the ladder demotes into.
+    // ── THE GOLDEN, UNCAPPED — and the boot that writes the whole-table
+    //    `.weights` artifact.
+    //
+    //    **THIS BOOT STILL WRITES, AND §M-3 DID NOT TOUCH IT.** The wave took
+    //    the cold path away from loads that STREAM; this one is fully
+    //    resident, so it lands the checkpoint and snapshots the store it
+    //    materialized exactly as it always did. What changed is who spends the
+    //    snapshot: it used to be the three-tier boot's road in, and it is the
+    //    PREPARE's now — the file the three-tier boot maps and the ladder
+    //    demotes into is the `.tiers` written below, cut out of this one.
     let mut resident =
         load(&rig, Plan::default(), Some(&cache.0)).expect("the uncapped shell loads");
     assert!(resident.weights_resident());
@@ -363,7 +412,26 @@ fn a_promoted_group_answers_the_bytes_it_answered() {
     eprintln!("uncapped answers {says:?} at {resident_ms:.2} ms/step");
     drop(resident);
 
-    // ── THE THREE-TIER LOAD.
+    // ── THE PREPARE, BETWEEN THE TWO BOOTS (§M-3). A serving load that
+    //    streams is served out of a prepared serving artifact or it is
+    //    refused, so the three-tier boot below cannot make its own file any
+    //    more — this call makes it, at the SAME plan and the SAME directory,
+    //    because the key is a function of that document and a prepare at
+    //    another seat writes a file the boot will not look for.
+    //
+    //    It lands the checkpoint for the store and the pinned tier and reads
+    //    what this budget SPILLS out of the `.weights` bootstrap above, which
+    //    is the bootstrap's remaining job. It leaves the `.tiers` and nothing
+    //    else — no shell, no arena, nothing on the device.
+    let prepared = Instant::now();
+    prepare(&rig, plan.clone(), Some(&cache.0))
+        .expect("a spilled deployment prepares out of the whole-table bootstrap");
+    eprintln!(
+        "prepared the serving artifact in {:.1} s",
+        prepared.elapsed().as_secs_f64()
+    );
+
+    // ── THE THREE-TIER LOAD, WARM BY CONSTRUCTION NOW.
     let mut shell = load(&rig, plan, Some(&cache.0)).expect("the three-tier shell loads");
     assert!(!shell.weights_resident());
 

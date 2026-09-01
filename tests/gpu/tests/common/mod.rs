@@ -42,7 +42,7 @@ pub fn init_trace() {
 //
 // `QWEN3_0_6B_REPO` and `resolve_qwen3_snapshot` named `Qwen/Qwen3-0.6B` and
 // every `boot_4090*` below resolved through them. This build ships no SKU that
-// checkpoint can be: `::model::qwen_3::IMPORTS` claims an artifact by NAME, and
+// checkpoint can be: `models::qwen_3::IMPORTS` claims an artifact by NAME, and
 // all five of its rows ask for `model.language_model.layers.*` at a qwen3.5
 // geometry, which a Qwen3-0.6B file does not hold. `runtime::model::ROWS` has no
 // id for it either. So `runtime::engine::load` cannot identify it and the boot
@@ -156,7 +156,7 @@ pub async fn boot_cuda_kv_cap(total_pages: u32) -> Result<pie::StandaloneHandle>
 /// The checkpoint the MTP harnesses were written against (a Qwen3.5-0.8B GDN
 /// backbone with a 1-layer MTP head bolted on).
 ///
-/// **THIS BUILD DECLARES NO DRAFT ARM ON IT.** `::model::qwen_3::CATALOG` puts
+/// **THIS BUILD DECLARES NO DRAFT ARM ON IT.** `models::qwen_3::CATALOG` puts
 /// the `mtp` export on exactly one row — `qwen36-27b-bf16-kv-bf16`, the only
 /// checkpoint in the catalog that publishes fifteen `mtp.*` planes — so a
 /// Qwen3.5-0.8B snapshot loads here as the plain `qwen35-d0.8b` dense row and
@@ -283,6 +283,17 @@ pub const SERVING_GREEDY_16: &str =
 
 /// Boot the standalone the way `pie serve` does, against the HF-cache
 /// snapshot of Qwen3.5-0.8B.
+/// Boot a standalone from a TOML this caller wrote.
+///
+/// The helpers above each build one config and boot it, which is right for a
+/// gate that varies one knob of a known shape. A gate that has to state a
+/// checkpoint AND a budget the others do not offer would otherwise grow a
+/// third parameter on two of them; this is the door for that.
+pub async fn boot_from_toml(toml: &str) -> Result<pie::StandaloneHandle> {
+    let (controller, gateway, worker) = derive_standalone(toml)?;
+    run_standalone(controller, gateway, worker).await
+}
+
 pub async fn boot_serving() -> Result<pie::StandaloneHandle> {
     boot_serving_frame(None).await
 }

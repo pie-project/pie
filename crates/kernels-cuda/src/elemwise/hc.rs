@@ -120,9 +120,85 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
     )
 }
 
+/// The per-token mix row: `mixes = normed · hc_fn^T`, `[N, M·H]` against a
+/// `[2M + M², M·H]` plane, all f32 — the layer's dynamic hyper plane
+/// (`{attn,ffn}_hc.fn`) fired, which is what [`gates`] below splits.
+///
+/// **NOT `linear.matmul`**: both operands are f32 and the dense gemm points
+/// are bf16; the sinkhorn is f32 by this family's design, which a bf16 detour
+/// would undo. One block per `(row, mix column)`.
+pub fn project(
+    ctx: &Ctx,
+    normed: Tensor,
+    hc_fn: Tensor,
+    stream_count: u32,
+    mixes: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.hc_project";
+    debug_assert!(
+        normed.dtype == Dtype::F32 && hc_fn.dtype == Dtype::F32 && mixes.dtype == Dtype::F32,
+        "`{OP}` projects an f32 row through an f32 plane into an f32 row"
+    );
+    debug_assert_eq!(
+        mixes.rows, normed.rows,
+        "the projection lands one mix row per stream row"
+    );
+    let fan = nonzero(OP, "the stream row this projection contracts", normed.width)?;
+    if hc_fn.width != fan {
+        return Err(refuse(
+            OP,
+            format!(
+                "the dynamic plane contracts {} and the stream row is {fan} wide",
+                hc_fn.width
+            ),
+        ));
+    }
+    if stream_count == 0 || stream_count > MAX_HC_MULT {
+        return Err(refuse(
+            OP,
+            format!(
+                "the stream count is {stream_count}, not one of the {MAX_HC_MULT} the \
+                 mixers unroll"
+            ),
+        ));
+    }
+    let mix_hc = 2 * stream_count + stream_count * stream_count;
+    if mixes.width != mix_hc || hc_fn.rows != mix_hc {
+        return Err(refuse(
+            OP,
+            format!(
+                "a {stream_count}-stream mix row is {mix_hc} wide; the plane lands {} \
+                 rows into a {}-wide row",
+                hc_fn.rows, mixes.width
+            ),
+        ));
+    }
+    let rows = nonzero(OP, "rows", mixes.rows)?;
+    ctx.fire(
+        OP,
+        // One block per `(row, column)`, laid on ONE axis — the shader's own
+        // point derives the pair, mirroring `elemwise/hc.metal`.
+        Fire::at(FILE, "::pie::elemwise::hc_project<256>")
+            .apply(Launch::grid([rows * mix_hc, 1, 1], [BLOCK, 1, 1])),
+        &[
+            normed.arg(),
+            hc_fn.arg(),
+            mixes.arg(),
+            stated(OP, fan)?.arg(),
+            stated(OP, mix_hc)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
+    )
+}
+
 /// Splits the mix row, Sinkhorn-normalises the combiner, and collapses the
 /// `M` streams into the layer's input — one block per token, the gate
 /// matrices landing beside it.
+///
+/// `normed` is the mix row [`project`] lands, `[N, 2M + M²]` — the stride the
+/// kernel reads it at, which is now the width of what it is handed.
 #[allow(clippy::too_many_arguments)]
 pub fn gates(
     ctx: &Ctx,

@@ -222,7 +222,7 @@ impl Sink for Runs {
 }
 
 fn sku() -> (Trace, CompiledModel) {
-    let trace = model::trace_of(SKU).unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
+    let trace = models::trace_of(SKU).unwrap_or_else(|| panic!("`{SKU}` is in the catalog"));
     let trace = trace(Platform::Cuda);
     let compiled = compile(&trace, &budget(), &DeviceProfile::default())
         .unwrap_or_else(|refusal| panic!("`{SKU}` bakes: {refusal:?}"));
@@ -285,7 +285,12 @@ fn a_copied_window_costs_one_launch_where_a_split_one_costs_its_runs() {
     let copied: Vec<usize> = fragmented
         .iter()
         .copied()
-        .filter(|&at| fallback::copies(&compiled, &compiled.template()[at].mask, bucket))
+        .filter(|&at| fallback::copies(
+                &compiled,
+                model_ir::RowAxis::Tokens,
+                &compiled.template()[at].mask,
+                bucket,
+            ))
         .collect();
     assert_eq!(
         copied, fragmented,
@@ -412,7 +417,7 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
             continue;
         }
         assert!(
-            fallback::copies(&compiled, &region.mask, bucket),
+            fallback::copies(&compiled, model_ir::RowAxis::Tokens, &region.mask, bucket),
             "region {:?} is in pieces and takes a different answer from its own mask",
             region.nodes,
         );
@@ -437,7 +442,8 @@ fn the_schedule_builder_takes_the_same_answer_as_the_consumers_that_read_it() {
             continue;
         }
         assert!(
-            fallback::answers(&compiled, region.nodes.clone()).is_empty(),
+            fallback::answers(&compiled, model_ir::RowAxis::Tokens, region.nodes.clone())
+                .is_empty(),
             "P4 wrote a row for a prepare region, and this test's reason to exist \
              was that it does not",
         );
@@ -455,7 +461,10 @@ fn the_menu_asks_for_a_copy_below_the_crossover_and_a_split_above_it() {
     let withdrawn: Vec<&Region> = compiled
         .template()
         .iter()
-        .filter(|region| !fallback::answers(&compiled, region.nodes.clone()).is_empty())
+        .filter(|region| {
+            !fallback::answers(&compiled, model_ir::RowAxis::Tokens, region.nodes.clone())
+                .is_empty()
+        })
         .collect();
     assert!(
         !withdrawn.is_empty(),
@@ -466,7 +475,7 @@ fn the_menu_asks_for_a_copy_below_the_crossover_and_a_split_above_it() {
     let mut splits = 0usize;
     for bucket in 0..lattice.len() as u32 {
         let mask = &withdrawn[0].mask;
-        if fallback::copies(&compiled, mask, bucket) {
+        if fallback::copies(&compiled, model_ir::RowAxis::Tokens, mask, bucket) {
             copies += 1;
         } else {
             splits += 1;
@@ -492,7 +501,7 @@ fn the_menu_asks_for_a_copy_below_the_crossover_and_a_split_above_it() {
         .expect("the lattice reaches past the crossover");
     assert_eq!(r, 4, "the withdrawn mask breaks into four runs");
     assert_eq!(
-        fallback::bound(&compiled, &withdrawn[0].mask),
+        fallback::bound(&compiled, model_ir::RowAxis::Tokens, &withdrawn[0].mask),
         4,
         "and the bound derived from the shipped order agrees",
     );

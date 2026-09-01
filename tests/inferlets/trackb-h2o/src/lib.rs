@@ -30,7 +30,7 @@
 //! second-party intrinsic or engine surface this program invented.
 //!
 //! **THE MASK AND THE CAPTURE CANNOT SHARE A FIRE, AND THAT IS THE ONE THING
-//! THIS PROGRAM HAS TO WORK AROUND.** `crates/model/src/qwen_3/forward.rs`
+//! THIS PROGRAM HAS TO WORK AROUND.** `crates/models/src/qwen_3/forward.rs`
 //! orders the `masked` window ahead of the `captures_scores` one in the
 //! attention split, as a correctness ruling: "a lane that asked for both takes
 //! the masked arm and keeps no scores — the arm that could honor both does not
@@ -219,7 +219,7 @@ struct Input {
     /// a declared ceiling, checked by name).
     ///
     /// The default is `Qwen/Qwen3.5-0.8B`: `Model::d0_8b` in
-    /// `crates/model/src/qwen_3/model.rs` is `layers: 24, attn_every: 4`, and
+    /// `crates/models/src/qwen_3/model.rs` is `layers: 24, attn_every: 4`, and
     /// the SKU is hybrid — `attn_at(l) = l % attn_every == attn_every - 1`
     /// puts an attention mixer on 6 of the 24 layers and a GDN mixer on the
     /// other 18. Only the attention layers export a plane.
@@ -508,7 +508,7 @@ async fn main(input: Input) -> Result<Output> {
     // ── THE SPLIT: OBSERVE, THEN ENFORCE. ──
     //
     // A lane that brings a mask takes the masked arm and KEEPS NO SCORES --
-    // `Attention::Masked` exports no lse, and `crates/model/src/qwen_3/
+    // `Attention::Masked` exports no lse, and `crates/models/src/qwen_3/
     // forward.rs` orders `masked` ahead of `captures_scores` in the split for
     // that reason, as a correctness ruling. So no single fire can both observe
     // and enforce, and H2O -- alone in Track B -- wants both on the same fire.

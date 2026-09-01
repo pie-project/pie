@@ -940,6 +940,12 @@ pub fn index_rope(
     q_out
 }
 
+/// `ratio` is which cached rows are keys: `1` for a per-token key cache
+/// (glm_5's `k_proj` indexer), the compressor's own ratio for a per-block one
+/// (dsv4-flash's, whose keys are its compressor's pooled entries stored at
+/// the boundary cell). The published ids are positions at `ratio == 1` and
+/// COMPRESSED ROW indices otherwise.
+#[allow(clippy::too_many_arguments)]
 pub fn index_topk(
     q: &Value,
     weights: &Value,
@@ -947,6 +953,7 @@ pub fn index_topk(
     heads: u32,
     head_dim: u32,
     top_k: u32,
+    ratio: u32,
 ) -> Value {
     let r = q.rec();
     let selection = r.fresh(tensor(q.rows(), top_k, Dtype::I32));
@@ -958,6 +965,7 @@ pub fn index_topk(
             heads,
             head_dim,
             top_k,
+            ratio,
             selection: selection.id(),
         },
         &[q, weights],
@@ -979,10 +987,20 @@ pub fn index_kv_append(k: &Value, keys: ValueId, write_page: &Value, write_offse
 }
 
 /// `row_valid` masks graph-padding rows out of the boundary math.
-pub fn pool_boundary_decode(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value) {
+///
+/// Returns `(boundary_pos, boundary_req, boundary_rope)` — the CELL the
+/// pooled entry is cached at, its lane, and the COMPRESSED ROW'S POSITION the
+/// entry is roped at. The last is not the first: see
+/// [`model_ir::ops::Attention::PoolBoundaryDecode`].
+pub fn pool_boundary_decode(
+    positions: &Value,
+    row_valid: &Value,
+    ratio: u32,
+) -> (Value, Value, Value) {
     let r = positions.rec();
     let boundary_pos = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     let boundary_req = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
+    let boundary_rope = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     r.push(
         Attention::PoolBoundaryDecode {
             positions: positions.id(),
@@ -990,17 +1008,25 @@ pub fn pool_boundary_decode(positions: &Value, row_valid: &Value, ratio: u32) ->
             ratio,
             boundary_pos: boundary_pos.id(),
             boundary_req: boundary_req.id(),
+            boundary_rope: boundary_rope.id(),
         },
         &[positions, row_valid],
     );
-    (boundary_pos, boundary_req)
+    (boundary_pos, boundary_req, boundary_rope)
 }
 
 /// `row_valid` masks graph-padding rows out of the boundary math.
-pub fn pool_boundary_prefill(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value) {
+///
+/// The prefill twin of [`pool_boundary_decode`], same three outputs.
+pub fn pool_boundary_prefill(
+    positions: &Value,
+    row_valid: &Value,
+    ratio: u32,
+) -> (Value, Value, Value) {
     let r = positions.rec();
     let boundary_pos = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     let boundary_req = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
+    let boundary_rope = r.fresh(tensor(Dim::Tokens, 1u64, Dtype::I32));
     r.push(
         Attention::PoolBoundaryPrefill {
             positions: positions.id(),
@@ -1008,10 +1034,11 @@ pub fn pool_boundary_prefill(positions: &Value, row_valid: &Value, ratio: u32) -
             ratio,
             boundary_pos: boundary_pos.id(),
             boundary_req: boundary_req.id(),
+            boundary_rope: boundary_rope.id(),
         },
         &[positions, row_valid],
     );
-    (boundary_pos, boundary_req)
+    (boundary_pos, boundary_req, boundary_rope)
 }
 
 /// `dtype` is the pooled entries' element type — the wrapper has no data
@@ -1021,6 +1048,7 @@ pub fn pool_gather(
     boundary_pos: &Value,
     boundary_req: &Value,
     pages: ValueId,
+    ape: Option<&Weight>,
     head_dim: u32,
     ratio: u32,
     dtype: Dtype,
@@ -1032,6 +1060,7 @@ pub fn pool_gather(
             boundary_pos: boundary_pos.id(),
             boundary_req: boundary_req.id(),
             pages,
+            ape: ape.map(|w| r.weight(w)),
             head_dim,
             ratio,
             entries: entries.id(),
@@ -1039,6 +1068,35 @@ pub fn pool_gather(
         &[boundary_pos, boundary_req],
     );
     entries
+}
+
+/// **THE COMPRESSOR'S ROLLING STATE, WRITTEN AT THE SOURCE CACHE'S OWN
+/// SLOT.** `kv` is `wkv · x` and `score` is `wgate · x`, both
+/// `[tokens, coff · head_dim]`; [`pool_gather`] reads them back at
+/// `write_page`/`write_offset`'s cell, because a pooling window closing in
+/// this fire straddles tokens earlier fires wrote.
+pub fn pool_state_write(
+    kv: &Value,
+    score: &Value,
+    pages: ValueId,
+    write_page: &Value,
+    write_offset: &Value,
+    head_dim: u32,
+    ratio: u32,
+) {
+    let r = kv.rec();
+    r.push(
+        Attention::PoolStateWrite {
+            kv: kv.id(),
+            score: score.id(),
+            pages,
+            write_page: write_page.id(),
+            write_offset: write_offset.id(),
+            head_dim,
+            ratio,
+        },
+        &[kv, score, write_page, write_offset],
+    );
 }
 
 pub fn pool_kv_append(
@@ -1097,6 +1155,45 @@ pub fn pool_lse(
             lse: lse.id(),
         },
         &[q, positions, request_of_token],
+    );
+    (o, lse)
+}
+
+/// [`pool_lse`] over the `selection` [`index_topk`] published — the NSA fine
+/// branch. `top_k` is the selection's own width, restated so the reader knows
+/// how many ids a row carries.
+#[allow(clippy::too_many_arguments)]
+pub fn pool_lse_selected(
+    q: &Value,
+    positions: &Value,
+    request_of_token: &Value,
+    selection: &Value,
+    entries: ValueId,
+    ratio: u32,
+    top_k: u32,
+    heads: u32,
+    head_dim: u32,
+    sm_scale: f32,
+) -> (Value, Value) {
+    let r = q.rec();
+    let o = r.fresh(q.ty().clone());
+    let lse = r.fresh(tensor(q.rows(), heads, Dtype::F32));
+    r.push(
+        Attention::PoolLseSelected {
+            q: q.id(),
+            positions: positions.id(),
+            request_of_token: request_of_token.id(),
+            selection: selection.id(),
+            entries,
+            ratio,
+            top_k,
+            heads,
+            head_dim,
+            sm_scale,
+            o: o.id(),
+            lse: lse.id(),
+        },
+        &[q, positions, request_of_token, selection],
     );
     (o, lse)
 }

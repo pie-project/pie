@@ -77,7 +77,7 @@ fn snapshot() -> Option<PathBuf> {
 /// The lane word the model's own `Classify` computes, reached the way the
 /// fire path reaches it.
 ///
-/// It named `model::qwen_3::forward::Facts` directly and said so: the catalog
+/// It named `models::qwen_3::forward::Facts` directly and said so: the catalog
 /// shipped `(sku, tp, TraceFn)`, nothing outside a family's module could say
 /// which bit `qo_one` is, and stating a word by naming the family was what a
 /// test could do and the runtime could not (`palo B-word`). The catalog carries
@@ -87,7 +87,7 @@ fn snapshot() -> Option<PathBuf> {
 /// disagreement with what production computes.
 fn word(query_len: u32) -> u64 {
     let classify = runtime::engine::load::classify(SKU).expect("this build ships the smoke's SKU");
-    classify(&model::Request::new(query_len, false))
+    classify(&models::Request::new(query_len, false))
 }
 
 /// Greedy: the highest logit.

@@ -58,7 +58,10 @@
 //!
 //! `row[0]` is the k|v plane count and the rest is the row proper. The append
 //! kernel writes two independent page arrays, so one allocation per cache row
-//! is cut in half: keys in the front, values behind them. Cutting it here
+//! is cut in half: keys in the front, values behind them — **unless the row
+//! declares ONE plane**, which is the MLA family's shared latent and is cut
+//! nowhere: the value reader addresses the key cells because there is one
+//! entry per token and both readers want it ([`split`]). Cutting it here
 //! rather than allocating twice keeps a layer's kv contiguous, which is what
 //! the page addressing assumes — and on this plane it buys one thing more,
 //! since two handles into one buffer cost two table rows where two buffers
@@ -81,11 +84,14 @@
 //! [`Handles`]: crate::device::Handles
 //! [`Context`]: crate::device::Context
 
+pub mod accounting;
 pub mod kv;
 
+use engine::transfer::KvCopy;
 use kernels_metal::{KvPool, RecurrentPool, Tensor};
 use model_ir::{CacheRow, Dtype, Trace};
 
+use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 use crate::run::{CachePool, CacheTable};
@@ -170,9 +176,17 @@ enum Shape {
         head_dim: u32,
         kv_heads: u32,
         dtype: Dtype,
-        /// Bytes from the front of the allocation to the value pages — which
-        /// is also one whole plane's length, and therefore the length each
-        /// plane's handle is minted at.
+        /// One plane's length in bytes, and therefore the length each plane's
+        /// handle is minted at.
+        plane_bytes: u64,
+        /// Bytes from the front of the allocation to the VALUE pages.
+        ///
+        /// [`plane_bytes`](Shape::Kv::plane_bytes) for the two-plane form —
+        /// keys in front, values behind them — and **ZERO for the one-plane
+        /// shared form**, where the value reader and the key reader address
+        /// the same cells because there is only one entry per token to
+        /// address. The two numbers were one field while two planes was the
+        /// only form, and a shared row is exactly where they part.
         values_at: u64,
     },
     /// A recurrent slab: elements per slot.
@@ -234,6 +248,142 @@ pub struct Seats {
     pub slot_of_row: Tensor,
 }
 
+/// **One span of kv cells moved inside this load's own pools** — the shape
+/// [`Pools::copy_kv`] takes, and the only one it takes.
+///
+/// **A WHOLE PAGE AND A SINGLE TOKEN ARE THE SAME MOVE.** The contract states
+/// them apart — `KvCopy::src_page_ids`/`dst_page_ids` are the whole-page half
+/// and `KvCopy::moves` the token-granular one — because a caller spells a
+/// prefix graft and a fork's partial tail differently. What the page
+/// arithmetic underneath sees is one thing either way: a run of `tokens` cells
+/// starting at `(page, token)` on each side. So the two spellings are
+/// flattened once, by [`Move::plan`], and the blit loop has one shape to walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Move {
+    /// The page read.
+    pub src_page: u32,
+    /// The first token slot read in it.
+    pub src_token: u32,
+    /// The page written.
+    pub dst_page: u32,
+    /// The first token slot written in it.
+    pub dst_token: u32,
+    /// How many consecutive token slots move. `page_size` is a whole page.
+    pub tokens: u32,
+}
+
+impl Move {
+    /// **The contract's `copy_kv` argument, flattened into runs.**
+    ///
+    /// Host arithmetic over two integers and two lists, which is why it lives
+    /// beside the page arithmetic rather than in [`crate::api`] where its
+    /// caller is: what a fork's moves come to is the same question with or
+    /// without a device, and a gate can ask it without one.
+    ///
+    /// # Consecutive cells are COALESCED
+    ///
+    /// A fork copying a partial page's live tokens states one `KvMove` per
+    /// TOKEN, and the run they form is one blit per plane rather than one per
+    /// token per plane. The merge is exact — identical pages on both sides,
+    /// both offsets continuing the previous run by one, and the run stopping
+    /// at the page's own edge — and it is order-preserving, so a caller whose
+    /// moves do not form runs gets the same bytes at more copies and never
+    /// different bytes.
+    ///
+    /// # OVERLAPPING ENDS ARE THE CALLER'S ERROR AND ARE NAMED HERE
+    ///
+    /// Both ends of a run live in the same reservation, so a run that reads
+    /// and writes overlapping cells of one page is a blit whose two regions
+    /// overlap — undefined, and silently so. A caller that means "shift a
+    /// page's tokens" states a staging page and two moves.
+    ///
+    /// # Errors
+    ///
+    /// The sentence a malformed plan is refused with, which
+    /// [`Metal::copy_kv`](crate::Metal) hands back as `Error::Invalid`: page
+    /// lists that are not parallel, an offset past the page, or a run whose
+    /// two ends overlap.
+    pub fn plan(copy: &KvCopy, page_size: u32) -> std::result::Result<Vec<Move>, String> {
+        // The contract's own clause (`KvCopy::validate`), restated where the
+        // arithmetic is. A belt and not a second policy: the verb has already
+        // asked it, and a `zip` that silently dropped the longer list would
+        // graft a fork's pages half over.
+        if copy.src_page_ids.len() != copy.dst_page_ids.len() {
+            return Err(format!(
+                "src_page_ids has {} entries and dst_page_ids {}",
+                copy.src_page_ids.len(),
+                copy.dst_page_ids.len()
+            ));
+        }
+        let mut moves: Vec<Move> =
+            Vec::with_capacity(copy.src_page_ids.len() + copy.moves.len());
+        // The whole-page half: every token slot of the page, both sides at
+        // offset zero. A page's LIVE length is the runtime's bookkeeping and
+        // not a number this verb is handed, so the whole page moves.
+        for (src, dst) in copy.src_page_ids.iter().zip(&copy.dst_page_ids) {
+            moves.push(Move {
+                src_page: *src,
+                src_token: 0,
+                dst_page: *dst,
+                dst_token: 0,
+                tokens: page_size,
+            });
+        }
+        // The token-granular half, coalesced into runs.
+        for (at, cell) in copy.moves.iter().enumerate() {
+            if cell.src_token_offset >= page_size || cell.dst_token_offset >= page_size {
+                return Err(format!(
+                    "kv move {at} names token offsets {}/{} in pages of {page_size} tokens",
+                    cell.src_token_offset, cell.dst_token_offset
+                ));
+            }
+            // A cell that names one place twice is not a move. Dropped rather
+            // than refused: a caller listing a fork's whole tail states the
+            // shared cells too, and it is asking for nothing.
+            if cell.src_page_id == cell.dst_page_id
+                && cell.src_token_offset == cell.dst_token_offset
+            {
+                continue;
+            }
+            let run = moves.last_mut().filter(|run| {
+                run.src_page == cell.src_page_id
+                    && run.dst_page == cell.dst_page_id
+                    && run.src_token + run.tokens == cell.src_token_offset
+                    && run.dst_token + run.tokens == cell.dst_token_offset
+                    && run.src_token + run.tokens < page_size
+            });
+            match run {
+                Some(run) => run.tokens += 1,
+                None => moves.push(Move {
+                    src_page: cell.src_page_id,
+                    src_token: cell.src_token_offset,
+                    dst_page: cell.dst_page_id,
+                    dst_token: cell.dst_token_offset,
+                    tokens: 1,
+                }),
+            }
+        }
+        for run in &moves {
+            if run.src_page != run.dst_page {
+                continue;
+            }
+            let (lo, hi) = (
+                u32::min(run.src_token, run.dst_token),
+                u32::max(run.src_token, run.dst_token),
+            );
+            if hi - lo < run.tokens {
+                return Err(format!(
+                    "a kv move of {} tokens reads page {} from token {} and writes the same \
+                     page at token {} — the two ends overlap, and a blit whose regions \
+                     overlap is undefined rather than a shift",
+                    run.tokens, run.src_page, run.src_token, run.dst_token
+                ));
+            }
+        }
+        Ok(moves)
+    }
+}
+
 /// Every cache space's bytes, one allocation per row.
 #[derive(Debug)]
 pub struct Pools {
@@ -287,27 +437,55 @@ impl Pools {
                     dtype,
                     space,
                 } => {
-                    let seat = facts.row(index, name)?;
                     let (planes, width) = split(name, planes)?;
-                    let heads = u64::from(seat.kv_heads) * u64::from(seat.head_dim);
-                    if heads != width {
-                        return Err(Fault::Unbound {
-                            what: format!(
-                                "cache `{name}`, whose row is {width} wide while its \
-                                 consumers state {} heads of {}",
-                                seat.kv_heads, seat.head_dim
-                            ),
-                        });
+                    // **A RESTATEMENT EXISTS ONLY WHERE A PAGED LAUNCH MADE
+                    // ONE**, and where it exists it must be the declaration.
+                    // The prefill arms state a head count; the decode and
+                    // masked arms state a head width alone (`kv_heads` 0); and
+                    // the latent, index and pool launches do not feed the row
+                    // pass at all (`model_exec::store::kv::SpaceFacts`). So a
+                    // row with no restatement is not an error and never was —
+                    // it is a row whose consumers take their widths from their
+                    // own operands — and `Pools::reserve` refusing one by name
+                    // was this shell asking a question the IR had already
+                    // answered "absent". The CUDA sibling has always read it
+                    // this way (`engine_cuda::store::Pools::reserve`).
+                    let restated = facts
+                        .rows
+                        .get(index)
+                        .copied()
+                        .flatten()
+                        .filter(|seat| seat.kv_heads != 0);
+                    if let Some(seat) = restated {
+                        let heads = u64::from(seat.kv_heads) * u64::from(seat.head_dim);
+                        if heads != width {
+                            return Err(Fault::Unbound {
+                                what: format!(
+                                    "cache `{name}`, whose row is {width} wide while its \
+                                     consumers state {} heads of {}",
+                                    seat.kv_heads, seat.head_dim
+                                ),
+                            });
+                        }
                     }
+                    // One head of the whole plane where no paged launch stated
+                    // a head width: the latent, index and pool kernels take
+                    // their widths from their op operands and never consult
+                    // these strides.
+                    let head_dim = restated.map_or(width, |seat| u64::from(seat.head_dim));
+                    let kv_heads = restated.map_or(1, |seat| u64::from(seat.kv_heads));
                     let element = elem_bytes(name, *dtype)?;
                     let plane = paging.pages() * u64::from(paging.page_size) * width * element;
                     slabs.push(Buffer::zeroed(device, plane * planes)?);
                     shapes.push(Shape::Kv {
                         space: *space,
-                        head_dim: seat.head_dim,
-                        kv_heads: seat.kv_heads,
+                        head_dim: u32::try_from(head_dim).unwrap_or(u32::MAX),
+                        kv_heads: u32::try_from(kv_heads).unwrap_or(u32::MAX),
                         dtype: *dtype,
-                        values_at: plane,
+                        plane_bytes: plane,
+                        // One plane means the value reader addresses the key
+                        // cells; two means the values begin one plane in.
+                        values_at: if planes == 2 { plane } else { 0 },
                     });
                 }
                 CacheRow::State { name, slab, dtype } => {
@@ -385,6 +563,7 @@ impl Pools {
                     head_dim,
                     kv_heads,
                     dtype,
+                    plane_bytes,
                     values_at,
                 } => {
                     let seat =
@@ -398,11 +577,12 @@ impl Pools {
                                 ),
                             })?;
                     let cells = self.paging.pages() * u64::from(self.paging.page_size);
-                    // `values_at` is where the value pages start AND how long
-                    // one plane is, so it is both arguments of the mint.
+                    // Where a plane starts and how long it is are two numbers
+                    // now: a shared row's value plane starts at zero and is
+                    // still one whole plane long.
                     let plane = |at: u64| -> Result<Tensor> {
                         Ok(Tensor::new(
-                            handles.bind(slab, at, values_at)?,
+                            handles.bind(slab, at, plane_bytes)?,
                             u32::try_from(cells).unwrap_or(u32::MAX),
                             kv_heads * head_dim,
                             dtype,
@@ -489,6 +669,150 @@ impl Pools {
             };
             let bytes = stride * u64::from(elem_size(dtype));
             slab.zero_span(u64::from(slot) * bytes, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// **Copy kv cells between pages of these pools, into `frame`'s command
+    /// buffer** (alto survey §9's gap list; `engine_cuda::store::Pools::copy_kv`
+    /// is the sibling).
+    ///
+    /// The device half of a prefix-tree fork: a page run two sequences share is
+    /// grafted onto fresh ids, and the partial page at the boundary has its
+    /// live tokens copied out so the fork can append past them without writing
+    /// into the parent's cells.
+    ///
+    /// # Every plane of every row, because a page id names all of them
+    ///
+    /// A "page" is not one allocation. Page `p` exists once per PLANE of every
+    /// `CacheRow::Kv` this plan declares — eighteen layers times a key half and
+    /// a value half, for a dense text model — and a mover that copied a subset
+    /// would leave a fork attending to the parent's keys at some layers and its
+    /// own at others, which reads as fluent garbage rather than as an error. So
+    /// the loop is over `rows × planes` and the caller names the page once,
+    /// exactly as [`Pools::clear`] takes a slot once for every recurrent row
+    /// underneath it.
+    ///
+    /// **THE TWO PLANES ARE ONE RESERVATION HERE**, which is this plane's own
+    /// difference: the CUDA sibling walks an arena per plane, and this module
+    /// cuts one allocation into a key half at `0` and a value half at
+    /// `values_at` (the module header's "k and v share a row and not a
+    /// buffer"). So the two plane bases are the loop and `values_at` is the
+    /// second of them — and both halves are one width, because [`split`]
+    /// admits no other form.
+    ///
+    /// # A BLIT AND NOT A `memcpy`, on a plane where a `memcpy` would work
+    ///
+    /// The pools are `StorageModeShared`, so the host could write these bytes
+    /// with `Buffer::write` and no encoder at all. What it could not do is
+    /// ORDER them: a host store is not ordered against a command buffer already
+    /// on the queue, so a graft written that way would land in cells a step
+    /// still in flight is reading, and the only fix would be a drain per fork
+    /// (which is what [`Pools::clear`] pays, and why it is only paid by plans
+    /// that have recurrent banks at all). Encoded into a command buffer the
+    /// copies inherit the queue's own order instead: behind every step already
+    /// committed, ahead of every step committed after — which is exactly the
+    /// ordering a caller that forks and then fires against both halves is
+    /// asking for, and it is article 2's no-sync-on-a-fire-path for free.
+    ///
+    /// # Refusals before bytes
+    ///
+    /// Two passes, and the split is article 4's: the first asks every span
+    /// whether it fits a page and commits the frame's own demand for the pages
+    /// named ([`Supply::commit`](engine::frame::Supply) is the admission gate,
+    /// and a fork names a destination page before any fire has admitted one).
+    /// The second encodes. So a refused plan leaves an empty command buffer,
+    /// which is dropped without commit and puts nothing on the device.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Ceiling`] for a run past a page's tokens or a page past the
+    /// pool, [`Fault::Device`] when the command buffer would not open a blit
+    /// pass, [`Fault::Deviceless`] off Apple. A move whose two ends OVERLAP is
+    /// refused earlier, by [`Move::plan`], where the contract's `Invalid` can
+    /// be spoken: it is the caller's statement that is wrong and not this
+    /// pool's arithmetic.
+    pub fn copy_kv(&mut self, frame: &mut Frame, moves: &[Move]) -> Result<()> {
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let page_size = u64::from(self.paging.page_size);
+        let mut highest = 0u32;
+        for span in moves {
+            for (page, token) in [
+                (span.src_page, span.src_token),
+                (span.dst_page, span.dst_token),
+            ] {
+                let end = u64::from(token) + u64::from(span.tokens);
+                if end > page_size {
+                    return Err(Fault::Ceiling {
+                        what: "token slots in one kv page",
+                        need: end,
+                        have: page_size,
+                    });
+                }
+                highest = highest.max(page.saturating_add(1));
+            }
+        }
+        // **BOTH ENDS HAVE TO BE ADMITTED, AND THIS IS THE GATE.** A fork is a
+        // control-plane verb: it names the destination page before any frame's
+        // demand has covered it, so the pages it addresses are stated here,
+        // through the same `Supply` the fire path states its union through. On
+        // this plane that is a ceiling check and a watermark union rather than
+        // a mapping (the impl's own note), which is why a page past the pool
+        // comes back as `Impossible` rather than as a blit into nothing.
+        engine::frame::Supply::commit(
+            self,
+            engine::frame::Demand {
+                kv_pages: highest,
+                state_slots: 0,
+                workspace: 0,
+            },
+        )?;
+        for (slab, shape) in self.slabs.iter().zip(&self.shapes) {
+            let Shape::Kv {
+                head_dim,
+                kv_heads,
+                dtype,
+                values_at,
+                ..
+            } = *shape
+            else {
+                continue;
+            };
+            let cell =
+                u64::from(kv_heads) * u64::from(head_dim) * u64::from(elem_size(dtype));
+            // **THE DISTINCT PLANE BASES, AND A SHARED ROW HAS ONE.** Copying
+            // a shared latent twice would be the same bytes to the same
+            // address — a self-overlapping blit, which is a device fault with
+            // no sentence in it and not a redundant copy.
+            let bases = [0, values_at];
+            let bases = if values_at == 0 { &bases[..1] } else { &bases[..] };
+            for &plane in bases {
+                for span in moves {
+                    if span.tokens == 0 {
+                        continue;
+                    }
+                    let bytes = u64::from(span.tokens) * cell;
+                    let at = |page: u32, token: u32| {
+                        plane + (u64::from(page) * page_size + u64::from(token)) * cell
+                    };
+                    let (src, dst) = (
+                        at(span.src_page, span.src_token),
+                        at(span.dst_page, span.dst_token),
+                    );
+                    if src == dst {
+                        continue;
+                    }
+                    // The one bounds check the blit itself has none of: a
+                    // `copyFromBuffer:` past the end of a reservation is a
+                    // device fault with no sentence in it, and `Buffer::span`
+                    // names both numbers.
+                    slab.span(src, bytes)?;
+                    slab.span(dst, bytes)?;
+                    frame.copy(slab.slab(), src, slab.slab(), dst, bytes)?;
+                }
+            }
         }
         Ok(())
     }
@@ -584,14 +908,74 @@ impl engine::frame::Supply for Pools {
     }
 }
 
-/// A kv row's `(planes, width)`: the leading dim is the k|v plane count and
-/// the rest is one plane's row.
+/// **The kv pool's resident bytes**, off the trace's cache rows and the paging
+/// alone — the `minimum` term of [`accounting::Accounting`], read BEFORE a byte
+/// is reserved so the wired ceiling can be checked ahead of the land.
+///
+/// Byte for byte [`Pools::reserve`]'s arithmetic, without the device and
+/// without the compiled class table: a kv row's width is the plane `split`
+/// reads off the declared planes, not the seat's head count, so this needs
+/// neither the bound device nor `Facts`. What `reserve` does on top — the
+/// head-multiple check — is validation, not sizing, and refuses there instead.
+///
+/// # Errors
+///
+/// [`Fault::Unbound`] for a cache row whose planes this shell cannot cut or
+/// whose element has no byte size — the same two refusals `reserve` raises.
+pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
+    let mut bytes: u64 = 0;
+    for row in &trace.caches {
+        match row {
+            CacheRow::Kv {
+                name,
+                planes,
+                dtype,
+                ..
+            } => {
+                let (count, width) = split(name, planes)?;
+                let element = elem_bytes(name, *dtype)?;
+                let plane = paging.pages() * u64::from(paging.page_size) * width * element;
+                bytes = bytes.saturating_add(plane.saturating_mul(count));
+            }
+            CacheRow::State { name, slab, dtype } => {
+                let stride: u64 = slab.iter().product();
+                let dtype = state_dtype(*dtype);
+                bytes = bytes.saturating_add(
+                    stride
+                        .saturating_mul(u64::from(paging.slots))
+                        .saturating_mul(elem_bytes(name, dtype)?),
+                );
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// A kv row's `(planes, width)`: how many planes one entry is written as, and
+/// how wide one of them is.
+///
+/// **TWO FORMS, AND THE SECOND IS NOT A DEGENERATE FIRST.** M22 turned the
+/// row's leading plane count into `CacheRow::Kv { planes }` — the per-plane
+/// widths themselves — and the IR spells three readings of it (see
+/// `model_ir::CacheRow`). This shell serves two:
+///
+/// * `[w, w]`, a key half and a value half at one width, cut out of one
+///   allocation (the module header's "k and v share a row and not a buffer").
+/// * `[w]`, **ONE PLANE READ AS BOTH k AND v**. This is not a two-plane row
+///   with the value half missing; it is the MLA family's latent, where there
+///   IS no second tensor — `attention.kv_append_shared` writes one entry per
+///   token and the absorbed reader contracts against those same cells twice,
+///   once as a key and once as a value. Allocating a second plane for it would
+///   double a 43-layer model's kv pool to hold a copy nothing writes and
+///   nothing reads.
+///
+/// `[k, v]` at DIFFERENT widths — the split latent page, `[kv_lora_rank,
+/// rope_dim]` — is the third reading and is still refused by name: the page
+/// addressing below cuts one allocation at one width, and two widths is a
+/// different cut and not a different number.
 fn split(name: &str, planes: &[u64]) -> Result<(u64, u64)> {
-    // M22 turned the row's leading plane count into `CacheRow::Kv { planes }`
-    // — the per-plane widths themselves. This shell cuts a kv page into an
-    // equal key half and value half, so it serves exactly the two-plane form
-    // at one width and refuses the rest by name, as the old dims reading did.
     match planes {
+        [shared] => Ok((1, *shared)),
         [keys, values] if keys == values => Ok((2, *keys)),
         [keys, values] => Err(Fault::Unbound {
             what: format!(
@@ -602,7 +986,8 @@ fn split(name: &str, planes: &[u64]) -> Result<(u64, u64)> {
         other => Err(Fault::Unbound {
             what: format!(
                 "cache `{name}`, which declares {} plane(s) — this shell cuts kv \
-                 pages into a key half and a value half, and knows no other form",
+                 pages into one shared plane or into a key half and a value half, \
+                 and knows no other form",
                 other.len()
             ),
         }),

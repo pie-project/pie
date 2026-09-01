@@ -28,7 +28,7 @@
 //! # The site, and why there is only one
 //!
 //! `qwen_3`'s text corrects the MIXER OUTPUT and nothing else
-//! (`crates/model/src/qwen_3/forward.rs`, `ops::linear::lora_correct` over the
+//! (`crates/models/src/qwen_3/forward.rs`, `ops::linear::lora_correct` over the
 //! reduced mixer result), so [`Site::O`] is the only site this family can
 //! honestly serve today — adapter.md §2's "one site, not six", and §4's wave 4
 //! is where the other five arrive. Both ends of that site are the replicated

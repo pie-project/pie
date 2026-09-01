@@ -561,7 +561,7 @@ mod tests {
     fn every_sku_in_the_catalog_reads_its_buffered_planes_or_says_it_has_none() {
         let mut buffered = 0usize;
         let mut table: Vec<String> = Vec::new();
-        for (sku, _, trace, _) in model::catalog() {
+        for (sku, _, trace, _) in models::catalog() {
             let trace = trace(Platform::Cuda);
             let read = super::read(&trace, 16)
                 .unwrap_or_else(|why| panic!("`{sku}` will not load: {why}"));

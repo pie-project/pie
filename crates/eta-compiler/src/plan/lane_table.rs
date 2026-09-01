@@ -4,11 +4,22 @@
 //! structs with `offset_of!` so the copies cannot drift.
 //!
 //! **Three kinds of `u64`, one spelling.** [`LaneRecord`] and
-//! [`LaneChannelSlot`] carry nine: addresses a kernel dereferences, ring tickets
+//! [`LaneChannelSlot`] carry ten: addresses a kernel dereferences, ring tickets
 //! it only compares, opaque values. Each states its kind because nothing else
 //! does — a ticket written where an address belongs compiles, passes the
 //! `offset_of!` pinning, and produces a wild dereference. Newtypes are declined:
 //! ~100 sites across four crates outside `compiler/` would wrap and unwrap.
+//!
+//! **THE RECORD CARRIES A SECOND RECTANGLE NOW, AND ONLY ONE SHELL READS IT.**
+//! [`LaneRecord::attn_score_base`] is the grouped Metal form's whole answer to
+//! the attention-score plane: that form binds no per-intrinsic buffer, so a
+//! rectangle it must reach has to arrive as an ADDRESS on this record, and the
+//! score slab is not the logits allocation at any displacement. The CUDA shell
+//! reaches the same rectangle through its five per-(lane, intrinsic) side
+//! arrays and never reads these two words — but the record is one struct on
+//! both planes, so the fields are declared, pinned and zeroed on both. A field
+//! declared on one side only is the silent reinterpretation
+//! [`crate::codegen::layout`] exists to rule out.
 
 /// Stamped into [`LaneTableHeader::abi_version`]; every backend decoder checks it.
 pub const LANE_TABLE_ABI_VERSION: u32 = 3;
@@ -86,6 +97,31 @@ pub struct LaneRecord {
     pub row_valid_offset: u32,
     /// Padding to 8-byte alignment. Must be zero; a non-zero reserved word is a corrupt table.
     pub reserved0: u32,
+    /// *Address.* Base of this lane's block of the attention-score slab, or zero for a lane that captured nothing.
+    ///
+    /// **APPENDED, AND DELIBERATELY NOT FOLDED IN BESIDE `logits_base`.** The
+    /// two are not one rectangle at a displacement: the readout lives in the
+    /// arena a fire wrote and the score slab is the shell's own reservation
+    /// (`engine_metal::scores`), which is exactly why the grouped form could
+    /// not reach it by counting rows off the trunk the way it reaches the
+    /// draft column. It is a second address or it is nothing.
+    ///
+    /// Zero is the honest absence: the emitted grouped gather faults rather
+    /// than dereferencing it, because a lane that did not capture has no
+    /// block and the last fire's mass is a wrong answer rather than a missing
+    /// one.
+    pub attn_score_base: u64,
+    /// Row pitch of the rectangle [`attn_score_base`](Self::attn_score_base) points at, in F32 ELEMENTS.
+    ///
+    /// The CUDA twin's `intrinsic_row_stride` under the one name this record
+    /// can give it. A plane is `ATTN_SCORE_KV_MAX` wide whatever a reader
+    /// declares, and a reader's declared row is a CEILING on it — the same
+    /// relation `ptir_m1_runtime_body.cuh`'s `0xA0` arm checks — so the pitch
+    /// has to arrive as its own number rather than be inferred from the
+    /// reader.
+    pub attn_score_row_stride: u32,
+    /// Padding to 8-byte alignment. Must be zero, for [`reserved0`](Self::reserved0)'s reason.
+    pub reserved1: u32,
 }
 
 /// One stage-local channel's per-lane state: the cells a put/take touches and the ring tickets the kernel checks.

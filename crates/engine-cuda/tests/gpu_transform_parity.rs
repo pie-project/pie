@@ -1,5 +1,22 @@
-//! The four rows a load fires on the device, fired, and compared byte for
-//! byte.
+//! The rows a load fires on the device, fired, and compared byte for byte.
+//!
+//! **THERE WERE FOUR AND THERE ARE TWO** (§M-3). Two of them were encodes —
+//! a bf16 to MXFP4 quantize and a bf16 to FP8 one — fired at LOAD time, and
+//! §M-3 shut that door: a serving plan does not convert, the stored form IS
+//! the served form, and `pie model import` runs the encode once instead. The
+//! CUDA kernel rows went with the door, which
+//! `plan::passes::tile::cuda_kernel` says in its own words where they stood:
+//! *"no device mask admits an encode any more, so a row for one could never
+//! be selected; the transform runs on the host, at `pie model import`, and
+//! the kernels it named are gone with it."* This file kept asserting both,
+//! and was therefore red from the commit that removed them.
+//!
+//! They are DELETED here rather than rerouted through the import target,
+//! which was the obvious repair and is the wrong one: `CONVERT_TILE_MAP_MASK`
+//! admits the encode as a KIND, so the plan compiles — and then names no
+//! kernel, because there is no CUDA row left to name. There is nothing on the
+//! device to compare a host answer against. A parity test whose reference and
+//! subject are the same host code path asserts nothing.
 //!
 //! `checkpoint`'s own `arena_transforms.rs` proves the executor OFFERS a
 //! transform to its backing with no GPU in the build. This proves the other
@@ -81,7 +98,7 @@ use checkpoint::plan::{
     CUDA_TILE_MAP_MASK, LoadPlan, StorageInstr, StorageTarget, compile as compile_load_plan,
 };
 use checkpoint::types::{
-    Axis, BackendKind, CheckpointFormat, DType, Encoding, FileId, QuantScheme, QuantSpec, TensorId,
+    BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId,
 };
 
 /// 64 rows of 128, which is four MXFP4 groups per row and enough rows that a
@@ -474,26 +491,25 @@ fn same_bytes(what: &str, device: &[u8], host: &[u8]) -> usize {
     device.len()
 }
 
-/// THE PROPERTY, for the three rows a compiled plan can name.
+/// THE PROPERTY, for the rows a compiled plan can name.
 ///
 /// Each case compiles a plan against the CUDA target, asserts the plan STATES
 /// the row — because a plan that names nothing would pass a byte comparison
 /// trivially, having run on the host both times — then executes it on the
 /// device and against the host and compares the whole arena.
+///
+/// **THE `assert_eq!` ON THE NAMED ROW IS WHAT KEPT THIS HONEST**, and it is
+/// worth saying which way it failed. When §M-3 took the encode kernels out,
+/// this test did not start comparing a host answer to itself and passing — it
+/// went red, naming the row it expected and the empty list it got. A weaker
+/// check (that SOME kernel ran, that the bytes matched) would have gone green
+/// on two transforms that had quietly moved to the host, which is exactly the
+/// failure `.wiki/fix/loader.md` records for the f64 `Cast`.
 #[test]
 fn a_named_row_fires_on_the_device_and_agrees_with_the_host() {
     if !device_or_skip("the named-row device/host parity") {
         return;
     }
-    let quant = |scheme: QuantScheme, bits: u8, group: u32| {
-        Encoding::Quant(QuantSpec {
-            scheme,
-            logical_dtype: DType::Bf16,
-            bits_per_element: bits,
-            group_size: group,
-            channel_axis: Some(Axis(1)),
-        })
-    };
     let cases: Vec<(&str, &str, ModelContract)> = vec![
         (
             "Cast f32 -> bf16",
@@ -505,34 +521,6 @@ fn a_named_row_fires_on_the_device_and_agrees_with_the_host() {
                     Expr::src("w32").cast(Encoding::Raw(DType::Bf16)),
                     vec![ROWS, COLS],
                     Encoding::Raw(DType::Bf16),
-                )],
-                groups: Vec::new(),
-            },
-        ),
-        (
-            "Encode bf16 -> MXFP4",
-            "quant::quantize_bf16_to_mxfp4_e2m1_per_block",
-            ModelContract {
-                alignment: 256,
-                tensors: vec![TensorContract::new(
-                    "out",
-                    Expr::src("w16").cast(quant(QuantScheme::Mxfp4E2M1E8M0, 4, 32)),
-                    vec![ROWS, COLS],
-                    quant(QuantScheme::Mxfp4E2M1E8M0, 4, 32),
-                )],
-                groups: Vec::new(),
-            },
-        ),
-        (
-            "Encode bf16 -> FP8 E4M3",
-            "quant::quantize_bf16_to_fp8_e4m3_per_channel",
-            ModelContract {
-                alignment: 256,
-                tensors: vec![TensorContract::new(
-                    "out",
-                    Expr::src("w16").cast(quant(QuantScheme::Fp8E4M3, 8, 0)),
-                    vec![ROWS, COLS],
-                    quant(QuantScheme::Fp8E4M3, 8, 0),
                 )],
                 groups: Vec::new(),
             },

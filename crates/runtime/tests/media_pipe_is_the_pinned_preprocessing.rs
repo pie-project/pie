@@ -9,12 +9,12 @@
 //! (`model`'s `qwen3_5_media_is_the_pinned_arithmetic` /
 //! `gemma4_media_is_the_pinned_arithmetic`); THESE claims need the codec —
 //! decode and the Catmull-Rom resample, which are the host's
-//! (`runtime::inferlet::host::media::decode`, per `model::media`'s dependency
+//! (`runtime::inferlet::host::media::decode`, per `models::media`'s dependency
 //! rule) — so they run here, composed exactly the way `image.from-bytes`
 //! composes them in service. The digest claims ride here too, because the
 //! digest does ([`span_digest`]'s own doc says why).
 
-use model::media::{Budget, EncodedSpan, Fault, Grid, VisionFrontEnd};
+use models::media::{Budget, EncodedSpan, Fault, Grid, VisionFrontEnd};
 use runtime::inferlet::media_codec as decode;
 use runtime::inferlet::span_digest;
 
@@ -24,7 +24,7 @@ fn encode_png(
     fe: &dyn VisionFrontEnd,
     bytes: &[u8],
     budget: Budget,
-) -> model::media::Result<EncodedSpan> {
+) -> models::media::Result<EncodedSpan> {
     fe.encode(&decode::decode(bytes)?, budget, decode::resize_exact)
 }
 
@@ -137,7 +137,7 @@ mod png {
 
 mod qwen {
     use super::*;
-    use model::qwen_3::media::Qwen35Vision;
+    use models::qwen_3::media::Qwen35Vision;
 
     /// **THE WHOLE PIPE, ON A REAL PNG.** Bytes this test wrote from the PNG
     /// specification (not from `image`'s encoder — see `common`), decoded,
@@ -296,7 +296,7 @@ mod qwen {
 
 mod gemma {
     use super::*;
-    use model::gemma_4::media::Gemma4Vision;
+    use models::gemma_4::media::Gemma4Vision;
 
     /// **THE WHOLE PIPE, ON A REAL PNG** written from the PNG specification rather
     /// than by the decoder's own library.

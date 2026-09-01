@@ -26,6 +26,9 @@ struct PtirLaneRecord {
   m1_u64 row_valid;
   m1_u32 row_valid_offset;
   m1_u32 reserved0;
+  m1_u64 attn_score_base;
+  m1_u32 attn_score_row_stride;
+  m1_u32 reserved1;
 };
 
 struct PtirLaneChannelSlot {
@@ -36,7 +39,7 @@ struct PtirLaneChannelSlot {
 };
 
 static_assert(sizeof(PtirLaneTableHeader) == 16, "lane header ABI");
-static_assert(sizeof(PtirLaneRecord) == 96, "lane record ABI");
+static_assert(sizeof(PtirLaneRecord) == 112, "lane record ABI");
 static_assert(sizeof(PtirLaneChannelSlot) == 32, "lane channel ABI");
 
 __device__ __forceinline__ void ptir_parallel_copy(

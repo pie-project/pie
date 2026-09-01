@@ -19,6 +19,9 @@ struct M3LaneRecord {
   ulong row_valid;
   uint row_valid_offset;
   uint reserved0;
+  ulong attn_score_base;
+  uint attn_score_row_stride;
+  uint reserved1;
 };
 struct M3LaneChannelSlot {
   ulong committed_cell;

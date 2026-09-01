@@ -675,7 +675,7 @@ mod tests {
     fn the_recurrent_rows_are_not_the_page_arithmetics() {
         // `space_of`/`row_of` answer `None` for a state cache, which is what
         // keeps the 36 gdn banks out of the page arithmetic entirely.
-        let trace = model::trace_of("qwen35-d0.8b-bf16-kv-bf16")
+        let trace = models::trace_of("qwen35-d0.8b-bf16-kv-bf16")
             .expect("the catalog ships the smoke's SKU");
         let trace = trace(model_dsl::Platform::Cuda);
         let states = trace

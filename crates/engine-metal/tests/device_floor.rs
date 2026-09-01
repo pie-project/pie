@@ -331,6 +331,148 @@ fn one_entry_fired_through_the_sink_computes_what_it_says() {
     println!("layout.embed: {got:?}");
 }
 
+/// **THE UNADDRESSABLE ID, AT BOTH DENSE POINTS, IN ONE FIRE.**
+///
+/// `layout.embed` and `layout.embed_concat` are one shader body under two
+/// stamps, and the stamp is exactly this: an id outside `[0, vocab)` reads
+/// **row zero** at the plain point and writes **zero** at the concatenating
+/// one. Neither answer is this plane's invention — they are what
+/// `kernels-cuda`'s `::pie::layout::embed` (`layout.cuh`, `tid_raw >= 0 &&
+/// tid_raw < vocab ? tid_raw : 0`) and `::pie::layout::embed_concat`
+/// (`embed_concat.cuh`, `y[at] = (id < 0 || id >= vocab) ? 0 : ...`) do, and
+/// the point of the gate is that the two PLANES agree per op, not that either
+/// op is right in the abstract.
+///
+/// The concat's answer is the one that has to differ: its sixteen ids per
+/// token are a HASH's output, and a head that hashed out of the table
+/// contributing row zero sixteen times would be a made-up embedding rather
+/// than an absent one.
+///
+/// Both landings are poisoned before the fire, so "zero" is a write and not an
+/// untouched buffer.
+#[test]
+fn an_unaddressable_id_clamps_at_one_dense_point_and_zeros_at_the_other() {
+    let _serial = serialized();
+    let Some(device) = device_or_skip("the dense embed bounds") else {
+        return;
+    };
+    let pipelines = Pipelines::new();
+    let handles = Handles::new();
+
+    let vocab = 6u32;
+    let hidden = 4u32;
+
+    // Row v holds `[v*10 + 0 .. v*10 + 3]` — the same table the permutation
+    // test above reads, so a wrong row is a wrong number.
+    let mut table_bytes = Vec::new();
+    for v in 0..vocab {
+        for d in 0..hidden {
+            table_bytes.extend_from_slice(&bf16(v as f32 * 10.0 + d as f32));
+        }
+    }
+    let mut table = Buffer::zeroed(&device, table_bytes.len() as u64).expect("the table reserves");
+    table.write(0, &table_bytes).expect("the table lands");
+    let table_h = handles
+        .bind(&table, 0, table_bytes.len() as u64)
+        .expect("table");
+
+    // Four shapes of wrong beside two in-range ids: negative, one past the
+    // last row, far past it, and `i32::MIN`, whose negation overflows.
+    let ids: [i32; 6] = [4, -1, vocab as i32, 2, 1 << 20, i32::MIN];
+    let mut id_store = Buffer::zeroed(&device, 4 * ids.len() as u64).expect("the ids reserve");
+    id_store.write(0, bytemuck_i32(&ids)).expect("the ids land");
+
+    // The plain point reads them as six rows of one id; the concatenating one
+    // as three rows of two, landing an eight-wide row. Same ids, same table,
+    // same total elements — only the stamp differs.
+    let out_bytes = ids.len() as u64 * u64::from(hidden) * 2;
+    let poison: Vec<u8> = (0..ids.len() * hidden as usize)
+        .flat_map(|_| bf16(-1.0))
+        .collect();
+
+    let mut plain = Buffer::zeroed(&device, out_bytes).expect("the plain landing reserves");
+    plain.write(0, &poison).expect("the poison lands");
+    let mut concat = Buffer::zeroed(&device, out_bytes).expect("the concat landing reserves");
+    concat.write(0, &poison).expect("the poison lands");
+
+    let ids_h = handles
+        .bind(&id_store, 0, 4 * ids.len() as u64)
+        .expect("ids");
+    let plain_h = handles.bind(&plain, 0, out_bytes).expect("plain out");
+    let concat_h = handles.bind(&concat, 0, out_bytes).expect("concat out");
+
+    let frame = device.frame().expect("a command buffer opens");
+    {
+        let sink = Sink::new(&device, &frame, &pipelines, &handles);
+        let table_t = Tensor::new(table_h, vocab, hidden, Dtype::Bf16);
+        kernels_metal::layout::embed(
+            &sink,
+            Tensor::new(ids_h, ids.len() as u32, 1, Dtype::I32),
+            table_t,
+            vocab,
+            Tensor::new(plain_h, ids.len() as u32, hidden, Dtype::Bf16),
+        )
+        .expect("the plain embed encodes");
+        kernels_metal::layout::embed_concat(
+            &sink,
+            Tensor::new(ids_h, ids.len() as u32 / 2, 2, Dtype::I32),
+            table_t,
+            vocab,
+            Tensor::new(concat_h, ids.len() as u32 / 2, hidden * 2, Dtype::Bf16),
+        )
+        .expect("the concatenating embed encodes");
+    }
+    frame.commit().expect("the fire completes");
+
+    let read = |buffer: &Buffer| -> Vec<f32> {
+        let mut got = vec![0u8; out_bytes as usize];
+        buffer.read(0, &mut got).expect("the output reads back");
+        got.chunks_exact(2)
+            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
+            .collect()
+    };
+    let got_plain = read(&plain);
+    let got_concat = read(&concat);
+
+    // The concat's slices are the plain point's rows at another stride, so one
+    // expectation walks both landings — and differs only in what an
+    // unaddressable id is worth.
+    let addressable = |id: i32| id >= 0 && (id as u32) < vocab;
+    let want_plain: Vec<f32> = ids
+        .iter()
+        .flat_map(|&id| {
+            let row = if addressable(id) { id } else { 0 };
+            (0..hidden).map(move |d| row as f32 * 10.0 + d as f32)
+        })
+        .collect();
+    let want_concat: Vec<f32> = ids
+        .iter()
+        .flat_map(|&id| {
+            (0..hidden).map(move |d| {
+                if addressable(id) {
+                    id as f32 * 10.0 + d as f32
+                } else {
+                    0.0
+                }
+            })
+        })
+        .collect();
+
+    assert_eq!(
+        got_plain, want_plain,
+        "`layout.embed` clamps an unaddressable id to row zero, as `layout.cuh` does"
+    );
+    assert_eq!(
+        got_concat, want_concat,
+        "`layout.embed_concat` writes zero for one, as `embed_concat.cuh` does"
+    );
+    assert!(
+        got_plain.iter().chain(&got_concat).all(|v| *v != -1.0),
+        "both landings were written, so a zero is an answer and not a leftover"
+    );
+    println!("dense embed bounds: ids {ids:?} clamp at one point and zero at the other");
+}
+
 /// The handle table's own two claims: a view past its buffer is refused, and
 /// a fire's rows do not survive the fire.
 #[test]
@@ -366,6 +508,197 @@ fn the_handle_table_refuses_a_view_past_its_buffer_and_rewinds_to_the_seal() {
         handles.get(u32::MAX).is_none(),
         "and `absent` resolves to nothing"
     );
+}
+
+/// **THE CORRECTION, AGAINST A HOST REFERENCE AND AGAINST ITSELF** (lane J,
+/// alto adapter §6.3).
+///
+/// `linear.lora_correct` is the one entry on this plane whose two halves live
+/// inside a single threadgroup — the `rank`-wide waist never leaves it
+/// (`kernels_metal::linear::lora`'s own header) — so nothing between the
+/// projection and the accumulate is observable from outside the fire. That
+/// makes a numerical gate the only way to know the halves agree, and it is
+/// why this one fires DETERMINISTIC PSEUDO-RANDOM `A` and `B` rather than a
+/// pattern the kernel could get right by symmetry: an `A` read down the wrong
+/// axis, a `B` read at the wrong stride and a waist accumulated in the wrong
+/// order all produce numbers, and only one arrangement produces THESE.
+///
+/// Three claims in one fire:
+///
+/// * **the routed rows compute `y += B[a]·(A[a]·x)`** against a host
+///   reference in f32, at bf16 tolerance;
+/// * **a `-1` row is the base model, exactly.** The op is IN PLACE, so an
+///   unrouted row must read back the value the trunk wrote, bit for bit —
+///   which is the identity-without-a-merge the whole guarded-window design
+///   rests on;
+/// * **a zero `B` corrects by nothing, exactly**, which is the arithmetic
+///   under `lora-probe`'s `adapter_scale = 0.0` parity claim.
+#[test]
+fn the_correction_adds_what_the_host_says_and_leaves_an_unrouted_row_alone() {
+    let _serial = serialized();
+    let Some(device) = device_or_skip("the adapter correction") else {
+        return;
+    };
+    let pipelines = Pipelines::new();
+    let handles = Handles::new();
+
+    // Small enough to reference by hand, wide enough that a row/column
+    // transposition of either bank changes the answer: `in` and `out` differ,
+    // and so does `rank`.
+    let rows = 4u32;
+    let in_width = 6u32;
+    let out_width = 5u32;
+    let rank = 3u32;
+    let adapters = 2u32;
+
+    // Deterministic pseudo-random, and the same splitmix the guest surface
+    // uses — so a failure here reads against `lora-probe`'s own fixture.
+    let pattern = |i: u32, salt: u32, amp: f32| -> f32 {
+        let mut x = (i ^ salt).wrapping_add(0x9e37_79b9);
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x85eb_ca6b);
+        x ^= x >> 13;
+        x = x.wrapping_mul(0xc2b2_ae35);
+        x ^= x >> 16;
+        ((x % 10_000) as f32 / 10_000.0 - 0.5) * 2.0 * amp
+    };
+    // Everything is round-tripped through bf16 BEFORE the reference is taken,
+    // so the host and the device multiply the same numbers and the only
+    // tolerance left is the accumulation order.
+    let round = |v: f32| f32::from_bits(u32::from(u16::from_le_bytes(bf16(v))) << 16);
+
+    // `x` is `[rows, in]`; `y` starts as the trunk's own value.
+    let x: Vec<f32> = (0..rows * in_width).map(|i| round(pattern(i, 0x1111, 1.0))).collect();
+    let y0: Vec<f32> = (0..rows * out_width).map(|i| round(pattern(i, 0x2222, 2.0))).collect();
+    // Adapter 0 is live; adapter 1's `B` is all zeros — the identity.
+    let bank_a: Vec<f32> = (0..adapters * rank * in_width)
+        .map(|i| round(pattern(i, 0x3333, 0.5)))
+        .collect();
+    let bank_b: Vec<f32> = (0..adapters * out_width * rank)
+        .map(|i| match i >= out_width * rank {
+            true => 0.0,
+            false => round(pattern(i, 0x4444, 0.5)),
+        })
+        .collect();
+    // Row 0 takes the live adapter, row 1 the zero-`B` one, row 2 is the base
+    // model and row 3 takes the live one again.
+    let routes: [i32; 4] = [0, 1, -1, 0];
+
+    let stage = |values: &[f32]| -> Vec<u8> {
+        values.iter().flat_map(|&v| bf16(v)).collect()
+    };
+    let x_bytes = stage(&x);
+    let y_bytes = stage(&y0);
+    let a_bytes = stage(&bank_a);
+    let b_bytes = stage(&bank_b);
+
+    let mut x_buf = Buffer::zeroed(&device, x_bytes.len() as u64).expect("x reserves");
+    x_buf.write(0, &x_bytes).expect("x lands");
+    let mut a_buf = Buffer::zeroed(&device, a_bytes.len() as u64).expect("A reserves");
+    a_buf.write(0, &a_bytes).expect("A lands");
+    let mut b_buf = Buffer::zeroed(&device, b_bytes.len() as u64).expect("B reserves");
+    b_buf.write(0, &b_bytes).expect("B lands");
+    let mut r_buf = Buffer::zeroed(&device, 4 * u64::from(rows)).expect("routes reserve");
+    r_buf.write(0, bytemuck_i32(&routes)).expect("routes land");
+    // **IN PLACE**: `y` carries the trunk's value in and the corrected value
+    // out, which is the aliasing the dispatch arm relies on.
+    let mut y_buf = Buffer::zeroed(&device, y_bytes.len() as u64).expect("y reserves");
+    y_buf.write(0, &y_bytes).expect("y lands");
+
+    let x_h = handles.bind(&x_buf, 0, x_bytes.len() as u64).expect("x");
+    let a_h = handles.bind(&a_buf, 0, a_bytes.len() as u64).expect("A");
+    let b_h = handles.bind(&b_buf, 0, b_bytes.len() as u64).expect("B");
+    let r_h = handles.bind(&r_buf, 0, 4 * u64::from(rows)).expect("routes");
+    let y_h = handles.bind(&y_buf, 0, y_bytes.len() as u64).expect("y");
+
+    let frame = device.frame().expect("a command buffer opens");
+    {
+        let sink = Sink::new(&device, &frame, &pipelines, &handles);
+        kernels_metal::linear::lora::correct(
+            &sink,
+            Tensor::new(x_h, rows, in_width, Dtype::Bf16),
+            // The weight table's `rows x width` reading of the bank shapes:
+            // `[adapters, rank·in]` and `[adapters, out·rank]`.
+            Tensor::new(a_h, adapters, rank * in_width, Dtype::Bf16),
+            Tensor::new(b_h, adapters, out_width * rank, Dtype::Bf16),
+            Tensor::new(r_h, rows, 1, Dtype::I32),
+            Tensor::new(y_h, rows, out_width, Dtype::Bf16),
+        )
+        .expect("the correction encodes");
+    }
+    frame.commit().expect("the fire completes");
+
+    let mut got = vec![0u8; y_bytes.len()];
+    y_buf.read(0, &mut got).expect("y reads back");
+    let got: Vec<f32> = got
+        .chunks_exact(2)
+        .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
+        .collect();
+
+    // ── THE HOST REFERENCE ──────────────────────────────────────────────
+    for row in 0..rows as usize {
+        let adapter = routes[row];
+        for out in 0..out_width as usize {
+            let base = y0[row * out_width as usize + out];
+            let want = match adapter {
+                // **BIT FOR BIT**, and the assertion says so: an unrouted row
+                // is returned on before a bank is read, so its bytes are the
+                // ones the trunk wrote and no tolerance applies.
+                -1 => {
+                    assert_eq!(
+                        got[row * out_width as usize + out].to_bits(),
+                        base.to_bits(),
+                        "row {row} routes to the base model and column {out} moved"
+                    );
+                    continue;
+                }
+                a => {
+                    let a = a as usize;
+                    let waist: Vec<f32> = (0..rank as usize)
+                        .map(|r| {
+                            (0..in_width as usize)
+                                .map(|k| {
+                                    let at = a * (rank * in_width) as usize
+                                        + r * in_width as usize
+                                        + k;
+                                    bank_a[at] * x[row * in_width as usize + k]
+                                })
+                                .sum::<f32>()
+                        })
+                        .collect();
+                    let delta: f32 = (0..rank as usize)
+                        .map(|r| {
+                            let at = a * (out_width * rank) as usize + out * rank as usize + r;
+                            bank_b[at] * waist[r]
+                        })
+                        .sum();
+                    base + delta
+                }
+            };
+            let saw = got[row * out_width as usize + out];
+            // bf16 carries 8 mantissa bits; the store rounds once and the
+            // f32 accumulation inside the threadgroup may order its adds
+            // differently from this loop.
+            let tol = 0.02 * want.abs().max(1.0);
+            assert!(
+                (saw - want).abs() <= tol,
+                "row {row} (adapter {adapter}) column {out}: device {saw}, host {want}"
+            );
+        }
+        // The zero-`B` adapter is the identity, and exactly so: every term of
+        // the sum is a product with a positive zero.
+        if adapter == 1 {
+            for out in 0..out_width as usize {
+                assert_eq!(
+                    got[row * out_width as usize + out].to_bits(),
+                    y0[row * out_width as usize + out].to_bits(),
+                    "row {row} carries a zero-`B` adapter and column {out} moved; the \
+                     correction is exactly zero, which is what `lora-probe`'s \
+                     `adapter_scale = 0.0` parity rests on"
+                );
+            }
+        }
+    }
 }
 
 /// f32 → the two bytes of its bf16 truncation, little-endian.

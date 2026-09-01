@@ -26,7 +26,7 @@ pub mod inferlet;
 /// knowledge — and a process-global `OnceLock` holding whatever this runtime
 /// booted is neither a family fact nor knowledge. `ModelMetadata` and the
 /// `(layers, vocab, arch)` rows FOLLOWED IT at M18, which deleted
-/// `model::serve` outright: what an artifact carries and what a fleet calls a
+/// `models::serve` outright: what an artifact carries and what a fleet calls a
 /// model are facts about serving, and this is the serving fabric.
 pub mod model;
 pub(crate) mod pipeline;

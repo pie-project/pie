@@ -378,6 +378,12 @@ impl QuantScheme {
     }
 }
 
+/// The tiled affine layout's two geometry constants, restated nowhere: they
+/// live beside the [`DType::U4g64tiled`] variant that names the layout, and
+/// this crate's [`RepackLayout::TiledAffineU4Weight`] checks a declared target
+/// shape against them.
+pub use dtype::{TILED_BAND, TILED_STEP};
+
 /// Which backend kernel a [`Expr::Repack`](crate::contract::Expr::Repack) names.
 ///
 /// The whole of what a repack says in a contract. Everything a kernel also
@@ -394,6 +400,26 @@ impl QuantScheme {
 pub enum RepackLayout {
     MarlinMxfp4Weight = 1,
     MarlinMxfp4Scale = 2,
+    /// **THE FOUR-BIT AFFINE CODE PLANE IN m16n8k16 FRAGMENT ORDER**
+    /// (§J4b) — `kernels_cuda::linear::tiled`'s `repack_affine_tiled`, whose
+    /// banner states the map and whose two readers are the tiled GEMM and
+    /// the tiled decode point.
+    ///
+    /// Operand `[rows, k]` of four-bit affine codes, target `[rows padded to
+    /// a whole 16-column band, k]` of the same. The rows are the
+    /// PROJECTION's output columns, so the padding is the band quantum and
+    /// the tail decodes to a zero weight.
+    ///
+    /// It is a plain matrix and not a batch, unlike the two above: a dense
+    /// projection has no expert axis, and declaring a leading `1` would be a
+    /// dimension the algebra could disagree with itself about.
+    TiledAffineU4Weight = 3,
+    /// **THE FACTOR PLANE BESIDE IT** — `repack_factors_tiled`, which is a
+    /// transpose of the (column, group) rectangle inside each 16-column
+    /// band and nothing else. One layout for the scales and the biases
+    /// alike: they are the same rectangle in the same order, and a second
+    /// row here would be one name for one permutation.
+    TiledAffineFactor = 4,
 }
 
 /// A repack as the *executor* needs it: the layout plus the geometry.

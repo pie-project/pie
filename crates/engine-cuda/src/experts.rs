@@ -195,6 +195,15 @@
 //! `mmap`'d `PROT_READ, MAP_PRIVATE` and NOT populated, and the group's weight
 //! row points straight into the mapping.
 //!
+//! **AND THERE ARE TWO SUCH FILES SINCE §K-T4**, which [`Spill`] is the name
+//! of. The whole-table artifact above is where a deployment starts, and only a
+//! machine that could hold the model resident can ever have written one. The
+//! SERVING artifact is the other: a capped boot with a weight cache directory
+//! transcribes every plane of the trace into it, so from then on this
+//! deployment's three tiers come out of one file — at any budget, since §M.3 —
+//! and the whole-table snapshot can be deleted. Nothing below this line
+//! branches on which — a plane is a window on a mapping either way.
+//!
 //! **THE GPU DEREFERENCES THE MAPPING ITSELF.** No `cudaHostRegister`, no
 //! copy, no pinned staging: on a device that reports `pageableMemoryAccess`
 //! (CUDA 12.2+ HMM) an unregistered host pointer is a valid device pointer,
@@ -322,6 +331,102 @@ impl Budgets {
             device: Some(bytes),
             host: None,
         }
+    }
+}
+
+/// **WHERE A SPILLED GROUP'S BYTES ARE READ FROM** — the two files that can
+/// answer, and the reason this is an enum rather than a path (§K.6-T4).
+///
+/// T2 is a mapping, and what is mapped is an artifact this shell wrote on an
+/// earlier boot. There are two of those, they are written by different loads
+/// for different reasons, and both carry the same bytes for a spilled plane:
+///
+/// ```text
+/// Resident  the whole-table artifact an UNCAPPED boot wrote — a snapshot of
+///           a device store that held every plane, indexed by param. The only
+///           source there was before T-4, and the one that bootstraps a
+///           deployment whose budgets have never held it.
+/// Tiers     this deployment's OWN serving artifact — written by a capped
+///           boot that had one of these and copied every plane forward.
+///           Budget-FREE since §M.3: it carries one image per plane of the
+///           trace, so it answers for whatever THIS load spills and for
+///           whatever the next budget pair spills too.
+/// ```
+///
+/// The pair matters because of what it lets an operator do: once one capped
+/// boot has written the serving artifact, that file IS the load — every plane
+/// of the trace, cut onto three rungs by whichever budgets the boot has — so
+/// the hundred-gigabyte resident artifact that seeded it can be deleted and
+/// every later boot of that deployment is warm.
+///
+/// **NOTHING IS COPIED HERE EITHER.** Both arms hand out windows on a
+/// mapping; which file a window came from is the only difference, and no
+/// kernel can tell.
+#[derive(Debug)]
+pub enum Spill {
+    /// **THE `.zt` ITSELF** (§M-4d) — the one file, which since §M-4b IS the
+    /// serving artifact and needs no second file beside it.
+    ///
+    /// The names are the trace's param order, because that is what `plane`
+    /// takes an id in and what a serving artifact addresses an object BY. The
+    /// two indices this variant replaces are keyed by that ordinal directly;
+    /// this one carries the translation instead of asking a reader to
+    /// re-derive it per lookup.
+    Serving(crate::checkpoint_serving::Serving),
+}
+
+impl Spill {
+    /// Which file these planes come out of.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        let Spill::Serving(serving) = self;
+        serving.path()
+    }
+
+    /// **One plane's bytes, borrowed from the mapping**, or `None` for a plane
+    /// this file does not carry.
+    ///
+    /// `id` is the param's ordinal in the plan's own order, and the plane axis
+    /// is always zero: a split-plane bank is already two `Trace::params` rows
+    /// here, so each is its own index entry. The `plane` axis of either index
+    /// is for a shell that puts both planes under one id, which this one does
+    /// not.
+    ///
+    /// # And a serving artifact answers for EVERY plane, on any rung
+    ///
+    /// Which used to take three lookups and now takes one. Format 2 held three
+    /// budget-shaped sections and a plane was in whichever one the plan's rung
+    /// put it in, so a lookup that asked only the mapped section would have
+    /// answered for T2 and nothing else — which is enough for [`Tier::open`]'s
+    /// seating but NOT for the LADDER, whose swaps send a berth's occupant
+    /// back to the file and therefore need a backing for every routed group.
+    ///
+    /// §M's file has one image per plane and no rungs in it at all, so the
+    /// question "where is this plane" has one answer for every budget, and the
+    /// ladder is as long as the resident artifact ever made it.
+    #[must_use]
+    pub fn plane(&self, id: u32) -> Option<&[u8]> {
+        let Spill::Serving(serving) = self;
+        serving.plane(id)
+    }
+
+    /// **What an operator does about a file that cannot answer for a plane.**
+    ///
+    /// One remedy now, because there is one file. It said "the two arms have
+    /// different remedies" while a spill could come out of a resident snapshot
+    /// or a tier artifact, and §M-4d retired both: a spilled load reads the
+    /// model's own `.zt`, so a hole is never a stale second file and never a
+    /// key collision.
+    ///
+    /// What it can still be is narrower and the sentence says it: the stamp
+    /// was checked at open (§M-4c), so the file is not a foreign recipe — it
+    /// is a trace that has gained a plane since the artifact was written.
+    fn remedy(&self) -> &'static str {
+        "The artifact is the model's own `.zt`, which since §M-4 IS the serving file: \
+         its objects are this trace's plane names, so a hole in it is a name this build \
+         declares and that file does not hold. The stamp was checked at open, so this \
+         is not a foreign recipe — it is a trace that has gained a plane since the \
+         artifact was written. Run `pie model import --force` on the source it names."
     }
 }
 
@@ -575,86 +680,93 @@ pub struct GroupPlan {
     pub held: Held,
 }
 
-impl Plan {
-    /// **The residency plan for `trace` under `device_budget`.**
+/// **THE PRIORITY RANKING, BEFORE ANY BUDGET CUTS IT** (§M.3).
+///
+/// [`Plan::of`] used to be one function: it worked out which planes a budget
+/// is allowed to move, ranked them, and then walked that ranking against the
+/// two budgets. **The first two steps mention no budget at all** — they are a
+/// pure function of the trace and the load plan's pairings — and separating
+/// them is what makes the serving artifact budget-polymorphic: the file states
+/// the RANKING, a boot states the CUT, and one file then serves any budget
+/// pair on this setup.
+///
+/// ```text
+///   floor      params no budget can move: ParamSource::Registered
+///   sequence   the cut sequence, HOTTEST FIRST
+///   banks      the dense routed banks: a device slab prefix AND a whole
+///              pinned copy, at every budget
+/// ```
+///
+/// Two readers, one statement. [`Plan::cut`] is the first; [`Ranking::images`]
+/// is the second and lays the artifact out. A ranking written twice would be
+/// two chances for a file to describe an order no boot walks.
+#[derive(Debug, Clone)]
+pub struct Ranking {
+    /// What a FULLY RESIDENT load of this trace demands of the device store.
+    full: u64,
+    /// **The params no budget can move**, ascending.
     ///
-    /// `None` — uncapped — answers the empty plan: land everything, open no
-    /// tier, hand the kernels no table. A stated budget is met by holding
-    /// fewer EXPERTS of a dense bank and fewer whole GROUPS of a packed one,
-    /// and never by holding fewer dense planes.
+    /// A registered plane is an adapter bank: `register_adapter` writes it at
+    /// a store offset reserved at load, so a bank on another tier is a
+    /// registration landing in bytes nobody reads. They are the floor under
+    /// any budget this trace can serve, and they are the reason the artifact
+    /// omits them — at write time they hold what `Buffer::zeroed` left.
+    floor: Vec<usize>,
+    /// What the floor reserves in the store, together.
+    floor_bytes: u64,
+    /// **THE CUT SEQUENCE, HOTTEST FIRST** — every dense plane a budget may
+    /// spill, in `prefetch::Schedule` order, then every packed routed group in
+    /// ascending param order.
+    ///
+    /// `prefetch::Schedule` is a pure function of the trace — the same planes
+    /// in the same order every fire — so read from the front it is what a pump
+    /// would copy first, and read from the back it is what a ceiling
+    /// surrenders first. Every `held` in here is the resting value; the cut
+    /// overwrites it.
+    sequence: Vec<GroupPlan>,
+    /// **The DENSE routed banks**, ascending by param.
+    ///
+    /// They are not in `sequence` and must not be: a bank has TWO readers at
+    /// EVERY budget — the device slab takes its first `resident` experts and
+    /// the pinned tier holds all of them, authoritatively — so it sits on
+    /// neither side of a cut. That is also why the artifact puts them after
+    /// the sequence: keeping them out of it leaves both cut points inside one
+    /// contiguous run.
+    banks: Vec<BankPlan>,
+}
+
+impl Ranking {
+    /// **The ranking this trace declares**, with the uniformity proof checked.
     ///
     /// `planes` is the load plan's pairing — which other params move when a
     /// packed bank moves — read by [`weights::prospect`] before a byte is
-    /// landed. An empty map is a plan with no packed bank, and a packed bank
+    /// landed. An empty map is a trace with no packed bank, and a packed bank
     /// missing from it is refused by name rather than seated half.
-    ///
-    /// **`budgets.host` IS WHAT OPENS THE THIRD TIER.** A packed group the
-    /// device budget cannot seat goes to T1; one the HOST budget cannot seat
-    /// either goes to T2 — the mapped artifact — and the plan reports those
-    /// bytes as [`Plan::spill_demand`]. This function never asks whether a T2
-    /// source exists: that is a file on a disk, and the statute that decides
-    /// whether a spilled load is servable is
-    /// [`Residency::admit_tiers`](engine::load::Residency::admit_tiers).
     ///
     /// # Errors
     ///
     /// [`Fault::Param`] for a param whose dtype has no byte size, whose bank
     /// shape breaks the uniformity proof, or whose packed bank the load plan
-    /// pairs no scales plane with; [`Fault::Residency`] for a budget that
-    /// cannot hold the dense planes plus one slot of every dense bank, naming
-    /// both numbers.
+    /// pairs no scales plane with.
     ///
     /// [`weights::prospect`]: crate::weights::prospect
-    pub fn of(trace: &Trace, planes: &Attachments, budgets: Budgets) -> Result<Plan> {
+    pub fn of(trace: &Trace, planes: &Attachments) -> Result<Ranking> {
         let bytes = crate::weights::plane_bytes(trace)?;
         let full = bytes.iter().map(|b| b.next_multiple_of(crate::weights::ALIGN)).sum();
-        let Some(budget) = budgets.device else {
-            return Ok(Plan {
-                device_bytes: full,
-                ..Plan::default()
-            });
-        };
-        if budget >= full {
-            // The budget covers the whole table: the degenerate case, and it
-            // is answered as the degenerate case rather than as a streamed
-            // load that happens to keep everything. `place_all()`.
-            return Ok(Plan {
-                device_bytes: full,
-                ..Plan::default()
-            });
-        }
-
         // **THE "NOTHING IS ROUTED" REFUSAL STOOD HERE, AND D2b RETIRED IT.**
         // It said that a plan with no routed-expert bank had no tier to hold
         // less of, because only the DYNAMIC demand shape streamed and the
         // static one — dense overflow — was not built. It is built: a dense
         // plane the budget cannot seat becomes a group of one and takes the
-        // same three tiers (streaming §2). A plan with no bank at all is now
-        // planned like any other, and what refuses is the floor below, which
-        // is about the planes that genuinely cannot move.
-        let (found, packed) = routed(trace, planes, &bytes)?;
-
-        // ── THE FLOOR, WHICH IS NOW THE UNSPILLABLE PLANES AND NOT THE DENSE
-        //    ONES (alto streaming §2's static demand shape, wave D2b).
-        //
-        //    A dense plane CAN leave the device now: it becomes a group of one
-        //    and walks the same three tiers a packed bank walks, given up in
-        //    reverse PREFETCH-SCHEDULE order so the plane a fire reads first is
-        //    the plane a budget surrenders last. What cannot leave is a
-        //    REGISTERED plane — `register_adapter` writes it at a store offset
-        //    reserved at load, so a bank on another tier is a registration
-        //    landing in bytes nobody reads. Those, plus one expert slot of
-        //    every dense bank, are the floor under any budget this plan can
-        //    serve; a budget below it is `Residency` -> `Impossible` rather
-        //    than `OutOfMemory` -> `Exhausted`, because nothing the deployment
-        //    frees changes the answer.
-        let streamable: BTreeSet<usize> = found
+        // same three tiers (streaming §2).
+        let (banks, packed) = routed(trace, planes, &bytes)?;
+        let streamable: BTreeSet<usize> = banks
             .iter()
             .map(|bank| bank.param)
             .chain(packed.iter().flat_map(|group| group.planes.iter().map(|plane| plane.param)))
             .collect();
-        let experts = found.first().map_or(0, |bank| bank.experts);
-        let mut pinned_floor = 0u64;
+        let mut floor: Vec<usize> = Vec::new();
+        let mut floor_bytes = 0u64;
         let mut spillable: Vec<GroupPlan> = Vec::new();
         for (at, param) in trace.params.iter().enumerate() {
             if streamable.contains(&at) {
@@ -662,7 +774,8 @@ impl Plan {
             }
             let reserved = bytes[at].next_multiple_of(crate::weights::ALIGN);
             if param.source == ParamSource::Registered {
-                pinned_floor += reserved;
+                floor.push(at);
+                floor_bytes += reserved;
                 continue;
             }
             spillable.push(GroupPlan {
@@ -679,24 +792,173 @@ impl Plan {
                 routed: false,
             });
         }
-        // **THE ORDER A BUDGET GIVES PLANES UP IN IS THE COMPILER'S.**
-        // `prefetch::Schedule` is a pure function of the trace — the same
-        // planes in the same order every fire — so this ordering is a
-        // compile-time constant and two boots of one deployment spill the same
-        // set. Read from the front, it is what a pump would copy first; read
-        // from the back, it is what a ceiling surrenders first.
+        // **THE ORDER A BUDGET GIVES PLANES UP IN IS THE COMPILER'S**, which
+        // is what makes it budget-free and therefore a property of the file:
+        // `prefetch::Schedule` is a pure function of the trace, so two boots
+        // of one deployment rank the same planes the same way and an artifact
+        // written by either is walked identically by the other.
         let schedule = model_compiler::prefetch::Schedule::of(trace);
-        //    The walk below offers T0 front to back, so the planes that fall
-        //    off its end are the schedule's tail — which is the spill order,
-        //    arrived at by construction rather than by a second sort.
         let rank: BTreeMap<usize, usize> = schedule
             .order()
             .into_iter()
             .enumerate()
             .map(|(at, param)| (param, at))
             .collect();
-        spillable.sort_by_key(|group| (rank.get(&group.param).copied().unwrap_or(usize::MAX), group.param));
-        let dense = pinned_floor;
+        spillable.sort_by_key(|group| {
+            (rank.get(&group.param).copied().unwrap_or(usize::MAX), group.param)
+        });
+        // **THE DENSE PLANES COME BEFORE THE PACKED BANKS.** A dense plane is
+        // read by every token of every fire; a routed expert may not be read
+        // at all. So the unconditional demand ranks above the conditional one,
+        // which is the only ordering that does not spend the scarcest tier on
+        // the least certain reader.
+        Ok(Ranking {
+            full,
+            floor,
+            floor_bytes,
+            sequence: spillable.into_iter().chain(packed).collect(),
+            banks,
+        })
+    }
+
+    /// What a FULLY RESIDENT load of this trace demands of the device store.
+    #[must_use]
+    pub fn full(&self) -> u64 {
+        self.full
+    }
+
+    /// The params no budget can move — see the field.
+    #[must_use]
+    pub fn floor(&self) -> &[usize] {
+        &self.floor
+    }
+
+    /// The cut sequence, hottest first — see the field.
+    #[must_use]
+    pub fn sequence(&self) -> &[GroupPlan] {
+        &self.sequence
+    }
+
+    /// The dense routed banks — see the field.
+    #[must_use]
+    pub fn banks(&self) -> &[BankPlan] {
+        &self.banks
+    }
+
+    /// **WHERE EVERY IMAGE OF THE SERVING ARTIFACT GOES**, one quad per image:
+    /// `(param, offset, bytes, reserved)`, in payload order (§M.3).
+    ///
+    /// [`Plan::host_layout`]'s analogue one level up, and it exists for the
+    /// same reason: the artifact's key mixes these triples, its writer
+    /// transcribes them into the index, and its reader cuts them — so the walk
+    /// that fills the payload and the index that describes it must be ONE
+    /// statement.
+    ///
+    /// ```text
+    ///   1. the cut sequence, in its own order, each group's planes in theirs
+    ///   2. the dense routed banks, WHOLE — every expert, not the resident
+    ///      ones — in ascending param order
+    /// ```
+    ///
+    /// **The registered planes are absent**, and that is the whole of what the
+    /// artifact's `FLAG_ADAPTERS_ZEROED` states: they hold what
+    /// `Buffer::zeroed` left at the moment the file is written, so a restore
+    /// leaves the store's zeros where they are rather than reading a hundred
+    /// megabytes of them back.
+    ///
+    /// `bytes` is what the checkpoint publishes into the image and `reserved`
+    /// is what the payload gives it — the same pair `weights::Place` carries.
+    /// **A BANK'S SPAN IS PADDED HERE AND IN [`Plan::host_layout`] ALIKE**, so
+    /// that every image on every rung starts on
+    /// [`weights::ALIGN`](crate::weights::ALIGN): that alignment is the reason
+    /// one image can serve all three rungs, and a span that only happened to
+    /// be aligned would make it an accident of the shapes.
+    #[must_use]
+    pub fn images(&self) -> Vec<(u64, u64, u64, u64)> {
+        let mut out = Vec::new();
+        let mut at = 0u64;
+        for group in &self.sequence {
+            for plane in &group.planes {
+                out.push((plane.param as u64, at, plane.bytes, plane.reserved));
+                at += plane.reserved;
+            }
+        }
+        for bank in &self.banks {
+            let span = u64::from(bank.experts) * bank.stride;
+            let reserved = span.next_multiple_of(crate::weights::ALIGN);
+            out.push((bank.param as u64, at, span, reserved));
+            at += reserved;
+        }
+        out
+    }
+}
+
+impl Plan {
+    /// **The residency plan for `trace` under `budgets`.**
+    ///
+    /// [`Ranking::of`] and then [`Plan::cut`], which is what this function has
+    /// always been: the ranking is the part that mentions no budget, and the
+    /// cut is the part that mentions nothing else.
+    ///
+    /// `None` — uncapped — answers the empty plan: land everything, open no
+    /// tier, hand the kernels no table.
+    ///
+    /// # Errors
+    ///
+    /// [`Ranking::of`]'s, plus [`Fault::Residency`] for a budget that cannot
+    /// hold the registered planes plus one slot of every dense bank.
+    pub fn of(trace: &Trace, planes: &Attachments, budgets: Budgets) -> Result<Plan> {
+        Plan::cut(&Ranking::of(trace, planes)?, budgets)
+    }
+
+    /// **THE CUT: what these budgets make of that ranking** (§M.3).
+    ///
+    /// A stated budget is met by holding fewer EXPERTS of a dense bank and
+    /// fewer whole GROUPS of a packed one, and never by holding fewer dense
+    /// planes than the ranking's floor.
+    ///
+    /// **`budgets.host` IS WHAT OPENS THE THIRD TIER.** A group the device
+    /// budget cannot seat goes to T1; one the HOST budget cannot seat either
+    /// goes to T2 — the mapped artifact — and the plan reports those bytes as
+    /// [`Plan::spill_demand`]. This function never asks whether a T2 source
+    /// exists: that is a file on a disk, and the statute that decides whether
+    /// a spilled load is servable is
+    /// [`Residency::admit_tiers`](engine::load::Residency::admit_tiers).
+    ///
+    /// **THE WALK CONTINUES PAST A GROUP THAT DOES NOT FIT.** A tier is
+    /// offered each group in ranking order and a group too large for what is
+    /// left falls through to the next tier while the walk goes on, because a
+    /// later, smaller group that does fit is a group that tier may as well
+    /// hold. So the two cut points are RANK THRESHOLDS with fitted exceptions
+    /// rather than strict prefixes — which costs the artifact nothing, since
+    /// every image is addressed by its own index entry and no rung is required
+    /// to be one contiguous run of the file.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Residency`] for a budget under the registered planes plus one
+    /// expert slot of every dense bank, naming both numbers.
+    pub fn cut(ranking: &Ranking, budgets: Budgets) -> Result<Plan> {
+        let full = ranking.full;
+        let Some(budget) = budgets.device else {
+            return Ok(Plan {
+                device_bytes: full,
+                ..Plan::default()
+            });
+        };
+        if budget >= full {
+            // The budget covers the whole table: the degenerate case, and it
+            // is answered as the degenerate case rather than as a streamed
+            // load that happens to keep everything. `place_all()`.
+            return Ok(Plan {
+                device_bytes: full,
+                ..Plan::default()
+            });
+        }
+
+        let found = ranking.banks.clone();
+        let experts = found.first().map_or(0, |bank| bank.experts);
+        let dense = ranking.floor_bytes;
         // One slot of every DENSE bank. A packed group contributes nothing
         // here: its floor is zero, because the whole of it may live on the
         // pinned tier and still be read.
@@ -719,33 +981,26 @@ impl Plan {
             )));
         }
 
-        // ── THE PACKED GROUPS, SEATED WHOLE OR NOT AT ALL, ACROSS THREE
-        //    TIERS.
+        // ── THE RANKING, SEATED WHOLE OR NOT AT ALL, ACROSS THREE TIERS.
         //
-        //    Walked in PLAN ORDER and offered each tier in turn: the device
-        //    while what is left of the device budget holds one whole, then the
-        //    pinned host while what is left of the host budget does, then the
-        //    mapping, which has no budget to run out of. A group that does not
-        //    fit a tier falls through and the walk CONTINUES rather than
-        //    stopping, because a later, smaller group that does fit is a group
-        //    that tier may as well hold — and because the answer has to be a
-        //    function of the trace and the two budgets alone, so that two
-        //    boots of one deployment plan the same table.
-        //
-        //    There is no "seat half of it": the module header states the
-        //    reason, and it is the whole of why this loop is over GROUPS.
+        //    Each group is offered the device while what is left of the device
+        //    budget holds one whole, then the pinned host while what is left
+        //    of the host budget does, then the mapping, which has no budget to
+        //    run out of. There is no "seat half of it": the module header
+        //    states the reason, and it is the whole of why this loop is over
+        //    GROUPS.
         //
         //    **THE DENSE BANKS' PINNED COPY IS RESERVED FIRST, AT ITS WORST
         //    CASE.** A streamed dense bank pins EVERY expert, and whether it
         //    streams is decided below this loop — so the host budget is
         //    charged for it here as though it does. The conservatism can only
-        //    send a group to T2 that T1 could have held, never the reverse,
-        //    and it applies to no catalog SKU today: no model text declares a
-        //    dense routed bank and a packed one in one plan.
+        //    send a group to T2 that T1 could have held, never the reverse.
         let mut left = budget - floor;
         let dense_pin: u64 = found
             .iter()
-            .map(|bank| u64::from(bank.experts) * bank.stride)
+            .map(|bank| {
+                (u64::from(bank.experts) * bank.stride).next_multiple_of(crate::weights::ALIGN)
+            })
             .sum();
         let mut host_left = budgets.host.map(|host| host.saturating_sub(dense_pin));
         let mut groups: Vec<GroupPlan> = Vec::new();
@@ -754,13 +1009,7 @@ impl Plan {
         let mut mapped_of: BTreeSet<usize> = BTreeSet::new();
         let mut seated = 0u64;
         let mut spill_bytes = 0u64;
-        //    **THE DENSE PLANES ARE OFFERED T0 BEFORE THE PACKED BANKS.**
-        //    A dense plane is read by every token of every fire; a routed
-        //    expert may not be read at all. So the unconditional demand takes
-        //    the device first and the conditional one takes what is left,
-        //    which is the only ordering that does not spend the scarcest tier
-        //    on the least certain reader.
-        for mut group in spillable.into_iter().chain(packed) {
+        for mut group in ranking.sequence.iter().cloned() {
             if group.bytes <= left {
                 left -= group.bytes;
                 seated += group.bytes;
@@ -847,22 +1096,23 @@ impl Plan {
         //
         // A MAPPED group owes the pinned tier nothing at all: its bytes were
         // on disk before this load began and stay there.
-        let mut host_bytes: u64 = banks
+        //
+        // **EVERY SPAN IS ALIGNED, BANKS INCLUDED** (§M.3): `host_walk` rounds
+        // each bank's span up to `weights::ALIGN` and this does the same
+        // arithmetic in the same order, so `host_demand` and `host_image` are
+        // one number and every T1 image starts where the store and the mapping
+        // would have started it.
+        let host_bytes: u64 = banks
             .iter()
-            .map(|bank| u64::from(bank.experts) * bank.stride)
-            .sum();
-        let pinned: u64 = groups
-            .iter()
-            .filter(|group| group.held == Held::Pinned)
-            .map(|group| group.bytes)
-            .sum();
-        if pinned > 0 {
-            // The groups' own offsets are aligned, so one rounding here is the
-            // whole of what the seats above owe them. `Tier::open` does the
-            // same arithmetic in the same order, and the two numbers agree.
-            host_bytes = host_bytes.next_multiple_of(crate::weights::ALIGN);
-            host_bytes += pinned;
-        }
+            .map(|bank| {
+                (u64::from(bank.experts) * bank.stride).next_multiple_of(crate::weights::ALIGN)
+            })
+            .sum::<u64>()
+            + groups
+                .iter()
+                .filter(|group| group.held == Held::Pinned)
+                .map(|group| group.bytes)
+                .sum::<u64>();
         Ok(Plan {
             banks,
             groups,
@@ -966,6 +1216,141 @@ impl Plan {
     #[must_use]
     pub fn host_demand(&self) -> u64 {
         self.host_bytes
+    }
+
+    /// **WHERE EVERY BYTE OF THE PINNED TIER GOES**, one quad per span:
+    /// `(param, host_at, bytes, reserved)`, in the order [`Tier::open`] seats
+    /// them — every dense bank, then every plane of every group held
+    /// [`Held::Pinned`].
+    ///
+    /// **ONE STATEMENT, THREE READERS** (§K.2, §M.3). It was the offset walk
+    /// inlined in [`Tier::open`], and it is extracted because two more callers
+    /// need the same numbers and must not re-derive them: the boot's CUT reads
+    /// these quads to route each image out of the serving artifact into the
+    /// pinned tier, and the background refill reads them again to lay the
+    /// page-locked copy out the same way. A walk written three times is three
+    /// chances for a tier to be seated at offsets nobody else believes.
+    ///
+    /// `bytes` is what the checkpoint publishes into the span and `reserved`
+    /// is what the tier gives it — the same pair `weights::Place` carries, and
+    /// they differ by up to [`weights::ALIGN`](crate::weights::ALIGN) - 1 bytes
+    /// of padding no landing writes. A dense bank's two numbers are equal: its
+    /// span is `experts * stride` exactly, and the alignment it needs is the
+    /// one the seats before it already left it on.
+    #[must_use]
+    pub fn host_layout(&self) -> Vec<(u64, u64, u64, u64)> {
+        self.host_walk().0
+    }
+
+    /// **How many bytes the pinned tier allocates** — where [`host_layout`]'s
+    /// walk ends.
+    ///
+    /// Not always the last span's end: a plan whose groups are ALL on the
+    /// mapping still rounds up to [`weights::ALIGN`](crate::weights::ALIGN)
+    /// after its banks, because the walk aligns before it looks at what the
+    /// groups are held on. So the total is the walk's own answer rather than
+    /// arithmetic on its last entry, and [`Tier::open`] allocates exactly it.
+    ///
+    /// [`host_layout`]: Plan::host_layout
+    #[must_use]
+    pub fn host_image(&self) -> u64 {
+        self.host_walk().1
+    }
+
+    /// The walk itself: the spans and where they end. Private, because a
+    /// caller that wants one of the two is asking a question with a name.
+    fn host_walk(&self) -> (Vec<(u64, u64, u64, u64)>, u64) {
+        let mut out = Vec::with_capacity(self.banks.len() + self.groups.len());
+        let mut at = 0u64;
+        for bank in &self.banks {
+            // **THE WHOLE BANK, NOT THE MISSING EXPERTS.** Pinned is the
+            // authoritative copy and the slab is a cache over it — `Plan::cut`
+            // argues it — so the span is every expert of the bank and the
+            // landing writes all of it.
+            //
+            // **AND IT IS PADDED TO `weights::ALIGN` LIKE EVERY OTHER IMAGE**
+            // (§M.3). It used to be `experts * stride` exactly, with ONE
+            // rounding after all the banks to line the groups up behind them —
+            // which left a bank's span aligned only when its shapes happened
+            // to make it so. The serving artifact carries one image per span
+            // and cuts it onto whichever rung the budget picks, and the whole
+            // reason one image can serve all three rungs is that every rung
+            // gives it the same alignment. So the padding is per bank, here,
+            // and `Ranking::images` does the same arithmetic in the same
+            // order.
+            let span = u64::from(bank.experts) * bank.stride;
+            let reserved = span.next_multiple_of(crate::weights::ALIGN);
+            out.push((bank.param as u64, at, span, reserved));
+            at += reserved;
+        }
+        for group in &self.groups {
+            if group.held != Held::Pinned {
+                continue;
+            }
+            for plane in &group.planes {
+                out.push((plane.param as u64, at, plane.bytes, plane.reserved));
+                at += plane.reserved;
+            }
+        }
+        (out, at)
+    }
+
+    /// **WHERE EVERY BYTE OF THE MAPPED SECTION GOES**, one quad per plane:
+    /// `(param, offset, bytes, reserved)`, in the order [`Tier::open`] seats
+    /// them — every plane of every group held [`Held::Mapped`], in plan order
+    /// (§K.6-T4).
+    ///
+    /// [`Plan::host_layout`]'s twin one tier down, and it exists for the same
+    /// reason: the tier artifact's writer transcribes these quads into the
+    /// MAPPED section's index run, and a section whose index disagrees with
+    /// the walk that filled it is the one failure a digest cannot catch. The
+    /// offsets are relative to the section's own base, which is where
+    /// [`tier::Artifact::plane`] resolves them from.
+    ///
+    /// **AND THE ALIGNMENT IS THE STORE'S**, not the section's: a kernel that
+    /// reinterprets an mxfp4 code plane as 32-bit words reads an aligned
+    /// address out of the mapping exactly as it does out of the store, and
+    /// [`weights::ALIGN`](crate::weights::ALIGN) is what makes that true on
+    /// all three tiers. The section as a whole starts on
+    /// [`tier::TIER_ALIGN`](crate::weight_cache::tier::TIER_ALIGN), which the
+    /// format arranges and this walk knows nothing about.
+    ///
+    /// [`tier::Artifact::plane`]: crate::weight_cache::tier::Artifact::plane
+    #[must_use]
+    pub fn mapped_layout(&self) -> Vec<(u64, u64, u64, u64)> {
+        self.mapped_walk().0
+    }
+
+    /// **How many bytes this cut leaves on the mapping** — where
+    /// [`mapped_layout`]'s walk ends.
+    ///
+    /// Zero for every plan that spills nothing, which is the plan every load
+    /// before wave W-1 had. Larger than [`Plan::spill_demand`] by the padding
+    /// between the planes: the demand is what the groups PUBLISH and this is
+    /// what their images RESERVE, the same pair the other two rungs carry.
+    ///
+    /// [`mapped_layout`]: Plan::mapped_layout
+    #[must_use]
+    pub fn mapped_image(&self) -> u64 {
+        self.mapped_walk().1
+    }
+
+    /// The walk itself, for [`Plan::host_walk`]'s reason.
+    ///
+    /// [`Plan::host_walk`]: Plan::host_walk
+    fn mapped_walk(&self) -> (Vec<(u64, u64, u64, u64)>, u64) {
+        let mut out = Vec::new();
+        let mut at = 0u64;
+        for group in &self.groups {
+            if group.held != Held::Mapped {
+                continue;
+            }
+            for plane in &group.planes {
+                out.push((plane.param as u64, at, plane.bytes, plane.reserved));
+                at += plane.reserved;
+            }
+        }
+        (out, at)
     }
 }
 
@@ -1128,8 +1513,23 @@ struct Seat {
     experts: u32,
     resident: u32,
     stride: u64,
-    /// Byte offset of expert 0 inside the pinned tier.
+    /// Byte offset of expert 0 inside the PAGE-LOCKED image — where the
+    /// landing sink writes and where the install will re-form `serving_at`.
     host_at: u64,
+    /// **THE ADDRESS EXPERT 0 IS READ FROM RIGHT NOW** (§L.1, at §M's
+    /// layout): `host.device() + host_at` for an eager seat, and the bank
+    /// image's own address inside the serving artifact while a deferred seat's
+    /// window is open.
+    ///
+    /// It is a per-span base and not one number for the whole tier, and §M is
+    /// why. The artifact holds one image per plane in a budget-free order, so
+    /// the images a given budget puts on T1 are a SUBSET of that order and not
+    /// a contiguous run of it — there is no single base address the pinned
+    /// offsets could be added to. What §L.2's install promised is unchanged:
+    /// every one of these moves inside one `drained`/`ready` bracket, followed
+    /// by one `publish_all` and one `publish_cells`, so a cell caught
+    /// mid-flight still names one of two addresses of the same verified bytes.
+    serving_at: u64,
     /// Index of expert 0's entry, in entries.
     entry_at: usize,
     /// Index of expert 0's counter, in counters.
@@ -1153,8 +1553,11 @@ struct Seat {
 #[derive(Debug)]
 struct Whole {
     param: usize,
-    /// Byte offset of this plane inside the pinned tier.
+    /// Byte offset of this plane inside the PAGE-LOCKED image.
     host_at: u64,
+    /// **THE ADDRESS THIS PLANE IS READ FROM RIGHT NOW** — see
+    /// [`Seat::serving_at`].
+    serving_at: u64,
 }
 
 /// **One plane of a packed group, seated on T2** — an address inside the
@@ -1332,13 +1735,202 @@ pub struct BankResidency {
     pub held: Option<Held>,
 }
 
+/// **WHERE THE PINNED TIER'S BYTES COME FROM**, decided by the caller of
+/// [`Tier::open`] and by nothing else.
+///
+/// One argument with three answers, because the allocation it decides is the
+/// only one in this file measured in TENS OF GIGABYTES and each answer costs
+/// something different. It was a `bool` for two of them (§K.4, phase T-3) and
+/// the third is what §L adds; the enum is here rather than a second parameter
+/// so that the three remain exclusive by construction.
+#[derive(Debug)]
+pub enum Fill {
+    /// **The cold load.** [`Pinned::mapped`]: zeroed here, then written span
+    /// by span by the landing sink as the checkpoint finalizes.
+    ///
+    /// The zeros are not decoration. The sink writes each plane's PUBLISHED
+    /// bytes and this tier seats each plane at `reserved` — those bytes
+    /// rounded up to [`weights::ALIGN`](crate::weights::ALIGN) — so the
+    /// padding at the end of every span is written by nothing. Zeroed, they
+    /// are a deterministic image the artifact can carry; unzeroed, they are
+    /// whatever the allocator handed out, which the writer would hash and
+    /// publish.
+    Cold,
+    /// **The warm restore.** [`Pinned::mapped_uninit`]: not zeroed, because
+    /// the caller holds a serving artifact carrying every image this tier
+    /// seats, and `Plan::host_layout` tiles the allocation — so all of it is
+    /// read in before anything reads a byte out (§K.4).
+    ///
+    /// Zeroing tens of gigabytes of page-locked memory costs tens of seconds
+    /// of memory bandwidth on every boot, and it is pure loss on the one boot
+    /// whose promise is that it does not touch the bytes twice. A caller that
+    /// takes this and then cannot keep the promise owes this tier
+    /// [`Tier::zero_host`] before the cold load runs.
+    ///
+    /// # A TRAP FOR THE §M-4d PORT, WRITTEN DOWN BEFORE ANYONE WALKS INTO IT
+    ///
+    /// This arm is about to be re-pointed at the model's own `.zt`, and the
+    /// two sources do not cover the same bytes.
+    ///
+    /// A tier image is a `reserved` span — the plane's bytes ROUNDED UP to
+    /// [`weights::ALIGN`](crate::weights::ALIGN) — so a restore from one
+    /// writes the padding at the end of every plane, and `Plan::host_layout`
+    /// tiles the whole allocation with those padded spans. That is what makes
+    /// `mapped_uninit` safe here: every byte is written before any is read.
+    ///
+    /// `checkpoint::file::serve::Fill` writes **exactly the part's published
+    /// length** and deliberately not the padding — the block table tiles the
+    /// DECODED size (departure #1), so the padding is not hashed and is not
+    /// read back. A fill built naively out of `serve::Fill` therefore leaves
+    /// every inter-plane gap of a NOT-ZEROED allocation holding whatever the
+    /// allocator last had there.
+    ///
+    /// Nothing would notice for a long time. No kernel reads a plane past its
+    /// `bytes`, so the model serves correctly; the gaps surface only when
+    /// something HASHES the image — a later write-back, a verify, a deferred
+    /// seat's install comparing what it built against what it served.
+    ///
+    /// So the port owes one of three, and must say which: write the padding
+    /// explicitly from [`serving::padded_spans`], zero the allocation first
+    /// and give up this arm's whole reason to exist, or narrow the promise so
+    /// the image is never hashed. The first is the cheap one — the padding is
+    /// a spec MUST of `0x00` in the file and a `memset` per plane here.
+    Restored,
+    /// **THE DEFERRED SEAT** (§L.1, phase L-1): no page-locked image at all,
+    /// yet. The tier serves each T1 image out of the artifact where it lies,
+    /// and a background thread builds the page-locked copy behind it.
+    ///
+    /// The artifact travels INTO the tier because the mapping has to outlive
+    /// the load: every T1 address this tier hands out is a pointer inside it
+    /// until the install, and a `Tier` that served out of a mapping somebody
+    /// else dropped is the one failure mode worth designing against.
+    ///
+    /// **The same bytes, at their own addresses.** §M's file holds one image
+    /// per plane in a budget-free order, so the images this budget puts on T1
+    /// are a subset of that order and not a run of it — each span carries its
+    /// own serving address (see [`Seat::serving_at`]) and the install re-forms
+    /// all of them at once rather than swapping one base.
+    ///
+    /// The caller owes two things: every image this seat will serve must be
+    /// VERIFIED before a kernel is pointed at it (§L.3 — there is no
+    /// first-touch hook, so the alternative to verifying up front is
+    /// unretractable tokens), and the device must report
+    /// `pageableMemoryAccess`, which is [`pageable_access`] and is the same
+    /// mechanism T2 already stands on.
+    Deferred(crate::weight_cache::tier::Artifact),
+}
+
+/// **THE BACKGROUND PAGE-LOCK-AND-FILL, WHILE IT IS OUTSTANDING** (§L.4).
+///
+/// One thread and one channel. The thread binds the device, maps the whole
+/// pinned image, reads every T1 image of the artifact into its own span —
+/// verifying each block against the table as the bytes land, because a
+/// background copy does not get to trust the boot's verification of a file it
+/// re-opened by path — page-locks the result and sends it. A thread that fails
+/// sends NOTHING: it has already counted what it found, said it out loud with
+/// the remedy, and LEFT THE FILE WHERE IT IS (§M.4); a seat whose refill
+/// failed keeps serving the verified bytes it has been serving all along.
+///
+/// **NOTHING OF THE TIER CROSSES.** The closure carries a `PathBuf`, a
+/// [`Head`](crate::weight_cache::tier::Head), a length and a device ordinal;
+/// the allocation it makes is unreachable from this side until it comes back
+/// over the channel, which is a stronger discipline than the one `Pinned`'s
+/// own `Send` argument asks for.
+#[derive(Debug)]
+struct Refill {
+    /// The thread, until [`Refill`] is dropped or the image is taken.
+    filling: Option<std::thread::JoinHandle<()>>,
+    /// The one message it will ever send.
+    filled: std::sync::mpsc::Receiver<Pinned>,
+    /// When the window opened. See [`Observed::window_ms`](
+    /// crate::weight_cache::tier::Observed::window_ms).
+    began: std::time::Instant,
+}
+
+/// What a [`Refill`] answers when it is asked between two fires.
+enum Filled {
+    /// Still page-locking, reading or hashing. Serving continues on T2.
+    Waiting,
+    /// The image is here, verified and page-locked. Install it.
+    Ready(Pinned),
+    /// The thread is finished and sent nothing, which is the only way it says
+    /// it failed. It has counted and named whatever it found; serving
+    /// continues, and this tier never promotes.
+    Refused,
+}
+
+impl Refill {
+    /// Ask, without waiting. See [`Filled`].
+    fn poll(&mut self) -> Filled {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.filled.try_recv() {
+            Ok(host) => Filled::Ready(host),
+            Err(TryRecvError::Empty) => Filled::Waiting,
+            Err(TryRecvError::Disconnected) => Filled::Refused,
+        }
+    }
+
+    /// **Wait for it.** The gate's half of [`Refill::poll`]: joins the thread
+    /// and answers what it sent, which is `None` for a fill that failed.
+    fn settle(mut self) -> Option<Pinned> {
+        if let Some(filling) = self.filling.take() {
+            let _ = filling.join();
+        }
+        self.filled.try_recv().ok()
+    }
+
+    /// How long this window has been open, in milliseconds.
+    fn window_ms(&self) -> u64 {
+        u64::try_from(self.began.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+impl Drop for Refill {
+    /// **THE THREAD IS JOINED, NOT DETACHED** (§L, hazard H6).
+    ///
+    /// A detached refill outlives the tier that armed it and then page-locks
+    /// tens of gigabytes against a process that has no use for them and no
+    /// handle to free them with — `cudaHostAlloc` on a dead deployment, held
+    /// until the process exits. A wait at teardown costs the seconds the read
+    /// had left; a leaked sixty-four-gigabyte page-lock costs the machine.
+    /// Between the two the wait is not close.
+    ///
+    /// It is usually free: the ordinary path takes the image out through
+    /// [`Refill::poll`] or [`Refill::settle`], and by then the thread has
+    /// already returned.
+    fn drop(&mut self) {
+        if let Some(filling) = self.filling.take() {
+            let _ = filling.join();
+        }
+    }
+}
+
 /// **The tier**: pinned bytes, a device slab, a table between them, and the
 /// counters that decide what moves.
 #[derive(Debug)]
 pub struct Tier {
     plan: Plan,
     /// T1: every expert of every streamed bank.
+    ///
+    /// **ZERO-LENGTH WHILE A DEFERRED SEAT IS OPEN** ([`Fill::Deferred`]) —
+    /// the bytes are in `image` until the install swaps this for the
+    /// page-locked copy the refill built.
     host: Pinned,
+    /// The background fill, while the seat is deferred and the window open.
+    /// `None` for every eager boot, and from the install on. See [`Refill`].
+    refill: Option<Refill>,
+    /// **THE MAPPING A DEFERRED SEAT SERVES T1 OUT OF**, held for the tier's
+    /// whole life — see [`Fill::Deferred`].
+    ///
+    /// **AND NOT DROPPED AT THE INSTALL**, which would be the tidy thing and
+    /// is the unsound one: unmapping is immediate and a kernel enqueued
+    /// before the install is not. The install's two events order the STREAMS
+    /// against each other; nothing on the host knows when the last fire that
+    /// read a mapped plane retired, so the address range stays reserved. The
+    /// pages behind it are clean file pages the kernel reclaims under
+    /// pressure on its own.
+    image: Option<crate::weight_cache::tier::Artifact>,
     /// The device-resident indirection tables, one row of `experts` entries
     /// per bank, concatenated. **The only mutable address surface** (article
     /// 7), and its own address never moves.
@@ -1398,8 +1990,8 @@ pub struct Tier {
     tick: u64,
     /// **T2**: the mapped warm artifact, held open for the load's whole life
     /// because the weight rows point into it. `None` for every plan that
-    /// spills nothing.
-    source: Option<crate::weight_cache::Artifact>,
+    /// spills nothing. Either file can answer — see [`Spill`].
+    source: Option<Spill>,
     /// Every plane of every group T2 holds, resolved against `source` at open
     /// time — the addresses stay valid because the mapping does.
     mapped: Vec<Mapped>,
@@ -1423,63 +2015,88 @@ impl Tier {
     /// spilled. Called BEFORE the checkpoint lands, because the landing writes
     /// a streamed bank's planes straight into [`Tier::host`].
     ///
-    /// `source` is the T2 artifact, already opened and verified by the caller.
-    /// It MUST be `Some` for a plan with a non-zero
+    /// `source` is the T2 artifact, already opened and verified by the caller
+    /// — EITHER of the two files a [`Spill`] can be, and this function does
+    /// not care which: it asks the enum for a plane and seats the window it
+    /// gets back. It MUST be `Some` for a plan with a non-zero
     /// [`Plan::spill_demand`] — the caller is
     /// [`Residency::admit_tiers`](engine::load::Residency::admit_tiers)'s
     /// other half and has already refused the load if it is not — and a
     /// mismatch here is [`Fault::Residency`] by name rather than a weight row
     /// pointing at nothing.
     ///
+    /// # The memset, the mapping, and who is allowed to skip which
+    ///
+    /// `fill` says where this tier's T1 bytes come from, and it is the only
+    /// thing that decides the one allocation here worth arguing about. The
+    /// three answers and what each of them owes are on [`Fill`].
+    ///
     /// # Errors
     ///
     /// [`Fault::OutOfMemory`] or [`Fault::Device`] for the allocations,
     /// [`Fault::Runtimeless`] without a runtime, [`Fault::Residency`] for a
     /// spilled plan with no source, a device that cannot dereference a
-    /// mapping, or a plane the artifact does not carry.
-    pub fn open(plan: Plan, source: Option<crate::weight_cache::Artifact>) -> Result<Tier> {
+    /// mapping, a plane the artifact does not carry, or a [`Fill::Deferred`]
+    /// artifact that carries no image at this plan's span for a plane it
+    /// pins.
+    pub fn open(plan: Plan, source: Option<Spill>, fill: Fill) -> Result<Tier> {
+        // ── WHERE EVERY BYTE OF THIS TIER GOES, AND IT IS THE PLAN THAT
+        //    SAYS SO. `Plan::host_layout` is the walk this function used to
+        //    inline: every dense bank's whole span, then — after one
+        //    alignment — every plane of every group held on T1. It is
+        //    extracted because the tier ARTIFACT's key mixes the same quads
+        //    and its writer transcribes them (§K.2), and a tier seated at
+        //    offsets the file disagrees with is the one failure a digest
+        //    cannot catch.
+        //
+        //    The two loops below consume it in the order it was produced, so
+        //    the zips are index-for-index; `image()` hands the same run back
+        //    out to the writer.
+        let layout = plan.host_layout();
+        let host_at = plan.host_image();
         let mut seats = Vec::with_capacity(plan.banks.len());
-        let (mut host_at, mut entry_at, mut counter_at) = (0u64, 0usize, 0usize);
-        for bank in plan.banks() {
+        let (mut entry_at, mut counter_at) = (0usize, 0usize);
+        for (bank, span) in plan.banks().iter().zip(&layout) {
+            debug_assert_eq!(span.0, bank.param as u64, "the layout walks the banks first");
             seats.push(Seat {
                 param: bank.param,
                 name: bank.name.clone(),
                 experts: bank.experts,
                 resident: bank.resident,
                 stride: bank.stride,
-                host_at,
+                host_at: span.1,
+                // Filled below, once the fill has said which image this tier
+                // is serving out of.
+                serving_at: 0,
                 entry_at,
                 counter_at,
                 slab: 0,
                 slot_of: vec![None; bank.experts as usize],
                 in_slot: Vec::new(),
             });
-            host_at += u64::from(bank.experts) * bank.stride;
             entry_at += bank.experts as usize;
             counter_at += bank.experts as usize;
         }
         // ── THE PACKED GROUPS, AFTER THE SEATS. Each plane is given the same
         //    alignment the device store would have given it, so a kernel that
         //    reinterprets the codes as 32-bit words reads an aligned address
-        //    on this tier exactly as it does on the other. `Plan::of` rounds
-        //    once, here, in the same order, so `host_demand` and this
-        //    allocation are the same number.
-        let mut wholes = Vec::new();
-        if !plan.groups.is_empty() {
-            host_at = host_at.next_multiple_of(crate::weights::ALIGN);
-        }
-        for group in plan.groups() {
-            if group.held != Held::Pinned {
-                continue;
-            }
-            for plane in &group.planes {
-                wholes.push(Whole {
+        //    on this tier exactly as it does on the other.
+        let planes = plan
+            .groups()
+            .iter()
+            .filter(|group| group.held == Held::Pinned)
+            .flat_map(|group| &group.planes);
+        let mut wholes: Vec<Whole> = planes
+            .zip(layout.get(plan.banks().len()..).unwrap_or(&[]))
+            .map(|(plane, span)| {
+                debug_assert_eq!(span.0, plane.param as u64, "then every pinned plane");
+                Whole {
                     param: plane.param,
-                    host_at,
-                });
-                host_at += plane.reserved;
-            }
-        }
+                    host_at: span.1,
+                    serving_at: 0,
+                }
+            })
+            .collect();
         // ── T2. The groups neither budget held, resolved against the
         //    mapping. Nothing is copied and nothing is read: `plane` hands
         //    back a window on the mapping, and its address is what the weight
@@ -1527,17 +2144,14 @@ impl Tier {
                 // index entry at plane zero — the `plane` axis of the index is
                 // for a shell that puts both planes under one id, which this
                 // one does not.
-                let Some(bytes) = artifact.plane(id, 0) else {
+                let Some(bytes) = artifact.plane(id) else {
                     bump(Stat::Absent);
                     return Err(Fault::Residency(format!(
                         "`{}` is planned onto the mapped tier and the artifact at {} \
-                         carries no plane {id}. The artifact is the snapshot a FULLY \
-                         RESIDENT load of this deployment wrote, and its index is keyed \
-                         by the plan's own param order — a hole in it means the file \
-                         and this plan were written from different traces. Delete it \
-                         and boot once uncapped.",
+                         carries no plane {id}. {}",
                         group.name,
                         artifact.path().display(),
+                        artifact.remedy(),
                     )));
                 };
                 if bytes.len() as u64 != seat.bytes {
@@ -1605,7 +2219,7 @@ impl Tier {
                     .map(|plane| {
                         let id = u32::try_from(plane.param).unwrap_or(u32::MAX);
                         artifact
-                            .plane(id, 0)
+                            .plane(id)
                             .filter(|bytes| bytes.len() as u64 == plane.bytes)
                             .map(|bytes| bytes.as_ptr() as u64)
                     })
@@ -1632,9 +2246,76 @@ impl Tier {
         let counters = counter_at as u64 * COUNTER;
         let cells = groups.len() as u64 * CELL;
         let group_counters = groups.len() as u64 * COUNTER;
+        // ── **THE ONE ALLOCATION THE MEMSET IS WORTH ARGUING ABOUT** — see
+        //    [`Fill`]. Every other pinned span here is a table, a mirror or a
+        //    shadow of kilobytes, and each of them is READ before it is
+        //    written; T1 is the only one measured in gigabytes, the only one a
+        //    restore covers whole, and the only one a boot can decline to make
+        //    at all.
+        let want = usize::try_from(host_at).unwrap_or(usize::MAX);
+        let (host, image) = match fill {
+            Fill::Cold => (Pinned::mapped(want)?, None),
+            Fill::Restored => (Pinned::mapped_uninit(want)?, None),
+            // **NOTHING IS PAGE-LOCKED HERE AND NOTHING IS COPIED.** The
+            // tier serves each T1 image out of the artifact where it lies, and
+            // the check that it may is one entry at a time below.
+            Fill::Deferred(artifact) => (Pinned::mapped(0)?, Some(artifact)),
+        };
+        // ── **AND THE ADDRESS EACH T1 SPAN IS READ FROM IS DECIDED HERE,
+        //    ONCE** (§L.1, at §M's layout).
+        //
+        //    Format 2 answered this with ONE number: the host section was the
+        //    pinned allocation's whole byte image at the same offsets, so a
+        //    deferred seat swapped a base and every T1 address moved with it.
+        //    §M's artifact is budget-free — one image per plane, in a ranking
+        //    order the budget then cuts — so the images this budget puts on T1
+        //    are a subset of that order rather than a contiguous run of it, and
+        //    there is no base to swap. Each span gets its own address instead,
+        //    and the install moves all of them inside the same bracket, which
+        //    is what §L.2's atomicity argument actually rested on.
+        //
+        //    The check that used to be one length comparison is now one per
+        //    image, and it is the stronger claim: a file that does not carry
+        //    this plane, or carries it at another span, is a file this seat
+        //    must not serve from, and it is named as that plane rather than as
+        //    a section of the wrong size.
+        let mut serving = Vec::with_capacity(layout.len());
+        for (param, host_at, _, reserved) in layout.iter().copied() {
+            serving.push(match &image {
+                None => host.device().saturating_add(host_at),
+                Some(artifact) => {
+                    let id = u32::try_from(param).unwrap_or(u32::MAX);
+                    let found = artifact
+                        .resolve(id)
+                        .filter(|group| group.reserved == reserved)
+                        .and_then(|group| artifact.span(group.offset, group.reserved));
+                    let Some(bytes) = found else {
+                        return Err(Fault::Residency(format!(
+                            "the serving artifact at {} carries no {reserved}-byte image \
+                             for param {param}, and a deferred seat reads that plane's T1 \
+                             bytes out of the file where they lie; the file names another \
+                             deployment",
+                            artifact.path().display(),
+                        )));
+                    };
+                    bytes.as_ptr() as u64
+                }
+            });
+        }
+        for (seat, at) in seats.iter_mut().zip(&serving) {
+            seat.serving_at = *at;
+        }
+        for (whole, at) in wholes
+            .iter_mut()
+            .zip(serving.get(plan.banks().len()..).unwrap_or(&[]))
+        {
+            whole.serving_at = *at;
+        }
         Ok(Tier {
             plan,
-            host: Pinned::mapped(usize::try_from(host_at).unwrap_or(usize::MAX))?,
+            host,
+            refill: None,
+            image,
             table: Buffer::zeroed(usize::try_from(entries).unwrap_or(usize::MAX))?,
             shadow: Pinned::mapped(usize::try_from(entries).unwrap_or(usize::MAX))?,
             counts: Buffer::zeroed(usize::try_from(counters).unwrap_or(usize::MAX))?,
@@ -1686,12 +2367,18 @@ impl Tier {
     /// the address is one the kernel dereferences over UVA at PCIe bandwidth
     /// and without a host round trip. The same "slow, not wrong" the dense
     /// tier's misses ride, one tier up and for the whole bank at once.
+    ///
+    /// **AND IT IS [`Whole::serving_at`] AND NOT THE PAGE-LOCKED ALLOCATION**
+    /// (§L.1): while a deferred seat's window is open that address is inside
+    /// the serving artifact's mapping, and the kernel cannot tell the two
+    /// apart — one is UVA over page-locked memory, the other is HMM over a
+    /// file, and both are a host pointer a packed select dereferences.
     #[must_use]
     pub fn pinned_at(&self, param: usize) -> Option<u64> {
         self.wholes
             .iter()
             .find(|whole| whole.param == param)
-            .map(|whole| self.host.device() + whole.host_at)
+            .map(|whole| whole.serving_at)
     }
 
     /// **The address of a plane this tier serves out of the MAPPED artifact**
@@ -1734,16 +2421,332 @@ impl Tier {
 
     /// **The artifact this tier serves T2 out of**, or `None` for a load that
     /// spilled nothing. What a gate reads to say which file the bytes came
-    /// from.
+    /// from — and, after T-4, WHICH of the two it was.
     #[must_use]
-    pub fn source(&self) -> Option<&crate::weight_cache::Artifact> {
+    pub fn source(&self) -> Option<&Spill> {
         self.source.as_ref()
     }
 
+    /// **One T2 plane's bytes, borrowed from the mapping this tier seated it
+    /// out of** — `None` for a param it does not serve from T2.
+    ///
+    /// The door the tier ARTIFACT's writer reads its third section through
+    /// (§K.6-T4). It is stated here rather than left to the caller to take
+    /// from [`Tier::mapped_at`] because the address and the length were
+    /// resolved TOGETHER at [`Tier::open`], against an index that agreed with
+    /// this plan; handing back the pair as a slice is what keeps the writer
+    /// from re-deriving either.
+    #[must_use]
+    pub fn mapped_plane(&self, param: usize) -> Option<&[u8]> {
+        let plane = self.mapped.iter().find(|plane| plane.param == param)?;
+        let at = usize::try_from(plane.at).ok()? as *const u8;
+        let len = usize::try_from(plane.bytes).ok()?;
+        // SAFETY: the pair came out of `Spill::plane` — a window on a mapping
+        // this tier owns in `source` for its whole life — and neither number
+        // has been touched since. The borrow is the tier's own, so nothing can
+        // outlive the mapping.
+        Some(unsafe { std::slice::from_raw_parts(at, len) })
+    }
+
     /// The pinned tier's host address, for the landing sink to store through.
+    ///
+    /// **ZERO-LENGTH WHILE [`Tier::deferring`]**, and deliberately: the
+    /// landing sink is the COLD load's writer, a deferred seat is a warm boot
+    /// that skipped the cold load, and a caller that falls back to it owes
+    /// this tier [`Tier::undefer`] first. `Pinned::write` refuses a span past
+    /// the allocation, so the failure is a sentence rather than a stray store.
     #[must_use]
     pub fn host(&self) -> &Pinned {
         &self.host
+    }
+
+    /// **IS THIS TIER STILL SERVING T1 OUT OF THE ARTIFACT'S MAPPING?**
+    ///
+    /// True between [`Fill::Deferred`] and the install — which is the window
+    /// §L.5 describes, and the one interval in which this tier holds no
+    /// page-locked bytes at all. False for every eager boot, and false again
+    /// the moment the refill's image lands.
+    #[must_use]
+    pub fn deferring(&self) -> bool {
+        self.image.is_some() && self.host.bytes() == 0
+    }
+
+    /// **THE ARTIFACT A DEFERRED SEAT IS SEATED OVER**, or `None` for a tier
+    /// that page-locked its own image.
+    ///
+    /// The door the boot verification goes through, and it hands back THIS
+    /// tier's mapping rather than the restore's own — which are two `mmap`s of
+    /// one path, taken a few microseconds apart, and are the same inode every
+    /// time but one. That one is what the door is for: what §L.3 promises is
+    /// that *every byte served was checksummed*, and the only way to promise
+    /// it about the bytes SERVED is to hash the mapping the addresses point
+    /// into. A file replaced between the two opens then meets the boot
+    /// verification instead of slipping past it.
+    #[must_use]
+    pub fn deferred_image(&self) -> Option<&crate::weight_cache::tier::Artifact> {
+        self.image.as_ref().filter(|_| self.host.bytes() == 0)
+    }
+
+    /// **THE HOST-SIDE ADDRESS OF ONE T1 PLANE RIGHT NOW** — the T1 doors'
+    /// other face, for the one reader that is the CPU.
+    ///
+    /// The device address and the host address of a page-locked allocation are
+    /// the same number under UVA, so every kernel-facing door answers
+    /// [`Tier::pinned_at`] and is done. The rotating dense pump is not
+    /// kernel-facing: it stages a plane through `cudaMemcpyAsync` from a HOST
+    /// pointer, and while a deferred seat's window is open that pointer is
+    /// inside the artifact's mapping. Reading a tenant out of the file rather
+    /// than out of page-locked memory is slow, not wrong — the same sentence
+    /// T2 has always been — and the pointer stays valid past the install
+    /// because the mapping is held for the tier's life.
+    ///
+    /// **A PLANE AT A TIME, AND NOT A BASE** (§M.3): the images a budget puts
+    /// on T1 are a subset of the artifact's ranking order rather than a run of
+    /// it, so there is no base an offset could be added to. `None` for a param
+    /// this tier does not hold on T1.
+    #[must_use]
+    pub fn serving_host_of(&self, param: usize) -> Option<*const u8> {
+        self.seats
+            .iter()
+            .find(|seat| seat.param == param)
+            .map(|seat| seat.serving_at)
+            .or_else(|| {
+                self.wholes
+                    .iter()
+                    .find(|whole| whole.param == param)
+                    .map(|whole| whole.serving_at)
+            })
+            .map(|at| at as *const u8)
+    }
+
+    /// **ARM THE BACKGROUND FILL** — the deferred seat's other half (§L.4).
+    ///
+    /// Called once, by the restore that verified this seat's T1 images in
+    /// place, after the staging lanes it shares a device with have been opened
+    /// and closed. `filling` is the thread; `filled` carries the page-locked image
+    /// it built, ONCE, and carries nothing at all when the fill failed — see
+    /// [`Refill`] for why silence is the failure signal and what the thread
+    /// owes before it goes quiet.
+    ///
+    /// The window closes at the first [`Tier::promote`] past the arrival, or
+    /// at [`Tier::settle_refill`]. Nothing else in this file waits for it.
+    pub fn arm_refill(
+        &mut self,
+        filling: std::thread::JoinHandle<()>,
+        filled: std::sync::mpsc::Receiver<Pinned>,
+    ) {
+        self.refill = Some(Refill {
+            filling: Some(filling),
+            filled,
+            began: std::time::Instant::now(),
+        });
+    }
+
+    /// **PUT THE PAGE-LOCKED IMAGE BACK** — the fall-through half of
+    /// [`Fill::Deferred`], and [`Tier::zero_host`]'s analogue for it.
+    ///
+    /// A deferred boot whose T1 images turned out not to hash to what the
+    /// file's block table states has no verified bytes to serve and no
+    /// allocation to land the cold load into. This is the recovery: the allocation the deferred
+    /// arm declined to make, made now and ZEROED — because what runs next is
+    /// the cold load, which writes only the spans the plan names, and the
+    /// padding between them has to be the deterministic image the artifact
+    /// this boot writes on its way out will carry.
+    ///
+    /// Called BEFORE [`Tier::land`], so there is no cell, no berth and no
+    /// entry to reseat: this is a base address changing while nothing has read
+    /// it. A tier that is not deferring is left exactly as it is.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::OutOfMemory`] or [`Fault::Device`] for the allocation the
+    /// deferred boot avoided — which is the failure this whole arm exists to
+    /// make rarer, met on the one path where it cannot be.
+    pub fn undefer(&mut self) -> Result<()> {
+        if !self.deferring() {
+            return Ok(());
+        }
+        // The refill is dropped — and therefore joined — before the
+        // allocation, so the two page-locks are never outstanding at once.
+        self.refill = None;
+        let want = usize::try_from(self.plan.host_image()).unwrap_or(usize::MAX);
+        self.host = Pinned::mapped(want)?;
+        self.reseat();
+        self.image = None;
+        Ok(())
+    }
+
+    /// **CLOSE THE WINDOW NOW** — the gate's door onto the deferred seat, and
+    /// nothing in the shell calls it.
+    ///
+    /// [`Tier::promote_now`]'s precedent, for the same reason it exists: the
+    /// install rides the inter-fire gap, so a shell that is idle never takes
+    /// it and a gate cannot observe a promotion by waiting for one. This asks
+    /// the same question with the waiting struck out — it JOINS the fill
+    /// thread instead of polling the channel — and strikes out nothing else:
+    /// the same two events in the same order, the same reseat, the same two
+    /// publishes.
+    ///
+    /// Answers whether the image was installed. `false` for a tier that was
+    /// never deferred, one whose window is already closed, and one whose fill
+    /// failed — that last is the §L.3 corollary and not an error: the seat
+    /// keeps serving the verified bytes it has been serving all along.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Device`] for an event or a copy the runtime refused.
+    pub fn settle_refill(&mut self, compute: *mut c_void, notify: *mut c_void) -> Result<bool> {
+        let Some(refill) = self.refill.take() else {
+            return Ok(false);
+        };
+        let window = refill.window_ms();
+        let Some(host) = refill.settle() else {
+            return Ok(false);
+        };
+        self.install(host, window, compute, notify)?;
+        Ok(true)
+    }
+
+    /// **THE INSTALL: ONE BASE ADDRESS, PUBLISHED ALL AT ONCE** (§L.2).
+    ///
+    /// Inside the same bracket every promotion runs in — `drained` recorded on
+    /// compute and waited on notify, the writes, `ready` recorded on notify
+    /// and waited on compute — because it is the same hazard: a table entry
+    /// and a cell may not be rewritten under a fire that is already reading
+    /// them.
+    ///
+    /// ```text
+    ///   drained  everything airborne on compute is past
+    ///   swap     host <- the page-locked image, every span's `serving_at`
+    ///            <- its offset inside it
+    ///   reseat   every T1 group's `at` re-formed, and its berth opened
+    ///   publish  publish_all (entries x 8 B) + publish_cells (groups x 16 B)
+    ///   ready    the next fire's launches wait here
+    /// ```
+    ///
+    /// **AND THE ONE LEG THIS BRACKET HAS THAT A PROMOTION DOES NOT**: both
+    /// rungs are byte-identical verified content — the mapping was hashed at
+    /// the boot, the page-locked copy was hashed as it was read — so the two
+    /// addresses name the same bytes. A cell caught mid-flight names one or
+    /// the other and there is no third answer, which is why the whole tier
+    /// moves in one round instead of one group per gap. The post-install
+    /// tier is the eager boot's, address for address.
+    fn install(
+        &mut self,
+        host: Pinned,
+        window_ms: u64,
+        compute: *mut c_void,
+        notify: *mut c_void,
+    ) -> Result<()> {
+        self.drained.record(compute)?;
+        self.drained.wait(notify)?;
+        self.host = host;
+        self.reseat();
+        self.refill = None;
+        // ── EVERY T1 GROUP, RE-FORMED AND GIVEN ITS BERTH. A group the
+        //    ladder moved during the window is on another rung now and is not
+        //    one of these: it holds a berth of its own, its cell names that
+        //    berth, and neither is a function of this base.
+        for at in 0..self.groups.len() {
+            if self.groups[at].held != Held::Pinned || self.groups[at].berth.is_some() {
+                continue;
+            }
+            let mut where_at = Vec::with_capacity(self.groups[at].planes.len());
+            for plane in &self.groups[at].planes {
+                let Some(whole) = self.wholes.iter().find(|whole| whole.param == plane.param)
+                else {
+                    return Err(Fault::Residency(format!(
+                        "`{}` is held on the pinned tier and plane {} has no offset in \
+                         its image; the seating and the install were built from \
+                         different walks",
+                        self.groups[at].name, plane.param,
+                    )));
+                };
+                where_at.push(whole.serving_at);
+            }
+            self.groups[at].at = where_at.clone();
+            let berth = self.berths.len();
+            self.berths.push(Berth {
+                tier: Held::Pinned,
+                at: where_at,
+                shape: self.groups[at].planes.iter().map(|plane| plane.reserved).collect(),
+                holds: Some(at),
+            });
+            self.groups[at].berth = Some(berth);
+        }
+        self.publish_all(notify)?;
+        self.publish_cells(notify)?;
+        self.ready.record(notify)?;
+        self.ready.wait(compute)?;
+        self.moving = true;
+        crate::weight_cache::tier::count_promoted(window_ms);
+        Ok(())
+    }
+
+    /// **EVERY T1 SPAN, RE-FORMED AGAINST THE PAGE-LOCKED ALLOCATION.**
+    ///
+    /// What used to be `self.serving = self.host.device()` — one assignment,
+    /// because format 2's host section was the allocation's whole image at the
+    /// same offsets. §M's artifact holds one image per plane in a budget-free
+    /// order, so a deferred seat's addresses are scattered through the file
+    /// and only the ALLOCATION is contiguous. This is the walk back: each
+    /// span's `host_at` is its offset in the page-locked image and always was,
+    /// so re-forming from it is the same arithmetic, done per span.
+    ///
+    /// Called by the two doors that make the allocation real — the install and
+    /// [`Tier::undefer`] — and by nothing else.
+    fn reseat(&mut self) {
+        let base = self.host.device();
+        for seat in &mut self.seats {
+            seat.serving_at = base.saturating_add(seat.host_at);
+        }
+        for whole in &mut self.wholes {
+            whole.serving_at = base.saturating_add(whole.host_at);
+        }
+    }
+
+    /// **PUT THE PINNED IMAGE BACK TO ZEROS** — the fall-through half of
+    /// [`Tier::open`]'s `refilling`.
+    ///
+    /// A warm boot that took the uninitialized allocation and then could not
+    /// fill it — an image whose bytes do not hash to what the file's block
+    /// table states, or a disk that refused a read halfway through one — is
+    /// about to
+    /// run the cold load into this tier, and the cold load writes only the
+    /// spans the plan names. This is the promise being kept late: after it,
+    /// the padding is the same deterministic zeros [`Pinned::mapped`] would
+    /// have left, and the artifact that boot writes on its way out carries no
+    /// byte nobody wrote.
+    ///
+    /// Costs the memset that was skipped, on the path where the skip did not
+    /// pay off. Nothing else in this tier is touched: the tables, the shadows
+    /// and the mirrors were never uninitialized.
+    pub fn zero_host(&self) {
+        self.host.zero();
+    }
+
+    /// **THE POPULATED SPANS OF THE PINNED IMAGE**:
+    /// `(param, host_at, bytes, reserved)` for every dense bank and every
+    /// plane of every group this tier holds on T1 (§K.6-T2's `Tier::image`).
+    ///
+    /// They tile `0..Pinned::bytes` exactly — every bank's padded span, then
+    /// every pinned plane's — which is what lets the restore promise that an
+    /// uninitialized allocation is written whole. Each `host_at` is an offset
+    /// in the TIER and not in the file: since §M.3 the artifact is ordered by
+    /// the ranking and this walk by the cut, so the restore reads image by
+    /// image rather than section to section.
+    ///
+    /// It is [`Plan::host_layout`] handed back: [`Tier::open`] SEATED this
+    /// tier out of that walk, so asking the tier and asking the plan are the
+    /// same question, and this door is the one whose name says which of the
+    /// two the writer meant. Everything between the spans — the alignment gap
+    /// after the banks, and each plane's padding up to
+    /// [`weights::ALIGN`](crate::weights::ALIGN) — is in the image and in no
+    /// entry, which is exactly what the reserved/published pair already says
+    /// of the device store.
+    #[must_use]
+    pub fn image(&self) -> Vec<(u64, u64, u64, u64)> {
+        self.plan.host_layout()
     }
 
     /// **Seat the slabs and publish the first table** — after the checkpoint
@@ -1790,7 +2793,7 @@ impl Tier {
                 copy_any(
                     stream,
                     seat.slab + slot as u64 * seat.stride,
-                    self.host.device() + seat.host_at + u64::from(*expert) * seat.stride,
+                    seat.serving_at + u64::from(*expert) * seat.stride,
                     usize::try_from(seat.stride).unwrap_or(usize::MAX),
                 )?;
             }
@@ -1809,7 +2812,6 @@ impl Tier {
     /// and the third is not, because a read-only mapping of a file is not a
     /// place anything is copied to.
     fn seat_groups(&mut self, store_at: &[(usize, u64)]) -> Result<()> {
-        let host = self.host.device();
         for at in 0..self.groups.len() {
             let held = self.groups[at].held;
             let mut where_at = Vec::with_capacity(self.groups[at].planes.len());
@@ -1823,7 +2825,7 @@ impl Tier {
                         .wholes
                         .iter()
                         .find(|whole| whole.param == plane.param)
-                        .map(|whole| host + whole.host_at),
+                        .map(|whole| whole.serving_at),
                     Held::Mapped => self
                         .mapped
                         .iter()
@@ -1832,14 +2834,26 @@ impl Tier {
                 };
                 let Some(found) = found else {
                     return Err(Fault::Residency(format!(
-                        "`{}` is planned {held:?} and plane {} has no address on that                          tier; the plan and the seating were built from different                          walks",
+                        "`{}` is planned {held:?} and plane {} has no address on that tier; the \
+                         plan and the seating were built from different walks",
                         self.groups[at].name, plane.param,
                     )));
                 };
                 where_at.push(found);
             }
             self.groups[at].at = where_at.clone();
-            if held != Held::Mapped {
+            // ── **AND A DEFERRED SEAT OPENS NO T1 BERTH** (§L.1). A berth is
+            //    a region a hotter group may be COPIED INTO, and while the
+            //    window is open the addresses a T1 group holds are inside a
+            //    read-only mapping of a file: `close_berth` would land its
+            //    bulk copy in the artifact. The rung is still `Held::Pinned`
+            //    and still true — the plan seated it there and the install
+            //    will put it there — so `residency()` reports what the plan
+            //    says and nothing about the ladder is relabelled. What the
+            //    window costs is that these regions cannot be displaced INTO
+            //    for a minute; the install pushes every one of them.
+            let deferring = held == Held::Pinned && self.refill.is_some();
+            if held != Held::Mapped && !deferring {
                 let berth = self.berths.len();
                 self.berths.push(Berth {
                     tier: held,
@@ -1912,7 +2926,7 @@ impl Tier {
         for seat in &self.seats {
             for expert in 0..seat.experts {
                 let entry = seat.entry_at + expert as usize;
-                let value = address_of(seat, expert, &self.host);
+                let value = address_of(seat, expert);
                 self.shadow
                     .write(entry * ENTRY as usize, &value.to_ne_bytes());
             }
@@ -2040,6 +3054,33 @@ impl Tier {
             self.skipped += 1;
             return Ok(0);
         }
+        // ── **AND THE DEFERRED SEAT'S ONE INSTALL, IF ITS IMAGE HAS ARRIVED**
+        //    (§L.2). Behind both guards above, because it writes the shadow
+        //    and every cell; and behind `swap.is_none()`, because a bulk copy
+        //    in flight is reading a berth address this round would re-form.
+        //    The question is a `try_recv` on a channel nobody else touches —
+        //    the gap's own budget is microseconds and this costs an atomic.
+        //
+        //    It takes the whole gap: the install IS the round, and the moves
+        //    the counters wanted wait for the next one. There is one of these
+        //    per load.
+        if self.swap.is_none() && self.refill.is_some() {
+            let (filled, window) = match self.refill.as_mut() {
+                Some(refill) => (refill.poll(), refill.window_ms()),
+                None => (Filled::Waiting, 0),
+            };
+            match filled {
+                Filled::Waiting => {}
+                Filled::Ready(host) => {
+                    self.install(host, window, compute, notify)?;
+                    return Ok(0);
+                }
+                // The thread said what it found and deleted what it found it
+                // in; nothing is installed, ever, and the seat goes on serving
+                // the bytes it verified at the boot (§L.3's corollary).
+                Filled::Refused => self.refill = None,
+            }
+        }
         let hits = self.mirror.read(0, self.mirror.bytes());
         let moves = self.decide(&hits);
         let step = self.step();
@@ -2058,7 +3099,7 @@ impl Tier {
             if let Some(out) = out {
                 seat.slot_of[*out as usize] = None;
                 let entry = seat.entry_at + *out as usize;
-                let value = pinned_address_of(seat, *out, &self.host);
+                let value = pinned_address_of(seat, *out);
                 self.shadow.write(entry * ENTRY as usize, &value.to_ne_bytes());
                 copy_any(
                     notify,
@@ -2073,7 +3114,7 @@ impl Tier {
             copy_any(
                 notify,
                 dst,
-                self.host.device() + seat.host_at + u64::from(*into) * seat.stride,
+                seat.serving_at + u64::from(*into) * seat.stride,
                 usize::try_from(seat.stride).unwrap_or(usize::MAX),
             )?;
             let entry = seat.entry_at + *into as usize;
@@ -2533,17 +3574,22 @@ fn vote(berths: &[Berth], groups: &[Group], count: impl Fn(usize) -> u32) -> Opt
 }
 
 /// Where expert `expert` of `seat` lives right now.
-fn address_of(seat: &Seat, expert: u32, host: &Pinned) -> u64 {
+fn address_of(seat: &Seat, expert: u32) -> u64 {
     match seat.slot_of[expert as usize] {
         Some(slot) => seat.slab + u64::from(slot) * seat.stride,
-        None => pinned_address_of(seat, expert, host),
+        None => pinned_address_of(seat, expert),
     }
 }
 
-/// Where expert `expert` of `seat` lives in the pinned tier — the address a
-/// kernel dereferences over UVA when the expert is not on the device.
-fn pinned_address_of(seat: &Seat, expert: u32, host: &Pinned) -> u64 {
-    host.device() + seat.host_at + u64::from(expert) * seat.stride
+/// Where expert `expert` of `seat` lives on T1 — the address a kernel
+/// dereferences when the expert is not on the device.
+///
+/// [`Seat::serving_at`] and not the pinned allocation's base: a deferred
+/// seat's `serving_at` is the bank's image inside the artifact's mapping and
+/// an eager one's is `host.device() + host_at`, and the expert arithmetic on
+/// top of it is the same either way (§L.1, §M.3).
+fn pinned_address_of(seat: &Seat, expert: u32) -> u64 {
+    seat.serving_at + u64::from(expert) * seat.stride
 }
 
 #[cfg(test)]
@@ -2553,14 +3599,14 @@ mod tests {
     use super::*;
 
     fn a3b() -> Trace {
-        let trace = model::trace_of("qwen35-a3b-bf16-kv-bf16").expect("the catalog ships the SKU");
+        let trace = models::trace_of("qwen35-a3b-bf16-kv-bf16").expect("the catalog ships the SKU");
         trace(Platform::Cuda)
     }
 
     /// The catalog's one split-plane MoE: 32 experts, 24 layers, mxfp4 banks.
     fn gpt_oss() -> Trace {
         let trace =
-            model::trace_of("gptoss-20b-bf16-mxfp4-kv-bf16").expect("the catalog ships the SKU");
+            models::trace_of("gptoss-20b-bf16-mxfp4-kv-bf16").expect("the catalog ships the SKU");
         trace(Platform::Cuda)
     }
 
@@ -2906,7 +3952,7 @@ mod tests {
         // is a routed-expert bank, so there is no tier to hold less of". There
         // is now: a dense plane the budget cannot seat becomes a group of one
         // and takes the pinned tier, read over UVA where it lies.
-        let trace = model::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships it");
+        let trace = models::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships it");
         let trace = trace(Platform::Cuda);
         let full = Plan::of(&trace, &Attachments::new(), Budgets::uncapped())
             .expect("uncapped plans")
@@ -2953,7 +3999,8 @@ mod tests {
             .expect("something stayed");
         assert!(
             spilled_first < resident_last || plan.groups().len() == trace.params.len(),
-            "a plane read at rank {spilled_first} spilled while one at {resident_last} stayed,              which is not the schedule's order"
+            "a plane read at rank {spilled_first} spilled while one at {resident_last} stayed, \
+             which is not the schedule's order"
         );
         // The plane read FIRST is resident, whatever the budget did.
         let first = schedule.order()[0];
@@ -3148,4 +4195,718 @@ mod tests {
             "a bank no route has reached was promoted on the strength of nothing"
         );
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    //  O1: THE ORDER THE WRITER LAYS OUT IS THE ORDER THE BOOT WALKS
+    // ════════════════════════════════════════════════════════════════════
+
+
+    /// The pairings the gate ranks with — [`model_dsl::scales_name`] and
+    /// `biases_name`, the two functions that mint a companion's name, asked
+    /// of a trace whose params those same calls declared.
+    ///
+    /// Host-only because `model_dsl` is a DEV dependency of this crate on
+    /// purpose: a shell must not know a model family. The production caller
+    /// that needs this order is `runtime::engine::load::sequence`, which is
+    /// above that line and can ask.
+    fn pairings_of(trace: &Trace) -> Attachments {
+        let at: BTreeMap<&str, usize> = trace
+            .params
+            .iter()
+            .enumerate()
+            .map(|(at, param)| (param.name.as_str(), at))
+            .collect();
+        let mut out = Attachments::new();
+        for (codes, param) in trace.params.iter().enumerate() {
+            let mut companions = Vec::new();
+            if let Some(&scales) = at.get(model_dsl::scales_name(&param.name).as_str()) {
+                companions.push(scales);
+            }
+            if let Some(&biases) = at.get(model_dsl::biases_name(&param.name).as_str()) {
+                companions.push(biases);
+            }
+            if !companions.is_empty() {
+                out.insert(codes, companions);
+            }
+        }
+        out
+    }
+
+    /// **The number [`Plan::cut`] refuses under**, recomputed from the public
+    /// ranking: every registered plane's reserved span, plus one expert slot
+    /// of every dense routed bank.
+    ///
+    /// `Ranking::floor_bytes` is private and stays private — the cut is its
+    /// only reader in the shell. The gate needs the number to STAND on the
+    /// floor deliberately (the pathological pair below), and recomputing it
+    /// from `floor()` and `banks()` is the honest way to get it: if the two
+    /// ever disagree, the `Plan::cut` call at that budget refuses and the gate
+    /// says so by name.
+    fn floor_of(ranking: &Ranking, bytes: &[u64]) -> u64 {
+        let registered: u64 = ranking
+            .floor()
+            .iter()
+            .map(|param| bytes[*param].next_multiple_of(crate::weights::ALIGN))
+            .sum();
+        let slots: u64 = ranking
+            .banks()
+            .iter()
+            .map(|bank| bank.stride.next_multiple_of(crate::weights::ALIGN))
+            .sum();
+        registered + slots
+    }
+
+    /// **THE ORDER AND THE SPANS THE WRITER LAYS OUT ARE THE ORDER AND THE
+    /// SPANS EVERY BOOT WALKS** — over every SKU the catalog ships, at five
+    /// budget pairs each, host-only (§M.3, gate O1).
+    ///
+    /// # Why this claim and not another
+    ///
+    /// §M.3 made the serving artifact budget-FREE: the file states the
+    /// RANKING, a boot states the CUT, and one artifact then serves any budget
+    /// pair on this setup. Everything that ruling buys rests on one measured
+    /// premise — *a plane's BYTES are identical on all three rungs and only
+    /// the WALK differs* — and that premise is stated twice in this file, in
+    /// two functions that share no code:
+    ///
+    /// ```text
+    ///   Ranking::images    param, at, bytes, reserved   the WRITER's walk
+    ///   Plan::host_layout  param, at, bytes, reserved   the T1 walk
+    ///   Plan::mapped_layout                             the T2 walk
+    ///        + the store, which is every ranked plane neither of those holds
+    /// ```
+    ///
+    /// **A plane written at the wrong span is the quietest failure this wave
+    /// can produce.** Nothing catches it. The digests agree, because the
+    /// writer hashes what the writer wrote. The index tiles, because
+    /// [`payload_fault`](crate::weight_cache::tier) checks the file against
+    /// ITSELF and not against a plan. The artifact opens, verifies, and every
+    /// lookup answers. The model then computes on bytes from the middle of
+    /// another plane and produces garbage logits with no error anywhere — no
+    /// refusal, no counter, no log line. The only way to catch it is to ask
+    /// the two walks whether they describe the same planes, which is what is
+    /// below.
+    ///
+    /// **AND UNTIL THIS TEST THAT QUESTION WAS ASKED IN EXACTLY ONE PLACE:**
+    /// claim 4 of `a_prepare_writes_the_tiers_a_bare_boot_refuses` — on a
+    /// card, against one SKU, behind `#[ignore]`, in a file the M-4 wave
+    /// deletes. So the wave that turns the ranking into the container's own
+    /// layout was about to remove the only standing check on its own central
+    /// premise. This gate is that check, moved to where it can run on every
+    /// commit: no device, no checkpoint, no artifact on a disk — a trace, a
+    /// pairing, and arithmetic.
+    ///
+    /// # What is asserted, and what is deliberately not
+    ///
+    /// ```text
+    ///  1. tiled     the images concatenate from zero: `at` is the running sum
+    ///               of `reserved`, every offset is `weights::ALIGN`-aligned,
+    ///               and `reserved` is `bytes` rounded up and nothing else
+    ///  2. whole     the ranked set is the trace minus the registered floor —
+    ///               no plane ranked and unplaced, none placed and unranked
+    ///  3. agreed    per plane, `bytes` and `reserved` are the SAME numbers in
+    ///               the ranking and in whichever rung's walk seats it
+    ///  4. partition every ranked plane is on exactly one rung, and each rung's
+    ///               walk tiles from zero the way the ranking's does
+    ///  5. monotone  raising `device_weight_budget` never raises what the two
+    ///               tiers below the store owe, and never raises T2's share of
+    ///               it — AS TOTALS. See the footnote: two narrower readings of
+    ///               (5) are FALSE by design and both counterexamples are named
+    /// ```
+    ///
+    /// **A DENSE ROUTED BANK IS THE ONE PLANE ON TWO RUNGS AT ONCE, AND THAT
+    /// IS NOT A HOLE IN (4).** [`Plan::cut`] argues it: the device slab takes
+    /// the bank's first `resident` experts and the pinned tier holds ALL of
+    /// them authoritatively, so a bank sits on neither side of a cut. It is
+    /// asserted as its own claim rather than excused from the partition.
+    ///
+    /// # The two readings of (5) that are FALSE, measured, and right
+    ///
+    /// The cut is a FIRST FIT down a hotness order — [`Plan::cut`]'s "the walk
+    /// continues past a group that does not fit", which is what makes the two
+    /// cut points rank THRESHOLDS with fitted exceptions rather than strict
+    /// prefixes. First fit is not monotone in its capacity, and the same
+    /// sentence therefore has two false readings, one per rung:
+    ///
+    /// ```text
+    ///   per plane   `dsv4-base-bf16-kv-bf16`, host uncapped. At a
+    ///               361_515_888-byte device ceiling the 505 MiB `embed` does
+    ///               not fit and 85 later planes do; at 653_825_760 `embed`
+    ///               fits, and 26 planes including `layer.0.gate_up` move
+    ///               from the store to T1
+    ///   T1 alone    `gemma4-e4b-eagle-bf16-kv-bf16`, `host_weight_budget`
+    ///               3_804_259_968. Device 3_845_547_648: T1 owes
+    ///               3_803_447_296 and T2 owes 7_568_359_424. Device
+    ///               5_740_796_352: T1 owes 3_804_259_840 — 812_544 bytes
+    ///               MORE — and T2 owes 5_671_983_872, 1.9 GiB less
+    /// ```
+    ///
+    /// **Both are the ranking doing its job.** `embed` is read at node zero of
+    /// every fire and the planes it displaced are not; the group that grew
+    /// T1 is one a freed T1 could finally hold whole, and it displaced smaller
+    /// ones onto a tier that is slower for them and faster for it. What is
+    /// monotone is what the design actually promises — the store never holds
+    /// less, T2 never holds more, and the two tiers below the store never owe
+    /// more together — and asserting the narrower forms would be asserting
+    /// promises this planner deliberately does not make.
+    ///
+    /// **AND NEITHER COSTS THE ARTIFACT ANYTHING**, which is the reason they
+    /// belong in this test's footnote rather than in a defect report: the
+    /// RANKING does not move under either. The file states an order that
+    /// mentions no budget, and every one of these plans walks it.
+    #[test]
+    fn the_ranking_lays_out_what_every_cut_walks() {
+        let mut walked = 0usize;
+        for (sku, _, trace_fn, _) in models::catalog() {
+            let trace = trace_fn(Platform::Cuda);
+            let planes = pairings_of(&trace);
+            // **EVERY CATALOG ROW RANKS, AND A ROW THAT DOES NOT IS THIS
+            // GATE'S FAILURE AND NOT ITS EXCEPTION.** This read `continue`
+            // while `weights::plane_bytes` had no arm for the two-bit MLX
+            // affine dtypes, and a sibling test named the two SKUs that fell
+            // through so the skip could not grow quietly. The arm landed and
+            // the two joined the walk, so the skip has nothing left to
+            // excuse: a row that cannot be sized here refuses at `Ranking::of`
+            // at EVERY budget, uncapped included, before a device is touched,
+            // which is a load that never happens rather than a plan that
+            // comes out wrong — loud, and worth failing on.
+            let ranking = Ranking::of(&trace, &planes).unwrap_or_else(|why| {
+                panic!(
+                    "{sku}: this shell cannot rank a catalog row, so no budget \
+                     serves it: {why:?}"
+                )
+            });
+            walked += 1;
+            let bytes = crate::weights::plane_bytes(&trace)
+                .unwrap_or_else(|why| panic!("{sku}: a ranked trace sizes: {why:?}"));
+
+            // ── (1) THE RANKING TILES ITS OWN PAYLOAD FROM ZERO.
+            //
+            //    This is `tier::payload_fault`'s invariant, stated on the
+            //    RANKING rather than on a file — which is where it is actually
+            //    decided. The file can only ever be as tiled as the walk that
+            //    filled it, and a writer handed an untileable ranking would
+            //    produce a file that passes `payload_fault` and describes the
+            //    wrong bytes.
+            let images = ranking.images();
+            let mut at = 0u64;
+            let mut ranked: BTreeMap<usize, (u64, u64)> = BTreeMap::new();
+            for (which, &(param, offset, span, reserved)) in images.iter().enumerate() {
+                let param = usize::try_from(param).expect("a param ordinal");
+                let name = &trace.params[param].name;
+                assert_eq!(
+                    offset, at,
+                    "{sku}: image {which} `{name}` starts at byte {offset} and {at} was \
+                     next — the ranking's images are a concatenation, and a boot that \
+                     cuts them addresses this one {} bytes from where it lies",
+                    offset.abs_diff(at),
+                );
+                assert_eq!(
+                    offset % crate::weights::ALIGN,
+                    0,
+                    "{sku}: image {which} `{name}` starts at {offset}, which is not a \
+                     multiple of {}: the one property that lets ONE image serve all \
+                     three rungs is that every rung gives it the store's alignment",
+                    crate::weights::ALIGN,
+                );
+                assert_eq!(
+                    reserved,
+                    span.next_multiple_of(crate::weights::ALIGN),
+                    "{sku}: `{name}` publishes {span} bytes into a {reserved}-byte \
+                     span; the padding between images is the ALIGN rounding and \
+                     nothing else, so {} bytes here are unaccounted for",
+                    reserved.abs_diff(span.next_multiple_of(crate::weights::ALIGN)),
+                );
+                assert_eq!(
+                    span, bytes[param],
+                    "{sku}: `{name}` is {span} bytes in the ranking and {} bytes in \
+                     the trace it was ranked from",
+                    bytes[param],
+                );
+                at += reserved;
+                assert!(
+                    ranked.insert(param, (span, reserved)).is_none(),
+                    "{sku}: `{name}` is ranked twice — two images name one plane, and \
+                     a boot would seat whichever it read last"
+                );
+            }
+            let registered: u64 = ranking
+                .floor()
+                .iter()
+                .map(|param| bytes[*param].next_multiple_of(crate::weights::ALIGN))
+                .sum();
+            assert_eq!(
+                at + registered,
+                ranking.full(),
+                "{sku}: the payload tiles {at} bytes and the registered planes reserve \
+                 {registered}; together they are the whole table, which is what every \
+                 budget in this file is compared against"
+            );
+
+            // ── (2) THE RANKED SET IS THE TRACE MINUS THE REGISTERED FLOOR.
+            let floor: BTreeSet<usize> = ranking.floor().iter().copied().collect();
+            for (param, decl) in trace.params.iter().enumerate() {
+                match floor.contains(&param) {
+                    true => {
+                        assert_eq!(
+                            decl.source,
+                            ParamSource::Registered,
+                            "{sku}: `{}` is on the floor and is not a registered plane",
+                            decl.name
+                        );
+                        assert!(
+                            !ranked.contains_key(&param),
+                            "{sku}: `{}` is an adapter bank the artifact deliberately \
+                             omits (FLAG_ADAPTERS_ZEROED) and the ranking carries an \
+                             image for it",
+                            decl.name
+                        );
+                    }
+                    false => assert!(
+                        ranked.contains_key(&param),
+                        "{sku}: `{}` is a plane of this trace that no image of the \
+                         ranking carries — a boot would find nothing to seat it from",
+                        decl.name
+                    ),
+                }
+            }
+
+            // ── THE FIVE BUDGET PAIRS, AND WHY THESE FIVE.
+            //
+            //    Each is a SHAPE of plan rather than a number: derived from
+            //    this SKU's own ranking so that one list covers a 400 MiB
+            //    draft model and a 568 GiB flash MoE.
+            let full = ranking.full();
+            let bottom = floor_of(&ranking, &bytes);
+            // What T1 owes when it is the ONLY place the spill can go — the
+            // number the third pair halves to force a plan onto T2.
+            let spilling = Budgets::device(bottom.max(full / 2));
+            let t1_only = Plan::cut(&ranking, spilling)
+                .unwrap_or_else(|why| panic!("{sku}: half the table serves: {why:?}"));
+            let cuts = [
+                // The degenerate plan. Nothing is placed, nothing streams, and
+                // the ranking still states every image — which is the whole of
+                // why an uncapped boot can WRITE the file a capped one reads.
+                ("uncapped", Budgets::uncapped()),
+                // A stated ceiling that happens to be enough. `Plan::cut` takes
+                // the same early return, and it must: a budget one byte over
+                // full residency is full residency, not a streamed load that
+                // keeps everything.
+                ("the whole table, stated", Budgets::device(full)),
+                // Two thirds of the table with NO host ceiling: the two-tier
+                // shape W-5 planned. Something must give, and everything that
+                // gives goes to T1 — so this is the pair that exercises
+                // `host_layout` at its longest and leaves `mapped_layout`
+                // empty.
+                ("two thirds, host uncapped", Budgets::device(bottom.max(full * 2 / 3))),
+                // Half the table and a host tier under what that spills: the
+                // only pair that puts planes on ALL THREE rungs at once, which
+                // is the pair the partition claim is actually about.
+                (
+                    "half the table, T1 under the spill",
+                    Budgets {
+                        device: spilling.device,
+                        host: Some(t1_only.host_demand() / 2),
+                    },
+                ),
+                // The pathological pair: the exact floor `Plan::cut` refuses
+                // under, and no host tier at all. Every plane a budget is
+                // allowed to move is on T2, which is the longest
+                // `mapped_layout` this SKU has and the shape a deployment gets
+                // on a box that cannot hold the model twice.
+                (
+                    "the floor exactly, no host tier",
+                    Budgets {
+                        device: Some(bottom),
+                        host: Some(0),
+                    },
+                ),
+            ];
+
+            for (why, budgets) in cuts {
+                let plan = Plan::cut(&ranking, budgets)
+                    .unwrap_or_else(|fault| panic!("{sku} / {why}: {fault:?}"));
+
+                // **THE TWO DOORS ARE ONE STATEMENT.** `Plan::of` is
+                // `Ranking::of` and then `Plan::cut`, and a boot reaches the
+                // layouts through whichever it happens to hold.
+                let door = Plan::of(&trace, &planes, budgets)
+                    .unwrap_or_else(|fault| panic!("{sku} / {why}: {fault:?}"));
+                assert_eq!(
+                    door.host_layout(),
+                    plan.host_layout(),
+                    "{sku} / {why}: `Plan::of` and `Plan::cut` lay T1 out differently"
+                );
+                assert_eq!(
+                    door.mapped_layout(),
+                    plan.mapped_layout(),
+                    "{sku} / {why}: `Plan::of` and `Plan::cut` lay T2 out differently"
+                );
+
+                // ── (3) AND (4), ONE RUNG AT A TIME.
+                let banks: BTreeSet<usize> = plan.banks().iter().map(|b| b.param).collect();
+                let on_t1 = walk(sku, why, "T1", &trace, &ranked, &plan.host_layout());
+                assert_eq!(
+                    on_t1.1,
+                    plan.host_image(),
+                    "{sku} / {why}: the T1 walk ends at {} and the tier allocates {}",
+                    on_t1.1,
+                    plan.host_image(),
+                );
+                let on_t2 = walk(sku, why, "T2", &trace, &ranked, &plan.mapped_layout());
+                assert_eq!(
+                    on_t2.1,
+                    plan.mapped_image(),
+                    "{sku} / {why}: the T2 walk ends at {} and the section states {}",
+                    on_t2.1,
+                    plan.mapped_image(),
+                );
+
+                let (on_t1, on_t2) = (on_t1.0, on_t2.0);
+                let mut counted = (0usize, 0usize, 0usize);
+                for &param in ranked.keys() {
+                    let name = &trace.params[param].name;
+                    assert!(
+                        !(plan.pinned(param) && plan.mapped(param)),
+                        "{sku} / {why}: `{name}` is on T1 and T2 at once; a group is \
+                         held whole on ONE rung and a torn pair is the failure that \
+                         computes and is wrong"
+                    );
+                    match (plan.pinned(param), plan.mapped(param)) {
+                        (true, _) => {
+                            assert!(
+                                on_t1.contains(&param),
+                                "{sku} / {why}: `{name}` is pinned and the T1 walk \
+                                 does not seat it — the landing would write it nowhere"
+                            );
+                            counted.1 += 1;
+                        }
+                        (_, true) => {
+                            assert!(
+                                on_t2.contains(&param),
+                                "{sku} / {why}: `{name}` is mapped and the T2 walk \
+                                 does not carry it — the handle would point past the \
+                                 section"
+                            );
+                            counted.2 += 1;
+                        }
+                        // Neither: the device store holds it whole, which is
+                        // the rung with no walk of its own because
+                        // `weights::places` lays it out off `streamed_whole`.
+                        _ => {
+                            assert!(
+                                !on_t2.contains(&param),
+                                "{sku} / {why}: `{name}` is in the store and the T2 \
+                                 walk carries it too"
+                            );
+                            assert!(
+                                on_t1.contains(&param) == banks.contains(&param),
+                                "{sku} / {why}: `{name}` is in the store and appears \
+                                 in the T1 walk without being a dense routed bank — \
+                                 only a bank is on two rungs at once"
+                            );
+                            counted.0 += 1;
+                        }
+                    }
+                }
+                assert_eq!(
+                    counted.0 + counted.1 + counted.2,
+                    ranked.len(),
+                    "{sku} / {why}: the three rungs hold {counted:?} of {} ranked \
+                     planes",
+                    ranked.len(),
+                );
+                assert_eq!(
+                    on_t2.len(),
+                    counted.2,
+                    "{sku} / {why}: the T2 walk carries {} planes and {} are mapped",
+                    on_t2.len(),
+                    counted.2,
+                );
+                assert_eq!(
+                    on_t1.len(),
+                    counted.1 + banks.len(),
+                    "{sku} / {why}: the T1 walk seats {} spans and the plan pins {} \
+                     planes plus {} whole banks",
+                    on_t1.len(),
+                    counted.1,
+                    banks.len(),
+                );
+
+                // **THE ONE PLANE ON TWO RUNGS, ASSERTED RATHER THAN
+                // EXCUSED.** A dense routed bank's slab is a cache over its
+                // pinned copy, so it is in the store AND in the T1 walk, and
+                // the store holds a PREFIX of it.
+                for bank in plan.banks() {
+                    let name = &bank.name;
+                    assert!(
+                        on_t1.contains(&bank.param),
+                        "{sku} / {why}: `{name}` is streamed expert by expert and the \
+                         pinned tier holds no copy for the table to point at"
+                    );
+                    assert!(
+                        !plan.streamed_whole(bank.param),
+                        "{sku} / {why}: `{name}`'s slab is in the store and the plan \
+                         says the store does not hold it"
+                    );
+                    let seats = plan.resident(bank.param).unwrap_or_else(|| {
+                        panic!("{sku} / {why}: `{name}` is streamed and seats no experts")
+                    });
+                    assert!(
+                        (1..bank.experts).contains(&seats),
+                        "{sku} / {why}: `{name}` declares {} experts and seats {seats} \
+                         — a streamed bank seats at least one and never all of them",
+                        bank.experts,
+                    );
+                    assert_eq!(seats, bank.resident, "{sku} / {why}: `{name}` two counts");
+                }
+
+                // The budget is a ceiling and the plan is under it.
+                if let Some(ceiling) = budgets.device {
+                    assert!(
+                        plan.device_demand() <= ceiling,
+                        "{sku} / {why}: the plan demands {} of a {ceiling}-byte store",
+                        plan.device_demand(),
+                    );
+                }
+            }
+
+            // ── THE SHAPE EACH PAIR WAS CHOSEN FOR.
+            let degenerate = Plan::cut(&ranking, Budgets::uncapped()).expect("uncapped cuts");
+            assert!(
+                !degenerate.streams(),
+                "{sku}: an uncapped budget is the degenerate plan and streams nothing"
+            );
+            assert_eq!(
+                degenerate.device_demand(),
+                full,
+                "{sku}: and it demands the whole table of the store"
+            );
+            assert!(
+                Plan::cut(&ranking, Budgets::device(full))
+                    .expect("a stated ceiling over the table cuts")
+                    .host_layout()
+                    .is_empty(),
+                "{sku}: a ceiling at full residency IS full residency"
+            );
+            let wide = Plan::cut(&ranking, Budgets::device(bottom.max(full * 2 / 3)))
+                .expect("two thirds cuts");
+            assert!(
+                wide.mapped_layout().is_empty(),
+                "{sku}: an uncapped host tier spills nothing to the mapping, however \
+                 tight the device is"
+            );
+            assert!(
+                !wide.host_layout().is_empty(),
+                "{sku}: two thirds of the table cannot be held whole"
+            );
+            let narrow = Plan::cut(
+                &ranking,
+                Budgets {
+                    device: Some(bottom),
+                    host: Some(0),
+                },
+            )
+            .expect("the floor cuts");
+            for group in ranking.sequence() {
+                for plane in &group.planes {
+                    assert!(
+                        narrow.mapped(plane.param),
+                        "{sku}: at the floor with no host tier, `{}` has one place \
+                         left and the plan does not put it there",
+                        group.name
+                    );
+                }
+            }
+            assert!(
+                Plan::cut(&ranking, Budgets::device(bottom.saturating_sub(1))).is_err()
+                    || bottom == 0,
+                "{sku}: one byte under the floor is a budget that cannot hold the \
+                 planes no budget can move, and it is refused by name"
+            );
+
+            // ── (5) THE CUT POINTS ARE MONOTONE IN THE BUDGETS.
+            //
+            //    Twice, because the two-tier shape and the three-tier one make
+            //    different promises and only one of them is about T1 alone.
+            //    The footnote on this test names what is deliberately NOT
+            //    asserted here, and the SKU and budgets that disprove it.
+            for host in [None, Some(t1_only.host_demand() / 2)] {
+                let mut before: Option<(u64, u64, u64, u64)> = None;
+                for step in 0..=8u64 {
+                    let device = Some(bottom + (full - bottom) * step / 8);
+                    let plan = Plan::cut(&ranking, Budgets { device, host })
+                        .unwrap_or_else(|fault| panic!("{sku}: step {step}: {fault:?}"));
+                    let ceiling = device.unwrap_or_default();
+                    let below = plan.host_demand() + plan.spill_demand();
+                    let now = (ceiling, plan.device_demand(), plan.spill_demand(), below);
+                    let Some(was) = before else {
+                        before = Some(now);
+                        continue;
+                    };
+                    assert!(
+                        now.1 >= was.1,
+                        "{sku} / host {host:?}: the store took {} at a {}-byte ceiling \
+                         and {} at a {}-byte one — a larger ceiling holds at least as \
+                         much, or the cut is not reading the same ranking",
+                        was.1,
+                        was.0,
+                        now.1,
+                        now.0,
+                    );
+                    assert!(
+                        now.2 <= was.2,
+                        "{sku} / host {host:?}: T2 owed {} at a {}-byte device ceiling \
+                         and {} at a {}-byte one — a plane never moves DOWN to the \
+                         mapping because the device got bigger",
+                        was.2,
+                        was.0,
+                        now.2,
+                        now.0,
+                    );
+                    assert!(
+                        now.3 <= was.3,
+                        "{sku} / host {host:?}: the two tiers below the store owed {} \
+                         at a {}-byte device ceiling and {} at a {}-byte one",
+                        was.3,
+                        was.0,
+                        now.3,
+                        now.0,
+                    );
+                    // **AND T1 ALONE ONLY WHEN IT IS UNCAPPED.** With a stated
+                    // host ceiling the first fit runs on T1 too, and the
+                    // footnote names the SKU where it grows.
+                    if host.is_none() {
+                        assert!(
+                            plan.host_demand() <= was.3,
+                            "{sku}: an uncapped T1 owed {} at a {}-byte device ceiling \
+                             and {} at a {}-byte one — with nowhere below it to spill \
+                             to, T1 holds exactly what the store gave up",
+                            was.3,
+                            was.0,
+                            plan.host_demand(),
+                            now.0,
+                        );
+                        assert_eq!(
+                            plan.spill_demand(),
+                            0,
+                            "{sku}: an uncapped host tier spills nothing to T2"
+                        );
+                    }
+                    before = Some(now);
+                }
+            }
+        }
+        assert!(
+            walked == models::catalog().len(),
+            "the gate walked {walked} of the catalog's {} rows",
+            models::catalog().len()
+        );
+    }
+
+    /// One rung's walk, checked against the ranking: it tiles from zero, every
+    /// offset is aligned, and every span is the plane's OWN span — the same
+    /// two numbers the artifact's image states.
+    ///
+    /// Returns the params it seated and where the walk ended, so the caller
+    /// can ask the partition question with them.
+    fn walk(
+        sku: &str,
+        why: &str,
+        rung: &str,
+        trace: &Trace,
+        ranked: &BTreeMap<usize, (u64, u64)>,
+        layout: &[(u64, u64, u64, u64)],
+    ) -> (BTreeSet<usize>, u64) {
+        let mut at = 0u64;
+        let mut seen = BTreeSet::new();
+        for (which, &(param, offset, span, reserved)) in layout.iter().enumerate() {
+            let param = usize::try_from(param).expect("a param ordinal");
+            let name = &trace.params[param].name;
+            assert_eq!(
+                offset, at,
+                "{sku} / {why}: {rung} span {which} `{name}` starts at {offset} and \
+                 {at} was next; the rung is a concatenation like the payload is"
+            );
+            assert_eq!(
+                offset % crate::weights::ALIGN,
+                0,
+                "{sku} / {why}: {rung} span {which} `{name}` starts at {offset}, which \
+                 the store would not have given it"
+            );
+            let &(want_span, want_reserved) = ranked.get(&param).unwrap_or_else(|| {
+                panic!(
+                    "{sku} / {why}: {rung} seats `{name}` and the ranking never ranked \
+                     it — the boot would have no image to cut it out of"
+                )
+            });
+            assert_eq!(
+                (span, reserved),
+                (want_span, want_reserved),
+                "{sku} / {why}: `{name}` is {span}/{reserved} (bytes/reserved) on \
+                 {rung} and {want_span}/{want_reserved} in the artifact. A plane's \
+                 bytes are the SAME on all three rungs and only the WALK differs, so \
+                 one of those two numbers cuts this plane at a length nothing \
+                 published it at"
+            );
+            assert!(
+                seen.insert(param),
+                "{sku} / {why}: {rung} seats `{name}` twice, at {} and at {offset}",
+                at,
+            );
+            at += reserved;
+        }
+        (seen, at)
+    }
+
+    /// **THE GEOMETRY IS THE SAME ON BOTH SHELLS AND THE BYTES ARE NOT**,
+    /// which is why the artifact needs a STAMP and not a length check (M-4c).
+    ///
+    /// The peer wave that landed under this gate made qwen_3's projections ask
+    /// which shell is serving: a mlxu4 row declares `U4g64tiled` when the
+    /// trace is taken at [`Platform::Cuda`] and plain `U4g64` at
+    /// `Platform::Metal`. A repack is size-PRESERVING — the band padding rides
+    /// in the shape and `plane_bytes` puts both dtypes in one arm — so the
+    /// ranking, every image span, and the whole payload are byte-for-byte
+    /// identical between the two, while the nibbles inside each plane are in a
+    /// different order.
+    ///
+    /// **That is the exact shape a length check cannot catch.** Two artifacts
+    /// with the same key geometry, the same digestible payload, the same index
+    /// — and one of them serves garbage on the other's card. Nothing in this
+    /// file can tell them apart, and nothing in this file should try: the
+    /// recipe stamp is the answer, and this test is the reason it has to be.
+    #[test]
+    fn a_tiled_row_and_a_row_major_one_rank_to_the_same_spans() {
+        let trace = models::trace_of("qwen36-27b-mlxu4-kv-bf16").expect("the catalog ships it");
+        let cuda = trace(Platform::Cuda);
+        let metal = trace(Platform::Metal);
+        let tiled = |trace: &Trace| {
+            trace
+                .params
+                .iter()
+                .filter(|param| param.dtype == model_ir::Dtype::U4g64tiled)
+                .count()
+        };
+        assert!(
+            tiled(&cuda) > 0 && tiled(&metal) == 0,
+            "the SKU's projections read the serving shell: {} tiled planes on CUDA \
+             and {} on Metal",
+            tiled(&cuda),
+            tiled(&metal),
+        );
+        let images = |trace: &Trace| {
+            Ranking::of(trace, &pairings_of(trace))
+                .expect("a mlxu4 row ranks")
+                .images()
+        };
+        assert_eq!(
+            images(&cuda),
+            images(&metal),
+            "a repack is size-preserving, so the two shells rank the same planes at \
+             the same spans — and an artifact written by one has the geometry the \
+             other would have written. Only the recipe stamp separates them"
+        );
+    }
 }
+

@@ -266,6 +266,30 @@ pub fn add_bias(bias: &Weight, out: &Value) -> Value {
     out_out
 }
 
+/// **THE TOWER'S OUTPUT STANDARDIZATION** (`vision_config.standardize`):
+/// `y = (x − bias) · scale`, per column, in place.
+///
+/// The last thing `Gemma4VisionModel.forward` does to a pooled soft token
+/// before the multimodal embedder projects it into trunk space. Both planes
+/// are `[tower hidden]` and both are the checkpoint's
+/// (`vision_tower.std_{bias,scale}`); the op's own note argues why they can
+/// neither fold into the projection behind them nor be spelled as
+/// [`add_bias`] followed by [`scale`].
+pub fn standardize(x: &Value, bias: &Weight, scale: &Weight) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elementwise::Standardize {
+            x: x.id(),
+            bias: r.weight(bias),
+            scale: r.weight(scale),
+            x_out: x_out.id(),
+        },
+        &[x],
+    );
+    x_out
+}
+
 pub fn mul_scalar(s: f32, x: &Value) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
@@ -515,6 +539,33 @@ pub fn hc_rmsnorm_f32(streams: &Value, eps: f32) -> Value {
         &[streams],
     );
     y
+}
+
+/// The per-token mix row: the normed stream row projected through the layer's
+/// dynamic hyper plane (`{attn,ffn}_hc.fn`, `[2M + M², M·hidden]`) into the
+/// `2M + M²` numbers [`hc_gates`] splits.
+pub fn hc_project(normed: &Value, dynamic: &Weight, stream_count: u32) -> Value {
+    let r = normed.rec();
+    let count = u64::from(stream_count);
+    let mix_hc = 2 * count + count * count;
+    assert_eq!(
+        dynamic.dim(0),
+        mix_hc,
+        "`{}` lands {} rows and a {stream_count}-stream mix row is {mix_hc} wide",
+        dynamic.name,
+        dynamic.dim(0),
+    );
+    let mixes = r.fresh(tensor(normed.rows(), mix_hc, Dtype::F32));
+    r.push(
+        Elementwise::HcProject {
+            normed: normed.id(),
+            weight: r.weight(dynamic),
+            stream_count,
+            mixes: mixes.id(),
+        },
+        &[normed],
+    );
+    mixes
 }
 
 pub fn hc_gates(

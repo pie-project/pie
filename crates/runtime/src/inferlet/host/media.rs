@@ -3,8 +3,8 @@
 //! **Model-agnostic by construction, and the split is the whole of what this
 //! file knows.** The inferlet hands the host raw encoded bytes (a PNG/JPEG, an
 //! animated GIF, a WAV); this file DECODES them ([`decode`], the codec being
-//! the host's — `model::media`'s own dependency rule), reads the bound model's
-//! `ROWS.arch`, asks [`::model::media::vision_front_end`] for that family's
+//! the host's — `models::media`'s own dependency rule), reads the bound model's
+//! `ROWS.arch`, asks [`models::media::vision_front_end`] for that family's
 //! front-end or refuses by name, and hands the pixels over with the resample
 //! lent. Everything after that — the resize target, patchify, normalize,
 //! log-mel, the interpolation taps of a resampled position table — is the
@@ -29,12 +29,12 @@
 pub mod decode;
 pub mod multimodal;
 
-use ::model::media::{
-    AudioFrontEnd, Budget, Delimiters, EncodedSpan, Fault, Grid, Rgb8, VisionFrontEnd,
-};
 use crate::inferlet::ProcessCtx;
 use crate::inferlet::host::pie;
 use anyhow::Result;
+use models::media::{
+    AudioFrontEnd, Budget, Delimiters, EncodedSpan, Fault, Grid, Rgb8, VisionFrontEnd,
+};
 use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -89,7 +89,7 @@ impl AudioFrontEnd for AudioAdapter {
         }
     }
 
-    fn encode_audio(&self, bytes: &[u8]) -> ::model::media::Result<EncodedSpan> {
+    fn encode_audio(&self, bytes: &[u8]) -> models::media::Result<EncodedSpan> {
         let (mel, n_frames) = multimodal::audio::process_wav_bytes(bytes).map_err(Fault::Decode)?;
         if n_frames == 0 {
             return Err(Fault::Empty("audio: clip decoded to zero frames".into()));
@@ -122,7 +122,7 @@ impl AudioFrontEnd for AudioAdapter {
 
 /// **THE DISPATCH** (media-door §4): the bound model's `ROWS.arch` to a vision
 /// front-end, or the one refusal this layer knows how to say. The arch match
-/// itself is [`::model::media::vision_front_end`] — a catalog fact, beside the
+/// itself is [`models::media::vision_front_end`] — a catalog fact, beside the
 /// families it names; this layer only knows the bound model, which the catalog
 /// does not.
 ///
@@ -131,17 +131,17 @@ impl AudioFrontEnd for AudioAdapter {
 /// [`Fault::NoVisionFrontEnd`], naming the model and the arch it was asked
 /// about — a text model has no tower and never will, and saying so here is
 /// what keeps every layer below this one free of the question.
-fn vision_front_end() -> ::model::media::Result<Box<dyn VisionFrontEnd>> {
+fn vision_front_end() -> models::media::Result<Box<dyn VisionFrontEnd>> {
     let m = crate::model::model();
     let arch = m.arch_name();
-    ::model::media::vision_front_end(arch).ok_or_else(|| Fault::NoVisionFrontEnd {
+    models::media::vision_front_end(arch).ok_or_else(|| Fault::NoVisionFrontEnd {
         model: m.name().to_string(),
         arch: arch.to_string(),
     })
 }
 
 /// The same, for audio.
-fn audio_front_end() -> ::model::media::Result<AudioAdapter> {
+fn audio_front_end() -> models::media::Result<AudioAdapter> {
     let m = crate::model::model();
     let arch = m.arch_name();
     if multimodal::audio_arch_supported(arch) {
@@ -481,7 +481,7 @@ mod tests {
         archs.dedup();
         assert!(!archs.is_empty(), "the catalog names no architectures");
         for arch in archs {
-            match ::model::media::vision_front_end(arch) {
+            match models::media::vision_front_end(arch) {
                 Some(fe) => {
                     assert_eq!(fe.arch(), arch, "a front-end answered for another arch");
                     let d = fe.delimiters();
@@ -506,8 +506,12 @@ mod tests {
     /// each spells its run with its own reserved pad.
     #[test]
     fn the_two_vision_archs_spell_their_runs_differently() {
-        let qwen = ::model::media::vision_front_end("qwen3_5").expect("qwen has a tower").delimiters();
-        let gemma = ::model::media::vision_front_end("gemma4").expect("gemma has a tower").delimiters();
+        let qwen = models::media::vision_front_end("qwen3_5")
+            .expect("qwen has a tower")
+            .delimiters();
+        let gemma = models::media::vision_front_end("gemma4")
+            .expect("gemma has a tower")
+            .delimiters();
         assert_eq!(qwen.placeholder, "<|image_pad|>");
         assert_eq!(qwen.prefix, "<|vision_start|>");
         // MD-B's own reading of THIS checkpoint's vocabulary: gemma-4 spells
@@ -558,7 +562,7 @@ mod tests {
     /// identity is computed where the hasher lives.
     #[test]
     fn two_spans_share_a_token_list_and_not_a_digest() {
-        use ::model::media::{Resample, Rgb8, StubFrontEnd};
+        use models::media::{Resample, Rgb8, StubFrontEnd};
         let identity: Resample = |src, _, _| src.clone();
         let fe = StubFrontEnd::new("stub", 4);
         let pixels = |bytes: [u8; 3]| Rgb8::new(1, 1, bytes.to_vec()).expect("one pixel");
@@ -587,7 +591,7 @@ mod tests {
     /// carries both the model and the arch it was asked about.
     #[test]
     fn an_unknown_arch_is_refused_as_no_vision_front_end() {
-        assert!(::model::media::vision_front_end("deepseek_v4").is_none());
+        assert!(models::media::vision_front_end("deepseek_v4").is_none());
         let fault = Fault::NoVisionFrontEnd {
             model: "ds-v4".into(),
             arch: "deepseek_v4".into(),

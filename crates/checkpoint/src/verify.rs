@@ -560,7 +560,8 @@ pub fn view_of(plan: &crate::plan::LoadPlan) -> PlanView<'_> {
         match instr {
             StorageInstr::Finalize { name, .. } => finalized.push(name.as_str()),
             StorageInstr::ExtentWrite { id, source, .. }
-            | StorageInstr::BulkExtentWrite { id, source, .. } => reads.push(ReadView {
+            | StorageInstr::BulkExtentWrite { id, source, .. }
+            | StorageInstr::GatherWrite { id, source, .. } => reads.push(ReadView {
                 instr: id.0,
                 file_id: source.file_id.0,
                 file_offset: source.file_offset,

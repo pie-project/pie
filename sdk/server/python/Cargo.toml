@@ -25,6 +25,18 @@ profile-fire = ["worker/profile-fire"]
 default = ["engine-cuda-13"]
 engine-cuda-12 = ["worker/engine-cuda-12"]
 engine-cuda-13 = ["worker/engine-cuda-13"]
+# **THE METAL SHELL, WHICH CAME BACK AT P5 AND WAS NEVER RE-EXPOSED HERE.**
+# The paragraph above still says the shader flavors "went with R3"; `worker`'s
+# own manifest has said "the Metal shell, BACK AT P5" since that landing, so
+# the engine has been hostable by `pie serve` and NOT by this wheel — which is
+# the only door `tests/inferlets/conftest.py` opens (`from pie.server import
+# Server`). Every inferlet gate that names `--engine metal` was therefore
+# unreachable on an Apple box for a packaging reason and not an engine one.
+# Apple-only at the crate level, so this flag alone is not a build that links:
+# `runtime`'s seam pairs it with `target_vendor = "apple"`. Build it with
+# `--no-default-features --features engine-metal`, since the CUDA default
+# wants `libnccl` and an Apple box has none.
+engine-metal = ["worker/engine-metal"]
 
 [lib]
 name = "pie_engine"

@@ -94,7 +94,7 @@ fn serialized() -> MutexGuard<'static, ()> {
 }
 
 fn word(query_len: u32, captures: bool) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false).capturing_scores(captures))
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false).capturing_scores(captures))
         .word()
 }
 
@@ -194,7 +194,7 @@ fn same_mass(left: &[Vec<LayerScores>], right: &[Vec<LayerScores>], what: &str) 
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn the_composition_fragments_a_window_and_the_table_asks_for_a_copy() {
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let compiled = compile(&trace, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
 
     // The three lanes of `fire_it`, as words: a capturing decode, a capturing
@@ -216,7 +216,12 @@ fn the_composition_fragments_a_window_and_the_table_asks_for_a_copy() {
             continue;
         }
         fragmented += 1;
-        if model_exec::fire::fallback::copies(&compiled, &region.mask, bucket) {
+        if model_exec::fire::fallback::copies(
+            &compiled,
+            model_ir::RowAxis::Tokens,
+            &region.mask,
+            bucket,
+        ) {
             copied += 1;
         }
     }
@@ -329,7 +334,7 @@ fn the_same_fragmented_fire_split_and_copied_is_the_same_bytes_in_fewer_launches
 /// split pays for them beyond one apiece)` — read off a fresh bake of the same
 /// text at the same budgets, which is where the number belongs.
 fn predicted() -> (u32, u32) {
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let compiled = compile(&trace, &BUDGETS, &DeviceProfile::default()).expect("the SKU bakes");
     let lanes = [
         model_exec::fire::Lane::new(word(1, true), 1),
@@ -479,7 +484,7 @@ fn a_window_in_three_pieces_becomes_one_launch_and_still_the_same_bytes() {
 
 /// The word a lane of the five-class fire carries.
 fn wide_word(query_len: u32, captures: bool, adapter: bool) -> u64 {
-    model::qwen_3::forward::Facts::of(
+    models::qwen_3::forward::Facts::of(
         &Request::new(query_len, false)
             .capturing_scores(captures)
             .adapted(adapter),
@@ -490,7 +495,7 @@ fn wide_word(query_len: u32, captures: bool, adapter: bool) -> u64 {
 /// `(fragmented windows, launches a split pays beyond one apiece)` for the
 /// five-lane composition, off a fresh bake.
 fn predicted_wide() -> (u32, u32) {
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let compiled = compile(&trace, &WIDE, &DeviceProfile::default()).expect("the SKU bakes");
     let lanes = [
         model_exec::fire::Lane::new(wide_word(5, true, false), 5),
@@ -641,11 +646,14 @@ fn what_a_copy_and_a_split_cost_on_this_device() {
 ///
 /// # What the tiered router does with this composition
 ///
-/// `Fallback::Copy` compacts its rows into a gathered rectangle whose payload
-/// sits at a fire-dependent offset behind `Slots::tail()`, so no captured
-/// pointer names those rows twice — which is why `Windows::admits` calls the
-/// region an `Admit::Island` with no clause anywhere in it that reads a
-/// policy. The tier-2 campaign made that a statement about the REGION rather
+/// `Fallback::Copy` compacts its rows into a gathered rectangle numbered from
+/// that rectangle's own zero, so no offset into the fire's plane names those
+/// rows and the staged `(count, start)` seat has nothing to say about them —
+/// which is why `Windows::admits` calls the region an `Admit::Island` with no
+/// clause anywhere in it that reads a policy. (The payload's ADDRESS stopped
+/// being fire-dependent when the tail acquired a stride,
+/// `window::Slots::gathered_at`; the shape clause is what the admission
+/// turns on, and it is unmoved.) The tier-2 campaign made that a statement about the REGION rather
 /// than about the composition: `record::cuts` cuts the template around the
 /// island, each captured stretch becomes its own exec, and the island's
 /// `[gather … the region's launches … scatter]` is re-issued by the eager walk
@@ -660,10 +668,10 @@ fn what_a_copy_and_a_split_cost_on_this_device() {
 /// # What is asserted
 ///
 /// ```text
-/// (1) the composition REPLAYS — `BodyStats::hits` moves, which is the
+/// (1) the composition REPLAYS — `BodyTally::hits` moves, which is the
 ///     evidence a body exists and was launched, where `captures` alone would
 ///     only say the boot armed something
-/// (2) the body it replays is SEGMENTED — `BodyStats::islands` is nonzero,
+/// (2) the body it replays is SEGMENTED — `LastCapture::islands` is nonzero,
 ///     because a gathered region cannot be in a graph and this file's whole
 ///     premise is that this composition has one
 /// (3) and the numbers are the golden's, bit for bit — same logits, same
@@ -676,7 +684,7 @@ fn what_a_copy_and_a_split_cost_on_this_device() {
 /// exactly the part of the fire where a segmented body could get it wrong: its
 /// launches are re-issued from the host every fire, and if any of them had
 /// taken the key's ceiling instead of the fire's live span
-/// (`Run::captured` is the one gate that stands them down) they would be
+/// (`run::Held::Eager` is the one answer that stands them down) they would be
 /// gridded past the rectangle the gather filled.
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
@@ -732,7 +740,7 @@ fn a_copied_window_says_under_the_tiered_router_what_it_says_eagerly() {
     // this key makes `captures` true whether or not anything ever replayed;
     // `hits` is the number that says a fire found its body and launched it.
     assert!(
-        stats.hits >= 1,
+        stats.tally.hits >= 1,
         "a fire with a gathered window replayed nothing. Its key is armed by \
          `Shell::arm_bodies`' fragmenting arm and its gathered region is an \
          island the body is cut around, so a hit is what this composition owes: \
@@ -743,7 +751,7 @@ fn a_copied_window_says_under_the_tiered_router_what_it_says_eagerly() {
     // `Windows::admits` exists to refuse — or that this fire never gathered at
     // all, which the `copied` assertion above already denies.
     assert!(
-        stats.islands >= 1,
+        stats.last_capture.islands >= 1,
         "the body that served a gathered composition holds no island, so either \
          the copy window reached a graph or the cut was made somewhere else: \
          {stats}"
@@ -809,9 +817,9 @@ fn load(what: &str, budget: Budget, slots: u32) -> Option<(Shell, tokenizer::Tok
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
 
@@ -849,7 +857,7 @@ fn load(what: &str, budget: Budget, slots: u32) -> Option<(Shell, tokenizer::Tok
             bodies: true,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
         // claims. `Runahead::of` is the door a deployment comes through.

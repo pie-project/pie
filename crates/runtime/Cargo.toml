@@ -155,7 +155,7 @@ grammar = { path = "../grammar" }
 # `(layers, vocab, arch)` per SKU and the shape an artifact's metadata arrives
 # in are `src/model.rs`, and host-side media decode is
 # `src/inferlet/host/media/multimodal.rs`.
-model = { path = "../model" }
+models = { path = "../models" }
 # THE RUNTIME TRACES, AND THE RUNTIME STATES THE LOAD CONTRACT (palo design §7,
 # decision 18). `model` above supplies the catalog and the per-SKU import; the
 # three edges below are what it takes to USE them at the boundary:

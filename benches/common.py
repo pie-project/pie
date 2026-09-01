@@ -499,6 +499,17 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
              "or an explicit list like '80-87,208-215'.",
     )
     p.add_argument("--gpu-mem-util", type=float, default=0.90)
+    p.add_argument(
+        "--engine-option",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Extra [model.engine.options] entries, handed straight to the "
+             "engine's own options struct (deny_unknown_fields still rules). "
+             "Values parse as TOML scalars: true/false, ints, floats, else "
+             "strings. Repeatable. pie cuda_native only; other engines "
+             "ignore it.",
+    )
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument("--sglang-attention-backend", default=None)
     p.add_argument("--sglang-sampling-backend", default=None)

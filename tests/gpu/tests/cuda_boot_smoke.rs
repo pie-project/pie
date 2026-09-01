@@ -14,7 +14,7 @@
 //!
 //! It booted `Qwen/Qwen3-0.6B` and named it in three doc lines and an
 //! `#[ignore]` reason. This build ships no SKU that checkpoint can be: every
-//! row of `::model::qwen_3::IMPORTS` claims an artifact by NAME at a qwen3.5
+//! row of `models::qwen_3::IMPORTS` claims an artifact by NAME at a qwen3.5
 //! geometry, and `runtime::model::ROWS` has no id for it, so
 //! `runtime::engine::load` refuses before a fire and the gate would have failed
 //! for a reason that is not about booting. It comes up on

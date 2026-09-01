@@ -183,7 +183,7 @@ const PAGES: [u32; 2] = [0, 1];
 /// The lane word the model's own `Classify` computes.
 fn word(query_len: u32) -> u64 {
     let classify = runtime::engine::load::classify(SKU).expect("this build ships the gate's SKU");
-    classify(&model::Request::new(query_len, false))
+    classify(&models::Request::new(query_len, false))
 }
 
 /// Greedy: the highest logit.
@@ -239,6 +239,7 @@ fn attached_prefill(
             readout,
         }],
         attachments,
+        media: Vec::new(),
     })
 }
 
@@ -265,6 +266,8 @@ fn a_lane_reads_back_the_interior_rows_it_names_in_the_order_it_names_them() {
         page_size: 16,
         max_context: 512,
         slots: 4,
+        max_patches: None,
+        max_images: None,
     };
     let request = runtime::engine::load::request(
         &checkpoint,

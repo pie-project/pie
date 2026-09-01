@@ -388,7 +388,7 @@ mod tests {
     use super::*;
 
     fn d0_8b() -> Trace {
-        let trace = model::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships it");
+        let trace = models::trace_of("qwen35-d0.8b-bf16-kv-bf16").expect("the catalog ships it");
         trace(Platform::Cuda)
     }
 

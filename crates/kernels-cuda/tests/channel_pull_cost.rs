@@ -82,6 +82,13 @@ struct Gpu {
 
 impl Gpu {
     fn open() -> Self {
+        // The same root `tests/common` states, and for the same reason: a
+        // compile-time constant under `target/`, so this crate's cubins
+        // survive between runs without the library reading an environment.
+        kernels_cuda::disk::install(Some(std::path::Path::new(concat!(
+            env!("CARGO_TARGET_TMPDIR"),
+            "/kernel-cache"
+        ))));
         unsafe {
             check(rt::cudaSetDevice(0), "cudaSetDevice");
             let mut stream: rt::cudaStream_t = core::ptr::null_mut();

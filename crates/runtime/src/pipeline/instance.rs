@@ -206,7 +206,7 @@ pub struct ForwardBindings {
     /// so a submission that carries no media constructs nothing, scans
     /// nothing, and is the submission it always was. `Arc` because a decoded
     /// image submitted to two passes is decoded once and copied never.
-    pub media: Vec<std::sync::Arc<::model::media::EncodedSpan>>,
+    pub media: Vec<std::sync::Arc<models::media::EncodedSpan>>,
 }
 
 /// Where a fire's folded boundary lands — the host mirror of WIT

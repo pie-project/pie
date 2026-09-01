@@ -103,22 +103,32 @@ pub fn m2_intrinsic_element_bytes(intr: u16) -> Option<u32> {
 
 /// Whether the GROUPED (M3) emitter can bind `intr`.
 ///
-/// **NARROWER THAN [`m2_intrinsic_buffer`], AND THE GAP IS ONE ID.** A
-/// grouped kernel binds no per-intrinsic buffer at all: it reads
-/// `lane.logits_base` out of the lane record and every `INTRINSIC_VAL` op is
-/// handed that one address (`emit_grouped_fused_region`). That is why the
-/// draft column has no grouped half either — it rides `M3RowMeta::mtp_offset`
-/// off the same base — and the score slab is not the same allocation as the
-/// logits at all, so there is no offset that would reach it.
+/// **THE SAME SET AS [`m2_intrinsic_buffer`]'S NOW, AND THE ID THAT CLOSED
+/// THE GAP GOT AN ADDRESS RATHER THAN AN ARGUMENT INDEX.** A grouped kernel
+/// binds no per-intrinsic buffer at all: every rectangle it reads arrives as a
+/// `ulong` on the lane record. `logits` and `mtp_logits` share one — the draft
+/// column rides `M3RowMeta::mtp_offset` off `lane.logits_base`, one rectangle
+/// in two row blocks — and this row used to say that `attn_score` therefore
+/// had nowhere to go, because the score slab is the shell's own reservation
+/// and no displacement off the readout reaches it.
 ///
-/// So the M2 slot table opening for `AttnScore` does not open the M3 one, and
-/// a grouped region that reads it is refused by name rather than emitted
-/// pointing at the trunk's rows. Closing this needs a score base on the lane
-/// record, which is the same `MTLBuffer.gpuAddress` plumbing the grouped path
-/// is waiting on for everything else.
+/// It has its own address now. `LaneRecord::attn_score_base` is the lane's
+/// block of that slab and `LaneRecord::attn_score_row_stride` its plane pitch,
+/// which is the CUDA twin's `(intrinsic_base, intrinsic_row_stride)` pair said
+/// in the one place this form has to say it. So the grouped emitter gathers
+/// the score rectangle from that base (`emit_score_gather`) and the two tables
+/// agree id for id.
+///
+/// **THIS IS WHAT LETS A TEN-CHANNEL PROGRAM READ SCORES AT ALL.** On the M2
+/// form the score rectangle costs two of the twelve argument slots the
+/// channels grow into — [`fused_channel_ceiling`] puts the ceiling at ten for
+/// a region that reads it — so a guest wanting both was refused by a limit
+/// that has nothing to do with what it asked for. On this form a channel is a
+/// row of the lane table and the score base is a word beside it, so neither
+/// crowds the other.
 #[must_use]
 pub fn m3_intrinsic_bindable(intr: u16) -> bool {
-    intr != intrinsic_tags::ATTN_SCORE && m2_intrinsic_buffer(intr).is_some()
+    m2_intrinsic_buffer(intr).is_some()
 }
 
 /// How many channels a fused region may bind directly once the intrinsics in
@@ -227,21 +237,25 @@ mod tests {
         assert_eq!(m2_intrinsic_element_bytes(intrinsic_tags::MTP_DRAFTS), Some(2));
     }
 
-    /// The grouped table is the single-lane one minus the score rectangle,
-    /// and the difference is a missing lane-record base rather than a policy.
+    /// The two tables agree id for id, and the score rectangle is where they
+    /// stopped disagreeing: it used to be absent here for want of a
+    /// lane-record base, and `LaneRecord::attn_score_base` is that base.
+    ///
+    /// Stated as an EQUALITY over the whole id space rather than as two
+    /// membership checks, because the interesting failure is a NEW id that
+    /// gains an M2 argument index and no grouped route — which would send
+    /// every region reading it back to the twelve-slot form silently.
     #[test]
-    fn the_grouped_path_binds_everything_but_the_score_rectangle() {
+    fn the_grouped_path_binds_every_rectangle_the_single_lane_form_does() {
         for id in IntrinsicId::ALL {
             let intr = *id as u16;
-            let expected =
-                m2_intrinsic_buffer(intr).is_some() && intr != intrinsic_tags::ATTN_SCORE;
             assert_eq!(
                 m3_intrinsic_bindable(intr),
-                expected,
+                m2_intrinsic_buffer(intr).is_some(),
                 "{id:?} disagrees between the M2 and M3 tables for a reason nothing states"
             );
         }
-        assert!(!m3_intrinsic_bindable(intrinsic_tags::ATTN_SCORE));
+        assert!(m3_intrinsic_bindable(intrinsic_tags::ATTN_SCORE));
         assert!(m3_intrinsic_bindable(intrinsic_tags::LOGITS));
     }
 }

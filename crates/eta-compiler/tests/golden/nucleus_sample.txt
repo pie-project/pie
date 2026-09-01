@@ -12,30 +12,30 @@ class: chan=2 FullRing
 case 0: top_p=0.5
 seed chan=0 = U32([1234, 0])
 seed chan=1 = F32([0.5])
-inputs 0: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
+inputs 0: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: None }
 step 0: committed=true missed=None sinks=0
 take chan=2 = I32([0])
 case 1: top_p=1
 seed chan=0 = U32([1234, 1])
 seed chan=1 = F32([1.0])
-inputs 1: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
+inputs 1: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: None }
 step 1: committed=true missed=None sinks=0
 take chan=2 = I32([0])
 case 2: top_p=0
 seed chan=0 = U32([1234, 2])
 seed chan=1 = F32([0.0])
-inputs 2: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
+inputs 2: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: None }
 step 2: committed=true missed=None sinks=0
 take chan=2 = I32([0])
 case 3: top_p=NaN
 seed chan=0 = U32([1234, 3])
 seed chan=1 = F32([NaN])
-inputs 3: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
+inputs 3: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: None }
 step 3: committed=true missed=None sinks=0
 take chan=2 = I32([0])
 case 4: top_p=inf
 seed chan=0 = U32([1234, 4])
 seed chan=1 = F32([inf])
-inputs 4: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: [] }
+inputs 4: PassInputs { logits: Some(F32([4.0, 4.0, 3.0, 2.0, 1.0, 0.0, -1.0, NaN])), mtp_logits: None, mtp_drafts: None, hidden: None, value_head: None, query: [], attn_score: None }
 step 4: committed=true missed=None sinks=0
 take chan=2 = I32([0])

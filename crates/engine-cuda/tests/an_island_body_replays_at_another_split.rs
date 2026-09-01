@@ -61,7 +61,7 @@
 //! grids and schedules were carved at the key's ceilings and must dominate a
 //! split they never saw; and the island, whose launches are re-issued from the
 //! host every fire and must plan, grid and address at the FIRE's own live
-//! geometry (`Run::captured` is the one gate that stands every ceiling down
+//! geometry (`run::Held::Eager` is the one answer that stands every ceiling down
 //! inside one — an island that took a ceiling would be gridded past the
 //! rectangle the gather actually filled).
 //!
@@ -81,13 +81,13 @@
 //! fire. It is one of the exponentially many present sets a lattice cannot
 //! hold a body for, and what the engine owes it is the behaviour it has: past
 //! `Graphs::seal_bodies` it WALKS, it is counted where an operator can see it
-//! (`BodyStats::sealed_declines`), and the first one is named on stderr with
+//! (`BodyTally::sealed_declines`), and the first one is named on stderr with
 //! its key spelled out. So the gate is two claims and not one, because the
 //! lattice's edge is a designed thing and an untested designed thing is a
 //! hope:
 //!
 //! ```text
-//! (a) the boot ARMS this composition — `BodyStats::armed_at_load` moves, some
+//! (a) the boot ARMS this composition — `BodyTally::armed_at_load` moves, some
 //!     armed body is SEGMENTED, and the map seals before any caller fires
 //! (b) two different splits of the WITNESS both REPLAY — `hits` moves twice,
 //!     `captures` does not move once past the boot, and `sealed_declines`
@@ -173,16 +173,24 @@ fn serialized() -> MutexGuard<'static, ()> {
 /// (`model_compiler::layout`'s `CROSSOVER_ROWS`), which is what makes the
 /// withdrawn window a GATHERED one rather than a split.
 ///
-/// **AND IT IS TWO POINTS RATHER THAN THREE, BECAUSE THE MAP'S SEATS ARE THE
-/// ENUMERATION'S BUDGET.** `record::MAX_BODIES` is sixty-four and this bake
-/// states twelve classes, so one lattice point already enumerates thirty
-/// prefill and mixed keys plus one fragmenting witness per (mask, separator)
-/// pair — and the fragmenting arm is the LAST one attempted inside each
-/// bucket. At three points the map filled inside the second one and the key
-/// this file's fires actually present was named in the boot line's `never
-/// attempted` warning instead of being armed. Dropping the rung no fire here
-/// lands on is the deployment saying what it fires; it is not a tuning of the
-/// engine, and the boot line is where the same sentence is available to an
+/// **AND IT IS TWO POINTS RATHER THAN THREE, BECAUSE AN ENUMERATION HAS A
+/// BUDGET.** This bake states twelve classes, so one lattice point already
+/// enumerates thirty prefill and mixed keys plus one fragmenting witness per
+/// (mask, separator) pair — and the fragmenting arm is the LAST one attempted
+/// inside each bucket. At three points the pass ran out inside the second one
+/// and the key this file's fires actually present was named in the boot line's
+/// `never attempted` warning instead of being armed.
+///
+/// **WHICH BOUND RAN OUT MOVED UNDER THIS FILE AND THE ARITHMETIC DID NOT**
+/// (the capacity wave). It used to be the map's seats — `record::MAX_BODIES`,
+/// sixty-four — and the bound is `[engine] bodies_mem` now, with the count
+/// surviving as a generous belt. The reason this file states two points rather
+/// than three is unchanged either way: a lattice wide enough to spend the
+/// budget before reaching the fires under test is a deployment describing
+/// shapes it does not fire. Dropping the rung no fire here lands on is the
+/// deployment saying what it fires; it is not a tuning of the engine, and the
+/// boot line — which now names bytes spent, seats taken, and which of the two
+/// stopped the pass — is where the same sentence is available to an
 /// operator.
 ///
 /// **THE BOOT LINE IS ALSO WHERE THE PREMISE OF (b) IS READABLE**, which is
@@ -190,8 +198,8 @@ fn serialized() -> MutexGuard<'static, ()> {
 /// these budgets prints `fragmented 14/14`, and fourteen is exactly the number
 /// of witnesses this bake has in TOTAL — one per (mask, separator) pair,
 /// deduplicated — so every one of them was attempted and armed inside the
-/// FIRST bucket, and the second bucket's fragmenting arm is what the map ran
-/// out of seats before reaching.
+/// FIRST bucket, and the second bucket's fragmenting arm is what the pass ran
+/// out of budget before reaching.
 ///
 /// **AND `max_adapters` IS ONE RATHER THAN ZERO, WHICH IS NOT A WIDENING.**
 /// The witness needs class `6`, class `6` is the capturing class whose word
@@ -214,7 +222,7 @@ fn budgets() -> Budget {
 /// facts move here — the row count (`qo_one`), the capture and the adapter —
 /// and the class table is what turns them into the ids the header names.
 fn word(query_len: u32, captures: bool, adapted: bool) -> u64 {
-    model::qwen_3::forward::Facts::of(
+    models::qwen_3::forward::Facts::of(
         &Request::new(query_len, false)
             .capturing_scores(captures)
             .adapted(adapted),
@@ -357,11 +365,11 @@ fn an_armed_island_body_replays_at_another_split_and_its_sibling_walks() {
     let armed = shell.body_stats();
     eprintln!("at boot: {armed}");
     assert!(
-        armed.armed_at_load >= 1,
+        armed.tally.armed_at_load >= 1,
         "the boot armed nothing at all, so nothing below is about arming: {armed}"
     );
     assert!(
-        armed.segmented >= 1,
+        armed.census.segmented >= 1,
         "the boot armed no SEGMENTED body. `Shell::arm_bodies`' fragmenting arm \
          is what enumerates a present set that breaks a mask — three classes, \
          with one standing between two of the mask's own — and without it no \
@@ -414,18 +422,18 @@ fn an_armed_island_body_replays_at_another_split_and_its_sibling_walks() {
     // counter standing still is the other half of "upfront": past the seal the
     // serving path records nothing at all.
     assert!(
-        after.hits >= before.hits + 2,
+        after.tally.hits >= before.tally.hits + 2,
         "two splits of one armed key produced fewer than two hits. A key whose \
          body was armed at boot serves every split of its bucket, because the \
          grids and the schedules were carved at the KEY's ceilings and the seat \
          retires the rows this fire did not bring: {after}"
     );
     assert_eq!(
-        after.captures, before.captures,
+        after.tally.captures, before.tally.captures,
         "the serving path captured {} body/bodies. The map is sealed after \
          `Shell::arm_bodies`, so a fire that mints one is a fire the boot did \
          not arm — read `sealed_declines` beside it: {after}",
-        after.captures - before.captures,
+        after.tally.captures - before.tally.captures,
     );
     // **AND THE WITNESS IS NOT SILENTLY WALKING**, which is the way claim (b)
     // failed before this file fired the triple the enumeration actually
@@ -434,11 +442,11 @@ fn an_armed_island_body_replays_at_another_split_and_its_sibling_walks() {
     // byte below still matches. This is the assertion that can tell the two
     // apart, and it belongs to the ARMED half.
     assert_eq!(
-        after.sealed_declines, before.sealed_declines,
+        after.tally.sealed_declines, before.tally.sealed_declines,
         "the sealed map turned this composition away {} time(s) — so the key \
          these fires present is not one `Shell::arm_bodies` armed, and the \
          stderr line beside this one spells the key it wanted: {after}",
-        after.sealed_declines - before.sealed_declines,
+        after.tally.sealed_declines - before.tally.sealed_declines,
     );
 
     // **CLAIM (c), THE REPLAY HALF.** The window table is derived every fire,
@@ -474,21 +482,21 @@ fn an_armed_island_body_replays_at_another_split_and_its_sibling_walks() {
     let declined = shell.body_stats();
     eprintln!("after the unarmed sibling: {declined}");
     assert!(
-        declined.sealed_declines >= after.sealed_declines + 1,
+        declined.tally.sealed_declines >= after.tally.sealed_declines + 1,
         "the sealed map served a composition the enumeration never armed, or \
-         counted the decline somewhere else. `BodyStats::sealed_declines` is \
+         counted the decline somewhere else. `BodyTally::sealed_declines` is \
          the one surface that says how far the traffic stands outside the \
          lattice: {declined}"
     );
     assert_eq!(
-        declined.hits, after.hits,
+        declined.tally.hits, after.tally.hits,
         "the unarmed sibling was served from a body. Its present set is not a \
          key `Shell::arm_bodies` armed, so a hit here means some other key's \
          body answered for it — which is the one failure a byte diff cannot be \
          relied on to catch: {declined}"
     );
     assert_eq!(
-        declined.captures, after.captures,
+        declined.tally.captures, after.tally.captures,
         "the declined fire minted a body. A sealed map warms toward no capture: \
          that is what `sealed_declines` means and `misses` does not: {declined}"
     );
@@ -604,9 +612,9 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     };
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU")(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import")(&source)
+    let contract = models::import_of(SKU).expect("the catalog ships an import")(&source)
         .expect("the import contract fits its own checkpoint");
     drop(source);
 
@@ -640,7 +648,7 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
             copies: true,
             ..engine_cuda::Knobs::default()
         },
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         weight_cache_dir: None,
     })

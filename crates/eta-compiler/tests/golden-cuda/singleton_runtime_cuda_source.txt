@@ -1,7 +1,20 @@
 # oracle dump: pie_cuda_driver::pipeline::generated::singleton_runtime_cuda_source
 # source of truth: compiler/codegen/src/cuda/ (the C++ oracle this was dumped from is deleted)
-# emitter_version: 24
+# emitter_version: 25
 # emitter_version 22 -> 24 WITHOUT a body change, over two waves. 23: `codegen::cuda::order` gives the single-node `top_k` library region a generated kernel of its own. 24: the same emitter took `sort_desc` (it is `top_k` at k = n) and `codegen::cuda::scan` took `cumsum`/`cumprod`. In both waves `emit_program` emits source where it used to emit a refusal. None of these dumps records those emitters -- they record `emit_fused_region_cuda`, whose bytes did not move -- but the CONSTANT keys every engine's compile cache and its NEGATIVE tier, and a shell that had already remembered `this guest program does not compile here` for a ranking or scanning program answers from that memory until the key changes.
+# emitter_version 24 -> 25 WITHOUT a body change either, and this one is a shared-ABI
+#   edit rather than a new emitter. `PtirLaneRecord` in `runtime/cuda/fused_block0.cuh`
+#   grew `attn_score_base` and `attn_score_row_stride`: the record is declared once in
+#   `codegen::layout` for both backends, and the METAL grouped form needed a second
+#   address on it because that form binds no per-intrinsic buffer and the attention
+#   -score slab is not the readout allocation. CUDA reaches the same rectangle through
+#   its five per-(lane, intrinsic) side arrays and reads neither field -- but the struct
+#   is 96 -> 112 bytes on both planes, so a kernel cached under 24 strides the lane
+#   table sixteen bytes short per lane and reads every lane after the first at the wrong
+#   offset. That is the invalidation this constant exists to force. The bodies below are
+#   unchanged: `golden-cuda/oracle-inputs/fused_block0.cuh` is the text the dump was
+#   taken with and `device_text.rs` puts it back, because those bytes are the kernel
+#   side's rather than the emitter's.
 # @runtime: bytes=46235 fnv1a64=0x7d926cdb88ba105b
 # cases: 1
 # REGENERATED: the body below is this compiler's output, not the recorded output of the source of truth above

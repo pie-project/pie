@@ -122,7 +122,7 @@ fn container(snapshot: &Path) -> Option<PathBuf> {
 /// The lane word the model's own `Classify` computes — runtime-side work, done
 /// here because this test IS the runtime for the length of one fire.
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 /// A loaded shell, or `None` and a sentence saying what was missing.
@@ -142,11 +142,12 @@ fn ready(what: &str) -> Option<Shell> {
         eprintln!("skipping {what}: {checkpoint:?} holds no tensor container");
         return None;
     };
-    let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the SKU");
     let trace = trace(Platform::Cuda);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the SKU's import contract fits its own checkpoint");
+    let contract =
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+            .expect("the SKU's import contract fits its own checkpoint");
     drop(source);
 
     let shell = Shell::load(Boot {
@@ -173,7 +174,7 @@ fn ready(what: &str) -> Option<Shell> {
         // reader can see it.
         graphs: engine_cuda::Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         weight_cache_dir: None,
     })

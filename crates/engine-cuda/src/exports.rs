@@ -203,6 +203,45 @@ pub(crate) fn corrected_classes(trace: &Trace, compiled: &CompiledModel) -> mode
     })
 }
 
+/// The classes whose window SCATTERS TOWER OUTPUT INTO TOKEN ROWS — the
+/// MEDIA classes, in the only vocabulary this shell has for the word (the
+/// multi-unit bodies wave).
+///
+/// [`masked_classes`]'s fourth twin, and it exists for
+/// [`decoding_classes`]'s reason exactly: the bodies path's load-time arming
+/// (`Shell::arm_bodies`) has to synthesize a fire that carries an IMAGE
+/// before any caller has shown it one, and a shell cannot compute a lane's
+/// fact word — the word is the model's `Classify::of`, runtime-side, and
+/// which bit is `media` stays the model's business (multimodal §15). So the
+/// question is asked about OPS: a class whose window runs the embed merge is
+/// a class an image lane lands in, and `Class::word` then names a word that
+/// resolves back to it.
+///
+/// **THE MERGE AND NOT THE TOWER.** The tower's own regions are on the PATCH
+/// axis and their rectangles are `Dim::Patches`; a class does not "run" them
+/// in the sense this predicate means, because an axis-empty fire simply does
+/// not launch that unit. What a media lane's class does run is the scatter
+/// that puts the tower's soft tokens onto that lane's placeholder rows —
+/// `layout.scatter_rows` or its dropping form — which is a TRUNK-unit node
+/// with a class mask, guarded on the media fact. That guard is the thing this
+/// reads.
+///
+/// Empty for every text-only artifact, and then the arming pass's tower arm
+/// enumerates nothing at all — which is the same nothing a plan with no
+/// decode arm gives the decode arm, and is why neither needs a second clause
+/// anywhere.
+#[must_use]
+pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> model_ir::ClassSet {
+    classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            model_ir::Operation::Layout(
+                model_ir::Layout::ScatterRows { .. } | model_ir::Layout::ScatterLiveRows { .. }
+            )
+        )
+    })
+}
+
 /// The classes whose window runs an `attention.decode` arm — the DECODE
 /// classes, in the only vocabulary this shell has for the word.
 ///

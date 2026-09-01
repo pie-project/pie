@@ -9,9 +9,15 @@
 //! it. The one coupling that matters is the engine cache root: this module
 //! names `cache/`, and `embedded_engine::set_cache_dir` is what tells the
 //! engines to write there. Its *contents* are enumerated from disk rather than
-//! listed here, because the subdirectory names (`ptir-cuda`, the GEMM tuning
-//! files) are chosen on the C++ side and a list here would be a second copy
-//! free to drift from them.
+//! listed here, because the subdirectory names (`cubins`, `gemm-algos`, and
+//! whatever the C++ side chooses) belong to the crates that write them, and a
+//! list here would be a second copy free to drift from them.
+//!
+//! That enumeration is what made bringing the kernel caches home a change with
+//! no line in this file: `kernels-cuda` used to resolve `~/.cache/pie` for
+//! itself, which put its cubins and its measured cuBLASLt table outside
+//! `$PIE_HOME` and so outside everything below. They take their subdirectory
+//! off the same root now and are counted and reclaimed with the rest.
 //!
 //! The exception is [`PLANNER_PROFILE_FILE`], and it is named here precisely
 //! *because* it does not share the reclaim semantics of everything around it.
@@ -126,9 +132,16 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
             // below, because it is the one thing here a cold boot does not
             // rebuild. The claim "deleting costs one cold rebuild" is true of
             // what is left, and was false while it covered the profile.
-            what: "Engine-side disk caches: compiled ETA modules, GEMM \
-                   autotuning results. All keyed and self-invalidating; \
-                   deleting costs one cold rebuild.",
+            // The GEMM half of this sentence was FALSE until the cache roots
+            // came together: `kernels-cuda` resolved its own path from
+            // `$XDG_CACHE_HOME`, so its cubins and its measured cuBLASLt table
+            // sat in `~/.cache/pie` — outside `$PIE_HOME`, and outside
+            // everything this module can see or reclaim. They are `cubins/`
+            // and `gemm-algos/` under this root now, enumerated from disk with
+            // the rest.
+            what: "Engine-side disk caches: compiled ETA modules, kernel \
+                   cubins, GEMM autotuning results. All keyed and \
+                   self-invalidating; deleting costs one cold rebuild.",
             reclaim: Reclaim::Safe,
             keep: &["weights", PLANNER_PROFILE_FILE, PLANNER_PROFILE_LOCK],
         },

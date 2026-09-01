@@ -22,9 +22,9 @@
 
 use crate::plan::index::PlanIndex;
 use crate::plan::{
-    FUSION_FP8_TO_MXFP4, LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_BIAS,
-    TILE_MAP_CAST, TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_SCALE, TileMapKind,
-    TransformFusion,
+    LoadPlan, SourceExtent, StorageInstr, StorageTarget, TILE_MAP_BIAS, TILE_MAP_CAST,
+    TILE_MAP_DECODE, TILE_MAP_ENCODE, TILE_MAP_REBLOCK, TILE_MAP_REPACK, TILE_MAP_SCALE,
+    TileMapKind,
 };
 use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 
@@ -78,8 +78,6 @@ use crate::types::{BackendKind, BufferId, DType, Encoding, QuantScheme};
 /// read it. That test is where the two meet.
 pub const CUDA_CAST_FP32_TO_BF16: &str = "quant::cast_fp32_to";
 pub const CUDA_SCALE_ROWS_BF16: &str = "quant::scale_rows";
-pub const CUDA_QUANTIZE_BF16_TO_MXFP4: &str = "quant::quantize_bf16_to_mxfp4_e2m1_per_block";
-pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_per_channel";
 
 /// The transforms `engine/cuda`'s kernels implement.
 ///
@@ -115,8 +113,18 @@ pub const CUDA_QUANTIZE_BF16_TO_FP8: &str = "quant::quantize_bf16_to_fp8_e4m3_pe
 /// decode whose zero-point half is a per-block `Bias` — and every plain-norm
 /// import of an MLX spelling carries the `-1.0` fold-undo besides. Both run
 /// on the host, exactly as the `Scale` next to them does.
+///
+/// **AND `ENCODE` WAS HERE, AND ITS DEPARTURE IS THE RULING** (§M-3, closing
+/// §J3). Serve-as-stored says the stored form is the served form; an encode
+/// in a SERVING plan says the opposite, and one family — kimi's mxfp4 expert
+/// banks over a bf16 checkpoint — was the whole of why the bit was set. The
+/// transform did not die and the SITE moved: `pie model import` compiles
+/// against [`CONVERT_TILE_MAP_MASK`], runs the same chain once on the host,
+/// and writes the codes. A device plan that still carries one is a load that
+/// would quantize a hundred gigabytes on the way in, so it is refused here,
+/// with the tensor named and the command to run.
 pub const CUDA_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE | TILE_MAP_BIAS;
+    TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_DECODE | TILE_MAP_BIAS;
 
 /// The transforms a plan for a Metal target may CARRY.
 ///
@@ -151,7 +159,7 @@ pub const CUDA_TILE_MAP_MASK: u32 =
 ///
 /// It was found by `qwen35-d0.8b-mlxu4`'s first light. `mlx_lm.convert` folds
 /// the `+1` of `Qwen3_5RMSNorm` into the norm weights it writes (see
-/// `model::qwen_3::import`'s `Layout::folds_the_norm_one`), so the import must
+/// `models::qwen_3::import`'s `Layout::folds_the_norm_one`), so the import must
 /// take it back out; declaring that refused the load with a mask, four stages
 /// before anything ran.
 ///
@@ -163,8 +171,18 @@ pub const CUDA_TILE_MAP_MASK: u32 =
 /// `qwen38-flash-mlxu4` arrived (see `CUDA_TILE_MAP_MASK`).
 ///
 /// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
+///
+/// **AND `ENCODE` WAS HERE, AND ITS DEPARTURE IS THE RULING** (§M-3, closing
+/// §J3). Serve-as-stored says the stored form is the served form; an encode
+/// in a SERVING plan says the opposite, and one family — kimi's mxfp4 expert
+/// banks over a bf16 checkpoint — was the whole of why the bit was set. The
+/// transform did not die and the SITE moved: `pie model import` compiles
+/// against [`CONVERT_TILE_MAP_MASK`], runs the same chain once on the host,
+/// and writes the codes. A device plan that still carries one is a load that
+/// would quantize a hundred gigabytes on the way in, so it is refused here,
+/// with the tensor named and the command to run.
 pub const METAL_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE | TILE_MAP_BIAS;
+    TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_DECODE | TILE_MAP_BIAS;
 
 /// The transforms a Vulkan plan may carry.
 ///
@@ -181,8 +199,17 @@ pub const METAL_TILE_MAP_MASK: u32 =
 /// the other.
 ///
 /// [`ArenaBacking::runs_named_kernels`]: crate::executor::arena::ArenaBacking::runs_named_kernels
-pub const VULKAN_TILE_MAP_MASK: u32 =
-    TILE_MAP_CAST | TILE_MAP_ENCODE | TILE_MAP_SCALE | TILE_MAP_DECODE;
+///
+/// **AND `ENCODE` WAS HERE, AND ITS DEPARTURE IS THE RULING** (§M-3, closing
+/// §J3). Serve-as-stored says the stored form is the served form; an encode
+/// in a SERVING plan says the opposite, and one family — kimi's mxfp4 expert
+/// banks over a bf16 checkpoint — was the whole of why the bit was set. The
+/// transform did not die and the SITE moved: `pie model import` compiles
+/// against [`CONVERT_TILE_MAP_MASK`], runs the same chain once on the host,
+/// and writes the codes. A device plan that still carries one is a load that
+/// would quantize a hundred gigabytes on the way in, so it is refused here,
+/// with the tensor named and the command to run.
+pub const VULKAN_TILE_MAP_MASK: u32 = TILE_MAP_CAST | TILE_MAP_SCALE | TILE_MAP_DECODE;
 
 /// The transforms `host_executor` implements. Not a device capability: it is
 /// what a plan compiled for no device may carry, which is the reference the
@@ -212,7 +239,19 @@ pub const HOST_TILE_MAP_MASK: u32 =
 /// larger thing than it was meant to protect — so the three device masks
 /// admit it now, and `validate_bound_encodings` enforces the fact that
 /// actually matters: a device is never HANDED a block.
-pub const CONVERT_TILE_MAP_MASK: u32 = HOST_TILE_MAP_MASK | TILE_MAP_ENCODE | TILE_MAP_DECODE;
+/// **AND `REPACK` JOINED THEM, ON THE ENCODE'S OWN ARGUMENT** (§J4b). A
+/// repack is a pure relabelling — the served row is the stored row, shifted
+/// and masked into the order a kernel's fragment wants — so it is not the
+/// conversion an encode is. What makes it an IMPORT-time transform is the
+/// same thing that made the encode one: it is paid once per weight, and
+/// paying it at every boot over a hundred gigabytes is a load that spends
+/// minutes rearranging bytes that could have been rearranged when the
+/// artifact was written. No device mask carries the bit, so a serving plan
+/// that states one is refused with the tensor named, exactly as an encode
+/// is; `pie model import` compiles against this constant, runs the
+/// permutation on the host, and writes the repacked plane.
+pub const CONVERT_TILE_MAP_MASK: u32 =
+    HOST_TILE_MAP_MASK | TILE_MAP_ENCODE | TILE_MAP_DECODE | TILE_MAP_REPACK;
 
 /// Which transforms a plan compiled for `backend` may CARRY.
 ///
@@ -280,28 +319,39 @@ mod mask_tests {
         }
     }
 
-    /// Vulkan is a backend of its own and not the unknown one.
+    /// **NO SERVING PLAN CONVERTS** (§M-3), and conversion still can.
     ///
-    /// It matters because `Unknown` is the arm a missing backend falls into,
-    /// and its mask does NOT admit `TILE_MAP_ENCODE` -- a quantised
-    /// checkpoint compiled against it produces a plan that carries no encode
-    /// instruction, which loads and is wrong. The Vulkan shell asked for
-    /// Metal's target for exactly this reason before it had one of its own,
-    /// with a note saying so; this is that note as a check.
+    /// This test used to say the opposite for Vulkan alone: that its mask had
+    /// to admit an encode or a quantised checkpoint would compile to a plan
+    /// that silently skipped one. That premise died with the door — a
+    /// checkpoint stored plain against a packed declaration is not a load to
+    /// be completed, it is a source to be imported — so the check is turned
+    /// over and widened to every backend, which is the property that actually
+    /// has to hold.
+    ///
+    /// [`CONVERT_TILE_MAP_MASK`] is asserted in the same breath because the
+    /// two are one statement: the encode moved, it did not die, and a test
+    /// that only checked the departure would be satisfied by deleting it.
     #[test]
-    fn the_vulkan_target_admits_what_a_quantised_load_needs() {
-        let vulkan = compilable_tile_maps(BackendKind::Vulkan);
+    fn no_device_plan_may_carry_an_encode_and_conversion_still_may() {
+        for backend in [
+            BackendKind::Cuda,
+            BackendKind::Metal,
+            BackendKind::Vulkan,
+            BackendKind::Unknown,
+        ] {
+            assert_eq!(
+                compilable_tile_maps(backend) & TILE_MAP_ENCODE,
+                0,
+                "a {backend:?} plan may carry an encode, so a serving load can \
+                 still quantize on the way in"
+            );
+        }
         assert_ne!(
-            vulkan & TILE_MAP_ENCODE,
+            CONVERT_TILE_MAP_MASK & TILE_MAP_ENCODE,
             0,
-            "a Vulkan plan may not carry an encode, so a quantised checkpoint \
-             compiles to a plan that silently skips it"
-        );
-        assert_ne!(
-            vulkan,
-            compilable_tile_maps(BackendKind::Unknown),
-            "the Vulkan arm is the fallback one, which is what having an arm \
-             was supposed to stop"
+            "conversion may not carry an encode either, so `pie model import` \
+             cannot write the codes the load now insists on"
         );
     }
 
@@ -314,7 +364,7 @@ mod mask_tests {
     /// instruction the selection was written for.
     #[test]
     fn a_kind_the_cuda_selector_can_answer_is_a_kind_the_mask_allows() {
-        for kind in [TileMapKind::Cast, TileMapKind::Scale, TileMapKind::Encode] {
+        for kind in [TileMapKind::Cast, TileMapKind::Scale] {
             assert_ne!(
                 CUDA_TILE_MAP_MASK & kind.capability_bit(),
                 0,
@@ -384,12 +434,6 @@ pub struct TileMapFacts {
 /// What the lowering decided. Written into the instruction verbatim.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TileLowering {
-    /// Rows of the output the engine transforms per launch. `0` means "no
-    /// tiling" — do the whole tensor in one pass — which is both the answer for
-    /// instructions that cannot be tiled and the answer when one tile covers
-    /// everything.
-    pub rows_per_tile: u32,
-    pub fusion: TransformFusion,
     /// The backend entry point these operands run as, or `None` for the host.
     ///
     /// See [`TransformSpec::kernel`](crate::plan::TransformSpec::kernel) for
@@ -430,15 +474,13 @@ pub fn lower(plan: &mut LoadPlan) -> usize {
         let (
             Some(facts),
             StorageInstr::TileMap {
-                tile, transform, ..
+                transform, ..
             },
         ) = (facts, instr)
         else {
             continue;
         };
         let lowering = lower_tile_map(&facts, &target);
-        tile.rows_per_tile = lowering.rows_per_tile;
-        transform.fusion = lowering.fusion;
         transform.kernel = lowering.kernel.map(str::to_string);
         named += usize::from(lowering.kernel.is_some());
     }
@@ -458,7 +500,6 @@ fn lower_tile_map(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering 
     match target.backend {
         BackendKind::Cuda => TileLowering {
             kernel: kernel(cuda_kernel(facts)),
-            ..cuda_encode(facts, target)
         },
         // Neither Metal nor Vulkan runs a transform: the host executor
         // derives its own tiling from `max_tile_bytes` at run time, which it
@@ -538,147 +579,17 @@ fn cuda_kernel(facts: &TileMapFacts) -> Option<&'static str> {
         // one is a contract that wandered, and it should be refused by name
         // rather than answered by a host fallback nobody asked for.
         TileMapKind::Bias => None,
-        // Runtime quantization. Both rows want a bf16 source and a 2-D shape;
-        // the MXFP4 one additionally wants a width that is a whole number of
-        // its 32-element block, and refuses to guess otherwise.
-        //
-        // Every other target, including the fused FP8->MXFP4 that
-        // `transcode.cu` implements, stays on the host: reaching it needs the
-        // SOURCE's block scales, which an `Encode` whose input is already a
-        // bf16 buffer does not have.
-        TileMapKind::Encode => {
-            let (_, cols) = facts.shape?;
-            if facts.source_dtype != Some(DType::Bf16) {
-                return None;
-            }
-            match facts.transform_to {
-                Some(QuantScheme::Mxfp4E2M1E8M0) => {
-                    (cols % 32 == 0).then_some(CUDA_QUANTIZE_BF16_TO_MXFP4)
-                }
-                Some(QuantScheme::Fp8E4M3) => Some(CUDA_QUANTIZE_BF16_TO_FP8),
-                _ => None,
-            }
-        }
-        TileMapKind::Decode
+        // **AND `Encode` HAD TWO ROWS HERE** — a bf16->MXFP4 and a
+        // bf16->FP8 quantize, the load-time door §M-3 shut. No device mask
+        // admits an encode any more, so a row for one could never be
+        // selected; the transform runs on the host, at `pie model import`,
+        // and the kernels it named are gone with it.
+        TileMapKind::Encode
+        | TileMapKind::Decode
         | TileMapKind::Transcode
         | TileMapKind::Reblock
         | TileMapKind::Repack => None,
     }
-}
-
-/// CUDA's one rule, ported from the deleted C++ `transcode_engine.hpp`.
-///
-/// The behaviour is deliberately unchanged from the C++ it replaces — this
-/// moved *where* the decision happens, not *what* it decides, so the existing
-/// kernel parity tests stayed valid as the safety net (`architecture.md` §8.1).
-/// The citation is provenance for a rule ported verbatim; the file is gone, and
-/// this is now the only statement of it.
-fn cuda_encode(facts: &TileMapFacts, target: &StorageTarget) -> TileLowering {
-    if facts.kind != TileMapKind::Encode {
-        return TileLowering::default();
-    }
-    TileLowering {
-        rows_per_tile: encode_rows_per_tile(facts, target),
-        fusion: encode_fusion(facts, target),
-        // Not this function's question. `lower_tile_map` asks `cuda_kernel`
-        // and overwrites; stating `None` here rather than answering twice is
-        // what keeps the two decisions from having to agree.
-        ..TileLowering::default()
-    }
-}
-
-/// Rows of the output the engine transforms per launch, or `0` for "all at
-/// once".
-///
-/// Ported including its use of the *logical* dtype width for a quantized
-/// source. That is not the true on-disk row size, but reproducing the
-/// arithmetic exactly is what keeps this a pure relocation; changing the budget
-/// is a separate question.
-///
-/// Every number this reads is now stated by the target. The rule that is left —
-/// scratch is the source plus the dequant buffer, unless they are the same
-/// dtype — is the part that cannot be a field, because it is *how the kernel is
-/// written*, not what the device is.
-fn encode_rows_per_tile(facts: &TileMapFacts, target: &StorageTarget) -> u32 {
-    let Some((rows, cols)) = facts.shape else {
-        return 0;
-    };
-    // A strided source would need its stride re-derived per tile, so only a
-    // contiguous run qualifies. An Encode with no source reads a device buffer,
-    // which is contiguous by construction.
-    if facts.has_source && !facts.compact_source {
-        return 0;
-    }
-    let Some(source_dtype) = facts.source_dtype else {
-        return 0;
-    };
-    // A block-scaled source carries one scale per `[block_scale_rows, N]` tile,
-    // so slicing the dequant by an arbitrary row count would cut a scale block
-    // in half. GLM-5.1's expert weights at [2048, 6144] fit in ~50 MB of
-    // scratch, so refusing to tile them costs nothing.
-    if target.block_scale_rows != 0 && crate::types::is_block_scaled(source_dtype) {
-        return 0;
-    }
-    let scratch_dtype = target.encode_scratch_dtype;
-    let source_row_bytes = cols.saturating_mul(source_dtype.bytes_ceil());
-    let scratch_row_bytes = cols.saturating_mul(scratch_dtype.bytes_ceil());
-    let scratch_per_row = if source_dtype == scratch_dtype {
-        scratch_row_bytes
-    } else {
-        source_row_bytes.saturating_add(scratch_row_bytes)
-    };
-    let rows_per_tile = rows_under_budget(rows, scratch_per_row, facts.max_tile_bytes);
-    // One tile covering everything is the untiled case; say so, rather than
-    // making the engine compare a row count against the shape to find out.
-    if u64::from(rows_per_tile) >= rows {
-        0
-    } else {
-        rows_per_tile
-    }
-}
-
-/// Whether to transcode FP8 straight to MXFP4, skipping the BF16 HBM
-/// round-trip.
-///
-/// Bit-identical to the two-step path and kernel parity-tested. What changed is
-/// that the opt-out is now a bit in `StorageTarget::fusion_mask` — a compile
-/// input — instead of `PIE_CUDA_DISABLE_FUSED_TRANSCODE` read inside the
-/// executor. An environment variable that silently selects different kernels
-/// for the same plan is exactly the thing `architecture.md` §8.1 objects to; as
-/// a target field it produces a *different plan*, which is the honest
-/// representation of different execution.
-///
-/// The *chain* stays here rather than becoming data, and that is the
-/// `architecture.md` §9 line: which two steps `Fp8ToMxfp4` collapses, and the
-/// proof that collapsing them is bit-identical, is the loader's model of the
-/// transform. Whether the kernel exists is the engine's, and that is the bit.
-fn encode_fusion(facts: &TileMapFacts, target: &StorageTarget) -> TransformFusion {
-    let fusable = target.fusion_mask & FUSION_FP8_TO_MXFP4 != 0
-        && facts.transform_to == Some(QuantScheme::Mxfp4E2M1E8M0)
-        && facts.has_source
-        && facts.source_dtype == Some(DType::E4m3);
-    if fusable {
-        TransformFusion::Fp8ToMxfp4
-    } else {
-        TransformFusion::None
-    }
-}
-
-/// Tile a transform by rows under a byte budget.
-///
-/// Separate because it is arithmetic rather than policy: given the cost of one
-/// row and the budget for one tile, this is the row count. What differs per
-/// backend is `scratch_per_row` and whether tiling is legal at all.
-fn rows_under_budget(rows: u64, scratch_per_row: u64, max_tile_bytes: u64) -> u32 {
-    if max_tile_bytes == 0 || scratch_per_row == 0 {
-        return clamp_rows(rows);
-    }
-    let per_tile = (max_tile_bytes / scratch_per_row).max(1);
-    clamp_rows(rows.min(per_tile))
-}
-
-fn clamp_rows(rows: u64) -> u32 {
-    u32::try_from(rows).unwrap_or(u32::MAX)
 }
 
 fn extent_is_compact(extent: &crate::extent::Extent) -> bool {

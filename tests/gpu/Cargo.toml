@@ -55,7 +55,7 @@ engine-cuda = { path = "../../crates/engine-cuda" }
 # The catalog's classifier input (`model::Request`), which is what states a
 # lane's fact word. A gate that spelled a word by hand would be pinning a
 # different model than the one it fires.
-model = { path = "../../crates/model" }
+models = { path = "../../crates/models" }
 # The guest-program half of `cuda_row_selected_readout`: it authors an ETA
 # epilogue at the LOAD's own vocabulary (a corpus golden is authored at the
 # dummy profile's and cannot bind here), plans it and emits CUDA for it —

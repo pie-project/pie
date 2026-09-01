@@ -85,6 +85,16 @@ pub(super) fn recompute_memory_plan(program: &mut LoadPlan) -> Result<usize> {
                     .checked_add(source.span_bytes)
                     .or_overflow("write byte overflow")?;
             }
+            // A gather reads its source once and writes its destination once,
+            // and the two are the same byte count in a different order.
+            StorageInstr::GatherWrite { source, .. } => {
+                checkpoint_read_bytes = checkpoint_read_bytes
+                    .checked_add(source.span_bytes)
+                    .or_overflow("read byte overflow")?;
+                device_write_bytes = device_write_bytes
+                    .checked_add(source.span_bytes)
+                    .or_overflow("write byte overflow")?;
+            }
             StorageInstr::TileMap {
                 source,
                 dest,

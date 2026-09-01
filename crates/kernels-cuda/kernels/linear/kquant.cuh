@@ -40,7 +40,7 @@
 // different kernel body: the decode arithmetic here is the format's, and
 // only the addressing would move.
 //
-// Geometry and guard are `linear/quant.cuh`'s `matmul_mlx_affine`, verbatim:
+// Geometry and guard are `linear/quant.cuh`'s `matmul_affine`, verbatim:
 // one block column per ACTIVATION ROW, `kRowsT` weight rows per warp, a lane
 // per super-block striding the row, and the trailing staged-rows `win` seat
 // so a replay carved at a bucket retires its padded rows off a word the fire
@@ -356,7 +356,7 @@ __global__ void matmul_q3k(
 // `d·sc(b)·q − dmin·m(b)`, the minimum SUBTRACTED, not folded into `q`.
 //
 // So the dot carries the same part/xsum pair the affine skeleton already
-// accumulates (`matmul_mlx_affine`, `moe_matmul_select_mlxu4`):
+// accumulates (`matmul_affine`, `moe_matmul_select_mlxu4`):
 //
 //     Σ (d·sc·q − dmin·m)·x  =  d·sc·Σ q·x  −  dmin·m·Σ x
 //

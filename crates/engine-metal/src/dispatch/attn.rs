@@ -8,14 +8,6 @@ use model_ir::{Attention, Operands, StructKind};
 
 use crate::run::{Run, StructSlot};
 
-/// `attention.mla_plan` refuses before a payload exists
-/// (`kernels_metal::attn::mla`), so no consuming arm can ever hold a live
-/// one; the unit keeps the stubs' signatures satisfied while each refusal
-/// names its own entry. When the builder becomes real, this constant stops
-/// making sense and the arms resolve through a `Run::mla_plan` accessor
-/// instead.
-const NO_MLA_PLAN: &attn::mla::MlaPlan = &attn::mla::MlaPlan;
-
 impl DispatchAttention for Run<'_> {
     fn dispatch(&mut self, op: &Attention) -> Result<(), KernelError> {
         self.attention(op).map_err(crate::error::kernel)
@@ -548,6 +540,11 @@ impl Run<'_> {
                 self.tensor(*write_page),
                 self.tensor(*write_offset),
             ),
+            // MENLO-SEAM (engine side): the op names a plan and kv geometry the
+            // metal flash engine never reads — it binds the fire's causal
+            // position and owning-request tables here (the paged sdpa family's
+            // seam), cut to the window like the `q` beside them, and walks the
+            // pool's pages by request.
             Attention::MlaDecode {
                 q,
                 plan: _,
@@ -557,17 +554,24 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-            } => attn::mla::attention_decode(
-                self.ctx(),
-                self.tensor(*q),
-                NO_MLA_PLAN,
-                self.tensor(*q_pe),
-                self.pool(*cache),
-                *heads,
-                *kv_lora_rank,
-                *sm_scale,
-                self.tensor(*o),
-            ),
+            } => {
+                let (positions, request_of_token) = {
+                    let fire = self.bindings();
+                    (fire.positions, fire.tables.request_of_token)
+                };
+                attn::mla::attention_decode(
+                    self.ctx(),
+                    self.tensor(*q),
+                    self.tensor(*q_pe),
+                    self.pool(*cache),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
+                    *heads,
+                    *kv_lora_rank,
+                    *sm_scale,
+                    self.tensor(*o),
+                )
+            }
             Attention::MlaPrefill {
                 q,
                 plan: _,
@@ -577,17 +581,24 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-            } => attn::mla::attention_prefill(
-                self.ctx(),
-                self.ragged(*q),
-                NO_MLA_PLAN,
-                self.tensor(*q_pe),
-                self.pool(*cache),
-                *heads,
-                *kv_lora_rank,
-                *sm_scale,
-                self.tensor(*o),
-            ),
+            } => {
+                let (positions, request_of_token) = {
+                    let fire = self.bindings();
+                    (fire.positions, fire.tables.request_of_token)
+                };
+                attn::mla::attention_prefill(
+                    self.ctx(),
+                    self.ragged(*q),
+                    self.tensor(*q_pe),
+                    self.pool(*cache),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
+                    *heads,
+                    *kv_lora_rank,
+                    *sm_scale,
+                    self.tensor(*o),
+                )
+            }
             Attention::MlaDecodeSelected {
                 q,
                 plan: _,
@@ -598,18 +609,25 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-            } => attn::mla::attention_decode_selected(
-                self.ctx(),
-                self.tensor(*q),
-                NO_MLA_PLAN,
-                self.tensor(*q_pe),
-                self.tensor(*selection),
-                self.pool(*cache),
-                *heads,
-                *kv_lora_rank,
-                *sm_scale,
-                self.tensor(*o),
-            ),
+            } => {
+                let (positions, request_of_token) = {
+                    let fire = self.bindings();
+                    (fire.positions, fire.tables.request_of_token)
+                };
+                attn::mla::attention_decode_selected(
+                    self.ctx(),
+                    self.tensor(*q),
+                    self.tensor(*q_pe),
+                    self.tensor(*selection),
+                    self.pool(*cache),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
+                    *heads,
+                    *kv_lora_rank,
+                    *sm_scale,
+                    self.tensor(*o),
+                )
+            }
             Attention::MlaPrefillSelected {
                 q,
                 plan: _,
@@ -620,40 +638,99 @@ impl Run<'_> {
                 kv_lora_rank,
                 sm_scale,
                 o,
-            } => attn::mla::attention_prefill_selected(
-                self.ctx(),
-                self.ragged(*q),
-                NO_MLA_PLAN,
-                self.tensor(*q_pe),
-                self.tensor(*selection),
-                self.pool(*cache),
-                *heads,
-                *kv_lora_rank,
-                *sm_scale,
-                self.tensor(*o),
-            ),
+            } => {
+                let (positions, request_of_token) = {
+                    let fire = self.bindings();
+                    (fire.positions, fire.tables.request_of_token)
+                };
+                attn::mla::attention_prefill_selected(
+                    self.ctx(),
+                    self.ragged(*q),
+                    self.tensor(*q_pe),
+                    self.tensor(*selection),
+                    self.pool(*cache),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
+                    *heads,
+                    *kv_lora_rank,
+                    *sm_scale,
+                    self.tensor(*o),
+                )
+            }
+
+            // qwen4's n-gram hasher: token ids against the lane's trailing
+            // window, the same state discipline the convolution below keeps.
+            //
+            // **THE CONSTANTS COME OFF THE SHELL AND NOT OFF THE NODE.** The
+            // CUDA sibling hands its `PleHash` aggregate across the launch ABI
+            // by value; this plane's `ArgValue` has no by-value blob seat, so
+            // `crate::scratch` wrote the same numbers into a `u64` plane at
+            // load and the arm mints it here. `None` is a load that wrote no
+            // plane for these constants, which is a refusal by name and not a
+            // launch against primes that are not there.
+            Attention::PleNgramIds {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                ngram_ids,
+            } => {
+                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                    return Err(kernels_metal::Error::Unsupported { op: op.name() });
+                };
+                attn::ple::ngram_ids(
+                    self.ctx(),
+                    self.tensor(*ids),
+                    &self.recurrent(*state),
+                    hash,
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    self.tensor(*ngram_ids),
+                )
+            }
+            Attention::PleNgramIdsChunked {
+                ids,
+                state,
+                eos,
+                mults,
+                primes,
+                offsets,
+                heads_per_ngram,
+                ngram_ids,
+            } => {
+                let Some(hash) = self.ple_hash(mults, primes, offsets) else {
+                    return Err(kernels_metal::Error::Unsupported { op: op.name() });
+                };
+                attn::ple::ngram_ids_chunked(
+                    self.ctx(),
+                    self.ragged(*ids),
+                    &self.recurrent(*state),
+                    hash,
+                    *eos,
+                    mults,
+                    primes,
+                    offsets,
+                    *heads_per_ngram,
+                    self.tensor(*ngram_ids),
+                )
+            }
 
             // The absorbed `ssm` family (`attention.ssm_*`), calling into
-            // `kernels_metal::attn::ssm`.
-            // qwen4's n-gram hasher and its dilated convolution: not on
-            // this plane yet.
-            Attention::PleNgramIds { .. } | Attention::PleNgramIdsChunked { .. } => {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
-            }
-            Attention::SsmCausalConv1d {
-                dilation: 2..,
-                ..
-            }
-            | Attention::SsmCausalConv1dChunked {
-                dilation: 2..,
-                ..
-            } => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            // `kernels_metal::attn::ssm`. The convolution takes its
+            // `dilation` whole now — qwen4's PLE mixes at three, every GDN
+            // mixer at one, and the undilated arm is the same launch it was.
             Attention::SsmCausalConv1d {
                 x,
                 weight,
                 state,
                 conv_width,
-                dilation: _,
+                dilation,
                 y,
             } => attn::ssm::causal_conv1d(
                 self.ctx(),
@@ -661,6 +738,7 @@ impl Run<'_> {
                 self.tensor(*weight),
                 &self.recurrent(*state),
                 *conv_width,
+                *dilation,
                 self.tensor(*y),
             ),
             Attention::SsmCausalConv1dChunked {
@@ -668,7 +746,7 @@ impl Run<'_> {
                 weight,
                 state,
                 conv_width,
-                dilation: _,
+                dilation,
                 y,
             } => attn::ssm::causal_conv1d_chunked(
                 self.ctx(),
@@ -676,6 +754,7 @@ impl Run<'_> {
                 self.tensor(*weight),
                 &self.recurrent(*state),
                 *conv_width,
+                *dilation,
                 self.tensor(*y),
             ),
             Attention::SsmGdnPrep {
@@ -821,6 +900,17 @@ impl Run<'_> {
                 *rope_dim,
                 *theta,
             ),
+            // THE TWO TABLES AND THE SLAB ARE THIS PLANE'S, AND NO OP NAMES
+            // ANY OF THEM. `index_topk_paged` on the CUDA plane rebuilds each
+            // row's absolute query position from `qo_indptr` and
+            // `kv_last_page_lens`; the metal pool carries no last-page table,
+            // so the selection reads `positions`/`request_of_token` off the
+            // fire the way `mla_naive_paged` and `pool_lse_paged` do — cut to
+            // the window, because the shader indexes them by the LAUNCH's own
+            // row. The score slab is `crate::scratch`'s index role, reserved
+            // at the paging's per-request key ceiling; a load that reserved
+            // none has no `attention.index_topk` in its trace, so reaching
+            // here without one is the shell disagreeing with its own carve.
             Attention::IndexTopk {
                 q,
                 weights,
@@ -828,17 +918,32 @@ impl Run<'_> {
                 heads,
                 head_dim,
                 top_k,
+                ratio,
                 selection,
-            } => attn::index::topk(
-                self.ctx(),
-                self.tensor(*q),
-                self.tensor(*weights),
-                self.pool(*keys),
-                *heads,
-                *head_dim,
-                *top_k,
-                self.tensor(*selection),
-            ),
+            } => {
+                let Some(scores) = self.index_scores() else {
+                    return Err(kernels_metal::Error::Unsupported {
+                        op: "attention.index_topk",
+                    });
+                };
+                let fire = self.bindings();
+                let (positions, request_of_token) =
+                    (fire.positions, fire.tables.request_of_token);
+                attn::index::topk(
+                    self.ctx(),
+                    self.tensor(*q),
+                    self.tensor(*weights),
+                    self.pool(*keys),
+                    self.cut_rows(positions),
+                    self.cut_rows(request_of_token),
+                    scores,
+                    *heads,
+                    *head_dim,
+                    *top_k,
+                    *ratio,
+                    self.tensor(*selection),
+                )
+            }
             Attention::IndexKvAppend {
                 k,
                 keys,
@@ -860,6 +965,7 @@ impl Run<'_> {
                 ratio,
                 boundary_pos,
                 boundary_req,
+                boundary_rope,
             } => attn::pool::boundary_decode(
                 self.ctx(),
                 self.tensor(*positions),
@@ -867,6 +973,7 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
+                self.tensor(*boundary_rope),
             ),
             Attention::PoolBoundaryPrefill {
                 positions,
@@ -874,6 +981,7 @@ impl Run<'_> {
                 ratio,
                 boundary_pos,
                 boundary_req,
+                boundary_rope,
             } => attn::pool::boundary_prefill(
                 self.ctx(),
                 self.ragged(*positions),
@@ -881,23 +989,81 @@ impl Run<'_> {
                 *ratio,
                 self.tensor(*boundary_pos),
                 self.tensor(*boundary_req),
+                self.tensor(*boundary_rope),
             ),
+            // MENLO-SEAM: the dsv4 compressor state (`state_kv`,
+            // `state_score`, `ape`) has no IR seat. The CUDA arm binds the
+            // slabs the shell staged into fire state (`Run::slabs`); this one
+            // binds `crate::scratch`'s pool role, reserved at the source
+            // paging's cell ceiling — the `index_topk` shape one family up,
+            // for the same reason. A load that reserved none has no
+            // `attention.pool_gather` in its trace, so reaching here without
+            // one is the shell disagreeing with its own carve.
+            //
+            // **AND THE ape SEAT IS AN OPERAND NOW.** The intra-block
+            // position plane is a checkpoint WEIGHT
+            // (`attn.compressor.ape`), not shell scratch, so it took an IR
+            // seat rather than a staged slab: `PoolGather.ape` is `Some` on
+            // a layer whose compressor states one and `None` on a
+            // parameter-free mean pool, which is the CUDA `ape == nullptr`
+            // path both shaders already carry.
             Attention::PoolGather {
                 boundary_pos,
                 boundary_req,
                 pages,
+                ape,
                 head_dim,
                 ratio,
                 entries,
-            } => attn::pool::gather(
-                self.ctx(),
-                self.tensor(*boundary_pos),
-                self.tensor(*boundary_req),
-                self.pool(*pages),
-                *head_dim,
-                *ratio,
-                self.tensor(*entries),
-            ),
+            } => {
+                let Some(state) = self.pool_state(*pages) else {
+                    return Err(kernels_metal::Error::Unsupported {
+                        op: "attention.pool_gather",
+                    });
+                };
+                attn::pool::gather(
+                    self.ctx(),
+                    self.tensor(*boundary_pos),
+                    self.tensor(*boundary_req),
+                    self.pool(*pages),
+                    *head_dim,
+                    *ratio,
+                    state.state_kv,
+                    state.state_score,
+                    ape.map(|id| self.tensor(id)),
+                    self.tensor(*entries),
+                )
+            }
+            // The gather's slabs, filled. Same seam and the same resolution:
+            // the state is keyed by the SOURCE space, which is this op's own
+            // `pages`, so a layer's writer and its reader find one plane.
+            Attention::PoolStateWrite {
+                kv,
+                score,
+                pages,
+                write_page,
+                write_offset,
+                head_dim,
+                ratio,
+            } => {
+                let Some(state) = self.pool_state(*pages) else {
+                    return Err(kernels_metal::Error::Unsupported {
+                        op: "attention.pool_state_write",
+                    });
+                };
+                attn::pool::state_write(
+                    self.ctx(),
+                    self.tensor(*kv),
+                    self.tensor(*score),
+                    self.pool(*pages),
+                    self.tensor(*write_page),
+                    self.tensor(*write_offset),
+                    *head_dim,
+                    *ratio,
+                    state.state_kv,
+                    state.state_score,
+                )
+            }
             Attention::PoolKvAppend {
                 entries,
                 boundary_pos,
@@ -932,6 +1098,34 @@ impl Run<'_> {
                 self.tensor(*request_of_token),
                 self.pool(*entries),
                 *ratio,
+                *heads,
+                *head_dim,
+                *sm_scale,
+                self.tensor(*o),
+                self.tensor(*lse),
+            ),
+            Attention::PoolLseSelected {
+                q,
+                positions,
+                request_of_token,
+                selection,
+                entries,
+                ratio,
+                top_k,
+                heads,
+                head_dim,
+                sm_scale,
+                o,
+                lse,
+            } => attn::pool::attention_lse_selected(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*positions),
+                self.tensor(*request_of_token),
+                self.tensor(*selection),
+                self.pool(*entries),
+                *ratio,
+                *top_k,
                 *heads,
                 *head_dim,
                 *sm_scale,

@@ -546,11 +546,34 @@ fn scheme_of(layout: &str, attrs: Option<&Value>) -> Result<QuantScheme, Error> 
 
 /// Which point of the affine-group space an object names.
 ///
-/// The parameters that separate the schemes this loader knows are the bit
-/// width, the packing order, and the form of the zero point. Anything the
+/// The parameters that separate the schemes this loader knows are the packing
+/// order, the form of the zero point, the form of the SCALES, and — for the
+/// rows this tree reads at one width only — the bit width. Anything the
 /// combination does not name is refused rather than rounded to the nearest
 /// scheme: reading GPTQ codes as AWQ would decode every weight backwards
 /// within its word.
+///
+/// # The width is a point, and only two rows are entitled to name one
+///
+/// `zt.quant_group/1` is parametric, and the core spec is explicit about what
+/// that costs a reader: *"a parametric profile MUST make every parameter its
+/// decoder needs a required attribute; anything left unstated will be inferred
+/// from something incidental, which is how a file that happens to use a
+/// 32-element group comes to be read as the one scheme that used to have
+/// 32-element groups."* This function was doing that with `bits`. The MLX row
+/// sat at four because MLX was four when the row was written, so the two
+/// widths that joined it later — eight for the MoE router gates, two for the
+/// DQ expert banks — fell off the table: two came back a REFUSAL of a file
+/// this tree had just written, and eight came back `Int8Asymmetric`, which is
+/// the same tuple in every field a reader was looking at.
+///
+/// So the width is matched only where this tree genuinely reads one width:
+/// `AwqInt4`, `GptqInt4` and `Int4B8` are four-bit rows here and
+/// [`QuantSpec::term`](crate::term) says so in its own words, and a wider
+/// declaration under those tuples is a scheme this crate cannot read back
+/// rather than a row to invent. The MLX row spans its three, and the tie it
+/// then makes with `Int8Asymmetric` at eight is broken by `scale_form`, which
+/// is the field whose whole job is to say what a factors plane holds.
 fn affine_group_scheme(attrs: Option<&Value>) -> Result<QuantScheme, Error> {
     let missing = |what: &str| {
         Error::Checkpoint(format!(
@@ -564,18 +587,43 @@ fn affine_group_scheme(attrs: Option<&Value>) -> Result<QuantScheme, Error> {
     let zero = attr_map(attrs, "zero_point").ok_or_else(|| missing("zero_point"))?;
     let form = map_text(zero, "form").ok_or_else(|| missing("zero_point.form"))?;
     let zero_packing = map_text(zero, "packing");
+    // **THE FIFTH PARAMETER, AND IT IS THE ONE THAT WAS NOT BEING READ.** The
+    // core spec names five things a `zt.quant_group/1` object states — bit
+    // width, group size, packing order, scale form, zero-point form — and the
+    // doc above this function names three of them plus this one. It was never
+    // fetched. Two schemes in the table below write the SAME packing order and
+    // the SAME zero point (`tensor`, packed `plain`), differ in nothing else a
+    // reader can see, and are told apart here and nowhere else.
+    let scale = map_scale_form(attrs).ok_or_else(|| missing("scale_form"))?;
 
-    Ok(match (bits, order, form, zero_packing) {
-        (4, "lsb_first", "tensor", Some("same_as_data")) => QuantScheme::AwqInt4,
-        (4, "msb_first", "tensor", Some("same_as_data")) => QuantScheme::GptqInt4,
-        (4, "lsb_first", "tensor", Some("plain")) => QuantScheme::MlxAffineU4,
-        (4, "lsb_first", "implied", _) => QuantScheme::Int4B8,
-        (8, _, "none", _) => QuantScheme::Int8Symmetric,
-        (8, _, "tensor", _) => QuantScheme::Int8Asymmetric,
+    Ok(match (bits, order, form, zero_packing, scale) {
+        (4, "lsb_first", "tensor", Some("same_as_data"), _) => QuantScheme::AwqInt4,
+        (4, "msb_first", "tensor", Some("same_as_data"), _) => QuantScheme::GptqInt4,
+        // **THREE WIDTHS, ONE SCHEME.** `MlxAffineU4` names the arithmetic and
+        // `bits` says how wide a code is — the argument `Dtype::U8g64` and the
+        // `U2g*` rows are each written on. Pinning this row at four was the
+        // reader disagreeing with its own writer: `file/write.rs` emits this
+        // exact tuple at two and at eight, so a 2-bit expert bank this tree
+        // WROTE came back "names no scheme this loader implements", and an
+        // 8-bit router gate came back as the row below.
+        (2 | 4 | 8, "lsb_first", "tensor", Some("plain"), "f16_factors") => {
+            QuantScheme::MlxAffineU4
+        }
+        (4, "lsb_first", "implied", _, _) => QuantScheme::Int4B8,
+        (8, _, "none", _, _) => QuantScheme::Int8Symmetric,
+        // The contested cell's other half. Eight bits, codes packed
+        // `lsb_first`, a zero-point tensor packed `plain` — every field an
+        // 8-bit MLX bank writes — and `f32_factors` where MLX writes
+        // `f16_factors`. That one word is the whole difference, which is why
+        // the row that matched on `(8, _, "tensor", _)` swallowed the MLX
+        // bank silently and handed a kernel an int8 decoder for bf16 factors.
+        (8, "lsb_first", "tensor", Some("plain"), "f32_factors") => {
+            QuantScheme::Int8Asymmetric
+        }
         _ => {
             return Err(Error::Checkpoint(format!(
                 "zt.quant_group/1 with bits {bits}, packing order {order:?}, zero point \
-                 {form:?}{} names no scheme this loader implements",
+                 {form:?}{}, scales {scale:?} names no scheme this loader implements",
                 zero_packing
                     .map(|p| format!(" packed {p:?}"))
                     .unwrap_or_default()
@@ -594,6 +642,12 @@ fn map_text<'a>(entries: &'a Value, key: &str) -> Option<&'a str> {
 
 fn attr_u64(attrs: Option<&Value>, key: &str) -> Option<u64> {
     attrs?.get(key)?.as_u64()
+}
+
+/// The `scale_form` attribute, which is a plain text key at the object's own
+/// level rather than inside `packing` or `zero_point`.
+fn map_scale_form(attrs: Option<&Value>) -> Option<&str> {
+    attrs?.get("scale_form")?.as_text()
 }
 
 #[cfg(test)]
@@ -878,11 +932,108 @@ mod tests {
         assert!(format!("{err}").contains("no address"), "{err}");
     }
 
+    /// One `zt.quant_group/1` object, built from parts, for the tests that
+    /// ask which scheme a given point of the space names.
+    fn affine(
+        name: &'static str,
+        bits: u64,
+        order: &'static str,
+        zero: cbor::Value,
+        scale_form: &'static str,
+    ) -> Result<Vec<RawTensor>, Error> {
+        lower(name, move |w| {
+            w.object("w", |o| {
+                o.shape([32u64, 32])
+                    .layout("zt.quant_group/1")
+                    .attr("bits", bits)
+                    .attr("packing", cbor::map([("order", order)]))
+                    .attr("zero_point", zero)
+                    .attr("scale_form", scale_form)
+                    .attr("group_size", 128u64)
+                    .part("data", |p| p.dtype(ZDType::U8).bytes(&[0u8; 512]))
+            })
+            .unwrap();
+        })
+    }
+
+    fn scheme_read_back(tensors: &[RawTensor]) -> QuantScheme {
+        match &tensors[0].encoding {
+            Encoding::Quant(spec) => spec.scheme,
+            other => panic!("expected a quantized payload, got {other:?}"),
+        }
+    }
+
     #[test]
     fn attributes_choose_the_quantization_scheme() {
         // `zt.quant_group/1` is parametric: the same layout id names different
         // schemes depending on the packing and zero-point attributes.
-        let tensors = lower("awq", |w| {
+        let tensors = affine(
+            "awq",
+            4,
+            "lsb_first",
+            cbor::map([("form", "tensor"), ("packing", "same_as_data")]),
+            "f16_factors",
+        )
+        .unwrap();
+        assert_eq!(scheme_read_back(&tensors), QuantScheme::AwqInt4);
+        match &tensors[0].encoding {
+            Encoding::Quant(spec) => assert_eq!(spec.group_size, 128),
+            other => panic!("expected a quantized payload, got {other:?}"),
+        }
+    }
+
+    /// The one cell of the space two schemes both write, and the field that
+    /// tells them apart.
+    ///
+    /// Eight bits, codes `lsb_first`, a zero-point TENSOR packed `plain`:
+    /// that is every visible field of an 8-bit MLX router gate, and it is
+    /// also every visible field of an `Int8Asymmetric` tensor. They differ in
+    /// `scale_form` and in nothing else, so a reader that does not fetch it
+    /// answers one of them with the other — which is what happened, in the
+    /// direction that stays quiet: MLX's bf16 factors read back as a scheme
+    /// whose factors are f32.
+    #[test]
+    fn the_scale_form_separates_the_two_schemes_that_share_a_cell() {
+        let plain = || cbor::map([("form", "tensor"), ("packing", "plain")]);
+        assert_eq!(
+            scheme_read_back(&affine("mlx8", 8, "lsb_first", plain(), "f16_factors").unwrap()),
+            QuantScheme::MlxAffineU4,
+            "an 8-bit MLX bank is the row whose factors are bf16"
+        );
+        assert_eq!(
+            scheme_read_back(&affine("i8a", 8, "lsb_first", plain(), "f32_factors").unwrap()),
+            QuantScheme::Int8Asymmetric,
+        );
+    }
+
+    /// MLX spans three widths, and the reader spans the same three.
+    ///
+    /// The 2-bit row is the one that was missing outright: a DQ expert bank
+    /// this tree WROTE came back "names no scheme this loader implements".
+    #[test]
+    fn the_mlx_row_is_read_at_each_of_its_three_widths() {
+        for bits in [2u64, 4, 8] {
+            let tensors = affine(
+                "mlx",
+                bits,
+                "lsb_first",
+                cbor::map([("form", "tensor"), ("packing", "plain")]),
+                "f16_factors",
+            )
+            .unwrap_or_else(|err| panic!("MLX at {bits} bits: {err}"));
+            assert_eq!(scheme_read_back(&tensors), QuantScheme::MlxAffineU4);
+        }
+    }
+
+    /// The fifth parameter is REQUIRED, and an object that omits it is
+    /// refused rather than read at whichever row happens to match without it.
+    ///
+    /// The core spec's own words for why: *"a parametric profile MUST make
+    /// every parameter its decoder needs a required attribute; anything left
+    /// unstated will be inferred from something incidental."*
+    #[test]
+    fn an_affine_object_that_states_no_scale_form_is_refused() {
+        let err = lower("no-scale-form", |w| {
             w.object("w", |o| {
                 o.shape([32u64, 32])
                     .layout("zt.quant_group/1")
@@ -890,20 +1041,13 @@ mod tests {
                     .attr("packing", cbor::map([("order", "lsb_first")]))
                     .attr(
                         "zero_point",
-                        cbor::map([("form", "tensor"), ("packing", "same_as_data")]),
+                        cbor::map([("form", "tensor"), ("packing", "plain")]),
                     )
-                    .attr("group_size", 128u64)
                     .part("data", |p| p.dtype(ZDType::U8).bytes(&[0u8; 512]))
             })
             .unwrap();
         })
-        .unwrap();
-        match &tensors[0].encoding {
-            Encoding::Quant(spec) => {
-                assert_eq!(spec.scheme, QuantScheme::AwqInt4);
-                assert_eq!(spec.group_size, 128);
-            }
-            other => panic!("expected a quantized payload, got {other:?}"),
-        }
+        .unwrap_err();
+        assert!(format!("{err}").contains("scale_form"), "{err}");
     }
 }

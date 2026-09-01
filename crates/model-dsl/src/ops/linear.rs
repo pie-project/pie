@@ -76,6 +76,27 @@ pub fn mlp_swiglu_clamp_alpha(packed: &Value, intermediate: u32, limit: f32, alp
     y
 }
 
+/// [`mlp_swiglu_clamp`]'s arithmetic over an UNFUSED pair — the two halves as
+/// two values, for a bank whose gate and up cannot be declared as one.
+///
+/// The result's type is the gate's, which is the pair's: two routed matmuls
+/// over `[experts, inter, hidden]` banks land the same `tokens·top_k × inter`
+/// rectangle, and the combine consumes both and writes one of that shape.
+pub fn mlp_swiglu_clamp_split(gate: &Value, up: &Value, limit: f32) -> Value {
+    let r = gate.rec();
+    let y = r.fresh(gate.ty().clone());
+    r.push(
+        Linear::MlpSwigluClampSplit {
+            gate: gate.id(),
+            up: up.id(),
+            limit,
+            y: y.id(),
+        },
+        &[gate, up],
+    );
+    y
+}
+
 pub fn mlp_geglu_tanh(gate: &Value, up: &Value) -> Value {
     let r = gate.rec();
     let y = r.fresh(gate.ty().clone());
@@ -229,6 +250,34 @@ pub fn moe_topk_sqrt_softplus(
             weights: weights.id(),
         },
         &[logits],
+    );
+    (routes, weights)
+}
+
+/// **THE LOOKUP ROUTER.** `tid2eid` is a `[vocab, top_k]` I64 table naming
+/// this token id's experts outright; the pair it lands is the pair a gate
+/// lands, at the uniform weight `1/top_k`, and no router logit is computed.
+pub fn moe_hash_route(
+    ids: &Value,
+    tid2eid: &Weight,
+    vocab: u32,
+    experts: u32,
+    top_k: u32,
+) -> (Value, Value) {
+    let r = ids.rec();
+    let routes = r.fresh(tensor(Dim::Tokens, top_k, Dtype::I32));
+    let weights = r.fresh(tensor(Dim::Tokens, top_k, Dtype::F32));
+    r.push(
+        Linear::MoeHashRoute {
+            ids: ids.id(),
+            tid2eid: r.weight(tid2eid),
+            vocab,
+            experts,
+            top_k,
+            routes: routes.id(),
+            weights: weights.id(),
+        },
+        &[ids],
     );
     (routes, weights)
 }

@@ -526,7 +526,7 @@ impl Disk {
     /// else `$XDG_CACHE_HOME/pie/ptir-cuda`, else `$HOME/.cache/pie/ptir-cuda`.
     /// Article 9 (alto design §1) says a shell reads no environment, and this
     /// was the last read in the crate: the directory is a DEPLOYMENT fact, so
-    /// it arrives typed on `Boot::program_cache_dir` — off the boot document's
+    /// it arrives typed on `Boot::cache_dir` — off the boot document's
     /// `[cache] dir`, which the worker has written all along — exactly as the
     /// warm-boot weight artifacts' directory does.
     ///

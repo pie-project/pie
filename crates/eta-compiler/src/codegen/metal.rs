@@ -37,7 +37,7 @@ pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
 /// `kMetalM1EmitterVersion` — bumped whenever emitted MSL changes; the engine's pipeline cache keys on it.
-pub const METAL_M1_EMITTER_VERSION: u16 = 41;
+pub const METAL_M1_EMITTER_VERSION: u16 = 42;
 
 /// `kMetalM1MaxChannels` — the single-lane readiness/commit kernels bind one
 /// `words_N` buffer per channel starting at buffer 2, and Metal's highest

@@ -233,7 +233,7 @@ fn fire(tokens: &[u32], attachment: Attachment) -> FrameSubmission {
     FrameSubmission::of(Step {
         lanes: vec![Lane {
             slot: 0,
-            word: classify(&model::Request::new(tokens.len() as u32, false)),
+            word: classify(&models::Request::new(tokens.len() as u32, false)),
             tokens: tokens.to_vec(),
             positions: Vec::new(),
             kv: KvDelta {
@@ -251,6 +251,7 @@ fn fire(tokens: &[u32], attachment: Attachment) -> FrameSubmission {
             readout: Readout::Last,
         }],
         attachments: vec![attachment],
+        media: Vec::new(),
     })
 }
 
@@ -279,6 +280,8 @@ fn a_device_only_ring_carries_a_cell_from_one_instance_to_another() {
         page_size: 16,
         max_context: 512,
         slots: 4,
+        max_patches: None,
+        max_images: None,
     };
     let request = runtime::engine::load::request(
         &checkpoint,

@@ -43,6 +43,7 @@
 //! instead of merely reported.
 
 use std::mem::size_of;
+use std::sync::Arc;
 
 use eta_compiler::codegen::launch::{LaunchChannel, LaunchStagePlan};
 use eta_exec::{
@@ -57,6 +58,7 @@ use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
 
 use super::compile::{Form, Region};
+use super::shared::SharedRing;
 
 /// The buffer index the first channel's committed cell binds at. Everything
 /// below it is fixed: status, descriptors, params, offsets, scratch,
@@ -81,14 +83,18 @@ const FIRST_CHANNEL_BUFFER: usize = 7;
 
 /// How wide one element of the rectangle `lane.logits_base` points at is.
 ///
-/// **TWO, AND UNCONDITIONALLY SO, WHERE THE M2 FORM ASKS THE SLOT TABLE.**
-/// The single-lane `0xA0` handler branches on `p.intr` and reads `float` for
-/// the score plane, which is why [`Prepared::bind_intrinsic`] takes the width
-/// off `m2_intrinsic_element_bytes`. The grouped kernels have no such branch:
-/// they cast the lane's base to `const device bfloat*` once and index it, and
-/// `m3_intrinsic_bindable` refuses the F32 rectangle by name for exactly that
-/// reason. So the row stride this file counts draft columns in is the bf16
-/// one, always.
+/// **TWO, AND UNCONDITIONALLY SO, BECAUSE THIS IS THE READOUT'S ELEMENT AND
+/// NOT AN INTRINSIC'S.** The M2 form asks the slot table
+/// (`m2_intrinsic_element_bytes`) because one argument index serves whichever
+/// id was routed to it; the grouped form has one address per RECTANGLE, and
+/// the rectangle `logits_base` names is the bf16 readout for both the trunk
+/// and the draft column. The score plane is F32 and rides
+/// `LaneRecord::attn_score_base` with a pitch of its own, so it is not
+/// counted here and never was.
+///
+/// Named because it is the row stride draft columns are counted in — see
+/// [`Prepared::regroup`], which converts a byte displacement between two
+/// rectangles into whole rows of this element.
 const INTRINSIC_ELEMENT_BYTES: u64 = 2;
 
 /// Threads a grouped LIBRARY sampler's threadgroup must have.
@@ -213,6 +219,15 @@ impl ChannelShape {
 pub struct Rings {
     slabs: Vec<Buffer>,
     shapes: Vec<ChannelShape>,
+    /// **The channels whose ring is not this instance's** — one entry per
+    /// dense slot, `Some` for a device-only channel the engine registered and
+    /// two passes share (design §5).
+    ///
+    /// The slab at that slot is a CLONE of the shared one, so every read and
+    /// write below is already against the right bytes and needs no arm; what
+    /// this list carries is the CURSOR, which is the other half of a ring and
+    /// the half a `Vec<Cursor>` inside one session cannot be.
+    shared: Vec<Option<Arc<SharedRing>>>,
 }
 
 impl Rings {
@@ -222,23 +237,73 @@ impl Rings {
     /// monotone cursors, which is the shared ring arithmetic's own rule
     /// (`eta_exec::channel`) and not this file's.
     ///
+    /// **`adopted` IS WHAT MAKES A RING BELONG TO ITS CHANNEL** (design §5,
+    /// and [`SharedRing`]'s own header). A dense slot with an adopted ring
+    /// reserves nothing: it takes a retain of the one slab the channel owns,
+    /// so the prefill's put and the decode's take address the same cells.
+    /// Every other slot is cut here, per instance, exactly as before — which
+    /// is right for the rings one pass owns, and that is most of them.
+    ///
     /// # Errors
     ///
     /// [`Fault::Device`] when the device declined a reservation,
-    /// [`Fault::Program`] for a shape whose ring will not fit a `u64`.
-    pub fn allocate(device: &Context, shapes: &[ChannelShape]) -> Result<Rings> {
+    /// [`Fault::Program`] for a shape whose ring will not fit a `u64`, and
+    /// for an adopted ring cut at a geometry this instance does not declare.
+    pub fn allocate(
+        device: &Context,
+        shapes: &[ChannelShape],
+        adopted: &[Option<Arc<SharedRing>>],
+    ) -> Result<Rings> {
         let mut slabs = Vec::with_capacity(shapes.len());
-        for shape in shapes {
+        let mut shared = Vec::with_capacity(shapes.len());
+        for (channel, shape) in shapes.iter().enumerate() {
+            if let Some(ring) = adopted.get(channel).and_then(Option::as_ref) {
+                // **THE TWO DECLARATIONS HAVE TO AGREE, AND A DISAGREEMENT IS
+                // A WRONG TOKEN RATHER THAN A FAULT.** The ring was cut at
+                // the geometry the REGISTRATION stated and this instance
+                // addresses it at the geometry its own package declares; if
+                // those differ the cells are at one stride and the reads at
+                // another, which no launch faults on.
+                if ring.shape() != *shape {
+                    return Err(Fault::program(
+                        "program::launch",
+                        format!(
+                            "channel {channel}'s shared ring was cut for {} cell(s) of \
+                             {:?} at capacity {} and this instance declares {} of {:?} \
+                             at capacity {}: one ring addressed at two strides is a \
+                             wrong cell and never a fault",
+                            ring.shape().numel,
+                            ring.shape().dtype,
+                            ring.shape().capacity,
+                            shape.numel,
+                            shape.dtype,
+                            shape.capacity
+                        ),
+                    ));
+                }
+                slabs.push(ring.slab());
+                shared.push(Some(Arc::clone(ring)));
+                continue;
+            }
             let cells = u64::from(shape.capacity) + 1;
             let bytes = cells
                 .checked_mul(shape.cell_stride() as u64)
                 .ok_or_else(|| Fault::program("program::launch", "a ring past what a u64 counts"))?;
             slabs.push(Buffer::zeroed(device, bytes.max(1))?);
+            shared.push(None);
         }
         Ok(Rings {
             slabs,
             shapes: shapes.to_vec(),
+            shared,
         })
+    }
+
+    /// The ring channel `channel` shares with the other instances bound to
+    /// it, or `None` for one this instance owns alone.
+    #[must_use]
+    pub fn shared(&self, channel: usize) -> Option<&Arc<SharedRing>> {
+        self.shared.get(channel).and_then(Option::as_ref)
     }
 
     /// How many channels this instance carries.
@@ -790,6 +855,52 @@ impl Grouped {
         self.record.logits_base = base;
         self.record.logits_row_offset = row_offset;
         self.record.logits_row_count = row_count;
+        self.write_record()
+    }
+
+    /// Point the lane at its block of the observability slab.
+    ///
+    /// **THE SECOND RECTANGLE, AND THE WHOLE OF WHAT THIS WAVE ADDED TO THE
+    /// SHARED RECORD.** The draft column is reached by counting rows off
+    /// `logits_base` because it IS that rectangle in a second row block; the
+    /// score slab is `crate::scores`'s own reservation, so no displacement
+    /// off the readout lands in it and the grouped form had nothing to
+    /// dereference. Now it has an address and a pitch — the CUDA twin's
+    /// `(intrinsic_base, intrinsic_row_stride)` pair, said in the one place a
+    /// kernel with no per-intrinsic argument index can be told it.
+    ///
+    /// `base` is the LANE's block rather than the slab's origin: the offset
+    /// `crate::scores::Scores::lane_base` answers is folded in before the
+    /// address is taken, exactly as the M2 form folds it into
+    /// `setBuffer:offset:atIndex:`. So the two forms are pointed at the same
+    /// first byte by construction rather than by two agreeing computations.
+    ///
+    /// Zero for a lane with no score rectangle bound, which is the value a
+    /// fresh record already holds; the emitted gather faults on it rather
+    /// than dereferencing, because a lane that did not capture has no block
+    /// and the previous fire's mass is a wrong answer.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the write said.
+    fn set_scores(&mut self, base: u64, row_stride: u32) -> Result<()> {
+        self.record.attn_score_base = base;
+        self.record.attn_score_row_stride = row_stride;
+        self.write_record()
+    }
+
+    /// Write the one lane's record back whole.
+    ///
+    /// Whole rather than patched at a field offset: the offsets belong to
+    /// `eta_compiler::codegen::layout`, and a byte range spelled here would be
+    /// a seventh copy of the lane table exactly where six were just collapsed
+    /// into one.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] when the lane is outside its own table, and whatever
+    /// the write said.
+    fn write_record(&mut self) -> Result<()> {
         let at = self.shape.record_offset(THE_LANE).ok_or_else(|| {
             Fault::program("program::launch", "the one lane is outside the lane table")
         })?;
@@ -1347,10 +1458,11 @@ impl Prepared {
             //    depends on what the emitter emitted and what the pipeline
             //    admitted. So what is refused at bind is only what no form
             //    could serve — an intrinsic the grouped emitter declines by
-            //    name (`AttnScore`, which has no address on the lane record)
-            //    or a stage with no grouped seat at all. The rest is
-            //    recorded and held against the regions at encode, where
-            //    `Region::form` is in hand.
+            //    name, or a stage with no grouped seat at all. The first of
+            //    those is empty today: `AttnScore` was the whole of it, and
+            //    it has `lane.attn_score_base` now. The rest is recorded and
+            //    held against the regions at encode, where `Region::form` is
+            //    in hand.
             if declared.width < width && declared.rows > 1 && !self.strideable(intrinsic) {
                 return Err(Fault::program(
                     "program::launch",
@@ -1361,7 +1473,9 @@ impl Prepared {
                          after the first would land {} elements short. A narrower read \
                          of ONE row is served; this one needs the grouped form, which \
                          carries a row pitch the way the CUDA handler's \
-                         `intrinsic_row_stride` does and which cannot bind {intrinsic:?}",
+                         `intrinsic_row_stride` does — and this stage has no grouped seat \
+                         for it, either because the plan said that path cannot cover the \
+                         stage or because the emitter binds no address for {intrinsic:?}",
                         declared.rows,
                         declared.width,
                         width - declared.width
@@ -1415,9 +1529,13 @@ impl Prepared {
     ///
     /// **BOTH HALVES, BECAUSE EITHER ONE MISSING PUTS EVERY READER BACK ON
     /// THE SINGLE-LANE FORM.** `m3_intrinsic_bindable` is the emitter's own
-    /// rule and `AttnScore` is the whole of what it declines; a stage the
-    /// planner said the grouped path cannot cover has no tables carved at
-    /// all (`StageNeeds::grouped_valid`, [`Grouped::build`]).
+    /// rule and it declines nothing now that the score rectangle has a
+    /// lane-record address of its own — but it is still ASKED rather than
+    /// assumed, because the day a new id gains an M2 argument index and no
+    /// grouped route, the shape only a strided form can serve has to be
+    /// refused at bind rather than encoded. The other half stands unchanged:
+    /// a stage the planner said the grouped path cannot cover has no tables
+    /// carved at all (`StageNeeds::grouped_valid`, [`Grouped::build`]).
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     fn strideable(&self, intrinsic: IntrinsicId) -> bool {
         self.grouped.is_some()
@@ -1461,33 +1579,64 @@ impl Prepared {
         ))
     }
 
-    /// Re-derive the grouped form's readout words from the slot table.
+    /// Re-derive the grouped form's rectangle words from the slot table.
     ///
     /// **THE TWO FORMS DISAGREE ABOUT WHAT A SECOND RECTANGLE IS**, and this
     /// is where the disagreement is resolved rather than papered over. The M2
-    /// form gives each intrinsic its own argument index, so two rectangles
-    /// may be two unrelated allocations. The grouped kernels hand every
-    /// `INTRINSIC_VAL` op ONE address — `lane.logits_base` — and reach the
-    /// draft column by counting rows off it, so two rectangles have to be one
-    /// reservation at a row-aligned displacement. When they are, this states
-    /// the displacement and the grouped path serves both columns; when they
-    /// are not, it leaves the draft block pointing at the trunk's first row
-    /// and [`super::compile`]'s choice is what keeps a region that reads the
-    /// draft column on the form that can bind it — `m3_intrinsic_bindable` is
-    /// the emitter's half of the same rule.
+    /// form gives each intrinsic its own argument index, so any two rectangles
+    /// may be any two unrelated allocations. The grouped kernels are handed
+    /// ADDRESSES, and the lane record carries two of them — so which
+    /// disagreement applies depends on which pair is asked about:
     ///
-    /// A stage with no trunk rectangle writes nothing: `vocab` stays zero,
-    /// and every emitted grouped gather refuses a zero vocabulary with
-    /// `FUSED_GEOMETRY_MISMATCH` rather than striding by it.
+    /// * `logits` and `mtp_logits` share `lane.logits_base` and the draft
+    ///   column is reached by counting rows off it, so those two have to be
+    ///   one reservation at a row-aligned displacement. When they are, this
+    ///   states the displacement and the grouped path serves both columns;
+    ///   when they are not, it leaves the draft block pointing at the trunk's
+    ///   first row and [`super::compile`]'s choice keeps a region reading the
+    ///   draft column on the form that can bind it.
+    /// * `attn_score` has `lane.attn_score_base` to itself, so there is no
+    ///   displacement to compute and nothing to agree with. The slab and the
+    ///   readout are unrelated allocations by construction (`crate::scores`
+    ///   owns one, the arena the other) and the record now says so instead of
+    ///   the emitter refusing to.
+    ///
+    /// A stage with no trunk rectangle writes no readout words: `vocab` stays
+    /// zero, and every emitted grouped gather refuses a zero vocabulary with
+    /// `FUSED_GEOMETRY_MISMATCH` rather than striding by it. The score words
+    /// are written regardless, for the reason spelled at the head of the body.
     ///
     /// # Errors
     ///
-    /// [`Fault::Program`] when the readout has no GPU address; whatever the
-    /// writes said.
+    /// [`Fault::Program`] when the readout or the score slab has no GPU
+    /// address; whatever the writes said.
     fn regroup(&mut self) -> Result<()> {
         if self.grouped.is_none() {
             return Ok(());
         }
+        // ── **THE SCORE RECTANGLE IS DERIVED FIRST, AND ON ITS OWN.** It is a
+        //    separate reservation with a separate pitch, so nothing about it
+        //    is a function of the readout — and an epilogue that reads scores
+        //    and no logits is a legal program (`attn-score.md` §4: only
+        //    decisions cross to the host, and a policy that only ranks keys
+        //    never touches the vocabulary). Deriving it below the trunk's
+        //    early return would leave exactly that program with a zero base
+        //    and a device-side `FUSED_GEOMETRY_MISMATCH` for a rectangle the
+        //    shell had already bound.
+        //
+        //    Zero and zero for an unbound rectangle, and written rather than
+        //    skipped: a rebind is the normal case on an attached fire, so a
+        //    slot that stops holding a rectangle has to CLEAR the record's
+        //    words as readily as a bind sets them.
+        let (score_base, score_stride) =
+            match self.intrinsics[IntrinsicId::AttnScore as usize].as_ref() {
+                Some(slot) => (address_of(&slot.base, slot.offset)?, slot.width),
+                None => (0, 0),
+            };
+        self.grouped
+            .as_mut()
+            .expect("the seat was there one statement ago")
+            .set_scores(score_base, score_stride)?;
         let Some(trunk) = self.intrinsics[IntrinsicId::Logits as usize].as_ref() else {
             return Ok(());
         };
@@ -1655,11 +1804,18 @@ impl Prepared {
     /// reservation is used; a `ulong` inside a table tells it nothing. So
     /// every buffer whose ADDRESS escaped into the lane record — the status
     /// word the verdict is written through, each ring the cells live in, the
-    /// readout rectangle — is declared with `useResource:usage:` on this
-    /// encoder, which is the same bookkeeping `icb.rs` does for its slabs and
-    /// `rebind.rs` for the reservations behind its argument buffer. A missing
-    /// declaration is not a validation error; it is a page that may not be
-    /// resident when the kernel reads it.
+    /// readout rectangle, and the observability slab the score base points
+    /// into — is declared with `useResource:usage:` on this encoder, which is
+    /// the same bookkeeping `icb.rs` does for its slabs and `rebind.rs` for
+    /// the reservations behind its argument buffer. A missing declaration is
+    /// not a validation error; it is a page that may not be resident when the
+    /// kernel reads it.
+    ///
+    /// The slab needs no line of its own: the loop over `self.intrinsics`
+    /// below walks every rectangle this stage has been pointed at, and the
+    /// score slab is one of them — it is bound through the same slot table
+    /// whichever form ends up reading it, which is precisely why the two
+    /// forms cannot be pointed at different bytes.
     ///
     /// # Errors
     ///
@@ -1886,6 +2042,7 @@ mod tests {
         let rings = Rings {
             slabs: Vec::new(),
             shapes: vec![shape],
+            shared: vec![None],
         };
         let width = shape.cell_stride() as u64;
         assert_eq!(rings.cell_offset(0, 0).unwrap(), 0);
@@ -1901,6 +2058,7 @@ mod tests {
         let rings = Rings {
             slabs: Vec::new(),
             shapes: Vec::new(),
+            shared: Vec::new(),
         };
         let said = rings.cell_offset(2, 0).expect_err("no such channel").to_string();
         assert!(said.contains('2'), "the refusal names the channel: {said}");

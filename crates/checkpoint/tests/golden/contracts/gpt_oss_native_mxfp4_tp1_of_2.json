@@ -31,11 +31,11 @@
             "encoding": {
               "Quant": {
                 "scheme": "Mxfp4E2M1E8M0",
-                "logical_dtype": "BF16",
+                "logical_dtype": "bf16",
                 "bits_per_element": 4,
                 "group_size": 32,
                 "channel_axis": 1,
-                "scale_dtype": "U8",
+                "scale_dtype": "u8",
                 "zero_point_dtype": null,
                 "block_shape": [
                   32
@@ -53,11 +53,11 @@
       "encoding": {
         "Quant": {
           "scheme": "Mxfp4E2M1E8M0",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": 1,
-          "scale_dtype": "U8",
+          "scale_dtype": "u8",
           "zero_point_dtype": null,
           "block_shape": [
             32
@@ -93,7 +93,7 @@
               2
             ],
             "encoding": {
-              "Raw": "U8"
+              "Raw": "u8"
             }
           }
         }
@@ -104,7 +104,7 @@
         2
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       }
     },
     {
@@ -130,7 +130,7 @@
         64
       ],
       "encoding": {
-        "Raw": "BF16"
+        "Raw": "bf16"
       }
     },
     {
@@ -163,11 +163,11 @@
             "encoding": {
               "Quant": {
                 "scheme": "Mxfp4E2M1E8M0",
-                "logical_dtype": "BF16",
+                "logical_dtype": "bf16",
                 "bits_per_element": 4,
                 "group_size": 32,
                 "channel_axis": 1,
-                "scale_dtype": "U8",
+                "scale_dtype": "u8",
                 "zero_point_dtype": null,
                 "block_shape": [
                   32
@@ -185,11 +185,11 @@
       "encoding": {
         "Quant": {
           "scheme": "Mxfp4E2M1E8M0",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": 1,
-          "scale_dtype": "U8",
+          "scale_dtype": "u8",
           "zero_point_dtype": null,
           "block_shape": [
             32
@@ -225,7 +225,7 @@
               2
             ],
             "encoding": {
-              "Raw": "U8"
+              "Raw": "u8"
             }
           }
         }
@@ -236,7 +236,7 @@
         2
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       }
     },
     {
@@ -262,7 +262,7 @@
         64
       ],
       "encoding": {
-        "Raw": "BF16"
+        "Raw": "bf16"
       }
     },
     {
@@ -287,11 +287,11 @@
             "encoding": {
               "Quant": {
                 "scheme": "Mxfp4E2M1E8M0",
-                "logical_dtype": "BF16",
+                "logical_dtype": "bf16",
                 "bits_per_element": 4,
                 "group_size": 32,
                 "channel_axis": 2,
-                "scale_dtype": "U8",
+                "scale_dtype": "u8",
                 "zero_point_dtype": null,
                 "block_shape": [
                   32
@@ -309,11 +309,11 @@
       "encoding": {
         "Quant": {
           "scheme": "Mxfp4E2M1E8M0",
-          "logical_dtype": "BF16",
+          "logical_dtype": "bf16",
           "bits_per_element": 4,
           "group_size": 32,
           "channel_axis": 2,
-          "scale_dtype": "U8",
+          "scale_dtype": "u8",
           "zero_point_dtype": null,
           "block_shape": [
             32
@@ -341,7 +341,7 @@
               4
             ],
             "encoding": {
-              "Raw": "U8"
+              "Raw": "u8"
             }
           }
         }
@@ -352,7 +352,7 @@
         4
       ],
       "encoding": {
-        "Raw": "U8"
+        "Raw": "u8"
       }
     },
     {
@@ -365,7 +365,7 @@
         64
       ],
       "encoding": {
-        "Raw": "BF16"
+        "Raw": "bf16"
       }
     }
   ]

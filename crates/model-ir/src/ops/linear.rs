@@ -37,6 +37,33 @@ pub enum Linear {
         alpha: f32,
         y: ValueId,
     },
+    /// **[`MlpSwigluClamp`](Linear::MlpSwigluClamp)'S ARITHMETIC OVER TWO
+    /// VALUES INSTEAD OF ONE ROW** — the same `min(g, limit)`, the same
+    /// `clamp(u, ±limit)`, the same `silu(g)·u`, with the halves arriving as
+    /// separate tensors rather than as the two halves of a `2·inter` row.
+    ///
+    /// **A ROW, BECAUSE A FUSED BANK IS NOT ALWAYS STATEABLE.** The packed
+    /// form is the cheaper one and stays the default: one bank, one GEMM, one
+    /// pass. But a bank carries ONE representation, and a per-tensor
+    /// quantization can give an artifact's `gate_proj` and `up_proj`
+    /// DIFFERENT ones — `mlx-community/DeepSeek-V4-Flash-2bit-DQ` groups the
+    /// gate by 32 and the up by 64 on four of its five layers, so the two
+    /// halves' scales planes join into no rectangle at any axis and the fused
+    /// declaration is not awkward there but unstateable. The model text that
+    /// meets such an artifact declares the pair, fires the routed matmul
+    /// twice, and combines here.
+    ///
+    /// The naming follows [`MlpGegluTanh`](Linear::MlpGegluTanh) /
+    /// [`MlpGegluTanhPacked`](Linear::MlpGegluTanhPacked), where the bare name
+    /// is the two-value form and `Packed` is the fused one — inverted only
+    /// because `MlpSwigluClamp` spent the bare name on the packed row first,
+    /// and renaming it would move every trace that already says it.
+    MlpSwigluClampSplit {
+        gate: ValueId,
+        up: ValueId,
+        limit: f32,
+        y: ValueId,
+    },
     MlpGegluTanh {
         gate: ValueId,
         up: ValueId,
@@ -115,6 +142,39 @@ pub enum Linear {
         top_k: u32,
         renormalize: bool,
         scaling: f32,
+        routes: ValueId,
+        weights: ValueId,
+    },
+    /// **ROUTING BY LOOKUP, NOT BY A GATE.** `tid2eid` is `[vocab, top_k]`
+    /// I64: for every token id it NAMES the `top_k` experts that id routes
+    /// to, at the uniform weight `1/top_k`. No router logits are computed at
+    /// all — the op reads the token ids and the table and lands the same
+    /// `routes` I32 / `weights` F32 pair every gate above it lands, so the
+    /// sorted-MoE path behind it cannot tell the two apart.
+    ///
+    /// DeepSeek-V4-Flash's first `num_hash_layers` layers route this way
+    /// (`ffn.gate.tid2eid`); every later layer carries the `noaux_tc`
+    /// correction bias and takes [`Self::MoeTopkSqrtSoftplus`].
+    ///
+    /// **AND IT STATES `experts` THOUGH IT READS NO LOGITS.** The kernel does
+    /// not need the number — the table names ids and the gather is over
+    /// `top_k` of them — but this op is a ROUTER, and the expert count is the
+    /// router's field for everything downstream that has to divide a bank by
+    /// it: the sorted-MoE tile (`engine_metal::scratch`) and, since wave W-a,
+    /// the residency plan that seats a fraction of a routed band
+    /// (`engine_metal::experts`). Neither can read it anywhere else — no
+    /// operand of `MoeMatmulSelect*` carries it and a bank's `[E, N·K]`
+    /// rectangle is a convention of the text that emitted it — so a hash
+    /// router that omitted it would make every layer it routes unseatable and
+    /// untileable, which is exactly what it did until this field existed.
+    MoeHashRoute {
+        ids: ValueId,
+        tid2eid: ValueId,
+        vocab: u32,
+        /// How many experts the bank behind this router declares. Not read by
+        /// the kernel; read by every pass that has to divide a band by it.
+        experts: u32,
+        top_k: u32,
         routes: ValueId,
         weights: ValueId,
     },
@@ -212,6 +272,7 @@ impl Operands for Linear {
             Self::MlpSwiglu { packed, .. } => sink.push(*packed),
             Self::MlpSwigluClamp { packed, .. } => sink.push(*packed),
             Self::MlpSwigluClampAlpha { packed, .. } => sink.push(*packed),
+            Self::MlpSwigluClampSplit { gate, up, .. } => sink.extend([*gate, *up]),
             Self::MlpGegluTanh { gate, up, .. } => sink.extend([*gate, *up]),
             Self::MlpGeluTanh { x, .. } => sink.push(*x),
             Self::MlpGegluTanhPacked { packed, .. } => sink.push(*packed),
@@ -220,6 +281,7 @@ impl Operands for Linear {
             Self::MoeTopkSoftmaxScaled { logits, scale, .. } => sink.extend([*logits, *scale]),
             Self::MoeTopkSigmoid { logits, .. } => sink.push(*logits),
             Self::MoeTopkSqrtSoftplus { logits, bias, .. } => sink.extend([*logits, *bias]),
+            Self::MoeHashRoute { ids, tid2eid, .. } => sink.extend([*ids, *tid2eid]),
             Self::MoeMatmulSelect { x, bank, routes, .. } => sink.extend([*x, *bank, *routes]),
             Self::MoeMatmulSelectBias { x, bank, bias, routes, .. } => {
                 sink.extend([*x, *bank, *bias, *routes]);
@@ -244,6 +306,7 @@ impl Operands for Linear {
             Self::MlpSwiglu { y, .. } => sink.push(*y),
             Self::MlpSwigluClamp { y, .. } => sink.push(*y),
             Self::MlpSwigluClampAlpha { y, .. } => sink.push(*y),
+            Self::MlpSwigluClampSplit { y, .. } => sink.push(*y),
             Self::MlpGegluTanh { y, .. } => sink.push(*y),
             Self::MlpGeluTanh { y, .. } => sink.push(*y),
             Self::MlpGegluTanhPacked { y, .. } => sink.push(*y),
@@ -252,6 +315,7 @@ impl Operands for Linear {
             Self::MoeTopkSoftmaxScaled { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeTopkSigmoid { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeTopkSqrtSoftplus { routes, weights, .. } => sink.extend([*routes, *weights]),
+            Self::MoeHashRoute { routes, weights, .. } => sink.extend([*routes, *weights]),
             Self::MoeMatmulSelect { y, .. } => sink.push(*y),
             Self::MoeMatmulSelectBias { y, .. } => sink.push(*y),
             Self::MoeMatmulSelectQuant { y, .. } => sink.push(*y),
@@ -273,6 +337,7 @@ impl Operands for Linear {
             | Self::MlpSwiglu { .. }
             | Self::MlpSwigluClamp { .. }
             | Self::MlpSwigluClampAlpha { .. }
+            | Self::MlpSwigluClampSplit { .. }
             | Self::MlpGegluTanh { .. }
             | Self::MlpGeluTanh { .. }
             | Self::MlpGegluTanhPacked { .. }
@@ -281,6 +346,7 @@ impl Operands for Linear {
             | Self::MoeTopkSoftmaxScaled { .. }
             | Self::MoeTopkSigmoid { .. }
             | Self::MoeTopkSqrtSoftplus { .. }
+            | Self::MoeHashRoute { .. }
             | Self::MoeMatmulSelect { .. }
             | Self::MoeMatmulSelectBias { .. }
             | Self::MoeMatmulSelectQuant { .. }
@@ -296,6 +362,7 @@ impl Operands for Linear {
             Self::MlpSwiglu { .. } => "linear.mlp_swiglu",
             Self::MlpSwigluClamp { .. } => "linear.mlp_swiglu_clamp",
             Self::MlpSwigluClampAlpha { .. } => "linear.mlp_swiglu_clamp_alpha",
+            Self::MlpSwigluClampSplit { .. } => "linear.mlp_swiglu_clamp_split",
             Self::MlpGegluTanh { .. } => "linear.mlp_geglu_tanh",
             Self::MlpGeluTanh { .. } => "linear.mlp_gelu_tanh",
             Self::MlpGegluTanhPacked { .. } => "linear.mlp_geglu_tanh_packed",
@@ -304,6 +371,7 @@ impl Operands for Linear {
             Self::MoeTopkSoftmaxScaled { .. } => "linear.moe_topk_softmax_scaled",
             Self::MoeTopkSigmoid { .. } => "linear.moe_topk_sigmoid",
             Self::MoeTopkSqrtSoftplus { .. } => "linear.moe_topk_sqrt_softplus",
+            Self::MoeHashRoute { .. } => "linear.moe_hash_route",
             Self::MoeMatmulSelect { .. } => "linear.moe_matmul_select",
             Self::MoeMatmulSelectBias { .. } => "linear.moe_matmul_select_bias",
             Self::MoeMatmulSelectQuant { .. } => "linear.moe_matmul_select_quant",

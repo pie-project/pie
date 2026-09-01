@@ -88,7 +88,7 @@ const FORK: [u32; 2] = [4, 5];
 /// path reaches it.
 fn word(query_len: u32) -> u64 {
     let classify = runtime::engine::load::classify(SKU).expect("this build ships the gate's SKU");
-    classify(&model::Request::new(query_len, false))
+    classify(&models::Request::new(query_len, false))
 }
 
 /// Greedy: the highest logit.
@@ -155,6 +155,8 @@ fn a_grafted_page_run_decodes_exactly_as_the_run_it_was_copied_from() {
         page_size: PAGE_SIZE,
         max_context: 512,
         slots: 4,
+        max_patches: None,
+        max_images: None,
     };
     let request = runtime::engine::load::request(
         &checkpoint,

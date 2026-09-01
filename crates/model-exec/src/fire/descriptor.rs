@@ -177,27 +177,37 @@ impl FireDescriptor {
         self.patch_rows > 0
     }
 
+    /// **THIS FIRE'S WINDOW TABLE ON ONE ROW AXIS** — the token seriation's
+    /// for a trunk region, the patch seriation's for a tower one.
+    ///
+    /// **THE ONE PICK, AND EVERY QUESTION BELOW IS THIS TABLE ASKED
+    /// SOMETHING.** A region belongs to exactly one axis — its capture
+    /// unit's — so cutting its window is a lookup and never a merge; what
+    /// used to stand at each such site was a two-arm match between a method
+    /// and its `patch_`-prefixed twin, one pair per question the walk asks.
+    /// The twins were the same delegation written twice, which is a second
+    /// derivation waiting to answer differently, and this is the pick said
+    /// once so the questions do not have to be.
+    ///
+    /// The two fields stay named because the WIRE is named: `pack` writes the
+    /// patch table into a trailer that is present iff there are patch rows,
+    /// and a fire with none pays no byte for it (this module's header). An
+    /// array would have had to answer where those bytes go.
+    #[must_use]
+    pub fn table(&self, axis: model_ir::RowAxis) -> &WindowTable {
+        match axis {
+            model_ir::RowAxis::Tokens => &self.classes,
+            model_ir::RowAxis::Patches => &self.patch_classes,
+        }
+    }
+
     /// How many PATCH rows a node with this class mask runs over — the
-    /// zero-row question on the second axis.
+    /// zero-row question on the second axis, and a forward onto
+    /// [`table`](FireDescriptor::table) for the callers that name the axis in
+    /// the method rather than in an argument.
     #[must_use]
     pub fn patch_rows_of(&self, mask: &ClassSet) -> u32 {
-        self.patch_classes.rows_of(mask)
-    }
-
-    /// The one patch-row-and-image interval a node with this class mask runs
-    /// over.
-    ///
-    /// # Errors
-    ///
-    /// The number of runs the mask covers, when that is more than one.
-    pub fn patch_span(&self, mask: &ClassSet) -> core::result::Result<Option<MaskSpan>, usize> {
-        self.patch_classes.span(mask)
-    }
-
-    /// Every patch interval a node with this class mask runs over, into a
-    /// buffer the caller keeps.
-    pub fn patch_spans_into(&self, mask: &ClassSet, out: &mut Vec<MaskSpan>) {
-        self.patch_classes.spans_into(mask, out);
+        self.table(model_ir::RowAxis::Patches).rows_of(mask)
     }
 
     /// How many lanes this fire carries.
@@ -210,7 +220,7 @@ impl FireDescriptor {
     /// zero-row question, asked against the table that crossed to the device.
     #[must_use]
     pub fn rows_of(&self, mask: &ClassSet) -> u32 {
-        self.classes.rows_of(mask)
+        self.table(model_ir::RowAxis::PRIMARY).rows_of(mask)
     }
 
     /// The one row-and-lane interval a node with this class mask runs over —
@@ -221,7 +231,7 @@ impl FireDescriptor {
     ///
     /// The number of runs the mask covers, when that is more than one.
     pub fn span(&self, mask: &ClassSet) -> core::result::Result<Option<MaskSpan>, usize> {
-        self.classes.span(mask)
+        self.table(model_ir::RowAxis::PRIMARY).span(mask)
     }
 
     /// Every interval a node with this class mask runs over, ascending — the
@@ -229,13 +239,13 @@ impl FireDescriptor {
     /// device. [`WindowTable::spans`] states what the list means.
     #[must_use]
     pub fn spans(&self, mask: &ClassSet) -> Vec<MaskSpan> {
-        self.classes.spans(mask)
+        self.table(model_ir::RowAxis::PRIMARY).spans(mask)
     }
 
     /// The same, into a buffer the caller keeps — what the walk asks once per
     /// region ([`WindowTable::spans_into`] says why it is not a `Vec`).
     pub fn spans_into(&self, mask: &ClassSet, out: &mut Vec<MaskSpan>) {
-        self.classes.spans_into(mask, out);
+        self.table(model_ir::RowAxis::PRIMARY).spans_into(mask, out);
     }
 
     /// How many bytes [`pack`](FireDescriptor::pack) will write.
@@ -516,9 +526,15 @@ mod tests {
         assert_eq!(&bytes[12..16], &5u32.to_le_bytes());
         assert_eq!(&bytes[16..20], &13u32.to_le_bytes());
         assert_eq!(&bytes[20..24], &2u32.to_le_bytes());
-        // The reserved word is zero, and it is what keeps the class table
-        // 8-byte aligned.
-        assert_eq!(&bytes[24..32], &0u64.to_le_bytes());
+        // Words 6 and 7 were ONE reserved `u64` under ABI 1, kept zero so the
+        // class table began 8-byte aligned. ABI 2 spends both of them: 24 is
+        // `patch_rows` and 28 is `patch_bucket`, and the alignment argument is
+        // unchanged because two `u32`s occupy exactly what the reserved word
+        // did. This descriptor carries no image, so both read zero — which is
+        // also the byte-for-byte equality with ABI 1 that a text-only fire
+        // keeps (this module's header).
+        assert_eq!(&bytes[24..28], &0u32.to_le_bytes());
+        assert_eq!(&bytes[28..32], &0u32.to_le_bytes());
     }
 
     #[test]

@@ -44,7 +44,7 @@
 //! 1. **The trunk prefix.** `mlx_lm` re-roots the tower as
 //!    `language_model.model.*`; the contract named transformers'
 //!    `model.language_model.*`, so `import` refused at the embedding and no
-//!    MLX file had ever satisfied this SKU. `model::qwen_3::import`'s
+//!    MLX file had ever satisfied this SKU. `models::qwen_3::import`'s
 //!    `Layout`.
 //! 2. **The folded rmsnorm one.** `mlx_lm`'s `sanitize` adds `1.0` to every
 //!    plain-RMSNorm weight so a kernel without the constant reproduces
@@ -92,11 +92,67 @@
 //! and what keeps the two roles off each other's bytes is the ladder's own
 //! `return`.
 //!
+//! # THE PLANE-ORDER HOLE, AND HOW IT CLOSED
+//!
+//! This suite was RED for one wave and nothing in it was adjusted to make it
+//! green again, which is the whole reason the account is kept. The five arms
+//! failed because `qwen35-d0.8b-mlxu4-kv-bf16`'s dense projections were
+//! declared in a plane order this shell has no reader for:
+//!
+//! 1. **The flip.** `models::qwen_3::model`'s `Model::new` turned every dense
+//!    projection of a `*-mlxu4-*` qwen_3 row from `U4g64` into `U4g64tiled` —
+//!    MLX affine codes in m16n8k16 fragment order, which
+//!    `kernels_cuda::linear::tiled` reads 2.5-6x faster. The predicate was the
+//!    declared weight width and nothing else, because `Model` is constructed
+//!    as an argument to `model_dsl::trace_hybrid` and so had no `Platform` to
+//!    ask — and the SKU it flipped is this one.
+//! 2. **The refusal on a raw snapshot** (§M-3 / §J4b). A repack is paid once
+//!    per weight, so a SERVING plan may not carry one:
+//!    `checkpoint::plan::passes::validate`'s `validate_target_support`
+//!    refuses it by name and points at `pie model import`.
+//!    `METAL_TILE_MAP_MASK` is `CAST | SCALE | DECODE | BIAS` — no
+//!    `TILE_MAP_REPACK` — so loading the `mlx_lm.convert` output said
+//!    *"this load would relayout a weight plane on the way in
+//!    (Some(TiledAffineU4Weight))"*.
+//! 3. **And the import answered it for CUDA, not here.** `pie model import`
+//!    compiled the same contract under `CONVERT_TILE_MAP_MASK`, ran the
+//!    repack host-side and wrote the relaid plane under the WEIGHT's name,
+//!    which `qwen_3::import`'s `read_own` arm binds with no transform — so
+//!    the artifact LOADED on this shell and did not answer. Measured, once:
+//!
+//!    ```text
+//!    ✓ imported local — 411MiB in 713ms  (378 planes repacked)
+//!    loaded qwen35-d0.8b-mlxu4-kv-bf16 on Apple M1 Max in 0.1s — weights 0.41 GiB
+//!    "The capital of France is the city of" -> "一时的وات**!.energyамет安全问题standenaland!."
+//!    ```
+//!
+//!    Finite, deterministic, and nonsense — `kernels_metal::linear::quant`'s
+//!    qmm and qmv arms index an affine bank ROW-MAJOR, and neither has a
+//!    fragment-order twin.
+//!
+//! **WHAT CLOSED IT** (§J4c): the flip at (1) learned the platform, exactly
+//! as the paragraph that stood here asked it to, and NOT by growing a
+//! load-time relayout — serving does not convert. `model_dsl::place` resolves
+//! a placed dtype against the setup the declaration is read for
+//! (`model_ir::Platform::placement`), and both readings of a family's text go
+//! through one: the trace through `catalog!`, the load contract through
+//! `runtime::engine::load` — and through `ready` below, which is a test that
+//! builds its own. So this shell's trace of this row declares the canonical
+//! `U4g64` its qmm and qmv arms already read.
+//!
+//! **AND THE DOOR THAT REOPENED IS THE RAW ONE.** With no repack in the plan,
+//! (2) has nothing to refuse: the `mlx_lm.convert` snapshot serves AS STORED,
+//! with no `pie model import` step at all, which is how this suite ran before
+//! the flip and how it runs now. The parity bars below are the ones that were
+//! written against `mlx_lm` before any of this and were never touched.
+//!
 //! # Gating
 //!
-//! Apple-only at compile time, and SKIPS at run time naming which
-//! precondition was missing — the device, the 4-bit snapshot, or the
-//! tokenizer beside it.
+//! Apple-only at compile time. The plane order is asserted FIRST and
+//! unconditionally — it is a fact about the trace, so a box with no device
+//! and no snapshot still checks it rather than skipping into a misleading
+//! green. Past it, the suite SKIPS at run time naming which precondition was
+//! missing — the device, the 4-bit snapshot, or the tokenizer beside it.
 //!
 //! ```text
 //! cargo test -p engine-metal --release --test four_bit_first_light -- --nocapture
@@ -367,7 +423,7 @@ fn argmax(logits: &[f32]) -> u32 {
 
 /// The lane word the model's own `Classify` computes.
 fn word(query_len: u32) -> u64 {
-    model::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_3::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 fn finite(logits: &[f32], what: &str) {
@@ -420,10 +476,50 @@ fn run(shell: &mut Shell, slot: u32, prompt: &[u32]) -> (Vec<u32>, Vec<f64>) {
     (produced, millis)
 }
 
+/// **THE PLANE ORDER, ASSERTED BEFORE ANY PRECONDITION IS LOOKED FOR.**
+///
+/// The module header argues it; this is the one line of it that runs. A plane
+/// order is a fact about the TRACE — no device, no snapshot and no checkpoint
+/// enters into it — so this states itself on any Apple box, and a machine
+/// missing the 4-bit snapshot checks it instead of skipping into a green that
+/// means nothing.
+///
+/// **AND IT IS A PANIC RATHER THAN A SKIP.** A skip would say "this box could
+/// not check", which is false: the box checked. It said so for a wave, while
+/// the projection flip took the tiled order for every platform, and it went
+/// quiet ON ITS OWN when §J4c gave the flip a platform to ask — which is the
+/// whole reason it was spelled as a property of the trace rather than as an
+/// `#[ignore]`. It stays for what it would catch next: this shell still has
+/// no fragment-order reader, so a text that reaches past `model_dsl::place`
+/// for one lands here rather than on the parity bars below.
+fn serves_the_order_it_declares() {
+    let trace = models::trace_of(SKU).expect("the catalog ships the 4-bit SKU")(Platform::Metal);
+    let tiled: Vec<&str> = trace
+        .params
+        .iter()
+        .filter(|param| param.dtype == model_dsl::Dtype::U4g64tiled)
+        .map(|param| param.name.as_str())
+        .collect();
+    assert!(
+        tiled.is_empty(),
+        "{SKU} declares {} plane(s) as U4g64tiled — MLX affine codes in m16n8k16 fragment \
+         order, which this shell has no reader for (first: {:?}). `kernels_metal::linear::quant` \
+         indexes an affine bank row-major, so neither road serves: a raw MLX snapshot is \
+         refused by the load plan (a serving plan does not repack) and a repacked artifact \
+         loads and answers nonsense (see the module header for the measurement). A text \
+         reaches that order only by asking for it — `model_dsl::place` answers this platform \
+         with the canonical `U4g64` — so a declaration that states it outright, or a placed \
+         variant with no `Platform::placement` row, is what put it here",
+        tiled.len(),
+        tiled.first().unwrap_or(&""),
+    );
+}
+
 /// Everything the tests below share: a loaded 4-bit shell and its
 /// vocabulary, or `None` and a sentence saying which precondition was
 /// missing.
 fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
+    serves_the_order_it_declares();
     if !engine_metal::device::present() {
         eprintln!("skipping {what}: this machine publishes no Metal device");
         return None;
@@ -448,11 +544,20 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    let trace = model::trace_of(SKU).expect("the catalog ships the 4-bit SKU");
+    let trace = models::trace_of(SKU).expect("the catalog ships the 4-bit SKU");
     let trace = trace(Platform::Metal);
     let source = ztensor_compat::index(&container).expect("the checkpoint opens");
-    let contract = model::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
-        .expect("the 4-bit SKU's import contract fits a real MLX 4-bit checkpoint");
+    // **READ FOR THIS SHELL** (§J4c). A load contract is `fn(&Source)` and a
+    // family's text may state a `Dtype` PLACEMENT, so the setup the contract
+    // is read under is what decides whether a projection is claimed in
+    // fragment order or row-major — and it has to be the setup the trace
+    // above was taken for, or the two describe different planes. This is
+    // `runtime::engine::load::contract_for`'s `trace.platform` wrap, in a
+    // test that builds its own contract.
+    let contract = models::placing_for(Platform::Metal, || {
+        models::import_of(SKU).expect("the catalog ships an import for the SKU")(&source)
+    })
+    .expect("the 4-bit SKU's import contract fits a real MLX 4-bit checkpoint");
     drop(source);
 
     let booted = Instant::now();
@@ -460,7 +565,14 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         trace,
         contract: &contract,
         checkpoint: &checkpoint,
+        // §M-4c, as `serve_smoke` states it: an unstamped snapshot proceeds,
+        // and the deployment's facts are stated honestly all the same.
+        tp_size: 1,
+        precision: models::precision_of(SKU)
+            .expect("the catalog states this row's precision")
+            .to_string(),
         budget: Budget::new(4, 256),
+        patches: None,
         profile: None,
         page_size: 16,
         context: 512,
@@ -668,6 +780,10 @@ fn a_ragged_prefill_pads_to_the_wider_rungs_and_its_tail_reaches_no_real_row() {
 /// Runs in a process of its own: see [`RESPAWN_KEY`].
 #[test]
 fn the_plain_stamped_point_matches_the_same_tokens_with_fp16_off() {
+    // **BEFORE THE RESPAWN AND NOT INSIDE IT.** The hole is the parent's to
+    // report: a child that failed on it would come back as "re-entering ran
+    // no such test", which names the wrong thing entirely.
+    serves_the_order_it_declares();
     if std::env::var_os(RESPAWN_KEY).is_none() {
         if !engine_metal::device::present() {
             eprintln!("skipping the plain point: this machine publishes no Metal device");

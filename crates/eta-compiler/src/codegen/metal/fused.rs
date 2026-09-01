@@ -7,8 +7,11 @@
 //! a second intrinsic rectangle, which binds down from the top of the same
 //! index space; see [`super::intrinsics`]); the grouped form reads them out of
 //! the lane table so one kernel serves every lane in the group, and it grows
-//! two inline expansions the single-lane form does not have — the MTP-draft
-//! argmax and the logits gather.
+//! three inline expansions the single-lane form does not have — the MTP-draft
+//! argmax, the logits gather and the score gather. All three exist because the
+//! rectangle they walk arrives as an ADDRESS on the lane record rather than as
+//! a bound buffer, so there is no `setBuffer:offset:` for the row arithmetic
+//! to disappear into.
 
 use crate::codegen::error::{EmitError, EmitterKind, RegionForm};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -217,10 +220,12 @@ pub fn emit_grouped_fused_region(
         return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedFused));
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
-    // **THE GROUPED PATH KEEPS THE NARROWER LIST**, and the id it still
-    // refuses is `attn_score`: a grouped kernel binds no per-intrinsic buffer
-    // at all — every `INTRINSIC_VAL` op is handed `lane.logits_base` out of
-    // the lane record — and the score slab is not that allocation. See
+    // **THE TWO LISTS ARE ONE LIST NOW**, and `attn_score` is the id that
+    // closed the gap. A grouped kernel still binds no per-intrinsic buffer —
+    // every rectangle it reads is an ADDRESS on the lane record — but the
+    // record carries a second one: `lane.attn_score_base` is the lane's block
+    // of the shell's observability slab, which no displacement off
+    // `lane.logits_base` was ever going to reach. See
     // `grouped_intrinsics_bindable`.
     grouped_intrinsics_bindable(&ops, region)?;
     let bases = result_bases(&ops);
@@ -431,6 +436,11 @@ pub fn emit_grouped_fused_region(
             source.push_str(BARRIER);
             continue;
         }
+        if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::ATTN_SCORE {
+            emit_score_gather(&mut source, base, &slots.o0);
+            source.push_str(BARRIER);
+            continue;
+        }
         if op.tag == tags::INTRINSIC_VAL
             && (op.intr == intrinsic_tags::LOGITS || op.intr == intrinsic_tags::MTP_LOGITS)
         {
@@ -619,6 +629,89 @@ fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
     source.push_str("      }\n");
     source.push_str("      if (m3_tid == 0) am_out[am_r] = int(m3_tgbuf[0].index);\n");
     source.push_str("      threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    source.push_str("    }\n");
+    source.push_str("  }\n");
+}
+
+/// The `attn_score` intrinsic: a strided gather out of the lane's block of the
+/// observability slab.
+///
+/// **THE SECOND ADDRESS ON THE LANE RECORD, AND THE WHOLE REASON IT IS
+/// THERE.** Everything below is [`emit_logits_gather`] with three words
+/// changed, which is the point: the score plane is a rectangle like the
+/// readout is, so the walk is the same walk. What it cannot share is the
+/// BASE — the slab is the shell's own reservation and the readout is the
+/// arena's, so no row displacement off `lane.logits_base` reaches it — and
+/// that is exactly what `lane.attn_score_base` supplies.
+///
+/// Three differences, each forced:
+///
+/// * the elements are `float`. A per-key mass is a probability a policy
+///   divides by and ranks on, not a bf16 quantity, and the single-lane
+///   `0xA0` handler takes the same arm on `p.intr`
+///   (`.wiki/alto/attn-score.md` §4). So this is a copy rather than a widen.
+/// * there is no `row_indices` indirection. Those entries are FIRE rows of
+///   the readout rectangle; a score row is a `(layer, head)` PLANE of one
+///   lane's block, and the block begins at the base. Rows are `0..n` and the
+///   lane map is the offset that was already folded into the address.
+/// * a zero base is a FAULT rather than a read. A lane that did not capture
+///   has no block, and the engine refuses that ask on the host side
+///   (`program::session`'s third guard); this is the device's half of the
+///   same sentence, because reading the slab at zero is a null dereference
+///   that takes the queue with it.
+fn emit_score_gather(source: &mut String, base: u32, o0: &str) {
+    source.push_str("  {\n");
+    // A plane is `ATTN_SCORE_KV_MAX` wide, so this walks a row far longer than
+    // one thread wants. Split it exactly as the logits gather splits its own.
+    source.push_str("    const uint score_begin = m3_tid;\n");
+    source.push_str("    const uint score_step = m3_threads;\n");
+    let _ = writeln!(
+        source,
+        "    const M1ValueDesc score_desc = descriptors[{base}];"
+    );
+    // The pitch is the SLAB's and the width is the READER's, the same parting
+    // the logits gather makes — and here the two normally agree, because a
+    // guest declares `[planes, attn_score_kv_max()]` and the published width
+    // IS the pitch the capture arm wrote at. They are still two numbers: a
+    // declared row is a CEILING (`ptir_m1_runtime_body.cuh` faults on
+    // `stride < logical_width` and on nothing else), so a guest reading the
+    // first `k` keys of each plane is served rather than refused.
+    source.push_str("    const uint score_stride = lane.attn_score_row_stride;\n");
+    source.push_str(
+        "    const uint score_width = \
+         score_desc.last == 0u ? score_stride : score_desc.last;\n",
+    );
+    let _ = writeln!(
+        source,
+        "    if (lane.attn_score_base == 0ul || score_stride == 0u || score_width == 0u || \
+         score_stride < score_width || \
+         score_desc.len % score_width != 0u) \
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
+    );
+    source.push_str(
+        "    const device float* score_planes = \
+         reinterpret_cast<const device float*>(lane.attn_score_base);\n",
+    );
+    let _ = writeln!(
+        source,
+        "    device float* score_out = reinterpret_cast<device float*>({o0});"
+    );
+    // Row-major with the extent hoisted, for `emit_logits_gather`'s reason:
+    // `lane` is a register copy but `score_out` is a device store the compiler
+    // cannot prove disjoint from anything, and a flat walk pays a divide and a
+    // modulo per element on top.
+    source.push_str("    const uint score_rows = score_desc.len / score_width;\n");
+    source.push_str("    for (uint sr = 0u; sr < score_rows; ++sr) {\n");
+    source.push_str(
+        "      const device float* score_src = score_planes + ulong(sr) * score_stride;\n",
+    );
+    source.push_str("      device float* score_dst = score_out + ulong(sr) * score_width;\n");
+    source.push_str(
+        "      for (uint column = score_begin; column < score_width; \
+         column += score_step) {\n",
+    );
+    source.push_str("        score_dst[column] = score_src[column];\n");
+    source.push_str("      }\n");
     source.push_str("    }\n");
     source.push_str("  }\n");
 }

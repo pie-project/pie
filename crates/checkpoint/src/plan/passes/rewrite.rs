@@ -27,6 +27,15 @@ pub(super) fn coalesce_persistent_arena_writes(program: &mut LoadPlan) -> Result
     // frees it at its last use, and an instruction that addresses the arena
     // by offset is the one thing it cannot honour. The backend says which
     // world the plan is for.
+    //
+    // AND IT IS NO LONGER THE ONLY THING THAT SAYS SO. A device-targeted plan
+    // can now be compiled for a streaming execution too — a capped load whose
+    // finalized tensors go to a pinned tier rather than into an arena — and it
+    // says so by leaving this pass out of the pipeline entirely
+    // (`plan::compile_streaming`, `pass::Pass::for_arena`) rather than by
+    // pretending its backend is unknown, which would change the lowering with
+    // it. The guard below stays for the host-targeted plan, which reaches this
+    // pass through the ordinary pipeline and still wants nothing from it.
     if program.target.backend == BackendKind::Unknown {
         return Ok(0);
     }
@@ -145,6 +154,7 @@ pub(super) fn flush_pending_bulk(
         StorageInstr::Allocate { .. }
         | StorageInstr::Fill { .. }
         | StorageInstr::ExtentWrite { .. }
+        | StorageInstr::GatherWrite { .. }
         | StorageInstr::TileMap { .. }
         | StorageInstr::CreateView { .. }
         | StorageInstr::Finalize { .. } => (u32::MAX, u64::MAX, u64::MAX),

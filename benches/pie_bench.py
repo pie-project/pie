@@ -298,6 +298,21 @@ def build_config(args: argparse.Namespace):
         # prefill width the planner would otherwise pick.
         if args.max_forward_tokens != PIE_MAX_FORWARD_TOKENS_DEFAULT:
             engine_options["max_forward_tokens"] = args.max_forward_tokens
+        for raw in getattr(args, "engine_option", []) or []:
+            key, sep, value = raw.partition("=")
+            if not sep:
+                raise SystemExit(f"--engine-option wants KEY=VALUE, got {raw!r}")
+            if value in ("true", "false"):
+                parsed: Any = value == "true"
+            else:
+                try:
+                    parsed = int(value)
+                except ValueError:
+                    try:
+                        parsed = float(value)
+                    except ValueError:
+                        parsed = value
+            engine_options[key] = parsed
         if args.max_forward_requests != PIE_MAX_FORWARD_REQUESTS_DEFAULT:
             engine_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "swap_pool_size", 0):
@@ -731,6 +746,19 @@ async def run(args: argparse.Namespace):
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
                 "wasm_delay_us": args.wasm_delay_us,
+                # THE FIRST TOKEN TAKES THE DEVICE AGAIN, ON BOTH ENGINES.
+                # This was set unconditionally for `--engine metal`, because
+                # the guest's default hands the prefill's token to the decode
+                # pass across a device-only channel the two passes SHARE and
+                # engine-metal gave each pass a ring of its own — the decode's
+                # empty forever, every request refused at its first decode
+                # frame in ~30 ms. engine-metal now mirrors engine-cuda's
+                # `27de300fa`: the ring belongs to the channel and both passes
+                # meet on it. So the knob is OPT-IN and nothing sets it by
+                # default; it is kept because it is a shipped shape (the first
+                # token out on `g0` and back as the decode's seed) and an A/B
+                # against the device handoff is worth being able to run.
+                **({"host_first_token": True} if getattr(args, "host_first_token", False) else {}),
                 **(
                     {"run_ahead_frames": args.run_ahead_frames}
                     if getattr(args, "run_ahead_frames", None)
@@ -1512,6 +1540,20 @@ def build_parser() -> argparse.ArgumentParser:
                      "frames (forwarded as the bench input's "
                      "run_ahead_frames; the ring grows to match). "
                      "Default: the inferlet's own sizing.",
+            )
+        if not any(
+            "--host-first-token" in a.option_strings for a in sp._actions
+        ):
+            sp.add_argument(
+                "--host-first-token",
+                dest="host_first_token",
+                action="store_true",
+                help="Hand the prefill's first token to the decode pass "
+                     "through the HOST (out on g0, back as the decode's seed) "
+                     "instead of across the device-only channel the two "
+                     "passes share. Costs one host hop per request and none "
+                     "per token. Default: the device handoff, which both "
+                     "engines now serve.",
             )
         sp.add_argument(
             "--dump-first-text",

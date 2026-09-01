@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use checkpoint::contract::compile::{Leaf, Lowering, Run, RunSource, compile};
+use checkpoint::contract::compile::{CopyList, Leaf, Lowering, Run, RunSource, compile};
 use checkpoint::contract::infer::{CheckpointTypes, infer_type};
 use checkpoint::contract::{Expr, TensorType};
 use checkpoint::testkit::reference::{TensorValue, replay};
@@ -241,7 +241,64 @@ fn a_gather_repeats_rows_and_coalesces_consecutive_ones() {
     let expr = Expr::src("e").gather(0, vec![4, 5, 6, 4, 5, 6]);
     let (_, checked) = infer_type(&expr, &fixture).unwrap();
     let lowering = compile(&expr, &checked, MAX_RUNS).unwrap();
+    let lowering = lowering.as_copy().expect("a row gather is a copy list");
     assert_eq!(lowering.run_count(), 2, "two blocks of three rows");
+}
+
+/// The other lowering, checked by the same oracle.
+///
+/// `compile` reaches for a table only when the copy list would exceed its cap,
+/// and the expression that forced the feature — a `[768, 1536]` stride-3
+/// deinterleave — is far too large to replay a byte at a time. So the cap is
+/// set to one instead: the routing is the same, the table is the same, and the
+/// mapping it denotes can be compared against a resolver that has never heard
+/// of either lowering.
+///
+/// `gather_lowering.rs` runs the real shape through the real executor.
+#[test]
+fn a_deinterleaving_gather_means_the_same_thing_as_a_table() {
+    let fixture = Fixture::new(&[("w", &[4, 6])]);
+    let channels = 3;
+    let indices: Vec<i64> = (0..channels)
+        .flat_map(|c| (0..6 / channels).map(move |j| j * channels + c))
+        .collect();
+    let expr = Expr::src("w").gather(1, indices.clone());
+    let (ty, checked) = infer_type(&expr, &fixture).unwrap();
+
+    let Lowering::Gather(table) = compile(&expr, &checked, 1).unwrap() else {
+        panic!("a cap of one leaves no room for a copy list");
+    };
+    assert_eq!(table.indices, indices);
+    assert_eq!(table.block, 1);
+    assert_eq!(table.rows, 4);
+    assert_eq!(table.src_row, 6);
+
+    let realized = replay(&Lowering::Gather(table), &ty, &fixture.values()).unwrap();
+    assert_eq!(realized, oracle(&expr, &fixture));
+
+    // The same expression under a cap it fits in is still a copy list: the
+    // gather is a fallback, not a preference.
+    assert!(compile(&expr, &checked, MAX_RUNS).unwrap().as_copy().is_some());
+}
+
+/// A gather whose blocks are whole rows keeps its table, and the table
+/// addresses rows rather than elements. The lowering below the gathered axis
+/// is what `block` carries.
+#[test]
+fn a_row_gather_tables_rows_not_elements() {
+    let fixture = Fixture::new(&[("e", &[8, 3])]);
+    let expr = Expr::src("e").gather(0, vec![5, 1, 7, 0, 3]);
+    let (ty, checked) = infer_type(&expr, &fixture).unwrap();
+    let Lowering::Gather(table) = compile(&expr, &checked, 1).unwrap() else {
+        panic!("a cap of one leaves no room for a copy list");
+    };
+    assert_eq!(table.block, 3, "one row per index");
+    assert_eq!(table.rows, 1, "nothing outside the gathered axis");
+    assert_eq!(table.src_row, 24);
+    assert_eq!(
+        replay(&Lowering::Gather(table), &ty, &fixture.values()).unwrap(),
+        oracle(&expr, &fixture)
+    );
 }
 
 #[test]
@@ -309,8 +366,8 @@ fn stacking_experts_is_a_reshaped_concatenation() {
 /// looks like. `compile` cannot produce these; the point is that if it ever
 /// did, the replay would say so rather than quietly returning a tensor with
 /// garbage in it.
-fn hand_rolled(runs: Vec<Run>, elements: i64) -> Lowering {
-    Lowering {
+fn hand_rolled(runs: Vec<Run>, elements: i64) -> CopyList {
+    CopyList {
         leaves: vec![Leaf::Checkpoint("w".to_string())],
         runs,
         elements,
@@ -335,7 +392,7 @@ fn the_replay_rejects_a_lowering_that_leaves_a_hole() {
         }],
         16,
     );
-    let err = replay(&lowering, &out_type(&[4, 4]), &fixture.values())
+    let err = replay(&Lowering::Copy(lowering), &out_type(&[4, 4]), &fixture.values())
         .unwrap_err()
         .to_string();
     assert!(err.contains("uninitialized"), "{err}");
@@ -355,7 +412,7 @@ fn the_replay_rejects_a_lowering_that_reads_past_its_input() {
         }],
         16,
     );
-    let err = replay(&lowering, &out_type(&[4, 4]), &fixture.values())
+    let err = replay(&Lowering::Copy(lowering), &out_type(&[4, 4]), &fixture.values())
         .unwrap_err()
         .to_string();
     assert!(err.contains("reads past the end"), "{err}");
@@ -376,7 +433,7 @@ fn the_replay_rejects_a_lowering_that_names_a_leaf_nobody_supplied() {
         16,
     );
     lowering.leaves = vec![Leaf::Checkpoint("absent".to_string())];
-    let err = replay(&lowering, &out_type(&[4, 4]), &fixture.values())
+    let err = replay(&Lowering::Copy(lowering), &out_type(&[4, 4]), &fixture.values())
         .unwrap_err()
         .to_string();
     assert!(err.contains("no reference value for 'absent'"), "{err}");
@@ -399,7 +456,7 @@ fn the_replay_rejects_a_lowering_that_writes_one_element_twice() {
         len: 16,
     };
     let lowering = hand_rolled(vec![run(0), run(0)], 16);
-    let err = replay(&lowering, &out_type(&[4, 4]), &fixture.values())
+    let err = replay(&Lowering::Copy(lowering), &out_type(&[4, 4]), &fixture.values())
         .unwrap_err()
         .to_string();
     assert!(err.contains("twice"), "{err}");
@@ -437,6 +494,7 @@ fn padding_a_head_dim_leaves_zeros_and_folds_the_copies() {
     let (ty, checked) = infer_type(&expr, &fixture).unwrap();
     assert_eq!(ty.shape, vec![4, 5]);
     let lowering = compile(&expr, &checked, MAX_RUNS).unwrap();
+    let lowering = lowering.as_copy().expect("a pad is a copy list");
     assert!(lowering.needs_zero_fill());
     // Eight alternating data and zero runs become four data runs and one fill.
     // They do not fold further: the destination stride is 5 and the row is 4,

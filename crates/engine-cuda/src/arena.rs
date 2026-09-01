@@ -146,7 +146,7 @@ mod tests {
     const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
     fn compiled() -> (model_ir::Trace, model_compiler::CompiledModel) {
-        let trace = model::trace_of(SKU).expect("the catalog ships the smoke's SKU");
+        let trace = models::trace_of(SKU).expect("the catalog ships the smoke's SKU");
         let trace = trace(Platform::Cuda);
         let compiled = compile(&trace, &Budget::new(4, 64), &DeviceProfile::default())
             .expect("the smoke's SKU bakes");

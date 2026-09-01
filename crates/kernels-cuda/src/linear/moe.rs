@@ -567,6 +567,7 @@ fn matmul_select_mxfp4(
             scales.arg(),
             bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
             y.arg(),
+            fan.top_k.arg(),
             act_div.arg(),
             n.arg(),
             k.arg(),
@@ -575,6 +576,12 @@ fn matmul_select_mxfp4(
             // before the ladder existed, and a null counter counts nothing.
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
+            // The staged-geometry seat, read in ROUTE space off words written
+            // in TOKEN space — the fan-out is the conversion, which is why
+            // `top_k` rides beside it (`linear/quant.cuh` states it, after
+            // `moe.cuh`). Unconditional: `ABSENT` when no body armed one,
+            // which is the arithmetic this leg always did.
+            ctx.stage(),
         ],
     )
 }
@@ -682,11 +689,14 @@ fn matmul_select_mlxu4(
             scales.arg(),
             biases.arg(),
             y.arg(),
+            fan.top_k.arg(),
             act_div.arg(),
             n.arg(),
             k.arg(),
             ArgValue::Ptr(seat.cell),
             ArgValue::Ptr(seat.hits),
+            // The twin's staged-geometry seat, on the twin's terms.
+            ctx.stage(),
         ],
     )
 }

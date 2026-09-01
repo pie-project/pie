@@ -1,11 +1,11 @@
 //! **THE CODEC — the one half of the media pipe that is not the model's.**
 //!
-//! `model::media` states the rule this module is the other side of: the
+//! `models::media` states the rule this module is the other side of: the
 //! catalog crate carries only dependencies every consumer of the catalog
 //! needs, and a compiler does not need a JPEG decoder. So the front-ends do
 //! arithmetic and THIS module — in the one crate that actually serves images —
 //! decodes the container and executes the resample the front-end asks for,
-//! lent through [`model::media::Resample`].
+//! lent through [`models::media::Resample`].
 //!
 //! Everything else in the pipe is arithmetic transcribed from a reference
 //! processor and gated against it. Decode is the exception: nobody transcribes
@@ -15,7 +15,7 @@
 //! **`image` 0.25, `default-features = false`, features `png` / `jpeg` / `gif`.**
 //!
 //! 1. **It is already in the lockfile, and for this exact code.** `runtime`
-//!    took `image` when `model::serve::multimodal` moved into it (M18), which
+//!    took `image` when `models::serve::multimodal` moved into it (M18), which
 //!    is the preprocessing the front-ends promote. Zero new crates resolved,
 //!    zero new licences to review (`image` and its tree are
 //!    MIT OR Apache-2.0, the workspace's own pair).
@@ -54,13 +54,13 @@
 //! Everything downstream of the resize — the patch order, the per-patch vector
 //! layout, the normalization, the grid arithmetic, the position table's taps
 //! and weights — is bit-pinned against `transformers` and gated as such
-//! (`model::qwen_3::media`, `model::gemma_4::media`, and this crate's own
+//! (`models::qwen_3::media`, `models::gemma_4::media`, and this crate's own
 //! whole-pipe tests). The resize is named here so that "approximately right"
 //! is a recorded decision about one step rather than an unexamined property of
 //! the whole pipe.
 
 use image::imageops::FilterType;
-use model::media::{Fault, Rgb8};
+use models::media::{Fault, Rgb8};
 
 /// **THE RESAMPLE FILTER**, and the module docs are its argument: Catmull-Rom
 /// is the Keys cubic at `a = -0.5`, which is PIL's `BICUBIC`, which is the
@@ -71,19 +71,24 @@ const RESAMPLE: FilterType = FilterType::CatmullRom;
 ///
 /// Alpha is composited away by `to_rgb8`'s own rule (the channel is dropped),
 /// which is `do_convert_rgb` in both reference processors.
-pub fn decode(bytes: &[u8]) -> model::media::Result<Rgb8> {
+pub fn decode(bytes: &[u8]) -> models::media::Result<Rgb8> {
     if bytes.is_empty() {
-        return Err(Fault::Decode("no bytes: an empty payload is no image".into()));
+        return Err(Fault::Decode(
+            "no bytes: an empty payload is no image".into(),
+        ));
     }
-    let img = image::load_from_memory(bytes)
-        .map_err(|e| Fault::Decode(format!("the bytes are not an image this front-end reads: {e}")))?;
+    let img = image::load_from_memory(bytes).map_err(|e| {
+        Fault::Decode(format!(
+            "the bytes are not an image this front-end reads: {e}"
+        ))
+    })?;
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
     Rgb8::new(h, w, rgb.into_raw())
 }
 
 /// Resample to exactly `(th, tw)` with [`RESAMPLE`] — the function lent to
-/// every front-end as its [`model::media::Resample`].
+/// every front-end as its [`models::media::Resample`].
 ///
 /// Exact and not fit-inside: the front-end has already computed the target
 /// from its own policy, and a resize that preserved aspect ratio a second

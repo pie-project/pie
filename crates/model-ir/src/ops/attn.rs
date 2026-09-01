@@ -367,7 +367,22 @@ pub enum Attention {
         theta: f32,
         q_out: ValueId,
     },
-    /// Scores `q` against the cached keys; `selection` is the top-k page ids.
+    /// Scores `q` against the cached keys; `selection` is the top-k key ids.
+    ///
+    /// **`ratio` IS WHICH CACHED ROWS ARE KEYS, AND IT IS THE DIFFERENCE
+    /// BETWEEN TWO FAMILIES.** glm_5's indexer keys one row per TOKEN — a
+    /// `k_proj` layernormed and roped into the index cache at the token's own
+    /// cell — and states `ratio = 1`: the visible keys are `pos + 1`, key `j`
+    /// lives at position `j`, and the ids this op publishes are token
+    /// positions. dsv4-flash's indexer keys one row per COMPRESSED BLOCK: its
+    /// keys are its own compressor's pooled entries (`v4mlx/compressor.py`'s
+    /// `compressor_prefill(..., rotate=True)` returns `[b, s // ratio, d]`),
+    /// stored at the boundary cell `(c + 1) * ratio - 1` exactly as
+    /// `PoolKvAppend` stores the attention compressor's, so it states its
+    /// compressor's own `ratio`: the visible keys are `(pos + 1) / ratio`, key
+    /// `c` lives at position `(c + 1) * ratio - 1`, and the ids this op
+    /// publishes are COMPRESSED ROW indices — which is exactly what
+    /// [`Self::PoolLseSelected`] walks.
     IndexTopk {
         q: ValueId,
         weights: ValueId,
@@ -375,6 +390,7 @@ pub enum Attention {
         heads: u32,
         head_dim: u32,
         top_k: u32,
+        ratio: u32,
         selection: ValueId,
     },
     IndexKvAppend {
@@ -389,12 +405,27 @@ pub enum Attention {
     // token-shaped — over-allocated with a sentinel in the non-boundary rows —
     // so no counted dim exists and the shapes stay trace-time facts.
     /// `row_valid` masks graph-padding rows out of the boundary math.
+    ///
+    /// **`boundary_rope` IS NOT `boundary_pos`.** The pooled entry is CACHED
+    /// at the cell its window closes on (`boundary_pos`, the block's LAST
+    /// token — `(c+1)·ratio - 1`, which is the cell `PoolLse` reads back),
+    /// but it is ROPED at the compressed row's own position
+    /// (`(p / ratio) · ratio` — the block's FIRST token, the reference's
+    /// `rows = arange(0, cutoff, ratio)` in `v4mlx/compressor.py`). Two
+    /// different positions for one entry, which is why this op publishes two
+    /// columns and not one; a text that roped at `boundary_pos` — or at the
+    /// raw token positions, which agree with it on every boundary row — is
+    /// off by `ratio - 1` on every compressed key it caches. Non-boundary
+    /// rows carry `0` here (they carry `-1` in `boundary_pos`, the sentinel
+    /// the append and the gather test), because a rope operand is an angle
+    /// and not a cell and the row is dropped before it is stored.
     PoolBoundaryDecode {
         positions: ValueId,
         row_valid: ValueId,
         ratio: u32,
         boundary_pos: ValueId,
         boundary_req: ValueId,
+        boundary_rope: ValueId,
     },
     PoolBoundaryPrefill {
         positions: ValueId,
@@ -402,12 +433,41 @@ pub enum Attention {
         ratio: u32,
         boundary_pos: ValueId,
         boundary_req: ValueId,
+        boundary_rope: ValueId,
+    },
+    /// **THE COMPRESSOR'S ROLLING STATE, WRITTEN.**
+    ///
+    /// `kv` is the learned compressor's `wkv · x` and `score` its `wgate · x`,
+    /// both `[tokens, coff · head_dim]`. They do not land in a fire-shaped
+    /// rectangle: [`Self::PoolGather`] addresses the state at the SOURCE
+    /// cache's own paged slot, because a pooling window closing in this fire
+    /// straddles tokens written in earlier ones. So this op scatters each row
+    /// into the cell `write_page`/`write_offset` name for it — the same cell
+    /// [`Self::KvAppendShared`] writes the latent into, in the same fire —
+    /// and the slabs it writes are the shell's, not a value the trace names.
+    ///
+    /// Without it the gather pools zeros, which is what it did for as long as
+    /// the compressor's four planes were interned.
+    PoolStateWrite {
+        kv: ValueId,
+        score: ValueId,
+        pages: ValueId,
+        write_page: ValueId,
+        write_offset: ValueId,
+        head_dim: u32,
+        ratio: u32,
     },
     /// Pools the closing window out of the kv cache into per-boundary entries.
+    ///
+    /// `ape` is the compressor's intra-block ABSOLUTE POSITION plane
+    /// (`[ratio, coff · head_dim]`, f32), folded into the gate logits before
+    /// the softmax. `None` for a parameter-free mean pool — the toy rows —
+    /// which is the `ape == nullptr` path both shaders already carry.
     PoolGather {
         boundary_pos: ValueId,
         boundary_req: ValueId,
         pages: ValueId,
+        ape: Option<ValueId>,
         head_dim: u32,
         ratio: u32,
         entries: ValueId,
@@ -430,6 +490,37 @@ pub enum Attention {
         request_of_token: ValueId,
         entries: ValueId,
         ratio: u32,
+        heads: u32,
+        head_dim: u32,
+        sm_scale: f32,
+        o: ValueId,
+        lse: ValueId,
+    },
+    /// [`Self::PoolLse`] over a SELECTION instead of over the whole visible
+    /// prefix: the same reader, the same online softmax and the same base-2
+    /// log-sum-exp the cascade merge folds, walking `selection[t · top_k + n]`
+    /// — the compressed-row ids [`Self::IndexTopk`] published, ascending, with
+    /// `-1` padding a row that saw fewer keys than its budget.
+    ///
+    /// **THIS IS THE NSA FINE BRANCH, AND THE BRANCH IT NARROWS IS THE
+    /// COMPRESSED ONE.** The reference oracle's attention is one softmax over
+    /// `concat(sliding window over the per-token latent, EVERY visible
+    /// compressed row)` with the per-head sink in the denominator — which is
+    /// what `prefill_lse` at `window` merged with `pool_lse` and closed by
+    /// `sink` already computes. The window is a fixed 128; the only key set
+    /// that grows with the context is the compressed one (`nvis = (pos + 1) /
+    /// ratio`), so the indexer's `index_topk` budget is what caps THAT, and
+    /// the ratio-128 layers carry no indexer because `S / 128` needs no
+    /// capping. A row whose visible count is inside the budget selects the
+    /// identity, so this op reduces to `PoolLse` exactly.
+    PoolLseSelected {
+        q: ValueId,
+        positions: ValueId,
+        request_of_token: ValueId,
+        selection: ValueId,
+        entries: ValueId,
+        ratio: u32,
+        top_k: u32,
         heads: u32,
         head_dim: u32,
         sm_scale: f32,
@@ -553,8 +644,12 @@ impl Operands for Attention {
             Self::PoolBoundaryPrefill { positions, row_valid, .. } => {
                 sink.extend([*positions, *row_valid]);
             }
-            Self::PoolGather { boundary_pos, boundary_req, pages, .. } => {
+            Self::PoolStateWrite { kv, score, pages, write_page, write_offset, .. } => {
+                sink.extend([*kv, *score, *pages, *write_page, *write_offset]);
+            }
+            Self::PoolGather { boundary_pos, boundary_req, pages, ape, .. } => {
                 sink.extend([*boundary_pos, *boundary_req, *pages]);
+                sink.extend(ape.iter().copied());
             }
             Self::PoolKvAppend {
                 entries,
@@ -575,6 +670,16 @@ impl Operands for Attention {
             }
             Self::PoolLse { q, positions, request_of_token, entries, .. } => {
                 sink.extend([*q, *positions, *request_of_token, *entries]);
+            }
+            Self::PoolLseSelected {
+                q,
+                positions,
+                request_of_token,
+                selection,
+                entries,
+                ..
+            } => {
+                sink.extend([*q, *positions, *request_of_token, *selection, *entries]);
             }
             Self::PleNgramIds { ids, state, .. } => sink.extend([*ids, *state]),
             Self::PleNgramIdsChunked { ids, state, .. } => sink.extend([*ids, *state]),
@@ -617,15 +722,27 @@ impl Operands for Attention {
             Self::IndexRope { q_out, .. } => sink.push(*q_out),
             Self::IndexTopk { selection, .. } => sink.push(*selection),
             Self::IndexKvAppend { .. } => {}
-            Self::PoolBoundaryDecode { boundary_pos, boundary_req, .. } => {
-                sink.extend([*boundary_pos, *boundary_req]);
+            Self::PoolBoundaryDecode {
+                boundary_pos,
+                boundary_req,
+                boundary_rope,
+                ..
+            } => {
+                sink.extend([*boundary_pos, *boundary_req, *boundary_rope]);
             }
-            Self::PoolBoundaryPrefill { boundary_pos, boundary_req, .. } => {
-                sink.extend([*boundary_pos, *boundary_req]);
+            Self::PoolBoundaryPrefill {
+                boundary_pos,
+                boundary_req,
+                boundary_rope,
+                ..
+            } => {
+                sink.extend([*boundary_pos, *boundary_req, *boundary_rope]);
             }
+            Self::PoolStateWrite { .. } => {}
             Self::PoolGather { entries, .. } => sink.push(*entries),
             Self::PoolKvAppend { .. } => {}
             Self::PoolLse { o, lse, .. } => sink.extend([*o, *lse]),
+            Self::PoolLseSelected { o, lse, .. } => sink.extend([*o, *lse]),
             Self::PleNgramIds { ngram_ids, .. } => sink.push(*ngram_ids),
             Self::PleNgramIdsChunked { ngram_ids, .. } => sink.push(*ngram_ids),
         }
@@ -669,9 +786,11 @@ impl Operands for Attention {
             Self::IndexKvAppend { .. } => {}
             Self::PoolBoundaryDecode { .. } => {}
             Self::PoolBoundaryPrefill { .. } => {}
+            Self::PoolStateWrite { .. } => {}
             Self::PoolGather { .. } => {}
             Self::PoolKvAppend { .. } => {}
             Self::PoolLse { .. } => {}
+            Self::PoolLseSelected { .. } => {}
             Self::PleNgramIds { .. } => {}
             Self::PleNgramIdsChunked { .. } => {}
         }
@@ -715,9 +834,11 @@ impl Operands for Attention {
             Self::IndexKvAppend { .. } => "attention.index_kv_append",
             Self::PoolBoundaryDecode { .. } => "attention.pool_boundary_decode",
             Self::PoolBoundaryPrefill { .. } => "attention.pool_boundary_prefill",
+            Self::PoolStateWrite { .. } => "attention.pool_state_write",
             Self::PoolGather { .. } => "attention.pool_gather",
             Self::PoolKvAppend { .. } => "attention.pool_kv_append",
             Self::PoolLse { .. } => "attention.pool_lse",
+            Self::PoolLseSelected { .. } => "attention.pool_lse_selected",
             Self::PleNgramIds { .. } => "attention.ple_ngram_ids",
             Self::PleNgramIdsChunked { .. } => "attention.ple_ngram_ids_chunked",
         }

@@ -254,9 +254,22 @@ pub struct Boundaries {
 }
 
 impl Boundaries {
+    /// **`lora` IS ADMITTED HERE BECAUSE A SINK CALL IS A DECLARATION AND NOT
+    /// AN OP** (alto adapter §6.1). `crate::op`'s `SINK_CALL` arm is `Ok(())`
+    /// — the interpreter runs nothing for it — and the effect is landed on the
+    /// HOST at instance bind, where `engine_metal::adapter::sink_of` reads the
+    /// call's channels off the launch package and
+    /// `engine_metal::adapter::planes_of` converts the seeded cells into the
+    /// banks' own bf16. So admitting it is not a claim that this backend
+    /// interprets a sink; it is the claim that this backend CONSUMES this
+    /// one, which `ModelProfile::has_lora` states at the other door and which
+    /// `eta_ir::validate` refuses a program for when it is false.
+    ///
+    /// It stays out of `kernel_calls` for the same reason it is in this list:
+    /// there is no entry to call, and there was never meant to be.
     pub const METAL: Self = Self {
         kernel_calls: &["metal.identity"],
-        sink_calls: &["metal.discard"],
+        sink_calls: &["metal.discard", "lora"],
     };
 
     pub const CUDA: Self = Self {

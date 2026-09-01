@@ -61,7 +61,7 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 fn word(query_len: u32) -> u64 {
-    model::qwen_4::forward::Facts::of(&Request::new(query_len, false)).word()
+    models::qwen_4::forward::Facts::of(&Request::new(query_len, false)).word()
 }
 
 /// One prompt's run: prefill, then `STEPS` decodes teacher-forced along the
@@ -112,7 +112,7 @@ fn ready() -> Option<(Shell, serde_json::Value)> {
     )
     .expect("the reference parses");
 
-    let micro = model::qwen_4::model::Model::flash_micro(Dtype::Bf16, Dtype::Bf16, 1);
+    let micro = models::qwen_4::model::Model::flash_micro(Dtype::Bf16, Dtype::Bf16, 1);
     let trace = model_dsl::trace_hybrid("qwen4-micro", &micro, Platform::Cuda);
     let source = ztensor_compat::index(&fixture.join("model.safetensors"))
         .expect("the fixture's checkpoint opens");
@@ -135,7 +135,7 @@ fn ready() -> Option<(Shell, serde_json::Value)> {
         ordinal: 0,
         graphs: engine_cuda::Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
-        program_cache_dir: None,
+        cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         weight_cache_dir: None,
     })

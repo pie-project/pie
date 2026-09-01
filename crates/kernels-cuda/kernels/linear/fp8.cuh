@@ -43,7 +43,7 @@ __device__ __forceinline__ float e4m3_to_f32(u8 byte) {
 // the warp reduce, rather than per group. That is not an optimisation but the
 // exactness argument: a factor pulled out of the sum is applied to the sum.
 //
-// The geometry is `matmul_mlx_affine`'s, for the same reason: one block column
+// The geometry is `matmul_affine`'s, for the same reason: one block column
 // per ACTIVATION ROW, `kRowsT` weight rows per warp, a lane per contraction
 // step striding by thirty-two so consecutive lanes read consecutive code
 // bytes. A decode step's row count is small and the weight is read once per

@@ -336,9 +336,21 @@ impl Residency {
     /// The third arm is `Impossible` and not
     /// [`Exhausted`](crate::Error::Exhausted) for the same reason the first
     /// two are: freeing device or host memory does not conjure a file. What
-    /// WOULD change it is booting the deployment once uncapped so the warm
-    /// artifact gets written, and the sentence says so rather than leaving the
-    /// operator to infer it.
+    /// WOULD change it is running `pie model import --prepare-only` on this
+    /// box, and the sentence says so rather than leaving the operator to infer
+    /// it. **A SECOND ROAD COUNTS TOO**: a shell whose weight cache holds this
+    /// deployment's serving artifact is sourced by it at any budget (§M.3), so
+    /// a prepared deployment carries its own source from then on. Which files
+    /// a shell will look at is the shell's to decide; this statute only asks
+    /// whether it found one.
+    ///
+    /// **AND IT STILL ADMITS ON THE BOOTSTRAP ALONE, DELIBERATELY** (§M-3).
+    /// The whole-table artifact an uncapped boot wrote is not something a
+    /// warm-only SERVE can be built from — the shell refuses one screen later,
+    /// by name, with the same remedy — but it is exactly what a PREPARE of a
+    /// spilled deployment reads its spilled planes out of, and `Cuda::prepare`
+    /// is admitted by this statute too. A rule that demanded the serving
+    /// artifact here would refuse the one run that creates it.
     ///
     /// **AND `Exhausted` IS STILL REACHABLE, ELSEWHERE AND CORRECTLY.** A
     /// budget this statute admits and an allocation the DEVICE then refuses is
@@ -388,13 +400,19 @@ impl Residency {
             return Err(crate::Error::Impossible(format!(
                 "weight residency: this load plans {} bytes onto the third tier — \
                  weights that neither `device_weight_budget` nor `host_weight_budget` \
-                 holds — and it has no T2 source to read them out of. The source is \
-                 the warm-boot weight artifact, which is a snapshot of the device \
-                 store and therefore needs no conversion to serve from (alto \
-                 streaming §0); this deployment either states no weight cache \
-                 directory or has not written one for this recipe yet. Boot it once \
-                 with the budgets uncapped to write the artifact, then re-state the \
-                 budgets; or raise one of them; or state `None`.",
+                 holds — and it has no T2 source to read them out of. The source is a \
+                 weight artifact, which is a snapshot of plane images and therefore \
+                 needs no conversion to serve from (alto streaming §0); this \
+                 deployment either states no weight cache directory or has never been \
+                 prepared on this machine. TWO FILES COUNT AS A SOURCE: the SERVING \
+                 artifact `pie model import` writes, which carries every plane of the \
+                 trace at a budget-free ranking and is what a serve reads; and the \
+                 whole-table artifact an UNCAPPED boot leaves behind, which is what a \
+                 PREPARE of a spilled deployment reads its spilled planes out of. So: \
+                 run `pie model import --prepare-only <checkpoint>` on this box — \
+                 booting it once uncapped first if this deployment has never had a \
+                 machine large enough to hold it whole — or raise one of the budgets, \
+                 or state `None`.",
                 tiers.spilled,
             )));
         }
@@ -434,6 +452,38 @@ pub struct LoadRequest {
     /// deployment's config layer is where an out-of-range depth is named
     /// (`crate::runahead::Runahead::MAX_FRAMES`). Zero reads as one.
     pub frames_in_flight: u8,
+    /// **THE TENSOR-PARALLEL DEGREE THIS LOAD IS FOR**, which a serving
+    /// artifact states and a shell must be able to compare against.
+    ///
+    /// A catalog fact — the row's own width — and not a fact the shell can
+    /// reach: a shell must not know a model family (design §7, decision 18),
+    /// which is why `engine-cuda`'s and `engine-metal`'s edges to `models` are
+    /// both DEV. So the runtime, which does see the catalog, states it here.
+    ///
+    /// `#[serde(default)]` reads as 1, which is what every request meant
+    /// before the field existed and what an unsharded load means now.
+    #[serde(default = "one_rank")]
+    pub tp_size: u64,
+    /// **THE SERVED NUMERIC FORM THIS LOAD IS FOR** — the field that makes one
+    /// model at two quantizations two artifacts.
+    ///
+    /// Here for [`tp_size`](LoadRequest::tp_size)'s reason and no other: it is
+    /// `models::precision_of`'s answer, and a shell cannot ask. A shell builds
+    /// `checkpoint::serving::Stamp::of` out of this, `tp_size`, the trace's
+    /// `name` and `platform`, and checks the artifact against it before a
+    /// plane lands.
+    ///
+    /// Empty is not a precision. A request that carries one is a request the
+    /// runtime could not assemble, and a shell should refuse rather than skip
+    /// the check — an artifact that passes because nobody stated what to
+    /// compare it to is the silent failure the stamp exists to end.
+    #[serde(default)]
+    pub precision: String,
+}
+
+/// [`LoadRequest::tp_size`]'s serde default: one rank.
+fn one_rank() -> u64 {
+    1
 }
 
 /// What a load answers with.
@@ -564,8 +614,15 @@ mod residency_tests {
             "and which tier they wanted: {said}"
         );
         assert!(
+            said.contains("pie model import --prepare-only"),
+            "and the one thing that would change the answer — which since §M-3 \
+             is a command and not a differently-configured boot: {said}"
+        );
+        assert!(
             said.contains("uncapped"),
-            "and the one thing that would change the answer: {said}"
+            "and the one case where a boot still comes into it, because a \
+             deployment that has never been held whole has nothing for a \
+             prepare to read its spilled planes out of: {said}"
         );
         assert!(
             matches!(refused, crate::Error::Impossible(_)),

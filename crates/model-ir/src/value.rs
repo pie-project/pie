@@ -21,6 +21,11 @@ pub struct ValueId(pub u32);
 /// enum now, in a leaf crate that deps nothing, and `model_ir::Dtype` is a name
 /// for it rather than a second one.
 pub use dtype::Dtype;
+/// The tiled affine layout's geometry, beside the [`Dtype`] that names it —
+/// `model_dsl::Weight::planes` sizes a repacked weight's three planes with
+/// these, and `checkpoint` checks a declared repack target against the same
+/// two numbers.
+pub use dtype::{TILED_BAND, TILED_STEP};
 
 /// The whole surviving shape algebra. Symbolic dims are sized by runtime
 /// budgets (`Tokens` → max_tokens, `Lanes` → max_lanes, `Patches` →
@@ -103,6 +108,21 @@ impl RowAxis {
     /// entirely made of.
     pub const PRIMARY: RowAxis = RowAxis::Tokens;
 
+    /// **EVERY AXIS, IN DISCRIMINANT ORDER** — what a pass that owes an
+    /// answer per row space iterates, and what [`PerAxis`] is laid out along.
+    ///
+    /// The order is the enum's own, so `ALL[axis as usize] == axis` and a
+    /// `PerAxis` entry is reachable by the same integer the variant is. That
+    /// equality is what makes the array an INDEX rather than a table with a
+    /// lookup in front of it, and it is why a third row space costs a variant
+    /// here and one more element at each fill site — never a second match arm
+    /// in every file that holds a pair.
+    pub const ALL: [RowAxis; 2] = [RowAxis::Tokens, RowAxis::Patches];
+
+    /// How many row spaces there are — [`ALL`](RowAxis::ALL)'s length, and
+    /// the width of every [`PerAxis`].
+    pub const COUNT: usize = RowAxis::ALL.len();
+
     /// The name a refusal or a ledger line spells this axis with.
     #[must_use]
     pub fn name(self) -> &'static str {
@@ -110,6 +130,105 @@ impl RowAxis {
             RowAxis::Tokens => "tokens",
             RowAxis::Patches => "patches",
         }
+    }
+}
+
+/// **ONE VALUE PER ROW AXIS, ADDRESSED BY THE AXIS** — the shape every
+/// per-axis fact in this tree is carried in, so that "which axis" is an INDEX
+/// and never a pair of hand-kept fields.
+///
+/// **WHY THIS EXISTS.** The second row axis arrived as a RECORD on the
+/// compiler half — `FireRows` has four named counts, `AxisPlan` names its
+/// axis — and as a MIRROR everywhere else: a `patch_classes` beside every
+/// `classes`, a `patch_pad` beside every `pad`, a `RowAxis::Patches` arm
+/// beside every `RowAxis::Tokens` one. A mirror is not a generalisation. It
+/// is the same derivation written twice, free to disagree with itself, and
+/// its cost is paid again in full by the third row space (the per-key
+/// attention-score extent, attn-score §6.1) — which is a variant of
+/// [`RowAxis`] and, with this type in the way, one more element at each fill
+/// site rather than a second field in nine files.
+///
+/// **AN ARRAY AND NOT A MAP.** [`RowAxis::ALL`] is in discriminant order and
+/// [`RowAxis::COUNT`] is its length, so the index is the variant's own
+/// integer: no hashing, no `Option`, no absent entry. Every axis has a value
+/// always — that is what makes a text-only fire's patch entry the ZERO
+/// window rather than a missing one, which is the reading the whole campaign
+/// rests on.
+///
+/// **AND IT KNOWS NOTHING ABOUT WHAT IT HOLDS.** `T` is a window table here,
+/// a pad pair there, a carve somewhere else. The type owes those no
+/// vocabulary and they owe it none; what it owns is the indexing and the
+/// promise that a `PerAxis` is total over the axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct PerAxis<T>([T; RowAxis::COUNT]);
+
+impl<T> PerAxis<T> {
+    /// One value per axis, IN [`RowAxis::ALL`]'s ORDER — the array fill a new
+    /// row space costs one more element of.
+    ///
+    /// Written as an array rather than as one argument per axis on purpose:
+    /// adding a variant then fails to compile HERE, at the fill, which is
+    /// where a caller has the value in hand to state. A per-variant signature
+    /// would fail to compile too, but only after the signature had been
+    /// widened by hand in every file that calls it.
+    pub const fn new(values: [T; RowAxis::COUNT]) -> PerAxis<T> {
+        PerAxis(values)
+    }
+
+    /// One value per axis, computed from the axis.
+    ///
+    /// The door for a fill whose entries are the same derivation over
+    /// different arguments — which is what a mirrored pair always was, said
+    /// once.
+    pub fn from_fn(mut f: impl FnMut(RowAxis) -> T) -> PerAxis<T> {
+        PerAxis(RowAxis::ALL.map(&mut f))
+    }
+
+    /// The same axes, carrying something else — `f` applied entry by entry,
+    /// in [`RowAxis::ALL`]'s order.
+    pub fn map<U>(self, mut f: impl FnMut(T) -> U) -> PerAxis<U> {
+        PerAxis(self.0.map(&mut f))
+    }
+
+    /// The entries in axis order, for a caller that wants to walk them
+    /// without naming the axes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    /// `(axis, value)` per axis, ascending — the loop a pass that owes one
+    /// answer per row space writes instead of two blocks.
+    pub fn iter(&self) -> impl Iterator<Item = (RowAxis, &T)> {
+        RowAxis::ALL.into_iter().zip(self.0.iter())
+    }
+}
+
+impl<T: Clone> PerAxis<T> {
+    /// The same value on every axis — the honest fill for a fact that is not
+    /// per-axis yet and is carried per-axis so that the day it becomes one
+    /// costs a call site rather than a type.
+    #[must_use]
+    pub fn splat(value: T) -> PerAxis<T> {
+        PerAxis::from_fn(|_| value.clone())
+    }
+}
+
+impl<T> core::ops::Index<RowAxis> for PerAxis<T> {
+    type Output = T;
+
+    /// **THE WHOLE POINT.** `table[axis]` where a mirrored pair used to spell
+    /// a two-arm match — in bounds by construction, because the array is
+    /// [`RowAxis::COUNT`] wide and a `RowAxis` is one of exactly that many
+    /// variants.
+    fn index(&self, axis: RowAxis) -> &T {
+        &self.0[axis as usize]
+    }
+}
+
+impl<T> core::ops::IndexMut<RowAxis> for PerAxis<T> {
+    fn index_mut(&mut self, axis: RowAxis) -> &mut T {
+        &mut self.0[axis as usize]
     }
 }
 
@@ -124,6 +243,15 @@ impl Dim {
     /// the same two sentences about the patch rectangle, and answer
     /// [`RowAxis::Patches`] for the same reason — which is what makes the
     /// second seriation's window pair the one that cuts them.
+    ///
+    /// **AND THE CUT NOW CONSUMES THIS.** `engine_cuda::run::Run::cut` picks
+    /// which of a window's intervals a column is sliced at by asking this
+    /// function and indexing a [`PerAxis`] with the answer, where it used to
+    /// carry one arm per variant against one named field per axis. So a new
+    /// row space's variants are cut correctly by the resolution the day they
+    /// answer here — the ROW-versus-LANE reading beside it is what still has
+    /// to be stated, because that is a fact about the DIM and not about its
+    /// axis.
     #[must_use]
     pub fn axis(self) -> Option<RowAxis> {
         match self {
@@ -371,4 +499,53 @@ pub enum Def {
 pub struct ValueDecl {
     pub def: Def,
     pub ty: Ty,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Dim, PerAxis, RowAxis};
+
+    /// **THE INDEX IS THE VARIANT'S OWN INTEGER, BOTH WAYS.** Every axis
+    /// reads back what was filled at it, `RowAxis::ALL` is in discriminant
+    /// order, and `Dim::axis` lands each symbolic dim on the entry its row
+    /// space owns — which is the whole contract every per-axis table in the
+    /// tree indexes on.
+    #[test]
+    fn a_per_axis_reads_back_what_each_axis_was_filled_with() {
+        let mut table = PerAxis::new(["tokens", "patches"]);
+        assert_eq!(table[RowAxis::Tokens], "tokens");
+        assert_eq!(table[RowAxis::Patches], "patches");
+        assert_eq!(table.as_slice().len(), RowAxis::COUNT);
+
+        // The array's order IS the enum's, which is what makes the index a
+        // multiplication rather than a lookup.
+        for (at, axis) in RowAxis::ALL.into_iter().enumerate() {
+            assert_eq!(table.as_slice()[at], axis.name());
+        }
+
+        // Writing through the index is the same address.
+        table[RowAxis::Patches] = "second";
+        assert_eq!(table[RowAxis::Patches], "second");
+        assert_eq!(table[RowAxis::Tokens], "tokens", "the other axis stood still");
+
+        // And `from_fn` is the same fill said once.
+        let named = PerAxis::from_fn(RowAxis::name);
+        assert_eq!(named[RowAxis::Tokens], "tokens");
+        assert_eq!(named[RowAxis::Patches], "patches");
+
+        // Which is what a cut indexes with: every symbolic dim's own axis.
+        let cut = PerAxis::new([10u32, 20]);
+        for (dim, want) in [
+            (Dim::Tokens, 10),
+            (Dim::TokensTimes(2), 10),
+            (Dim::Lanes, 10),
+            (Dim::LanesPlus(1), 10),
+            (Dim::Patches, 20),
+            (Dim::Images, 20),
+            (Dim::ImagesPlus(1), 20),
+        ] {
+            assert_eq!(cut[dim.axis().expect("a symbolic dim names a row space")], want);
+        }
+        assert_eq!(Dim::Const(8).axis(), None, "a fixed block belongs to no axis");
+    }
 }

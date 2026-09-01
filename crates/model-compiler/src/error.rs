@@ -184,7 +184,8 @@ pub enum Error {
     /// somebody else's bytes. So it is named at the door, with the field the
     /// deployment has to fill in.
     #[error(
-        "the plan states {} rows and the budgets size no {} ceiling —          a deployment that serves this model declares the axis's ladder",
+        "the plan states {} rows and the budgets size no {} ceiling — a deployment that serves \
+         this model declares the axis's ladder",
         .axis.name(),
         .axis.name()
     )]
@@ -203,7 +204,9 @@ pub enum Error {
     /// declared tower already has: the tower stated before the trunk that
     /// reads its output.
     #[error(
-        "the {} capture unit (unit {unit}) resumes at nodes {}..{} after another          unit has run. A unit is one exec and an exec is one contiguous stretch          of the script; the model text states the tower before the trunk that          reads it",
+        "the {} capture unit (unit {unit}) resumes at nodes {}..{} after another unit has run. A \
+         unit is one exec and an exec is one contiguous stretch of the script; the model text \
+         states the tower before the trunk that reads it",
         .axis.name(),
         .nodes.start,
         .nodes.end
