@@ -414,11 +414,11 @@ pub struct Seats {
     /// the tail launch starts at it, so a fire that splits binds one device
     /// vector twice rather than staging two that could disagree. The two are
     /// never bound on the SAME launch — [`Run::recurrent`] hands the head the
-    /// length and clears the origin, [`Run::recurrent_tail`] does the
+    /// length and clears the origin, [`Run::recurrent_tail_absolute`] does the
     /// opposite.
     ///
     /// [`Run::recurrent`]: crate::run::Run
-    /// [`Run::recurrent_tail`]: crate::run::Run
+    /// [`Run::recurrent_tail_absolute`]: crate::run::Run
     pub begin_at: Tensor,
 }
 

@@ -31,7 +31,7 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
         "gemma4-26b-a4b-mlxu4-kv-bf16",
         1,
         model_dsl::trace_hybrid,
-        Model::a4b(Dtype::MlxU4, Dtype::Bf16, 1)
+        Model::a4b(Dtype::U4g64, Dtype::Bf16, 1)
     ),
     (
         "gemma4-31b-bf16-kv-bf16",
@@ -43,7 +43,7 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
         "gemma4-31b-mlxu4-kv-bf16",
         1,
         model_dsl::trace_hybrid,
-        Model::b31(Dtype::MlxU4, Dtype::Bf16, 1)
+        Model::b31(Dtype::U4g64, Dtype::Bf16, 1)
     ),
     (
         "gemma4-31b-bf16-kv-bf16-tp2",
@@ -76,10 +76,10 @@ pub const IMPORTS: &[crate::ImportRow] = &[
     // would otherwise be claimed by the 31B row, which asks for sixty layers
     // and finds thirty.
     ("gemma4-26b-a4b-mlxu4-kv-bf16", |src| {
-        Model::a4b(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
+        Model::a4b(Dtype::U4g64, Dtype::Bf16, 1).import(src)
     }),
     ("gemma4-31b-mlxu4-kv-bf16", |src| {
-        Model::b31(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
+        Model::b31(Dtype::U4g64, Dtype::Bf16, 1).import(src)
     }),
     ("gemma4-e4b-eagle-bf16-kv-bf16", |src| {
         Model::e4b_eagle(Dtype::Bf16, Dtype::Bf16, 1).import(src)

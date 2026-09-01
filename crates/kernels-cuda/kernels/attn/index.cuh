@@ -31,11 +31,20 @@ __global__ void index_knorm_rope(
     const T* __restrict__ w,
     const T* __restrict__ b,
     const i32* __restrict__ positions,
-    i32 head_dim, i32 rope_dim, float theta, float eps)
+    i32 head_dim, i32 rope_dim, float theta, float eps,
+    const u32* __restrict__ win)
 {
     const int n = static_cast<int>(blockIdx.x);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first block owns — the key
+    // row and the position that dates it are both read there.
+    const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = static_cast<int>(threadIdx.x);
-    T* row = idx_k + static_cast<long long>(n) * head_dim;
+    T* row = idx_k + static_cast<long long>(n_row) * head_dim;
 
     __shared__ float red[kBlock];
     float s = 0.f;
@@ -58,7 +67,7 @@ __global__ void index_knorm_rope(
     if (tid == 0) {
         float buf[kMaxRopeDim];
         for (int d = 0; d < rope_dim; ++d) buf[d] = Elem<T>::to_f32(row[d]);
-        rope_interleave_inplace(buf, rope_dim, positions[n], theta);
+        rope_interleave_inplace(buf, rope_dim, positions[n_row], theta);
         for (int d = 0; d < rope_dim; ++d) row[d] = Elem<T>::from_f32(buf[d]);
     }
 }
@@ -67,15 +76,24 @@ template <class T>
 __global__ void index_q_rope(
     T* __restrict__ idx_q,
     const i32* __restrict__ positions,
-    i32 n_heads, i32 head_dim, i32 rope_dim, float theta)
+    i32 n_heads, i32 head_dim, i32 rope_dim, float theta,
+    const u32* __restrict__ win)
 {
     const int n = static_cast<int>(blockIdx.x);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first block owns — the query
+    // row and the position that dates it are both read there.
+    const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = static_cast<int>(threadIdx.x);
     if (h >= n_heads) return;
-    T* row = idx_q + (static_cast<long long>(n) * n_heads + h) * head_dim;
+    T* row = idx_q + (static_cast<long long>(n_row) * n_heads + h) * head_dim;
     float buf[kMaxRopeDim];
     for (int d = 0; d < rope_dim; ++d) buf[d] = Elem<T>::to_f32(row[d]);
-    rope_interleave_inplace(buf, rope_dim, positions[n], theta);
+    rope_interleave_inplace(buf, rope_dim, positions[n_row], theta);
     for (int d = 0; d < rope_dim; ++d) row[d] = Elem<T>::from_f32(buf[d]);
 }
 
@@ -152,11 +170,21 @@ __global__ void index_topk_paged(
     const u32* __restrict__ kv_last_page_lens,
     float* __restrict__ scores,
     i32* __restrict__ selection,
-    i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk)
+    i32 R, i32 H, i32 D, i32 page_size, i32 score_stride, i32 topk,
+    const u32* __restrict__ win)
 {
     const int t = static_cast<int>(blockIdx.x);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first block owns. Only the
+    // PLANES move by it — the qo boundaries below are the window's own,
+    // rebased to its zero, and the score scratch starts at its own too.
+    const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     const int tid = static_cast<int>(threadIdx.x);
-    i32* srow = selection + static_cast<long long>(t) * topk;
+    i32* srow = selection + static_cast<long long>(t_row) * topk;
 
     int r = 0;
     for (; r < R - 1; ++r) {
@@ -175,8 +203,8 @@ __global__ void index_topk_paged(
     if (nkeys < 0) nkeys = 0;
 
     float* frow = scores + static_cast<long long>(t) * score_stride;
-    const T* qi = idx_q + static_cast<long long>(t) * H * D;
-    const T* wi = idx_w + static_cast<long long>(t) * H;
+    const T* qi = idx_q + static_cast<long long>(t_row) * H * D;
+    const T* wi = idx_w + static_cast<long long>(t_row) * H;
     for (int j = tid; j < nkeys; j += kBlock) {
         const int page =
             static_cast<int>(kv_page_indices[pages_first + j / page_size]);

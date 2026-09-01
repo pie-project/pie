@@ -180,8 +180,9 @@ const CHUNK: usize = 64 << 20;
 
 /// What happened to the cache on one load.
 ///
-/// **PROCESS-GLOBAL AND NOT A FIELD**, for the reason `record::FOLD_OBSERVED`
-/// is: a gate at the runtime level holds the engine behind a `Box<dyn Engine>`
+/// **PROCESS-GLOBAL AND NOT A FIELD**, for the reason the retired
+/// `record::FOLD_OBSERVED` was: a gate at the runtime level holds the engine
+/// behind a `Box<dyn Engine>`
 /// on a lane thread and cannot ask the instance anything. The per-load answer
 /// a CALLER wants rides home on
 /// [`LoadFacts::weights_from_cache`](engine::load::LoadFacts);

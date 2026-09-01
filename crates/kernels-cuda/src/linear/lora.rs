@@ -231,6 +231,9 @@ pub fn correct(
             rank_i.arg(),
             out_i.arg(),
             stride.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

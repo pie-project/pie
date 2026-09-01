@@ -23,7 +23,8 @@ __global__ void mla_split_q_b(
     int total,
     int heads,
     int nope,
-    int rope)
+    int rope,
+    const u32* __restrict__ win)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
@@ -31,11 +32,20 @@ __global__ void mla_split_q_b(
     const int d = i % per;
     const int h = (i / per) % heads;
     const int n = i / (heads * per);
-    const T v = q_b[i];
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first element belongs to.
+    // The flat index has to be re-laid on it — the cut reads and writes the
+    // same row axis.
+    const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+    const T v = q_b[(static_cast<long long>(n_row) * heads + h) * per + d];
     if (d < nope) {
-        q_nope[(static_cast<long long>(n) * heads + h) * nope + d] = v;
+        q_nope[(static_cast<long long>(n_row) * heads + h) * nope + d] = v;
     } else {
-        q_pe[(static_cast<long long>(n) * heads + h) * rope + (d - nope)] = v;
+        q_pe[(static_cast<long long>(n_row) * heads + h) * rope + (d - nope)] = v;
     }
 }
 
@@ -48,14 +58,23 @@ __global__ void mla_latents(
     int kv_lora,
     int rope,
     int src_row_stride,
-    float eps)
+    float eps,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first block owns — the fused
+    // projection and both halves it is cut into share that row axis.
+    const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
-    const T* row = kv_a + static_cast<long long>(n) * src_row_stride;
+    const T* row = kv_a + static_cast<long long>(n_row) * src_row_stride;
 
     for (int d = tid; d < rope; d += BLOCK_DIM) {
-        k_pe[static_cast<long long>(n) * rope + d] = row[kv_lora + d];
+        k_pe[static_cast<long long>(n_row) * rope + d] = row[kv_lora + d];
     }
 
     float local = 0.f;
@@ -74,7 +93,7 @@ __global__ void mla_latents(
     for (int d = tid; d < kv_lora; d += BLOCK_DIM) {
         const float v = Elem<T>::to_f32(row[d]);
         const float w = Elem<T>::to_f32(norm_weight[d]);
-        kv_c[static_cast<long long>(n) * kv_lora + d] = Elem<T>::from_f32(v * inv_rms * w);
+        kv_c[static_cast<long long>(n_row) * kv_lora + d] = Elem<T>::from_f32(v * inv_rms * w);
     }
 }
 
@@ -317,9 +336,19 @@ __global__ void mla_naive_paged_kernel(
     __nv_bfloat16* __restrict__ o,
     const std::int32_t* __restrict__ selection, int top_k,
     int R, int H, int CKV, int KPE, int page_size, float sm_scale, bool causal,
-    int G)
+    int G,
+    const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first block owns. Only the
+    // PLANES move by it — the qo boundaries this searches are the window's
+    // own, rebased to its zero, so the token ordinal they answer stays `t`.
+    const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -331,7 +360,7 @@ __global__ void mla_naive_paged_kernel(
     const int pper = KPE / 32;
 
     const std::int32_t* srow =
-        (selection != nullptr) ? selection + static_cast<long long>(t) * top_k : nullptr;
+        (selection != nullptr) ? selection + static_cast<long long>(t_row) * top_k : nullptr;
 
     int lo = 0, hi = R - 1;
     while (lo < hi) {
@@ -355,9 +384,9 @@ __global__ void mla_naive_paged_kernel(
     float* wl    = wm + kMlaNaiveWarps;
 
     const __nv_bfloat16* qn =
-        q_nope + (static_cast<long long>(t) * H + h) * CKV;
+        q_nope + (static_cast<long long>(t_row) * H + h) * CKV;
     const __nv_bfloat16* qp =
-        q_pe + (static_cast<long long>(t) * H + h) * KPE;
+        q_pe + (static_cast<long long>(t_row) * H + h) * KPE;
     float qn_r[kMlaNaiveMaxPer];
     float qp_r[kMlaNaiveMaxPePer];
     for (int i = 0; i < per; ++i) qn_r[i] = __bfloat162float(qn[lane + i * 32]);
@@ -428,7 +457,7 @@ __global__ void mla_naive_paged_kernel(
             }
         }
         const float inv = (l_all > 0.f) ? (1.f / l_all) : 0.f;
-        o[(static_cast<long long>(t) * H + blockIdx.y * G + gg) * CKV + d] =
+        o[(static_cast<long long>(t_row) * H + blockIdx.y * G + gg) * CKV + d] =
             __float2bfloat16(v * inv);
     }
 }
@@ -530,7 +559,8 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
     __nv_bfloat16* __restrict__ o,
-    int R, int H, int page_size, float sm_scale, bool causal)
+    int R, int H, int page_size, float sm_scale, bool causal,
+    const u32* __restrict__ win)
 {
     extern __shared__ __align__(16) char smem_raw[];
     __nv_bfloat16* sQ = reinterpret_cast<__nv_bfloat16*>(smem_raw);
@@ -546,6 +576,15 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const int warp = tid >> 5;
 
     const int t = blockIdx.y;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first block owns. Only the
+    // PLANES move by it — the qo boundaries this scans are the window's own,
+    // rebased to its zero, so the token ordinal they answer stays `t`.
+    const int t_row = win != nullptr ? t + static_cast<int>(win[1]) : t;
     const int h0 = blockIdx.x * kBM;
 
     __shared__ int s_req;
@@ -575,7 +614,7 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     for (int c = tid; c < kBM * kChunksPerRow; c += kThreads) {
         const int row = c / kChunksPerRow;
         const int d = (c % kChunksPerRow) * 8;
-        const long long qh = (static_cast<long long>(t) * H + h0 + row);
+        const long long qh = (static_cast<long long>(t_row) * H + h0 + row);
         const int4 v = (d < kCkv)
             ? *reinterpret_cast<const int4*>(q_nope + qh * kCkv + d)
             : *reinterpret_cast<const int4*>(q_pe + qh * kKpe + (d - kCkv));
@@ -749,8 +788,8 @@ __global__ __launch_bounds__(kThreads, PIE_MLA_MMA_MINBLK) void mla_mma_paged_ke
     const float l0 = sL[g], l1 = sL[g + 8];
     const float i0 = (l0 > 0.f) ? (1.f / l0) : 0.f;
     const float i1 = (l1 > 0.f) ? (1.f / l1) : 0.f;
-    __nv_bfloat16* o0 = o + (static_cast<long long>(t) * H + h0 + g) * kCkv;
-    __nv_bfloat16* o1 = o + (static_cast<long long>(t) * H + h0 + g + 8) * kCkv;
+    __nv_bfloat16* o0 = o + (static_cast<long long>(t_row) * H + h0 + g) * kCkv;
+    __nv_bfloat16* o1 = o + (static_cast<long long>(t_row) * H + h0 + g + 8) * kCkv;
     #pragma unroll
     for (int n = 0; n < kNTiles; ++n) {
         const int d = dbase + n * 8 + p;

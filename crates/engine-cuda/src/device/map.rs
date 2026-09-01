@@ -2,21 +2,46 @@
 //! stops being a census and becomes a coordinate system.
 //!
 //! [`nodes::walk`](crate::device::nodes::walk) reads a captured graph and
-//! hands back what the driver said. This module turns one such reading into
-//! the table the fire path rebinds against: per node the live
-//! `CUgraphNode_t`, its entrypoint, its `(offset, size)` parameter cells and
-//! the bytes the capture froze into them, its grid, block and shared memory —
-//! all keyed by an index that TWO captures of the same walk agree on. Step 4
-//! keeps one of these beside each exec and applies [`diff`]'s [`Patch`]es
-//! with `cudaGraphExecKernelNodeSetParams`.
+//! hands back what the driver said. This module turns one such reading into a
+//! coordinate system over it: per node the live `CUgraphNode_t`, its
+//! entrypoint, its `(offset, size)` parameter cells and the bytes the capture
+//! froze into them, its grid, block and shared memory — all indexed so that
+//! TWO captures of the same walk agree, which is what makes [`diff`] able to
+//! say WHAT MOVED between one composition's capture and another's.
 //!
-//! **This module writes nothing.** It reads two graphs and says what moved;
-//! the exec it would be written to is `record.rs`'s, and so is the decision
-//! to write at all. The split is not fastidiousness: what moved is derivable
-//! from the two graphs ALONE and is therefore testable without an exec, a
-//! fire, or a checkpoint, while the write needs a policy (which exec, which
-//! fire, whether the pass is worth its 68 µs) that no pair of graphs
-//! contains.
+//! **AND WHAT IT WAS BUILT FOR NO LONGER EXISTS, WHICH IS WORTH SAYING
+//! PLAINLY.** Step 4 of `.wiki/palo/cuda-abi.md` §7 kept one of these tables
+//! beside each exec and applied [`diff`]'s [`Patch`]es with
+//! `cudaGraphExecKernelNodeSetParams` — the FOLD, which the tier-2 campaign
+//! deleted along with the keyed capture path. A body writes into no exec at
+//! all (`record.rs`'s header states why: absence rides the key, and the row
+//! count rides a staged seat), so nothing on the fire path holds a table or
+//! wants a patch.
+//!
+//! What survives is the measurement surface, and it survives on its own
+//! merits. Two captures of two compositions, diffed here, are how this shell
+//! answers "how much of a graph is actually a function of the fire" without
+//! running one — the question every future device-side-descriptor wave opens
+//! with, and the question poc1-24's cost laws were measured against. The
+//! probe gates (`cuda_node_map`, `cuda_descriptor_abi_probe`) are its
+//! callers, `record::Graphs::keep_graphs` is the seam that hands them real
+//! captured bodies, and this module is what they read those bodies through.
+//!
+//! **This module writes nothing**, which is the part of step 4's design that
+//! was right independently of step 4: what moved is derivable from the two
+//! graphs ALONE and is therefore testable without an exec, a fire, or a
+//! checkpoint, while the write needs a policy (which exec, which fire,
+//! whether the pass is worth its 68 µs) that no pair of graphs contains. The
+//! mechanical write half stood here — `apply`, one
+//! `cudaGraphExecKernelNodeSetParams` per [`Patch`] — and went out with the
+//! fold that called it. What a measurement still needs from that call is its
+//! PRICE and the fields the driver validates, and that is
+//! [`nodes::rebind`](crate::device::nodes::rebind), which has a probe caller.
+//! [`Patch`] stays what it always was: the report `diff` writes, carrying the
+//! live handles because a table that held only the numbers could describe a
+//! rebind without being able to perform one — and [`Patch::block`] stays
+//! beside it, because the ABI packing is a fact this module's own unit test
+//! asserts and the next writer of a captured node will need.
 //!
 //! # The fingerprint hashes a multiset, and the reason is the tiebreak
 //!
@@ -48,7 +73,7 @@
 //! What the fingerprint deliberately does NOT hash: any argument, any grid,
 //! any pointer. Those are exactly what a rebind exists to move, and a
 //! fingerprint that noticed them would call every fire a new topology — which
-//! is today's exact key wearing a hash's costume.
+//! is the retired exact-shape key wearing a hash's costume.
 //!
 //! # The ambiguity census is a result, not a warning
 //!
@@ -465,13 +490,20 @@ pub struct Patch {
     pub moved: Vec<Component>,
 }
 
+
 impl Patch {
     /// The parameter block as the ABI lays it out: one buffer, each parameter
     /// at its own `offset`.
     ///
-    /// The `CU_LAUNCH_PARAM_BUFFER_POINTER` form of the call takes exactly
-    /// this, which is what makes application mechanical — no per-kernel
-    /// pointer array to keep alive, one `Vec<u8>` per node.
+    /// **THE ABI FACT, KEPT AS CODE BECAUSE A UNIT TEST ASSERTS IT**
+    /// (`a_patch_packs_its_parameters_where_the_abi_puts_them`). The
+    /// `CU_LAUNCH_PARAM_BUFFER_POINTER` form of
+    /// `cudaGraphExecKernelNodeSetParams` takes exactly this — one `Vec<u8>`
+    /// per node, no per-kernel pointer array to keep alive — which is what
+    /// made the fold's application mechanical. The fold is deleted and the
+    /// call has no in-tree caller; the PACKING is still the thing every
+    /// future writer of a captured node has to get right, and the cheapest
+    /// place to state it is beside the type that carries the cells.
     #[must_use]
     pub fn block(&self) -> Vec<u8> {
         let len = self
@@ -489,96 +521,18 @@ impl Patch {
     }
 }
 
-/// Write patches into an instantiated exec: one
-/// `cudaGraphExecKernelNodeSetParams` per patch, restating the node in full.
-///
-/// **THE ONE WRITE THIS MODULE OWNS, AND IT IS STILL POLICY-FREE**: which
-/// exec, which patches and whether the pass is worth its microseconds stay
-/// `record.rs`'s decisions — this is the mechanical half the module doc
-/// promised step 4, kept beside [`Patch`] because the ABI packing
-/// ([`Patch::block`]) and the driver call that consumes it are one fact.
-///
-/// The call takes the node handle of the graph the exec was instantiated
-/// from ([`Patch::node`]) and the parameter block is handed over in the
-/// `kernelParams` form — one host pointer per argument, each into the packed
-/// block — which is the form the probe validated writes through (GRID ✓
-/// ARG ✓ FUNC ✓, §1 of the design note). The node's existing params are read
-/// first and mutated, so fields this table does not model (the v2 struct's
-/// context) keep what instantiation gave them.
-///
-/// # Errors
-///
-/// [`Fault::Runtimeless`] for a build with no runtime; [`Fault::Device`]
-/// naming the first node the driver refused. A refusal mid-list leaves the
-/// exec partially written — the caller must treat that exec as unbound (the
-/// fold drops it by name rather than launching it).
-///
-/// [`Fault::Runtimeless`]: crate::error::Fault::Runtimeless
-/// [`Fault::Device`]: crate::error::Fault::Device
-#[cfg(feature = "_cuda")]
-pub fn apply(exec: &crate::device::graph::GraphExec, patches: &[Patch]) -> Result<()> {
-    use cudarc::driver::sys as dr;
-
-    let raw: dr::CUgraphExec = exec.raw().cast();
-    for patch in patches {
-        // The node's current statement, so the fields a patch does not carry
-        // stay what they were.
-        let mut params: dr::CUDA_KERNEL_NODE_PARAMS = unsafe { core::mem::zeroed() };
-        let read = unsafe { dr::cuGraphKernelNodeGetParams_v2(patch.node.cast(), &raw mut params) };
-        if read != dr::CUresult::CUDA_SUCCESS {
-            return Err(crate::error::Fault::Device {
-                call: "cuGraphKernelNodeGetParams_v2",
-                code: read as i32,
-            });
-        }
-        params.func = patch.entry.cast();
-        params.gridDimX = patch.grid[0];
-        params.gridDimY = patch.grid[1];
-        params.gridDimZ = patch.grid[2];
-        params.blockDimX = patch.block[0];
-        params.blockDimY = patch.block[1];
-        params.blockDimZ = patch.block[2];
-        params.sharedMemBytes = patch.smem;
-        // The block, then one pointer per argument into it — alive for the
-        // duration of the call, which is all the driver needs: it copies.
-        let block = patch.block();
-        let mut cells: Vec<*mut c_void> = patch
-            .params
-            .iter()
-            .map(|param| unsafe { block.as_ptr().add(param.offset) as *mut c_void })
-            .collect();
-        params.kernelParams = cells.as_mut_ptr();
-        params.extra = core::ptr::null_mut();
-        let wrote =
-            unsafe { dr::cuGraphExecKernelNodeSetParams_v2(raw, patch.node.cast(), &raw const params) };
-        if wrote != dr::CUresult::CUDA_SUCCESS {
-            return Err(crate::error::Fault::Device {
-                call: "cuGraphExecKernelNodeSetParams_v2",
-                code: wrote as i32,
-            });
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "_cuda"))]
-#[allow(unused_variables)]
-pub fn apply(exec: &crate::device::graph::GraphExec, patches: &[Patch]) -> Result<()> {
-    Err(crate::error::Fault::Runtimeless)
-}
-
 /// What two captures of one shape have to say to each other.
 #[derive(Clone, Debug)]
 pub enum Diff {
     /// The two walks are not the same graph, so no alignment between them
     /// exists.
     ///
-    /// **NOT A REFUSAL.** A composition the exec cache has never seen is the
-    /// ordinary case — it captures, instantiates and keys a new entry, which
-    /// is what today's shell does for every shape. Naming it here keeps the
-    /// caller from having to tell "this fire needs a new graph" apart from
-    /// "this fire's graph cannot be trusted", which are answers with
-    /// different consequences.
+    /// **NOT A REFUSAL.** A composition no capture has stood for yet is the
+    /// ordinary case — it is captured and keyed, which is what
+    /// `record::Graphs` does for every present set its lattice enumerates.
+    /// Naming it here keeps the caller from having to tell "this is a
+    /// different graph" apart from "this graph cannot be trusted", which are
+    /// answers with different consequences.
     NotSameTopology {
         /// What the map was built from.
         held: Topology,

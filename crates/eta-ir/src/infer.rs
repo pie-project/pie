@@ -40,7 +40,7 @@ pub enum BodyErrorKind {
     /// The op set's element type is [`Dtype`], which the loader, the kernels
     /// and the transfer contract share; ETA computes in four of its variants
     /// and [`crate::types::class_of`] says which. A `cast` to `Bf16`, or a
-    /// second-party kernel declaring an `Fp8E4m3` result, is well-formed as a
+    /// second-party kernel declaring an `E4m3` result, is well-formed as a
     /// *value* and has no meaning here, so it is refused by name at the one
     /// point every op's result passes through. Refused here and not at the
     /// encoder, where the only answer left is a panic.

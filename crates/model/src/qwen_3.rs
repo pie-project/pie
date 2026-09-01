@@ -25,19 +25,19 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
         "qwen36-27b-mlxu4-kv-bf16",
         1,
         model_dsl::trace_hybrid,
-        Model::d27b_undrafted(Dtype::MlxU4, Dtype::Bf16, 1)
+        Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16, 1)
     ),
     (
         "qwen38-27b-mlxu4-kv-bf16",
         1,
         model_dsl::trace_hybrid,
-        Model::d27b_undrafted(Dtype::MlxU4, Dtype::Bf16, 1)
+        Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16, 1)
     ),
     (
         "qwen36-35b-a3b-mlxu4-kv-bf16",
         1,
         model_dsl::trace_hybrid,
-        Model::a3b(Dtype::MlxU4, Dtype::Bf16, 1)
+        Model::a3b(Dtype::U4g64, Dtype::Bf16, 1)
     ),
     (
         "qwen35-a3b-bf16-kv-bf16",
@@ -61,7 +61,7 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
         "qwen35-d0.8b-mlxu4-kv-bf16",
         1,
         model_dsl::trace_hybrid,
-        Model::d0_8b(Dtype::MlxU4, Dtype::Bf16, 1)
+        Model::d0_8b(Dtype::U4g64, Dtype::Bf16, 1)
     ),
     (
         "qwen35-d0.8b-vision-eagle-bf16-kv-bf16",
@@ -190,10 +190,10 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
 ///
 pub const IMPORTS: &[crate::ImportRow] = &[
     ("qwen36-27b-mlxu4-kv-bf16", |src| {
-        Model::d27b_undrafted(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
+        Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16, 1).import(src)
     }),
     ("qwen35-d0.8b-mlxu4-kv-bf16", |src| {
-        Model::d0_8b(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
+        Model::d0_8b(Dtype::U4g64, Dtype::Bf16, 1).import(src)
     }),
     // **AHEAD OF `qwen35-a3b-bf16`, WHICH IS THE SAME FORTY LAYERS**
     // (campaign M-5). The two rows read one architecture — every number
@@ -204,7 +204,7 @@ pub const IMPORTS: &[crate::ImportRow] = &[
     // `.weight`/`.scales`/`.biases` triplet, and a bf16 A3B checkpoint holds
     // only the first.
     ("qwen36-35b-a3b-mlxu4-kv-bf16", |src| {
-        Model::a3b(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
+        Model::a3b(Dtype::U4g64, Dtype::Bf16, 1).import(src)
     }),
     ("qwen36-27b-bf16-kv-bf16", |src| {
         Model::d27b(Dtype::Bf16, Dtype::Bf16, 1).import(src)
@@ -213,7 +213,7 @@ pub const IMPORTS: &[crate::ImportRow] = &[
         Model::d27b(Dtype::Bf16, Dtype::Bf16, 1).import(src)
     }),
     ("qwen38-27b-mlxu4-kv-bf16", |src| {
-        Model::d27b_undrafted(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
+        Model::d27b_undrafted(Dtype::U4g64, Dtype::Bf16, 1).import(src)
     }),
     ("qwen35-a3b-bf16-kv-bf16", |src| {
         Model::a3b(Dtype::Bf16, Dtype::Bf16, 1).import(src)

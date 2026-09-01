@@ -87,15 +87,30 @@ __global__ void mlp_geglu_tanh(
     const T* __restrict__ gate,
     const T* __restrict__ up,
     T* __restrict__ y,
-    i32 n)
+    i32 n,
+    i32 width,
+    const u32* __restrict__ win)
 {
     const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
+    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
+    // lane is not a row here, so the live-rows word bounds `win[0] * width`
+    // elements, and `win[1] * width` is where they begin. Armed, the planes
+    // arrive at their base and this lane owns element `at`; null, they arrived
+    // pre-shifted and `idx` is the element already.
+    if (win != nullptr &&
+        static_cast<long long>(idx) >=
+            static_cast<long long>(win[0]) * width) return;
+    const long long at = win != nullptr
+        ? idx + static_cast<long long>(win[1]) * width
+        : idx;
+    // `gate`, `up` and `y` are one row per token on the axis the guard counts,
+    // so all three read the shifted element.
     constexpr float c = 0.7978845608028654f;
-    const float g = Elem<T>::to_f32(gate[idx]);
-    const float u = Elem<T>::to_f32(up[idx]);
+    const float g = Elem<T>::to_f32(gate[at]);
+    const float u = Elem<T>::to_f32(up[at]);
     const float gelu = 0.5f * g * (1.f + tanhf(c * (g + 0.044715f * g * g * g)));
-    y[idx] = Elem<T>::from_f32(gelu * u);
+    y[at] = Elem<T>::from_f32(gelu * u);
 }
 
 /// **THE UNGATED GELU** (`.wiki/alto/multimodal.md` §6.2).
@@ -117,13 +132,28 @@ template <class T>
 __global__ void mlp_gelu_tanh(
     const T* __restrict__ x,
     T* __restrict__ y,
-    i32 n)
+    i32 n,
+    i32 width,
+    const u32* __restrict__ win)
 {
     const i32 idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
+    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
+    // lane is not a row here, so the live-rows word bounds `win[0] * width`
+    // elements, and `win[1] * width` is where they begin. Armed, the planes
+    // arrive at their base and this lane owns element `at`; null, they arrived
+    // pre-shifted and `idx` is the element already.
+    if (win != nullptr &&
+        static_cast<long long>(idx) >=
+            static_cast<long long>(win[0]) * width) return;
+    const long long at = win != nullptr
+        ? idx + static_cast<long long>(win[1]) * width
+        : idx;
+    // `x` and `y` are one row per token on the axis the guard counts, so both
+    // read the shifted element.
     constexpr float c = 0.7978845608028654f;
-    const float g = Elem<T>::to_f32(x[idx]);
-    y[idx] = Elem<T>::from_f32(
+    const float g = Elem<T>::to_f32(x[at]);
+    y[at] = Elem<T>::from_f32(
         0.5f * g * (1.f + tanhf(c * (g + 0.044715f * g * g * g))));
 }
 
@@ -143,14 +173,29 @@ template <class T>
 __global__ void gate_sigmoid_mul(
     T* __restrict__ x,
     const T* __restrict__ gate,
-    i32 n)
+    i32 n,
+    i32 width,
+    const u32* __restrict__ win)
 {
     const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float xv = Elem<T>::to_f32(x[i]);
-    const float gv = Elem<T>::to_f32(gate[i]);
+    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
+    // lane is not a row here, so the live-rows word bounds `win[0] * width`
+    // elements, and `win[1] * width` is where they begin. Armed, the planes
+    // arrive at their base and this lane owns element `at`; null, they arrived
+    // pre-shifted and `i` is the element already.
+    if (win != nullptr &&
+        static_cast<long long>(i) >=
+            static_cast<long long>(win[0]) * width) return;
+    const long long at = win != nullptr
+        ? i + static_cast<long long>(win[1]) * width
+        : i;
+    // `x` and its gate are one row per token on the axis the guard counts, so
+    // both read the shifted element.
+    const float xv = Elem<T>::to_f32(x[at]);
+    const float gv = Elem<T>::to_f32(gate[at]);
     const float s = 1.f / (1.f + __expf(-gv));
-    x[i] = Elem<T>::from_f32(xv * s);
+    x[at] = Elem<T>::from_f32(xv * s);
 }
 
 template <class T>
@@ -189,13 +234,24 @@ template <class T, bool GateSecond>
 __device__ __forceinline__ void mlp_swiglu_body(
     const T* __restrict__ packed,
     T* __restrict__ y,
-    i32 I)
+    i32 I,
+    const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<i32>(win[0])) return;
+    // The seat's second word says WHERE those rows are. Armed, the pointers
+    // are the plane's own base and this block owns plane row `win[1] + n`;
+    // null, they arrived pre-shifted and `n` is the row already.
+    const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
 
-    const long long row = static_cast<long long>(n) * I;
+    // `packed` and `y` are both one row per token — the axis the guard
+    // counts — so both read the shifted row.
+    const long long row = static_cast<long long>(plane_row) * I;
     const long long packed_row = row * 2;
     const float g = Elem<T>::to_f32(packed[packed_row + gate_offset<GateSecond>(i, I)]);
     const float u = Elem<T>::to_f32(packed[packed_row + up_offset<GateSecond>(i, I)]);
@@ -204,28 +260,41 @@ __device__ __forceinline__ void mlp_swiglu_body(
 }
 
 template <class T>
-__global__ void mlp_swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 I) {
-    mlp_swiglu_body<T, false>(packed, y, I);
+__global__ void mlp_swiglu(const T* __restrict__ packed, T* __restrict__ y, i32 I,
+                           const u32* __restrict__ win) {
+    mlp_swiglu_body<T, false>(packed, y, I, win);
 }
 
 template <class T>
 __global__ void mlp_swiglu_gate_second(
-    const T* __restrict__ packed, T* __restrict__ y, i32 I)
+    const T* __restrict__ packed, T* __restrict__ y, i32 I,
+    const u32* __restrict__ win)
 {
-    mlp_swiglu_body<T, true>(packed, y, I);
+    mlp_swiglu_body<T, true>(packed, y, I, win);
 }
 
 template <class T, bool GateSecond>
 __device__ __forceinline__ void mlp_situ_body(
     const T* __restrict__ packed,
     T* __restrict__ y,
-    i32 I, float beta, float linear_beta)
+    i32 I, float beta, float linear_beta,
+    const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<i32>(win[0])) return;
+    // The seat's second word says WHERE those rows are. Armed, the pointers
+    // are the plane's own base and this block owns plane row `win[1] + n`;
+    // null, they arrived pre-shifted and `n` is the row already.
+    const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
 
-    const long long row = static_cast<long long>(n) * I;
+    // `packed` and `y` are both one row per token — the axis the guard
+    // counts — so both read the shifted row.
+    const long long row = static_cast<long long>(plane_row) * I;
     const long long packed_row = row * 2;
     const float g = Elem<T>::to_f32(packed[packed_row + gate_offset<GateSecond>(i, I)]);
     float u = Elem<T>::to_f32(packed[packed_row + up_offset<GateSecond>(i, I)]);
@@ -239,63 +308,89 @@ __device__ __forceinline__ void mlp_situ_body(
 template <class T>
 __global__ void mlp_situ(
     const T* __restrict__ packed, T* __restrict__ y,
-    i32 I, float beta, float linear_beta)
+    i32 I, float beta, float linear_beta,
+    const u32* __restrict__ win)
 {
-    mlp_situ_body<T, false>(packed, y, I, beta, linear_beta);
+    mlp_situ_body<T, false>(packed, y, I, beta, linear_beta, win);
 }
 
 template <class T>
 __global__ void mlp_situ_gate_second(
     const T* __restrict__ packed, T* __restrict__ y,
-    i32 I, float beta, float linear_beta)
+    i32 I, float beta, float linear_beta,
+    const u32* __restrict__ win)
 {
-    mlp_situ_body<T, true>(packed, y, I, beta, linear_beta);
+    mlp_situ_body<T, true>(packed, y, I, beta, linear_beta, win);
 }
 
 template <class T, bool GateSecond>
 __device__ __forceinline__ void mlp_geglu_tanh_packed_body(
     const T* __restrict__ packed,
     T* __restrict__ y,
-    i32 I)
+    i32 I,
+    const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<i32>(win[0])) return;
+    // The seat's second word says WHERE those rows are. Armed, the pointers
+    // are the plane's own base and this block owns plane row `win[1] + n`;
+    // null, they arrived pre-shifted and `n` is the row already.
+    const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
-    const long long packed_row = static_cast<long long>(n) * 2 * I;
+    // `packed` and `y` are both one row per token — the axis the guard
+    // counts — so both read the shifted row.
+    const long long packed_row = static_cast<long long>(plane_row) * 2 * I;
     const float g = Elem<T>::to_f32(packed[packed_row + gate_offset<GateSecond>(i, I)]);
     const float u = Elem<T>::to_f32(packed[packed_row + up_offset<GateSecond>(i, I)]);
     constexpr float kAlpha = 0.7978845608028654f;
     constexpr float kBeta = 0.044715f;
     const float inner = kAlpha * (g + kBeta * g * g * g);
     const float gelu = 0.5f * g * (1.f + tanhf(inner));
-    y[static_cast<long long>(n) * I + i] = Elem<T>::from_f32(gelu * u);
+    y[static_cast<long long>(plane_row) * I + i] = Elem<T>::from_f32(gelu * u);
 }
 
 template <class T>
 __global__ void mlp_geglu_tanh_packed(
-    const T* __restrict__ packed, T* __restrict__ y, i32 I)
+    const T* __restrict__ packed, T* __restrict__ y, i32 I,
+    const u32* __restrict__ win)
 {
-    mlp_geglu_tanh_packed_body<T, false>(packed, y, I);
+    mlp_geglu_tanh_packed_body<T, false>(packed, y, I, win);
 }
 
 template <class T>
 __global__ void mlp_geglu_tanh_packed_gate_second(
-    const T* __restrict__ packed, T* __restrict__ y, i32 I)
+    const T* __restrict__ packed, T* __restrict__ y, i32 I,
+    const u32* __restrict__ win)
 {
-    mlp_geglu_tanh_packed_body<T, true>(packed, y, I);
+    mlp_geglu_tanh_packed_body<T, true>(packed, y, I, win);
 }
 
 template <class T>
 __global__ void mlp_swiglu_clamp(
     const T* __restrict__ packed,
     T* __restrict__ y,
-    i32 I, float limit)
+    i32 I, float limit,
+    const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<i32>(win[0])) return;
+    // The seat's second word says WHERE those rows are. Armed, the pointers
+    // are the plane's own base and this block owns plane row `win[1] + n`;
+    // null, they arrived pre-shifted and `n` is the row already.
+    const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
 
-    const long long row = static_cast<long long>(n) * I;
+    // `packed` and `y` are both one row per token — the axis the guard
+    // counts — so both read the shifted row.
+    const long long row = static_cast<long long>(plane_row) * I;
     const long long packed_row = row * 2;
     float g = Elem<T>::to_f32(packed[packed_row + i]);
     float u = Elem<T>::to_f32(packed[packed_row + I + i]);
@@ -308,13 +403,24 @@ template <class T>
 __global__ void mlp_swiglu_clamp_alpha(
     const T* __restrict__ packed,
     T* __restrict__ y,
-    i32 I, float limit, float alpha)
+    i32 I, float limit, float alpha,
+    const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<i32>(win[0])) return;
+    // The seat's second word says WHERE those rows are. Armed, the pointers
+    // are the plane's own base and this block owns plane row `win[1] + n`;
+    // null, they arrived pre-shifted and `n` is the row already.
+    const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) : n;
     const i32 i = blockIdx.y * blockDim.x + threadIdx.x;
     if (i >= I) return;
 
-    const long long row = static_cast<long long>(n) * I;
+    // `packed` and `y` are both one row per token — the axis the guard
+    // counts — so both read the shifted row.
+    const long long row = static_cast<long long>(plane_row) * I;
     const long long packed_row = row * 2;
     float g = Elem<T>::to_f32(packed[packed_row + i]);
     float u = Elem<T>::to_f32(packed[packed_row + I + i]);
@@ -428,14 +534,27 @@ __global__ void moe_sigmoid_gate_add(
     const T* __restrict__ sum,
     const T* __restrict__ x,
     const T* __restrict__ scalar_gate,
-    i32 H, i32 stride)
+    i32 H, i32 stride,
+    const u32* __restrict__ win)
 {
     const i32 n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<i32>(win[0])) return;
+    // The seat's second word says WHERE those rows are. Armed, the pointers
+    // are the plane's own base and this block owns plane row `win[1] + n`;
+    // null, they arrived pre-shifted and `n` is the row already.
+    const i32 plane_row = win != nullptr ? n + static_cast<i32>(win[1]) : n;
     const i32 h = blockIdx.y * blockDim.x + threadIdx.x;
     if (h >= H) return;
-    const float gv = Elem<T>::to_f32(scalar_gate[static_cast<long long>(n) * stride]);
+    // The gate is one scalar per token row at its row's head, so it is a
+    // plane of the guarded axis like `out`, `sum` and `x`: all four shift
+    // together, or the row would be gated by another row's scalar.
+    const float gv =
+        Elem<T>::to_f32(scalar_gate[static_cast<long long>(plane_row) * stride]);
     const float s = 1.f / (1.f + __expf(-gv));
-    const long long i = static_cast<long long>(n) * H + h;
+    const long long i = static_cast<long long>(plane_row) * H + h;
     const float ov = Elem<T>::to_f32(sum[i]);
     const float xv = Elem<T>::to_f32(x[i]);
     out[i] = Elem<T>::from_f32(ov + xv * s);

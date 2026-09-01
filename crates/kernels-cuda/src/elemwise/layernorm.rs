@@ -58,7 +58,15 @@ pub fn layernorm_no_scale(ctx: &Ctx, x: Tensor, eps: f32, y: &mut Tensor) -> Res
             symbol(&format!("::pie::elemwise::layernorm_no_scale<{t}, 256>")),
         )
         .apply(Launch::per_row(rows, BLOCK)),
-        &[x.arg(), y.arg(), hidden.arg(), eps.arg()],
+        &[
+            x.arg(),
+            y.arg(),
+            hidden.arg(),
+            eps.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -120,6 +128,9 @@ pub fn layernorm(
             y.arg(),
             hidden.arg(),
             eps.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

@@ -34,8 +34,6 @@ pub use backend::{
 };
 #[cfg(feature = "_engine-cuda")]
 pub use backend::envelopes_resolved;
-#[cfg(feature = "_engine-cuda")]
-pub use backend::fold_observed;
 pub use channel::{
     ChannelBinding, ChannelCloser, ChannelEndpoint, ChannelJoin, ChannelValue, RegisteredChannel,
 };

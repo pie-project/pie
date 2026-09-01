@@ -18,9 +18,9 @@
 //!
 //! [`graph`] is the step-5 arrival: `cudaStreamBeginCapture` and its three
 //! companions, and nothing about when to use them. Policy — which fires
-//! capture, what a graph is keyed by, when one is evicted — is
-//! [`record`](crate::record)'s and [`serve`](crate::serve)'s, the same way
-//! the eager plane's is.
+//! capture, where a composition is CUT, which key a body answers to, when one
+//! is evicted — is [`record`](crate::record)'s and [`serve`](crate::serve)'s,
+//! the same way the eager plane's is.
 
 pub mod alloc;
 pub mod conditional;
@@ -31,11 +31,12 @@ pub mod ctx;
 /// allocating it.
 pub mod elastic;
 pub mod graph;
-/// The load-time rebind table one capture publishes (`palo cuda-abi` §7,
-/// step 3), and the diff between two of them.
+/// The coordinate system one capture publishes (`palo cuda-abi` §7, step 3),
+/// and the diff between two of them. A MEASUREMENT surface since the tier-2
+/// campaign deleted the fold that read it on the fire path.
 pub mod map;
 /// Captured-graph introspection: the walk [`map`] is built on, and the
-/// write-side probes that are still only probes.
+/// write-side probes, which are the only place this shell prices a rebind.
 pub mod nodes;
 
 pub use alloc::{

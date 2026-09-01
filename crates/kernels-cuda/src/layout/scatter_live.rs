@@ -109,6 +109,14 @@ pub fn scatter_live_rows(
             symbol(&format!("::pie::layout::scatter_live_rows<{unit}>")),
         )
         .apply(Launch::per_row(rows, threads)),
-        &[src.arg(), y.arg(), routes.arg(), units.arg()],
+        &[
+            src.arg(),
+            y.arg(),
+            routes.arg(),
+            units.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }

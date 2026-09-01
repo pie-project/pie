@@ -9,7 +9,7 @@
 //! tensor. The first two arrive as planes; the third arrives as an argument,
 //! because it is one number and a plane would cost a load per block to say it.
 //!
-//! **THE PLANE WIDTHS ARE THE FORM'S OWN ALGEBRA.** `dtype::quant::NVFP4`
+//! **THE PLANE WIDTHS ARE THE FORM'S OWN ALGEBRA.** `Dtype::Nvfp4.repr()`
 //! states `plane_widths(4096) == [2048, 256, 4]`, and the two widths this
 //! entry checks are that statement at any `k`: `k/2` code bytes a row, `k/16`
 //! scale bytes a row. A caller whose planes are a different rectangle is

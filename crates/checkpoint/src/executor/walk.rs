@@ -1985,7 +1985,7 @@ impl Walk<'_, '_> {
                 bytes.len()
             )));
         }
-        let operand = if dtype == DType::Fp8E4m3 {
+        let operand = if dtype == DType::E4m3 {
             let source = source.ok_or_else(|| {
                 invalid("host Encode of an FP8 operand requires a checkpoint source")
             })?;
@@ -3252,7 +3252,7 @@ mod tests {
                     file_offset: data_offset,
                     span_bytes: 4096,
                     shape: vec![64, 64],
-                    encoding: Encoding::Raw(DType::Fp8E4m3),
+                    encoding: Encoding::Raw(DType::E4m3),
                 },
                 RawTensor {
                     id: TensorId(1),
@@ -3484,7 +3484,7 @@ mod tests {
                     file_offset: data_offset,
                     span_bytes: 16,
                     shape: vec![4, 4],
-                    encoding: Encoding::Raw(DType::Fp8E4m3),
+                    encoding: Encoding::Raw(DType::E4m3),
                 },
                 RawTensor {
                     id: TensorId(1),

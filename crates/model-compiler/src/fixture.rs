@@ -64,6 +64,7 @@ impl Build {
                 caches: vec![CacheRow::State {
                     name: "state".to_string(),
                     slab: vec![1],
+                    dtype: Dtype::Bf16,
                 }],
                 values: Vec::new(),
                 nodes: Vec::new(),

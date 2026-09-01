@@ -155,6 +155,9 @@ pub fn full(
             ArgValue::ABSENT,
             0_i32.arg(),
             0_i32.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -232,6 +235,9 @@ pub fn partial_last(
             UNSCALED.arg(),
             0.0_f32.arg(),
             0.0_f32.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -297,6 +303,9 @@ pub fn yarn(
             interleaved.arg(),
             stated(OP, per_block)?.arg(),
             stated(OP, pairs)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -327,6 +336,9 @@ fn rope_partial(
             stated(op, head_dim)?.arg(),
             stated(op, rotary_dim)?.arg(),
             theta.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

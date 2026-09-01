@@ -358,6 +358,26 @@ fn two_capturing_lanes_observe_their_own_rows() {
 /// `export_axes` already makes about the capture COLUMN. What is added here
 /// is the arm: the column was always written, and the per-key rectangle is
 /// new, so "the axis is free when off" has to be re-asked of the new thing.
+///
+/// # The launch count needs a graph, and this is where the file states `On`
+///
+/// "The same launches" is not a thing an eager fire can be asked. It has no
+/// artifact: the walk issues and forgets, and the only external count of what
+/// a fire ran is the node census of something RECORDED. So this test — alone
+/// in this file — puts the shell in the tiered mode and states `bodies`, and
+/// the count it compares is `BodyStats::nodes`.
+///
+/// **AND THAT MAKES THE CLAIM STRONGER THAN THE SUBTRACTION IT REPLACES.**
+/// The version of this test written against the keyed cache read
+/// `Stats::nodes` on a shell loaded `Graphs::Off`, where the counter is zero
+/// by construction — it was subtracting zero from zero and calling the result
+/// a launch count. What is asked now is what the claim actually means: capture
+/// the plain composition's body, run the capturing fire on another lane, and
+/// then demand that the plain lane REPLAYS THE BODY IT ALREADY HAD — hits
+/// moving, captures unmoved, reshapes unmoved, `nodes` unmoved. A slab that
+/// leaked a launch into the plain path would have to change the plain
+/// composition's graph to do it, and a graph that changed is a re-capture or a
+/// reshape, both of which are counted here.
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_fire_no_lane_captured_pays_the_observability_axis_nothing() {
@@ -367,13 +387,31 @@ fn a_fire_no_lane_captured_pays_the_observability_axis_nothing() {
     };
     let prompt = encode(&tokenizer, PROMPT);
 
-    shell.open(0).expect("the slot opens");
+    // The one test in this file that records. `record::WARM_FIRES` walks pass
+    // before a composition is captured, so the plain fire is issued three
+    // times and the third is the one that mints the body every assertion
+    // below is about.
+    shell.set_mode(Graphs::On);
+    shell.set_bodies(true);
+
     let mut mass: Vec<Vec<LayerScores>> = Vec::new();
-    let before = shell.graph_stats().nodes;
-    let plain = shell
-        .fire_captured(&[seat(0, &prompt, false)], &[], &mut mass)
-        .expect("the plain fire lands");
-    let plain_nodes = shell.graph_stats().nodes - before;
+    let mut plain = Vec::new();
+    for _ in 0..3 {
+        // Re-opened every round so the three fires present ONE composition
+        // rather than a lengthening prefill.
+        shell.open(0).expect("the slot opens");
+        plain = shell
+            .fire_captured(&[seat(0, &prompt, false)], &[], &mut mass)
+            .expect("the plain fire lands");
+    }
+    let armed = shell.body_stats();
+    assert!(
+        armed.captures >= 1,
+        "the plain composition was never captured, so there is no graph whose \
+         launches this test could count and nothing below asserts anything. A \
+         moved `refusals` says the admissibility rule turned it away: {armed}"
+    );
+    let plain_nodes = armed.nodes;
     assert!(
         mass[0].is_empty(),
         "a lane that captured nothing was handed {} columns",
@@ -394,16 +432,38 @@ fn a_fire_no_lane_captured_pays_the_observability_axis_nothing() {
 
     // And the plain fire again, on a re-opened slot, after all of that.
     shell.open(0).expect("the slot reopens");
-    let again_before = shell.graph_stats().nodes;
+    let before_again = shell.body_stats();
     let again = shell
         .fire_captured(&[seat(0, &prompt, false)], &[], &mut mass)
         .expect("the plain fire lands again");
-    let again_nodes = shell.graph_stats().nodes - again_before;
+    let after = shell.body_stats();
+    eprintln!("across the plain fire that followed the capturing one: {after}");
 
     assert_eq!(
-        plain_nodes, again_nodes,
-        "a plain fire walked {plain_nodes} nodes before the slab was ever written \
-         and {again_nodes} after; the observability axis is not free when off"
+        (
+            after.hits - before_again.hits,
+            after.captures - before_again.captures,
+            after.reshapes - before_again.reshapes,
+        ),
+        (1, 0, 0),
+        "the plain fire that followed a capturing one on another lane did not \
+         replay the body the plain composition already had. A moved `captures` \
+         or `reshapes` says the plain fire's graph CHANGED across a capturing \
+         fire — which is the observability axis costing an off lane something \
+         — and a zero hit says it walked instead: before {before_again} / \
+         after {after}"
+    );
+    // `BodyStats::nodes` names the MOST RECENTLY CAPTURED body, so this says
+    // two things at once: nothing captured across the capturing fire and the
+    // plain fire after it, and the census still describes the plain
+    // composition's own graph.
+    assert_eq!(
+        after.nodes, plain_nodes,
+        "the last captured body holds {} launches where the plain composition \
+         was recorded with {plain_nodes}; something minted a graph after the \
+         slab had been written, and the observability axis is not free when \
+         off",
+        after.nodes,
     );
     assert_eq!(
         plain[0], again[0],
@@ -485,7 +545,16 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         slots: 4,
         ordinal: 0,
         graphs: Graphs::Off,
-        knobs: engine_cuda::Knobs::default(),
+        // The golden path for every claim in this file but one: what is under
+        // test is the score axis, and a recorded fire would put a second
+        // subject in the room. S-3 below states `On` on this same shell for
+        // its own reason, which it argues where it does it. `bodies` is
+        // written out because it defaults to TRUE now and this load's `Off`
+        // is what keeps the arming pass from running, not the word.
+        knobs: engine_cuda::Knobs {
+            bodies: true,
+            ..engine_cuda::Knobs::default()
+        },
         program_cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         weight_cache_dir: None,

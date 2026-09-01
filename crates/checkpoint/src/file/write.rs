@@ -86,8 +86,8 @@ fn storage_of(
         DType::F32 => (ZDType::F32, None),
         DType::F16 => (ZDType::F16, None),
         DType::Bf16 => (ZDType::BF16, None),
-        DType::Fp8E4m3 => (ZDType::U8, Some("f8_e4m3fn")),
-        DType::Fp8E5m2 => (ZDType::U8, Some("f8_e5m2")),
+        DType::E4m3 => (ZDType::U8, Some("f8_e4m3fn")),
+        DType::E5m2 => (ZDType::U8, Some("f8_e5m2")),
         DType::E8m0 => (ZDType::U8, Some("f8_e8m0")),
         DType::I64 => (ZDType::I64, None),
         DType::I32 => (ZDType::I32, None),
@@ -102,7 +102,19 @@ fn storage_of(
         // spec, which the `Encoding::Quant` arm above already answered. A
         // *declaration* naming one of them is a plane with no element width
         // to store, and there is no zTensor dtype for it.
-        DType::Fp4 | DType::Mxfp4 | DType::MlxU4 | DType::MlxU8 | DType::MlxU4G32 => {
+        DType::E2m1
+        | DType::Mxfp4
+        | DType::Nvfp4
+        | DType::U4g64
+        | DType::U8g64
+        | DType::U4g32
+        | DType::U2g16k
+        | DType::I3g16k
+        | DType::U4g32k
+        | DType::U5g32k
+        | DType::I6g16k
+        | DType::E4m3row
+        | DType::E4m3tile128 => {
             return Err(Error::Checkpoint(format!(
                 "cannot store a raw {decl_dtype:?} tensor: the packed codes \
                  are written as packed U8 under a quant encoding"
@@ -1182,8 +1194,8 @@ mod tests {
     fn round_trip_of(scheme: QuantScheme) -> RoundTrip {
         match scheme {
             QuantScheme::None => RoundTrip::NotAnEncoding,
-            QuantScheme::Fp8E4M3 => RoundTrip::Collapses(DType::Fp8E4m3),
-            QuantScheme::Fp8E5M2 => RoundTrip::Collapses(DType::Fp8E5m2),
+            QuantScheme::Fp8E4M3 => RoundTrip::Collapses(DType::E4m3),
+            QuantScheme::Fp8E5M2 => RoundTrip::Collapses(DType::E5m2),
             QuantScheme::Int8Symmetric
             | QuantScheme::Int8Asymmetric
             | QuantScheme::AwqInt4
@@ -1280,8 +1292,8 @@ mod tests {
             let spec = QuantSpec {
                 scheme,
                 logical_dtype: match scheme {
-                    QuantScheme::Fp8E4M3 => DType::Fp8E4m3,
-                    QuantScheme::Fp8E5M2 => DType::Fp8E5m2,
+                    QuantScheme::Fp8E4M3 => DType::E4m3,
+                    QuantScheme::Fp8E5M2 => DType::E5m2,
                     _ => DType::Bf16,
                 },
                 bits_per_element: 0,

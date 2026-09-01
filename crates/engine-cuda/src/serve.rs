@@ -64,7 +64,7 @@
 //! order: [`Windows::of`] before the staging, because the per-window boundary
 //! vectors are among the bytes the staging writes.
 //!
-//! # The three modes, and why the golden one is still first
+//! # The three modes, of which one is the serving one
 //!
 //! [`Graphs`] is the whole of the shell's capture policy, and it is a word,
 //! not a branch in the fire path:
@@ -78,13 +78,38 @@
 //!          ATTRIBUTION arm: it isolates "the schedules changed" from "the
 //!          graph changed", and a difference between Off and Shaped is a
 //!          statement about flashinfer's padded split, not about capture.
-//! On       Shaped, plus `record.rs`: capture once per shape key, replay
-//!          after.
+//! On       Shaped, plus `record.rs`: BODIES. The load arms one per point of
+//!          the realizable lattice and seals the map, and the serving path
+//!          replays without ever capturing.
 //! ```
+//!
+//! **`On` IS THE DEFAULT AND THE OTHER TWO PRINT A LINE AT LOAD.** They are
+//! diagnostic arms — an uncaptured decode pays ~470 kernel launches of host
+//! time per token-step — and `Shell::load` says so once, in the same voice it
+//! uses for `[engine] bodies = off` and for a rotating load, because all
+//! three are the same sentence at different depths: this deployment is
+//! serving the eager walk.
 //!
 //! [`Boot::graphs`] states which of the three, and nothing overrides it: the
 //! word arrives typed from the boot document (`[engine] graphs`) and is read
 //! once, at load, never on the fire path.
+//!
+//! # And the three tiers under `On`
+//!
+//! `record.rs`'s header states them in full; the reason they appear here is
+//! that this file is where each one is CHOSEN, in `prepare` and in the router
+//! `enqueue_on` runs:
+//!
+//! ```text
+//! tier 1  a body whose every region a graph holds — one exec, one launch
+//! tier 2  a body cut around its ISLANDS — the regions no capture can name
+//!         (gathered, grouped, unshifted-windowed) are walked eagerly between
+//!         the execs, GROWN to the nearest legal boundary (`record::widen`),
+//!         and the cuts are a function of the key
+//! tier 3  the eager walk, and a COUNTER. What reaches it is a composition no
+//!         `record::BodyKey` can name, a load gate that stands recording down,
+//!         or one the widening left no captured stretch in — never a silence.
+//! ```
 //!
 //! # The knobs, and where they stopped coming from
 //!
@@ -94,7 +119,8 @@
 //! a word a shell reads out of its own process environment is a word that is
 //! not in the boot document, does not travel to the other shell, and is
 //! invisible to every reader of the config. They are typed now, and they land
-//! in three places:
+//! in three places — six of them, because three of the nine named the FOLD
+//! and died with it (the tier-2 campaign):
 //!
 //! ```text
 //! PIE_CUDA_GRAPHS         -> Boot::graphs                [engine] graphs
@@ -102,11 +128,15 @@
 //! PIE_CUDA_STREAMS        -> Knobs::side_streams         [engine] side_streams
 //! PIE_CUDA_GROUPED        -> Knobs::grouped              [engine] grouped
 //! PIE_CUDA_PAD            -> Knobs::pad                  [engine] pad
-//! PIE_CUDA_FOLD           -> Knobs::fold                 [engine] fold
-//! PIE_CUDA_PIPELINE       -> Knobs::pipeline             [engine] pipeline
-//! PIE_CUDA_FOLD_DISABLE   -> Knobs::fold_disable_library [engine] fold_disable
 //! PIE_CUDA_FALLBACK_COPY  -> Knobs::copies               [engine] fallback_copy
+//! (never a word)          -> Knobs::bodies               [engine] bodies
 //! ```
+//!
+//! The last row was never a `PIE_CUDA_*` variable and never will be: the
+//! bodies path (`record::BodyKey`) landed after article 9, so its knob was
+//! born in the boot document. It is in the table anyway, because a reader
+//! looking for "which words does this shell answer to" needs one list and not
+//! a list plus an exception.
 //!
 //! Two of them are COMPILER inputs and not shell flags, and they are the two
 //! that do not appear on [`Knobs`] as booleans. The shape lattice is baked —
@@ -125,12 +155,16 @@
 //!
 //! # What v1 does not do
 //!
-//! tp=1, so no collective ever fires, and padding buys no KEY collapse — a
-//! fire's shape is still its key, because two fires can share a bucket and
-//! differ in the per-class split, and the captured windowed extents would then
-//! be the other fire's (`record.rs` argues the mechanism; the cuda-abi note's
-//! own CORRECTION argues why D4 alone collapses nothing). The ETA prologue
-//! and epilogue are wired ([`Shell::fire_attached`]); what is not is a guest
+//! tp=1, so no collective ever fires. A region the bodies path cannot record
+//! — a gathered window, a grouped one, a windowed one whose ops do not all
+//! read the seat's start — is an ISLAND: the body is captured in segments
+//! around it and the fire path re-issues it eagerly between the execs
+//! (`record::Cut`, `record::BodyStats::islands`), which is `record.rs`'s own
+//! header. What still walks end to end is a composition no key can name (two
+//! row axes) or one whose islands, grown to their legal boundaries, left no
+//! captured stretch at all (`record::widen`, `record::Uncut::Eager`), and both
+//! are counted. The ETA prologue and epilogue are wired
+//! ([`Shell::fire_attached`]); what is not is a guest
 //! program INSIDE the graph, which design §9 rules out rather than defers.
 
 // THE READ-BACK SURFACE, NEXT DOOR (alto wave P). A child module because it
@@ -143,7 +177,9 @@ use std::cell::Cell;
 use std::path::Path;
 
 use checkpoint::contract::ModelContract;
-use model_exec::fire::{Composition, FireDescriptor, Lane as FireLane, compose_axes, walk};
+use model_exec::fire::{
+    Composition, FireDescriptor, Lane as FireLane, compose_axes, walk,
+};
 // THE THREE-PHASE SEAM, FROM THE NEUTRAL CRATE (alto design §3). Renamed at
 // the import because this crate already has a `Shell` (the loaded model) and a
 // `Prepared`/`Enqueued` of its own — which is the point: the traits are what
@@ -177,7 +213,10 @@ use crate::window::{At, Cursor, Lanes, Windows};
 // THE EXPORT SEAM AND THE TWO OP SCANS, FROM THEIR OWN MODULE (alto wave P).
 // Pure IR analysis: what `Shell::load` does with them is call order, and what
 // they compute is not.
-use crate::exports::{Exports, MTP_SEAM, SCORES_SEAM, corrected_classes, masked_classes};
+use crate::exports::{
+    Exports, MTP_SEAM, SCORES_SEAM, corrected_classes, decoding_classes, masked_classes,
+    regions_shifting,
+};
 
 /// How much of a fire this shell records.
 ///
@@ -198,7 +237,9 @@ pub enum Graphs {
     Off,
     /// Eager, with graph-shaped (padded) schedules.
     Shaped,
-    /// Captured once per shape key, replayed after. The serving default.
+    /// **BODIES**: the load arms one exec per point of the realizable
+    /// lattice, seals the map, and every fire after replays. The serving
+    /// default, and the only mode that records anything.
     #[default]
     On,
 }
@@ -230,14 +271,18 @@ impl Graphs {
 /// what a deployment asked for, and is invisible to every reader of the
 /// config — so the words are typed here and the deployment states them.
 ///
-/// **WHERE THE OTHER TWO WENT, AND WHY THEY ARE NOT FIELDS HERE.** Two of
+/// **WHERE THE OTHERS WENT, AND WHY THEY ARE NOT FIELDS HERE.** Two of
 /// the nine were never shell flags at all: `PIE_CUDA_BUCKETS` is the shape
 /// lattice and `PIE_CUDA_GRAPHS` is the capture mode. The lattice is baked —
 /// P4 writes one fallback row per bucket RANGE, so moving it moves which
 /// consumer is withdrawn — and it therefore reaches the compiler as
 /// [`Budget::buckets`] through the load door, where `crate::api::lattice`
 /// is the policy that fills a budget stating none. The capture mode was
-/// already [`Boot::graphs`].
+/// already [`Boot::graphs`]. **And three of the nine named the FOLD**
+/// (`PIE_CUDA_FOLD`, `PIE_CUDA_PIPELINE`, `PIE_CUDA_FOLD_DISABLE`), which the
+/// tier-2 campaign deleted along with the keyed capture path: a boot document
+/// that still spells one of the three is read as a document that spells an
+/// unknown key, which is to say ignored.
 ///
 /// Every default below is what this shell did with the variable ABSENT, byte
 /// for byte, so a deployment that states nothing gets exactly what it got
@@ -264,61 +309,71 @@ pub struct Knobs {
     /// tail-waste measurement needs, and the tokens must be byte-identical
     /// across it, because everything the padding computes lands in rows no
     /// reader has.
+    ///
+    /// **AND IT IS THE BODIES PATH'S PRECONDITION** (the tier-1 key-collapse
+    /// wave). A `record::BodyKey` is a LATTICE POINT and a present set, and
+    /// every ceiling a body is captured at — its grids, its schedules, its
+    /// arena column, its staged row vectors — is that point. With this off
+    /// there is no point: `Composition::bucket` is still computed but nothing
+    /// is stamped, so every ceiling would collapse onto the fire's own split
+    /// and two splits of one key would carve two different graphs. So
+    /// `Shell::prepare` refuses to record a body while this is `false`, and
+    /// the A/B arm above serves every fire EAGERLY. That costs the measurement
+    /// nothing — what it diffs is the arithmetic in rows no reader has — and
+    /// it is what lets every ceiling downstream be unconditional.
     pub pad: bool,
-    /// **D5-LITE'S FOLD** (`PIE_CUDA_FOLD`, `.wiki/palo/cuda-abi.md` §6b, §7
-    /// step 4). OFF.
+    /// **THE BODIES** (`[engine] bodies`, the bodies design's chunk B). ON.
     ///
-    /// Under [`Graphs::On`], one exec per BUCKET, captured once at a synthetic
-    /// full composition and rebound on the host per fire — empty windows
-    /// become `cudaGraphNodeSetEnabled` bits, moving arguments become
-    /// `cudaGraphExecKernelNodeSetParams` restatements derived from a
-    /// throwaway capture of the real walk and cached per composition. Off is
-    /// today's keyed path exactly, which is the A/B arm every fold gate diffs
-    /// against; [`Shell::set_fold`] flips it between fires so the A/B is one
-    /// load, like [`Shell::set_mode`]'s.
+    /// Under [`Graphs::On`], one exec per COMPOSITION: a body is captured FOR
+    /// its class set at its bucket, and the row count that varies between two
+    /// fires of one composition rides the staged live-rows seat
+    /// ([`crate::window::Windows::live`], `kernels_cuda::Ctx::arm_stage`)
+    /// instead of a launch parameter the capture froze. So a decode stream
+    /// whose batch wanders mints ONE exec, and nothing is written into that
+    /// exec on the fire path ever — `record`'s header carries the whole
+    /// argument.
     ///
-    /// OFF by default because the fold's off arm is today's shipping answer
-    /// until the gates say otherwise — the same posture the capture mode took
-    /// while capture was landing. A fold-path refusal is never silent: every
-    /// one lands in [`record::FoldStats::refusals`] by name, and the refused
-    /// bucket or composition serves the keyed path.
-    pub fold: bool,
-    /// **THE FOLD'S PIPELINE** (`PIE_CUDA_PIPELINE`, step 5). ON.
+    /// **ON BY DEFAULT SINCE THE TIER-2 CAMPAIGN, BECAUSE IT IS THE ONLY
+    /// RECORDED PATH THERE IS.** It shipped off while it was the newer of two
+    /// caches and the keyed one was the arm it was diffed against. The keyed
+    /// cache is gone; a load that states `[engine] graphs on` and leaves this
+    /// alone gets bodies, and `[engine] bodies = off` is now the DIAGNOSTIC
+    /// arm — every fire walks eagerly under it, which is `graphs = off` plus
+    /// graph-shaped schedules and is what a bisect wants.
     ///
-    /// Off restores step 4's fold exactly: one exec per bucket, every rebind
-    /// on the critical path between prepare and launch. On, a hot bucket
-    /// lazily instantiates a TWIN exec on its first back-to-back fire, a fire
-    /// whose composition some seat already holds launches with zero host
-    /// writing (the ping-pong swap), and a fire whose successor the caller
-    /// stated ([`Shell::expect`]) applies that successor's binding to the idle
-    /// exec AFTER its own launch and BEFORE its sync — host work the GPU never
-    /// waits on. On by default because it changes nothing a fire computes —
-    /// the same bindings land on an exec that is not in flight (poc-c measured
-    /// the overlap legal and hidden) — and the off arm exists for the A/B, not
-    /// as a safety hatch.
-    pub pipeline: bool,
-    /// **THE DISABLE POLICY** (`PIE_CUDA_FOLD_DISABLE=all|library`, §6c
-    /// finding 2). `false` is `all`.
+    /// **AND WHEN IT IS OFF NOTHING MOVES.** The seat is carved either way and
+    /// staged only on a fire this knob routed, so the off arm pays no host
+    /// bytes, no H2D and no armed context — it is the eager walk, byte for
+    /// byte, which is what makes the A/B honest.
+    /// [`Shell::set_bodies`] flips it between fires, as [`Shell::set_mode`]
+    /// does with the capture mode.
     ///
-    /// `all` disables every absent-window node of a folded exec, step 4's
-    /// answer: correct for library nodes (which own no zero-row contract) and
-    /// pie nodes alike, at ~1.3 µs of dispatch per disabled node. `true` is
-    /// `library`: pie windowed nodes stay ENABLED at zero rows — their count
-    /// cells written to zero by a fitted zero form, an empty launch on the
-    /// zero-row contract (~1 µs) — and only the library residue is disabled.
+    /// **AND IT SERVES ONLY WHAT THE OPS CAN SERVE.** A composition is
+    /// admitted when every present region either covers the whole fire or
+    /// holds nothing but ops that read the seat's START ([`crate::SHIFTED`],
+    /// per region through [`Shell::shifted`]) — for the second kind the launch
+    /// plane hands the plane's base and the device does the shifting
+    /// (`Run::plane_base`). Everything else is an ISLAND — gathered and
+    /// grouped windows always, and any windowed region holding one guard-only
+    /// op — and since the tier-2 campaign an island does not refuse the key:
+    /// the body is captured in SEGMENTS around it and the island is re-issued
+    /// eagerly between the execs ([`record::Cut`],
+    /// [`record::BodyStats::islands`]). The FA2 attention arms and the four
+    /// chunked prefill scans were once the names that kept a real MIXED fire
+    /// out; both families are on the list now, so a mixed composition is
+    /// captured whole and it is `Fallback::Copy` and `Fallback::Grouped` that
+    /// are served through a cut.
     ///
-    /// The default is `all` because the measurement said so: of the
-    /// all-decode binding's 120 absent-window nodes, 36 are pie nodes the fit
-    /// can zero and 84 are library nodes that must disable either way, and
-    /// steady decode measured the two policies at parity — 3.439 against 3.440
-    /// ms/fire, byte-identical tokens (the policy gate in `tests/fold_gate.rs`;
-    /// the full numbers ride in `.wiki/palo/cuda-abi.md` §6d). A 0.3 µs/node
-    /// rate difference across 36 nodes is ~11 µs, under this workload's noise
-    /// floor — so the arm with the structurally simpler failure story ships (a
-    /// disabled node cannot compute; a zero form is a fitted claim), and the
-    /// other stays one boot key away for the SKU where the pie share is large
-    /// enough to read.
-    pub fold_disable_library: bool,
+    /// **AND THE SHAPE A BODY REPLAYS AT IS THE BUCKET'S, NOT THE FIRE THAT
+    /// WARMED IT.** The plan builders are carved at the lattice point's lane
+    /// ceiling and row total (`Run::planning`, the plan-at-bucket-ceiling
+    /// design), so the payload numbers a capture bakes are a function of the
+    /// key rather than of whichever batch happened to arrive first. That is
+    /// what makes "one exec per composition" true for a wandering batch
+    /// instead of aspirational: `record::BodyStats::reshapes` sits at zero,
+    /// and a nonzero one is a bug report about a builder rather than a
+    /// property of the traffic.
+    pub bodies: bool,
     /// **`Fallback::Copy` WHERE P4'S TABLE ASKS FOR ONE**
     /// (`PIE_CUDA_FALLBACK_COPY`). ON.
     ///
@@ -376,7 +431,7 @@ pub struct Knobs {
     /// here for the reason the others are: it is an `[engine]` key, and this
     /// struct is what the boot document's `[engine]` table parses into. What
     /// makes it a knob rather than a `Boot` field is the same thing that makes
-    /// the eight above knobs — it describes THIS MACHINE's shell, not one
+    /// the fields above knobs — it describes THIS MACHINE's shell, not one
     /// model's bake, so it is stated once when the engine is opened and
     /// carried onto every load.
     ///
@@ -405,9 +460,7 @@ impl Default for Knobs {
     fn default() -> Knobs {
         Knobs {
             pad: true,
-            fold: false,
-            pipeline: true,
-            fold_disable_library: false,
+            bodies: true,
             copies: true,
             grouped: true,
             side_streams: None,
@@ -466,10 +519,12 @@ pub struct Boot<'a> {
     /// How much of a fire to record. `[engine] graphs` in the boot document,
     /// and nothing overrides it any more (article 9).
     pub graphs: Graphs,
-    /// **THE SHELL'S OWN WORDS**, typed — what nine `PIE_CUDA_*` environment
+    /// **THE SHELL'S OWN WORDS**, typed — what the `PIE_CUDA_*` environment
     /// reads were before article 9. [`Knobs::default`] is what an absent
-    /// environment meant, byte for byte, so a caller that states nothing
-    /// fires exactly what it fired before.
+    /// environment meant for every word that is still live, byte for byte;
+    /// the one default that has MOVED since is [`Knobs::bodies`], which the
+    /// tier-2 campaign flipped on because the path it used to be diffed
+    /// against no longer exists.
     pub knobs: Knobs,
     /// **Where the warm-boot weight artifacts live** (alto design §7's T2
     /// tier), typed from the boot config rather than read from the
@@ -662,10 +717,16 @@ pub struct Seated<'a> {
     pub readout: Option<&'a [u32]>,
 }
 
-/// One lane of the fold's SYNTHETIC composition — the owned side of a
-/// [`Seated`] the arming pass borrows. A private carrier, not a submission
-/// type: nothing outside [`Shell::arm_at`] builds one, and nothing it
-/// carries ever executes (capture does not).
+/// One lane of a SYNTHETIC composition — the owned side of a [`Seated`] an
+/// arming pass borrows. A private carrier, not a submission type: only
+/// [`Shell::synthetic_lanes`] builds one, and only [`Shell::fire_synthetic`]
+/// fires it.
+///
+/// **AND ITS LAUNCHES ARE REAL.** An arming pass walks EAGERLY first, exactly
+/// as any miss does, which is the whole point of arming: the eager pass is
+/// what warms the JIT, grows the scratch slabs and gives the dense tuner its
+/// second sighting. Its numbers are still nobody's — no readback, no epilogue,
+/// no `held` advance — but the kernels run.
 struct Synthetic {
     /// The class's representative word (`Class::word`) — the one part of a
     /// submission decision #18 says the shell must not invent, invented here
@@ -690,6 +751,107 @@ struct Synthetic {
     captures: bool,
     /// Which real slot lends its page arithmetic.
     slot: u32,
+}
+
+/// **ONE KEY THE BODIES ARMING MEANS TO CLIMB, AS A GEOMETRY** — the three
+/// present-set shapes `Shell::arm_bodies` enumerates, each carrying the lanes
+/// it will synthesize and nothing else.
+///
+/// **A KIND AND NOT A LANE LIST, BECAUSE THE BOOT LINE COUNTS BY KIND.** A
+/// short decode tally, a short prefill tally and a short mixed tally are three
+/// different sentences about a deployment (its seats, its context, both), and
+/// an operator reading one number could act on none of them. The `Display`
+/// below is what a refusal names, for the same reason.
+///
+/// The rows a prefill or mixed arm carries are `Shell::spread`'s answer, taken
+/// BEFORE any fire, so a bucket this deployment cannot hold is refused by name
+/// instead of by a planner's `Fault`.
+#[derive(Debug, Clone)]
+enum BodySynth {
+    /// One decode class, `lanes` lanes of one row each — the composition that
+    /// makes a fire a decode, at the lane count this rung admits.
+    Decode { lanes: u32, class: usize },
+    /// One non-decode class, the bucket's rows spread over its lanes.
+    Prefill { class: usize, rows: Vec<u32> },
+    /// One decode lane beside one non-decode class's lanes.
+    Mixed {
+        decode: usize,
+        class: usize,
+        rows: Vec<u32>,
+    },
+    /// **A PRESENT SET THAT PUTS A FOREIGN CLASS'S ROWS INSIDE SOME REGION'S
+    /// WINDOW** — the composition a SEGMENTED body exists for (the tier-2
+    /// campaign).
+    ///
+    /// The three kinds above top out at TWO present classes, and two classes
+    /// can never break a window: a fire orders its classes by the shipped
+    /// order with the absent ones dropped, and dropping a class can only CLOSE
+    /// a gap (`model_exec::fire::fallback::bound` argues it), so a mask over a
+    /// subset of two present classes is always one interval. It takes a THIRD
+    /// class standing between two of a mask's own to put foreign rows inside
+    /// that mask's span — and that is exactly the composition P4 answers with
+    /// a `Fallback`, which the shell serves as a split, a gathered rectangle
+    /// or a grouped segment list. The last two are ISLANDS, so without this
+    /// arm no load would ever arm a segmented body at all and the tier-2 path
+    /// would exist without a key to exercise it.
+    ///
+    /// **AND THE WITNESS IS THREE CLASSES AND NOT THE WHOLE MASK**
+    /// ([`Shell::witness`]): the separator and its two nearest neighbours in
+    /// the mask, which is the minimal set that breaks it. A witness carrying
+    /// the mask's other classes needs a seat for each of them, and a
+    /// deployment that cannot seat the wide one arms nothing where the narrow
+    /// one — the composition its traffic actually brings — would have armed.
+    ///
+    /// One lane per class, in ascending class order, with the row counts
+    /// `Shell::arm_bodies` spread — a decode class takes exactly one row,
+    /// because one row per lane is what makes a fire a decode.
+    Fragmented { lanes: Vec<(usize, u32)> },
+}
+
+impl BodySynth {
+    /// **WHICH CLASSES THIS SYNTHETIC PUTS ROWS IN** — the PRESENT SET, which
+    /// is half of a [`record::BodyKey`] and what `Windows::admits` reads
+    /// alongside the bucket.
+    ///
+    /// Ascending and deduplicated, so two targets of one present set at two
+    /// lattice points answer the same vector — which is what
+    /// `Shell::arm_bodies`' skip list is keyed on (and what its own note
+    /// argues is a budget rule rather than a theorem, now that the remaining
+    /// decline can move with the bucket).
+    fn present(&self) -> Vec<usize> {
+        let mut classes = match self {
+            BodySynth::Decode { class, .. } | BodySynth::Prefill { class, .. } => vec![*class],
+            BodySynth::Mixed { decode, class, .. } => vec![*decode, *class],
+            BodySynth::Fragmented { lanes } => lanes.iter().map(|(class, _)| *class).collect(),
+        };
+        classes.sort_unstable();
+        classes.dedup();
+        classes
+    }
+}
+
+impl core::fmt::Display for BodySynth {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BodySynth::Decode { lanes, class } => write!(f, "decode c{class} x{lanes}"),
+            BodySynth::Prefill { class, rows } => {
+                write!(f, "prefill c{class} {rows:?}")
+            }
+            BodySynth::Mixed { decode, class, rows } => {
+                write!(f, "mixed c{decode}+c{class} {rows:?}")
+            }
+            BodySynth::Fragmented { lanes } => {
+                write!(f, "fragmented ")?;
+                for (at, (class, rows)) in lanes.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str("+")?;
+                    }
+                    write!(f, "c{class}:{rows}")?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl<'a> Seated<'a> {
@@ -943,7 +1105,6 @@ pub struct Media<'a> {
     pub token_positions: &'a [i32],
 }
 
-/// One loaded model, serving.
 /// What one fire's window table cost, in launches — the fallback made
 /// countable.
 ///
@@ -960,6 +1121,32 @@ pub struct FireCost {
     pub copied: u32,
 }
 
+/// One key's segmentation, memoized — [`Shell::segments`]'s value.
+///
+/// Three fields and no machinery: what the admissibility rule said, whether a
+/// legal cut exists over it, and the one input to the first that the
+/// `record::BodyKey` does not carry.
+struct Segmented {
+    /// `window::Copies::enabled` as the deriving fire answered it. Not a key
+    /// coordinate, so it is stored and CHECKED rather than assumed.
+    copies: bool,
+    /// `Windows::admits` WIDENED (`record::widen`), one entry per template
+    /// region. Shared rather than cloned: `Prepared` holds a handle for the
+    /// length of the fire and the table is read, never written — and shared is
+    /// also what makes the widening one answer, since the `Run`, the capture
+    /// loop and `record::cuts` all read this same slice.
+    admits: std::sync::Arc<[crate::window::Admit]>,
+    /// Did `record::cuts` accept it, or has nobody asked yet?
+    ///
+    /// `None` is a table derived for a fire the outer gate had already
+    /// answered — an eager load still builds one every fire, and asking would
+    /// print a decline at a deployment that never wanted a body. `Some(false)`
+    /// is a key `record::Graphs::body_refuse` has been told about and the
+    /// operator has been shown once.
+    cuttable: Option<bool>,
+}
+
+/// One loaded model, serving.
 pub struct Shell {
     device: Context,
     /// **The unified accounting sentence this load was admitted under** (alto
@@ -1040,6 +1227,41 @@ pub struct Shell {
     /// window. Empty for an artifact that declares no correction at all, and
     /// then an adapter has nowhere to go.
     corrected: model_ir::ClassSet,
+    /// The classes whose window runs an `attention.decode` arm — the same
+    /// reading of the same template [`masked`](Shell::masked) is, kept for
+    /// one caller: [`Shell::arm_bodies`], which has to synthesize a DECODE
+    /// composition at load, before any fire has shown it one, and cannot
+    /// compute a lane's fact word to find the class the honest way (the word
+    /// is the runtime's, decision #18). A class that runs the one-query-row
+    /// arm is a class a decode lane lands in, and `Class::word` names a word
+    /// that resolves back to it.
+    ///
+    /// Empty for a plan with no decode arm at all, and then load-time arming
+    /// has nothing to aim at.
+    decoding: model_ir::ClassSet,
+    /// **WHICH OF MY REGIONS CAN BE REPLAYED SOMEWHERE OTHER THAN ROW ZERO**
+    /// — one entry per region of the bake's template, in region order, `true`
+    /// when every op in the region is named by [`crate::SHIFTED`] and so reads
+    /// the staged seat's START as well as its count.
+    ///
+    /// I read it once, here, for [`masked`](Shell::masked)'s reason: it is a
+    /// fact about the OP VOCABULARY of the artifact I loaded, settled before
+    /// any device is bound, and a per-fire walk of the template would be the
+    /// same answer paid for on every fire. It is a `Vec<bool>` and not a class
+    /// set because the thing that gets a launch — and therefore the thing that
+    /// gets a seat — is a region, and two classes can share one.
+    ///
+    /// What I do with it is the bodies path's admissibility question, asked
+    /// per region ([`Windows::admits`](crate::window::Windows::admits)): a
+    /// windowed region whose ops all move their own base is one a graph may
+    /// hold, and one whose ops do not is an ISLAND the body is cut around.
+    ///
+    /// **AND I AM READ TWICE PER BODIED FIRE, FROM THE TWO SIDES OF ONE
+    /// PREDICATE** (chunk 2b-ii). The gate in `prepare` spends me to admit the
+    /// fire; the walk spends me again through `Run::bodied` to hand an
+    /// admitted region its plane's base and to arm its seat. One slice, so the
+    /// host's answer and the launch's cannot be two answers.
+    shifted: Vec<bool>,
     /// **WHICH BIT OF A FACT WORD PUTS A LANE IN THE CORRECTION'S WINDOW**
     /// (alto adapter §6.4), or `None` for a bake where no single bit does.
     ///
@@ -1131,29 +1353,94 @@ pub struct Shell {
     /// handed and every launch is the one this shell made before D4.
     /// [`Knobs::pad`] states it at load.
     pad: bool,
-    /// Does this shell fold the composition axis? [`Knobs::fold`] states it
-    /// at load; [`Shell::set_fold`] flips it between fires.
-    fold: bool,
-    /// Is the fire currently running the SYNTHETIC arming pass? Set by
-    /// [`Shell::maybe_arm_fold`] around its recursive `fire_captured` call
-    /// and read in exactly three places: the arming pass must not try to arm
-    /// again, must route to `record::Graphs::arm_fold`, and must return
-    /// before the readback — nothing it computes is anybody's numbers.
+    /// Does this shell serve fires from a recorded BODY? [`Knobs::bodies`]
+    /// states it at load; [`Shell::set_bodies`] flips it between fires.
+    ///
+    /// **READ IN `prepare` AND NOT AT THE ROUTER.** Routing a fire to a body
+    /// means STAGING the live-rows seat, and staging happens on the host half
+    /// of the step; a router that decided later would be deciding after the
+    /// only instant that could have written the words. So `prepare` answers it
+    /// once, writes the answer onto [`Prepared::bodied`], and the router reads
+    /// that — which also makes the two decisions incapable of disagreeing
+    /// across a `set_bodies` between the phases.
+    bodies: bool,
+    /// Is the fire currently running a SYNTHETIC arming pass
+    /// ([`Shell::arm_bodies`], the bodies design's chunk C)? Set by
+    /// [`Shell::fire_synthetic`] around its recursive `fire_captured` call.
+    ///
+    /// Three SUPPRESSIONS, because nothing it computes is anybody's numbers:
+    /// an arming pass must not advance `Shell::last`, must not promote
+    /// experts, and must return before the readback (and so before the
+    /// epilogue and the `held` advance).
+    ///
+    /// **AND NO EXCEPTION AT THE BODIES GATE, WHICH IS WHAT THE FOLD'S DEATH
+    /// SIMPLIFIED.** Two kinds of synthetic used to arrive here and the gate
+    /// in `prepare` had to tell them apart — the fold's template pass had no
+    /// business seating anything, the bodies pass had no other business at
+    /// all. There is one kind now, so the gate asks nothing about this word
+    /// and a synthetic reaches the body path exactly as a caller's fire does.
+    /// It has to: the gate is what STAGES the live-rows seat, and a body
+    /// captured without the seat staged is a body captured against a geometry
+    /// no replay can move.
+    ///
+    /// **THE ONE PLACE THE ROUTER READS IT IS THE FIRE THAT IS NOBODY'S.** A
+    /// synthetic whose composition the gate REFUSED has nothing to record and
+    /// nothing worth running, so the router answers `Ok(())` and walks away —
+    /// see `Shell::enqueue_on`'s arming arm. It is also what makes
+    /// `Shell::armed_body` meaningful: `prepare` writes the key it composed
+    /// only under this word.
     arming: bool,
-    /// Is the arming pass the zero-form PROBE (§6c finding 2) rather than
-    /// the template? Set beside [`Shell::arming`] by the same caller, read
-    /// in one place: the walk dispatch routes a probing pass to
-    /// `record::Graphs::arm_probe` — a second synthetic capture at
-    /// perturbed rows, fitted against the template, never instantiated.
-    probing: bool,
-    /// Every class some fire of this load has had rows in — the arming
-    /// ladder's second rung. The FULL composition is the design; when its
-    /// capture refuses (a class whose kernels were never JIT-warmed cannot
-    /// compile inside a thread-local capture), the union of classes real
-    /// traffic has exercised is the largest template this load can honestly
-    /// capture, and a fire bringing a class outside it refuses the fold by
-    /// name at alignment.
-    seen_classes: model_ir::ClassSet,
+    /// **THE BODY KEY THE LAST ARMING FIRE ACTUALLY COMPOSED**, or `None` for
+    /// a synthetic the gate turned away — written by `prepare` while
+    /// [`arming`](Shell::arming) is set, read once per key by
+    /// [`Shell::arm_bodies`], and meaningless at any other instant.
+    ///
+    /// **A CHANNEL BACK OUT OF `prepare`, AND IT EXISTS BECAUSE A LADDER HAS
+    /// AN ORDER.** A `record::BodyKey`'s ladder stands its classes in
+    /// SERIATION order — ascending row offset, which `fire::compose` takes
+    /// from the artifact's baked class order — so the arming loop, which knows
+    /// only which classes it asked for, cannot name a multi-class key it just
+    /// fired without re-deriving that order. Re-deriving it here would be a
+    /// second answer waiting to disagree with the one the cache is keyed on,
+    /// which is exactly the failure `record::Ladder::rung`'s own note
+    /// describes on the rung axis: an arming pass that pins bodies the traffic
+    /// it was armed for will never find.
+    ///
+    /// So the key travels from the one instant that composed it. The
+    /// single-class DECODE arm still builds its key by hand — that is what
+    /// `record::Ladder::single` is for, and a one-class ladder has no order to
+    /// lose — and a `debug_assert` at that site says the two readings agree.
+    armed_body: Option<record::BodyKey>,
+    /// **THE SEGMENTATION OF EVERY KEY THIS LOAD HAS DERIVED ONE FOR** (the
+    /// tier-2 campaign) — the `Windows::admits` table and whether
+    /// `record::cuts` accepted it, held per [`record::BodyKey`] so that the
+    /// steady state derives neither.
+    ///
+    /// **A MEMO AND NOT A CACHE, BECAUSE THE KEY SPACE IS THE SEALED
+    /// LATTICE.** `record::Graphs::arm_bodies` walks every realizable key
+    /// before the load serves anything, so this map reaches its final size at
+    /// boot and never grows under traffic — the same property that lets
+    /// `record::Graphs::bodies_refused` be an unbounded set. There is no
+    /// eviction and there is nothing to evict: an entry is one `Admit` per
+    /// template region and two words.
+    ///
+    /// What it buys is two allocations per fire. Both derivations are
+    /// FUNCTIONS OF THE KEY (`Windows::admits` carries the proof clause by
+    /// clause), so re-deriving them per fire was re-deriving a constant: the
+    /// table itself, and `record::cuts`' verdict on it, which `prepare` asks
+    /// as a predicate and throws the script away. The negative verdict was
+    /// already memoized — `record::Graphs::body_refuse` is what deduplicates
+    /// the printed decline — and this is the positive one beside it.
+    ///
+    /// **AND THE STORED `copies` WORD IS THE HOLE IN THAT PROOF, KEPT
+    /// HONEST.** One input to the table is not a key coordinate:
+    /// `window::Copies::enabled` is `[engine] fallback_copy` AND "did this
+    /// fire stage mask bits" (a masked fire takes the split, because a
+    /// gather would have to compact the mask slab too). So an entry records
+    /// which answer it was derived under and a fire that disagrees derives
+    /// again rather than reading somebody else's table. See
+    /// `Windows::admits`' own note for what is still owed on that axis.
+    segments: std::collections::HashMap<record::BodyKey, Segmented>,
     /// What the last fire's window table cost, in launches.
     ///
     /// **THE ONE OBSERVABLE OF A FALLBACK FROM OUTSIDE.** Whether a region
@@ -1390,6 +1677,16 @@ impl Shell {
         // with the export seam rather than in this file (alto wave P).
         let masked = masked_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
+        // And the same scan a third time, for the bodies path's load-time
+        // arming: which classes run an `attention.decode` arm, and are
+        // therefore the classes a decode lane's word resolves to
+        // (`Shell::decoding`).
+        let decoding = decoding_classes(&boot.trace, &compiled);
+        // And the third, beside them because it is the same reading of the
+        // same template: which REGIONS hold nothing but ops that address off
+        // the staged seat's start, and can therefore carry a body's replay
+        // somewhere other than the fire's row zero (`Shell::shifted`).
+        let shifted = regions_shifting(&boot.trace, &compiled);
         let paging = Paging::of(boot.page_size, boot.context, boot.slots)?;
         // ── **THE UNIFIED ACCOUNTING SENTENCE, AHEAD OF EVERY BYTE** (alto
         //    streaming §3 item 5, `next.md` B2). Weight tier + elastic pool +
@@ -1529,9 +1826,15 @@ impl Shell {
             spaces,
             &facts,
             compiled.classes.classes.len(),
+            // **THE LIVE-ROWS SEAT'S OTHER AXIS.** The template's length is
+            // how many regions a fire can ever announce, and `max_runs` below
+            // is how many launches any one of them can ever cost; the seat is
+            // carved at their product because its address is a multiplication
+            // from the walk's cursor (`Windows::live_at`).
+            compiled.template().len(),
             model_exec::fire::max_runs(&compiled),
             model_exec::fire::fragmentable(&compiled),
-            device.device().num_sm,
+            device.device(),
             // THE ONE NUMBER, FROM THE ONE MODULE (article 8), and `Boot` is
             // now where it arrives: the deployment states
             // `frame_dispatch_depth`, the contract carries it as
@@ -1595,7 +1898,7 @@ impl Shell {
         // The same instant and the same reason: the correction window's bit is
         // read off the class table before the struct takes it.
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
-        Ok(Shell {
+        let mut shell = Shell {
             device,
             accounting,
             trace: boot.trace,
@@ -1617,6 +1920,8 @@ impl Shell {
             masked,
             adapter_fact,
             corrected,
+            decoding,
+            shifted,
             // **SEATED OFF THE BANKS AND MOUNTED NOWHERE.** How many adapters
             // can be resident at once is the model text's declaration (alto
             // adapter §3.3: `slots` is residency, not a catalog); WHERE the
@@ -1634,20 +1939,19 @@ impl Shell {
             // environment variable meant.
             copies: boot.knobs.copies,
             pad: boot.knobs.pad,
-            fold: boot.knobs.fold,
+            bodies: boot.knobs.bodies,
             arming: false,
-            probing: false,
-            seen_classes: model_ir::ClassSet::default(),
+            armed_body: None,
+            // Empty, and filled by the arming pass below: every key the
+            // lattice realizes derives its segmentation once, at boot.
+            segments: std::collections::HashMap::new(),
             last: FireCost::default(),
             cache: {
                 let mut cache = GraphCache::new();
-                cache.set_pipeline(boot.knobs.pipeline);
-                cache.set_fold_library(boot.knobs.fold_disable_library);
-                // **THE GRAPH CACHE LEARNS TO ASK** (F2b). Eviction and every
-                // rebind used to rest on "every fire ends synchronized"; they
-                // rest on this counter now, and the bucket's seat cap derives
-                // from the same run-ahead number the staging ring does.
-                cache.watch(airborne.clone(), boot.runahead.frames_in_flight);
+                // **THE GRAPH CACHE LEARNS TO ASK** (F2b). Eviction used to
+                // rest on "every fire ends synchronized"; it rests on this
+                // counter now.
+                cache.watch(airborne.clone());
                 cache
             },
             // The deployment's cubin directory, stated (article 9). `None`
@@ -1665,7 +1969,98 @@ impl Shell {
             // reap in front of every stage is what makes that true. Created
             // at load: the fire path allocates nothing (article 9).
             guest_landed: crate::device::graph::Event::new()?,
-        })
+        };
+        // ── **THE ROTATING LOAD'S BOOT LINE, BECAUSE A MODE THAT CANNOT
+        //    RECORD MUST NOT BE SILENT ABOUT IT.** `Shell::enqueue_on`'s
+        //    `records` line refuses to record a fire whose weights rotate,
+        //    for `crate::rotate`'s reason: the pump's backpressure is a HOST
+        //    cursor the walk advances, and a replayed graph has no walk. That
+        //    refusal is per fire and permanent — a rotor armed at load is
+        //    armed for the life of it — so the honest instant to say it is
+        //    here, once, and not as a counter an operator has to go looking
+        //    for. (The counter exists too: `record::BodyStats::eager_rotating`.
+        //    This line is what makes the counter's first reading expected
+        //    instead of alarming.)
+        //
+        //    Printed only under a mode that RECORDS, on the arming loop's own
+        //    rule below: a deployment that never asked for graphs is not
+        //    losing anything and has nothing to be told.
+        //
+        //    **AND IT IS THE LINE THAT EXPLAINS THE ARMING PASS'S ABSENCE.**
+        //    `Shell::arm_bodies` refuses to run at all on a rotating load —
+        //    its rungs would each pay `record::WARM_FIRES` executed walks and
+        //    capture nothing, because the refusal above is what they would
+        //    land in — so a rotating load prints THIS line and no "bodies
+        //    armed" line at all. The second clause below is what says so out
+        //    loud, and it is stated only when `[engine] bodies` is on: a load
+        //    serving the diagnostic eager arm is not being told which pass it
+        //    did not get.
+        if shell.weights.rotating() && shell.graphs.records() {
+            eprintln!(
+                "engine-cuda: [engine] graphs is on but this load armed a dense rotor, \
+                 so every fire walks eagerly and nothing is recorded — a rotation's \
+                 backpressure is a host cursor and a replayed graph has no walk{}",
+                if shell.bodies {
+                    "; the bodies path's load-time arming is skipped for the same reason, \
+                     since every rung it climbed would execute its warm fires and capture \
+                     nothing"
+                } else {
+                    ""
+                }
+            );
+        }
+        // ── **AND THE MODE THAT NEVER RECORDS GETS THE SAME SENTENCE** —
+        //    the warning [`Graphs::Off`]'s doc has promised since 2026-08-29
+        //    ("graph는 당연히 on이고 off일시 warning을 내도록") and nothing had
+        //    ever printed. Off and Shaped are DIAGNOSTIC modes: every fire
+        //    pays the eager walk's ~470 launches of host time per decode
+        //    step, which is the right price for a bisect and the wrong one
+        //    for a deployment. One line at load, because the choice is made
+        //    at load and never re-decided.
+        //
+        //    **AND `[engine] bodies = off` IS THE SAME SENTENCE ONE LEVEL
+        //    DOWN**, which is new with the tier-2 campaign. It used to mean
+        //    "serve the keyed cache instead", which was a real serving answer;
+        //    the keyed cache is gone, so what it means now is `Graphs::On` with
+        //    nothing recorded — the eager walk with graph-shaped schedules.
+        //    That is a legitimate bisect arm and an illegitimate deployment,
+        //    and it is exactly as worth one line as the mode above it.
+        if !shell.graphs.records() {
+            eprintln!(
+                "engine-cuda: [engine] graphs is {}, a diagnostic mode — every fire \
+                 walks eagerly (~470 kernel launches of host time per decode step) \
+                 with nothing captured; leave the key unstated to serve bodies",
+                match shell.graphs {
+                    Graphs::Off => "off",
+                    Graphs::Shaped => "shaped",
+                    Graphs::On => "on",
+                }
+            );
+        } else if !shell.bodies {
+            eprintln!(
+                "engine-cuda: [engine] bodies is off under [engine] graphs = on, a \
+                 diagnostic arm — bodies are the only recorded path, so every fire walks \
+                 eagerly (~470 kernel launches of host time per decode step) with nothing \
+                 captured; leave the key unstated to serve them"
+            );
+        }
+        // ── **THE BODIES PATH'S ARMING INSTANT** (the bodies design's chunk
+        //    C), and it is the LAST thing the load does. Every plane the
+        //    synthetic fires below touch — the staging ring, the arena, the
+        //    pools, the graph cache — is built by the lines above, and the
+        //    device is bound on this thread because `Shell::load` bound it.
+        //
+        //    Nothing here can fail the load: every rung is a best effort and
+        //    a refused one leaves the composition exactly where it was, which
+        //    is on the eager walk. See `arm_bodies`.
+        //
+        //    **AND ON A ROTATING LOAD IT RETURNS ON ITS GATE AND FIRES
+        //    NOTHING**, printing no line of its own: the rotor's line above
+        //    is the whole announcement, because a pass whose every rung could
+        //    only walk eagerly and capture nothing has no partial arm to
+        //    report.
+        shell.arm_bodies();
+        Ok(shell)
     }
 
     /// **Move one sequence's recurrent state onto another slot** (alto survey
@@ -1729,8 +2124,9 @@ impl Shell {
     /// Write one adapter's planes into this load's banks (design §8).
     ///
     /// **REGISTERING IS A POOL WRITE AND A TABLE ROW — NOT A RECAPTURE**
-    /// (decision 17). The graph key is a fire's COMPOSITION (`record::Key`),
-    /// and a bank's contents are not in it; the bank's addresses were reserved
+    /// (decision 17). The graph key is a fire's COMPOSITION
+    /// (`record::BodyKey`), and a bank's contents are not in it; the bank's
+    /// addresses were reserved
     /// at load and do not move. So the thirty-second adapter costs what the
     /// first did — a copy — and every graph this shell has recorded stays
     /// valid, which is the property
@@ -1913,49 +2309,6 @@ impl Shell {
         self.device.bind_thread()
     }
 
-    /// **THE NEXT FIRE, STATED** — the pipeline's hint, and the seam the
-    /// runtime's frame scheduler reaches through: it seals frames EARLY and
-    /// posts at run-ahead depth 2 (`runtime::scheduler::frame`,
-    /// `DEFAULT_DISPATCH_DEPTH`), so at the moment it submits fire N it
-    /// usually holds fire N+1 sealed — composition known, tokens not yet.
-    /// The composition is all the prebind needs: after fire N's launch and
-    /// before its sync, the fold applies N+1's cached binding to an exec
-    /// that is not in flight, and fire N+1 finds its composition already
-    /// bound.
-    ///
-    /// The lanes' TOKEN CONTENTS are irrelevant here (a binding is enables
-    /// and arguments derived from the composition, and the tokens are
-    /// staged per fire), so a caller may state next-fire lanes whose tokens
-    /// it has not sampled yet. An empty slice clears the hint. A hint that
-    /// turns out wrong costs nothing but the hidden host work: the next
-    /// fire simply rebinds as it would have anyway.
-    ///
-    /// Stating a batch the artifact cannot compose clears the hint too —
-    /// the fire that actually submits it will say why, and a hint is not
-    /// the place to fail anybody.
-    pub fn expect(&mut self, lanes: &[Lane<'_>]) {
-        if lanes.is_empty() {
-            self.cache.fold_expect(None);
-            return;
-        }
-        let submitted: Vec<FireLane> = lanes
-            .iter()
-            .map(|lane| FireLane::new(lane.word, lane.tokens.len() as u32))
-            .collect();
-        let hint = compose_axes(&self.compiled, &self.budgets, &submitted)
-            .ok()
-            .map(|composition| {
-                (
-                    record::FoldKey {
-                        bucket: composition.bucket(),
-                        copies: self.copies,
-                    },
-                    record::Key::of(composition.classes(), self.copies),
-                )
-            });
-        self.cache.fold_expect(hint);
-    }
-
     // ── The guest-program plane (design §9) ──
     //
     // THE DOORS, AND `fire_attached` IS THE ONE THAT JOINS THEM: register a
@@ -2124,9 +2477,8 @@ impl Shell {
     /// [`Fault::Fire`] for a batch the artifact cannot describe or a dispatch
     /// the backend refused, [`Fault::Fragmented`] for a region whose classes
     /// this fire's order does not make consecutive, [`Fault::Ceiling`] for a
-    /// sequence past its slot's pages, [`Fault::Device`] for a transfer, and
-    /// — in [`Graphs::On`] — [`Fault::Schedule`] for a fire whose attention
-    /// schedules are not the shape its recorded graph was captured against.
+    /// sequence past its slot's pages, and [`Fault::Device`] for a transfer, a
+    /// capture or a launch.
     pub fn fire(&mut self, lanes: &[Lane<'_>]) -> Result<Vec<Vec<f32>>> {
         let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
         self.fire_seated(&seated)
@@ -2193,217 +2545,26 @@ impl Shell {
         self.fire_captured(lanes, attachments, &mut Vec::new())
     }
 
-    /// **THE FOLD'S ARMING INSTANT** (`PIE_CUDA_FOLD`), and every path that
-    /// fires must pass through it.
+    /// **ONE SYNTHETIC COMPOSITION'S LANES**, from a list of `(class, rows)`
+    /// pairs — the geometry half of the arming pass, and
+    /// [`Shell::fire_synthetic`]'s twin.
     ///
-    /// Before ANY of a fire's staging: the synthetic pass stages into the same
-    /// reserved input buffers, and running it first is what lets the real fire
-    /// overwrite them cleanly afterwards. The guard on `arming` is the
-    /// recursion base — the synthetic pass is itself a fire.
-    ///
-    /// **IT STANDS OUTSIDE THE THREE PHASES, WHICH IS WHERE ALTO PUTS IT**
-    /// (design §4: "arming → control plane"). Arming captures and
-    /// instantiates; a `prepare` that could do that would be a prepare that
-    /// reaches a stream, which is the one thing the phase exists to forbid.
-    ///
-    /// **AND IT IS PUBLIC BECAUSE THERE ARE TWO CALLERS NOW** (alto F2b). It
-    /// used to sit inside `fire_captured`, which was the only door onto the
-    /// phases; `Cuda::submit` drives `prepare`/`enqueue`/`settle_step`
-    /// directly — that is what makes the receipt asynchronous — so the door it
-    /// no longer walks through is this one, and it has to be called by name.
-    /// Missing it does not fail: it silently serves every fire on the keyed
-    /// path, which is exactly the shape `cuda_fold_hint_e2e` caught.
-    pub fn arm_if_due(&mut self, lanes: &[Seated<'_>]) {
-        if self.fold && !self.arming && self.graphs.records() {
-            self.maybe_arm_fold(lanes);
-        }
-    }
-
-    /// Arm this fire's bucket with a folded exec, if this is the fire to do
-    /// it (`record::Graphs::fold_due` — the signature has warmed and the
-    /// bucket holds neither exec nor refusal).
-    ///
-    /// **NOTHING HERE CAN FAIL A FIRE.** Arming is an optimization pass over
-    /// somebody else's fire; every refusal it meets is tallied by name in
-    /// [`record::FoldStats::refusals`] and the fire proceeds keyed. The
-    /// composition arithmetic is re-done here — pure, microseconds — because
-    /// the alternative is threading a probe result through the staging that
-    /// has not happened yet.
-    ///
-    /// The ladder: the FULL composition first (`.wiki/palo/cuda-abi.md` §4b
-    /// — every class non-empty, so every region's launches are in the
-    /// template), then the union of classes real traffic has exercised. The
-    /// second rung exists because a class no fire ever ran has un-JIT-ed
-    /// kernels and un-grown scratch slabs, and both are host work a
-    /// thread-local capture refuses by design — a refusal the full rung
-    /// NAMES rather than dodges, so the day a workload warms every class the
-    /// full template is what arms.
-    fn maybe_arm_fold(&mut self, lanes: &[Seated<'_>]) {
-        // **A MULTI-UNIT ARTIFACT IS NEVER ARMED** (multimodal §5.3). The
-        // fold plane arms one graph per bucket per key and a fire that
-        // launches two execs has two bucket numbers, so `fire_folded` refuses
-        // this artifact by name anyway — arming it first would pay a capture
-        // and an instantiation for a graph nothing will ever replay. The
-        // refusal is stated in one place and read in two, which is why this
-        // is the flag and not a second predicate.
-        if self.compiled.fold_refused {
-            return;
-        }
-        let submitted: Vec<FireLane> = lanes
-            .iter()
-            .map(|seated| FireLane::new(seated.lane.word, seated.lane.tokens.len() as u32))
-            .collect();
-        let Ok(composition) = compose_axes(&self.compiled, &self.budgets, &submitted) else {
-            // A batch the artifact cannot describe: the fire itself is about
-            // to say so properly.
-            return;
-        };
-        let key = record::FoldKey {
-            bucket: composition.bucket(),
-            copies: self.copies,
-        };
-        let signature = record::Key::of(composition.classes(), self.copies);
-        if !self.cache.fold_due(&key, &signature) {
-            return;
-        }
-
-        let count = self.compiled.classes.classes.len();
-        let full: Vec<usize> = (0..count).collect();
-        let mut seen: Vec<usize> = (0..count)
-            .filter(|class| self.seen_classes.contains(*class))
-            .collect();
-        for class in composition.present() {
-            if !seen.contains(&(*class as usize)) {
-                seen.push(*class as usize);
-            }
-        }
-        seen.sort_unstable();
-
-        let rungs: Vec<Vec<usize>> = if seen == full {
-            vec![full]
-        } else {
-            vec![full, seen]
-        };
-        for classes in rungs {
-            let rung = classes.len();
-            match self.arm_at(&composition, key, &classes, false) {
-                Ok(()) => {
-                    // The zero-form PROBE (§6c finding 2): a second
-                    // synthetic capture of the SAME rung at perturbed rows,
-                    // fitted against the template so the `library` disable
-                    // policy has its zero forms. A refusal costs that
-                    // policy its table for this bucket — the nodes stay
-                    // disable-only, which is the correct fallback — and is
-                    // tallied, never fatal: the bucket just armed.
-                    if let Err(why) = self.arm_at(&composition, key, &classes, true) {
-                        self.cache
-                            .fold_note(&format!("probing at {rung} classes: {why}"));
-                    }
-                    return;
-                }
-                // An `Unbound` here is the fold's own sentence, written for
-                // this tally; anything else is the device's and keeps its
-                // full Display form.
-                Err(Fault::Unbound { what }) => self
-                    .cache
-                    .fold_note(&format!("arming at {rung} classes: {what}")),
-                Err(why) => self
-                    .cache
-                    .fold_note(&format!("arming at {rung} classes: {why}")),
-            }
-        }
-        self.cache.fold_refuse(
-            key,
-            "every synthetic composition refused; the bucket stays keyed",
-        );
-    }
-
-    /// One rung of the arming ladder: stage a synthetic composition over
-    /// exactly `classes` and run it through the ordinary fire path with
-    /// [`Shell::arming`] set, so `record::Graphs::arm_fold` captures the
-    /// template off the same staging every real fire uses.
-    ///
-    /// The synthetic geometry is the REAL composition's where the class is
-    /// present and one one-row lane where it is not — plausible by
-    /// construction (the planners see row counts a real fire could have
-    /// brought) and small by construction (a class the fire did not bring
-    /// asks for no scratch a warmed fire has not already grown). Rows shrink
-    /// off the largest class until the total sits inside the bucket, and a
-    /// bucket too tight to seat every class refuses by name.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the synthetic fire refused — staging, a planner on synthetic
-    /// geometry (kill factor 5), the capture, the census, the instantiate.
-    /// The caller tallies the sentence; nothing is retried.
-    fn arm_at(
-        &mut self,
-        real: &Composition,
-        key: record::FoldKey,
-        classes: &[usize],
-        probe: bool,
-    ) -> Result<()> {
-        let bucket = key.bucket;
-        if classes.len() as u32 > self.budget.max_lanes {
-            return Err(Fault::Unbound {
-                what: format!(
-                    "{} classes and max_lanes {}; the template needs one lane per class",
-                    classes.len(),
-                    self.budget.max_lanes
-                ),
-            });
-        }
-        let mut rows: Vec<u32> = classes
-            .iter()
-            .map(|class| real.classes().class(*class).rows.max(1))
-            .collect();
-        let mut total: u32 = rows.iter().sum();
-        while total > bucket {
-            let (at, most) = rows
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by_key(|(_, rows)| *rows)
-                .expect("a rung is never classless");
-            if most <= 1 {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "{} one-row classes cannot fit inside bucket {bucket}",
-                        rows.len()
-                    ),
-                });
-            }
-            let cut = (total - bucket).min(most - 1);
-            rows[at] -= cut;
-            total -= cut;
-        }
-        // The PROBE'S PERTURBATION: every class whose rows CAN move, moves —
-        // shrink where there is slack, grow where the bucket has headroom —
-        // because the fit's whole signal is a window row count at two
-        // values. A class stuck at one row with no headroom stays put and
-        // its segments simply fit nothing, which the fit reads as "no
-        // signal" and answers with the disable-only fallback.
-        if probe {
-            for count in &mut rows {
-                if *count > 1 {
-                    *count -= 1;
-                    total -= 1;
-                } else if total < bucket {
-                    *count += 1;
-                    total += 1;
-                }
-            }
-        }
-
+    /// The caller states the LIST and this states everything below it: the
+    /// word, the placeholder ids, the mask form, the adapter row, the draft
+    /// and capture bits, and which real slot lends its page arithmetic. A pair
+    /// may repeat its class — `n` lanes of one class is a fire whose class
+    /// table has one window of `n` rows and `n` lanes, which is exactly a
+    /// decode batch.
+    fn synthetic_lanes(&self, lanes: &[(usize, u32)]) -> Vec<Synthetic> {
         let slots = self.held.len().max(1) as u32;
-        let owned: Vec<Synthetic> = classes
+        lanes
             .iter()
-            .zip(&rows)
             .enumerate()
-            .map(|(at, (&class, &rows))| Synthetic {
+            .map(|(at, &(class, rows))| Synthetic {
                 word: self.compiled.classes.classes[class].word(),
-                // Token id 0 in every cell: the synthetic pass never
-                // executes, so the ids only have to be stageable.
+                // Token id 0 in every cell: the ids only have to be
+                // stageable, because the pass executes over a composition
+                // whose numbers nobody reads.
                 tokens: vec![0u32; rows as usize],
                 // An all-allowed mask over the post-append extent, for a
                 // class whose window runs the masked arm — the word and the
@@ -2421,12 +2582,29 @@ impl Shell {
                     .is_some_and(|mtp| mtp.classes.contains(class)),
                 captures: self.exports.capturing.contains(class),
                 // Real slots, round-robin: the page arithmetic needs a slot
-                // that exists, and `held: Some(1)` below keeps the borrow
-                // from touching the slot's own counting or clearing its
-                // banks.
+                // that exists, and `held: Some(1)` in `fire_synthetic` keeps
+                // the borrow from touching the slot's own counting or
+                // clearing its banks.
                 slot: (at as u32) % slots,
             })
-            .collect();
+            .collect()
+    }
+
+    /// **FIRE ONE SYNTHETIC COMPOSITION**, with [`Shell::arming`] set — the
+    /// firing half of an arming pass, and [`Shell::synthetic_lanes`]'s twin.
+    ///
+    /// The borrow, the `held: Some(1)`, the absent readout, the plain RS verb
+    /// and the flag restoration on both the success and the failure path: the
+    /// walk lands in `record::Graphs::fire_body` exactly as a caller's fire
+    /// would, which is the whole reason a load-armed body and a traffic-armed
+    /// one are the same body.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the synthetic fire refused — staging, a planner on synthetic
+    /// geometry (kill factor 5), the capture, the instantiate. The caller
+    /// tallies the sentence; nothing is retried.
+    fn fire_synthetic(&mut self, owned: &[Synthetic]) -> Result<()> {
         let seated: Vec<Seated<'_>> = owned
             .iter()
             .map(|lane| Seated {
@@ -2443,25 +2621,1123 @@ impl Shell {
                 adapter: lane.adapter,
                 drafts: lane.drafts,
                 captures_scores: lane.captures,
-                // The arming pass computes nothing and plans no readback, so
-                // there is no row list to carry and nothing that would read
-                // one.
+                // The arming pass computes nobody's numbers and plans no
+                // readback, so there is no row list to carry and nothing that
+                // would read one.
                 readout: None,
-                // The arming pass is SYNTHETIC and nothing it carries
-                // executes: the plain fold is the one RS shape that
-                // graph-replays (design §6), so it is also the only one a
-                // template can be armed for.
+                // The arming pass is SYNTHETIC: the plain fold is the one RS
+                // shape that graph-replays (design §6), so it is also the
+                // only one a body can be armed for.
                 rs: RsVerb::Fold,
                 rs_reset: RsReset::Inferred,
             })
             .collect();
 
         self.arming = true;
-        self.probing = probe;
         let armed = self.fire_captured(&seated, &[], &mut Vec::new());
         self.arming = false;
-        self.probing = false;
         armed.map(|_| ())
+    }
+
+    /// **THE MOST LANES THIS LOAD CAN EVER SEAT AT ONCE**, and it is a
+    /// DEPLOYMENT FACT rather than a tuning: `min(slots, max_lanes,
+    /// max_tokens)`.
+    ///
+    /// Three separate numbers bound a lane count and the smallest wins. Two
+    /// are the arena's ceilings, cut at load; the third — the one that
+    /// actually binds on every deployment this shell serves — is the SLOT
+    /// count, because a lane needs a sequence seat for its page arithmetic
+    /// and two lanes sharing a seat would be two appends into one kv cell.
+    /// All three are settled before the first fire and none of them moves
+    /// after it: `held` is sized once at [`Shell::load`] and the budget is
+    /// the bake's.
+    ///
+    /// **AND IT IS ONE FUNCTION BECAUSE IT IS IN A CACHE KEY**
+    /// ([`record::Ladder::rung`]): a decode class is carved to this number, so
+    /// [`Shell::arm_bodies`] and [`Shell::prepare`] computing it two ways
+    /// would be an arming pass that pins bodies the traffic it was armed for
+    /// cannot find. There is one reading, here, and both callers take it.
+    fn lane_ceiling(&self) -> u32 {
+        (self.held.len() as u32)
+            .min(self.budget.max_lanes)
+            .min(self.budget.max_tokens)
+    }
+
+    /// **THIS KEY'S ADMISSIBILITY TABLE, DERIVED ONCE AND READ EVERY FIRE
+    /// AFTER** (the tier-2 campaign) — `Windows::admits` WIDENED
+    /// (`record::widen`), memoized in [`Shell::segments`].
+    ///
+    /// **AND THE WIDENING IS INSIDE THE MEMO, WHICH IS THE WHOLE OF HOW THE
+    /// THREE READERS STAY ONE ANSWER.** `Windows::admits` says which regions
+    /// a graph MAY hold; some of those answers cannot be cut at — a boundary
+    /// inside a fork group, one between two arms of a conditional, a schedule
+    /// on the far side of one from its readers — and `record::widen` grows the
+    /// islands until every boundary is legal. That widened table is what this
+    /// hands out: to the `Run` (`Run::captured`, which stands the ceilings
+    /// down inside an island), to `record::Fire::admits` (the capture loop and
+    /// the ledger) and to `record::cuts` (the gate's verdict and the capture
+    /// script). A caller that widened for itself would be a region a graph
+    /// holds and a walk re-issues, which is the one failure this campaign can
+    /// produce and the one nothing downstream would notice.
+    ///
+    /// **THE MEMO IS SOUND BECAUSE THE DERIVATION IS A FUNCTION OF THE KEY**,
+    /// and that is not this method's claim to make: `Windows::admits` argues
+    /// it clause by clause — gathered is `fallback::copies`' bucket-keyed
+    /// answer, a segment list is the artifact's, the interval clauses are the
+    /// present set's, `shifted` is read once at load. A key therefore has ONE
+    /// table for the life of the load, which is exactly what a body captured
+    /// at that key replays: `record::Graphs::fire_body` still `debug_assert`s
+    /// its island list on every hit, and what that now compares is the
+    /// resident body's script against the table this memo served — which is
+    /// the comparison that catches a body captured before something moved.
+    ///
+    /// **AND THE ONE INPUT THAT IS NOT A KEY COORDINATE IS CARRIED IN THE
+    /// ENTRY.** `window::Copies::enabled` is `[engine] fallback_copy` — a
+    /// load constant — AND "did this fire stage mask bits", which is not. A
+    /// masked fire takes the split, so on a SKU with a masked axis and a P4
+    /// copy row two fires of one key can disagree about whether a region is
+    /// gathered. An entry records which answer it was derived under and a
+    /// fire that disagrees derives again, rather than reading a table that
+    /// was never about it. That keeps the memo honest; it does not close the
+    /// underlying question, which is `Windows::admits`' own note.
+    fn segmentation(
+        &mut self,
+        key: &record::BodyKey,
+        windows: &Windows,
+        rows: u32,
+        copies: bool,
+    ) -> std::sync::Arc<[crate::window::Admit]> {
+        if let Some(held) = self.segments.get(key)
+            && held.copies == copies
+        {
+            // **AND THE MEMO IS CHECKED AT ITS OWN DOOR, IN DEBUG.** The claim
+            // above is that this table is a function of the key; a memo that
+            // merely believed it would be the thing that hid the day it stops
+            // being true. Re-deriving here and diffing the WHOLE table is
+            // strictly stronger than what `Graphs::fire_body` asserts — that
+            // one sees only the island projection, and only for a key that
+            // holds a body — and it costs a `Vec` per fire in a debug build
+            // and exactly nothing in a release one.
+            debug_assert!(
+                held.admits.as_ref()
+                    == record::widen(&self.compiled, &windows.admits(rows, &self.shifted)),
+                "the admissibility table for {key} is not what this key derived \
+                 before, so `Windows::admits` has grown an input the key does \
+                 not carry",
+            );
+            return std::sync::Arc::clone(&held.admits);
+        }
+        // **WIDENED HERE AND NOWHERE ELSE.** One call, one table, three
+        // readers — see this method's header for why that is not a
+        // convenience.
+        let admits: std::sync::Arc<[crate::window::Admit]> =
+            record::widen(&self.compiled, &windows.admits(rows, &self.shifted)).into();
+        self.segments.insert(key.clone(), Segmented {
+            copies,
+            admits: std::sync::Arc::clone(&admits),
+            cuttable: None,
+        });
+        admits
+    }
+
+    /// **IS THERE ANYTHING LEFT FOR A GRAPH TO HOLD?** — `record::cuts`
+    /// asked as the predicate `prepare`'s gate wants, once per key.
+    ///
+    /// `prepare` throws the script away — the capture loop derives its own,
+    /// off the same table, at the one instant that is going to record — so
+    /// what the gate needs is the verdict alone, and the verdict is a
+    /// function of the key for [`segmentation`](Shell::segmentation)'s
+    /// reason: `cuts` reads that table and the template and nothing else.
+    /// Memoized in the same entry, so a steady stream allocates no `Vec<Cut>`
+    /// per fire.
+    ///
+    /// **AND THE DECLINE IS TAKEN HERE**, which is why this is a second
+    /// method and not a field of the first. It is `prepare`'s gate that
+    /// decides whether a composition is being ASKED to record — a load
+    /// serving `graphs = off`, or `bodies = off`, or one whose weights rotate
+    /// is not — and a shell that printed "this body declines to be
+    /// segmented" at a deployment that never wanted a body would be counting
+    /// traffic against a path it does not serve. So the table above is
+    /// derived for every fire and this question is asked only past the outer
+    /// clauses, exactly where the old inline `cuts` call stood.
+    fn cuttable(&mut self, key: &record::BodyKey, admits: &[crate::window::Admit]) -> bool {
+        if let Some(Some(held)) = self.segments.get(key).map(|seg| seg.cuttable) {
+            return held;
+        }
+        // Bound first: the script is dropped here and the borrow of
+        // `self.compiled` with it, so the decline arm below is free to write
+        // the refusal memo.
+        let script = record::cuts(&self.compiled, admits);
+        let verdict = match script {
+            Ok(_) => true,
+            Err(uncut) => {
+                // **THE ONE REFUSAL LEFT ON THIS AXIS, AND IT IS NO LONGER
+                // ABOUT A BOUNDARY** (the tier-2 campaign, then the
+                // widening). A boundary a graph cannot be cut at — inside a
+                // fork group, between two arms of a conditional, across a
+                // schedule from its readers — used to decline the whole
+                // composition and throw away every capturable region of it.
+                // `record::widen` GROWS the island to the nearest legal
+                // boundary instead, because a region served eagerly is the
+                // eager walk and is always right. So what reaches this arm is
+                // the terminal case: a composition the growing consumed
+                // entirely, whose body would be a script of islands with no
+                // exec in it. It is declined BY NAME, before a stream is
+                // touched, and the sentence is printed once per key because
+                // `body_refuse` is the memo that deduplicates it and counts
+                // the composition.
+                //
+                // **AND IT IS A SENTENCE ABOUT THE ARTIFACT, WHICH IS WHY IT
+                // IS WORTH A LINE.** Every window of this composition is one
+                // this shell has to re-issue every fire, so the answer to it
+                // is a `crate::SHIFTED` look or a seat — not a capture.
+                eprintln!(
+                    "engine-cuda: body {key} holds nothing a graph can keep — {uncut}. \
+                     This composition walks eagerly for the life of the load; \
+                     `record::widen` grew its islands to the nearest legal boundary \
+                     first, and `record::Uncut` names what was left."
+                );
+                self.cache.body_refuse(key.clone());
+                false
+            }
+        };
+        if let Some(seg) = self.segments.get_mut(key) {
+            seg.cuttable = Some(verdict);
+        }
+        verdict
+    }
+
+    /// **ARM THIS LOAD'S WHOLE BODY LATTICE BEFORE A CALLER HAS FIRED
+    /// ANYTHING, THEN CLOSE THE MAP** (the bodies design's chunk C, finished
+    /// by the tier-1 key-collapse wave's chunk B), so that every fire this
+    /// deployment can assemble replays from its first one and the serving path
+    /// captures NOTHING.
+    ///
+    /// Called once, from the tail of [`Shell::load`], on the load thread,
+    /// before any real fire and therefore before any real staging. Nothing it
+    /// does can fail the load.
+    ///
+    /// # What it fires, and why the key space is a list rather than a guess
+    ///
+    /// A `record::BodyKey` is a lattice point and a class LADDER — which
+    /// classes have rows, and the ceiling each one is carved to — and since
+    /// the key collapse EVERY NUMBER in it comes from load constants: the
+    /// present set from the class table, the bucket from `Budget::buckets`,
+    /// and each rung from `record::Ladder::rung` of the two. So the keys this
+    /// deployment can realize are enumerable, and this pass enumerates them:
+    ///
+    /// * **the present sets** are the DECODE classes ([`Shell::decoding`] —
+    ///   which classes run an `attention.decode` arm, read off the template
+    ///   the way [`Shell::masked`] is), the non-decode ones, and the pairs of
+    ///   one of each. A shell cannot compute a lane's fact word, so "the
+    ///   decode class" is asked as a question about ops rather than about
+    ///   bits, and `Class::word` names a word that resolves back to it;
+    /// * **the buckets** are `Budget::buckets`, filtered by what the
+    ///   deployment can actually present — a decode key at a rung above the
+    ///   seats, a prefill key whose rows will not fit `seats x context`, a
+    ///   mixed key on a one-seat load are all named and skipped;
+    /// * **and the CEILINGS ARE NOT READ OFF THE SYNTHETIC FIRE AT ALL** —
+    ///   they are `record::Ladder::rung` of the bucket and
+    ///   [`Shell::lane_ceiling`], the same call a real fire's ladder makes,
+    ///   because a number this pass computed its own way is a key the traffic
+    ///   cannot find. It used to be `rung_of` over the synthetic lane count,
+    ///   and on a load whose seats sit under the lattice floor that armed
+    ///   `c:8` while every fire of the bucket asked for `c:4`.
+    ///
+    /// **AND THE SYNTHETIC'S GEOMETRY INSIDE THE KEY DOES NOT MATTER**, which
+    /// is what makes prefill and mixed arming possible where it once was not.
+    /// A body's launches are gridded at the key's own ceilings
+    /// (`Run::carve_rows`), so a capture taken over ANY split of the bucket
+    /// stands for every split of it. What the synthetic has to be is fireable,
+    /// not representative.
+    ///
+    /// The COPY POLICY used to be a fact of this key too, and is not any more:
+    /// `record::BodyKey`'s own header argues why no fire the two policies
+    /// could distinguish ever reaches a body.
+    ///
+    /// # And then the seal, which is the other half of "upfront"
+    ///
+    /// Having walked the key space, this pass closes the map
+    /// (`record::Graphs::seal_bodies`) — but only if it armed something. Past
+    /// that line a fire whose key holds no body keeps its eager numbers and is
+    /// counted (`record::BodyStats::sealed_declines`) instead of warming
+    /// toward a capture nobody asked for. The bodies path's whole claim is
+    /// that its keys are known in advance; the seal is that claim enforced
+    /// rather than hoped for.
+    ///
+    /// # The warm ladder, which is not optional and is not new
+    ///
+    /// At load nothing has been JIT-ed, no scratch slab has grown and the
+    /// dense autotuner has seen no shape twice — the three reasons
+    /// `crate::record`'s header gives for walking a miss eagerly BEFORE
+    /// capturing it. Capture a body cold and its cuBLAS ladder is the untuned
+    /// one, frozen for the life of the load, and every replay afterwards
+    /// disagrees arithmetically with the eager walk it stands for.
+    ///
+    /// So each key is fired [`record::WARM_FIRES`] times through the ORDINARY
+    /// bodied path, and the ordinary warm bookkeeping in
+    /// `record::Graphs::fire_body` does the rest: the first fire walks
+    /// eagerly and records nothing, and the `WARM_FIRES`-th walks eagerly
+    /// again — the tuner's second sighting — and captures off that walk. That
+    /// is the same ladder a real fire climbs; nothing here counts differently,
+    /// and load-armed and traffic-armed bodies are the same bodies.
+    ///
+    /// # The one load it does not arm at all
+    ///
+    /// A ROTATING one. `Shell::enqueue_on` refuses to record any fire whose
+    /// weights rotate — permanently, for the life of the load — so every rung
+    /// this loop climbed would execute its warm fires against the eager walk
+    /// and reach the end of the ladder with nothing captured. The pass exists
+    /// to move a warm cost off the first caller and onto the boot; under a
+    /// rotor there is nowhere to move it to, and paying it anyway is load-time
+    /// device seconds spent on a cache that cannot exist. The gate's first
+    /// lines refuse the whole pass, and the rotor's own boot line in
+    /// [`Shell::load`] is where an operator reads that it happened.
+    ///
+    /// # What a refusal costs
+    ///
+    /// Nothing. A rung whose composition the admissibility rule turns away is
+    /// refused into `bodies_refused` by `prepare`, exactly as a real fire's
+    /// would be; a schedule that declines to be graph-shaped is
+    /// `BodyStats::declines`; a synthetic geometry a planner will not take is
+    /// a `Fault` this swallows. In every case the composition is left where
+    /// it already was — walking eagerly, counted — and the loop moves to the
+    /// next rung, because an armed SUBSET is a win and a load that refused to
+    /// boot over it would be trading a whole deployment for a warm cache.
+    fn arm_bodies(&mut self) {
+        // The FIVE outer clauses of the router's own gate, restated at the
+        // one instant that can act on them. `bodies` off is the diagnostic
+        // eager arm and arms nothing at all; a mode that records nothing has
+        // no cache to arm; and a multi-unit artifact is refused from the body
+        // path by name (`CompiledModel::fold_refused` — a compiler fact about
+        // two row axes, not a shell knob), so arming it would pay captures for
+        // execs no fire will ever reach.
+        //
+        // **AND A ROTATING LOAD IS THE FOURTH, WHICH IS NOT A CAUTION BUT AN
+        // ARITHMETIC.** `Shell::enqueue_on`'s `records` line refuses to
+        // record ANY fire whose weights rotate — a rotation's backpressure is
+        // a host cursor the walk advances and a replayed graph has no walk,
+        // which `crate::rotate` argues in full — and that refusal is
+        // permanent for the life of the load, not conditional on a fire.
+        // So every rung this loop would climb lands in the router's eager
+        // `else`: `record::WARM_FIRES` real executed walks per rung, real
+        // device seconds at boot, and not one exec captured at the end of
+        // them. The whole of this pass is moving a warm cost off the first
+        // caller and onto the load, and under a rotor there is nothing to
+        // move it TOWARD — the first caller pays the eager walk either way,
+        // and so does the ten-thousandth. Work that can only produce eager
+        // walks is refused where it is asked for. The boot line above says
+        // the same thing in words, once, for the operator; this is the line
+        // that stops the load paying for it.
+        //
+        // **AND THE PAD IS THE FIFTH, ON THE SAME ARITHMETIC.** `prepare`'s
+        // gate will not record a body without an armed lattice point, so every
+        // synthetic this pass fired under `[engine] pad off` would compose,
+        // stage, be refused the body arm and return having armed nothing. The
+        // clause is here for the reason the rotor's is: work that can only
+        // produce nothing is refused where it is asked for.
+        if !self.bodies
+            || !self.pad
+            || !self.graphs.records()
+            || self.compiled.fold_refused
+            || self.weights.rotating()
+        {
+            return;
+        }
+
+        // **THE CEILING IS A DEPLOYMENT FACT AND NOT A TUNING**, and it is
+        // read from the one place that states it ([`Shell::lane_ceiling`]),
+        // because the same number is in the key this pass is about to name. A
+        // decode fire is one row per lane, so its lane count is its row count
+        // and the seats bound both.
+        let ceiling = self.lane_ceiling();
+        if ceiling == 0 {
+            return;
+        }
+        // A deployment that declared no lattice has no rungs and every row
+        // count is its own bucket (`Composition::bucket` is the row count
+        // itself), so the rungs ARE the admissible lane counts. One that
+        // declared a lattice arms its points — synthesized at the LANE count
+        // a real fire of that rung can actually bring, which is the rung
+        // itself when the seats allow it and the seat ceiling when they do
+        // not. The second case is not a corner: `bucket_of` rounds a fire's
+        // rows UP, so a deployment whose seats sit below the lattice floor
+        // still serves every decode fire out of the FIRST rung — a rung this
+        // loop would otherwise skip entirely, and did, until a four-seat
+        // deployment armed nothing.
+        let rungs: Vec<(u32, u32)> = if self.budget.buckets.is_empty() {
+            (1..=ceiling).map(|n| (n, n)).collect()
+        } else {
+            let mut rungs = Vec::new();
+            for point in self.budget.buckets.iter().copied() {
+                if point <= ceiling {
+                    rungs.push((point, point));
+                } else {
+                    // The first rung past the seats: every admissible lane
+                    // count above the previous rung rounds up to it.
+                    //
+                    // **AND ONLY IF THERE IS SUCH A LANE COUNT.** When the
+                    // seats land exactly ON the previous rung, the rung below
+                    // already arms every decode fire this load can bring and
+                    // this point names a bucket the synthesis cannot reach:
+                    // `ceiling` lanes are `ceiling` rows, and `ceiling` rows
+                    // round DOWN to the rung that holds them. Pushing it
+                    // anyway spends a synthetic fire to seat a body under one
+                    // key and then look for it under another, which arms
+                    // nothing and — since the arming loop now cross-checks
+                    // the key it named against the key `prepare` composed —
+                    // trips that check besides.
+                    if ceiling > rungs.last().map_or(0, |(point, _)| *point) {
+                        rungs.push((point, ceiling));
+                    }
+                    break;
+                }
+            }
+            rungs
+        };
+        // **AND IT IS THE WHOLE REALIZABLE LATTICE NOW, NOT DECODE ONLY** —
+        // the tier-1 key-collapse wave's chunk B, and the paragraph that
+        // stood here is retired rather than amended, because both of its
+        // reasons died.
+        //
+        // What it argued was that only a DECODE composition is worth arming,
+        // on two grounds. The first was `Body::grids`: "a body may serve a
+        // fire only when the capture's per-launch `(rows, lanes)` dominate the
+        // fire's, a decode composition at a rung has exactly ONE maximal
+        // geometry and the key states it, and a prefill or mixed key has no
+        // such corner, its rows and lanes being free of each other inside one
+        // key". That was true and is not: the grids are issued at the KEY's
+        // ceiling now (`Run::carve_rows`, `Run::carve_lanes`, and
+        // `record::launch_grid` is the ledger's twin), so ANY in-key geometry
+        // captures the key's maximum and the corner nobody could synthesize
+        // stopped being needed.
+        //
+        // The second was the BUDGET, and its constant is retired with it.
+        // `MAX_ARMED_BODIES` was eight — a quarter of `record::MAX_BODIES` —
+        // on the argument that "the map has to have room left for traffic",
+        // and the decode rungs of a doubling lattice filled it exactly. That
+        // reservation stopped having a population to protect when the map was
+        // SEALED at the end of this pass: traffic mints no bodies now, so
+        // every seat under `record::MAX_BODIES` belongs to this enumeration
+        // and the only honest bound is the map itself. What the old constant's
+        // other argument said — that each key costs `record::WARM_FIRES`
+        // EXECUTED walks at load, which is real boot-time device seconds — is
+        // still true and is now answered by the deployment rather than by a
+        // number in this file: the enumeration is as large as the lattice the
+        // deployment can realize, and the map's size is what STOPS it — asked
+        // of the map, per key, so that only a key which actually seats a body
+        // spends a seat. A refused present set costs one synthetic fire and no
+        // budget at all, which is what keeps a baked class table's phantom
+        // fact combinations from crowding out the shapes traffic brings.
+        //
+        // **SO WHAT IS ENUMERATED IS THE KEY SPACE, WHICH IS FINALLY A THING
+        // A LOAD CAN WALK.** A `record::BodyKey` is a PRESENT SET and a
+        // BUCKET, and both are drawn from load constants — the class table and
+        // `Budget::buckets` — with every number in the ladder a function of
+        // the pair (`record::Ladder::rung`). FOUR kinds of present set are
+        // enumerated and each gets its own loop:
+        //
+        // * **decode-only**, one key per lattice point per decode class, at
+        //   the lane count a real decode fire of that rung can bring. The loop
+        //   below is the one that was already here, unchanged in shape and in
+        //   its rungs' arithmetic;
+        // * **prefill-only**, one key per lattice point per NON-decode class.
+        //   The synthetic is the bucket's own row total spread over
+        //   `min(bucket, seats, max_lanes)` lanes — the bucket itself and not
+        //   "the previous rung plus one", because `bucket_of` is idempotent on
+        //   a lattice point: the total lands on this key by construction,
+        //   where a rung-plus-one would need this loop to re-derive the
+        //   lattice's own ordering and would name a DIFFERENT key on any
+        //   deployment whose buckets are not the ones it assumed;
+        // * **mixed**, one key per (decode class x non-decode class) pair per
+        //   lattice point — one decode lane of one row, and the remaining
+        //   `bucket - 1` rows spread over prefill lanes;
+        // * **fragmented**, one key per (fragmentable region MASK, separator)
+        //   per lattice point — THREE classes: the class that stands between
+        //   two of the mask's own and the nearest of those two on either side
+        //   of it, one lane each (the tier-2 campaign,
+        //   `Shell::fragmenting`). **THIS IS THE ONLY ARM THAT CAN ARM A
+        //   SEGMENTED BODY**, and the reason is arithmetic rather than taste:
+        //   the three above present one class or two, a mask over a subset of
+        //   two present classes is always one interval, and a window that is
+        //   one interval is never gathered, grouped or split. So without this
+        //   loop the tier-2 path would exist with no key to exercise it, and
+        //   every composition P4 wrote a `Fallback` row for would walk eagerly
+        //   past the seal. What it does NOT do is cover the class-set space,
+        //   which is exponential and is not a thing a boot walks — one witness
+        //   per mask is this wave's reach and `Shell::fragmenting` states it.
+        //
+        // **AND THE SYNTHETIC'S OWN SPLIT DOES NOT MATTER, WHICH IS THE
+        // SENTENCE THAT MAKES MIXED ARMING POSSIBLE AT ALL.** Every fire of
+        // one key grids at the same ceiling, so the capture this pass takes
+        // stands for every split of the bucket the key admits — nine prefill
+        // rows beside three decode ones, or three beside nine. The synthetic
+        // only has to BE a fire of the key: present the right classes, land in
+        // the right bucket, and be something the deployment can actually
+        // stage, plan and run.
+        //
+        // **A KEY THE DEPLOYMENT CANNOT FIRE IS REFUSED BY NAME AND NEVER
+        // ARMED.** A lane needs a seat, a seat holds `Paging::context` tokens,
+        // and a fire needs at least one lane per present class — so a bucket
+        // whose rows cannot be spread over the seats this load has is a bucket
+        // no caller can bring either. Arming it would spend a synthetic fire
+        // to hear a refusal; skipping it silently would leave an operator
+        // reading a short armed count with no sentence to explain it. So it is
+        // named in the boot line and left out of `wanted`.
+        //
+        // Ascending buckets, because that is the order the budget is spent
+        // in: a lattice wider than `record::MAX_BODIES` never reaches its
+        // LARGEST buckets, which are the fires a deployment assembles least
+        // often and the ones whose captures cost the most.
+        let seats = self.held.len() as u32;
+        let context = self.pools.paging().context();
+        let max_lanes = self.budget.max_lanes;
+        let classes = self.compiled.classes.classes.len();
+        let prefilling: Vec<usize> = (0..classes)
+            .filter(|class| !self.decoding.contains(*class))
+            .collect();
+        let mut targets: Vec<(u32, BodySynth)> = Vec::new();
+        let mut unfireable: Vec<String> = Vec::new();
+        let fragmenting = self.fragmenting();
+        for (bucket, lanes) in &rungs {
+            for class in self.decoding.iter() {
+                targets.push((*bucket, BodySynth::Decode {
+                    lanes: *lanes,
+                    class,
+                }));
+            }
+        }
+        // The prefill and mixed halves need a LATTICE to enumerate over: a
+        // deployment that declared none has `Composition::bucket == rows`, so
+        // its key space is one key per row count and there is nothing finite
+        // to walk. The decode half above still arms, because a decode fire's
+        // rows are bounded by the seats whether or not a lattice exists.
+        for point in self.budget.buckets.iter().copied() {
+            for class in prefilling.iter().copied() {
+                match Self::spread(point, seats.min(max_lanes), context) {
+                    Some(rows) => targets.push((point, BodySynth::Prefill { class, rows })),
+                    None => unfireable.push(format!(
+                        "prefill c{class} at bucket {point} ({seats} seat(s) x \
+                         {context} context, {max_lanes} lane(s))"
+                    )),
+                }
+            }
+            for decode in self.decoding.iter() {
+                for class in prefilling.iter().copied() {
+                    // A mixed fire needs a seat for the decode lane and at
+                    // least one for the prefill class, and a bucket with a row
+                    // for each: two of everything, and `spread` refuses the
+                    // rest.
+                    let rows = (point >= 2 && seats >= 2)
+                        .then(|| {
+                            Self::spread(
+                                point - 1,
+                                (seats - 1).min(max_lanes.saturating_sub(1)),
+                                context,
+                            )
+                        })
+                        .flatten();
+                    match rows {
+                        Some(rows) => targets.push((point, BodySynth::Mixed {
+                            decode,
+                            class,
+                            rows,
+                        })),
+                        None => unfireable.push(format!(
+                            "mixed c{decode}+c{class} at bucket {point} ({seats} seat(s) \
+                             x {context} context, {max_lanes} lane(s))"
+                        )),
+                    }
+                }
+            }
+            // **AND THE COMPOSITIONS A SEGMENTED BODY EXISTS FOR** (the tier-2
+            // campaign, [`BodySynth::Fragmented`]). Three present classes,
+            // which is both the fewest that can put a foreign class's rows
+            // inside a mask's span — what makes a region gathered, grouped or
+            // windowed-without-the-seat, an ISLAND — and the most this arm
+            // asks for: a witness wider than the break needs a seat per class,
+            // and a deployment that cannot seat it arms nothing where the
+            // three-class fire it actually serves would have armed. Without
+            // this arm the enumeration tops out at two classes and no load
+            // arms a segmented body at all.
+            for present in &fragmenting {
+                match self.fragment_rows(present, point, seats, context) {
+                    Some(lanes) => {
+                        targets.push((point, BodySynth::Fragmented { lanes }));
+                    }
+                    None => unfireable.push(format!(
+                        "fragmented {present:?} at bucket {point} ({seats} seat(s) x \
+                         {context} context, {max_lanes} lane(s))"
+                    )),
+                }
+            }
+        }
+        // Ascending bucket, stable inside it, so the loop below spends the
+        // map's seats on the smallest buckets first and whatever it runs out
+        // of budget for is the largest.
+        targets.sort_by_key(|(bucket, _)| *bucket);
+        if targets.is_empty() {
+            return;
+        }
+
+        // **THE BUDGET IS THE MAP, AND A KEY THAT SEATS NOTHING MUST NOT SPEND
+        // IT** (the tier-1 key-collapse wave). The enumeration used to be
+        // TRUNCATED to `record::MAX_BODIES` up front, which decided which keys
+        // this load would arm before it knew which of them it CAN arm — and a
+        // baked class table holds every fact combination the compiler can
+        // distinguish, most of which no deployment's traffic ever presents. On
+        // a two-decode-class, ten-prefill-class bake the first lattice point
+        // alone enumerates thirty-two keys, so a load whose phantom pairs are
+        // half of them spent half its map on compositions that refuse and
+        // dropped every bucket above the floor to make room.
+        //
+        // So the loop attempts keys in ascending bucket order and asks the MAP
+        // rather than the list: a key that arms occupies a seat, a key that
+        // refuses costs one synthetic fire and nothing else, and the pass
+        // stops when `record::MAX_BODIES` bodies stand. What is left unvisited
+        // is named in the boot line by the bucket it stopped at, which is the
+        // sentence an operator can act on ("this lattice is wider than the
+        // map").
+        //
+        // **AND A PRESENT SET THAT WAS REFUSED IS NOT ASKED AGAIN AT THE NEXT
+        // BUCKET — WHICH IS A BUDGET RULE NOW AND NO LONGER A THEOREM** (the
+        // tier-2 campaign). It used to be one: the refusal was
+        // `Windows::covers_fire_shifted`, which reads the SHAPES of a
+        // composition's windows, every one of those is a function of which
+        // classes have rows and of the artifact (`window::seat`'s note: two
+        // masks resolve to the same span exactly when their present classes
+        // are the same set), and the bucket moves no window's shape — so one
+        // refusal per present set was the whole of what there was to learn.
+        //
+        // A window's shape no longer refuses anything: `Windows::admits` makes
+        // an ISLAND of it and `record::cuts` cuts the body around it. What is
+        // left to learn here is the WIDENING's verdict (`record::Uncut::Eager`
+        // — every region an island once the islands have grown to their legal
+        // boundaries), and that one CAN move with the bucket, because
+        // `fallback::copies` is bucket-keyed: a region that splits above the
+        // crossover and gathers below it crosses the admissibility line with
+        // the lattice point, and an island the widening spreads over a fork
+        // group at one bucket is one region at the other. So this list is kept as what it
+        // has to be: a bound on the synthetic fires a wide bake spends, not a
+        // proof about them. A set skipped here that a larger bucket would have
+        // armed costs exactly one unarmed key, which is what every other
+        // unarmed key costs and is counted in the same place
+        // (`record::BodyStats::sealed_declines`).
+        //
+        // This is still the only "which classes can fire" answer this shell
+        // can derive: the class table says which fact combinations EXIST, and
+        // nothing in the artifact says which of them a deployment's callers
+        // will present.
+        let mut armed = 0usize;
+        let mut wanted = 0usize;
+        let mut kinds = [(0usize, 0usize); 4];
+        let mut refused: Option<String> = None;
+        let mut unadmitted: Vec<Vec<usize>> = Vec::new();
+        let mut never = 0usize;
+        let mut never_from = 0u32;
+        for (bucket, target) in targets {
+            // The map's seats, asked of the map — `insert_body` bounds what is
+            // RESIDENT, and the arming pass's bodies are pinned, so the live
+            // count is the only honest reading of what is left.
+            if self.cache.body_stats().bodies >= record::MAX_BODIES {
+                if never == 0 {
+                    never_from = bucket;
+                }
+                never += 1;
+                continue;
+            }
+            let present = target.present();
+            if unadmitted.contains(&present) {
+                // Named, not fired: this present set has already told this
+                // load that no composition of it is admissible.
+                unfireable.push(format!("bucket {bucket}, {target}: inadmissible present set"));
+                continue;
+            }
+            wanted += 1;
+            let (at, lanes): (usize, Vec<(usize, u32)>) = match &target {
+                // One-row lanes of one class: a decode fire that lands in this
+                // lattice point — at the rung's own lane count when the seats
+                // hold it, at the seat ceiling when the rung is the first one
+                // past them (the composition still rounds up to `bucket`).
+                BodySynth::Decode { lanes, class } => {
+                    (0, vec![(*class, 1u32); *lanes as usize])
+                }
+                BodySynth::Prefill { class, rows } => (
+                    1,
+                    rows.iter().map(|rows| (*class, *rows)).collect(),
+                ),
+                // The decode lane FIRST, which is a statement about nothing:
+                // `fire::compose` seriates by the baked class order and not by
+                // submission order, so the ladder this key gets is the one a
+                // real mixed fire gets whichever way round these are listed.
+                BodySynth::Mixed { decode, class, rows } => (
+                    2,
+                    core::iter::once((*decode, 1u32))
+                        .chain(rows.iter().map(|rows| (*class, *rows)))
+                        .collect(),
+                ),
+                // One lane per class, already paired with its rows by
+                // `Shell::fragment_rows` — this arm has nothing to compose,
+                // because the shape it needs is the one that shape function
+                // had to reason about.
+                BodySynth::Fragmented { lanes } => (3, lanes.clone()),
+            };
+            kinds[at].1 += 1;
+            let owned = self.synthetic_lanes(&lanes);
+            self.armed_body = None;
+            // A `Fault` is this GEOMETRY's, not necessarily this present set's
+            // — a planner may take a bucket and refuse the one above it — so a
+            // key that faulted teaches the skip list nothing and is not
+            // allowed to speak for its set's other lattice points.
+            let mut faulted = false;
+            for _ in 0..record::WARM_FIRES {
+                let fired = self.fire_synthetic(&owned);
+                // **AND EACH KEY'S FIRES ARE SETTLED BEFORE THE NEXT ONE**,
+                // which is the one thing this loop does that a real fire path
+                // must never do — and it is control plane, at load, with no
+                // caller waiting. Two reasons, both structural rather than
+                // cautious:
+                //
+                // * the settlement pool holds one event per IN-FLIGHT step
+                //   (`Settlement::claim` answers `Fault::Ceiling`, not a
+                //   wait), and this loop issues far more steps than a
+                //   run-ahead depth without a `read_out` to bound them. A
+                //   fire path is bounded by the caller's frames; this is
+                //   bounded by nothing but the sync;
+                // * and `insert_body`'s replacement and eviction paths both
+                //   ask `Airborne::settled_past`. A key whose predecessors
+                //   are all settled asks that question against a quiet
+                //   device, so an arming refusal means what it says instead
+                //   of meaning "the last key had not landed yet".
+                let landed = self.device.synchronize();
+                if let Err(why) = fired.and(landed) {
+                    // A synthetic geometry this load will not stage, plan or
+                    // land. The key is lost and the next one is not.
+                    refused = Some(format!("bucket {bucket}, {target}: {why}"));
+                    faulted = true;
+                    break;
+                }
+            }
+            // **THE KEY THE SYNTHETIC ACTUALLY BUILT, TAKEN FROM THE ONE
+            // INSTANT THAT COMPOSED IT** (`Shell::armed_body`, written by
+            // `prepare`). A prefill or mixed ladder has an ORDER — ascending
+            // row offset, which `fire::compose` decides from the artifact's
+            // baked class order — and this loop knows the classes it asked
+            // for, not the order they were seriated into. Reconstructing it
+            // here would be a second answer waiting to disagree with the one
+            // the cache is keyed on, which is precisely the bug
+            // `record::Ladder::rung`'s own note describes on the rung axis.
+            //
+            // The decode arm keeps building its key by hand, because that is
+            // the arm the `Ladder::single` constructor exists for and its
+            // single-class ladder has no order to lose — and the `debug_assert`
+            // is what says the two readings agree.
+            //
+            // **AND WHETHER THE COMPOSITION WAS ADMITTED AT ALL IS READ FIRST,
+            // OFF THE SAME WORD.** `prepare` writes `armed_body` on exactly
+            // the arming fires its gate admitted, so `None` here is the
+            // admissibility rule turning this PRESENT SET away — the same
+            // answer it gives at every other bucket, which is why the set goes
+            // on the skip list rather than being asked again once per lattice
+            // point. It is read before the match because the decode arm builds
+            // its key by hand and would otherwise report `Some` for a fire
+            // nothing admitted.
+            let admitted = self.armed_body.is_some();
+            let key = match &target {
+                BodySynth::Decode { class, .. } => {
+                    let rung = record::Ladder::rung(*class, bucket, &self.decoding, ceiling);
+                    let built = record::BodyKey {
+                        bucket,
+                        classes: record::Ladder::single(*class, rung),
+                    };
+                    debug_assert!(
+                        self.armed_body.as_ref().is_none_or(|armed| *armed == built),
+                        "the decode arming built {built} and the synthetic fire composed \
+                         {:?}",
+                        self.armed_body,
+                    );
+                    Some(built)
+                }
+                _ => self.armed_body.take(),
+            };
+            // **ASKED OF THE CACHE AND NOT OF THE RETURN VALUE.** A fire that
+            // came back `Ok` may still have declined to seat — the schedule
+            // was not graph-shaped, or the map had no droppable body — and
+            // both are tallied inside `fire_body` already. What "armed" means
+            // is that the key holds an exec now, so that is what is asked.
+            //
+            // **AND THE ANSWER IS ALSO WHERE THE PIN IS WRITTEN**
+            // (`record::Body::pinned`): this call is the one instant in the
+            // engine that can tell a body the LOAD armed from one traffic
+            // minted, because the capture itself went down `fire_body`
+            // indistinguishable from a warm key's. It seats the exemption
+            // from the bodies map's LRU at the same line it counts the key,
+            // so the two can never disagree.
+            if key.is_some_and(|key| self.cache.body_armed(&key)) {
+                armed += 1;
+                kinds[at].0 += 1;
+            } else if !admitted && !faulted {
+                unadmitted.push(present);
+            }
+        }
+
+        // **THE BOOT LINE, BECAUSE A PARTIAL ARM MUST NOT BE SILENT.** An
+        // operator who states `[engine] bodies` is buying "every fire
+        // replays"; a load that armed nine of thirteen keys has bought it for
+        // nine shapes and, since the SEAL below, has bought the other four an
+        // eager walk for the life of the load. That is the one fact this pass
+        // produces and this is the only place it exists.
+        //
+        // **PER COMPOSITION KIND, BECAUSE THAT IS THE AXIS AN OPERATOR CAN
+        // ACT ON.** A short decode count is a deployment whose seats sit under
+        // its lattice; a short prefill count is a context or a lane ceiling; a
+        // short mixed count is usually both. One total would say "something
+        // was lost" and nothing else.
+        //
+        // **AND `wanted` IS WHAT WAS ATTEMPTED, NOT WHAT WAS ENUMERATED**,
+        // which is the arithmetic the budget change forced. A key the loop
+        // never fired is not a key this load "wanted and missed": it is either
+        // a present set already known inadmissible or a key past the map's
+        // last seat, and both have their own clause below. Counting them in
+        // the denominator would report `22 of 182` on a load that armed
+        // everything its map can hold.
+        //
+        // **AND THE FOUR WAYS A KEY CAN BE LOST WITHOUT FAILING ANYTHING**,
+        // stated when they happened and absent when they did not. A `Fault`
+        // from the synthetic fire is the `refused` sentence; a bucket this
+        // deployment cannot synthesize at all — or a present set an earlier
+        // bucket already proved inadmissible — is `unfireable`, named before a
+        // fire was spent on it; a lattice wider than `record::MAX_BODIES` is
+        // the `never` warning, which names the bucket the map ran out at; and
+        // two are quiet by construction because `record::Graphs::fire_body`
+        // counts them rather than returning them — a composition the
+        // admissibility rule turned away is `refusals`, and a schedule that
+        // would not fit its workspace grant is `declines`, which under the
+        // bucket ceiling is a property of the KEY and so is permanent for it.
+        //
+        // **AND HOW MANY OF THEM ARE SEGMENTED** (the tier-2 campaign,
+        // `record::BodyStats::segmented`). A body with an island replays
+        // through an EAGER stretch every fire — the stretch's launches are
+        // re-issued on the host, one at a time, between two
+        // `cudaGraphLaunch`es — so a load whose armed bodies are mostly
+        // segmented is a load whose replay is buying less than the whole of
+        // what a graph can buy. It is not a warning: the alternative for those
+        // compositions is the eager walk end to end, which is strictly worse.
+        // It is the number that says which SKUs are worth a `crate::SHIFTED`
+        // look, which is the seat-first half of this campaign's discipline.
+        let tally = self.cache.body_stats();
+        eprintln!(
+            "engine-cuda: bodies armed {armed} of {wanted} compositions at load \
+             (decode {}/{}, prefill {}/{}, mixed {}/{}, fragmented {}/{}; \
+             {} segmented){}{}{}{}",
+            kinds[0].0,
+            kinds[0].1,
+            kinds[1].0,
+            kinds[1].1,
+            kinds[2].0,
+            kinds[2].1,
+            kinds[3].0,
+            kinds[3].1,
+            tally.segmented,
+            match &refused {
+                Some(why) => format!(" (last refusal: {why})"),
+                None => String::new(),
+            },
+            if unfireable.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [{} key(s) never fired — this deployment cannot synthesize \
+                     them, or their present set was already refused admission; \
+                     e.g. {}]",
+                    unfireable.len(),
+                    unfireable[0],
+                )
+            },
+            if never == 0 {
+                String::new()
+            } else {
+                format!(
+                    " [WARNING: {never} key(s) never attempted — the map's \
+                     record::MAX_BODIES seats were all spoken for at bucket \
+                     {never_from}, so every key from there up walks eagerly for the \
+                     life of this load]"
+                )
+            },
+            match (tally.declines, tally.refusals) {
+                (0, 0) => String::new(),
+                (declines, refusals) => format!(
+                    " [{declines} declined a workspace grant, {refusals} inadmissible]"
+                ),
+            },
+        );
+
+        // **AND NOW THE MAP IS CLOSED** (`record::Graphs::seal_bodies`). The
+        // enumeration above walked every key this deployment can realize, so
+        // what is left unarmed is not a key that is behind the traffic — it is
+        // one this pass could not fire or chose to drop, and a serving fire
+        // that minted it would be paying `record::WARM_FIRES` eager walks, a
+        // capture and an instantiation on somebody's critical path to reach a
+        // decision the boot already made. Past this line the bodies path
+        // mints nothing: a key with no body walks and is counted
+        // (`record::BodyStats::sealed_declines`).
+        //
+        // **ONLY IF SOMETHING WAS ACTUALLY ARMED.** A pass that armed zero has
+        // proved nothing about this deployment — every key refused, or the
+        // enumeration held none — and sealing on it would turn a load that used
+        // to warm its bodies from traffic into a load with no bodies at all.
+        // That is strictly worse than the behaviour this wave replaced, and it
+        // is the one direction a seal must not be wrong in.
+        if armed > 0 {
+            self.cache.seal_bodies();
+        }
+    }
+
+    /// **THE MINIMAL PRESENT SETS THAT BREAK A WINDOW** — the arming pass's
+    /// fourth enumeration, and the only one that can reach a SEGMENTED body
+    /// (the tier-2 campaign).
+    ///
+    /// # Why the other three cannot
+    ///
+    /// A fire orders its classes by the artifact's shipped order with the
+    /// absent ones dropped, and dropping a class can only CLOSE a gap
+    /// (`model_exec::fire::fallback::bound` carries the argument). So a mask
+    /// over a subset of ONE or TWO present classes is always one interval, and
+    /// the decode-only, prefill-only and mixed enumerations — which present
+    /// one class and two — can never produce a fire P4 answers a `Fallback`
+    /// for. Every window of every one of their compositions is a single span,
+    /// which is either whole-fire or windowed-and-shifting, which is
+    /// `Admit::Captured`. They arm bodies with no islands, always, and that is
+    /// not a property anybody chose.
+    ///
+    /// It takes a THIRD class standing between two of a mask's own to put
+    /// foreign rows inside that mask's span. Then the shell resolves the
+    /// region as a split (`r` windows), a gathered rectangle (`Fallback::Copy`
+    /// and `[engine] copies`) or a grouped segment list — and the last two are
+    /// islands, which is what tier 2 was built for.
+    ///
+    /// # The MINIMAL sets only, and MINIMAL means THREE CLASSES
+    ///
+    /// The set of present sets is exponential in the class count and no boot
+    /// pass can walk it. What a boot CAN walk is the minimal witnesses: for
+    /// each distinct region mask and each class that stands between two of
+    /// that mask's own, the THREE classes that witness it — the separator,
+    /// the nearest mask class in front of it and the nearest one behind it.
+    /// Three, because two of a mask's classes with a foreign one between them
+    /// is the whole of what makes a window two intervals, and the mask's other
+    /// classes are rows on one side or the other of a break that has already
+    /// happened.
+    ///
+    /// **AND THAT IS THE FIX, NOT A REFINEMENT.** This enumerated the mask's
+    /// WHOLE class set plus a separator, which is a present set of `|mask| + 1`
+    /// classes — and a fire needs a lane per present class and a seat per
+    /// lane, so on a four-seat deployment a four-class mask armed nothing at
+    /// all: every one of its keys was named in the boot line's `never fired`
+    /// list and the composition traffic actually brings — three classes, one
+    /// lane each — was never armed, fell past the seal and walked for the life
+    /// of the load. The count is unchanged (one witness per mask per
+    /// separator, deduplicated); what changed is that the sets are the sets a
+    /// caller can present.
+    ///
+    /// A load whose traffic presents a LARGER superset — the witness plus a
+    /// fourth class — keys to a body this does not arm and, past the seal,
+    /// walks (`record::BodyStats::sealed_declines` is where that shows).
+    /// Widening past minimal is a lattice question — how many class sets a
+    /// deployment's callers can realize — and not a capture one, so it is
+    /// named here rather than guessed at.
+    fn fragmenting(&self) -> Vec<Vec<usize>> {
+        let classes = self.compiled.classes.classes.len();
+        let mut seen: Vec<&model_ir::ClassSet> = Vec::new();
+        let mut found: Vec<Vec<usize>> = Vec::new();
+        for region in self.compiled.template() {
+            if region.mask.len() < 2 || seen.contains(&&region.mask) {
+                continue;
+            }
+            seen.push(&region.mask);
+            for separator in 0..classes {
+                if region.mask.contains(separator) {
+                    continue;
+                }
+                let Some(present) = Self::witness(&self.compiled, &region.mask, separator)
+                else {
+                    continue;
+                };
+                if Self::breaks(&self.compiled, &region.mask, &present)
+                    && !found.contains(&present)
+                {
+                    found.push(present);
+                }
+            }
+        }
+        found
+    }
+
+    /// **THE THREE CLASSES THAT WITNESS ONE SEPARATOR BREAKING ONE MASK**, or
+    /// `None` when this separator does not stand BETWEEN two of the mask's
+    /// classes at all — [`Shell::fragmenting`]'s minimal set.
+    ///
+    /// The neighbours are read off the order the mask's own classes and the
+    /// separator seriate to (`ClassOrder::class_order`), and they are still
+    /// the neighbours in the TRIPLE's order because dropping classes only
+    /// closes gaps: a `Seriated` order filters one fixed frontier and an
+    /// `Identity` one is ascending, so no subset ever reorders what it keeps.
+    /// That is the same property `model_exec::fire::fallback::bound` rests on
+    /// and the reason a three-class witness is enough.
+    ///
+    /// `None` for a separator that sits in front of every one of the mask's
+    /// classes or behind all of them: it closes no gap and opens none, and a
+    /// present set built around it would be a key with a whole window in it —
+    /// which the decode, prefill and mixed arms already arm.
+    fn witness(
+        compiled: &CompiledModel,
+        mask: &model_ir::ClassSet,
+        separator: usize,
+    ) -> Option<Vec<usize>> {
+        let mut whole: Vec<usize> = mask.iter().collect();
+        whole.push(separator);
+        let order = compiled
+            .order
+            .class_order(&model_ir::ClassSet::of(whole.iter().copied()), None);
+        let mut before: Option<usize> = None;
+        let mut after: Option<usize> = None;
+        let mut passed = false;
+        for class in order {
+            let class = class as usize;
+            if class == separator {
+                passed = true;
+                continue;
+            }
+            if !mask.contains(class) {
+                continue;
+            }
+            if passed {
+                after = Some(class);
+                break;
+            }
+            before = Some(class);
+        }
+        let mut present = vec![before?, separator, after?];
+        present.sort_unstable();
+        Some(present)
+    }
+
+    /// **DOES `mask` COVER MORE THAN ONE INTERVAL OF THE ORDER `present`
+    /// SERIATES TO?** — [`Shell::fragmenting`]'s one predicate.
+    ///
+    /// Asked of `ClassOrder::class_order` and not of the fallback table,
+    /// because the question is about a HYPOTHETICAL fire's row order and the
+    /// table answers about the shipped one. `model_exec::fire::compose` builds
+    /// a fire's order the same way, from the same call, so a present set this
+    /// says breaks a mask is one whose fire will find that window in pieces.
+    fn breaks(compiled: &CompiledModel, mask: &model_ir::ClassSet, present: &[usize]) -> bool {
+        let order = compiled
+            .order
+            .class_order(&model_ir::ClassSet::of(present.iter().copied()), None);
+        let mut runs = 0usize;
+        let mut inside = false;
+        for class in order {
+            if mask.contains(class as usize) {
+                runs += usize::from(!inside);
+                inside = true;
+            } else {
+                inside = false;
+            }
+        }
+        runs > 1
+    }
+
+    /// **ONE LANE PER CLASS OF A FRAGMENTING PRESENT SET, AT ROW COUNTS THAT
+    /// LAND ON `bucket`** — [`BodySynth::Fragmented`]'s geometry, or `None`
+    /// for a set this deployment cannot fire at this lattice point.
+    ///
+    /// **A DECODE CLASS TAKES EXACTLY ONE ROW**, because one row per lane is
+    /// what makes a fire a decode and a lane whose word says so with three
+    /// tokens in it is a composition no caller can bring. The rows left over
+    /// go to the non-decode classes, spread evenly by [`Shell::spread`] for
+    /// the reason it always spreads evenly: the split does not reach the key,
+    /// so the only thing it has to be is fireable.
+    ///
+    /// `None` when the deployment cannot seat one lane per class, when the
+    /// lattice point has fewer rows than the set has classes, or when the set
+    /// is ALL decode classes — the last because their total is the class count
+    /// itself, which lands on whichever bucket holds it and not on the one
+    /// being enumerated.
+    fn fragment_rows(
+        &self,
+        present: &[usize],
+        bucket: u32,
+        seats: u32,
+        context: u32,
+    ) -> Option<Vec<(usize, u32)>> {
+        let width = present.len() as u32;
+        if width < 2 || seats < width || self.budget.max_lanes < width || bucket < width {
+            return None;
+        }
+        let decodes = present
+            .iter()
+            .filter(|class| self.decoding.contains(**class))
+            .count() as u32;
+        let prefilling: Vec<usize> = present
+            .iter()
+            .copied()
+            .filter(|class| !self.decoding.contains(*class))
+            .collect();
+        if prefilling.is_empty() {
+            return None;
+        }
+        let rows = Self::spread(bucket - decodes, prefilling.len() as u32, context)?;
+        if rows.len() != prefilling.len() {
+            return None;
+        }
+        let mut taken = rows.into_iter();
+        Some(
+            present
+                .iter()
+                .map(|class| {
+                    if self.decoding.contains(*class) {
+                        (*class, 1u32)
+                    } else {
+                        (*class, taken.next().unwrap_or(1))
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// **SPREAD `rows` OVER AT MOST `lanes` LANES OF AT MOST `context` ROWS
+    /// EACH**, or `None` for a total this deployment cannot present — the
+    /// geometry half of a prefill or mixed arming key.
+    ///
+    /// `lanes` is the caller's own reading of how many the class may take — a
+    /// prefill-only key may use every seat, a mixed one has already spent a
+    /// seat on its decode lane — and it is narrowed to `rows` here, because a
+    /// lane with no row is `fire::Fault::EmptyLane`.
+    ///
+    /// **THE ONLY THING THE SPLIT HAS TO BE IS FIREABLE.** Which lane carries
+    /// which row does not reach the key — a `record::BodyKey` holds the
+    /// present set and the bucket, and the ceilings beside them are functions
+    /// of that pair — and it does not reach the CAPTURE either, because the
+    /// launches are gridded at those ceilings and not at this fire's split
+    /// (`Run::carve_rows`). So the even spread below is chosen for being the
+    /// one that fits soonest: it is the split that minimises the tallest lane,
+    /// which is the number a slot's context bounds.
+    ///
+    /// `None` says the deployment cannot hold this total at all — no lane to
+    /// put a row in, or more rows than `lanes x context` cells — and the
+    /// caller names it in the boot line rather than spending a synthetic fire
+    /// to be told the same thing by a planner.
+    fn spread(rows: u32, lanes: u32, context: u32) -> Option<Vec<u32>> {
+        let lanes = lanes.min(rows);
+        if lanes == 0 || u64::from(context) * u64::from(lanes) < u64::from(rows) {
+            return None;
+        }
+        let base = rows / lanes;
+        let over = rows % lanes;
+        Some(
+            (0..lanes)
+                .map(|at| base + u32::from(at < over))
+                .collect(),
+        )
     }
 
     /// The same fire, with the capture columns read back (design §9, palo C4).
@@ -2517,18 +3793,6 @@ impl Shell {
         media: &[Media<'_>],
         scores: &mut Vec<Vec<LayerScores>>,
     ) -> Result<Vec<Vec<f32>>> {
-        // ── THE FOLD'S ARMING INSTANT (`PIE_CUDA_FOLD`). Before ANY of this
-        //    fire's staging: the synthetic pass stages into the same reserved
-        //    input buffers, and running it first is what lets the real fire
-        //    overwrite them cleanly afterwards. The guard on `arming` is the
-        //    recursion base — the synthetic pass is itself a `fire_captured`.
-        //
-        //    **IT STANDS OUTSIDE THE THREE PHASES, WHICH IS WHERE ALTO PUTS
-        //    IT** (design §4: "arming → control plane"). Arming captures and
-        //    instantiates; a `prepare` that could do that would be a prepare
-        //    that reaches a stream, which is the one thing the phase exists to
-        //    forbid.
-        self.arm_if_due(lanes);
         // ── THE THREE PHASES, BACK TO BACK (alto design §3). This is the
         //    degenerate one-step frame: F1 changes the SHAPE and not the
         //    schedule, so the launches below happen in the order and at the
@@ -2697,6 +3961,59 @@ pub struct Prepared<'a> {
     slot: Option<crate::inputs::SlotGuard>,
     /// What went into that slot, as lengths — read by `commit` on the stream.
     lengths: crate::inputs::Staged,
+    /// **IS THIS FIRE A BODY'S?** (the bodies design's chunk B) — decided in
+    /// `prepare`, because it is the same question as "does this fire stage the
+    /// live-rows seat", and staging is the host half's.
+    ///
+    /// Carried rather than re-asked so that the two readings cannot disagree:
+    /// the words are in the slot iff this is `true`, and the router below
+    /// takes the body arm iff this is `true`. A [`Shell::set_bodies`] between
+    /// the phases moves the NEXT step and not this one, which is the same
+    /// thing every other per-fire word here does.
+    bodied: bool,
+    /// **WHICH REGIONS THAT BODY HOLDS, AND WHICH ONES IT RE-ISSUES** —
+    /// `Windows::admits` as step 4c-a computed it, one entry per TEMPLATE
+    /// region (the tier-2 campaign).
+    ///
+    /// Carried for [`Prepared::bodied`]'s reason and one step further: the
+    /// table decided the gate, so the table has to be the one both readers
+    /// take. `Run::bodied` gets it, because `Run::captured` is what stands
+    /// every ceiling, seat and plane base down inside an island; and
+    /// `record::Fire::admits` gets it, because it is what the capture loop is
+    /// cut with (`record::cuts`) and what the per-launch ledger is kept over.
+    /// A second reading on either side would be a body cut in one place and
+    /// replayed in another.
+    ///
+    /// Built for every fire and read only by a bodied one, which is
+    /// [`Prepared::ladder`]'s arrangement exactly.
+    ///
+    /// **A HANDLE AND NOT A VECTOR** (`Shell::segments`): the table is a
+    /// function of the `record::BodyKey`, so it is derived once per key and
+    /// shared, and a fire clones a refcount rather than a heap allocation.
+    /// Nothing writes through it — both readers take `&[Admit]`.
+    admits: std::sync::Arc<[crate::window::Admit]>,
+    /// **THE BODY KEY'S CLASS LADDER** (the ceiling design's Option B) — one
+    /// lattice rung per present class, in the order the rows stand.
+    ///
+    /// Carried for [`Prepared::bodied`]'s reason exactly: the key was built
+    /// here, in `prepare`, and the ceilings `Run::planning` carves at have to
+    /// be the ceilings that key spells. Read twice — by step 4d, which pads
+    /// the fire-wide lane vectors out to the ladder's reach, and by the `Run`
+    /// the router builds below (`Run::bodied`'s `carve`). A fire the bodies
+    /// gate refused carries its ladder too and nothing reads it, because
+    /// `bodied` is what both readers are gated on.
+    ladder: record::Ladder,
+    /// **THE LANE CEILING THAT LADDER'S DECODE RUNGS WERE TAKEN FROM**
+    /// ([`Shell::lane_ceiling`]) — carried for the ladder's reason, one step
+    /// further on.
+    ///
+    /// `enqueue_on` builds the `record::Fire` that [`record::Graphs::fire_body`]
+    /// re-keys off, and re-keying means calling `record::BodyKey::of` with the
+    /// arguments this phase called it with. The bucket rides the composition
+    /// and the decode set is the shell's own field; this is the third
+    /// argument, and reading it again there rather than carrying it would be
+    /// a second reading of a number the key is looked up by.
+    lane_ceiling: u32,
 }
 
 impl Drop for Prepared<'_> {
@@ -2838,9 +4155,8 @@ impl FrameShell for Shell {
     {
         // F1 submits one step per frame, so there is never a predecessor. The
         // parameter is here because the wave-order effects that will read it
-        // are real and named — channel sequence tickets apply in wave order,
-        // and the fold's ping-pong rebinds W's idle exec while W-1 runs — and
-        // a signature that had to grow a parameter later would make every
+        // are real and named — channel sequence tickets apply in wave order —
+        // and a signature that had to grow a parameter later would make every
         // shell's `prepare` a breaking change at exactly the wave that can
         // least afford one.
         let _ = prev;
@@ -3277,14 +4593,6 @@ impl FrameShell for Shell {
             })
             .collect();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
-        // The fold's traffic memory: which classes real fires have exercised
-        // is what the arming ladder's second rung captures, and a synthetic
-        // pass must not count as traffic.
-        if !arming {
-            for class in composition.present() {
-                self.seen_classes.insert(*class as usize);
-            }
-        }
         let descriptor = FireDescriptor::of(&composition);
 
         // ── **THE SECOND SERIATION, CASHED INTO THREE VECTORS.** The
@@ -3859,7 +5167,7 @@ impl FrameShell for Shell {
         //    image-placeholder rows take their patch's grid coordinate)
         //    overwrites its own interval, and a lane's rows are one interval
         //    of the fire's — the same fact the route rebase leans on.
-        let mrope_positions = if !self.mrope_seat {
+        let mut mrope_positions = if !self.mrope_seat {
             Vec::new()
         } else {
             let mut triples = Vec::with_capacity(positions.len() * AXES);
@@ -3987,7 +5295,9 @@ impl FrameShell for Shell {
                 }
             }
         }
-        let geometries = geometries;
+        // Still `mut`, and the last write to it is step 4d's lane padding.
+        // `pages` is read HERE, before it, which is the honest place: it is
+        // the page-id count, and the lanes that padding adds own no page.
         let pages = geometries
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
@@ -4012,7 +5322,16 @@ impl FrameShell for Shell {
             .iter()
             .position(|&rows| rows == composition.bucket())
             .unwrap_or(0) as u32;
-        let windows = Windows::of(
+        // **THE COPY POLICY, AS ONE WORD, BECAUSE TWO READERS WANT IT.** The
+        // window table is built with it, and the segmentation memo STORES it
+        // (`Shell::segments`): it is the one input to `Windows::admits` that
+        // the `record::BodyKey` does not carry, so a memo that assumed it
+        // would be a memo that can serve the wrong table. A masked fire takes
+        // the split — `Copies::enabled`'s own doc says which vector a gather
+        // would still have to compact and why it is the page-id list's
+        // problem again — and that half is a fact about the FIRE.
+        let copies_here = copies && masks.iter().all(|lane| lane.mask.is_none());
+        let mut windows = Windows::of(
             &self.trace,
             &self.compiled,
             composition.classes(),
@@ -4020,12 +5339,15 @@ impl FrameShell for Shell {
             &indptr_host,
             crate::window::Copies {
                 bucket,
-                // A masked fire takes the split: `Copies::enabled`'s own doc
-                // says which vector a gather would still have to compact and
-                // why it is the page-id list's problem again.
-                enabled: copies && masks.iter().all(|lane| lane.mask.is_none()),
+                enabled: copies_here,
                 spaces: &geometries,
             },
+            // **THE BLOB'S CARVE, HANDED TO THE TABLE THAT LAYS ITSELF OUT IN
+            //  IT.** `Inputs::reserve` divided the window bytes into
+            //  fixed-width slots and `Windows::packed` places each window at
+            //  its slot's offset, so a recorded body's baked `indptr` pointer
+            //  is right for every fire of its key (`crate::window`'s header).
+            self.inputs.window_slots(),
         )?;
         // The synthetic pass is not the last fire anybody means.
         if !arming {
@@ -4044,6 +5366,349 @@ impl FrameShell for Shell {
         //    (`crate::mask` argues every term of it). `None` is a fire no
         //    lane masked, and then no seat is bound at all.
         let staged = crate::mask::stage(&masks)?;
+
+        // **THE BODY KEY'S SECOND HALF, BUILT BEFORE THE GATE THAT USES IT**
+        // (the ceiling design's Option B): one CEILING per present class, in
+        // the order the rows stand. Three readers — the key below, step 4d's
+        // padding reach, and the `Run` `enqueue_on` builds — and one
+        // computation, so there is no second reading to fall out of step with
+        // the one the cache is keyed on.
+        //
+        // **AND WHAT GOES IN IS THE KEY'S OWN COORDINATES AND TWO LOAD
+        // CONSTANTS**, not this fire's rows: the bucket, which class is a
+        // decode class, and the lane ceiling. The class table is asked one
+        // question only — which classes have rows — so two fires of one
+        // bucket that split their rows differently build the SAME ladder and
+        // reach the same body. That is the key collapse, and this line is
+        // where it happens on the host side.
+        let lane_ceiling = self.lane_ceiling();
+        let ladder = record::Ladder::of(
+            composition.classes(),
+            composition.bucket(),
+            &self.decoding,
+            lane_ceiling,
+        );
+
+        // ── 4c. **IS THIS FIRE A BODY'S?** (the bodies design's chunk B) —
+        //    asked HERE, at the last host instant before the slot is written,
+        //    because the answer decides whether the live-rows seat's words go
+        //    into it. The router in `enqueue_on` reads what this writes; it
+        //    cannot ask again, because by then the staging is behind it.
+        //
+        //    The outer clauses are the router's own, restated: a fire that
+        //    records nothing, one that moves buffered bytes and one whose
+        //    weights rotate are all eager for reasons `enqueue_on` argues in
+        //    full, and an eager fire has no body.
+        //
+        //    **AND THERE IS NO ARMING CLAUSE HERE ANY MORE, WHICH IS WHAT
+        //    THE FOLD'S DELETION SIMPLIFIED.** A clause used to stand in this
+        //    conjunction reading "not a synthetic, unless it is the BODIES
+        //    path's synthetic" — because two kinds of arming pass arrived and
+        //    the fold's template had no business seating anything. There is
+        //    one kind now (`Shell::arm_bodies`), and seating a body is the
+        //    entire thing it was fired to do, so it takes the gate exactly as
+        //    a caller's fire does. It has to: this gate is what STAGES the
+        //    live-rows seat, and a body captured without the seat staged is a
+        //    body captured against a geometry no replay can move. Its numbers
+        //    are still nobody's — the readback, the epilogue and the `held`
+        //    advance are suppressed elsewhere on `Shell::arming`.
+        //
+        //    **AND THREE CLAUSES THAT ARE THIS PATH'S OWN.**
+        //
+        //    * **A MULTI-UNIT ARTIFACT IS NEVER SERVED FROM A BODY**, which is
+        //      `CompiledModel::fold_refused`'s sentence and it transfers whole:
+        //      a `BodyKey` carries ONE bucket, and a fire that launches two
+        //      execs has one bucket PER UNIT — the token axis's and the patch
+        //      axis's — so there is no single lattice point for the key to
+        //      name. A per-unit body is its own later wave; a key carrying
+        //      both numbers is the product multimodal §1 refuses.
+        //    * **AND SOMETHING MUST BE LEFT FOR A GRAPH TO HOLD**
+        //      (`record::cuts`, the tier-2 campaign) — which is what is LEFT
+        //      of the clause that used to stand here. That clause read "every
+        //      present region must be one a body can be replayed over", asked
+        //      of the whole window table by `Windows::covers_fire_shifted`,
+        //      and it refused a whole composition over one gathered or grouped
+        //      or unshifted region. The rule itself has not moved an inch —
+        //      `Windows::admits` asks the same clauses — but it is asked PER
+        //      REGION now, and the refused ones become ISLANDS: the body holds
+        //      every stretch around them and the fire path re-issues them
+        //      eagerly between the execs. So the shape of a window no longer
+        //      decides whether this key has a body; it decides how much of the
+        //      composition the body holds.
+        //
+        //      Nor does the CUT any more. A segment boundary may not fall
+        //      inside a fork group or between two arms of a conditional, and a
+        //      plan builder may not land on the far side of one from the
+        //      launches that read its schedule — and each of those three is a
+        //      rule for GROWING the island to the nearest legal boundary
+        //      (`record::widen`), not a reason to refuse. An island region is
+        //      served by the eager walk, which is always correct; a refusal
+        //      threw away every capturable region of a twenty-eight-layer text
+        //      over one withdrawn window.
+        //
+        //      What can still refuse is the composition the growing consumed
+        //      ENTIRELY: every region an island, no exec to capture, a body
+        //      that would be a script of eager stretches. `record::cuts`
+        //      answers `record::Uncut::Eager` for it, once per key, and the
+        //      fire WALKS.
+        //
+        //      Chunk 2b-ii's flip is unchanged and is now carried per region:
+        //      the same `Run` this gate builds is handed the same table with
+        //      `.bodied(..)`, so the region the host says a graph holds is the
+        //      region the walk carves, seats and shifts — and the region it
+        //      says is an island is the region the walk leaves exactly as the
+        //      eager path leaves it (`Run::captured`).
+        //    * **AND THE PAD MUST BE ARMED**, which is this wave's clause and
+        //      the one that is about the KEY rather than about the fire.
+        //      Everything a body promises is stated at a lattice point: the
+        //      grids (`Run::carve_rows`, `Run::carve_lanes`), the schedules
+        //      (`Run::planning`), the arena column, the staged row vectors.
+        //      With `Shell::pad` off there is no lattice point — the armed
+        //      `Pad::bucket` is this fire's own row count — so every one of
+        //      those ceilings would be a live span wearing a key's name, and
+        //      two SPLITS of one bucket would carve differently while sharing
+        //      one `record::BodyKey`. The old code met that by asking the
+        //      ceilings themselves for slack (`pad.bucket > pad.rows`), which
+        //      quietly disarmed them for the fire that lands EXACTLY on its
+        //      bucket — a real fire, and the one `Shell::arm_bodies`
+        //      synthesizes by construction. So the clause moves here, once,
+        //      where it is a statement about the deployment: `[engine] pad =
+        //      off` is a diagnostic arm, a shell serving it has no business
+        //      recording bodies, and past this line `bodied` IMPLIES an armed
+        //      pad and every ceiling below is unconditional.
+        // ── 4c-a. **WHICH REGIONS A BODY OF THIS COMPOSITION WOULD HOLD**
+        //    (the tier-2 campaign) — `Windows::admits`, one entry per template
+        //    region, computed HERE because this is the instant that has the
+        //    window table and because three later readers must all take the
+        //    same answer: the gate below, the `Run` the router builds
+        //    (`Run::captured`, which is what stands every ceiling down inside
+        //    an island), and `record::Fire::admits`, which is what the capture
+        //    loop is cut with and what the ledger is kept over.
+        //
+        //    Computed unconditionally, before the gate, because it is what the
+        //    gate ASKS: the shape of a composition's windows no longer refuses
+        //    the key, it decides how much of the key's composition a graph
+        //    holds. The vector is one byte per region and a fire that turns
+        //    out not to be a body's simply never reads it.
+        //
+        //    **AND IT IS DERIVED ONCE PER KEY AND NOT ONCE PER FIRE**
+        //    ([`Shell::segments`]). Both this table and `record::cuts`' verdict
+        //    on it are functions of the `record::BodyKey` — that is the whole
+        //    argument `Windows::admits` carries, clause by clause — so a
+        //    steady decode stream was allocating two vectors per fire to
+        //    re-derive a constant. The memo holds the table behind an `Arc`,
+        //    which is what `Prepared` carries, and the fire path allocates
+        //    neither.
+        //
+        // `composition.bucket()` and not the lattice POSITION named `bucket`
+        // above: the key's number is the one `record::Fire` carries, which is
+        // the row count the launches were recorded at. The LADDER beside it is
+        // that same number asked per class (the ceiling design's Option B),
+        // built once above because step 4d and the `Run` both read it — and
+        // there is no third field, because the copy policy cannot separate two
+        // bodies that both exist (`record::BodyKey`'s header).
+        //
+        // Composed unconditionally now, where the gate used to compose it
+        // inside its own last conjunct: the memo is keyed on it, and the
+        // arming channel below wants it too, so one clone here replaces the
+        // one or two that stood below.
+        let key = record::BodyKey {
+            bucket: composition.bucket(),
+            classes: ladder.clone(),
+        };
+        let admits = self.segmentation(&key, &windows, composition.rows(), copies_here);
+        let bodied = self.bodies
+            && self.pad
+            && self.graphs.records()
+            && !self.weights.rotating()
+            && !rs_moves.iter().any(|verb| !matches!(verb, RsMove::None))
+            && !self.compiled.fold_refused
+            // **AND THE TEMPLATE MUST BE CUTTABLE AROUND ITS ISLANDS**
+            // (`Shell::cuttable`, which takes the named decline and prints it
+            // once). Asked LAST, past every outer clause, because it is the
+            // only one that says anything to an operator — and asked through
+            // a memo, because the answer is a function of the key.
+            && !self.cache.body_refused(&key)
+            && self.cuttable(&key, admits.as_ref());
+
+        // **AND THE ARMING PASS TAKES THE KEY IT JUST COMPOSED AWAY WITH IT**
+        // (`Shell::armed_body`, the tier-1 key-collapse wave). This is the one
+        // instant in the engine that has both the fire's window table and the
+        // key's ladder in hand, and `Shell::arm_bodies` — which knows only
+        // which classes it asked for — has to be able to NAME the key its
+        // synthetic landed on in order to pin it. Written only under the
+        // arming word, so a real fire pays one `bool` test and no clone; and
+        // written as `None` for a synthetic the gate refused, so the loop
+        // cannot pin a key nothing seated.
+        if arming {
+            self.armed_body = bodied.then(|| key.clone());
+        }
+
+        // ── 4c-b. **AND THE ROW VECTORS, STAGED OUT TO THE BUCKET'S ROW
+        //    CEILING** (the grid-at-ceiling wave) — step 4d's argument on the
+        //    other axis, and it arrives for the same reason one chunk later.
+        //
+        //    A bodied fire's whole-fire regions are gridded at the BUCKET
+        //    (`Run::carve_rows`), so a launch there runs blocks for rows this
+        //    fire does not have. Those blocks are retired — every seated entry
+        //    opens on `r >= win[0]` — but three of the fire's row vectors are
+        //    read by entries that DECLARE their rectangle rather than only
+        //    addressing it, and a declaration that stops at the live rows is a
+        //    refusal rather than a stale read: `layout.embed` asserts
+        //    `ids.rows == y.rows`, `elemwise.rope` asserts the same of its
+        //    position stream, and `elemwise.rope_mrope` REFUSES by name on it.
+        //    `y` is an arena rectangle and the arena is carved at the bucket
+        //    for this fire (`Shell::enqueue_on`), so the ids and the positions
+        //    have to reach as far.
+        //
+        //    **AND THE PADDING IS GENUINELY EMPTY, WHICH IS STEP 4d'S OWN
+        //    DISCIPLINE.** Token id zero, position zero, and — for a plan that
+        //    rotates by a triple — three zeros: a padded row gathers the
+        //    vocabulary's first embedding and rotates it by nothing, into a
+        //    plane row `row_valid` marks invalid and every guard retires. The
+        //    alternative is leaving the last fire's ids there, which is the
+        //    thing this shell refuses to do anywhere else on the padded axis.
+        //
+        //    `row_valid` is NOT padded with ones — it is the one vector whose
+        //    tail has to say the opposite of its head, and `inputs::Fire::live_rows`
+        //    is how the staging is told where the fire's own rows stop.
+        //
+        //    **AND THE WRITE DESCRIPTORS COME WITH THEM, WHICH IS A STAGING
+        //    FACT BEFORE IT IS A GUARD.** `Inputs::commit` copies the
+        //    per-space `write_page` and `write_offset` at the ROW count it was
+        //    handed, so a padded fire whose descriptors stopped at its own
+        //    rows would have the copy read pinned bytes nobody wrote this
+        //    frame. `-1` is what goes in the tail: `attn/kv.cuh`'s explicit
+        //    writer tests `offset_in_page < 0` before it dereferences the page
+        //    id, so a padded row retires there as well as at `win[0]` and at
+        //    `row_valid` — three belts, and this one is the one that makes the
+        //    H2D honest.
+        //
+        //    **AND THE ADAPTER ROUTE VECTOR IS THE FOURTH, AND IT IS A
+        //    DECLARATION AND NOT A GUARD.** `linear.lora_correct` opens on
+        //    `routes.rows == x.rows` — `x` is the arena rectangle, which this
+        //    fire carved at the bucket — so a routes vector that stopped at
+        //    the live rows is a REFUSED launch (a `debug_assert` in the
+        //    correction's own door) and not a stale read. `-1` is what goes in
+        //    the tail, and it is the same sentinel the branch above writes for
+        //    an unrouted lane: the projection half computes a zero waist row
+        //    for it and the combine returns before it reads the bank, so a
+        //    padded row is the base model's nothing whatever else retires it.
+        //    Written only where the axis is on at all — an empty vector is the
+        //    off switch this axis is built around, and padding it would turn
+        //    that switch on for a fire no lane routed.
+        //
+        //    Nothing off the bodies path moves a byte: `carve_rows` is this
+        //    fire's own row count there, and every resize is a no-op. And the
+        //    pad is not asked for again — `bodied` implies it since the gate
+        //    above took that clause.
+        let carve_rows = if bodied {
+            composition.bucket().max(composition.rows())
+        } else {
+            composition.rows()
+        };
+        if carve_rows > rows {
+            tokens.resize(carve_rows as usize, 0);
+            positions.resize(carve_rows as usize, 0);
+            if !mrope_positions.is_empty() {
+                mrope_positions.resize(carve_rows as usize * AXES, 0);
+            }
+            if any_adapter {
+                adapter_routes.resize(carve_rows as usize, -1);
+            }
+            for geometry in &mut geometries {
+                geometry.write_page.resize(carve_rows as usize, -1);
+                geometry.write_offset.resize(carve_rows as usize, -1);
+            }
+        }
+
+        // ── 4d. **THE LANE TABLES, STAGED OUT TO THE BUCKET'S LANE CEILING**
+        //    (the plan-at-bucket-ceiling design, chunk 2), and only on the
+        //    bodies path.
+        //
+        //    A body is captured at one composition and replayed at another,
+        //    and the chunk after this one raises what the SCHEDULES are
+        //    carved at from this fire's lanes to the ceiling the bucket
+        //    spells. The moment a plan is carved at a lane count larger than
+        //    the fire brought, every reader that walks a padded lane reads
+        //    whatever the LAST fire left in that slot of the carve — a page
+        //    run that still points at somebody's pages, a length that still
+        //    says tokens. The guards would mostly hold (a decode's
+        //    `block_valid_mask` retires the over-launched work item,
+        //    `protective_get_kv_offset` clamps a page past the bound, the
+        //    live-rows seat says how many rows are the fire's own), and
+        //    "mostly" is the wrong footing for a cache. So the padded lanes
+        //    are made GENUINELY EMPTY here — no pages, no tokens, no rows —
+        //    and every one of those guards goes back to being belt-and-braces
+        //    over a reading that is already right.
+        //
+        //    **THE CEILING IS THE LADDER'S LANE REACH**, which is the sum of
+        //    every present class's rung with each one CAPPED AT THE LOAD'S
+        //    LANE CEILING — one past the last lane any window of this key may
+        //    be carved to (the ceiling design's Option B, tightened by the
+        //    tier-1 key-collapse wave). A rung is a row count read as a lane
+        //    count for the reason the fire's bucket was — a lane is at least
+        //    one row (`fire::Fault::EmptyLane`), so a class of `rung` rows can
+        //    carry no more than `rung` lanes — and a lane also needs a SEAT,
+        //    which is the second bound and the tighter one wherever a prefill
+        //    rung (the whole bucket) runs past the seats. `record::Ladder::lane_reach`
+        //    carries the argument and the deployment inequality it buys.
+        //
+        //    **AND IT IS THE SUM AND NOT THE FIRE'S BUCKET, BECAUSE THE
+        //    CARVES ARE LAID END TO END.** Chunk 2 padded to
+        //    `Composition::bucket` because there was one carve and it began at
+        //    lane zero. Option B gives every class its own carve, at an origin
+        //    that is the prefix sum of the rungs in front of it, so what the
+        //    staging has to define is the LAST carve's end — and the sum is
+        //    that number. It dominates the fire's own lanes (each class's
+        //    capped rung holds its own lanes, and the sum is taken where the
+        //    lanes stand); for a single-class fire it is that class's cap.
+        //
+        //    Clamped to `max_lanes` because THAT is what the staging was
+        //    carved at (`Inputs::reserve`: `lanes + 1` bounds, `lanes`
+        //    per-lane entries) — a reach above the lane ceiling is a row count
+        //    no lane count can reach, and padding past the carve would smear
+        //    into the region behind it. The clamp is why `Run::planning` reads
+        //    the ceiling back OFF these vectors instead of recomputing it: a
+        //    carve is only honest as far as the staging defined. `pad_to`
+        //    never shrinks, so the clamp is safe to spell as a `min` and a
+        //    reach at or below this fire's lanes moves nothing at all.
+        //
+        //    **AND NOTHING OFF THE BODIES PATH MOVES A BYTE.** Everything
+        //    that reads these vectors ahead of this line has already read
+        //    them — `pages` is the page-id count and empty lanes own no page,
+        //    `Windows::of` took the geometries for its gather above and a
+        //    gathered window is not a body — so the only readers of what this
+        //    grows are the staging below and the host planning twins in
+        //    `enqueue_on`, whose window slices are cut at live lanes either
+        //    way.
+        let mut qo_absolute: Vec<i32> = Vec::new();
+        if bodied {
+            let ceiling = ladder.lane_reach(lane_ceiling).min(self.budget.max_lanes) as usize;
+            for geometry in &mut geometries {
+                geometry.pad_to(ceiling);
+            }
+            // The fire-wide row vector gets the same treatment for the same
+            // reason (chunk 2c-a's vector, this chunk's tail): entries past
+            // the live lanes repeat the last bound, so `qo_absolute[lane]` is
+            // DEFINED and spells a zero-row lane at every lane a ceiling plan
+            // can name. Copied rather than padded in place because the
+            // table's own vector is what every window's rebased slice was cut
+            // from and what `Run::qo_indptr_absolute_host` slices per window;
+            // the copy is what the H2D takes.
+            qo_absolute = windows.qo_absolute_host().to_vec();
+            kv::pad_indptr(&mut qo_absolute, ceiling);
+            // **AND THE TABLE IS TOLD HOW FAR THE COPY REACHES** (the
+            // plan-at-bucket-ceiling design, chunk 3). The bytes are the
+            // staging's, but the SHAPE of the device reading is the window
+            // table's to state (`Windows::qo_absolute`), and a decode
+            // schedule carved at this ceiling hands its launch a `q_indptr`
+            // that has to say it reaches lane `ceiling` — which is also the
+            // number `Run::planning` reads back to learn what the staged
+            // vectors cover.
+            windows.stage_qo_absolute(ceiling as u32);
+        }
+        let geometries = geometries;
 
         // ── 5. THE STAGING SLOT, CLAIMED, AND THE FIRE'S VECTORS WRITTEN INTO
         //    IT — host only, no stream in reach (alto design §4:
@@ -4068,10 +5733,64 @@ impl FrameShell for Shell {
                 tokens: &tokens,
                 positions: &positions,
                 windows: &boundaries,
+                // **THE SAME BOUNDARIES, THE SECOND READING, AND ON THE SAME
+                // SWITCH** (bodies design, chunk 2c-a). One fire-wide
+                // `[lanes + 1]` vector with nothing subtracted — the one the
+                // table above rebased every window's copy out of, which is why
+                // it is asked for rather than rebuilt — for the consumer whose
+                // pointer is the PLANE's base rather than the window's
+                // (`Run::plane_base`, `Run::qo_indptr_absolute`). Only a
+                // bodied fire can have such a consumer, so only a bodied fire
+                // pays the H2D; empty is the off switch, exactly as below.
+                //
+                // Since chunk 2 it is the table's vector PADDED OUT TO THE
+                // BUCKET's lane ceiling (step 4d), which is why it is a local
+                // `Vec` rather than the table's own slice: the entries past
+                // the live lanes are zero-row lanes, so a ceiling plan finds
+                // a defined bound wherever it looks. Empty stays empty, and
+                // an unbodied fire hands `&[]` exactly as before.
+                qo_absolute: &qo_absolute,
+                // **THE LIVE-ROWS SEAT, WRITTEN ONLY FOR A BODY** (bodies
+                // design, chunks A and B). `windows.live()` holds the identity
+                // words — four per launch, its own full row count and row
+                // offset and its own lane count and lane offset — and staging
+                // them changes no arithmetic on ANY path: a
+                // guard that reads the seat admits exactly the rows its launch
+                // was already going to run. What it does change is the H2D
+                // this fire pays, so the words go over only when something
+                // means to read them, which is the bodies path and nothing
+                // else. Empty is the off switch, end to end: no host bytes, no
+                // copy, no seat bound, and `Ctx::stage` stays the null pointer
+                // — which is what makes the EAGER path byte for byte the path
+                // it was.
+                //
+                // The words themselves are the identity either way. A body
+                // does not need them to be anything else: it is captured at
+                // one composition and replayed at another ROW COUNT — and,
+                // since the chunked-arm wave, at another LANE OFFSET — of the
+                // same one, and the identity written by THIS fire is exactly
+                // this fire's geometry.
+                live: if bodied { windows.live() } else { &[] },
                 slot_ids: &slot_ids,
                 spaces: &geometries,
                 mask: staged.as_ref(),
                 adapter_routes: any_adapter.then_some(adapter_routes.as_slice()),
+                // **HOW FAR THE PADDING MASK HAS TO REACH** (the
+                // grid-at-ceiling wave). A bodied fire's whole-fire regions
+                // are gridded at the BUCKET — `Run::carve_rows`, the same
+                // number `Ctx::opaque_rows` has padded their GEMMs to since D4
+                // — so the rows between this fire's own and the bucket are
+                // launched and then retired, and the SEAT-LESS pool writers
+                // retire them off this mask alone. Zero everywhere else, which
+                // is the fire's own rows and the tail nobody launches.
+                // **AND WHERE THIS FIRE'S OWN ROWS STOP.** `tokens` above
+                // reaches the bucket for a bodied fire (step 4c-b) so that the
+                // entries which DECLARE a rectangle can declare the one their
+                // launch is gridded over; this is what keeps the padding mask
+                // from claiming those rows are real. Equal to the vector's own
+                // length on every other path, which writes the all-valid mask
+                // this staging has always written.
+                live_rows: rows,
             },
         )?;
 
@@ -4091,6 +5810,10 @@ impl FrameShell for Shell {
         Ok(Prepared {
             slot: Some(slot),
             lengths: staged_lens,
+            bodied,
+            admits,
+            ladder,
+            lane_ceiling,
             lanes,
             attachments,
             composition,
@@ -4195,7 +5918,7 @@ impl FrameShell for Shell {
         //
         //    The ARMING pass is held out: it computes nobody's numbers, and
         //    letting a synthetic fire move experts would make the working set
-        //    a function of when the fold armed.
+        //    a function of what the load armed.
         if !self.arming {
             let (compute, notify) = (self.device.stream(), self.device.notify_stream());
             if let Some(tier) = self.weights.experts_mut() {
@@ -4254,10 +5977,10 @@ impl Shell {
     ) -> Result<(u32, Option<Readback>)> {
         // **THE STEP THIS FIRE WILL SETTLE AT**, stamped onto the graph cache
         // before anything launches. Every exec launched below carries it, and
-        // it is what eviction and the fold's rebind compare against the
-        // settled count — the arithmetic that replaced "every fire ends
-        // synchronized". Read rather than consumed: `settle` is what takes the
-        // number, one host statement later with nothing in between.
+        // it is what eviction compares against the settled count — the
+        // arithmetic that replaced "every fire ends synchronized". Read rather
+        // than consumed: `settle` is what takes the number, one host statement
+        // later with nothing in between.
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
         let Shell {
@@ -4270,11 +5993,8 @@ impl Shell {
             inputs,
             facts,
             graphs,
-            copies,
             pad,
-            fold,
             arming,
-            probing,
             cache,
             // NAMED, NOT ABSORBED BY THE `..`: the guest-program plane is
             // touched at the fire's BOUNDARIES and nowhere between them, and
@@ -4305,14 +6025,23 @@ impl Shell {
             // the walk, and the epilogue binding that points a guest at it —
             // and both of them are in this function.
             scores,
+            // NAMED FOR THE SIXTH TIME AND FOR THE SAME REASON: the per-region
+            // "this region moves its own base" slice is read at exactly two
+            // instants — the bodies gate in `prepare`, and the `Run` built
+            // below — and this is the second of them (the bodies design's
+            // chunk 2b-ii).
+            shifted,
+            // NAMED FOR THE SEVENTH TIME AND FOR THE SAME REASON: which
+            // classes a decode lane lands in is read at exactly two instants
+            // — the ladder `prepare` builds, and the `record::Fire` below,
+            // which hands it on so `fire_body` re-keys with the arguments
+            // `prepare` keyed with (`record::Ladder::rung`).
+            decoding,
             ..
         } = self;
         let graphs = *graphs;
-        let copies = *copies;
         let pad = *pad;
-        let fold = *fold;
         let arming = *arming;
-        let probing = *probing;
 
         // ── The prologue. Channel reads, state, token prep — never the
         //    readout, which does not exist yet.
@@ -4440,6 +6169,16 @@ impl Shell {
         //    enqueued behind W's kernels on the one compute stream.
         let handles = inputs.commit(device.stream(), slot, &p.lengths)?;
         p.windows.bind(handles.windows);
+        // And the live-rows seat beside them — `None` for a fire that staged
+        // no words, which is every fire today, and then `Windows::live_at`
+        // answers the disarmed `0` the whole plane is built to be identical
+        // under.
+        p.windows.bind_live(handles.live_rows);
+        // And the absolute reading of the qo boundaries beside it — `None` for
+        // a fire that staged none, and then `Windows::qo_absolute` answers
+        // `None` and every ragged view takes the rebased vector it always
+        // took.
+        p.windows.bind_qo_absolute(handles.qo_absolute);
 
         // ── **THE PATCH BYTES, WRITTEN INSIDE THE ENQUEUE** (multimodal
         //    §5.4). Three copies onto the same compute stream, in front of
@@ -4480,10 +6219,40 @@ impl Shell {
         // — which does not fault, it computes, and the failure arrives inside
         // a GEMM whose destination has no rows. The composition holds both
         // pairs because it seriated both axes.
+        // **AND THE TOKEN COLUMN IS CARVED AT THE BUCKET FOR A BODIED FIRE**
+        // (the grid-at-ceiling wave). `Run::cut` hands a launch in a region
+        // that owns a retirement the KEY's row ceiling rather than this
+        // window's live span, and its last line clamps that extent to the
+        // rectangle the value RESOLVES to — so a column cut at the live rows
+        // would clamp the ceiling straight back down to them and the grids
+        // would follow the fire after all.
+        //
+        // **A COLUMN HEIGHT AND NOT A ROW COUNT, WHICH IS WHY THIS IS A
+        // SECOND NUMBER RATHER THAN A WIDER `rows`.** The arena's offsets are
+        // static — `model_exec::store::arena::rect` moves only the rectangle's
+        // HEIGHT with this argument, and the allocation behind it is
+        // `max_tokens` tall on every load (P0 promises every bucket sits under
+        // that) — so raising it names bytes the carve already holds and no
+        // value's neighbour moves. `rows` beside it stays the fire's own and
+        // goes on being the fire's own everywhere it is read: the pool seats
+        // below take it, and what they mean by it is how many rows the page
+        // geometry describes, which padding does not change.
+        //
+        // The PATCH axis takes no such ceiling: a body carries one bucket and
+        // a multi-unit artifact is refused from the path outright
+        // (`CompiledModel::fold_refused`), so there is no lattice point for
+        // the second row axis to be carved at.
+        // `p.bodied` alone, because it implies the pad: `prepare`'s gate takes
+        // that clause once, where it is a sentence about the deployment.
+        let carve_rows = if p.bodied {
+            u64::from(p.composition.bucket()).max(u64::from(rows))
+        } else {
+            u64::from(rows)
+        };
         let slots = arena.slots(
             &compiled.arena,
             model_compiler::FireRows {
-                tokens: u64::from(rows),
+                tokens: carve_rows,
                 lanes: u64::from(lane_count),
                 patches: u64::from(p.composition.patch_rows()),
                 images: u64::from(p.composition.images()),
@@ -4575,7 +6344,15 @@ impl Shell {
                     Some(ScheduleSeat {
                         shape: Shape {
                             num_requests: lane_count,
-                            num_q_heads: seat.reading.q_heads,
+                            // The FIRE's lanes go in and `Run::planning`
+                            // narrows both: the request count to the asking
+                            // node's window, and this origin to the window's
+                            // own `lane_offset` — but only where the pointers
+                            // beside it are the plane's, which is where a
+                            // launch is handed lane tables it did not have
+                            // sliced for it.
+                            lane_offset: 0,
+                                                        num_q_heads: seat.reading.q_heads,
                             num_kv_heads: seat.reading.kv_heads,
                             head_dim: seat.reading.head_dim,
                             page_size: paging.page_size,
@@ -4724,7 +6501,30 @@ impl Shell {
             &place,
         )
         .across(&side_ctx, &stream)
-        .quantized(armed);
+        .quantized(armed)
+        // **THE LAUNCH PLANE'S HALF OF THE BODIES GATE** (chunk 2b-ii). The
+        // two words the walk needs to hand a shifting region its plane's base
+        // instead of its window's slice, and to arm the seat that then tells
+        // it where its rows are. `p.bodied` is `prepare`'s own answer — the
+        // same one that put the live-rows words into the slot — so a fire that
+        // staged no seat resolves exactly the pointers it always did, and the
+        // eager path is byte for byte what it was.
+        //
+        // **AND THE THIRD WORD IS THE KEY'S CEILINGS** (the ceiling design's
+        // Option B): the ladder `prepare` built beside the key, over the class
+        // table it was built from, which is what `Run::planning` turns a
+        // window's span into a carve with. `None` off the bodies path, where
+        // there is no key and therefore no ceiling to take.
+        .bodied(
+            p.bodied,
+            shifted.as_slice(),
+            p.admits.as_ref(),
+            p.bodied.then(|| record::Carve {
+                classes: p.composition.classes(),
+                ladder: &p.ladder,
+                lane_ceiling: p.lane_ceiling,
+            }),
+        );
         // The other half of the bundle above: where a conditional body's
         // launches land. The cursor writes `window::BODY` into the cell for
         // exactly the span between a `cond_begin` and its `cond_end`.
@@ -4744,10 +6544,11 @@ impl Shell {
         }
         // TWO MODES, ONE WALK (design §6, decision #11). Off and Shaped run
         // it whole; On splits it at the phase boundary — prepare on the open
-        // stream, then the capture regions either replayed from this shape's
-        // graph or run and recorded into one. Which is why `record::fire`
-        // takes the same arguments `walk` does and answers the same errors:
-        // it is not another path, it is the same one at two instants.
+        // stream, then the capture regions either replayed from this
+        // composition's body or run and recorded into one. Which is why
+        // `record::Graphs::fire_body` takes the same arguments `walk` does and
+        // answers the same errors: it is not another path, it is the same one
+        // at two instants.
         // **A BUFFERED FIRE IS NOT GRAPH-REPLAYABLE, AND THAT IS DESIGN §6'S
         // OWN SENTENCE** ("the default is the only RS shape that
         // graph-replays"). The scatter and the gather are copies whose page
@@ -4761,41 +6562,165 @@ impl Shell {
         // dense pump rotates a slot's contents at each region boundary, and
         // its backpressure is a HOST cursor the walk advances; a replayed
         // graph has no walk, so a captured rotation would bake one fire's ring
-        // state into an exec that outlives it — and the copies and their
-        // events would be nodes standing in no position of the parent chain,
-        // which is the hole `Tapped`'s census already declines a conditional
-        // for. So a load whose weights rotate takes the eager walk, whatever
-        // mode the shell is in: the same walk, the same launches, nothing
-        // recorded. `crate::rotate`'s header carries the whole argument.
+        // state into an exec that outlives it. So a load whose weights rotate
+        // takes the eager walk, whatever mode the shell is in: the same walk,
+        // the same launches, nothing recorded. `crate::rotate`'s header
+        // carries the whole argument.
         let records = graphs.records() && !p.rs.buffered && !weights.rotating();
         let walked = if records {
-            let fire = record::Fire {
-                trace,
-                compiled,
-                descriptor: &p.descriptor,
-                stream: device.stream(),
-                lanes: forked,
-                conditionals,
-                key: record::Key::of(p.composition.classes(), copies),
-                bucket: p.composition.bucket(),
-            };
-            if arming {
-                // The synthetic pass: prepare on the host, one tapped
-                // capture, one instantiate — nothing executes and nothing
-                // launches. `maybe_arm_fold` owns what a refusal means.
-                // The PROBE variant captures a second geometry and fits the
-                // zero forms instead of instantiating anything.
-                if probing {
-                    cache.arm_probe(&fire, &mut run, &place)
-                } else {
-                    cache.arm_fold(&fire, &mut run, &place)
-                }
-            } else if fold {
-                cache.fire_folded(&fire, &mut run, &place).map(|_mode| ())
+            // **THE ROUTER, AND IT IS TWO ARMS AND A HOLE** (the tier-2
+            // campaign). A fire that reaches here either has a body or is the
+            // load's own synthetic that could not have one; everything else
+            // walks. There used to be two more arms — the keyed cache and the
+            // fold's template — and collapsing them is what makes `p.bodied`
+            // the whole question at this line.
+            if arming && !p.bodied {
+                // **THE ARMING PASS'S SYNTHETIC, WHOSE COMPOSITION THE GATE
+                // REFUSED** (`Shell::arm_bodies`). There is nothing to record
+                // — `prepare` already named the refusal into `bodies_refused`
+                // — and there is nothing worth running either, because this
+                // fire is nobody's: its numbers are read by no caller and its
+                // launches would warm a composition the map will never hold.
+                Ok(())
+            } else if p.bodied {
+                // **THE BODY ARM, AND SINCE THE TIER-2 CAMPAIGN THE ONLY
+                // RECORDED ONE** (the bodies design's chunk B).
+                //
+                // Every clause that put this fire here was decided in
+                // `prepare` and is in `Prepared::bodied`: the outer three this
+                // `records` already carries, the armed pad, the multi-unit
+                // refusal `CompiledModel::fold_refused` states, and the
+                // admissibility rule `record::BodyKey` argues. Nothing is
+                // re-asked, because the seat's words are already in the slot
+                // and a second opinion here could only disagree with them.
+                //
+                // **AND THE ARMING INSTANT IS EITHER A REAL FIRE'S OR THE
+                // LOAD'S, AND BOTH ARRIVE HERE.** A body's capture rides its
+                // key's `record::WARM_FIRES`-th miss, whose own eager pass is
+                // what warms the JIT, grows the scratch slabs and gets the
+                // dense tuner's tuned ladder into the graph (`record`'s
+                // header argues all three). `Shell::arm_bodies` climbs that
+                // exact ladder at load with synthetic compositions — same
+                // call, same counters, same number of eager walks — so a
+                // load-armed body and a traffic-armed one are the same body,
+                // and this line is the only place either is made.
+                let fire = record::Fire {
+                    trace,
+                    compiled,
+                    descriptor: &p.descriptor,
+                    // The same table the `Run` above resolves in, handed to the
+                    // record mode for the one thing the descriptor cannot say:
+                    // how many rows each LAUNCH runs over, which is what a
+                    // resident body's grids are compared against now that a
+                    // windowed region can be one of them (chunk 2b-ii).
+                    windows: &p.windows,
+                    stream: device.stream(),
+                    lanes: forked,
+                    conditionals,
+                    bucket: p.composition.bucket(),
+                    // **AND THE TWO CONSTANTS THE KEY'S SECOND HALF IS CARVED
+                    // FROM.** `prepare` built a ladder already
+                    // (`Prepared::ladder`); this hands the INPUTS rather than that
+                    // ladder so that `fire_body` builds its key exactly as the
+                    // gate did — one function, `BodyKey::of`, off one composition,
+                    // one phase apart. It used to hand the lattice, because a rung
+                    // was `rung_of` over the class's rows; a rung is a ceiling
+                    // now, so what has to travel is which classes are decode
+                    // classes and how many lanes the load can seat.
+                    decoding,
+                    lane_ceiling: p.lane_ceiling,
+                    // **AND THE TWO THE LEDGER NEEDS** (the grid-at-ceiling
+                    // wave). `record::launch_grid` restates `Run::carve_rows` and
+                    // `Run::carve_lanes` from outside the walk, so it needs the
+                    // same two facts the `Run` above was handed: which regions
+                    // move their own plane, and the bucket the pad was ARMED at
+                    // — `armed.bucket`, not `Composition::bucket`, because a
+                    // shell with the pad off carved nothing and its grids are
+                    // live spans that must go on being able to grow.
+                    shifted: shifted.as_slice(),
+                    // **AND THE TABLE THAT SAYS WHICH REGIONS ANY OF THAT
+                    // APPLIES TO** (the tier-2 campaign). The same slice the
+                    // `Run` above was handed: `record::cuts` turns it into the
+                    // capture script, and `record::launch_grids` and
+                    // `record::grew_past` keep the ledger to the CAPTURED
+                    // regions on the write and on the read alike. Handed
+                    // rather than recomputed for `shifted`'s reason — the
+                    // host's answer and the walk's have to be one answer.
+                    admits: p.admits.as_ref(),
+                    // **AND IT IS THE ARMED BUCKET WHOLE, WITH NO SLACK TEST IN
+                    // FRONT OF IT** (the tier-1 key-collapse wave). It used to be
+                    // zeroed where `bucket == rows`, to keep the ledger quiet on
+                    // the `[engine] pad = off` arm; the bodies route now REQUIRES
+                    // the pad (`prepare`'s gate), so the only fires that read this
+                    // are padded ones and the only thing the old test could still
+                    // reach was the padded fire that lands exactly on its lattice
+                    // point — where zeroing it made the ledger describe live spans
+                    // while the launches were issued at ceilings.
+                    carve_bucket: armed.bucket,
+                };
+
+                cache.fire_body(&fire, &mut run, &place)
             } else {
-                cache.fire(&fire, &mut run, &place).map(|_mode| ())
+                // **AND A RECORDING MODE WITH NO BODY FOR THIS FIRE WALKS**,
+                // which is TIER 3 and is an answer rather than a fallback.
+                // Since the tier-2 campaign what puts a fire here is never a
+                // window's shape — a gathered or grouped region is an ISLAND
+                // inside a body that serves the rest of the composition — but
+                // one of the two things a cut cannot rescue: an artifact with
+                // two row axes, which no single `record::BodyKey` can name,
+                // or a composition the widening left no captured stretch in
+                // (`record::widen`, `record::Uncut::Eager`).
+                // Either way the refusal was already named, once per
+                // composition, into `record::BodyStats::refusals`. Counted per
+                // COMPOSITION and not per fire, deliberately: what an operator
+                // needs is how many of its SHAPES this tier cannot serve.
+                //
+                // No pump is threaded onto this cursor and none can be: the
+                // `records` line above already excluded every rotating load,
+                // so `weights.rotor()` is `None` on every fire that reaches
+                // this branch. The pumped cursor lives in the eager `else`
+                // below, which is the one that serves them.
+                let mut cursor = Cursor::new(&place);
+                walk(trace, compiled, &p.descriptor, &mut run, &mut cursor)
+                    .map_err(Fault::from)
             }
         } else {
+            // **AND AN EAGER WALK UNDER A RECORDING MODE IS A WARNING, SO IT
+            // IS COUNTED HERE.** Every other way a fire can miss its graph is
+            // already a number the cache keeps — warming, declined, refused,
+            // evicted — and the two clauses on the `records` line above were
+            // the only ones that took a fire out of every graph without
+            // leaving a trace anywhere. An operator who states `[engine]
+            // graphs on` and reads a steady hit count has bought what it
+            // thought it bought; one who reads these two moving instead now
+            // knows WHICH sentence above spent its replays.
+            //
+            // **ONLY WHILE THE MODE RECORDS**, which is the whole of the
+            // gate: `Graphs::Off` and `Graphs::Shaped` walk eagerly BY
+            // CHOICE, and a counter that moved under them would be measuring
+            // the knob. Both clauses are handed over rather than one, because
+            // a fire can be disqualified twice and the second reason does not
+            // stop mattering — `record::BodyStats::eager_buffered` states
+            // that rule and what it costs (their sum is not a fire count).
+            //
+            // **AND THE LOAD'S OWN SYNTHETIC FIRES WOULD BE COUNTED LIKE ANY
+            // OTHER**, because they are ordinary fires: `arm_bodies` climbs
+            // the warm ladder through this same call, and nothing here knows
+            // or cares that nobody is waiting on the answer.
+            //
+            // **WHICH IS EXACTLY WHY THAT LOOP NO LONGER RUNS ON A ROTATING
+            // LOAD.** Its rungs used to land in this branch — real executed
+            // walks at boot, `eager_rotating` moving before a caller had
+            // connected, and not one exec captured at the end of it — so the
+            // pass is now refused at its own gate for this counter's reason
+            // (`Shell::arm_bodies`). What that buys the reading is that the
+            // first nonzero `eager_rotating` on any load is a CALLER's fire:
+            // the load no longer spends walks it knew in advance would be
+            // spent for nothing, and the boot line is where the rotor is
+            // announced instead.
+            if graphs.records() {
+                cache.eager_walk(weights.rotating(), p.rs.buffered);
+            }
             // **THE ROTATION RIDES THE EAGER CURSOR** (alto streaming §3 item
             // 4). `Cursor::pumping` is the region seam: release, issue,
             // acquire, once per `region_begin`, on the fire's own compute
@@ -4818,9 +6743,23 @@ impl Shell {
         // thing to fire on this stream is a guest program's epilogue, a
         // registration's copy or the next fire's warm pass, and none of them
         // is the fire that number was true of.
+        //
+        // **AND THE SEAT ENDS WITH IT, FOR THE SAME SENTENCE** (bodies
+        // design): the address `Run::ctx` stamped points into the staging slot
+        // this fire is about to release, so a stage left armed would be an
+        // entry reading the next fire's words — or a freed carve's — through
+        // an argument nobody re-checked. Every context the walk could have
+        // armed is put back, including the conditional body's, which
+        // `Run::ctx` reaches through `window::BODY` rather than through the
+        // side list.
         device.ctx().disarm();
+        device.ctx().disarm_stage();
         for ctx in &side_ctx {
             ctx.disarm();
+            ctx.disarm_stage();
+        }
+        if let Some(body) = device.conditional_ctx() {
+            body.disarm_stage();
         }
         walked?;
 

@@ -209,8 +209,8 @@ impl Model {
                     // what differs is how many TENSORS each is and how wide
                     // its codes are, and both of those are facts about the
                     // weight's declared dtype rather than about the layout.
-                    // `Model::new` declares them `MlxU8` wherever the stack is
-                    // `MlxU4`, and `read` asks the weight rather than the file.
+                    // `Model::new` declares them `U8g64` wherever the stack is
+                    // `U4g64`, and `read` asks the weight rather than the file.
                     b.read(router, n("mlp.gate.weight"))?;
 
                     // **THE ONE PLACE THE TWO SPELLINGS PART** — `gpt_oss::

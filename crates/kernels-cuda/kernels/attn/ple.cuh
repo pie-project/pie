@@ -71,17 +71,27 @@ __global__ void ple_ngram_ids_update(
     long long slot_stride_elems,
     int* __restrict__ ngram_ids,
     int rows,
-    PleHash h)
+    PleHash h,
+    const u32* __restrict__ win)
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= rows) return;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first thread owns. The token
+    // it reads and the table row it lands are both there; the slot table is
+    // the LANES', and a lane ordinal is not a row.
+    const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int slot = slot_ids[r];
     if (slot < 0) return;
     int* state = state_base + (long long)slot * slot_stride_elems;
 
     const int span = h.ngram - 1;
     int window[PLE_MAX_NGRAM];
-    window[0] = ids[r];
+    window[0] = ids[r_row];
     for (int p = 1; p <= span; ++p) {
         const int cell = state[span - p];
         window[p] = cell == 0 ? h.eos : cell - 1;
@@ -91,11 +101,11 @@ __global__ void ple_ngram_ids_update(
     int out[PLE_MAX_HEADS];
     ple_hash_row(h, window, out);
     for (int k = 0; k < h.heads; ++k) {
-        ngram_ids[(long long)r * h.heads + k] = out[k];
+        ngram_ids[(long long)r_row * h.heads + k] = out[k];
     }
 
     for (int p = 0; p < span - 1; ++p) state[p] = state[p + 1];
-    state[span - 1] = ids[r] + 1;
+    state[span - 1] = ids[r_row] + 1;
 }
 
 // Prefill form: one thread block per request; walks the request's tokens in
@@ -112,26 +122,47 @@ __global__ void ple_ngram_ids_chunked(
     const u8* __restrict__ write_state_mask,
     const int* commit_len,
     const int* begin_at,
-    PleHash h)
+    PleHash h,
+    const u32* __restrict__ win)
 {
     const int r = blockIdx.x;
-    int t0 = (int)qo_indptr[r];
-    int Nr = (int)qo_indptr[r + 1] - t0;
+
+    // **THE STAGED-GEOMETRY SEAT, ON THE LANE AXIS** (the chunked-arm wave).
+    // One block per REQUEST, so the word that retires a ceiling grid's padding
+    // is `win[2]` — the window's live lane count — and not `win[0]`, which is
+    // the row count the decode form above reads.
+    if (win != nullptr && r >= static_cast<int>(win[2])) return;
+    // **AND THE LANE READS SPLIT, WHICH IS THIS WAVE'S CRUX.** `qo_indptr` is
+    // the WINDOW's own rebased CSR — staged into the fixed-stride window blob
+    // at an address a body may bake — so it is read at the window-local `r`.
+    // `slot_ids`, the fold predicate, the commit length and the segment origin
+    // are the FIRE's tables, handed over whole under a plane base
+    // (`Run::recurrent_absolute`) because `lane_offset` is not a function of a
+    // body key; those are read at `r + win[3]`.
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    // And the ROW axis: `ids` and `ngram_ids` are the fire's own planes,
+    // handed as BASES under an armed seat while the CSR above counts from the
+    // window's zero, so `win[1]` bridges the two. The state slab is addressed
+    // by the slot's VALUE and moves for neither.
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+
+    int t0 = (int)qo_indptr[r] + row0;
+    int Nr = (int)qo_indptr[r + 1] - (int)qo_indptr[r];
 
     // The segment this launch owns (the 2R split) — the causal conv's own
     // trimming, read for the same reason: state may only advance over the
     // committed prefix, and the tail launch re-covers the rest.
     if (begin_at != nullptr) {
-        int b = begin_at[r];
+        int b = begin_at[rl];
         if (b > Nr) b = Nr;
         if (b > 0) { t0 += b; Nr -= b; }
     }
     if (commit_len != nullptr) {
-        const int c = commit_len[r];
+        const int c = commit_len[rl];
         if (c < Nr) Nr = c;
     }
     if (Nr <= 0) return;
-    const int slot = slot_ids[r];
+    const int slot = slot_ids[rl];
     if (slot < 0) return;
     int* state = state_base + (long long)slot * slot_stride_elems;
 
@@ -160,7 +191,7 @@ __global__ void ple_ngram_ids_chunked(
     __syncthreads();
 
     if (write_state &&
-        (write_state_mask == nullptr || write_state_mask[r] != 0) &&
+        (write_state_mask == nullptr || write_state_mask[rl] != 0) &&
         tid == 0) {
         // The new window: the last `span` ids of (state ++ segment).
         int next[PLE_MAX_NGRAM];

@@ -37,13 +37,31 @@ __device__ __forceinline__ void rmsnorm_row(
     int hidden,
     int x_row_stride,
     int y_row_stride,
-    float eps)
+    float eps,
+    int heads,
+    const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked. `heads` is how many
+    // blocks stand in one token row — 1 when the launch is one block per row,
+    // and the head count when the PER-HEAD launch flattened `rows x heads`
+    // into `blockIdx.x` — so the row this block stands in is `row / heads`
+    // (`rmsnorm_grouped_plus_one`'s idiom, one file down).
+    if (win != nullptr && row / heads >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows START: with a stage armed `x` and
+    // `y` arrive at the plane's base, so this block's slice is its block index
+    // shifted by that start — a WHOLE number of heads in the flattened frame;
+    // with none they arrive pre-shifted. `weight` is indexed by column and
+    // never moves, per-head or not: one head-wide plane serves every head.
+    const int plane_row =
+        win != nullptr ? row + static_cast<int>(win[1]) * heads : row;
+
     const int tid = threadIdx.x;
 
-    const T* xr = x + static_cast<long long>(row) * x_row_stride;
-    T* yr = y + static_cast<long long>(row) * y_row_stride;
+    const T* xr = x + static_cast<long long>(plane_row) * x_row_stride;
+    T* yr = y + static_cast<long long>(plane_row) * y_row_stride;
 
     float local = 0.f;
     for (int i = tid; i < hidden; i += BLOCK) {
@@ -72,10 +90,12 @@ __global__ void rmsnorm(
     int hidden,
     int x_row_stride,
     int y_row_stride,
-    float eps)
+    float eps,
+    int heads,
+    const u32* __restrict__ win)
 {
     rmsnorm_row<T, BLOCK, false>(
-        x, weight, y, hidden, x_row_stride, y_row_stride, eps);
+        x, weight, y, hidden, x_row_stride, y_row_stride, eps, heads, win);
 }
 
 template <class T, int BLOCK = 256>
@@ -86,10 +106,12 @@ __global__ void rmsnorm_plus_one(
     int hidden,
     int x_row_stride,
     int y_row_stride,
-    float eps)
+    float eps,
+    int heads,
+    const u32* __restrict__ win)
 {
     rmsnorm_row<T, BLOCK, true>(
-        x, weight, y, hidden, x_row_stride, y_row_stride, eps);
+        x, weight, y, hidden, x_row_stride, y_row_stride, eps, heads, win);
 }
 
 // The hyper-connection norm: moments per `group`-wide slice, scale by
@@ -104,14 +126,25 @@ __global__ void rmsnorm_grouped_plus_one(
     T* __restrict__ y,
     int group,
     int groups,
-    float eps)
+    float eps,
+    const u32* __restrict__ win)
 {
     const int b = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): one block per (row,
+    // group), so the row this block stands in is `b / groups` — a replay
+    // carved at a bucket retires its padded rows off the word the fire staged.
+    if (win != nullptr && b / groups >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those rows start, so the flattened slice this
+    // block owns moves by a WHOLE number of groups. `b % groups` is therefore
+    // unchanged by the shift, which is why the weight index keeps reading `b`:
+    // that plane is per-group, not per-row.
+    const int gb = win != nullptr ? b + static_cast<int>(win[1]) * groups : b;
+
     const int tid = threadIdx.x;
 
-    const T* xr = x + static_cast<long long>(b) * group;
+    const T* xr = x + static_cast<long long>(gb) * group;
     const T* wr = weight + static_cast<long long>(b % groups) * group;
-    T* yr = y + static_cast<long long>(b) * group;
+    T* yr = y + static_cast<long long>(gb) * group;
 
     float local = 0.f;
     for (int i = tid; i < group; i += BLOCK) {
@@ -498,13 +531,29 @@ __global__ void rmsnorm_no_scale(
     const T* __restrict__ x,
     T* __restrict__ y,
     int hidden,
-    float eps)
+    float eps,
+    int heads,
+    const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked. `heads` is how many
+    // blocks stand in one token row — 1 for the whole-row launch, the head
+    // count for the PER-HEAD one that flattened `rows x heads` into
+    // `blockIdx.x` — so the row this block stands in is `row / heads`.
+    if (win != nullptr && row / heads >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: with a stage armed `x` and
+    // `y` arrive at the plane's base, so this block's slice is its block index
+    // shifted by that start, a whole number of heads in the flattened frame;
+    // with none they arrive pre-shifted.
+    const int plane_row =
+        win != nullptr ? row + static_cast<int>(win[1]) * heads : row;
+
     const int tid = threadIdx.x;
 
-    const T* xr = x + static_cast<long long>(row) * hidden;
-    T* yr = y + static_cast<long long>(row) * hidden;
+    const T* xr = x + static_cast<long long>(plane_row) * hidden;
+    T* yr = y + static_cast<long long>(plane_row) * hidden;
 
     float local = 0.f;
     for (int i = tid; i < hidden; i += BLOCK) {
@@ -565,14 +614,29 @@ __global__ void rmsnorm_gated_f32_in(
     T* __restrict__ y,
     int hidden,
     float eps,
-    int sigmoid_gate)
+    int sigmoid_gate,
+    int heads,
+    const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked. `heads` is how many
+    // blocks stand in one token row — 1 for the whole-row launch, the head
+    // count for the PER-HEAD one that flattened `rows x heads` into
+    // `blockIdx.x` — so the row this block stands in is `row / heads`.
+    if (win != nullptr && row / heads >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `x`, `gate` and `y` are all
+    // row planes and move together, by a whole number of heads in the
+    // flattened frame; `weight` is indexed by column and stays.
+    const int plane_row =
+        win != nullptr ? row + static_cast<int>(win[1]) * heads : row;
+
     const int tid = threadIdx.x;
 
-    const float* xr = x + static_cast<long long>(row) * hidden;
-    const T* gr = gate + static_cast<long long>(row) * hidden;
-    T* yr = y + static_cast<long long>(row) * hidden;
+    const float* xr = x + static_cast<long long>(plane_row) * hidden;
+    const T* gr = gate + static_cast<long long>(plane_row) * hidden;
+    T* yr = y + static_cast<long long>(plane_row) * hidden;
 
     float local = 0.f;
     for (int i = tid; i < hidden; i += BLOCK) {
@@ -596,38 +660,87 @@ __global__ void rmsnorm_gated_f32_in(
 }
 
 template <class T>
-__global__ void residual_add(T* __restrict__ y, const T* __restrict__ x, usize n) {
+__global__ void residual_add(T* __restrict__ y, const T* __restrict__ x, usize n,
+                             int width, const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float a = Elem<T>::to_f32(y[i]);
-    const float b = Elem<T>::to_f32(x[i]);
-    y[i] = Elem<T>::from_f32(a + b);
+    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
+    // lane is not a row here, so the live-rows word bounds `win[0] * width`
+    // elements, and `win[1] * width` is where they begin. Armed, the planes
+    // arrive at their base and this lane owns element `at`; null, they arrived
+    // pre-shifted and `i` is the element already.
+    if (win != nullptr &&
+        i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
+    const usize at = win != nullptr
+        ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
+        : i;
+    // Both planes are one row per token on the axis the guard counts, so both
+    // read the shifted element.
+    const float a = Elem<T>::to_f32(y[at]);
+    const float b = Elem<T>::to_f32(x[at]);
+    y[at] = Elem<T>::from_f32(a + b);
 }
 
 template <class T>
-__global__ void mul_scalar(T* __restrict__ x, float s, usize n) {
+__global__ void mul_scalar(T* __restrict__ x, float s, usize n,
+                           int width, const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
+    // lane is not a row here, so the live-rows word bounds `win[0] * width`
+    // elements, and `win[1] * width` is where they begin. Armed, the planes
+    // arrive at their base and this lane owns element `at`; null, they arrived
+    // pre-shifted and `i` is the element already.
+    if (win != nullptr &&
+        i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
+    const usize at = win != nullptr
+        ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
+        : i;
+    // The scalar is a launch argument and moves with nothing.
     const float s_rounded = Elem<T>::to_f32(Elem<T>::from_f32(s));
-    x[i] = Elem<T>::from_f32(Elem<T>::to_f32(x[i]) * s_rounded);
+    x[at] = Elem<T>::from_f32(Elem<T>::to_f32(x[at]) * s_rounded);
 }
 
 // silu(s * x), in place: the scalar sits INSIDE the activation, which is
 // what keeps this from being `mul_scalar` composed with anything.
 template <class T>
-__global__ void silu_scaled(T* __restrict__ x, float s, usize n) {
+__global__ void silu_scaled(T* __restrict__ x, float s, usize n,
+                            int width, const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float v = Elem<T>::to_f32(x[i]) * s;
-    x[i] = Elem<T>::from_f32(v / (1.f + __expf(-v)));
+    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
+    // lane is not a row here, so the live-rows word bounds `win[0] * width`
+    // elements, and `win[1] * width` is where they begin. Armed, the planes
+    // arrive at their base and this lane owns element `at`; null, they arrived
+    // pre-shifted and `i` is the element already.
+    if (win != nullptr &&
+        i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
+    const usize at = win != nullptr
+        ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
+        : i;
+    // The scalar is a launch argument and moves with nothing.
+    const float v = Elem<T>::to_f32(x[at]) * s;
+    x[at] = Elem<T>::from_f32(v / (1.f + __expf(-v)));
 }
 
 template <class T>
-__global__ void scale(T* __restrict__ x, const T* __restrict__ s, usize n) {
+__global__ void scale(T* __restrict__ x, const T* __restrict__ s, usize n,
+                      int width, const u32* __restrict__ win) {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
+    // lane is not a row here, so the live-rows word bounds `win[0] * width`
+    // elements, and `win[1] * width` is where they begin. Armed, the planes
+    // arrive at their base and this lane owns element `at`; null, they arrived
+    // pre-shifted and `i` is the element already.
+    if (win != nullptr &&
+        i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
+    const usize at = win != nullptr
+        ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
+        : i;
+    // `s` is a one-element plane, not a row plane, and is read where it is.
     const float f = Elem<T>::to_f32(s[0]);
-    x[i] = Elem<T>::from_f32(Elem<T>::to_f32(x[i]) * f);
+    x[at] = Elem<T>::from_f32(Elem<T>::to_f32(x[at]) * f);
 }
 
 template <class T>
@@ -646,9 +759,19 @@ template <class T>
 __global__ void add_bias(
     T* __restrict__ out,
     const T* __restrict__ bias,
-    int dim)
+    int dim,
+    const u32* __restrict__ win)
 {
-    add_bias_row<T>(out + static_cast<long long>(blockIdx.x) * dim, bias, dim);
+    const int n = static_cast<int>(blockIdx.x);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `out` is a row plane handed
+    // at its base, `bias` is one row wide and indexed by column.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    add_bias_row<T>(out + static_cast<long long>(row) * dim, bias, dim);
 }
 
 template <class T>
@@ -692,18 +815,27 @@ __global__ void res_blend(
     const T* __restrict__ norm_weight,
     const T* __restrict__ proj_weight,
     T* __restrict__ out,
-    i32 B, i32 H, i32 block_rows, float eps)
+    i32 B, i32 H, i32 block_rows, float eps,
+    const u32* __restrict__ win)
 {
     const i32 t = static_cast<i32>(blockIdx.x);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && t >= static_cast<i32>(win[0])) return;
+    // And `win[1]` is where those live rows START: with a stage armed the
+    // pointers arrive at the plane's base, so the row this block owns is its
+    // block index shifted by that start; with none they arrive pre-shifted.
+    const i32 row = win != nullptr ? t + static_cast<i32>(win[1]) : t;
 
     __shared__ float scratch[kThreads / 32];
     __shared__ float prob_s[kMaxBlocks + 1];
 
-    const long long token_off = static_cast<long long>(t) * H;
+    const long long token_off = static_cast<long long>(row) * H;
     const i32 rows = B + 1;
 
     auto row_ptr = [&](i32 j) -> const T* {
-        return (j < B) ? blocks + (static_cast<long long>(j) * block_rows + t) * H
+        return (j < B) ? blocks + (static_cast<long long>(j) * block_rows + row) * H
                        : prefix + token_off;
     };
 
@@ -762,11 +894,20 @@ __global__ void rmsnorm_gated_by(
     const ElemT* __restrict__ g,
     const float* __restrict__ weight,
     ElemT* __restrict__ out,
-    int H, int D, float eps)
+    int H, int D, float eps,
+    const u32* __restrict__ win)
 {
     const int t = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && t >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `o`, `g` and `out` share
+    // one `[rows, H, D]` addressing and move together; `weight` is per-`d`.
+    const int row = win != nullptr ? t + static_cast<int>(win[1]) : t;
+
     const int h = blockIdx.y;
-    const long long base = ((long long)t * H + h) * D;
+    const long long base = ((long long)row * H + h) * D;
 
     float acc = 0.f;
     for (int d = threadIdx.x; d < D; d += blockDim.x) {

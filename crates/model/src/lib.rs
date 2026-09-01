@@ -101,7 +101,7 @@ pub fn import_of(
 /// **A NORM IS NOT A BANK, AND A QUANTIZED SKU IS NOT A SECOND FAMILY TEXT.**
 /// A family's `new` takes one weight representation and stamps it on every
 /// plane it declares, which was right while every representation stored itself
-/// verbatim. `Mxfp4` and `MlxU4` do not: they are a bank's codes, they come
+/// verbatim. `Mxfp4` and `U4g64` do not: they are a bank's codes, they come
 /// with companion planes, and no checkpoint in either scheme quantizes a
 /// layernorm — MLX's own rule is that a group of sixty-four codes needs
 /// sixty-four columns to group, and a `[hidden]` norm has one axis and no

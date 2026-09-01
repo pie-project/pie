@@ -109,6 +109,9 @@ pub fn embed_weighted(
             hidden.arg(),
             vocab.arg(),
             taps.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

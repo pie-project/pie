@@ -415,7 +415,7 @@ impl ForwardHybrid for Model {
                     // is `GeGLU()`, which is `gelu_approx(gate) * up` — the
                     // dense `mlp`'s own `geglu`, on the routed stack.
                     let select = |act: &Value, bank: &Weight| match bank.dtype {
-                        Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 => {
+                        Dtype::Mxfp4 | Dtype::U4g64 | Dtype::U8g64 => {
                             ops::linear::moe_matmul_select_quant(act, bank, &routes, x.top_k)
                         }
                         _ => ops::linear::moe_matmul_select(act, bank, &routes, x.top_k),

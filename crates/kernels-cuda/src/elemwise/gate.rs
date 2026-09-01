@@ -34,6 +34,17 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, x: &mut Tensor) -> Result<(), Error>
             "::pie::linear::gate_sigmoid_mul<::pie::bf16>",
         )
         .apply(Launch::flat(lanes, BLOCK)),
-        &[x.arg(), gate.arg(), stated(OP, lanes)?.arg()],
+        &[
+            x.arg(),
+            gate.arg(),
+            stated(OP, lanes)?.arg(),
+            // The element-form seat's width: this launch is flat over
+            // `rows * width`, so the kernel needs the row's width to read the
+            // staged row count and row start as elements.
+            stated(OP, x.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }

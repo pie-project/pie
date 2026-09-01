@@ -282,21 +282,29 @@ impl Graph {
 /// handles the next thing enqueued would depend on — for a single-stream
 /// capture, the last node recorded so far.
 ///
-/// **THE FOLD'S REGION CENSUS RIDES ON THIS** (`.wiki/palo/cuda-abi.md` §6,
-/// D5-lite), and on nothing stronger because nothing stronger is answered:
-/// full node ENUMERATION of a capture-in-progress graph is refused by this
+/// **THE ONE THING A CAPTURE-IN-PROGRESS WILL SAY ABOUT ITSELF**
+/// (`.wiki/palo/cuda-abi.md` §6), and the measurement is why this entry
+/// exists: full node ENUMERATION of a capture in progress is refused by this
 /// toolkit — `cudaGraphGetNodes` and `cuGraphGetNodes` both answer
 /// InvalidValue (code 1) mid-capture, measured on CUDA 13.0 / 580.159 —
 /// while the frontier is `cuStreamGetCaptureInfo`'s documented out-parameter
 /// (it exists so `cuStreamUpdateCaptureDependencies` callers can read before
-/// they write). So the census records the frontier at every region boundary
-/// and places nodes AFTER the capture ends, when the finished graph
-/// enumerates freely: on a serial capture the graph is a chain, the frontier
-/// at a boundary is the chain position the region ended at, and every node
-/// between two boundary positions belongs to the region between them. This
-/// is why the fold captures SERIALLY — a forked capture's frontier is one
-/// stream's, and its finished graph is not a chain positions can be read
-/// off.
+/// they write).
+///
+/// **WHAT USED TO RIDE ON IT WAS THE FOLD'S REGION CENSUS**, retired with the
+/// fold: record the frontier at every region boundary, then place nodes AFTER
+/// the capture ends, when the finished graph enumerates freely — on a serial
+/// capture the graph is a chain, the frontier at a boundary is the chain
+/// position the region ended at, and every node between two boundary positions
+/// belongs to the region between them. That is also why the fold captured
+/// SERIALLY: a forked capture's frontier is one stream's, and its finished
+/// graph is not a chain positions can be read off. The tier-2 campaign cuts a
+/// composition at region boundaries instead (`record::cuts`), so a segment IS
+/// its own graph and there is nothing to attribute after the fact.
+///
+/// It is kept as the shell's door onto that driver fact, which
+/// [`super::conditional`] names beside its own, rather than as a fire-path
+/// call: nothing in `record.rs` reads it.
 ///
 /// The handles stay valid after `cudaStreamEndCapture`: ending a capture
 /// finishes the same `cudaGraph_t` these nodes already belong to.
@@ -358,88 +366,18 @@ pub fn capture_frontier(stream: *mut c_void) -> Result<Vec<*mut c_void>> {
     }
 }
 
+// **AN EXEC IS LAUNCHED AND NOTHING ELSE, WHICH IS WHAT THE TIER-2 CAMPAIGN
+// LEFT BEHIND.** Two more calls stood in this block and both were the FOLD's:
+// `set_node_enabled`, which turned an absent window's nodes off host-side
+// (`.wiki/palo/cuda-abi.md` §6, D5-lite: ~0.22 µs per node with no re-upload),
+// and `upload`, which re-landed the exec's device-side state after such a
+// write. Absence rides the `record::BodyKey` now — a body holds exactly the
+// present regions its key names — so there is no node to disable and nothing
+// to re-upload, and the two calls went out with the path that wrote them. What
+// the measurements bought is kept where measurements are kept: `device::nodes`
+// still prices `cudaGraphExecKernelNodeSetParams` against a live exec, through
+// [`GraphExec::raw`], for a probe rather than for a fire.
 impl GraphExec {
-    /// Turn one node of this exec on or off, host-side.
-    ///
-    /// **THE FOLD'S COMPOSITION AXIS** (`.wiki/palo/cuda-abi.md` §6, D5-lite):
-    /// a folded exec holds every region of the full composition, and an empty
-    /// window's nodes are turned OFF here rather than keyed away. For a
-    /// LIBRARY node this is the correctness mechanism — there is no zero-row
-    /// contract to fall back on — and for one of ours it is economy (the
-    /// zero-row early exit would be correct at ~1 µs of dispatch). The PoC
-    /// priced the call at ~0.22 µs with NO re-upload needed, which is what
-    /// makes a per-fire enable diff affordable where `cuGraphExecUpdate`
-    /// would not be.
-    ///
-    /// `node` is the handle in the `cudaGraph_t` this exec was instantiated
-    /// from — the same coordinate `cudaGraphExecKernelNodeSetParams` takes —
-    /// so the template graph must still be alive, which is the rule the fold
-    /// keeps by owning it beside the exec.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] or [`Fault::Device`] (a node kind the runtime
-    /// cannot toggle — anything but kernel, memcpy, memset).
-    pub fn set_node_enabled(&self, node: *mut c_void, enabled: bool) -> Result<()> {
-        #[cfg(feature = "_cuda")]
-        {
-            // SAFETY: the exec is this handle's and `node` belongs to the
-            // graph it was instantiated from — the caller's stated contract.
-            unsafe {
-                crate::device::ctx::check(
-                    "cudaGraphNodeSetEnabled",
-                    cudarc::runtime::sys::cudaGraphNodeSetEnabled(
-                        self.raw.cast(),
-                        node.cast(),
-                        u32::from(enabled),
-                    ),
-                )
-            }
-        }
-        #[cfg(not(feature = "_cuda"))]
-        {
-            let _ = (node, enabled);
-            Err(Fault::Runtimeless)
-        }
-    }
-
-    /// Re-land this exec's device-side state on `stream`.
-    ///
-    /// **THE OTHER HALF OF A HOST REBIND, PAID AT BIND TIME.**
-    /// `.wiki/palo/cuda-abi.md` §2 states the rule — after a host-side
-    /// update the exec must be re-uploaded before the next launch — for the
-    /// device-updatable case, and the plain-exec documentation promises the
-    /// opposite ("the next launch will use the updated parameters"). The
-    /// fold measured the question rather than picking a doc: steady folded
-    /// launches after a ~500-node restatement run at EXACT parity with the
-    /// keyed replay once structure is equal (the steady-mixed gate,
-    /// streams off: 4.511 against 4.511 ms/fire), with this upload in the
-    /// rebind. It is kept there because it is the stated-safe order, it is
-    /// enqueue-only, and it costs the binding — which a throwaway capture
-    /// already dwarfs — rather than any launch.
-    ///
-    /// # Errors
-    ///
-    /// [`Fault::Runtimeless`] or [`Fault::Device`].
-    pub fn upload(&self, stream: *mut c_void) -> Result<()> {
-        #[cfg(feature = "_cuda")]
-        {
-            // SAFETY: the exec is this handle's, alive until `Drop`, and the
-            // stream is the shell's.
-            unsafe {
-                crate::device::ctx::check(
-                    "cudaGraphUpload",
-                    cudarc::runtime::sys::cudaGraphUpload(self.raw.cast(), stream.cast()),
-                )
-            }
-        }
-        #[cfg(not(feature = "_cuda"))]
-        {
-            let _ = stream;
-            Err(Fault::Runtimeless)
-        }
-    }
-
     /// Launch it on `stream`.
     ///
     /// **THIS IS THE WHOLE FIRE PATH, ONCE THE PREPARE PHASE IS DONE.** One

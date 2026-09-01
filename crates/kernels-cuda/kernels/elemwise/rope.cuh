@@ -54,21 +54,33 @@ __global__ void rope_full(
     const u32* __restrict__ kv_last_page_lens,
     const u8* __restrict__ row_valid,
     int R,
-    int page_size)
+    int page_size,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows START: `q`, `k`, `v`, `positions`
+    // and `row_valid` are all row planes handed at their base. The token index
+    // handed to `kv_slot_for_token` moves WITH them — it is a coordinate in
+    // the same frame `positions` is indexed by, and the CSR it walks describes
+    // the whole plane; the CSR planes themselves are per-request and stay put.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int total_heads = num_q_heads + num_kv_heads;
 
     const int half = head_dim / 2;
-    const int pos = positions[n];
+    const int pos = positions[row];
 
     KvSlot slot{};
     bool write_this_row = false;
     if constexpr (kWriteKv) {
-        write_this_row = (row_valid == nullptr) || (row_valid[n] != 0);
+        write_this_row = (row_valid == nullptr) || (row_valid[row] != 0);
         if (write_this_row) {
             slot = kv_slot_for_token(qo_indptr, kv_page_indices, kv_page_indptr,
-                                     kv_last_page_lens, n, R, page_size);
+                                     kv_last_page_lens, row, R, page_size);
         }
     }
 
@@ -103,7 +115,7 @@ __global__ void rope_full(
         }
 
         if (head_idx < num_q_heads) {
-            bf16* qp = q + (static_cast<long long>(n) * num_q_heads +
+            bf16* qp = q + (static_cast<long long>(row) * num_q_heads +
                                      head_idx) * head_dim;
             if (interleaved) rotate_pair_interleaved(qp, dim_pair, cos_v, sin_v);
             else rotate_pair(qp, half, dim_pair, cos_v, sin_v);
@@ -111,7 +123,7 @@ __global__ void rope_full(
         }
         {
             const int kv_h = head_idx - num_q_heads;
-            bf16* kp = k + (static_cast<long long>(n) * num_kv_heads +
+            bf16* kp = k + (static_cast<long long>(row) * num_kv_heads +
                                      kv_h) * head_dim;
             if (interleaved) rotate_pair_interleaved(kp, dim_pair, cos_v, sin_v);
             else rotate_pair(kp, half, dim_pair, cos_v, sin_v);
@@ -122,7 +134,7 @@ __global__ void rope_full(
                     const int j1 = interleaved ? dim_pair * 2 + 1
                                                : dim_pair + half;
                     const bf16* vp =
-                        v + (static_cast<long long>(n) * num_kv_heads + kv_h) *
+                        v + (static_cast<long long>(row) * num_kv_heads + kv_h) *
                                 head_dim;
                     const int base = kv_h * head_dim;
                     const long long d0 = kv_dst_index<kHnd>(
@@ -327,7 +339,7 @@ __global__ void qk_rmsnorm_rotate_devwin(
     const bf16* __restrict__ q_weight,
     const bf16* __restrict__ k_weight,
     const i32* __restrict__ positions,
-    const u32* __restrict__ win,
+    const u32* __restrict__ devwin,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -335,9 +347,13 @@ __global__ void qk_rmsnorm_rotate_devwin(
     float eps)
 {
     const int n = blockIdx.x;
+    // `devwin` is the pre-staged device window pair, `(start, count)`:
+    // word 0 is a START. The staged-geometry seat's `win` is `(count,
+    // start)` — same pointer shape, opposite word order, and the rename
+    // is what keeps one from ever arming the other.
     {
-        const int w0 = static_cast<int>(win[0]);
-        const int w1 = static_cast<int>(win[1]);
+        const int w0 = static_cast<int>(devwin[0]);
+        const int w1 = static_cast<int>(devwin[1]);
         if (n < w0 || n >= w0 + w1) return;
     }
     const int head_idx = blockIdx.y;
@@ -449,13 +465,23 @@ __global__ void rope_yarn(
     float mscale,
     bool interleaved,
     int heads_per_block,
-    int cache_pairs)
+    int cache_pairs,
+    const u32* __restrict__ win)
 {
     extern __shared__ float2 yarn_cs[];
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `q`, `k` and `positions`
+    // are row planes handed at their base. The angle cache is keyed by the
+    // POSITION VALUE the vector yields, never by the row, and does not move.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int total_heads = num_q_heads + num_kv_heads;
     const int half = head_dim / 2;
-    const int pos = positions[n];
+    const int pos = positions[row];
 
     auto angle = [&](int d) -> float2 {
         const float base_freq = powf(theta,
@@ -480,13 +506,13 @@ __global__ void rope_yarn(
                                                  : angle(dim_pair);
 
         if (head_idx < num_q_heads) {
-            bf16* qp = q + (static_cast<long long>(n) * num_q_heads +
+            bf16* qp = q + (static_cast<long long>(row) * num_q_heads +
                                      head_idx) * head_dim;
             if (interleaved) rotate_pair_interleaved(qp, dim_pair, cs.x, cs.y);
             else             rotate_pair(qp, half, dim_pair, cs.x, cs.y);
         } else {
             const int kv_h = head_idx - num_q_heads;
-            bf16* kp = k + (static_cast<long long>(n) * num_kv_heads +
+            bf16* kp = k + (static_cast<long long>(row) * num_kv_heads +
                                      kv_h) * head_dim;
             if (interleaved) rotate_pair_interleaved(kp, dim_pair, cs.x, cs.y);
             else             rotate_pair(kp, half, dim_pair, cs.x, cs.y);
@@ -504,13 +530,23 @@ __global__ void rope_partial(
     int num_kv_heads,
     int head_dim,
     int rotary_dim,
-    float theta)
+    float theta,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `q`, `k` and `positions`
+    // are row planes handed at their base; the angles are keyed by the
+    // position VALUE, never by the row.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int total_heads = num_q_heads + num_kv_heads;
     const int half = head_dim / 2;
     const int rope_angles = rotary_dim / 2;
-    const int pos = positions[n] + position_delta;
+    const int pos = positions[row] + position_delta;
 
     for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
         const int head_idx = t / half;
@@ -529,7 +565,7 @@ __global__ void rope_partial(
 
         if (head_idx < num_q_heads) {
             T* qp = q +
-                (static_cast<long long>(n) * num_q_heads + head_idx) * head_dim;
+                (static_cast<long long>(row) * num_q_heads + head_idx) * head_dim;
             const float a = Elem<T>::to_f32(qp[dim_pair]);
             const float b = Elem<T>::to_f32(qp[dim_pair + half]);
             qp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);
@@ -537,7 +573,7 @@ __global__ void rope_partial(
         } else {
             const int kv_h = head_idx - num_q_heads;
             T* kp = k +
-                (static_cast<long long>(n) * num_kv_heads + kv_h) * head_dim;
+                (static_cast<long long>(row) * num_kv_heads + kv_h) * head_dim;
             const float a = Elem<T>::to_f32(kp[dim_pair]);
             const float b = Elem<T>::to_f32(kp[dim_pair + half]);
             kp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);
@@ -559,13 +595,23 @@ __global__ void rope_partial_last(
     bool interleaved,
     float yarn_factor,
     float yarn_low_dim,
-    float yarn_high_dim)
+    float yarn_high_dim,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `q`, `k` and `positions`
+    // are row planes handed at their base; the angles are keyed by the
+    // position VALUE, never by the row.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int total_heads = num_q_heads + num_kv_heads;
     const int rope_half = rotary_dim / 2;
     const int offset = head_dim - rotary_dim;
-    const int pos = positions[n];
+    const int pos = positions[row];
 
     for (int t = threadIdx.x; t < total_heads * rope_half; t += blockDim.x) {
         const int head_idx = t / rope_half;
@@ -584,8 +630,8 @@ __global__ void rope_partial_last(
 
         const bool is_q = (head_idx < num_q_heads);
         bf16* base = is_q
-            ? q + static_cast<long long>(n * num_q_heads + head_idx) * head_dim
-            : k + static_cast<long long>(n * num_kv_heads + (head_idx - num_q_heads)) * head_dim;
+            ? q + static_cast<long long>(row * num_q_heads + head_idx) * head_dim
+            : k + static_cast<long long>(row * num_kv_heads + (head_idx - num_q_heads)) * head_dim;
 
         const int i = interleaved ? offset + 2 * dim_pair : offset + dim_pair;
         const int j = interleaved ? offset + 2 * dim_pair + 1

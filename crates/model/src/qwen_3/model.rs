@@ -868,7 +868,7 @@ impl Model {
         // A bf16 stack's gates stay bf16: the raise is from four bits to
         // eight, not to eight from anywhere.
         let gate = match w {
-            Dtype::MlxU4 => Dtype::MlxU8,
+            Dtype::U4g64 => Dtype::U8g64,
             other => other,
         };
         let q_heads = d.q_heads / tp;

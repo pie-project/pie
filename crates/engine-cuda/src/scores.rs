@@ -171,11 +171,6 @@ impl Scores {
         self.lanes
     }
 
-    /// Device bytes held, for the footprint line.
-    #[must_use]
-    pub(crate) fn bytes(&self) -> u64 {
-        self.store.bytes() as u64
-    }
 
     /// Where lane `lane`'s block of planes begins, as an address.
     #[must_use]

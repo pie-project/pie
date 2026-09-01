@@ -105,6 +105,9 @@ fn split_kv_a_norm(
             rope.arg(),
             src_row_stride.arg(),
             eps.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -188,6 +191,9 @@ pub fn split_q_b(
             heads.arg(),
             nope.arg(),
             rope.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -526,6 +532,9 @@ mod naive {
                     shape.page_size.arg(),
                     shape.sm_scale.arg(),
                     shape.causal.arg(),
+                    // The staged-geometry seat: the region's live-rows word when a
+                    // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                    ctx.stage(),
                 ],
             );
         }
@@ -589,6 +598,9 @@ mod naive {
                 shape.sm_scale.arg(),
                 shape.causal.arg(),
                 g.arg(),
+                // The staged-geometry seat: the region's live-rows word when a
+                // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                ctx.stage(),
             ],
         )
     }

@@ -380,7 +380,7 @@ impl Floor {
                 .expect("the handle table seats a rectangle")
         };
         let floor = Floor {
-            codes: Tensor::new(bind(&codes_buf), N, k, Dtype::MlxU4),
+            codes: Tensor::new(bind(&codes_buf), N, k, Dtype::U4g64),
             scales: Tensor::new(bind(&scales_buf), N, k / GROUP, Dtype::Bf16),
             biases: Tensor::new(bind(&biases_buf), N, k / GROUP, Dtype::Bf16),
             x: Tensor::new(bind(&act_buf), ROWS, k, Dtype::Bf16),

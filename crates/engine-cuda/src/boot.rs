@@ -168,7 +168,17 @@ fn graphs(doc: &toml::Table) -> Graphs {
 /// below was a `PIE_CUDA_*` variable read inside the shell at load; two of the
 /// nine are not here because they were never shell flags — `[engine] graphs`
 /// is [`graphs`] above and the shape lattice is a compiler input that reaches
-/// the bake through `LoadBudgets::buckets`.
+/// the bake through `LoadBudgets::buckets` — and three more are not here
+/// because they named the FOLD, which the tier-2 campaign deleted along with
+/// the keyed capture path (`fold`, `pipeline`, `fold_disable`). A boot
+/// document that still states one of the three is read exactly as a document
+/// that states any other unknown key: ignored.
+///
+/// **AND ONE KEY BELOW WAS NEVER A VARIABLE AT ALL.** `[engine] bodies` landed
+/// after article 9 did, so it has no environment ancestor to be the round trip
+/// OF — it is simply a knob, read here, the way every knob should have been.
+/// It is stated in the same closure as the rest because "how a boolean is
+/// spelled in this document" is one answer and not a per-key one.
 ///
 /// Absent means the shell's own default, which is what the absent variable
 /// meant, so this function states nothing it was not told. A key spelled with
@@ -177,11 +187,6 @@ fn graphs(doc: &toml::Table) -> Graphs {
 /// else leaves the default rather than inventing a third answer.
 fn knobs(doc: &toml::Table) -> Result<Knobs, String> {
     let table = doc.get("engine").and_then(toml::Value::as_table);
-    let word = |key: &str| -> Option<&str> {
-        table
-            .and_then(|engine| engine.get(key))
-            .and_then(toml::Value::as_str)
-    };
     // A boolean key may be written as one (`pad = false`) or as the word the
     // environment variable took (`pad = "off"`). Both are the operator saying
     // the same thing, and refusing one of them would be a schema this document
@@ -201,17 +206,33 @@ fn knobs(doc: &toml::Table) -> Result<Knobs, String> {
     Ok(Knobs {
         gpu_mem_utilization: gpu_mem_utilization(table, stock.gpu_mem_utilization)?,
         pad: flag("pad", stock.pad),
-        fold: flag("fold", stock.fold),
-        pipeline: flag("pipeline", stock.pipeline),
-        // `all` (the default) disables every absent-window node of a folded
-        // exec; `library` keeps pie windowed nodes enabled at fitted zero rows
-        // and disables only the library residue. Spelled as the policy's own
-        // name rather than as a boolean, because that is what the measurement
-        // in `.wiki/palo/cuda-abi.md` §6d calls the two arms.
-        fold_disable_library: match word("fold_disable") {
-            Some("library" | "lib") => true,
-            Some(_) | None => stock.fold_disable_library,
-        },
+        // The bodies path (`record::BodyKey`) — one exec per composition,
+        // with the row count on the staged live-rows seat. Never a
+        // `PIE_CUDA_*` word: it landed after article 9, so it was born here.
+        //
+        // **ON UNLESS THIS DOCUMENT SAYS OTHERWISE, SINCE THE TIER-2
+        // CAMPAIGN.** It shipped off while a keyed cache stood beside it as
+        // the arm it was diffed against; that cache is gone, so bodies are the
+        // only recorded path and `bodies = off` is now the DIAGNOSTIC arm —
+        // `graphs` still on, schedules still graph-shaped, every fire walking
+        // eagerly and nothing captured. `Shell::load` prints a line when a
+        // document asks for it, exactly as it does for `graphs = off`.
+        //
+        // **AND IT IS THE ONE KNOB HERE THAT DOES WORK AT LOAD** (the bodies
+        // design's chunk C): leaving it on makes `Shell::arm_bodies` fire a
+        // synthetic composition at every lattice rung the deployment can seat
+        // and then SEAL the map, so the steady state's first fire replays and
+        // the serving path captures nothing. `set_bodies` between fires still
+        // turns the path on and off; it cannot re-run the arming, because
+        // arming is a load-time pass and this is the word that decides whether
+        // the load takes it.
+        //
+        // A load that arms prints one line saying how many rungs it armed and
+        // how many it lost, and to what — the arming's own faults, the
+        // compositions the admissibility rule turned away, and the schedules
+        // that would not fit their workspace grant. Nothing else reports a
+        // partial arm.
+        bodies: flag("bodies", stock.bodies),
         copies: flag("fallback_copy", stock.copies),
         grouped: flag("grouped", stock.grouped),
         // `off` is P6's off arm and bakes an artifact with no fork group at
@@ -409,24 +430,50 @@ graphs = "shaped""#), Graphs::Shaped);
 
     /// **THE ROUND TRIP ARTICLE 9 IS FOR** (alto wave P's gate): a word set in
     /// the boot document reaches the shell's own toggle, with no environment
-    /// anywhere in the path. `pad` and `fold` are the two the gate names.
+    /// anywhere in the path. `pad` is the one the gate names, and `bodies` is
+    /// the first knob that never had an environment word to fall back on — so
+    /// this round trip is the ONLY way it can be set at all.
     #[test]
     fn a_knob_set_in_the_boot_document_reaches_the_shells_toggle() {
         let read = |text: &str| {
             knobs(&text.parse::<toml::Table>().expect("valid TOML")).expect("a legal document")
         };
         assert_eq!(read("").pad, true, "absent is the shell's own default");
-        assert_eq!(read("").fold, false);
         assert_eq!(read("[engine]\npad = false").pad, false);
         assert_eq!(read("[engine]\npad = \"off\"").pad, false, "the word spelling too");
-        assert_eq!(read("[engine]\nfold = true").fold, true);
-        assert_eq!(read("[engine]\nfold = \"on\"").fold, true);
+        assert_eq!(
+            read("").bodies,
+            true,
+            "on is the shipping arm since the keyed path died"
+        );
+        assert_eq!(read("[engine]\nbodies = false").bodies, false);
+        assert_eq!(read("[engine]\nbodies = \"off\"").bodies, false);
+        assert_eq!(read("[engine]\nbodies = \"on\"").bodies, true);
+        assert_eq!(
+            read("[engine]\nbodies = 0").bodies,
+            true,
+            "an integer is not a spelling this document accepts, so the default stands",
+        );
         // Everything a key does not mention keeps the default, so one stated
         // knob never moves another.
-        let one = read("[engine]\nfold = true");
+        let one = read("[engine]\nbodies = false");
         assert!(
-            Knobs { fold: false, ..one } == Knobs::default(),
-            "stating `fold` moved something else"
+            Knobs { bodies: true, ..one } == Knobs::default(),
+            "stating `bodies` moved something else"
+        );
+        let one = read("[engine]\npad = false");
+        assert!(
+            Knobs { pad: true, ..one } == Knobs::default(),
+            "stating `pad` moved something else"
+        );
+        // **AND A RETIRED KEY IS AN UNKNOWN KEY.** `fold`, `pipeline` and
+        // `fold_disable` named the graph fold, which died with the keyed
+        // capture path; a document that still states one is read exactly as a
+        // document that states nothing.
+        assert!(
+            read("[engine]\nfold = true\npipeline = false\nfold_disable = \"library\"")
+                == Knobs::default(),
+            "a retired key moved a live one"
         );
     }
 
@@ -443,29 +490,23 @@ graphs = "shaped""#), Graphs::Shaped);
         assert_eq!(read(""), None, "and so is absent");
     }
 
-    /// The other five keys, and the two that are not booleans.
+    /// The other keys, and the one that is not a boolean.
     #[test]
     fn every_engine_knob_key_is_read_in_the_spellings_the_words_took() {
         let read = |text: &str| {
             knobs(&text.parse::<toml::Table>().expect("valid TOML")).expect("a legal document")
         };
-        assert_eq!(read("[engine]\npipeline = \"off\"").pipeline, false);
         assert_eq!(read("[engine]\nfallback_copy = 0").copies, true, "not a bool: default");
         assert_eq!(read("[engine]\nfallback_copy = \"0\"").copies, false);
         assert_eq!(read("[engine]\ngrouped = \"none\"").grouped, true, "unknown word: default");
         assert_eq!(read("[engine]\ngrouped = false").grouped, false);
-        assert_eq!(
-            read("[engine]\nfold_disable = \"library\"").fold_disable_library,
-            true
-        );
-        assert_eq!(read("[engine]\nfold_disable = \"all\"").fold_disable_library, false);
         assert_eq!(read("[engine]\nside_streams = 4").side_streams, Some(4));
         assert_eq!(read("[engine]\nside_streams = \"off\"").side_streams, Some(0));
         assert_eq!(read("").side_streams, None, "absent leaves the profile's figure");
     }
 
-    /// **THE TENTH `[engine]` KEY, AND THE ONE THAT WAS NEVER A `PIE_CUDA_*`
-    /// WORD** (alto streaming §3 item 5, `next.md` B1): the fraction of the
+    /// **THE `[engine]` KEY THAT WAS NEVER A `PIE_CUDA_*` WORD** (alto
+    /// streaming §3 item 5, `next.md` B1): the fraction of the
     /// card this deployment lets pie hold. Declared, defaulted, validated and
     /// schema'd in `worker::config` for four waves and read by no shell —
     /// which is the failure `[model] weight_cache_dir` had, one table over.

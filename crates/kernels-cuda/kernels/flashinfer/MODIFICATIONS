@@ -14,11 +14,12 @@ byte -- steps 1 and 2 mechanically, step 3 from upstream and not from here:
        `tests/upstream_manifest.rs` and was empty; see THE TEST IS GONE
        below;
     3. put back everything a `// PIE: REMOVED` marker names, the files listed
-       under HOST C++ below, and the two EDITS listed under THE EDIT THAT IS
-       NOT A REMOVAL and THE SECOND EDIT below it.  A strip cannot perform
-       step 3 on its own: removed text leaves nothing to strip, only a marker
-       saying what stood there.  Step 3 needs the upstream tarball; steps 1
-       and 2 do not.
+       under HOST C++ below, and the EDITS listed under THE EDIT THAT IS NOT
+       A REMOVAL, THE SECOND EDIT and THE THIRD EDIT below it.  A strip cannot
+       perform step 3 on its own: removed text leaves nothing to strip, only a
+       marker saying what stood there, and an ADDITION leaves the added code
+       standing after its marker is gone.  Step 3 needs the upstream
+       tarball; steps 1 and 2 do not.
 
 THE DIRECTION OF STEP 3 REVERSED, and this document said the opposite until
 it did.  It used to read "restore `#include "exception.h"` to `page.cuh` and
@@ -136,6 +137,52 @@ every one of them below 762 -- so a marker line inserted above the edit would
 falsify all eight.  A one-token change that costs no lines is worth less than
 eight citations that still land where they say.  This entry is the record, and
 this file is the place a rebaser is sent.
+
+THE THIRD EDIT IS THREE OF THEM, THEY ARE ADDITIONS RATHER THAN CHANGES, AND
+THEY ALL CARRY MARKERS.  The two edits above are one-token changes that could
+not carry a marker without falsifying a citation.  These are the opposite
+case: each ADDS text, each addition carries its own `// PIE:` marker, and step
+1 therefore removes the comment and leaves the code -- which for an addition
+is not enough.  Step 3 has to take these out, and here is what it takes out:
+
+    attention/default_decode_params.cuh   `IdType* q_indptr;` appended to
+                                          `BatchDecodeParams`, after
+                                          `partition_kv`, plus its
+                                          `q_indptr(nullptr)` in both of that
+                                          struct's constructor init lists.
+                                          `BatchDecodeParamsMLA` and the two
+                                          Single structs are untouched.
+    attention/decode.cuh                  the two `q + batch_idx * q_stride_n`
+                                          in the batch decode device function
+                                          become
+                                          `q + params.q_indptr[batch_idx] * ...`.
+    attention/cascade.cuh                 a trailing
+                                          `const uint32_t* __restrict__ win`
+                                          on the two Persistent kernels, the
+                                          merge and its attention-sum
+                                          twin, and the two lines each derives
+                                          from it: the row count is bounded by
+                                          `win[0]` and every `v_merged` /
+                                          `s_merged` / `v_sum` write is shifted
+                                          by `win[1]`.  A null `win` is the
+                                          upstream kernel exactly.
+
+WHY THEY EXIST, IN ONE SENTENCE EACH.  A decode request's query row was
+`batch_idx` itself, which is true only while the launch's request numbers and
+the plane's rows are one numbering; PIE's engine can hand these kernels a
+plane a window sits inside, and prefill has read a `q_indptr` for that reason
+all along.  And the cascade merge wrote its output dense from row zero, which
+is the same assumption on the output side -- `win` is the `(count, start)`
+seat every other kernel in this tree already takes, spelled here for the one
+launch of the fa2 family that touches the fire's own planes.
+
+THE COLUMNS MOVED WITH THEM.  The three rows above were re-derived from the
+files; `added` was raised by each file's net line delta, which for these edits
+includes two continuation lines that are a REWRAP of an upstream line rather
+than an addition.  The column has no surviving definition to be exact against
+-- the test that re-derived it is gone (see THE TEST IS GONE above) -- and
+overcounting by two is the direction that does not claim upstream text is
+ours.
 
 HOST C++ IS GONE, AND THAT IS WHY THIS TABLE LOST FOUR ROWS.  The move
 carried 28 files.  Four of them contained no device code at all -- not one
@@ -815,9 +862,9 @@ had a second one.
 
 file                                       guards   added    lines      bytes
 -----------------------------------------------------------------------------
-attention/cascade.cuh                            1       6      564      23436
-attention/decode.cuh                             3      13      921      41006
-attention/default_decode_params.cuh              0       0      279       8705
+attention/cascade.cuh                            1      20      578      24483
+attention/decode.cuh                             3      18      926      41279
+attention/default_decode_params.cuh              0       8      287       9138
 attention/default_prefill_params.cuh             4      12      208       6253
 attention/mask.cuh                               0       0       30        922
 attention/mla.cuh                                4      28     1127      53926
@@ -842,7 +889,7 @@ profiler.cuh                                     0       0      149       6708
 utils.cuh                                        6      26      497      26136
 vec_dtypes.cuh                                   0       0     2194      74561
 -----------------------------------------------------------------------------
-26 files                                        40     367    15280     651326
+26 files                                        40     394    15307     653079
 12 files are untouched. `LICENSE` is upstream's, copied and not counted.
 
 Not upstream, written by PIE, and NO LONGER IN THIS DIRECTORY:

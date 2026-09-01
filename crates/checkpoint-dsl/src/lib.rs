@@ -97,7 +97,7 @@ impl<'a> Builder<'a> {
     /// would be two imports pretending to be one. So the call site says the
     /// logical name and this verb says how many tensors that is.
     ///
-    /// **THE TRIPLET IS REQUIRED, NOT PREFERRED.** A weight declared `MlxU4`
+    /// **THE TRIPLET IS REQUIRED, NOT PREFERRED.** A weight declared `U4g64`
     /// against a checkpoint that ships bf16 could instead let the LOADER
     /// encode — which is a real and wanted path through `read_own`, and a
     /// disaster through `model::identify`: the u4 SKU would claim every bf16
@@ -251,9 +251,9 @@ fn group_of(dtype: Dtype) -> u32 {
         Dtype::Mxfp4 => 32,
         // Both affine widths group sixty-four CODES, not sixty-four bytes:
         // the group is a property of the scheme and the width is a property
-        // of the code. See `dtype::Dtype::MlxU8`.
-        Dtype::MlxU4 | Dtype::MlxU8 => 64,
-        Dtype::MlxU4G32 => 32,
+        // of the code. See `dtype::Dtype::U8g64`.
+        Dtype::U4g64 | Dtype::U8g64 => 64,
+        Dtype::U4g32 => 32,
         other => panic!("`{other:?}` blocks no axis; only a packed bank has groups"),
     }
 }
@@ -291,7 +291,7 @@ struct Claim {
 #[must_use]
 fn claim(w: &Weight, tp: u32) -> Claim {
     let (encoding, scales) = match w.dtype {
-        Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => {
+        Dtype::Mxfp4 | Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => {
             (grouped(w), Some(scaling(w)))
         }
         Dtype::Bf16
@@ -301,17 +301,32 @@ fn claim(w: &Weight, tp: u32) -> Claim {
         | Dtype::U32
         | Dtype::U8
         | Dtype::I8
-        | Dtype::Fp8E4m3
+        | Dtype::E4m3
         | Dtype::E8m0
-        | Dtype::Fp8E5m2
+        | Dtype::E5m2
         | Dtype::I64
         | Dtype::I16
         | Dtype::U64
         | Dtype::U16
         | Dtype::Bool => (encoding(w.dtype), None),
-        Dtype::Fp4 => panic!(
-            "`Dtype::Fp4` names a kv-page quantization scheme, not a stored \
+        Dtype::E2m1 => panic!(
+            "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
+        ),
+        // Served formats no model text declares yet — they reach the engine
+        // through an import plan, never through a load contract's weight
+        // declaration, so a claim naming one has no encoding story here.
+        Dtype::Nvfp4
+        | Dtype::U2g16k
+        | Dtype::I3g16k
+        | Dtype::U4g32k
+        | Dtype::U5g32k
+        | Dtype::I6g16k
+        | Dtype::E4m3row
+        | Dtype::E4m3tile128 => panic!(
+            "`{:?}` is served but not yet a weight representation a load \
+             contract declares",
+            w.dtype
         ),
     };
     Claim {
@@ -415,7 +430,7 @@ fn planes(
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
     match w.dtype {
-        Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => affine_planes(src, w, vec![from]),
+        Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => affine_planes(src, w, vec![from]),
         _ => Ok(vec![copy(src, w, from)?]),
     }
 }
@@ -427,7 +442,7 @@ fn planes_fused(
 ) -> Result<Vec<TensorContract>, Error> {
     let parts: Vec<String> = parts.into_iter().collect();
     match w.dtype {
-        Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => affine_planes(src, w, parts),
+        Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => affine_planes(src, w, parts),
         _ => Ok(vec![fused(src, w, parts)?]),
     }
 }
@@ -843,7 +858,7 @@ fn seams_clear_the_blocked_axis(
 pub fn scaling(w: &Weight) -> Scales {
     let form = match w.dtype {
         Dtype::Mxfp4 => ScaleForm::RawE8M0,
-        Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => ScaleForm::Bf16AffineFactors,
+        Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => ScaleForm::Bf16AffineFactors,
         other => panic!(
             "`{}` is {other:?}, which pairs with nothing; only a packed bank \
              has scales",
@@ -915,12 +930,12 @@ pub fn encoding(dtype: Dtype) -> Encoding {
         Dtype::U32 => Encoding::Raw(DType::U32),
         Dtype::U8 => Encoding::Raw(DType::U8),
         Dtype::I8 => Encoding::Raw(DType::I8),
-        Dtype::Fp8E4m3 => Encoding::Raw(DType::Fp8E4m3),
+        Dtype::E4m3 => Encoding::Raw(DType::E4m3),
         Dtype::E8m0 => Encoding::Raw(DType::E8m0),
         // The six the checkpoint vocabulary brought when the two dtype enums
         // merged. Each stores itself verbatim, so each is `Raw` of itself —
         // the same answer every row above gives.
-        Dtype::Fp8E5m2 => Encoding::Raw(DType::Fp8E5m2),
+        Dtype::E5m2 => Encoding::Raw(DType::E5m2),
         Dtype::I64 => Encoding::Raw(DType::I64),
         Dtype::I16 => Encoding::Raw(DType::I16),
         Dtype::U64 => Encoding::Raw(DType::U64),
@@ -937,7 +952,7 @@ pub fn encoding(dtype: Dtype) -> Encoding {
         // under one bf16 scale and one bf16 offset, dequantized to bf16. The
         // channel axis is stated by whoever holds the shape —
         // `grouped` — because a rank is not a fact about a scheme.
-        Dtype::MlxU4 => Encoding::Quant(QuantSpec {
+        Dtype::U4g64 => Encoding::Quant(QuantSpec {
             scheme: QuantScheme::MlxAffineU4,
             logical_dtype: DType::Bf16,
             bits_per_element: 4,
@@ -951,29 +966,42 @@ pub fn encoding(dtype: Dtype) -> Encoding {
         // bank needs no scheme of its own. `Landing::affine_point_of` reports
         // this number to the engine and `kernels_metal::linear::quant` stamps
         // a point at both widths, so the two travel the whole way down as one
-        // path with a number in it. See `dtype::Dtype::MlxU8` for the
+        // path with a number in it. See `dtype::Dtype::U8g64` for the
         // checkpoint that mixes them.
-        Dtype::MlxU8 => Encoding::Quant(QuantSpec {
+        Dtype::U8g64 => Encoding::Quant(QuantSpec {
             scheme: QuantScheme::MlxAffineU4,
             logical_dtype: DType::Bf16,
             bits_per_element: 8,
             group_size: 64,
             channel_axis: None,
         }),
-        // **AND THE SAME SCHEME AT HALF THE GROUP** — `MlxU8`'s argument one
+        // **AND THE SAME SCHEME AT HALF THE GROUP** — `U8g64`'s argument one
         // spec field over: `group_size` has always been the number that says
         // how many codes share a scale, and a 160-wide table row can only
-        // group by thirty-two (see `dtype::Dtype::MlxU4G32`).
-        Dtype::MlxU4G32 => Encoding::Quant(QuantSpec {
+        // group by thirty-two (see `dtype::Dtype::U4g32`).
+        Dtype::U4g32 => Encoding::Quant(QuantSpec {
             scheme: QuantScheme::MlxAffineU4,
             logical_dtype: DType::Bf16,
             bits_per_element: 4,
             group_size: 32,
             channel_axis: None,
         }),
-        Dtype::Fp4 => panic!(
-            "`Dtype::Fp4` names a kv-page quantization scheme, not a stored \
+        Dtype::E2m1 => panic!(
+            "`Dtype::E2m1` names a kv-page quantization scheme, not a stored \
              weight plane; no load contract declares one"
+        ),
+        // See `claim`: served, but no load contract declares one yet, so no
+        // encoding is theirs to have here.
+        Dtype::Nvfp4
+        | Dtype::U2g16k
+        | Dtype::I3g16k
+        | Dtype::U4g32k
+        | Dtype::U5g32k
+        | Dtype::I6g16k
+        | Dtype::E4m3row
+        | Dtype::E4m3tile128 => panic!(
+            "`{dtype:?}` is served but not yet a weight representation a load \
+             contract declares"
         ),
     }
 }

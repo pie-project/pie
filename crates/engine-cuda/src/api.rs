@@ -339,9 +339,7 @@ impl Cuda {
 /// `engine::error`'s header draws.
 fn fault(fault: Fault) -> Error {
     match fault {
-        Fault::Runtimeless | Fault::Device { .. } | Fault::Schedule { .. } => {
-            Error::Device(fault.to_string())
-        }
+        Fault::Runtimeless | Fault::Device { .. } => Error::Device(fault.to_string()),
         // `Unlowered` joins them: a region baked behind a conditional node is
         // an ARTIFACT this shell cannot record, so the recovery is a different
         // profile at load time and not a different fire.
@@ -1205,19 +1203,6 @@ intended for diagnostics, not serving",
         let mut steps = Vec::with_capacity(frame.steps.len());
         let mut settled = Vec::with_capacity(frame.steps.len());
         for (index, step) in frame.steps.iter().enumerate() {
-            // ── THE NEXT STEP, STATED (`Engine::expect_fire`, advisory).
-            //    The fold's prebind applies the SUCCESSOR's cached binding to
-            //    a seat that is not in flight, inside this step's own hidden
-            //    window, so the successor has to be on the table before this
-            //    step fires. It used to be stated by the runtime's per-step
-            //    loop; a frame that crosses whole is a frame whose successors
-            //    the engine already knows, so the hint is derived here instead
-            //    of restated there. The lookahead ACROSS frames stays the
-            //    runtime's, because only the scheduler can see the launch
-            //    queued behind this one.
-            if let Some(next) = frame.steps.get(index + 1) {
-                self.expect_fire(next);
-            }
             // ── ARTICLE 1, AND THE ERROR ARM IS ARTICLE 4's OTHER HALF. A
             //    step that faults POISONS THE FRAME'S REMAINING STEPS — the
             //    loop simply stops, so nothing after it is prepared or
@@ -1312,59 +1297,6 @@ intended for diagnostics, not serving",
         }
         self.pending = Some((ticket.id, settled));
         Ok(())
-    }
-
-    /// The contract's advisory, landed on [`Shell::expect`]: the fold's
-    /// prebind seam (`.wiki/palo/cuda-abi.md` §6d) applies the hinted
-    /// composition's cached binding to an exec that is not in flight, after
-    /// the next fire's launch and before its sync.
-    ///
-    /// Only the composition crosses — `Shell::expect` reads each lane's
-    /// `word` and `tokens.len()` and nothing else, so the borrow of the
-    /// token vectors here is a shape statement, not a content one. Nothing
-    /// of `fire`'s validation runs: a hint the artifact cannot compose is
-    /// dropped inside `expect` (the fire that actually submits it will say
-    /// why), and a hint before a load has no shell to warm and warms
-    /// nothing — both are the advisory contract's "a wrong hint costs only
-    /// the hidden work", not errors.
-    fn expect_fire(&mut self, submission: &Step) {
-        // The HINT sees the same words the fire will, adapters included: the
-        // prebind caches a composition, and a composition is a set of classes
-        // — so a hint stated in the unadapted classes would warm the wrong
-        // one and the fire it was for would find nothing. Advisory either way
-        // (a wrong hint costs only the hidden work), which is why the lookup
-        // here refuses nothing and simply leaves the word alone.
-        let adapted: Vec<bool> = if self.adapters.is_empty() {
-            vec![false; submission.lanes.len()]
-        } else {
-            let mut adapted = vec![false; submission.lanes.len()];
-            for attachment in &submission.attachments {
-                if self.adapters.contains_key(&attachment.instance)
-                    && let Some(lane) = adapted.get_mut(attachment.lane as usize)
-                {
-                    *lane = true;
-                }
-            }
-            adapted
-        };
-        let Ok(shell) = self.loaded_mut() else {
-            return;
-        };
-        let lanes: Vec<Lane<'_>> = submission
-            .lanes
-            .iter()
-            .enumerate()
-            .map(|(at, lane)| Lane {
-                slot: lane.slot,
-                word: if adapted[at] {
-                    shell.adapted_word(lane.word).unwrap_or(lane.word)
-                } else {
-                    lane.word
-                },
-                tokens: &lane.tokens,
-            })
-            .collect();
-        shell.expect(&lanes);
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
@@ -2033,12 +1965,14 @@ impl Cuda {
         //    three, with `read_out` on the end; it is what the native surface
         //    and the arming pass use, and it is deliberately not what this
         //    path calls.
-        // ── THE FOLD'S ARMING INSTANT, BEFORE ANY OF THIS FIRE'S STAGING
-        //    (design §4: arming is control plane). It used to be the first
-        //    line of `Shell::fire_captured`, which was the only door onto the
-        //    phases; this path drives them directly, so it calls the door by
-        //    name. Nothing here can fail a fire — see `Shell::arm_if_due`.
-        shell.arm_if_due(&seated);
+        //
+        //    **AND THERE IS NO ARMING INSTANT ON THIS PATH ANY MORE.** An
+        //    arming call stood here, ahead of every fire's staging, because
+        //    the graph fold armed a bucket off the first real fire that
+        //    reached it. Bodies arm at LOAD (`Shell::arm_bodies`, the last
+        //    thing `Shell::load` does) and the map is sealed before a caller
+        //    connects, so the serving path has nothing to arm and this is one
+        //    fewer thing between a submission and its launches.
 
         // ── **THE MARSHAL** (media-door §6, wave MD-C). The contract's media
         //    rows in, `serve::Media` borrows out — the same eight fields,

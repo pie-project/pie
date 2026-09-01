@@ -86,6 +86,16 @@ pub struct DecodeParams {
     pub kv_chunk_size_ptr: DevicePtr,
     pub block_valid_mask: DevicePtr,
     pub partition_kv: bool,
+    /// **THE DECODE SIDE'S ROW INDIRECTION** — `[lanes + 1]` query
+    /// boundaries, appended to `::flashinfer::BatchDecodeParams` where
+    /// prefill has carried a `q_indptr` all along. `decode.cuh` read
+    /// `q + batch_idx * q_stride_n` and now reads
+    /// `q + q_indptr[batch_idx] * q_stride_n`; for a decode lane the two are
+    /// the same number whenever the vector is the launch's own rebased one,
+    /// because a decode lane is exactly one query row. They part company when
+    /// `batch_idx` is a FIRE lane and the rows it names are the plane's,
+    /// which is the whole reason the field exists.
+    pub q_indptr: DevicePtr,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -184,6 +194,18 @@ pub fn sm_scale_or_default(sm_scale: f32, head_dim: u32) -> f32 {
     }
 }
 
+/// The paged-kv view the fa2 kernels take by value.
+///
+/// **`batch_size` IS THE INDEX THE PROTECTIVE PAGE BOUND IS READ AT**, and
+/// that is its only device meaning: three `indptr[batch_size]` sites
+/// (`decode.cuh`:479 and :753, `prefill.cuh`:3420) take it as `last_indptr`,
+/// the ceiling `paged_kv_t::protective_get_kv_offset` clamps an over-iterated
+/// page against. It is therefore ONE PAST THE LAST LANE OF THE VECTOR THIS
+/// LAUNCH WAS HANDED — `lane_offset + num_requests`, which is the request
+/// count itself wherever the table was sliced to the window, and the window's
+/// end inside the FIRE's table wherever it was handed over whole. Too SMALL
+/// is the silent failure: a legitimate page clamps to offset 0 and the fire
+/// reads page zero's bytes.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn make_paged_kv(
@@ -241,7 +263,7 @@ pub fn make_decode_params(
             shape.num_kv_heads,
             shape.page_size,
             shape.head_dim,
-            shape.num_requests,
+            shape.lane_offset + shape.num_requests,
             shape.hnd_layout,
             bufs.k_pages,
             bufs.v_pages,
@@ -272,6 +294,11 @@ pub fn make_decode_params(
     p.kv_tile_indices = resolve(int_buf, info.kv_tile_indices_offset);
     p.o_indptr = resolve(int_buf, info.o_indptr_offset);
     p.kv_chunk_size_ptr = resolve(int_buf, info.kv_chunk_size_ptr_offset);
+    // The row indirection, from the same CSR the prefill side takes. It is
+    // never optional: `decode.cuh` dereferences it for every work item, so a
+    // caller that leaves it null faults loudly rather than reading the rows
+    // `batch_idx` used to name.
+    p.q_indptr = bufs.qo_indptr;
     p.padded_batch_size = info.padded_batch_size as u32;
     p.partition_kv = info.split_kv;
 
@@ -315,7 +342,7 @@ pub fn make_prefill_params(
             shape.num_kv_heads,
             shape.page_size,
             shape.head_dim,
-            shape.num_requests,
+            shape.lane_offset + shape.num_requests,
             shape.hnd_layout,
             bufs.k_pages,
             bufs.v_pages,
@@ -352,7 +379,20 @@ pub fn make_prefill_params(
     p.partition_kv = info.split_kv;
 
     p.max_total_num_rows = info.total_num_rows as u32;
-    p.total_num_rows = 0;
+    // **THE COUNT THE PLAN HAS BEEN STAGING ALL ALONG**, wired at last. The
+    // schedule writes `qo_indptr[batch_size]` — this window's own row total —
+    // at `total_num_rows_offset` whenever it laid one out, and the fold reads
+    // `*seq_len_ptr` in place of the baked `max_seq_len` when the pointer is
+    // not null. The two numbers are equal by construction (`Request::
+    // total_num_rows` IS that last boundary), so wiring it moves no token; it
+    // is the fold's bound becoming a word this fire wrote rather than one a
+    // capture froze. A schedule that laid no such word out keeps the null,
+    // which is why this is not `resolve` — `resolve` answers the workspace
+    // BASE for an absent seat, and the fold would read that as a count.
+    p.total_num_rows = match info.total_num_rows_offset {
+        Some(off) => int_buf.saturating_add(u64::from(off)),
+        None => 0,
+    };
 
     let mut partials = Partials::default();
     if info.split_kv {

@@ -215,6 +215,37 @@ pub struct Ctx {
     /// threads, because a `Ctx` holds raw handles and is neither `Send` nor
     /// `Sync` already.
     pad: core::cell::Cell<Pad>,
+
+    /// The device address of this REGION's live-geometry words, or `0` — the
+    /// staged-geometry seat (bodies design; the census's option (c)).
+    ///
+    /// **FOUR `u32` LIVE AT THAT ADDRESS, AND THE ORDER IS THE ENGINE'S
+    /// CONTRACT** (`engine_cuda::window`): `[rows, row_offset, lanes,
+    /// lane_offset]`. The cell here is an ADDRESS and knows none of that — it
+    /// is the kernels that read words, each only the ones its own grid means.
+    /// A row-gridded entry reads 0 and 1; a REQUEST-gridded one (the chunked
+    /// linear-attention scans) reads 2 and 3 instead, retiring padded lanes on
+    /// `win[2]` and turning its window request number into a fire lane with
+    /// `win[3]`. Widening the seat moved neither of the first two words, which
+    /// is why every entry that shipped before the lane pair existed is
+    /// untouched by it.
+    ///
+    /// **THE SAME LIFECYCLE ARGUMENT AS `pad`, FOR THE INVERSE OPERATION.**
+    /// `pad` rounds a launch's extent UP to a bucket the recorded graph was
+    /// carved for; the stage is how a REPLAY of that graph serves fewer rows
+    /// than it was carved at: an entry that supports the seat passes this
+    /// address as its `win` argument, and the device text's
+    /// `if (win != nullptr && r >= win[0]) return;` retires the rows the
+    /// bucket padded in — read from memory at run time, never baked into a
+    /// node parameter. Fire-lived, region-stamped, eight bytes between two
+    /// fires: a `Cell` for exactly `pad`'s reason.
+    ///
+    /// `0` IS THE WHOLE OF THE OFF SWITCH. [`ArgValue::ABSENT`] is
+    /// `Ptr(0)`, so a disarmed stage and the null seat every entry passes
+    /// today are the SAME argument bytes — an engine that never arms this
+    /// leaves every launch bit-identical to the plane before the field
+    /// existed, which is what "no regression by construction" means here.
+    stage: core::cell::Cell<u64>,
 }
 
 impl Ctx {
@@ -232,6 +263,7 @@ impl Ctx {
                 rows: 0,
                 bucket: 0,
             }),
+            stage: core::cell::Cell::new(0),
         }
     }
 
@@ -312,6 +344,14 @@ impl Ctx {
     /// block rather than freeing it — the address a recorded graph holds
     /// stays its own for the life of the arena. The module comment there
     /// carries the measurement.
+    ///
+    /// **THE CONTRACT ON A NEW SLAB'S AUTHOR**: size it by the launch's own
+    /// row count and load-fixed constants, and by nothing else. Every slab in
+    /// the tree is monotone in per-launch rows, and the bodies path SPENDS
+    /// that fact: its staleness check watches per-launch rows alone, so "no
+    /// launch grew" must keep implying "no slab grew". A slab sized off a
+    /// chunk count, a page count or a lane count would break that theorem
+    /// silently — grow one off rows, or bring the check a new witness.
     pub fn scratch(
         &self,
         op: &'static str,
@@ -360,6 +400,36 @@ impl Ctx {
     /// a bench firing on this stream between two fires must see.
     pub fn disarm(&self) {
         self.pad.set(Pad::default());
+    }
+
+    /// Stamp the staged-geometry seat: the device address of the four `u32`
+    /// this region's live geometry will be read from at run time.
+    ///
+    /// **PER REGION, LIKE [`arm`](Ctx::arm)**, and armed by the same caller
+    /// for the same reason: only the engine's walk knows which region the
+    /// next launch belongs to, and a region's live rows are its window's, not
+    /// the fire's. An entry that supports the seat passes [`stage`](Ctx::stage)
+    /// as its `win` argument; one that does not is unaffected, because the
+    /// seat travels as an ordinary argument and this cell is read by nothing
+    /// else.
+    pub fn arm_stage(&self, addr: u64) {
+        self.stage.set(addr);
+    }
+
+    /// Put the stage back to "no body is being served" — the null seat.
+    pub fn disarm_stage(&self) {
+        self.stage.set(0);
+    }
+
+    /// The staged-geometry seat as the argument an entry passes: the
+    /// live-geometry words' address, or [`ArgValue::ABSENT`] when nothing
+    /// armed one —
+    /// which are the same variant, because `ABSENT` is `Ptr(0)` and `0` is
+    /// the disarmed stage. The device guard reads `win != nullptr` off
+    /// exactly these bytes.
+    #[must_use]
+    pub fn stage(&self) -> ArgValue {
+        ArgValue::Ptr(self.stage.get())
     }
 
     /// What this fire told the entries to round to, for a caller that wants

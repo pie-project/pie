@@ -178,14 +178,22 @@ __global__ void sink_rescale(
     const T* __restrict__ sinks,
     i32 N,
     i32 num_q_heads,
-    i32 head_dim)
+    i32 head_dim,
+    const u32* __restrict__ win)
 {
     const i32 t = static_cast<i32>(blockIdx.x);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && t >= static_cast<i32>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first block owns.
+    const i32 t_row = win != nullptr ? t + static_cast<i32>(win[1]) : t;
     const i32 h = static_cast<i32>(blockIdx.y);
     if (t >= N || h >= num_q_heads) return;
 
     constexpr float kLn2 = 0.69314718055994530942f;
-    const float lse_val = lse[t * num_q_heads + h];
+    const float lse_val = lse[t_row * num_q_heads + h];
     const float sink = Elem<T>::to_f32(sinks[h]);
     float r;
     if (!isfinite(lse_val)) {
@@ -197,7 +205,7 @@ __global__ void sink_rescale(
     }
 
     const i32 row_stride = num_q_heads * head_dim;
-    T* row = o + static_cast<long long>(t) * row_stride + h * head_dim;
+    T* row = o + static_cast<long long>(t_row) * row_stride + h * head_dim;
     for (i32 d = static_cast<i32>(threadIdx.x); d < head_dim;
          d += static_cast<i32>(blockDim.x)) {
         row[d] = Elem<T>::from_f32(Elem<T>::to_f32(row[d]) * r);
@@ -430,35 +438,44 @@ __global__ void merge_lse_combine(
     T* __restrict__ o_out,
     float* __restrict__ lse_out,
     int num_heads,
-    int head_dim)
+    int head_dim,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first block owns. Both
+    // partials, both log-sums and both outputs ride that one row axis.
+    const int n_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = blockIdx.y;
 
-    const float l1 = lse1[n * num_heads + h];
-    const float l2 = lse2[n * num_heads + h];
+    const float l1 = lse1[n_row * num_heads + h];
+    const float l2 = lse2[n_row * num_heads + h];
 
     if (!isfinite(l2)) {
 
         if (o1 != o_out) {
-            const long long off = (static_cast<long long>(n) * num_heads + h) * head_dim;
+            const long long off = (static_cast<long long>(n_row) * num_heads + h) * head_dim;
             for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
                 o_out[off + d] = o1[off + d];
             }
         }
         if (lse_out != nullptr && lse_out != lse1) {
-            if (threadIdx.x == 0) lse_out[n * num_heads + h] = l1;
+            if (threadIdx.x == 0) lse_out[n_row * num_heads + h] = l1;
         }
         return;
     }
 
     if (!isfinite(l1)) {
-        const long long off = (static_cast<long long>(n) * num_heads + h) * head_dim;
+        const long long off = (static_cast<long long>(n_row) * num_heads + h) * head_dim;
         for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
             o_out[off + d] = o2[off + d];
         }
         if (lse_out != nullptr) {
-            if (threadIdx.x == 0) lse_out[n * num_heads + h] = l2;
+            if (threadIdx.x == 0) lse_out[n_row * num_heads + h] = l2;
         }
         return;
     }
@@ -468,7 +485,7 @@ __global__ void merge_lse_combine(
     const float w2 = exp2f(l2 - lse_max);
     const float inv_total = 1.0f / (w1 + w2);
 
-    const long long off = (static_cast<long long>(n) * num_heads + h) * head_dim;
+    const long long off = (static_cast<long long>(n_row) * num_heads + h) * head_dim;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         const float v1 = Elem<T>::to_f32(o1[off + d]);
         const float v2 = Elem<T>::to_f32(o2[off + d]);
@@ -476,7 +493,7 @@ __global__ void merge_lse_combine(
     }
 
     if (lse_out != nullptr && threadIdx.x == 0) {
-        lse_out[n * num_heads + h] = lse_max + log2f(w1 + w2);
+        lse_out[n_row * num_heads + h] = lse_max + log2f(w1 + w2);
     }
 }
 }

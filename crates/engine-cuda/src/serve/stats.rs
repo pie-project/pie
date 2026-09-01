@@ -1,5 +1,5 @@
 //! **WHAT A CALLER CAN ASK A LOADED SHELL** — the read-back surface, and the
-//! five words that flip between fires.
+//! words that flip between fires.
 //!
 //! A child module of [`serve`](super) rather than a sibling, because these
 //! are `Shell`'s own methods reading `Shell`'s own private fields: what moved
@@ -9,10 +9,10 @@
 //! * **an accessor**, handing back a fact the load already computed (the
 //!   trace, the bake, the paging, the export axes);
 //! * **a counter**, handing back what the last fire or the whole process
-//!   measured (the graph cache's stats, the fold's motion, the pools'
-//!   committed bytes, the weight cache's hits);
+//!   measured (the graph cache's census, the pools' committed bytes, the
+//!   weight cache's hits);
 //! * **a toggle**, moving one word between two fires so an A/B is ONE load
-//!   with one thing changed — [`Shell::set_mode`]'s argument, made five
+//!   with one thing changed — [`Shell::set_mode`]'s argument, made three
 //!   times.
 //!
 //! It sat in `serve.rs` under a header saying that file has no logic and is
@@ -314,49 +314,60 @@ impl Shell {
     /// otherwise identical fires and diffing the logits is a complete test of
     /// the claim. One shell, for `set_mode`'s reason: two loads would be two
     /// residencies and two tuner histories, and a difference could be either.
+    /// **AND IT SHAPES A BODY'S CUTS, WHICH IS WHAT TIER 2 CHANGED ABOUT
+    /// IT.** The copy policy was half of a graph KEY under the retired
+    /// exact-shape cache — a copied region records a gather, one launch and a
+    /// scatter where a split records `r` launches — and for one wave after
+    /// that it was a pure walk-shape word, because a gathered region was
+    /// refused admission and the fires the two policies shaped differently
+    /// were exactly the fires no body served. Neither is true now. A
+    /// `record::BodyKey` still carries no copy axis, and a gathered region is
+    /// now an ISLAND: so this word decides WHERE a body of that key is cut,
+    /// while the key itself cannot tell the two answers apart.
+    ///
+    /// **SO IT IS A BOOT-TIME A/B AND NOT A BETWEEN-FIRES ONE, ON A LOAD
+    /// WHOSE LATTICE HAS A COPY ROW.** State it before `Shell::load` arms
+    /// (`[engine] fallback_copy`) and everything below is consistent: the
+    /// arming pass derives one segmentation per key and every replay wants
+    /// that one. Flip it between fires and a key that already holds a body
+    /// keeps a script cut for the OTHER policy — `Shell::segments` re-derives
+    /// the table, because it stores the word beside it, but the resident
+    /// exec is what it is. `record::Graphs::fire_body`'s island `debug_assert`
+    /// is what catches that, by name, and closing it means either putting the
+    /// word in the key or standing bodies down for the fire that disagrees.
+    /// Until then: on a load with no copy row this word is still the pure
+    /// walk-shape A/B it was, and on one with a copy row it belongs in the
+    /// boot document.
+    ///
+    /// What it still moves, and safely, is the WALK — `Windows`,
+    /// `FireCost::copied`, `Shell::last_fire_cost` — which is the whole of
+    /// what an eager-arm diff reads.
     pub fn set_copies(&mut self, copies: bool) {
-        // The graph cache is keyed on this (`record::Key`), so flipping it
-        // misses rather than replaying a body recorded under the other policy.
         self.copies = copies;
     }
 
-    /// Does this shell fold the composition axis? See [`Shell::fold`]'s field.
+    /// Does this shell serve fires from a recorded body? See
+    /// [`Shell::bodies`](super::Shell)'s field.
     #[must_use]
-    pub fn folding(&self) -> bool {
-        self.fold
+    pub fn bodying(&self) -> bool {
+        self.bodies
     }
 
-    /// Turn the fold on or off between fires — the third A/B, and it is one
+    /// Turn the bodies path on or off between fires — the fourth A/B, and one
     /// load for [`Shell::set_mode`]'s reason: two loads would be two
     /// residencies and two tuner histories, and a difference could be either.
-    /// Buckets already armed stay armed; turning the fold off simply stops
-    /// routing fires through them, exactly as `set_mode(Off)` leaves keyed
-    /// execs resident.
-    pub fn set_fold(&mut self, fold: bool) {
-        self.fold = fold;
-    }
-
-    /// Turn the fold's pipeline on or off between fires — the twin exec and
-    /// the ahead-of-sync prebind ([`Knobs::pipeline`](super::Knobs::pipeline)).
-    /// Off is step 4's fold exactly, which is what the pipelined revisit
-    /// gate diffs against; one load, for [`Shell::set_mode`]'s reason.
-    pub fn set_pipeline(&mut self, pipeline: bool) {
-        self.cache.set_pipeline(pipeline);
-    }
-
-    /// Is the fold's pipeline on?
-    #[must_use]
-    pub fn pipelining(&self) -> bool {
-        self.cache.pipelined()
-    }
-
-    /// Choose the fold's disable policy between fires
-    /// ([`Knobs::fold_disable_library`](super::Knobs::fold_disable_library)):
-    /// `false`
-    /// disables every absent-window node, `true` keeps pie windowed nodes
-    /// enabled at fitted zero rows and disables only the library residue.
-    pub fn set_fold_library(&mut self, library: bool) {
-        self.cache.set_fold_library(library);
+    ///
+    /// Bodies already captured stay captured; turning it off simply stops
+    /// routing fires through them — and stops staging the live-rows seat,
+    /// which is what makes the off arm the EAGER walk byte for byte rather
+    /// than the eager walk plus a copy.
+    ///
+    /// **IT TAKES EFFECT AT THE NEXT `prepare` AND NOT AT THE NEXT LAUNCH.**
+    /// Whether a fire is a body's is decided on the host half of the step,
+    /// because that is where the seat's words are written; a flip between a
+    /// step's prepare and its enqueue moves the step after it.
+    pub fn set_bodies(&mut self, bodies: bool) {
+        self.bodies = bodies;
     }
 
     /// What the last fire's window table cost. See [`FireCost`].
@@ -365,16 +376,22 @@ impl Shell {
         self.last
     }
 
-    /// What this load's graph cache has done.
+    /// **WHAT THIS LOAD'S GRAPH CACHE HAS DONE — THE WHOLE CENSUS, ON ONE
+    /// SURFACE.** There used to be three (`graph_stats`, `fold_stats` and this
+    /// one) and an operator had to add up two of them to ask "how many fires
+    /// ran outside every graph"; there is one recorded path now and one struct
+    /// that answers for it.
+    ///
+    /// **INCLUDING THE TWO NUMBERS THIS CACHE DID NOT DO**:
+    /// `eager_rotating` and `eager_buffered` count fires the ROUTER walked
+    /// eagerly while the mode said record — a rotating load, a buffered
+    /// recurrent fire — and they ride here rather than a surface of their own
+    /// for exactly that reason. Zero under `Graphs::Off` and `Graphs::Shaped`
+    /// by construction: eagerness is what those modes ARE. See
+    /// [`record::BodyStats::eager_rotating`].
     #[must_use]
-    pub fn graph_stats(&self) -> record::Stats {
-        self.cache.stats()
-    }
-
-    /// What this load's fold has done. See [`record::FoldStats`].
-    #[must_use]
-    pub fn fold_stats(&self) -> record::FoldStats {
-        self.cache.fold_stats()
+    pub fn body_stats(&self) -> record::BodyStats {
+        self.cache.body_stats()
     }
 
     /// **PROBE SEAM (`palo cuda-abi` wave), off by default.** Ask this load's
@@ -384,9 +401,10 @@ impl Shell {
         self.cache.keep_graphs(keep);
     }
 
-    /// The graphs kept by [`Shell::keep_graphs`], in capture order.
+    /// The graphs kept by [`Shell::keep_graphs`], in capture order, each
+    /// beside the [`record::BodyKey`] its body was captured for.
     #[must_use]
-    pub fn kept_graphs(&self) -> &[(record::Key, crate::device::Graph)] {
+    pub fn kept_graphs(&self) -> &[(record::BodyKey, crate::device::Graph)] {
         self.cache.kept()
     }
 
@@ -503,10 +521,9 @@ impl Shell {
     /// The weight artifact cache's process-global census — restored, missed,
     /// stored, corrupt, declined.
     ///
-    /// Process-global for the same reason [`Shell::fold_observed`] is: a gate
-    /// at the runtime level holds the engine behind `Box<dyn Engine>` on a
-    /// lane thread and cannot ask a shell instance anything. See
-    /// [`crate::weight_cache::observed`].
+    /// Process-global because a gate at the runtime level holds the engine
+    /// behind `Box<dyn Engine>` on a lane thread and cannot ask a shell
+    /// instance anything. See [`crate::weight_cache::observed`].
     #[must_use]
     pub fn weight_cache_observed() -> crate::weight_cache::Observed {
         crate::weight_cache::observed()
@@ -520,16 +537,4 @@ impl Shell {
         crate::program::ports::resolved()
     }
 
-    /// The fold's process-global motion mirror —
-    /// `(folds, rebinds, rebind_us, swaps, prebinds, prebind_us, twins)` —
-    /// for a caller that cannot reach a shell instance: the serving runtime's
-    /// gates, which hold the engine behind `Box<dyn Engine>` on a lane
-    /// thread. See [`record::fold_observed`] for what is published, where,
-    /// and why process-global is the honest scope. An instance in hand
-    /// should ask [`Shell::fold_stats`] instead — it answers the full
-    /// census.
-    #[must_use]
-    pub fn fold_observed() -> (u64, u64, u64, u64, u64, u64, u64) {
-        record::fold_observed()
-    }
 }

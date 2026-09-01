@@ -408,6 +408,7 @@ fn plan_of(case: &Case) -> PrefillPlan {
         },
         shape: Shape {
             num_requests: case.requests() as u32,
+            lane_offset: 0,
             num_q_heads: case.q_heads,
             num_kv_heads: case.kv_heads,
             head_dim: case.head_dim,
@@ -887,7 +888,7 @@ fn the_refusals_fire_by_name() {
     );
 
     let mut quantized = pool;
-    quantized.keys = Tensor::new(k_at, pool.keys.rows, pool.keys.width, Dtype::Fp8E4m3);
+    quantized.keys = Tensor::new(k_at, pool.keys.rows, pool.keys.width, Dtype::E4m3);
     let dequantized = go(
         q,
         quantized,

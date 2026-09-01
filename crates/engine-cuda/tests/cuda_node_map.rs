@@ -27,6 +27,16 @@
 //! seam, walked into a map, with its census PRINTED rather than pinned (the
 //! probe's own lesson: pin the rules, print the catalogs).
 //!
+//! **AND WHAT THAT SEAM KEEPS IS A BODY NOW.** The exact-shape keyed cache
+//! this file used to capture through was deleted by the tier-2 campaign, so
+//! `kept_graphs` hands back `(BodyKey, Graph)` pairs — the key names a lattice
+//! point and a present set rather than a `(rows, lanes)` shape. Nothing about
+//! the node map changes with it: a `cudaGraph_t` is a `cudaGraph_t`, the walk
+//! reads parameter blocks, and the rules under test are the driver's. What
+//! changes is the key printed beside each census, and how the test has to
+//! arrange for a capture to happen at all — see
+//! `a_real_capture_becomes_a_node_map_...`, which states the seal argument.
+//!
 //! ```text
 //! cargo test -p engine-cuda --features cuda-13 --release \
 //!   --test cuda_node_map -- --nocapture --test-threads=1
@@ -37,7 +47,7 @@
 //! The whole file is behind `_cuda` because it launches kernels through
 //! `cudarc` directly — there is no kernel entry in `kernels-cuda` whose
 //! topology this file could bend into a fork — and every test skips at run
-//! time when the machine has no device, as `graph_replay.rs` does.
+//! time when the machine has no device, as `serve_smoke.rs` does.
 #![cfg(feature = "_cuda")]
 
 use core::ffi::c_void;
@@ -434,7 +444,20 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         slots: 4,
         ordinal: 0,
         graphs: Graphs::On,
-        knobs: engine_cuda::Knobs::default(),
+        // **AND `bodies` IS STOOD DOWN AT LOAD ON PURPOSE**, which is the one
+        // thing this file states differently from a deployment. A load that
+        // states the word arms its whole lattice and then SEALS the body map,
+        // so every capture happens inside `Shell::load` — before a test can
+        // ask `keep_graphs` for them — and no fire afterwards records
+        // anything for the probe to walk. Stood down here, the map is left
+        // open and the warm ladder captures off the traffic below, which is
+        // the only capture a test can put a seam in front of. The artifact is
+        // the same either way: arming captures go through `Graphs::fire_body`
+        // exactly as traffic captures do.
+        knobs: engine_cuda::Knobs {
+            bodies: false,
+            ..engine_cuda::Knobs::default()
+        },
         program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
@@ -500,6 +523,9 @@ fn a_real_capture_becomes_a_node_map_and_reports_its_ambiguity_census() {
 
     shell.keep_graphs(true);
     shell.set_mode(Graphs::On);
+    // The word, said here rather than at load, for the reason `ready` states:
+    // an armed load has nothing left to capture.
+    shell.set_bodies(true);
 
     // Two compositions, so the census has something to compare against.
     for _ in 0..3 {
@@ -567,9 +593,9 @@ fn a_real_capture_becomes_a_node_map_and_reports_its_ambiguity_census() {
 
         // A SECOND READING OF THE SAME GRAPH. Weaker than two captures — the
         // driver is enumerating one graph twice, not building two — but it is
-        // the strongest form the exec cache offers today (one capture per
-        // key, so a second capture of one composition does not exist to diff
-        // against), and it exercises the whole alignment over 400+ real
+        // the strongest form the body map offers today (one capture per
+        // `BodyKey`, so a second capture of one composition does not exist to
+        // diff against), and it exercises the whole alignment over 400+ real
         // nodes, ambiguous classes included.
         let again = nodes::walk(graph).expect("the kept graph walks twice");
         let (patches, unmoved, agreed) = aligned(

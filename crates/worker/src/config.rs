@@ -1576,8 +1576,11 @@ pub struct CudaNativeEngineOptions {
     pub enable_system_speculation: bool,
     /// **HOW MUCH OF A FIRE THE SHELL RECORDS**: `"off"` (the golden eager
     /// path), `"shaped"` (eager, with graph-shaped padded schedules — the
-    /// attribution arm) or `"on"` (captured once per shape key, replayed
-    /// after). **Omit for the shell's own default**, which is `"off"`.
+    /// attribution arm) or `"on"` (bodies: captured at load, replayed after).
+    /// **Omit for the shell's own default**, which is `"on"` — the other two
+    /// are diagnostic arms and the shell prints a line when it is asked to
+    /// serve one, because an uncaptured decode pays ~470 kernel launches of
+    /// host time per token-step.
     ///
     /// Written into the boot document as `[engine] graphs`, which the runtime
     /// has read since the palo rewrite and which nothing wrote until now.
@@ -1592,24 +1595,26 @@ pub struct CudaNativeEngineOptions {
     /// byte-identical across it: everything the padding computes lands in rows
     /// no reader has.
     pub pad: Option<bool>,
-    /// **THE FOLD** (D5-lite): under `graphs = "on"`, one exec per BUCKET,
-    /// captured once at a synthetic full composition and rebound on the host
-    /// per fire. **Omit for off**, which is the keyed path every fold gate
-    /// diffs against.
-    pub fold: Option<bool>,
-    /// **THE FOLD'S PIPELINE**: a hot bucket lazily instantiates a twin exec,
-    /// a fire whose composition a seat already holds launches with zero host
-    /// writing, and a stated successor's binding is applied to the idle exec
-    /// after the launch and before the sync. **Omit for on.** Ignored unless
-    /// `fold` is set.
-    pub pipeline: Option<bool>,
-    /// **WHICH ABSENT-WINDOW NODES A FOLDED EXEC DISABLES**: `"all"` disables
-    /// every one of them; `"library"` keeps pie windowed nodes enabled at
-    /// fitted zero rows and disables only the library residue. **Omit for
-    /// `"all"`**, which steady decode measured at parity with the other arm
-    /// (3.439 against 3.440 ms/fire, byte-identical tokens) and which has the
-    /// simpler failure story. Ignored unless `fold` is set.
-    pub fold_disable: Option<String>,
+    /// **BODIES**: under `graphs = "on"`, one exec per `(bucket, present
+    /// set)`, captured at LOAD for every point of the lattice the deployment
+    /// can realize and replayed across row counts off the staged-geometry
+    /// seat — no host rebinding at all, and no capture on the serving path.
+    /// **Omit for on**, which is the shipping graph path: since the tier-2
+    /// campaign a body is the only recorded path there is, and the regions a
+    /// graph cannot hold are re-issued eagerly between its execs rather than
+    /// refusing the composition. `false` is the DIAGNOSTIC arm — graphs on,
+    /// schedules graph-shaped, every fire walking — and it is what the bodies
+    /// gate diffs against for token identity.
+    ///
+    /// Three keys stood beside this one and named the FOLD (`fold`,
+    /// `pipeline`, `fold_disable`): one exec per BUCKET, rebound on the host
+    /// per fire. The tier-2 campaign deleted the fold along with the keyed
+    /// capture path — a body pays nothing per fire where the fold paid a
+    /// restatement per present node — so the three are gone from this struct.
+    /// They were `Option`s defaulting to absent, so a deployment that never
+    /// stated them is unaffected; one that did is refused by name here
+    /// (`deny_unknown_fields`) rather than silently ignored.
+    pub bodies: Option<bool>,
     /// **`Fallback::Copy` WHERE THE COMPILER'S TABLE ASKS FOR ONE.** Below the
     /// copy/split crossover — every bucket a decode fire lands in — a copy
     /// measured 1.07x the ideal against a split's 1.82x. **Omit for on.**
@@ -1685,9 +1690,7 @@ impl Default for CudaNativeEngineOptions {
             enable_system_speculation: false,
             graphs: None,
             pad: None,
-            fold: None,
-            pipeline: None,
-            fold_disable: None,
+            bodies: None,
             fallback_copy: None,
             grouped: None,
             side_streams: None,

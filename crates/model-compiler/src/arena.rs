@@ -1004,16 +1004,28 @@ pub fn elem_bytes(dtype: Dtype) -> Option<u64> {
         Dtype::I64 | Dtype::U64 => Some(8),
         Dtype::U8
         | Dtype::I8
-        | Dtype::Fp8E4m3
-        | Dtype::Fp8E5m2
+        | Dtype::E4m3
+        | Dtype::E5m2
         | Dtype::E8m0
         | Dtype::Bool => Some(1),
-        // `MlxU8` is byte-wide and still belongs here: it names a WEIGHT
+        // `U8g64` is byte-wide and still belongs here: it names a WEIGHT
         // bank's affine codes, and a code is only a number beside its group's
         // scale and offset. An arena rectangle of them would be an op that
         // declared its output in a storage element, which is what this refusal
         // is for.
-        Dtype::Fp4 | Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => None,
+        Dtype::E2m1
+        | Dtype::Mxfp4
+        | Dtype::Nvfp4
+        | Dtype::U4g64
+        | Dtype::U8g64
+        | Dtype::U4g32
+        | Dtype::U2g16k
+        | Dtype::I3g16k
+        | Dtype::U4g32k
+        | Dtype::U5g32k
+        | Dtype::I6g16k
+        | Dtype::E4m3row
+        | Dtype::E4m3tile128 => None,
     }
 }
 

@@ -12,7 +12,7 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
         "gptoss-20b-mlxu4-mxfp4-kv-bf16",
         1,
         model_dsl::trace_hybrid,
-        Model::b20(Dtype::MlxU4, Dtype::Mxfp4, Dtype::Bf16, 1)
+        Model::b20(Dtype::U4g64, Dtype::Mxfp4, Dtype::Bf16, 1)
     ),
     (
         "gptoss-20b-bf16-mxfp4-kv-bf16",
@@ -50,7 +50,7 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
 /// packing and its dense weights' representation are independent facts.
 pub const IMPORTS: &[crate::ImportRow] = &[
     ("gptoss-20b-mlxu4-mxfp4-kv-bf16", |src| {
-        Model::b20(Dtype::MlxU4, Dtype::Mxfp4, Dtype::Bf16, 1).import(src)
+        Model::b20(Dtype::U4g64, Dtype::Mxfp4, Dtype::Bf16, 1).import(src)
     }),
     ("gptoss-20b-bf16-mxfp4-kv-bf16", |src| {
         Model::b20(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, 1).import(src)

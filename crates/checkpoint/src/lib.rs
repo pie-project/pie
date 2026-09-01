@@ -45,7 +45,7 @@ pub mod executor;
 pub mod extent;
 pub mod file;
 pub mod plan;
-pub mod qnf;
+mod term;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 pub mod types;

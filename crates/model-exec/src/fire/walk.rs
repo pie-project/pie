@@ -105,6 +105,15 @@
 //! would renumber every region after the first prepare one and hand the whole
 //! capture somebody else's rows.
 //!
+//! **THERE ARE THREE SUCH FILTERS AND THEY ARE ONE MECHANISM.** [`Phases`]
+//! cuts the fire at the host/device seam, [`Units`] cuts it at the row-space
+//! seam (one exec per capture unit), and [`Regions`] cuts it at the
+//! CAPTURABILITY seam — a stretch of the template a shell can record, then a
+//! stretch it must re-issue eagerly, then another it can record. All three
+//! answer the same question about the same loop and none of them touches the
+//! structure, which is why a walk restricted three ways is still this walk
+//! and not another one.
+//!
 //! # The conditional bracket, and why an eager sink may ignore it
 //!
 //! A region P3 put behind a conditional node is announced with
@@ -243,6 +252,58 @@ impl Units {
     }
 }
 
+/// Which contiguous STRETCH of the template a walk dispatches — the third
+/// filter, and the one segmented capture is cut with (the tier-2 campaign).
+///
+/// **[`Phases`]' AND [`Units`]' TWIN, FOR THE THIRD REASON A SHELL HAS TO
+/// SPLIT ONE FIRE INTO SEVERAL INSTANTS.** The phase filter exists because
+/// prepare is host work and capture is not; the unit filter because one plan
+/// can state two row spaces and each is its own exec; this one because some
+/// regions of one unit CANNOT be captured at all. A region whose window is
+/// gathered, grouped, or windowed without every op reading the seat's start
+/// addresses rows at a fire-dependent offset, so no pointer a capture froze
+/// names them twice; a shell that wants the rest of the composition in a
+/// graph cuts the template AROUND such a region and re-issues it eagerly
+/// between the execs (`engine_cuda::record`'s `Cut`).
+///
+/// **THE STRUCTURE IS STILL NOT FILTERED, WHICH IS THE WHOLE DOCTRINE.**
+/// Every region is announced to the sink under every setting — a sink counts
+/// regions to know which window it is in — so a region's number means one
+/// thing in a segment pass, in an island pass and in a whole walk. What the
+/// span decides is which regions' NODES are dispatched, and nothing else.
+///
+/// A plan with no islands is one span over the whole template, so
+/// [`All`](Regions::All) and `Span { from: 0, upto: len }` are the same walk
+/// on every composition a body could already serve. That is not a
+/// coincidence to lean on quietly: it is what makes the segmented path cost a
+/// text-only fire one comparison per region and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Regions {
+    /// Every region of the template — what an eager shell walks, and what a
+    /// shell whose whole composition is capturable records.
+    #[default]
+    All,
+    /// The half-open stretch `[from, upto)` of `CompiledModel::template`, in
+    /// template order — one segment's regions, or one island's.
+    Span {
+        /// The first region this pass dispatches.
+        from: u32,
+        /// One past the last.
+        upto: u32,
+    },
+}
+
+impl Regions {
+    /// Does this setting dispatch the region at `index`?
+    #[must_use]
+    pub fn admits(self, index: u32) -> bool {
+        match self {
+            Regions::All => true,
+            Regions::Span { from, upto } => from <= index && index < upto,
+        }
+    }
+}
+
 /// Walk one fire, dispatching only the nodes of `phases`.
 ///
 /// [`walk()`] is this at [`Phases::All`], and a shell that captures is the
@@ -296,6 +357,46 @@ pub fn walk_units<D: Dispatch + Serve, S: Sink>(
     sink: &mut S,
     phases: Phases,
     units: Units,
+) -> Result<()> {
+    walk_regions(
+        trace, compiled, descriptor, dispatch, sink, phases, units, Regions::All,
+    )
+}
+
+/// Walk one fire, dispatching only the nodes of `phases` that belong to
+/// `units` AND stand in `regions` — the whole filter, and the form a
+/// SEGMENTED capture calls (the tier-2 campaign).
+///
+/// [`walk_units`] is this at [`Regions::All`], and an island is why the
+/// parameter exists: a composition whose windows are not all replayable is
+/// captured in the stretches that ARE and re-issued eagerly in the stretches
+/// that are not, which is `exec₁ → island → exec₂ → …` on one stream. Every
+/// one of those is a call of this function over the same template, differing
+/// only in which stretch it dispatches — so the region numbering, the
+/// fallback branch, the zero-row rule and the collective rule are the ones
+/// they always were, and a segment's walk is the walk it would have been
+/// inside a whole one.
+///
+/// **THE ISLAND PASS AND THE SEGMENT PASS ARE THE SAME CALL.** Which of the
+/// two a span is is the caller's word, decided off its shell's own
+/// admissibility table; this function knows only that some regions dispatch
+/// and the rest are announced. That is deliberate: a filter that knew what an
+/// island WAS would be a second walk wearing this one's name, and the
+/// property that makes segmented capture safe is precisely that it is not.
+///
+/// # Errors
+///
+/// As [`walk()`].
+#[allow(clippy::too_many_arguments)]
+pub fn walk_regions<D: Dispatch + Serve, S: Sink>(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    descriptor: &FireDescriptor,
+    dispatch: &mut D,
+    sink: &mut S,
+    phases: Phases,
+    units: Units,
+    regions: Regions,
 ) -> Result<()> {
     // A mask indexes the window table by position, so a table of the wrong
     // width does not fail to find a class — it finds another class's rows and
@@ -354,10 +455,20 @@ pub fn walk_units<D: Dispatch + Serve, S: Sink>(
             RowAxis::Patches => descriptor.patch_spans_into(&region.mask, &mut runs),
         }
 
-        // Does this pass dispatch this region at all? The phase filter and the
-        // unit filter are one question with two halves, asked once so that the
-        // gather, the nodes and the scatter cannot answer it differently.
-        let dispatches = phases.admits(region.phase) && units.admits(unit);
+        // Does this pass dispatch this region at all? The phase filter, the
+        // unit filter and the SPAN filter are one question with three halves,
+        // asked once so that the gather, the nodes and the scatter cannot
+        // answer it differently.
+        //
+        // **AND THE THIRD HALF IS WHERE A SEGMENTED CAPTURE IS CUT** (the
+        // tier-2 campaign). A shell that cannot record every region of a
+        // composition records the stretches it can and re-issues the rest
+        // eagerly between them; both passes come down this line, and the only
+        // thing that distinguishes them is which stretch `regions` names. The
+        // structure above and below is untouched by all three, which is what
+        // keeps a region's number meaning one thing in every pass.
+        let dispatches =
+            phases.admits(region.phase) && units.admits(unit) && regions.admits(index as u32);
 
         // Rule 4's branch, and the whole of it. A region P4 answered
         // `Fallback::Grouped` for is ONE launch over the intervals rather than

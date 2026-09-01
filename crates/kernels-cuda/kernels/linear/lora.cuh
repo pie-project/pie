@@ -74,7 +74,8 @@ __global__ void lora_combine(
     T* __restrict__ y,
     const i32* __restrict__ segments,
     int segs,
-    int rank, int out_width, long long adapter_stride)
+    int rank, int out_width, long long adapter_stride,
+    const u32* __restrict__ win)
 {
     int row = blockIdx.y;
     if (segments != nullptr) {
@@ -83,6 +84,18 @@ __global__ void lora_combine(
         if ((int)blockIdx.y >= segments[2 * seg + 1]) return;
         row = segments[2 * seg] + (int)blockIdx.y;
     }
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged; it reads the row the segments settled, so both arms retire.
+    //
+    // The seat's second word (the row START) is deliberately NOT read here.
+    // `segments` has already resolved `row` against the rectangle this launch
+    // was handed, and nothing in the kernel says whether a staged start is the
+    // same origin those segment firsts were measured from or a second one to
+    // compose with. Guard-only until the two origins are stated in one place;
+    // an unshifted row is a row the engine can refuse, a doubly-shifted one is
+    // a row nobody catches.
+    if (win != nullptr && row >= (int)win[0]) return;
     const int adapter = routes[row];
     if (adapter < 0) return;
 

@@ -20,13 +20,23 @@ __global__ void hc_gates(
     int H,
     float hc_eps,
     float hc_post_alpha,
-    int sinkhorn_iters)
+    int sinkhorn_iters,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows START: `mixes`, `residual`,
+    // `post_mix`, `comb_mix` and `layer_input` are all row planes handed at
+    // their base and move together; `scale` and `base` are per-stream tables.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int tid = threadIdx.x;
 
     const int mix_hc = M * 2 + M * M;
-    const float* row = mixes + static_cast<long long>(n) * mix_hc;
+    const float* row = mixes + static_cast<long long>(plane_row) * mix_hc;
 
     __shared__ float pre[MAX_HC_MULT];
     __shared__ float post[MAX_HC_MULT];
@@ -41,7 +51,7 @@ __global__ void hc_gates(
 
         const float logit = row[M + tid] * scale[1] + base[M + tid];
         post[tid] = 1.f / (1.f + expf(-logit)) * hc_post_alpha;
-        post_mix[static_cast<long long>(n) * M + tid] = post[tid];
+        post_mix[static_cast<long long>(plane_row) * M + tid] = post[tid];
     }
     __syncthreads();
 
@@ -96,12 +106,12 @@ __global__ void hc_gates(
     }
 
     if (tid < M * M) {
-        comb_mix[static_cast<long long>(n) * M * M + tid] = comb[tid];
+        comb_mix[static_cast<long long>(plane_row) * M * M + tid] = comb[tid];
     }
     __syncthreads();
 
-    const T* res_n = residual + static_cast<long long>(n) * M * H;
-    T* out = layer_input + static_cast<long long>(n) * H;
+    const T* res_n = residual + static_cast<long long>(plane_row) * M * H;
+    T* out = layer_input + static_cast<long long>(plane_row) * H;
 
     for (int h = tid; h < H; h += blockDim.x) {
         float acc = 0.f;
@@ -121,7 +131,8 @@ __global__ void hc_fold(
     T* out,
     int N,
     int M,
-    int H)
+    int H,
+    const u32* __restrict__ win)
 {
     if (M > MAX_HC_MULT) return;
     const long long idx =
@@ -130,18 +141,26 @@ __global__ void hc_fold(
 
     const int h = static_cast<int>(idx % H);
     const int n = static_cast<int>(idx / H);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `comb_mix`, `post_mix`,
+    // `x`, `residual` and `out` are all row planes and move together. The
+    // `idx >= N * H` bound above is the LAUNCH's, and stays on the raw index.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
-    const float* comb_n = comb_mix + static_cast<long long>(n) * M * M;
-    const float* post_n = post_mix + static_cast<long long>(n) * M;
-    const float x_h = Elem<T>::to_f32(x[static_cast<long long>(n) * H + h]);
-    const T* res_n = residual + static_cast<long long>(n) * M * H;
+    const float* comb_n = comb_mix + static_cast<long long>(row) * M * M;
+    const float* post_n = post_mix + static_cast<long long>(row) * M;
+    const float x_h = Elem<T>::to_f32(x[static_cast<long long>(row) * H + h]);
+    const T* res_n = residual + static_cast<long long>(row) * M * H;
 
     float r[MAX_HC_MULT];
     for (int i = 0; i < M; ++i) {
         r[i] = Elem<T>::to_f32(res_n[static_cast<long long>(i) * H + h]);
     }
 
-    T* out_n = out + static_cast<long long>(n) * M * H;
+    T* out_n = out + static_cast<long long>(row) * M * H;
 
     for (int j = 0; j < M; ++j) {
         float acc = post_n[j] * x_h;
@@ -192,17 +211,26 @@ __global__ void hc_expand(
     T* __restrict__ output,
     int N,
     int M,
-    int H)
+    int H,
+    const u32* __restrict__ win)
 {
     const long long idx =
         static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= static_cast<long long>(N) * H) return;
     const int n = static_cast<int>(idx / H);
     const int h = static_cast<int>(idx % H);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `input` and `output` are
+    // both row planes handed at their base. The `idx >= N * H` bound above is
+    // the LAUNCH's, and stays on the raw index.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
-    const T val = input[static_cast<long long>(n) * H + h];
+    const T val = input[static_cast<long long>(row) * H + h];
     for (int m = 0; m < M; ++m) {
-        output[static_cast<long long>(n) * M * H + m * H + h] = val;
+        output[static_cast<long long>(row) * M * H + m * H + h] = val;
     }
 }
 
@@ -211,12 +239,21 @@ __global__ void hc_rmsnorm_f32(
     const T* __restrict__ input,
     float* __restrict__ output,
     int dim,
-    float eps)
+    float eps,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `input` and `output` are
+    // both row planes handed at their base.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int tid = threadIdx.x;
-    const T* row = input + static_cast<long long>(n) * dim;
-    float* out = output + static_cast<long long>(n) * dim;
+    const T* row = input + static_cast<long long>(plane_row) * dim;
+    float* out = output + static_cast<long long>(plane_row) * dim;
 
     float local_sum = 0.f;
     for (int d = tid; d < dim; d += blockDim.x) {
@@ -317,14 +354,23 @@ __global__ void hc_mix(
     const T* __restrict__ normed,
     T* __restrict__ y,
     int M,
-    int H)
+    int H,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `gates`, `normed` and `y`
+    // are all row planes handed at their base and move together.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int tid = threadIdx.x;
 
-    const T* gr = gates + static_cast<long long>(n) * M * H;
-    const T* nr = normed + static_cast<long long>(n) * M * H;
-    T* yr = y + static_cast<long long>(n) * H;
+    const T* gr = gates + static_cast<long long>(row) * M * H;
+    const T* nr = normed + static_cast<long long>(row) * M * H;
+    T* yr = y + static_cast<long long>(row) * H;
 
     for (int h = tid; h < H; h += BLOCK) {
         float acc = 0.f;
@@ -345,14 +391,23 @@ __global__ void hc_inject(
     const T* __restrict__ gates,
     T* __restrict__ hyper,
     int M,
-    int H)
+    int H,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `o`, `gates` and `hyper`
+    // are all row planes handed at their base and move together.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int tid = threadIdx.x;
 
-    const T* orow = o + static_cast<long long>(n) * H;
-    const T* gr = gates + static_cast<long long>(n) * M;
-    T* hr = hyper + static_cast<long long>(n) * M * H;
+    const T* orow = o + static_cast<long long>(row) * H;
+    const T* gr = gates + static_cast<long long>(row) * M;
+    T* hr = hyper + static_cast<long long>(row) * M * H;
 
     __shared__ float g[MAX_HC_MULT];
     if (tid < M) {
@@ -380,17 +435,26 @@ __global__ void ple_gate(
     const T* __restrict__ value,
     T* __restrict__ y,
     int M,
-    int H)
+    int H,
+    const u32* __restrict__ win)
 {
     const int b = blockIdx.x;
     const int tid = threadIdx.x;
     const int n = b / M;
     const int s = b - n * M;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `key`, `query`, `value` and
+    // `y` are all row planes handed at their base. The stream `s` WITHIN the
+    // row is a position in the flattening, not a row, and does not move.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
-    const T* kr = key + (static_cast<long long>(n) * M + s) * H;
-    const T* qr = query + (static_cast<long long>(n) * M + s) * H;
-    const T* vr = value + static_cast<long long>(n) * H;
-    T* yr = y + (static_cast<long long>(n) * M + s) * H;
+    const T* kr = key + (static_cast<long long>(row) * M + s) * H;
+    const T* qr = query + (static_cast<long long>(row) * M + s) * H;
+    const T* vr = value + static_cast<long long>(row) * H;
+    T* yr = y + (static_cast<long long>(row) * M + s) * H;
 
     float local = 0.f;
     for (int i = tid; i < H; i += BLOCK) {

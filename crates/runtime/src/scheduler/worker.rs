@@ -1296,9 +1296,12 @@ impl EngineLoop {
         use crate::engine::completion;
 
         // ── THE NEXT LAUNCH, STATED (`Engine::expect_fire`, advisory).
-        //    The CUDA fold's prebind wants a SUCCESSOR's composition on the
-        //    table before a step fires, because the hidden window it uses is
-        //    inside the fire itself — after the launch, before the sync.
+        //    A prebind wants a SUCCESSOR's composition on the table before a
+        //    step fires, because the hidden window it uses is inside the fire
+        //    itself — after the launch, before the sync. The CUDA fold was
+        //    where that was measured and it is deleted (the tier-2 campaign:
+        //    a body pays nothing per fire, so there is nothing to prebind);
+        //    `engine_metal` is the consumer now, and the seam is unchanged.
         //    Two places know a successor, and the frame verb splits them:
         //
         //    * the frame's own next step is the ENGINE's to see now. A frame
@@ -5306,11 +5309,13 @@ mod tests {
     /// **THE HINT SEAM'S CONFORMANCE TEST** (palo cuda-abi step 6): before a
     /// step fires, the lane states the NEXT fire to the engine — the frame's
     /// own next step exactly, and at a frame boundary whatever launch is
-    /// already queued behind the executing one. The GPU gate
-    /// (`tests/gpu/tests/cuda_fold_hint_e2e.rs`) shows the serving-loop
-    /// motion; THIS test is the one that pins the ordering, because on
-    /// hardware the ordering is what a prebind cashes and a wrong order is
-    /// silently just a wasted hint.
+    /// already queued behind the executing one. The GPU gate that showed the
+    /// serving-loop motion was the CUDA fold's, and it went out with the fold
+    /// (the tier-2 campaign); the surviving consumer is `engine_metal`'s
+    /// `expect_fire`. THIS test is the one that pins the ORDERING, which is
+    /// the half that was never engine-specific: on hardware the ordering is
+    /// what a prebind cashes and a wrong order is silently just a wasted
+    /// hint.
     ///
     /// Determinism: the engine's `fire` sleeps 20 ms, so by the time frame
     /// 1's fire returns, frames 2 and 3 — posted before any fire began —

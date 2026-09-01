@@ -1189,7 +1189,7 @@ impl Builder<'_> {
     ) -> TransformSpec {
         transform.metadata_source = source.and_then(|source| {
             let raw = self.sources.tensor(source.tensor_id)?;
-            if !matches!(raw.encoding, Encoding::Raw(DType::Fp8E4m3)) {
+            if !matches!(raw.encoding, Encoding::Raw(DType::E4m3)) {
                 return None;
             }
             self.sources
@@ -1654,8 +1654,8 @@ fn annotate(err: Error, name: &str) -> Error {
 
 fn dtype_to_quant_marker(dtype: DType) -> QuantScheme {
     match dtype {
-        DType::Fp8E4m3 => QuantScheme::Fp8E4M3,
-        DType::Fp8E5m2 => QuantScheme::Fp8E5M2,
+        DType::E4m3 => QuantScheme::Fp8E4M3,
+        DType::E5m2 => QuantScheme::Fp8E5M2,
         DType::I8 | DType::U8 => QuantScheme::Int8Symmetric,
         _ => QuantScheme::None,
     }

@@ -149,23 +149,6 @@ pub enum Fault {
         have: u64,
     },
 
-    /// A fire whose schedules are not the shape the graph for its key was
-    /// captured against.
-    ///
-    /// **THE ONE CLAIM A GRAPH KEY CANNOT CHECK BY ITSELF.** A recorded fire
-    /// bakes the attention schedule's offsets, its padded batch size and its
-    /// tile width into the launches it recorded, and the prepare phase
-    /// rebuilds that schedule every fire. Under
-    /// [`FireBindings::capture`](crate::FireBindings) the builders carve
-    /// graph-shaped schedules, so those numbers depend on the fire's SHAPE
-    /// and the key holds the shape fixed — but that is somebody else's
-    /// arithmetic, and a change in it would otherwise present as slightly
-    /// wrong logits forever. Refused by name instead.
-    Schedule {
-        /// The shape key, as `record::Key` spells it.
-        key: String,
-    },
-
     /// A lane's mask does not REACH the lane's readable extent.
     ///
     /// **THE SHORT DIRECTION IS THE ONLY DANGEROUS ONE.** A mask states
@@ -551,14 +534,14 @@ pub enum Fault {
     /// # The frozen extent, which is a bound on the SAVING and not on the node
     ///
     /// A captured launch's extent is fixed in its node parameters (build log
-    /// 10), and the exec key is the per-class `(rows, lanes)` vector — so on
-    /// the keyed path an exec already serves one composition and the walk
-    /// skipped its empty windows at RECORD time. The predicate is therefore
-    /// constant across the replays of any one keyed exec, and what the node
-    /// buys there is nothing. It is not decoration: the decision is IN the
-    /// graph, so an exec replayed under a composition its recording fire never
-    /// saw — the fold's axis, and what a padded lattice would do — skips the
-    /// body correctly instead of computing over rows it does not have.
+    /// 10), and a `record::BodyKey` names WHICH CLASSES HAVE ROWS — so a body
+    /// already serves one composition and the walk skipped its empty windows
+    /// at RECORD time. The predicate is therefore constant across every replay
+    /// of any one body, and what the node buys there is nothing. It is not
+    /// decoration: the decision is IN the graph, so an exec replayed under a
+    /// composition its recording fire never saw — what a padded lattice would
+    /// do, and what the retired fold's bucket axis did — skips the body
+    /// correctly instead of computing over rows it does not have.
     Unlowered {
         /// Which region of the template.
         region: u32,
@@ -611,12 +594,6 @@ impl fmt::Display for Fault {
             Self::Ceiling { what, need, have } => write!(
                 f,
                 "this fire wants {need} {what} and the shell reserved {have}"
-            ),
-            Self::Schedule { key } => write!(
-                f,
-                "the attention schedules this fire built are not the shapes the graph \
-                 for {key} was captured against, and a replay would read the captured \
-                 ones"
             ),
             Self::Mask {
                 lane,

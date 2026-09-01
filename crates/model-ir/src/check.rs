@@ -558,16 +558,7 @@ struct N(Dtype);
 
 impl Display for N {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(match self.0 {
-            Dtype::Bf16 => "bf16", Dtype::F16 => "f16", Dtype::F32 => "f32",
-            Dtype::I32 => "i32", Dtype::U32 => "u32", Dtype::U8 => "u8",
-            Dtype::I8 => "i8", Dtype::Fp8E4m3 => "fp8e4m3", Dtype::Fp4 => "fp4",
-            Dtype::Mxfp4 => "mxfp4", Dtype::MlxU4 => "mlxu4",
-            Dtype::MlxU8 => "mlxu8", Dtype::MlxU4G32 => "mlxu4g32",
-            Dtype::E8m0 => "e8m0",
-            Dtype::Fp8E5m2 => "fp8e5m2", Dtype::I64 => "i64", Dtype::I16 => "i16",
-            Dtype::U64 => "u64", Dtype::U16 => "u16", Dtype::Bool => "bool",
-        })
+        f.write_str(self.0.spelling())
     }
 }
 

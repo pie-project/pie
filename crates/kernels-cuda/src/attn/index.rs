@@ -73,6 +73,9 @@ pub fn layernorm_rope(
             rope_dim.arg(),
             theta.arg(),
             eps.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -104,6 +107,9 @@ pub fn rope(
             head_dim.arg(),
             rope_dim.arg(),
             theta.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -218,6 +224,9 @@ pub fn topk(
             keys.page_size.arg(),
             max_kv.arg(),
             top_k.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

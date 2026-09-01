@@ -355,13 +355,13 @@ impl Model {
         // family's conversion actually does. A bf16 stack's projections
         // stay bf16.
         let proj = match w {
-            Dtype::MlxU4 => Dtype::MlxU8,
+            Dtype::U4g64 => Dtype::U8g64,
             other => crate::dense(other),
         };
         // The table is the one G32 plane in the tree: its 160-wide rows
-        // cannot group by sixty-four (`dtype::Dtype::MlxU4G32`).
+        // cannot group by sixty-four (`dtype::Dtype::U4g32`).
         let narrow_group = match w {
-            Dtype::MlxU4 => Dtype::MlxU4G32,
+            Dtype::U4g64 => Dtype::U4g32,
             other => other,
         };
         let hidden = u64::from(d.hidden);

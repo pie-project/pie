@@ -44,16 +44,26 @@ __global__ void rope_mrope(
     int head_dim,
     int rotary_dim,
     float theta,
-    int s0, int s1, int s2)
+    int s0, int s1, int s2,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `q`, `k` and the `[rows, 3]`
+    // `positions` stream are row planes handed at their base; the angles are
+    // keyed by the position VALUES that stream yields, never by the row.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int total_heads = num_q_heads + num_kv_heads;
     const int half = head_dim / 2;
     const int rope_angles = rotary_dim / 2;
 
-    const int pos_t = positions[3 * n + 0];
-    const int pos_h = positions[3 * n + 1];
-    const int pos_w = positions[3 * n + 2];
+    const int pos_t = positions[3 * row + 0];
+    const int pos_h = positions[3 * row + 1];
+    const int pos_w = positions[3 * row + 2];
     (void)s0;
 
     for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
@@ -77,7 +87,7 @@ __global__ void rope_mrope(
 
         if (head_idx < num_q_heads) {
             T* qp = q +
-                (static_cast<long long>(n) * num_q_heads + head_idx) * head_dim;
+                (static_cast<long long>(row) * num_q_heads + head_idx) * head_dim;
             const float a = Elem<T>::to_f32(qp[dim_pair]);
             const float b = Elem<T>::to_f32(qp[dim_pair + half]);
             qp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);
@@ -85,7 +95,7 @@ __global__ void rope_mrope(
         } else {
             const int kv_h = head_idx - num_q_heads;
             T* kp = k +
-                (static_cast<long long>(n) * num_kv_heads + kv_h) * head_dim;
+                (static_cast<long long>(row) * num_kv_heads + kv_h) * head_dim;
             const float a = Elem<T>::to_f32(kp[dim_pair]);
             const float b = Elem<T>::to_f32(kp[dim_pair + half]);
             kp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);
@@ -131,17 +141,27 @@ __global__ void rope_mrope_blocked(
     int head_dim,
     int rotary_dim,
     float theta,
-    int s0, int s1, int s2)
+    int s0, int s1, int s2,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `q`, `k` and the `[rows, 3]`
+    // `positions` stream are row planes handed at their base; the angles are
+    // keyed by the position VALUES that stream yields, never by the row.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int total_heads = num_q_heads + num_kv_heads;
     const int half = head_dim / 2;
     const int rope_angles = rotary_dim / 2;
     const int total = s0 + s1 + s2;
 
-    const int pos[3] = { positions[3 * n + 0],
-                         positions[3 * n + 1],
-                         positions[3 * n + 2] };
+    const int pos[3] = { positions[3 * row + 0],
+                         positions[3 * row + 1],
+                         positions[3 * row + 2] };
 
     for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
         const int head_idx = t / half;
@@ -164,7 +184,7 @@ __global__ void rope_mrope_blocked(
 
         if (head_idx < num_q_heads) {
             T* qp = q +
-                (static_cast<long long>(n) * num_q_heads + head_idx) * head_dim;
+                (static_cast<long long>(row) * num_q_heads + head_idx) * head_dim;
             const float a = Elem<T>::to_f32(qp[dim_pair]);
             const float b = Elem<T>::to_f32(qp[dim_pair + half]);
             qp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);
@@ -172,7 +192,7 @@ __global__ void rope_mrope_blocked(
         } else {
             const int kv_h = head_idx - num_q_heads;
             T* kp = k +
-                (static_cast<long long>(n) * num_kv_heads + kv_h) * head_dim;
+                (static_cast<long long>(row) * num_kv_heads + kv_h) * head_dim;
             const float a = Elem<T>::to_f32(kp[dim_pair]);
             const float b = Elem<T>::to_f32(kp[dim_pair + half]);
             kp[dim_pair]        = Elem<T>::from_f32(a * cos_v - b * sin_v);

@@ -230,7 +230,7 @@ impl Model {
         // A bf16 stack's router stays bf16: the raise is from four bits to
         // eight, not to eight from anywhere.
         let router = match weights {
-            Dtype::MlxU4 => Dtype::MlxU8,
+            Dtype::U4g64 => Dtype::U8g64,
             other => other,
         };
         let hidden = d.hidden as u64;

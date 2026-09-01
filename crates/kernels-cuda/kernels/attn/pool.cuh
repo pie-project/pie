@@ -435,13 +435,23 @@ __global__ void pool_lse_paged(
     int head_dim,
     int ratio,
     int page_size,
-    float scale) {
+    float scale,
+    const u32* __restrict__ win) {
     const int qi = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && qi >= static_cast<int>(win[0])) return;
+    // And WHERE those rows begin: an armed seat's pointers are plane bases,
+    // so `win[1]` is the plane row this launch's first block owns. Every
+    // per-token plane below is read there — the lane a row names and the
+    // position that dates it as much as the query itself.
+    const int qi_row = win != nullptr ? qi + static_cast<int>(win[1]) : qi;
     const int q_head = blockIdx.y;
     const int tid = threadIdx.x;
 
-    const int req = req_of_token[qi];
-    const int qpos = positions[qi];
+    const int req = req_of_token[qi_row];
+    const int qpos = positions[qi_row];
 
     const int num_visible = (qpos + 1) / ratio;
 
@@ -450,21 +460,21 @@ __global__ void pool_lse_paged(
     float* reduce = smem + head_dim;
 
     const bf16* q_row =
-        q + (static_cast<long long>(qi) * num_q_heads + q_head) * head_dim;
+        q + (static_cast<long long>(qi_row) * num_q_heads + q_head) * head_dim;
     for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
         q_smem[d] = bf16_to_f32(q_row[d]);
     }
     __syncthreads();
 
     bf16* o_row =
-        o + (static_cast<long long>(qi) * num_q_heads + q_head) * head_dim;
+        o + (static_cast<long long>(qi_row) * num_q_heads + q_head) * head_dim;
 
     if (num_visible <= 0) {
         for (int d = tid; d < head_dim; d += ATTN_BLOCK) {
             o_row[d] = f32_to_bf16(0.f);
         }
         if (lse_out != nullptr && tid == 0) {
-            lse_out[qi * num_q_heads + q_head] = neg_inf();
+            lse_out[qi_row * num_q_heads + q_head] = neg_inf();
         }
         return;
     }
@@ -523,7 +533,7 @@ __global__ void pool_lse_paged(
 
     if (lse_out != nullptr && tid == 0) {
         constexpr float kLog2e = 1.44269504088896340736f;
-        lse_out[qi * num_q_heads + q_head] =
+        lse_out[qi_row * num_q_heads + q_head] =
             z_shared > 0.f ? ((logf(z_shared) + row_max) * kLog2e) : neg_inf();
     }
     for (int i = 0; i < dims_per_thread; ++i) {

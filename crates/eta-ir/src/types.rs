@@ -84,13 +84,21 @@ pub const fn class_of(d: Dtype) -> Option<DtypeClass> {
         // change to the op set, the interpreter and the wire format at once.
         Dtype::F16
         | Dtype::Bf16
-        | Dtype::Fp8E4m3
-        | Dtype::Fp8E5m2
-        | Dtype::Fp4
+        | Dtype::E4m3
+        | Dtype::E5m2
+        | Dtype::E2m1
         | Dtype::Mxfp4
-        | Dtype::MlxU4
-        | Dtype::MlxU8
-        | Dtype::MlxU4G32
+        | Dtype::Nvfp4
+        | Dtype::U4g64
+        | Dtype::U8g64
+        | Dtype::U4g32
+        | Dtype::U2g16k
+        | Dtype::I3g16k
+        | Dtype::U4g32k
+        | Dtype::U5g32k
+        | Dtype::I6g16k
+        | Dtype::E4m3row
+        | Dtype::E4m3tile128
         | Dtype::E8m0
         | Dtype::I64
         | Dtype::I16
@@ -203,11 +211,11 @@ mod dtype_tests {
             Dtype::F32,
             Dtype::F16,
             Dtype::Bf16,
-            Dtype::Fp8E4m3,
-            Dtype::Fp8E5m2,
-            Dtype::Fp4,
+            Dtype::E4m3,
+            Dtype::E5m2,
+            Dtype::E2m1,
             Dtype::Mxfp4,
-            Dtype::MlxU4,
+            Dtype::U4g64,
             Dtype::E8m0,
             Dtype::I64,
             Dtype::I32,

@@ -86,6 +86,9 @@ pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), 
             stated(OP, x.rows)?.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, x.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -110,6 +113,9 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
             y.arg(),
             stated(OP, nonzero(OP, "the normed row's width", y.width)?)?.arg(),
             eps.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -171,6 +177,9 @@ pub fn gates(
             gate_eps.arg(),
             alpha.arg(),
             stated(OP, sinkhorn)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -210,6 +219,9 @@ pub fn fold(
             stated(OP, y.rows)?.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, x.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -243,6 +255,9 @@ pub fn mix(ctx: &Ctx, gates: Tensor, normed: Tensor, streams: u32, y: &mut Tenso
             y.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, y.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -270,6 +285,9 @@ pub fn inject(ctx: &Ctx, o: Tensor, gates: Tensor, streams: u32, hyper: &mut Ten
             hyper.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, o.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -311,6 +329,9 @@ pub fn ple_gate(
             y.arg(),
             stated(OP, fan)?.arg(),
             stated(OP, value.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

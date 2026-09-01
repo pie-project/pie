@@ -368,6 +368,7 @@ fn tower_and_trunk() -> Trace {
         caches: vec![CacheRow::State {
             name: "state".to_string(),
             slab: vec![1],
+            dtype: Dtype::Bf16,
         }],
         values,
         nodes,

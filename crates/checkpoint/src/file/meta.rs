@@ -82,7 +82,7 @@ pub const SOURCE_ENCODING_KEY: &str = "pie_source_encoding";
 ///
 /// It exists because nothing about a weight says whether it has been
 /// quantized already. An FP8 weight a checkpoint shipped and an FP8 weight a
-/// quantizing build produced are both `Raw(Fp8E4m3)` at `[N, K]` with an
+/// quantizing build produced are both `Raw(E4m3)` at `[N, K]` with an
 /// `_scale_inv` beside them; the first is a legitimate re-encoding source and
 /// the second is a finished product, and they differ only in where they came
 /// from. The

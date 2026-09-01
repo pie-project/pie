@@ -41,7 +41,7 @@ use model_ir::{Attention, Operands, Operation, StructKind, Trace, Ty, ValueId};
 use crate::error::{Fault, Result};
 
 pub use model_exec::store::kv::{
-    Geometry, Paging, Reader, Seat, SpaceFacts, indptr, reads, row_of, space_of,
+    Geometry, Paging, Reader, Seat, SpaceFacts, indptr, pad_indptr, reads, row_of, space_of,
 };
 
 /// Compute one fire's geometry — [`model_exec::store::kv::geometry`], in this

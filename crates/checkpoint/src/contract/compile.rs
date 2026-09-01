@@ -1349,7 +1349,7 @@ mod tests {
         let out = lower(Expr::src("k_proj"), &qwen3());
         let bf16 = out.byte_runs(&Encoding::Raw(DType::Bf16)).unwrap();
         assert_eq!(bf16[0].len, 1024 * 2048 * 2);
-        let fp8 = out.byte_runs(&Encoding::Raw(DType::Fp8E4m3)).unwrap();
+        let fp8 = out.byte_runs(&Encoding::Raw(DType::E4m3)).unwrap();
         assert_eq!(fp8[0].len, 1024 * 2048);
     }
 
@@ -1370,7 +1370,7 @@ mod tests {
     fn bit_widths_match_the_encodings() {
         assert_eq!(bits_per_element(&Encoding::Raw(DType::F32)), 32);
         assert_eq!(bits_per_element(&Encoding::Raw(DType::Bf16)), 16);
-        assert_eq!(bits_per_element(&Encoding::Raw(DType::Fp8E4m3)), 8);
+        assert_eq!(bits_per_element(&Encoding::Raw(DType::E4m3)), 8);
         assert_eq!(bits_per_element(&Encoding::Quant(mxfp4())), 4);
     }
 

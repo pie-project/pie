@@ -138,7 +138,7 @@ impl Model {
             b.read(&attn.o_bias, ck("self_attn.o_proj.bias"))?;
             b.read(&attn.sinks, ck("self_attn.sinks"))?;
             // **THE ROUTER GATE, AT ITS OWN WIDTH.** `Moe::router` is declared
-            // `MlxU8` wherever the stack is `MlxU4` — `gpt_oss.py`'s
+            // `U8g64` wherever the stack is `U4g64` — `gpt_oss.py`'s
             // `quant_predicate`, read at `Model::new` — and `read` asks the
             // weight rather than the file, so the same call reads a bf16
             // tensor here from a transformers checkpoint and an eight-bit

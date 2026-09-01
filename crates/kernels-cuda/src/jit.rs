@@ -113,10 +113,12 @@ pub(crate) enum Fault {
         unit: &'static str,
         log: String,
     },
-    /// A scratch slab asked to grow mid-capture. Growth frees and
-    /// reallocates, which would poison the graph, so the fire is refused —
-    /// the engine's warm-before-capture pass is the fix (see
-    /// [`Ctx::scratch`]).
+    /// A scratch slab asked to grow mid-capture. Growth allocates — and an
+    /// allocation inside `cudaStreamBeginCapture` is host work the capture
+    /// refuses — so the fire is refused; the engine's warm-before-capture
+    /// pass is the fix (see [`Ctx::scratch`]). (Growth no longer frees: the
+    /// old block retires so baked addresses stay valid — the refusal's
+    /// reason is the allocation, not a lost address.)
     Unwarmed {
         name: &'static str,
         have: usize,

@@ -1,17 +1,33 @@
 //! **What a captured graph says about itself** (`palo cuda-abi` wave).
 //!
-//! **HALF OF THIS MODULE IS NO LONGER A PROBE.** [`walk`] was written to
-//! answer one question — is a captured graph a host-side map from node to
-//! kernel argument? — and the answer was yes for 621 of 621 nodes, so
-//! `.wiki/palo/cuda-abi.md` §7 promotes it: [`crate::device::map`] builds a
-//! load-time table on top of this walk, and step 4's exec cache rebinds
-//! against that table on the fire path. What stays probe-only is everything
-//! that WRITES: [`rebind`] mutates an instantiated exec to price the writes
-//! and to find out which fields the driver validates, and
-//! [`exec_footprint`] instantiates copies to weigh one. Neither is called
-//! from a fire, and the split is deliberate — reading a graph is derivable
-//! from the graph alone, and writing one needs a policy that lives in
-//! `record.rs`.
+//! **THIS MODULE IS THE MEASUREMENT SURFACE, AND SINCE THE TIER-2 CAMPAIGN
+//! IT IS THAT AND NOTHING ELSE.** [`walk`] was written to answer one
+//! question — is a captured graph a host-side map from node to kernel
+//! argument? — and the answer was yes for 621 of 621 nodes, which
+//! `.wiki/palo/cuda-abi.md` §7 promoted into [`crate::device::map`]: a
+//! load-time table, and a diff between two of them. The consumer that table
+//! was built FOR was the fold's exec cache, which rebound against it on the
+//! fire path; the fold is deleted, and the answer the campaign took instead
+//! is that a body writes into no exec at all (`record.rs`'s header). So
+//! nothing here is called from a fire, and what the module is now is the
+//! place the driver facts poc1-24 measured are stated in code that still
+//! runs:
+//!
+//! ```text
+//! walk           what a captured graph says about itself — read by
+//!                `device::map`, and by the two probe gates
+//!                (`cuda_node_map`, `cuda_descriptor_abi_probe`)
+//! rebind         prices `cudaGraphExecKernelNodeSetParams` per node and
+//!                finds which fields the driver validates
+//! exec_footprint instantiates copies to weigh one exec
+//! ```
+//!
+//! The split between reading and writing is still worth keeping, and it is
+//! why the write half never grew a caller: what moved between two captures is
+//! derivable from the two graphs ALONE, and is therefore testable without an
+//! exec, a fire or a checkpoint, while a write needs a policy — which exec,
+//! which fire, whether the pass is worth its microseconds — that no pair of
+//! graphs contains and that this shell has decided not to have.
 //!
 //! Build log 10 ruled a per-fire `cudaGraphExecKernelNodeSetParams` rebind
 //! unreachable because "rebinding needs a host-side map from graph node to
@@ -633,6 +649,17 @@ pub fn rebind(
     //    arm switch the Metal plane does from a shader.
     // Prefer a func of a DIFFERENT ARITY, so a success says the driver did
     // not check rather than that the swap happened to be shaped alike.
+    //
+    // And BECAUSE the driver does not check, the swap must bring its own
+    // param block: `SetParams` copies argument bytes per the NEW func's
+    // layout, so handing it the old node's array under a wider entrypoint is
+    // an out-of-bounds read — a SIGSEGV, not an error code. (The staged-seat
+    // wave is what surfaced this: seated kernels grew a trailing word, the
+    // arity spread widened, and the probe's own experiment started reading
+    // past the block it was handed.) The cells below are the target's shape,
+    // filled from the old block where the two layouts overlap and zeroed
+    // beyond — the finding this experiment records is unchanged: the driver
+    // accepted a func whose shape it never compared.
     let mine = held.first().map(|(_, p)| arity(p.func)).unwrap_or(0);
     let other = held
         .iter()
@@ -651,7 +678,47 @@ pub fn rebind(
                 .map(|(_, p)| (name_of(p.func), arity(p.func)))
                 .unwrap_or_default();
             out.func_to = (name_of(func), arity(func));
-            try_one(&|p| p.func = func)
+            let farm: std::cell::RefCell<Vec<Box<[u8]>>> = std::cell::RefCell::new(Vec::new());
+            let plots: std::cell::RefCell<Vec<Box<[*mut core::ffi::c_void]>>> =
+                std::cell::RefCell::new(Vec::new());
+            try_one(&|p| {
+                let mut ptrs: Vec<*mut core::ffi::c_void> = Vec::new();
+                let mut at = 0usize;
+                loop {
+                    let (mut offset, mut size) = (0usize, 0usize);
+                    if unsafe { dr::cuFuncGetParamInfo(func, at, &raw mut offset, &raw mut size) }
+                        != dr::CUresult::CUDA_SUCCESS
+                        || at > 64
+                    {
+                        break;
+                    }
+                    let mut cell = vec![0u8; size.max(1)].into_boxed_slice();
+                    if !p.kernelParams.is_null() && at < arity(p.func) {
+                        let (mut was_offset, mut was) = (0usize, 0usize);
+                        if unsafe {
+                            dr::cuFuncGetParamInfo(p.func, at, &raw mut was_offset, &raw mut was)
+                        } == dr::CUresult::CUDA_SUCCESS
+                        {
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    (*p.kernelParams.add(at)).cast::<u8>(),
+                                    cell.as_mut_ptr(),
+                                    size.min(was),
+                                );
+                            }
+                        }
+                    }
+                    ptrs.push(cell.as_mut_ptr().cast());
+                    farm.borrow_mut().push(cell);
+                    at += 1;
+                }
+                let mut block = ptrs.into_boxed_slice();
+                p.func = func;
+                if !block.is_empty() {
+                    p.kernelParams = block.as_mut_ptr();
+                }
+                plots.borrow_mut().push(block);
+            })
         }
         None => Err(-1),
     };
@@ -704,8 +771,11 @@ fn arity(func: cudarc::driver::sys::CUfunction) -> usize {
 /// wall time, measured by instantiating `copies` of `graph` and watching
 /// `cudaMemGetInfo`.
 ///
-/// The number the split-keyed world multiplies by its exec count, and the one
-/// a keyless plane would multiply by `len(buckets)`.
+/// The number a cache multiplies by its exec count, and the one that sized
+/// [`crate::record::MAX_BODIES`]: the retired keyed path would have multiplied
+/// it by the traffic's distinct `(rows, lanes)` tables, and the sealed lattice
+/// multiplies it by the present sets times the buckets, which is a list the
+/// load can walk.
 ///
 /// # Errors
 ///

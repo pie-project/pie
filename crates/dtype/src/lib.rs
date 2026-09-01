@@ -1,25 +1,7 @@
-//! The element type, as one enum for the whole tree.
-//!
-//! There were two, and they said the same thing in two spellings: the IR's
-//! `model_ir::Dtype`, which named what a traced value computes in and what a
-//! weight plane or kv page stores, and the loader's `checkpoint::types::DType`,
-//! which named what a checkpoint tensor holds on disk. Neither vocabulary was a
-//! subset of the other — the IR knew the sub-byte quant codes (`Fp4`, `Mxfp4`)
-//! and the loader knew the wide ints and `Bool` — so every edge between them was
-//! a hand-written table that could be wrong in one direction only, and the third
-//! size table (`engine::transfer::dtype_bits`) could disagree with both.
-//!
-//! This crate is the union of the two vocabularies and nothing else: the enum,
-//! its width, and serde. It is a leaf — it deps `serde` and no crate in the
-//! tree — so anything from the loader to a kernel entry function can name it
-//! without naming a plane it has no business in.
-//!
-//! `no_std`, and `serde` is a feature rather than a fact. Both are for the
-//! guests: `eta-ir` is what a wasm inferlet imports, it is `no_std` with serde
-//! off by default, and a leaf that forced either on would force it on every
-//! guest build in the tree. The feature is **on by default**, so every host
-//! consumer sees the crate it always saw; `eta-ir` is the one that takes it
-//! with `default-features = false` and forwards its own `serde` feature here.
+//! The closed storage-type enum for the whole tree: elements and every
+//! composite quantization format a kernel actually serves.
+//! [`Dtype::repr`] expands each variant to its algebra, and every number
+//! downstream derives from that; the wire form is the mangled spelling.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -28,131 +10,31 @@
 #[cfg(test)]
 extern crate std;
 
-// `quant`'s [`Term`](quant::Term) is a recursive tree and has to box itself.
-// Nothing else in the crate allocates, so the box lives behind a feature that
-// is OFF by default: a wasm guest that imports this crate for `Dtype` gets no
-// allocator dependency it did not ask for, and the canonicalizer -- the one
-// consumer that needs the unprojected term -- turns it on.
-#[cfg(feature = "alloc")]
-extern crate alloc;
+mod repr;
 
-pub mod quant;
+pub use repr::{
+    Elem, Fmt, G64_U4_F16_Z_F16, G128_U4_F16_Z_U4, GT_T3_F16_N, Group, MAX_PLANES, Mangled, Off,
+    PlaneWidths, Quantum, spells,
+};
 
-/// Element type as data, not a generic: monomorphization's guarantee moved to
-/// the trace-time validator plus a launch-site match. The one such enum in the
-/// stack — it names storage representations as well as compute elements, so a
-/// weight plane, a kv page, a checkpoint tensor and a traced value all say what
-/// they hold in one spelling.
-///
-/// `Mxfp4` is a weight plane's 32-code block packed to 16 bytes; the companion
-/// `.scales` plane beside it is `E8m0`, which is only ever that companion and
-/// never something an author declares. `MlxU4` is the other packed weight
-/// plane, and it carries two companions rather than one — `.scales` and
-/// `.biases`, both `Bf16`. `Fp8E4m3`, `I8` and `Fp4` name kv-page
-/// quant schemes. What a scheme's granularity is (per-tensor vs per-token-head)
-/// and how wide an fp4 block runs are not facts about the element — they are
-/// sibling fields of the cache row that chose the scheme.
-///
-/// The `#[serde(alias = ...)]` attributes below are the loader's old spellings.
-/// A `LoadPlan` is `Serialize`, and plans recorded before the two enums merged
-/// name their dtypes `"BF16"`, `"F8E4M3"`, `"F8E5M2"` and `"E8M0"`; the aliases
-/// keep those readable. Nothing *writes* them any more — a plan serialized
-/// today carries the spelling on the variant.
+/// Storage type as data: every kv page, weight plane, and traced value names
+/// what it holds in one spelling, whether element or whole quantized format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Dtype {
-    // ── floats ──────────────────────────────────────────────────────────
     /// IEEE-754 binary32.
     F32,
     /// IEEE-754 binary16.
     F16,
     /// bfloat16: binary32's exponent range at binary16's width.
-    #[cfg_attr(feature = "serde", serde(alias = "BF16"))]
     Bf16,
-    /// OCP FP8 with a 4-bit exponent and a 3-bit mantissa.
-    #[cfg_attr(feature = "serde", serde(alias = "F8E4M3"))]
-    Fp8E4m3,
-    /// OCP FP8 with a 5-bit exponent and a 2-bit mantissa.
-    #[cfg_attr(feature = "serde", serde(alias = "F8E5M2"))]
-    Fp8E5m2,
-    /// Bare 4-bit float codes, two per byte, scaled by whatever chose them.
-    Fp4,
-    /// OCP Microscaling FP4: a 32-code block of `Fp4` packed to 16 bytes,
-    /// with an `E8m0` scale per block in the companion `.scales` plane.
-    Mxfp4,
-    /// MLX's affine 4-bit weight codes: one unsigned 4-bit code per element,
-    /// eight to a `U32` word, with one `Bf16` scale and one `Bf16` zero point
-    /// per 64-code group -- an element is `code * scale + bias`. The two
-    /// companion planes are named `.scales` and `.biases`, which is MLX's own
-    /// convention and the one a converted checkpoint is bound by.
-    ///
-    /// `Mxfp4`'s sibling and not its cousin. Both name a weight bank's codes
-    /// plane, neither is anything an activation is stated in, and both are
-    /// four bits wide; what differs is the group width and what a group's
-    /// companion holds — an exponent byte there, a scale AND an offset here.
-    /// The whole scheme is `checkpoint::types::QuantScheme::MlxAffineU4`,
-    /// which is where the group width and the scale form are settled. This
-    /// name is only what a weight declaration stamps to reach it.
-    MlxU4,
-    /// **MLX's affine 8-bit weight codes**, `MlxU4`'s own scheme at twice the
-    /// width: one unsigned 8-bit code per element, four to a `U32` word, with
-    /// one `Bf16` scale and one `Bf16` zero point per 64-code group. An
-    /// element is `code * scale + bias`, exactly as at four bits, and the
-    /// companion planes carry MLX's same `.scales` and `.biases` names.
-    ///
-    /// **IT EXISTS BECAUSE ONE CHECKPOINT MIXES THE TWO, AND MIXES THEM ON
-    /// PURPOSE.** `mlx_lm` lets a family name planes that must not be
-    /// quantized as hard as the rest, through `quant_predicate`, and
-    /// `gpt_oss.py`'s says
-    ///
-    /// ```python
-    /// if path.endswith("router"):
-    ///     return {"group_size": 64, "bits": 8}
-    /// ```
-    ///
-    /// so `mlx-community/gpt-oss-20b-MXFP4-Q4` publishes a stack whose
-    /// attention is affine-U4 and whose twenty-four MoE ROUTER GATES are
-    /// affine-U8. A router picks which experts a token visits; four bits of a
-    /// `[32, 2880]` gate is a different set of experts, and the model that
-    /// results is not the model. `qwen3_5.py` and `gemma4_text.py` carry the
-    /// same predicate for their own gates, so this is a convention rather than
-    /// one file's accident.
-    ///
-    /// **THE WIDTH IS A NUMBER THE PLANE CARRIES, NOT A NEW ARITHMETIC.**
-    /// `QuantScheme::MlxAffineU4` names the SCHEME — affine codes, 64 to a
-    /// group, bf16 scale and bf16 offset — and `QuantSpec::bits_per_element`
-    /// has always been the field that says how wide a code is. Both widths
-    /// therefore land on that one scheme, and the affine kernels already
-    /// stamp both: `kernels_metal::linear::quant`'s `WIDTHS` is `[4, 8]`, and
-    /// the `bits` its points are chosen by comes off
-    /// `checkpoint::plan::Landing::affine_point_of`, which reads the plane's
-    /// own spec. What this variant adds is the ability for a MODEL TEXT to say
-    /// which width a weight is, which is the one thing `Dtype` is for.
-    MlxU8,
-    /// `MlxU4` grouped by THIRTY-TWO codes instead of sixty-four — the same
-    /// affine scheme, the same `.scales`/`.biases` companions, half the
-    /// group.
-    ///
-    /// **IT EXISTS BECAUSE A ROW CAN BE TOO NARROW TO GROUP BY 64.** MLX
-    /// quantizes along the last axis and requires the group to divide it;
-    /// qwen4's PLE n-gram table stores 160-wide rows, `160 % 64 != 0`, so
-    /// `mlx_lm.convert` drops that one tensor family to `group_size: 32`
-    /// (`Qwen3.8-Flash-Next-MLX`'s `config.json` lists all 128 shards under
-    /// it) while everything beside it stays at 64. The width is four bits
-    /// either way; `QuantSpec::group_size` has always been the field that
-    /// says how many codes share a scale, and this variant is what lets a
-    /// model TEXT say it — `MlxU8`'s own argument, one spec field over.
-    MlxU4G32,
-    /// OCP Microscaling's 8-bit exponent-only scale format: the stored byte
-    /// `b` denotes `2^(b - 127)`. It carries no sign and no mantissa, so it
-    /// only ever appears as the scale beside a block-scaled tensor -- which is
-    /// why `QuantScheme` long knew it only as half of `Mxfp4E2M1E8M0`.
-    /// DeepSeek-V4 pairs it with FP8-E4M3 weights instead, a combination that
-    /// composite cannot name.
-    #[cfg_attr(feature = "serde", serde(alias = "E8M0"))]
+    /// OCP FP8, 4-bit exponent, 3-bit mantissa.
+    E4m3,
+    /// OCP FP8, 5-bit exponent, 2-bit mantissa.
+    E5m2,
+    /// Bare 4-bit float codes, two per byte.
+    E2m1,
+    /// OCP Microscaling's 8-bit exponent-only scale byte.
     E8m0,
-
-    // ── ints ────────────────────────────────────────────────────────────
     /// Signed 64-bit.
     I64,
     /// Signed 32-bit.
@@ -167,104 +49,427 @@ pub enum Dtype {
     U32,
     /// Unsigned 16-bit.
     U16,
-    /// Unsigned 8-bit — also the byte a packed quant plane is carried in.
+    /// Unsigned 8-bit.
     U8,
-
-    // ── logical ─────────────────────────────────────────────────────────
-    /// One byte per element, as every checkpoint format stores it.
+    /// One byte per element.
     Bool,
+
+    /// OCP Microscaling FP4: `g32_e2m1_e8m0_n`.
+    Mxfp4,
+    /// NVIDIA NVFP4: `g16_e2m1_gt_e4m3_f32_n_n`.
+    Nvfp4,
+    /// Affine 4-bit, 64 per group: `g64_u4_bf16_b_bf16`.
+    U4g64,
+    /// Affine 8-bit, 64 per group: `g64_u8_bf16_b_bf16`.
+    U8g64,
+    /// Affine 4-bit, 32 per group: `g32_u4_bf16_b_bf16`.
+    U4g32,
+    /// Two-bit k-quant (ggml `q2_k`): `g16_u2_g16_u4_f16_n_b_g16_u4_f16_n`.
+    U2g16k,
+    /// Three-bit k-quant (ggml `q3_k`): `g16_i3_g16_i6_f16_n_n`.
+    I3g16k,
+    /// Four-bit k-quant (ggml `q4_k`): `g32_u4_g8_u6_f16_n_b_g8_u6_f16_n`.
+    U4g32k,
+    /// Five-bit k-quant (ggml `q5_k`): `g32_u5_g8_u6_f16_n_b_g8_u6_f16_n`.
+    U5g32k,
+    /// Six-bit k-quant (ggml `q6_k`): `g16_i6_g16_i8_f16_n_n`.
+    I6g16k,
+    /// FP8, one f32 scale per row: `gr_e4m3_f32_n`.
+    E4m3row,
+    /// FP8, one f32 scale per 128x128 tile: `g128x128_e4m3_f32_n`.
+    E4m3tile128,
 }
 
 impl Dtype {
-    /// Bits one element of this dtype occupies.
-    ///
-    /// Bits and not bytes because the sub-byte formats are real: `Fp4` and
-    /// `Mxfp4` pack two elements per byte, and a `size() -> usize` that rounded
-    /// them up to one would over-report every quantized pool by 2×.
+    /// Every variant, in declaration order.
+    pub const ALL: [Self; 28] = [
+        Self::F32,
+        Self::F16,
+        Self::Bf16,
+        Self::E4m3,
+        Self::E5m2,
+        Self::E2m1,
+        Self::E8m0,
+        Self::I64,
+        Self::I32,
+        Self::I16,
+        Self::I8,
+        Self::U64,
+        Self::U32,
+        Self::U16,
+        Self::U8,
+        Self::Bool,
+        Self::Mxfp4,
+        Self::Nvfp4,
+        Self::U4g64,
+        Self::U8g64,
+        Self::U4g32,
+        Self::U2g16k,
+        Self::I3g16k,
+        Self::U4g32k,
+        Self::U5g32k,
+        Self::I6g16k,
+        Self::E4m3row,
+        Self::E4m3tile128,
+    ];
+
+    /// The variant's algebra, from which every derived number comes.
+    #[must_use]
+    pub const fn repr(self) -> &'static Fmt<'static> {
+        const BF16: Fmt<'static> = Fmt::Elem(Elem::Bf16);
+        const F16: Fmt<'static> = Fmt::Elem(Elem::F16);
+        const F32: Fmt<'static> = Fmt::Elem(Elem::F32);
+        const KQ_U6X8: Fmt<'static> = Fmt::Q {
+            g: Group::N(8),
+            elem: Elem::U(6),
+            gain: &F16,
+            offset: None,
+        };
+        const KQ_U4X16: Fmt<'static> = Fmt::Q {
+            g: Group::N(16),
+            elem: Elem::U(4),
+            gain: &F16,
+            offset: None,
+        };
+        match self {
+            Self::F32 => &Fmt::Elem(Elem::F32),
+            Self::F16 => &Fmt::Elem(Elem::F16),
+            Self::Bf16 => &Fmt::Elem(Elem::Bf16),
+            Self::E4m3 => &Fmt::Elem(Elem::E { e: 4, m: 3 }),
+            Self::E5m2 => &Fmt::Elem(Elem::E { e: 5, m: 2 }),
+            Self::E2m1 => &Fmt::Elem(Elem::E { e: 2, m: 1 }),
+            Self::E8m0 => &Fmt::Elem(Elem::E { e: 8, m: 0 }),
+            Self::I64 => &Fmt::Elem(Elem::I(64)),
+            Self::I32 => &Fmt::Elem(Elem::I(32)),
+            Self::I16 => &Fmt::Elem(Elem::I(16)),
+            Self::I8 => &Fmt::Elem(Elem::I(8)),
+            Self::U64 => &Fmt::Elem(Elem::U(64)),
+            Self::U32 => &Fmt::Elem(Elem::U(32)),
+            Self::U16 => &Fmt::Elem(Elem::U(16)),
+            Self::U8 => &Fmt::Elem(Elem::U(8)),
+            Self::Bool => &Fmt::Elem(Elem::Bool),
+            Self::Mxfp4 => &Fmt::Q {
+                g: Group::N(32),
+                elem: Elem::E { e: 2, m: 1 },
+                gain: &Fmt::Elem(Elem::E { e: 8, m: 0 }),
+                offset: None,
+            },
+            Self::Nvfp4 => &Fmt::Q {
+                g: Group::N(16),
+                elem: Elem::E { e: 2, m: 1 },
+                gain: &Fmt::Q {
+                    g: Group::Tensor,
+                    elem: Elem::E { e: 4, m: 3 },
+                    gain: &F32,
+                    offset: None,
+                },
+                offset: None,
+            },
+            Self::U4g64 => &Fmt::Q {
+                g: Group::N(64),
+                elem: Elem::U(4),
+                gain: &BF16,
+                offset: Some(Off::Post(&BF16)),
+            },
+            Self::U8g64 => &Fmt::Q {
+                g: Group::N(64),
+                elem: Elem::U(8),
+                gain: &BF16,
+                offset: Some(Off::Post(&BF16)),
+            },
+            Self::U4g32 => &Fmt::Q {
+                g: Group::N(32),
+                elem: Elem::U(4),
+                gain: &BF16,
+                offset: Some(Off::Post(&BF16)),
+            },
+            Self::U2g16k => &Fmt::Q {
+                g: Group::N(16),
+                elem: Elem::U(2),
+                gain: &KQ_U4X16,
+                offset: Some(Off::Post(&KQ_U4X16)),
+            },
+            Self::I3g16k => &Fmt::Q {
+                g: Group::N(16),
+                elem: Elem::I(3),
+                gain: &Fmt::Q {
+                    g: Group::N(16),
+                    elem: Elem::I(6),
+                    gain: &F16,
+                    offset: None,
+                },
+                offset: None,
+            },
+            Self::U4g32k => &Fmt::Q {
+                g: Group::N(32),
+                elem: Elem::U(4),
+                gain: &KQ_U6X8,
+                offset: Some(Off::Post(&KQ_U6X8)),
+            },
+            Self::U5g32k => &Fmt::Q {
+                g: Group::N(32),
+                elem: Elem::U(5),
+                gain: &KQ_U6X8,
+                offset: Some(Off::Post(&KQ_U6X8)),
+            },
+            Self::I6g16k => &Fmt::Q {
+                g: Group::N(16),
+                elem: Elem::I(6),
+                gain: &Fmt::Q {
+                    g: Group::N(16),
+                    elem: Elem::I(8),
+                    gain: &F16,
+                    offset: None,
+                },
+                offset: None,
+            },
+            Self::E4m3row => &Fmt::Q {
+                g: Group::Row,
+                elem: Elem::E { e: 4, m: 3 },
+                gain: &F32,
+                offset: None,
+            },
+            Self::E4m3tile128 => &Fmt::Q {
+                g: Group::Tile(128, 128),
+                elem: Elem::E { e: 4, m: 3 },
+                gain: &F32,
+                offset: None,
+            },
+        }
+    }
+
+    /// The canonical name: the repr's mangled spelling.
+    #[must_use]
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Bf16 => "bf16",
+            Self::E4m3 => "e4m3",
+            Self::E5m2 => "e5m2",
+            Self::E2m1 => "e2m1",
+            Self::E8m0 => "e8m0",
+            Self::I64 => "i64",
+            Self::I32 => "i32",
+            Self::I16 => "i16",
+            Self::I8 => "i8",
+            Self::U64 => "u64",
+            Self::U32 => "u32",
+            Self::U16 => "u16",
+            Self::U8 => "u8",
+            Self::Bool => "bool",
+            Self::Mxfp4 => "g32_e2m1_e8m0_n",
+            Self::Nvfp4 => "g16_e2m1_gt_e4m3_f32_n_n",
+            Self::U4g64 => "g64_u4_bf16_b_bf16",
+            Self::U8g64 => "g64_u8_bf16_b_bf16",
+            Self::U4g32 => "g32_u4_bf16_b_bf16",
+            Self::U2g16k => "g16_u2_g16_u4_f16_n_b_g16_u4_f16_n",
+            Self::I3g16k => "g16_i3_g16_i6_f16_n_n",
+            Self::U4g32k => "g32_u4_g8_u6_f16_n_b_g8_u6_f16_n",
+            Self::U5g32k => "g32_u5_g8_u6_f16_n_b_g8_u6_f16_n",
+            Self::I6g16k => "g16_i6_g16_i8_f16_n_n",
+            Self::E4m3row => "gr_e4m3_f32_n",
+            Self::E4m3tile128 => "g128x128_e4m3_f32_n",
+        }
+    }
+
+    /// The variant whose repr is exactly this term, or `None` if unsupported.
+    #[must_use]
+    pub fn of_fmt(f: &Fmt<'_>) -> Option<Self> {
+        for d in Self::ALL {
+            if *d.repr() == *f {
+                return Some(d);
+            }
+        }
+        None
+    }
+
+    /// The element this dtype is, or `None` for a composite.
+    #[must_use]
+    pub const fn elem(self) -> Option<Elem> {
+        match *self.repr() {
+            Fmt::Elem(e) => Some(e),
+            Fmt::Q { .. } => None,
+        }
+    }
+
+    /// Bits one code occupies; for the five k-quants this is the code width,
+    /// not the container size.
     #[must_use]
     pub const fn bits(self) -> u64 {
-        match self {
-            Self::I64 | Self::U64 => 64,
-            Self::F32 | Self::I32 | Self::U32 => 32,
-            Self::F16 | Self::Bf16 | Self::I16 | Self::U16 => 16,
-            Self::Fp8E4m3
-            | Self::Fp8E5m2
-            | Self::E8m0
-            | Self::I8
-            | Self::U8
-            | Self::MlxU8
-            | Self::Bool => 8,
-            Self::Fp4 | Self::Mxfp4 | Self::MlxU4 | Self::MlxU4G32 => 4,
+        match self.repr().code().rate() {
+            Some((bits, 1)) => bits as u64,
+            _ => panic!("every Dtype's code is a whole-bit element"),
         }
     }
 
     /// Bytes one element occupies, rounded up.
-    ///
-    /// Exact for every dtype a checkpoint stores one element per address in,
-    /// and a deliberate over-report for the two sub-byte codes — an element of
-    /// `Fp4` has no address of its own. Multiply [`bits`](Dtype::bits) and
-    /// divide once when the count is known instead, wherever the answer is a
-    /// span rather than a stride.
     #[must_use]
     pub const fn bytes_ceil(self) -> u64 {
         self.bits().div_ceil(8)
+    }
+
+    /// Bits per weight for a `k`-wide row.
+    #[must_use]
+    pub fn bpw(self, k: u32) -> Option<f64> {
+        self.repr().bpw(k)
+    }
+
+    /// The leaf-per-plane byte rectangle.
+    #[must_use]
+    pub fn plane_widths(self, k: u32) -> Option<PlaneWidths> {
+        self.repr().plane_widths(k)
+    }
+
+    /// The minimal k-split.
+    #[must_use]
+    pub fn quantum(self) -> Quantum {
+        self.repr().quantum()
+    }
+}
+
+impl core::fmt::Display for Dtype {
+    /// The canonical name.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.spelling())
+    }
+}
+
+const _: () = {
+    let mut i = 0;
+    while i < Dtype::ALL.len() {
+        let d = Dtype::ALL[i];
+        assert!(
+            spells(d.repr(), d.spelling()),
+            "a Dtype's spelling does not mangle its repr"
+        );
+        i += 1;
+    }
+};
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Dtype {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.spelling())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Dtype {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = Dtype;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("a dtype spelling such as \"bf16\" or \"g64_u4_bf16_b_bf16\"")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Dtype, E> {
+                for d in Dtype::ALL {
+                    if d.spelling() == text {
+                        return Ok(d);
+                    }
+                }
+                Err(E::unknown_variant(text, &[]))
+            }
+        }
+        d.deserialize_str(V)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Dtype;
-    #[cfg(feature = "serde")]
-    use std::vec;
-    #[cfg(feature = "serde")]
+    use super::{Dtype, Fmt, Group};
+    use std::string::{String, ToString};
     use std::vec::Vec;
 
-    /// The width table, against the two it was merged from.
+    /// `repr` is injective, and `of_fmt` inverts it.
     #[test]
-    fn widths_are_what_both_tables_said() {
-        // checkpoint's `DType::bytes`.
-        assert_eq!(Dtype::I64.bytes_ceil(), 8);
-        assert_eq!(Dtype::U64.bytes_ceil(), 8);
-        assert_eq!(Dtype::F32.bytes_ceil(), 4);
-        assert_eq!(Dtype::I32.bytes_ceil(), 4);
-        assert_eq!(Dtype::U32.bytes_ceil(), 4);
-        assert_eq!(Dtype::F16.bytes_ceil(), 2);
-        assert_eq!(Dtype::Bf16.bytes_ceil(), 2);
-        assert_eq!(Dtype::I16.bytes_ceil(), 2);
-        assert_eq!(Dtype::U16.bytes_ceil(), 2);
-        for narrow in [
-            Dtype::Fp8E4m3,
-            Dtype::Fp8E5m2,
-            Dtype::E8m0,
-            Dtype::I8,
-            Dtype::U8,
-            Dtype::Bool,
-        ] {
-            assert_eq!(narrow.bytes_ceil(), 1);
+    fn repr_is_injective_and_of_fmt_inverts_it() {
+        for (i, a) in Dtype::ALL.iter().enumerate() {
+            for b in &Dtype::ALL[i + 1..] {
+                assert_ne!(a.repr(), b.repr(), "{a:?} and {b:?} share a repr");
+            }
         }
-        // `engine::transfer::dtype_bits` — the sub-byte half nobody else had.
-        assert_eq!(Dtype::Fp4.bits(), 4);
-        assert_eq!(Dtype::Mxfp4.bits(), 4);
-        assert_eq!(Dtype::MlxU4.bits(), 4);
+        for d in Dtype::ALL {
+            assert_eq!(Dtype::of_fmt(d.repr()), Some(d), "{d:?}");
+        }
+        assert_eq!(Dtype::of_fmt(&super::G128_U4_F16_Z_U4), None);
+        assert_eq!(Dtype::of_fmt(&super::GT_T3_F16_N), None);
     }
 
-    /// A plan recorded under the loader's old spellings still reads.
-    #[cfg(feature = "serde")]
+    /// A composite variant's identifier is derived from its repr.
     #[test]
-    fn the_old_loader_spellings_still_deserialize() {
-        let old = r#"["BF16","F8E4M3","F8E5M2","E8M0"]"#;
-        let read: Vec<Dtype> = serde_json::from_str(old).expect("old spellings read");
-        assert_eq!(
-            read,
-            vec![Dtype::Bf16, Dtype::Fp8E4m3, Dtype::Fp8E5m2, Dtype::E8m0]
-        );
+    fn composite_names_are_derived_from_their_reprs() {
+        fn cap(token: String) -> String {
+            let mut c = token.chars();
+            match c.next() {
+                Some(first) => first.to_uppercase().chain(c).collect(),
+                None => token,
+            }
+        }
+        fn derived(f: &Fmt<'_>) -> Option<String> {
+            let Fmt::Q { g, elem, gain, .. } = *f else {
+                return None;
+            };
+            let group = match g {
+                Group::N(n) => std::format!("g{n}"),
+                Group::Tile(r, c) if r == c => std::format!("tile{r}"),
+                Group::Tile(r, c) => std::format!("tile{r}x{c}"),
+                Group::Row => "row".to_string(),
+                Group::Tensor => "t".to_string(),
+            };
+            let nested = if matches!(gain, Fmt::Q { .. }) { "k" } else { "" };
+            Some(std::format!("{}{group}{nested}", cap(elem.to_string())))
+        }
+        let mut exceptions = Vec::new();
+        for d in Dtype::ALL {
+            let Some(name) = derived(d.repr()) else {
+                continue;
+            };
+            let ident = std::format!("{d:?}");
+            if ident == name {
+                continue;
+            }
+            exceptions.push(ident);
+        }
+        assert_eq!(exceptions, ["Mxfp4", "Nvfp4"]);
     }
 
-    /// What it writes is the variant's own spelling, not the alias.
+    /// What it writes is the canonical spelling, and the trip is an identity.
     #[cfg(feature = "serde")]
     #[test]
-    fn what_it_writes_is_the_variant_name() {
+    fn what_it_writes_is_the_spelling_and_it_round_trips() {
         let text = serde_json::to_string(&Dtype::Bf16).expect("write");
-        assert_eq!(text, "\"Bf16\"");
+        assert_eq!(text, "\"bf16\"");
+        let text = serde_json::to_string(&Dtype::U4g64).expect("write");
+        assert_eq!(text, "\"g64_u4_bf16_b_bf16\"");
+        for d in Dtype::ALL {
+            let text = serde_json::to_string(&d).expect("write");
+            let back: Dtype = serde_json::from_str(&text).expect("read");
+            assert_eq!(back, d);
+        }
+        let bad: Result<Dtype, _> = serde_json::from_str("\"q4_k\"");
+        assert!(bad.is_err(), "a vendor name is not a wire spelling");
+    }
+
+    /// The bits-per-weight numbers the published tables pin.
+    #[test]
+    fn bpw_matches_the_published_tables() {
+        let k = 4096;
+        assert_eq!(Dtype::Mxfp4.bpw(k), Some(4.25));
+        assert_eq!(Dtype::Nvfp4.bpw(k), Some(4.5));
+        assert_eq!(Dtype::U4g64.bpw(k), Some(4.5));
+        assert_eq!(Dtype::U8g64.bpw(k), Some(8.5));
+        assert_eq!(Dtype::U4g32.bpw(k), Some(5.0));
+        assert_eq!(Dtype::U4g32k.bpw(k), Some(4.5));
+        assert_eq!(Dtype::I6g16k.bpw(k), Some(6.5625));
+        assert_eq!(Dtype::U2g16k.bpw(k), Some(2.625));
+        assert_eq!(Dtype::U5g32k.bpw(k), Some(5.5));
+        assert_eq!(Dtype::I3g16k.bpw(k), Some(3.4375));
+        assert_eq!(Dtype::E4m3row.bpw(4096), Some(8.0 + 32.0 / 4096.0));
+        assert_eq!(Dtype::E4m3row.bpw(1024), Some(8.0 + 32.0 / 1024.0));
+        assert_eq!(Dtype::Bf16.bpw(k), Some(16.0));
     }
 }

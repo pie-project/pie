@@ -35,7 +35,7 @@ pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 DType::U16 => u16::from_le_bytes(chunk.try_into().unwrap()) as f64,
                 DType::U8 | DType::Bool => chunk[0] as f64,
                 DType::E8m0 => (chunk[0] as f64 - 127.0).exp2(),
-                DType::Fp8E4m3 | DType::Fp8E5m2 => {
+                DType::E4m3 | DType::E5m2 => {
                     return Err(invalid("host Cast does not implement FP8"));
                 }
                 // A 64-bit integer does not survive the f64 pivot this cast
@@ -47,18 +47,29 @@ pub fn decode_values(bytes: &[u8], dtype: DType) -> Result<Vec<f64>, Error> {
                 // Sub-byte codes have no element to chunk on: `width` above
                 // rounded them up to a byte, and a byte holds two of them.
                 // Packing and unpacking them is `codec::mxfp4`'s, not a cast's.
-                DType::Fp4 | DType::Mxfp4 | DType::MlxU4 | DType::MlxU4G32 => {
+                DType::E2m1 => {
                     return Err(invalid("host Cast does not implement the sub-byte codes"));
                 }
-                // Byte-wide, and no more castable for it: an `MlxU8` byte is
-                // an affine CODE, meaningless without the scale and the offset
-                // of its group. Reading it as the integer it happens to be
-                // would produce a number, which is the failure mode this arm
-                // exists to prevent.
-                DType::MlxU8 => {
+                // A quantized format's byte is a CODE, meaningless without
+                // its group's factors. Reading it as the integer it happens
+                // to be would produce a number, which is the failure mode
+                // this arm exists to prevent; decoding a whole plane is a
+                // codec's or a kernel's job, never a cast's.
+                DType::Mxfp4
+                | DType::Nvfp4
+                | DType::U4g64
+                | DType::U8g64
+                | DType::U4g32
+                | DType::U2g16k
+                | DType::I3g16k
+                | DType::U4g32k
+                | DType::U5g32k
+                | DType::I6g16k
+                | DType::E4m3row
+                | DType::E4m3tile128 => {
                     return Err(invalid(
-                        "host Cast does not implement affine codes: an MlxU8 byte means \
-                         nothing without its group's scale and offset",
+                        "host Cast does not implement quantized formats: a code means \
+                         nothing without its group's factors",
                     ));
                 }
             })
@@ -87,18 +98,30 @@ pub fn encode_values(values: &[f64], dtype: DType) -> Result<Vec<u8>, Error> {
             DType::E8m0 => {
                 return Err(invalid("host Cast does not encode to E8M0"));
             }
-            DType::Fp8E4m3 | DType::Fp8E5m2 => {
+            DType::E4m3 | DType::E5m2 => {
                 return Err(invalid("host Cast does not implement FP8"));
             }
             // See `decode_values`: a sub-byte code is packed, not cast.
-            DType::Fp4 | DType::Mxfp4 | DType::MlxU4 | DType::MlxU4G32 => {
+            DType::E2m1 => {
                 return Err(invalid("host Cast does not implement the sub-byte codes"));
             }
-            // And an affine code is quantized, not cast — see `decode_values`.
-            DType::MlxU8 => {
+            // And a quantized format's code is quantized, not cast — choosing
+            // one picks the group's factors too. See `decode_values`.
+            DType::Mxfp4
+            | DType::Nvfp4
+            | DType::U4g64
+            | DType::U8g64
+            | DType::U4g32
+            | DType::U2g16k
+            | DType::I3g16k
+            | DType::U4g32k
+            | DType::U5g32k
+            | DType::I6g16k
+            | DType::E4m3row
+            | DType::E4m3tile128 => {
                 return Err(invalid(
-                    "host Cast does not encode to affine codes: choosing an MlxU8 byte \
-                     is a quantization, which picks the group's scale and offset too",
+                    "host Cast does not encode to quantized formats: choosing a code \
+                     is a quantization, which picks the group's factors too",
                 ));
             }
             DType::I64 | DType::U64 => {

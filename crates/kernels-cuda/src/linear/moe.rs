@@ -117,6 +117,9 @@ pub fn topk_softmax(
             e.arg(),
             k.arg(),
             0_i32.arg(), // `hidden`, read only by the fused form
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -160,6 +163,9 @@ pub fn topk_softmax_scaled(
             e.arg(),
             k.arg(),
             0_i32.arg(), // `hidden`, read only by the fused form
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -194,6 +200,9 @@ fn ranked_router(
             k.arg(),
             renormalize.arg(),
             scaling.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -413,6 +422,13 @@ pub fn matmul_select(
 /// this rather than stamping a twin, and passes its own `op` so that a refusal
 /// or a launch failure comes back attributed to the correction the author
 /// wrote instead of to an MoE the plan does not contain.
+///
+/// **AND THE STAGED-GEOMETRY SEAT RIDES THE SAME PATH**, which costs the
+/// borrower nothing: `linear.lora_correct` is `engine_cuda::GROUPED`'s single
+/// name and a grouped region is refused admission to a body, so no lora fire
+/// can happen with a stage armed and the seat it passes is always `ABSENT` —
+/// the null pointer the kernel reads as the arithmetic it did before the seat
+/// existed. Only `linear.moe_matmul_select` ever arms it.
 pub(crate) fn select_gemv(
     ctx: &Ctx,
     op: &'static str,
@@ -476,6 +492,12 @@ pub(crate) fn select_gemv(
             // arm on it is the arithmetic it did before the seats existed.
             ArgValue::Ptr(experts.table),
             ArgValue::Ptr(experts.hits),
+            // The staged-geometry seat, read here in ROUTE space off words
+            // written in TOKEN space: the grid's route axis is `top_k` of the
+            // region's rows, so the kernel multiplies the pair by the fan-out
+            // (`moe.cuh` states the conversion). `ABSENT` when no body armed
+            // one, which is the arithmetic this leg always did.
+            ctx.stage(),
         ],
     )
 }
@@ -711,6 +733,9 @@ pub fn weighted_sum(
             weights.arg(),
             stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -771,6 +796,9 @@ pub fn bias_sum(
             weights.arg(),
             stated(OP, top_k)?.arg(),
             stated(OP, y.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -812,6 +840,9 @@ pub fn sigmoid_gate_add(
             // the head of a `gate.width`-wide row (the old strided column,
             // stated on the handle).
             stated(OP, nonzero(OP, "the gate row's pitch", gate.width)?)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

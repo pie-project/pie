@@ -29,6 +29,12 @@ use model_dsl::Platform;
 use model_exec::fire::{Lane, MaskSpan, WindowTable, compose, fallback};
 use model_ir::Trace;
 
+/// A slot table generously above every hand-built fire below — the tests ask
+/// about window semantics, not the carve, so the ceiling only has to hold.
+fn test_slots() -> engine_cuda::window::Slots {
+    engine_cuda::window::Slots::new(8, 512, 8, 1)
+}
+
 /// The SKU whose `captures_scores` window P4 withdraws, and the one the
 /// reproduction numbers in this file's doc were measured on.
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
@@ -99,6 +105,7 @@ fn every_run_of_a_split_window_gets_its_own_span_and_its_own_boundaries() {
         fire.patch_classes(),
         &boundaries,
         engine_cuda::window::Copies::off(),
+        test_slots(),
     )
     .expect("a fragmented window is a slow path, not a fault");
 
@@ -205,6 +212,7 @@ fn a_window_p4_promised_whole_is_still_a_bake_integrity_refusal() {
         &WindowTable::default(),
         &indptr(&vec![1; count]),
         engine_cuda::window::Copies::off(),
+        test_slots(),
     )
     .expect_err("a promise P4 made and this table broke");
     let said = refusal.to_string();

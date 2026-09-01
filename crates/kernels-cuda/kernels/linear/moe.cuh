@@ -102,13 +102,27 @@ __device__ __forceinline__ void moe_topk_softmax_body(
     i32* __restrict__ topk_idx,
     float* __restrict__ topk_w,
     int num_experts, int K, int hidden,
+    const u32* __restrict__ win,
     const T* __restrict__ per_expert_scale = nullptr)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): this grid is one
+    // block per TOKEN row, so a replay whose grid was carved at a bucket
+    // retires its padded rows here, off a word the fire staged and not a
+    // parameter the recording baked. A router's grid counts rows and nothing
+    // else, so the seat's lane pair is not read at all.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // The seat's second word says WHERE those rows are. Armed, the logits
+    // this block scores and the routes and weights it lands are planes of the
+    // one token axis, handed at their own base, and this block owns plane row
+    // `win[1] + n`; null, they arrived pre-shifted and `n` is the row already.
+    // All three shift together -- a router that scored one token's logits and
+    // wrote another token's routes would be wrong in silence.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
     const T* row =
         FusedGemv ? logits
-                  : logits + static_cast<long long>(n) * num_experts;
+                  : logits + static_cast<long long>(plane_row) * num_experts;
 
     __shared__ float probs[kRouterMaxExperts];
     __shared__ float buf[kSoftmaxBlock];
@@ -116,7 +130,7 @@ __device__ __forceinline__ void moe_topk_softmax_body(
 
     float local_max = -flt_max();
     if constexpr (FusedGemv) {
-        const T* x = act + static_cast<long long>(n) * hidden;
+        const T* x = act + static_cast<long long>(plane_row) * hidden;
         const int warp = tid >> 5;
         const int lane = tid & 31;
         constexpr int kWarps = kSoftmaxBlock / 32;
@@ -173,8 +187,8 @@ __device__ __forceinline__ void moe_topk_softmax_body(
     for (int j = tid; j < num_experts; j += kSoftmaxBlock) probs[j] *= inv_Z;
     __syncthreads();
 
-    i32* out_idx = topk_idx + static_cast<long long>(n) * K;
-    float* out_w = topk_w + static_cast<long long>(n) * K;
+    i32* out_idx = topk_idx + static_cast<long long>(plane_row) * K;
+    float* out_w = topk_w + static_cast<long long>(plane_row) * K;
     float w_sum = 0.f;
     for (int k = 0; k < K; ++k) {
         float best_v = -1.f;
@@ -209,10 +223,11 @@ __global__ void moe_topk_softmax(
     const T* __restrict__ bias,
     i32* __restrict__ topk_idx,
     float* __restrict__ topk_w,
-    int num_experts, int K, int hidden)
+    int num_experts, int K, int hidden,
+    const u32* __restrict__ win)
 {
     moe_topk_softmax_body<T, false>(logits, act, bias, topk_idx, topk_w,
-                                num_experts, K, hidden);
+                                num_experts, K, hidden, win);
 }
 
 // **ADDITIVE, FOR GEMMA 4's MIXTURE.** The same softmax-then-renormalize the
@@ -225,10 +240,11 @@ __global__ void moe_topk_softmax_scaled(
     const T* __restrict__ per_expert_scale,
     i32* __restrict__ topk_idx,
     float* __restrict__ topk_w,
-    int num_experts, int K, int hidden)
+    int num_experts, int K, int hidden,
+    const u32* __restrict__ win)
 {
     moe_topk_softmax_body<T, false>(logits, act, nullptr, topk_idx, topk_w,
-                                num_experts, K, hidden, per_expert_scale);
+                                num_experts, K, hidden, win, per_expert_scale);
 }
 
 template <class T>
@@ -241,7 +257,7 @@ __global__ void moe_topk_softmax_fused_gemv(
     int num_experts, int K, int hidden)
 {
     moe_topk_softmax_body<T, true>(router_weight, act, bias, topk_idx, topk_w,
-                               num_experts, K, hidden);
+                               num_experts, K, hidden, nullptr);
 }
 
 template <class T, int PerLane>
@@ -430,11 +446,23 @@ __global__ void moe_topk_sigmoid(
     int E,
     int K,
     bool renormalize,
-    float routed_scaling_factor)
+    float routed_scaling_factor,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat, the ranked router's copy of the softmax
+    // router's: one block per token row, so the padded rows of a grid carved
+    // at a bucket retire here off the fire's own staged word. The lane pair
+    // is nothing to a grid that counts rows.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where the live rows start: logits in, routes and
+    // weights out, three planes of one token axis handed at their bases, this
+    // block owning plane row `win[1] + n`. Null, they came pre-shifted and
+    // `n` is the row. `correction_bias` is the expert bank, addressed by
+    // expert and never by row, so it does not move.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
-    const T* row = logits + static_cast<long long>(n) * E;
+    const T* row = logits + static_cast<long long>(plane_row) * E;
     __shared__ float scores[kRouterMaxExperts];
     __shared__ float orig_scores[kRouterMaxExperts];
 
@@ -451,8 +479,8 @@ __global__ void moe_topk_sigmoid(
     __syncthreads();
 
     if (tid == 0) {
-        i32* idx = topk_idx + static_cast<long long>(n) * K;
-        float* w = topk_w + static_cast<long long>(n) * K;
+        i32* idx = topk_idx + static_cast<long long>(plane_row) * K;
+        float* w = topk_w + static_cast<long long>(plane_row) * K;
         float sum = 0.f;
         const int picks = K < E ? K : E;
         for (int k = 0; k < picks; ++k) {
@@ -499,11 +527,23 @@ __global__ void moe_topk_sqrt_softplus(
     int E,
     int K,
     bool renormalize,
-    float routed_scaling_factor)
+    float routed_scaling_factor,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat, the ranked router's copy of the softmax
+    // router's: one block per token row, so the padded rows of a grid carved
+    // at a bucket retire here off the fire's own staged word. The lane pair
+    // is nothing to a grid that counts rows.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where the live rows start: logits in, routes and
+    // weights out, three planes of one token axis handed at their bases, this
+    // block owning plane row `win[1] + n`. Null, they came pre-shifted and
+    // `n` is the row. `correction_bias` is the expert bank, addressed by
+    // expert and never by row, so it does not move.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int tid = threadIdx.x;
-    const T* row = logits + static_cast<long long>(n) * E;
+    const T* row = logits + static_cast<long long>(plane_row) * E;
     __shared__ float scores[kRouterMaxExperts];
     __shared__ float orig_scores[kRouterMaxExperts];
 
@@ -516,8 +556,8 @@ __global__ void moe_topk_sqrt_softplus(
     __syncthreads();
 
     if (tid == 0) {
-        i32* idx = topk_idx + static_cast<long long>(n) * K;
-        float* w = topk_w + static_cast<long long>(n) * K;
+        i32* idx = topk_idx + static_cast<long long>(plane_row) * K;
+        float* w = topk_w + static_cast<long long>(plane_row) * K;
         float sum = 0.f;
         for (int k = 0; k < K; ++k) {
             int best_i = -1;
@@ -830,16 +870,34 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     T* __restrict__ out,
     int top_k, int K, int N, long long expert_stride,
     const T* const* __restrict__ expert_table,
-    unsigned int* __restrict__ expert_hits)
+    unsigned int* __restrict__ expert_hits,
+    const u32* __restrict__ win)
 {
     const int route = blockIdx.y;
+    // **THE SEAT IS IN TOKEN ROWS AND THIS AXIS IS IN ROUTES**, and the
+    // conversion between them is the fan-out. The seat's pair belongs to the
+    // REGION, whose row space is the token space -- the one `moe_weighted_sum`
+    // folds this rectangle back onto, indexing its routed source at
+    // `plane_row * top_k + k` -- so a window of `win[0]` token rows starting
+    // at `win[1]` is a run of `win[0] * top_k` routes starting at route
+    // `win[1] * top_k`. Multiply once and every plane below reads a route
+    // ordinal that is the PLANE's, not the launch's.
+    if (win != nullptr && route >= static_cast<int>(win[0]) * top_k) return;
+    const int plane_route = win != nullptr
+        ? route + static_cast<int>(win[1]) * top_k
+        : route;
     const int row = blockIdx.x * kWarps + threadIdx.y;
     if (row >= N) return;
     const int lane = threadIdx.x;
-    const int expert = topk_idx[route];
+    // `topk_idx` is the `[tokens, top_k]` route plane laid out route-major, so
+    // the route ordinal indexes it whole; `out` is one row per route and takes
+    // the same ordinal.
+    const int expert = topk_idx[plane_route];
 
     if (expert < 0) {
-        if (lane == 0) out[(long long)route * N + row] = Elem<T>::from_f32(0.f);
+        if (lane == 0) {
+            out[(long long)plane_route * N + row] = Elem<T>::from_f32(0.f);
+        }
         return;
     }
     // One thread of one block per route does the counting: `blockIdx.x == 0`
@@ -850,7 +908,12 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     }
     const T* w = moe_expert_base(weight_base, expert_table, expert, expert_stride)
         + (long long)row * K;
-    const T* x = act + (long long)(ActByToken ? route / top_k : route) * K;
+    // And the activation follows the same ordinal into whichever space it
+    // was cut in: `route / top_k` is the plane's TOKEN row on the up leg,
+    // where `x` holds one row per token, and the route ordinal itself on the
+    // down leg, where it holds one per route.
+    const T* x =
+        act + (long long)(ActByToken ? plane_route / top_k : plane_route) * K;
 
     float acc = 0.f;
     const int vec = K / kMoeVecWidth;
@@ -889,7 +952,9 @@ __device__ __forceinline__ void moe_matmul_select_gemv_body(
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     }
-    if (lane == 0) out[(long long)route * N + row] = Elem<T>::from_f32(acc);
+    if (lane == 0) {
+        out[(long long)plane_route * N + row] = Elem<T>::from_f32(acc);
+    }
 }
 
 template <class T, bool ActByToken, int kWarps, int kUnroll = 1>
@@ -904,7 +969,7 @@ __global__ void moe_matmul_select_gemv(
 {
     moe_matmul_select_gemv_body<T, ActByToken, kWarps, kUnroll>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits);
+        expert_table, expert_hits, nullptr);
 }
 
 template <class T>
@@ -915,11 +980,12 @@ __global__ void moe_matmul_select_gemv_by_token(
     T* __restrict__ out,
     int top_k, int K, int N, long long expert_stride,
     const T* const* __restrict__ expert_table,
-    unsigned int* __restrict__ expert_hits)
+    unsigned int* __restrict__ expert_hits,
+    const u32* __restrict__ win)
 {
     moe_matmul_select_gemv_body<T, true, kGemvWarps, 1>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits);
+        expert_table, expert_hits, win);
 }
 
 template <class T>
@@ -930,11 +996,12 @@ __global__ void moe_matmul_select_gemv_by_route(
     T* __restrict__ out,
     int top_k, int K, int N, long long expert_stride,
     const T* const* __restrict__ expert_table,
-    unsigned int* __restrict__ expert_hits)
+    unsigned int* __restrict__ expert_hits,
+    const u32* __restrict__ win)
 {
     moe_matmul_select_gemv_body<T, false, kGemvWarps, 1>(
         topk_idx, act, weight_base, out, top_k, K, N, expert_stride,
-        expert_table, expert_hits);
+        expert_table, expert_hits, win);
 }
 
 template <class T>
@@ -1288,12 +1355,25 @@ __global__ void moe_weighted_sum(
     T* __restrict__ out,
     const T* __restrict__ src,
     const float* __restrict__ weights,
-    int top_k, int hidden)
+    int top_k, int hidden,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // The seat's second word says WHERE those rows are. Armed, the pointers
+    // are the plane's own base and this block owns plane row `win[1] + n`;
+    // null, they arrived pre-shifted and `n` is the row already.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = blockIdx.y * blockDim.x + threadIdx.x;
     if (h >= hidden) return;
-    const long long base = static_cast<long long>(n) * top_k;
+    // `src` and `weights` are `top_k` rows per token and `out` is one: three
+    // planes of the SAME token axis, so all three shift by the one start. A
+    // fold that shifted the answer but not the routes it sums would take
+    // another row's routes, so they move together or not at all.
+    const long long base = static_cast<long long>(plane_row) * top_k;
     float acc = 0.f;
     #pragma unroll
     for (int k = 0; k < kMaxTopK; ++k) {
@@ -1302,7 +1382,7 @@ __global__ void moe_weighted_sum(
         const float v = Elem<T>::to_f32(src[r * hidden + h]);
         acc += weights[r] * v;
     }
-    out[static_cast<long long>(n) * hidden + h] = Elem<T>::from_f32(acc);
+    out[static_cast<long long>(plane_row) * hidden + h] = Elem<T>::from_f32(acc);
 }
 
 template <class T>
@@ -1312,13 +1392,25 @@ __global__ void moe_bias_sum(
     const T* __restrict__ bias,
     const i32* __restrict__ topk_idx,
     const float* __restrict__ weights,
-    int top_k, int hidden)
+    int top_k, int hidden,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, and with them the
+    // tail's route ids, which a retired row never dereferences.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // The seat's second word says WHERE those rows are. Armed, the pointers
+    // are the plane's own base and this block owns plane row `win[1] + n`;
+    // null, they arrived pre-shifted and `n` is the row already.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
     const int h = blockIdx.y * blockDim.x + threadIdx.x;
     if (h >= hidden) return;
-    const long long base = static_cast<long long>(n) * top_k;
-    const long long i = static_cast<long long>(n) * hidden + h;
+    // `x`, `out`, `topk_idx` and `weights` are all planes of the token axis
+    // the guard counts, so all four take the shifted row together; `bias` is
+    // the expert bank, addressed by the route id, and never moves.
+    const long long base = static_cast<long long>(plane_row) * top_k;
+    const long long i = static_cast<long long>(plane_row) * hidden + h;
     float acc = Elem<T>::to_f32(x[i]);
     for (int k = 0; k < top_k; ++k) {
         const long long r = base + k;

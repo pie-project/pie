@@ -13,7 +13,7 @@
 //! tensors, so both spellings concatenate.
 //!
 //! **EVERY PROJECTION READS AS STORED** — the mixed-4/8 file's eight-bit
-//! triplets land as the `MlxU8` planes `model.rs` declares, the four-bit
+//! triplets land as the `U8g64` planes `model.rs` declares, the four-bit
 //! banks land as theirs, and the one weight transform this import states is
 //! the norm fold above, taken back out. The dequantizing landing this file
 //! shipped first (`Builder::read_dequant`, still the door for a scheme with

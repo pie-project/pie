@@ -14,6 +14,10 @@
 //! * [`masked_classes`] / [`corrected_classes`] — the same reading taken from
 //!   the OP VOCABULARY rather than from a seam: which classes' windows run an
 //!   `attention.masked` arm, and which run a `linear.lora_correct` one.
+//! * [`regions_shifting`] — the op vocabulary read a third time and answered
+//!   PER REGION instead of per class: which regions hold nothing but ops that
+//!   address off the staged seat's start ([`crate::SHIFTED`]), and can
+//!   therefore be replayed somewhere other than the fire's row zero.
 //!
 //! [`Shell::load`]: crate::serve::Shell::load
 
@@ -197,6 +201,77 @@ pub(crate) fn corrected_classes(trace: &Trace, compiled: &CompiledModel) -> mode
             model_ir::Operation::Linear(model_ir::Linear::LoraCorrect { .. })
         )
     })
+}
+
+/// The classes whose window runs an `attention.decode` arm — the DECODE
+/// classes, in the only vocabulary this shell has for the word.
+///
+/// [`masked_classes`]'s third twin, read off the same template for the same
+/// reason, and it exists because the bodies path's load-time arming
+/// (`Shell::arm_bodies`) has to synthesize a decode composition before any
+/// fire has shown it one. A shell cannot compute a lane's fact word — the
+/// word comes from the model's own `Classify::of`, runtime-side (decision
+/// #18), and which bit is `qo_one` stays the model's business — so "the
+/// decode class" cannot be asked as a question about bits. It can be asked as
+/// a question about OPS, and this is that question: a class whose window runs
+/// the one-query-row attention arm is a class a decode lane lands in, and
+/// `Class::word` then names a word that resolves back to it.
+///
+/// A SET rather than one class, because a bake may split the decode world
+/// further — masked decode beside plain, corrected beside uncorrected — and
+/// each of those is a composition of its own with a body of its own. Empty
+/// for a plan with no `attention.decode` arm at all (a purely recurrent text,
+/// say), and then load-time arming has nothing to aim at and arms nothing.
+#[must_use]
+pub(crate) fn decoding_classes(trace: &Trace, compiled: &CompiledModel) -> model_ir::ClassSet {
+    classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            model_ir::Operation::Attention(model_ir::Attention::Decode { .. })
+        )
+    })
+}
+
+/// **WHICH TEMPLATE REGIONS CAN MOVE THEIR OWN BASE** — one `bool` per
+/// region of [`CompiledModel::template`], in region order, `true` when EVERY
+/// op in it is named by [`crate::SHIFTED`].
+///
+/// [`masked_classes`]'s and [`corrected_classes`]'s structural twin — the
+/// same walk of the same template testing the same node ops — and it differs
+/// in exactly two ways, both forced by what the answer is for. It asks ALL
+/// rather than ANY, because one guard-only op in a region addresses the wrong
+/// row for the whole region's launch; and it answers PER REGION rather than
+/// per class, because the thing that gets a seat is a region's launch and the
+/// thing that reads it is a region's kernel. A class set could not say it: two
+/// classes share a region, and it is the region that either moves or does not.
+///
+/// **A REGION WITH NO NODES IS `true`, AND IT IS NOT MERELY THE VACUOUS
+/// ANSWER.** `all` over an empty range is `true` for free, and here that is
+/// also what the question means: a region carries a window because of its
+/// MASK — `Windows::of` cuts one per template region off the class table and
+/// never looks at `Region::nodes` — so an empty region can hold a windowed
+/// rectangle and still launch nothing over it. Nothing in it can address a
+/// row, so nothing in it can address the wrong one, and refusing it would
+/// refuse a body over a region that computes no bytes. The compiler ships no
+/// such region; this says what would be true of one.
+///
+/// A node index the trace does not hold reads as NOT shifting, which refuses
+/// the region. The two tables are baked together and that cannot happen; if it
+/// ever does, the narrow reading is the one that stays sound.
+#[must_use]
+pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
+    compiled
+        .template()
+        .iter()
+        .map(|region| {
+            region.nodes.clone().all(|node| {
+                trace.nodes.get(node as usize).is_some_and(|node| {
+                    let name = model_ir::Operands::name(&node.op);
+                    crate::SHIFTED.contains(&name) || crate::PLANNED.contains(&name)
+                })
+            })
+        })
+        .collect()
 }
 
 /// The union of the region masks whose regions run a node `wanted` accepts.

@@ -319,6 +319,66 @@ pub struct Geometry {
     pub write_offset: Vec<i32>,
 }
 
+impl Geometry {
+    /// **EXTEND THE LANE TABLES OUT TO `lanes`, AS GENUINELY EMPTY LANES.**
+    ///
+    /// A fire staged at a bucket's lane CEILING hands its kernels more lanes
+    /// than it brought, and what those lanes hold decides whether the guards
+    /// are belt-and-braces or load-bearing. Stale bytes from the last fire
+    /// are a page run that still points at somebody's pages; this writes the
+    /// one thing that is true of a lane nobody submitted — no pages, no
+    /// tokens — so a reader that walks a padded lane finds emptiness rather
+    /// than a neighbour's cache.
+    ///
+    /// * [`indptr`](Geometry::indptr) repeats its last bound, which is
+    ///   `[begin, begin)`: zero pages, and flashinfer's `get_length` returns
+    ///   `0` for exactly that test (`page.cuh`, `indptr[b + 1] ==
+    ///   indptr[b]`) without reading anything else. It is also what makes
+    ///   `indptr[batch_size]` — the `last_indptr`
+    ///   `paged_kv_t::protective_get_kv_offset` clamps against — DEFINED and
+    ///   still monotone at a baked `batch_size` past the live lanes; too
+    ///   small is that clamp's silent failure
+    ///   (`kernels_cuda::attn::fa2_abi::make_paged_kv`).
+    /// * [`last_page_len`](Geometry::last_page_len) is zero: the honest
+    ///   reading of "this lane's last page holds nothing", and unread anyway
+    ///   for a lane whose bounds are equal.
+    /// * [`kv_len`](Geometry::kv_len) is zero: the length AFTER the append,
+    ///   for a lane that appends nothing to nothing. The host plan builders
+    ///   walk this one directly.
+    ///
+    /// [`indices`](Geometry::indices) does not move, because empty lanes own
+    /// no pages; neither do the two row tables, because an empty lane brings
+    /// no rows.
+    ///
+    /// **IT ONLY EVER GROWS.** A `lanes` at or below what the fire brought
+    /// leaves every vector exactly as it was, which is what makes a caller's
+    /// clamp of a ceiling down to its carve safe to spell as a `min`.
+    pub fn pad_to(&mut self, lanes: usize) {
+        pad_indptr(&mut self.indptr, lanes);
+        self.last_page_len.resize(self.last_page_len.len().max(lanes), 0);
+        self.kv_len.resize(self.kv_len.len().max(lanes), 0);
+    }
+}
+
+/// **EXTEND A `[n + 1]` BOUNDARY VECTOR TO `[lanes + 1]` BY REPEATING ITS
+/// LAST BOUND**, which spells `lanes - n` empty lanes and nothing else.
+///
+/// The one operation both boundary vectors of a fire want — the per-space
+/// page CSR ([`Geometry::pad_to`]) and the fire-wide row vector
+/// [`indptr`] — so it is written once. Never shrinks, for
+/// [`Geometry::pad_to`]'s reason.
+///
+/// An EMPTY vector is left empty, because empty is a caller's off switch —
+/// the fire-wide qo vector stages nothing when it holds nothing
+/// (`engine_cuda::inputs::Fire::qo_absolute`) — and padding it would turn
+/// that switch on.
+pub fn pad_indptr(indptr: &mut Vec<i32>, lanes: usize) {
+    let Some(&last) = indptr.last() else {
+        return;
+    };
+    indptr.resize(indptr.len().max(lanes + 1), last);
+}
+
 /// Compute one fire's geometry.
 ///
 /// **THE LENGTHS ARE AFTER THE APPEND, AND THAT IS NOT A CHOICE.** The
@@ -641,5 +701,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_padded_lane_owns_no_page_and_no_token() {
+        // Two live lanes, staged out to a ceiling of five: the page CSR goes
+        // flat and the two per-lane tables go to zero, which is the whole of
+        // what "an empty lane" means to a reader.
+        let mut g = geometry(
+            &paging(),
+            &[
+                Seat { slot: 0, have: 0, rows: 20 },
+                Seat { slot: 1, have: 3, rows: 1 },
+            ],
+        )
+        .expect("two lanes page");
+        let pages = g.indices.clone();
+        let (write_page, write_offset) = (g.write_page.clone(), g.write_offset.clone());
+
+        g.pad_to(5);
+
+        assert_eq!(g.indptr, vec![0, 2, 3, 3, 3, 3], "the tail repeats the last bound");
+        assert_eq!(g.last_page_len, vec![4, 4, 0, 0, 0]);
+        assert_eq!(g.kv_len, vec![20, 4, 0, 0, 0]);
+        assert_eq!(g.indices, pages, "an empty lane owns no page");
+        assert_eq!(g.write_page, write_page, "an empty lane brings no row");
+        assert_eq!(g.write_offset, write_offset);
+    }
+
+    #[test]
+    fn a_padded_lane_reads_zero_length_the_way_the_device_computes_it() {
+        // `paged_kv_t::get_length` in page.cuh: equal bounds is zero, before
+        // `last_page_len` is read at all. Restated here because the pad
+        // values are chosen for it.
+        let mut g = geometry(&paging(), &[Seat { slot: 2, have: 0, rows: 5 }])
+            .expect("one lane pages");
+        g.pad_to(3);
+
+        let length = |lane: usize| -> i32 {
+            if g.indptr[lane + 1] == g.indptr[lane] {
+                return 0;
+            }
+            (g.indptr[lane + 1] - g.indptr[lane] - 1) * 16 + g.last_page_len[lane]
+        };
+        assert_eq!(length(0), 5, "the live lane still reads its own tokens");
+        assert_eq!(length(1), 0);
+        assert_eq!(length(2), 0);
+        // And the protective bound the fa2 kernels clamp against is defined
+        // at the CEILING, which is the whole point of padding the vector.
+        assert_eq!(g.indptr[3], g.indptr[1], "monotone, and no page past the live ones");
+    }
+
+    #[test]
+    fn a_pad_below_the_live_lanes_moves_nothing() {
+        // What lets a caller clamp a bucket's ceiling down to its carve with
+        // a `min` and stage the result unconditionally.
+        let mut g = geometry(
+            &paging(),
+            &[
+                Seat { slot: 0, have: 0, rows: 2 },
+                Seat { slot: 1, have: 0, rows: 2 },
+                Seat { slot: 2, have: 0, rows: 2 },
+            ],
+        )
+        .expect("three lanes page");
+        let before = g.clone();
+
+        g.pad_to(1);
+        g.pad_to(0);
+
+        assert_eq!(g, before);
+    }
+
+    #[test]
+    fn the_fire_wide_qo_vector_pads_to_zero_row_lanes() {
+        let mut bounds = indptr(&[
+            Seat { slot: 0, have: 0, rows: 7 },
+            Seat { slot: 1, have: 0, rows: 1 },
+        ]);
+        assert_eq!(bounds, vec![0, 7, 8]);
+
+        pad_indptr(&mut bounds, 4);
+
+        assert_eq!(bounds, vec![0, 7, 8, 8, 8], "every padded lane spans no row");
+        // Never shrinks, for `Geometry::pad_to`'s reason.
+        pad_indptr(&mut bounds, 1);
+        assert_eq!(bounds, vec![0, 7, 8, 8, 8]);
     }
 }

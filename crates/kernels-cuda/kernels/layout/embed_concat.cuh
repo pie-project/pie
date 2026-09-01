@@ -16,7 +16,8 @@ __global__ void embed_concat(
     int rows,
     int heads,
     int width,
-    int vocab)
+    int vocab,
+    const u32* __restrict__ win)
 {
     const long long i =
         (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -27,9 +28,19 @@ __global__ void embed_concat(
     const long long rh = i / width;
     const int h = (int)(rh % heads);
     const long long r = rh / heads;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && r >= static_cast<long long>(win[0])) return;
+    // And `win[1]` is where those live rows start: `ids` and `y` are row
+    // planes handed at their base, so the OUTPUT element this thread writes
+    // must be re-addressed from the shifted row rather than from the flat
+    // launch index. `table` is read by the id and never moves.
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const long long at = (row * heads + h) * (long long)width + w;
 
-    const int id = ids[r * heads + h];
-    y[i] = (id < 0 || id >= vocab)
+    const int id = ids[row * heads + h];
+    y[at] = (id < 0 || id >= vocab)
         ? Elem<T>::from_f32(0.f)
         : table[(long long)id * width + w];
 }
@@ -59,7 +70,8 @@ __global__ void embed_concat_mlxu4(
     int group,
     int vocab,
     const EmbedTableBases* __restrict__ bases,
-    unsigned int* __restrict__ hits)
+    unsigned int* __restrict__ hits,
+    const u32* __restrict__ win)
 {
     const long long i =
         (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -82,10 +94,20 @@ __global__ void embed_concat_mlxu4(
     const long long rh = i / width;
     const int h = (int)(rh % heads);
     const long long r = rh / heads;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && r >= static_cast<long long>(win[0])) return;
+    // And `win[1]` is where those live rows start: `ids` and `y` are row
+    // planes handed at their base, so the OUTPUT element this thread writes
+    // must be re-addressed from the shifted row rather than from the flat
+    // launch index. The code/scale banks are read by the id and never move.
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const long long at = (row * heads + h) * (long long)width + w;
 
-    const int id = ids[r * heads + h];
+    const int id = ids[row * heads + h];
     if (id < 0 || id >= vocab) {
-        y[i] = Elem<T>::from_f32(0.f);
+        y[at] = Elem<T>::from_f32(0.f);
         return;
     }
 
@@ -95,7 +117,7 @@ __global__ void embed_concat_mlxu4(
     const bf16* s16 = reinterpret_cast<const bf16*>(scales_at);
     const bf16* b16 = reinterpret_cast<const bf16*>(biases_at);
     const float v = code * Elem<bf16>::to_f32(s16[fx]) + Elem<bf16>::to_f32(b16[fx]);
-    y[i] = Elem<T>::from_f32(v);
+    y[at] = Elem<T>::from_f32(v);
 }
 
 // The eight-bit twin of the gather above — one byte one code, the same
@@ -114,7 +136,8 @@ __global__ void embed_concat_mlxu8(
     int group,
     int vocab,
     const EmbedTableBases* __restrict__ bases,
-    unsigned int* __restrict__ hits)
+    unsigned int* __restrict__ hits,
+    const u32* __restrict__ win)
 {
     const long long i =
         (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -137,10 +160,20 @@ __global__ void embed_concat_mlxu8(
     const long long rh = i / width;
     const int h = (int)(rh % heads);
     const long long r = rh / heads;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && r >= static_cast<long long>(win[0])) return;
+    // And `win[1]` is where those live rows start: `ids` and `y` are row
+    // planes handed at their base, so the OUTPUT element this thread writes
+    // must be re-addressed from the shifted row rather than from the flat
+    // launch index. The code/scale banks are read by the id and never move.
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const long long at = (row * heads + h) * (long long)width + w;
 
-    const int id = ids[r * heads + h];
+    const int id = ids[row * heads + h];
     if (id < 0 || id >= vocab) {
-        y[i] = Elem<T>::from_f32(0.f);
+        y[at] = Elem<T>::from_f32(0.f);
         return;
     }
 
@@ -149,7 +182,7 @@ __global__ void embed_concat_mlxu8(
     const bf16* s16 = reinterpret_cast<const bf16*>(scales_at);
     const bf16* b16 = reinterpret_cast<const bf16*>(biases_at);
     const float v = code * Elem<bf16>::to_f32(s16[fx]) + Elem<bf16>::to_f32(b16[fx]);
-    y[i] = Elem<T>::from_f32(v);
+    y[at] = Elem<T>::from_f32(v);
 }
 
 } // namespace pie::layout

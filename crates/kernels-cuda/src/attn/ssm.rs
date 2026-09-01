@@ -189,6 +189,9 @@ pub fn causal_conv1d(
             c.arg(),
             k.arg(),
             dil.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -260,6 +263,17 @@ pub fn causal_conv1d_chunked(
             // F3b): the segment's origin, bound only on the tail launch of a
             // row whose fold boundary falls inside its own tokens.
             state.begin_at.arg(),
+            // **THE STAGED-GEOMETRY SEAT, READ ON THE LANE AXIS** (the
+            // chunked-arm wave). Both arms above are gridded on REQUESTS, so
+            // the words they spend are `win[2]` (retire the lanes a bucket's
+            // ceiling padded in) and `win[3]` (this window's request number as
+            // a FIRE lane, for the tables `Run::recurrent_absolute` hands over
+            // whole); `win[1]` shifts the two activation planes, and the
+            // window's own CSR stays on the launch-local ordinal. Passed
+            // UNCONDITIONALLY, which is what puts the name on
+            // `engine_cuda::SHIFTED`: an arm that took the seat only sometimes
+            // would want pre-shifted pointers the rest of the time.
+            ctx.stage(),
         ],
     )
 }
@@ -304,6 +318,9 @@ pub fn gdn_prep(
             gates.arg(),
             stated(OP, rows)?.arg(),
             stated(OP, v_heads)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -420,6 +437,9 @@ impl Delta {
                 stated(op, self.k_dim)?.arg(),
                 stated(op, self.conv_dim)?.arg(),
                 q_scale.arg(),
+                // The staged-geometry seat: the region's live-rows word when a
+                // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                ctx.stage(),
             ],
         )?;
         ctx.fire(
@@ -437,6 +457,9 @@ impl Delta {
                 stated(op, self.k_dim)?.arg(),
                 stated(op, self.v_dim)?.arg(),
                 stated(op, self.conv_dim)?.arg(),
+                // The staged-geometry seat: the region's live-rows word when a
+                // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                ctx.stage(),
             ],
         )?;
         Ok(staged)
@@ -505,6 +528,9 @@ pub fn gated_delta(
             stated(OP, v_heads)?.arg(),
             stated(OP, k_dim)?.arg(),
             stated(OP, v_dim)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -587,6 +613,13 @@ pub fn gated_delta_chunked(
                 // test and is now said out loud (wave F3b).
                 state.begin_at.arg(),
                 state.fused_decay.arg(),
+                // The staged-geometry seat, read on the LANE axis: `win[2]`
+                // retires the lanes a bucket's ceiling padded in and `win[3]`
+                // names the fire lane of this window's request `r`, while
+                // `win[1]` shifts the output plane and the window's own CSR
+                // and the staged scratch stay launch-local (`ssm.cuh` states
+                // the split per pointer).
+                ctx.stage(),
             ],
         );
     }
@@ -627,6 +660,9 @@ pub fn gated_delta_chunked(
                 stated(OP, v_dim)?.arg(),
                 state.write_state.arg(),
                 state.write_state_mask.arg(),
+                // The staged-geometry seat, on the lane axis — the fla arm
+                // above carries the note.
+                ctx.stage(),
             ],
         );
     }
@@ -652,6 +688,9 @@ pub fn gated_delta_chunked(
                     stated(OP, v_heads)?.arg(),
                     stated(OP, k_dim)?.arg(),
                     stated(OP, v_heads / k_heads)?.arg(),
+                    // The staged-geometry seat: the region's live-rows word when a
+                    // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                    ctx.stage(),
                 ],
             )?;
         }
@@ -678,6 +717,9 @@ pub fn gated_delta_chunked(
             stated(OP, v_heads)?.arg(),
             stated(OP, k_dim)?.arg(),
             stated(OP, v_dim)?.arg(),
+            // The staged-geometry seat, on the lane axis — the fla arm above
+            // carries the note.
+            ctx.stage(),
         ],
     )
 }
@@ -786,6 +828,9 @@ impl Kda {
                 ArgValue::Ptr(staged.v),
                 stated(op, self.width)?.arg(),
                 norm_eps.arg(),
+                // The staged-geometry seat: the region's live-rows word when a
+                // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                ctx.stage(),
             ],
         )?;
         ctx.fire(
@@ -805,6 +850,9 @@ impl Kda {
                 stated(op, self.heads)?.arg(),
                 stated(op, self.head_dim)?.arg(),
                 0.0_f32.arg(), // the decay's lower bound, unbounded here
+                // The staged-geometry seat: the region's live-rows word when a
+                // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                ctx.stage(),
             ],
         )?;
         Ok(staged)
@@ -854,6 +902,9 @@ pub fn kda_step(
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -908,6 +959,12 @@ pub fn kda_chunked(
             y.arg(),
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
+            // The staged-geometry seat, read on the LANE axis: `win[2]`
+            // retires the padded lanes of a ceiling grid, `win[3]` names the
+            // fire lane of this window's request, `win[1]` shifts the output
+            // plane, and the window's own CSR and the staged scratch planes
+            // stay launch-local (`ssm.cuh` states the split per pointer).
+            ctx.stage(),
         ],
     )
 }

@@ -30,13 +30,27 @@ __global__ void scatter_live_rows(
     const U* __restrict__ tight,
     U* __restrict__ wide,
     const i32* __restrict__ index,
-    int units)
+    int units,
+    const u32* __restrict__ win)
 {
     const int n = static_cast<int>(blockIdx.x);
-    const i32 at = index[n];
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked. A retired row's
+    // route is not read at all, which is the point: the tail of a padded
+    // rectangle carries whatever the last fire left in the map.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start. `tight` and `index` share
+    // ONE row axis — the map's `n`-th entry is the `n`-th row of `tight` — so
+    // they move together or the copy reads one row and routes another. `wide`
+    // does not move: `at` is an absolute destination the map names, not a
+    // position in this launch.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const i32 at = index[row];
     if (at < 0) return;
 
-    const U* src = tight + static_cast<long long>(n) * units;
+    const U* src = tight + static_cast<long long>(row) * units;
     U* dst = wide + static_cast<long long>(at) * units;
     for (int i = static_cast<int>(threadIdx.x); i < units;
          i += static_cast<int>(blockDim.x)) {

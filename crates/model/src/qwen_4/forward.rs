@@ -378,7 +378,7 @@ fn moe(x: &Value, mlp: &Mlp) -> Value {
                 *top_k,
             );
             let select = |act: &Value, bank: &model_dsl::Weight| match bank.dtype {
-                Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 => {
+                Dtype::Mxfp4 | Dtype::U4g64 | Dtype::U8g64 => {
                     ops::linear::moe_matmul_select_quant(act, bank, &routes, *top_k)
                 }
                 _ => ops::linear::moe_matmul_select(act, bank, &routes, *top_k),

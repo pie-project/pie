@@ -15,6 +15,45 @@
 //! PIE_SMOKE_SNAPSHOT=... cargo test -p engine-cuda --features cuda-13 \
 //!   --release --test cuda_descriptor_abi_probe -- --nocapture --test-threads=1
 //! ```
+//!
+//! # What the seam holds now, and why the axis sweeps got shorter
+//!
+//! This probe was written over the exact-shape keyed cache, where one
+//! `(rows, lanes)` shape was one capture: the A sweep below fired all-decode
+//! at one, two, three and four lanes and got FOUR graphs, the B sweep fired a
+//! decode lane beside prefills of 8, 16, 24, 12 and 9 tokens and got FIVE, and
+//! the affine fit over those points is what answered the question above —
+//! which components of a launch move with the fire, and could a host rebind
+//! therefore restate them.
+//!
+//! **THE ANSWER TO THAT QUESTION IS WHY THE SWEEPS NOW COLLAPSE.** The
+//! rebinding path the probe measured for was built, measured, and then
+//! superseded by a cheaper one: a body is keyed on the COMPOSITION — a lattice
+//! point and a present set — and its launches are carved at the KEY's ceilings
+//! (`Run::planning`), so the live geometry reaches the device through a staged
+//! seat that the kernels READ rather than through a host write into the exec.
+//! Nothing in a captured launch moves with the fire, so there is nothing to
+//! rebind and nothing to fit. `kept_graphs` hands back `(BodyKey, Graph)`
+//! pairs, and A's four lane counts are ONE key while B's five widths are two
+//! (bucket 16 and bucket 32) — so the sweeps below print one census apiece for
+//! what they capture, say "nothing captured for this composition" for the
+//! shapes that share a key, and the `>= 3` guards on the law fits simply do
+//! not fire. A bucket lattice is powers of two, so no re-chosen sweep would
+//! bring them back: three captures on one axis exist, but the axis is the
+//! bucket and a power-of-two ladder is not affine in tokens.
+//!
+//! What survives, and is still worth running:
+//!
+//! - **the census** — every kernel node of a real body walked, its parameter
+//!   block read, its components classified. A block that stopped reading is a
+//!   `Refused::Opaque` and the sibling gate (`cuda_node_map.rs`) pins it at
+//!   zero.
+//! - **the structural difference** — all-decode against decode+prefill:
+//!   absent regions are ABSENT from the graph, not present at a zero grid.
+//!   That is the fact the walk's topology fingerprint rests on.
+//! - **the rebind cost** — `cudaGraphExecKernelNodeSetParams` priced per node
+//!   on a real exec, kept because it is the number that would have to be beaten
+//!   by anything proposing a host-updated exec again.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -105,7 +144,16 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         slots: 4,
         ordinal: 0,
         graphs: Graphs::On,
-        knobs: engine_cuda::Knobs::default(),
+        // **`bodies` IS STOOD DOWN AT LOAD ON PURPOSE** — `cuda_node_map.rs`
+        // states the whole argument: a load that says the word arms its
+        // lattice and SEALS the body map inside `Shell::load`, so every
+        // capture happens before a probe can put `keep_graphs` in front of it
+        // and the fires below would find nothing to walk. Stood down, the map
+        // is open and the warm ladder captures off the sweeps.
+        knobs: engine_cuda::Knobs {
+            bodies: false,
+            ..engine_cuda::Knobs::default()
+        },
         program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
@@ -514,8 +562,12 @@ fn what_a_captured_graph_says_about_its_own_arguments() {
 
     shell.keep_graphs(true);
     shell.set_mode(Graphs::On);
+    // The word, said here rather than at load, for the reason `ready` states.
+    shell.set_bodies(true);
 
-    // -- A: the all-decode topology.
+    // -- A: the all-decode topology. FOUR lane counts, ONE body key — they
+    //    are one lattice point and one present set, which is the whole of why
+    //    the fit below no longer has points to fit.
     let mut decode: Vec<(u64, Walked)> = Vec::new();
     let mut decode1: Option<Walked> = None;
     for k in [1usize, 2, 3, 4] {
@@ -539,7 +591,11 @@ fn what_a_captured_graph_says_about_its_own_arguments() {
     }
 
     // -- B: the mixed topology. 8 -> 16 fits; 24, 12 and 9 verify, and NINE
-    //    is the one that breaks a `div_ceil` law the even points hide.
+    //    is the one that breaks a `div_ceil` law the even points hide — that
+    //    was the reading under keyed captures. Under body keys these five
+    //    widths are TWO keys (nine and ten and thirteen rows bucket to 16,
+    //    seventeen and twenty-five to 32), so two of them capture and three
+    //    report nothing.
     let mut mixed: Vec<(u64, Walked)> = Vec::new();
     for tokens in [8usize, 16, 24, 12, 9] {
         shell.open(1).expect("slot 1 re-opens");
@@ -602,13 +658,20 @@ fn what_a_captured_graph_says_about_its_own_arguments() {
         structural("all-decode x2", a, "decode+prefill(8)", b);
     }
 
-    // -- The rebind kill factors.
-    let stats = shell.graph_stats();
+    // -- What the sweeps actually cost the map, which is now a body count and
+    //    not an exec-per-shape one: two sweeps of nine compositions between
+    //    them, and a handful of captures.
+    let stats = shell.body_stats();
+    eprintln!("\n==== CAPTURE COST ====\n   {stats}");
     eprintln!(
-        "\n==== CAPTURE COST ====\n   {} captures, {} replays, {} warming, {:.1} ms of capture \
-         in all, {} execs resident",
-        stats.captures, stats.replays, stats.warming, stats.capture_millis, stats.execs,
+        "   {} nodes and {} edges in the most recently captured body",
+        stats.nodes, stats.edges,
     );
+    // The moving-nodes subset comes off the B fit, which a bucket-keyed map
+    // no longer gives enough points to run — so this is zero on a bodies load
+    // and the subset pass below prices an empty set. The IDENTITY pass is the
+    // number that still matters: per-node rebind cost on a real exec, and the
+    // floor anything proposing a host-updated exec has to beat.
     let movers = movers_hint;
     eprintln!("\n==== REBIND (cudaGraphExecKernelNodeSetParams) ====");
     if let Some((_, graph)) = shell.kept_graphs().last() {

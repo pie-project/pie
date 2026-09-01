@@ -35,6 +35,12 @@ use std::collections::BTreeSet;
 
 use model_ir::{ClassSet, Operands, Trace};
 
+/// A slot table generously above every hand-built fire below — the tests ask
+/// about window semantics, not the carve, so the ceiling only has to hold.
+fn test_slots() -> engine_cuda::window::Slots {
+    engine_cuda::window::Slots::new(8, 512, 8, 1)
+}
+
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 /// The op both profile lists are keyed on.
@@ -158,9 +164,9 @@ fn the_grouped_region_gets_one_window_whose_segments_are_the_splits_own_spans() 
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
     let boundaries = indptr(&rows);
 
-    let split_windows = Windows::of(&plan, &split, fire.classes(), fire.patch_classes(), &boundaries, Copies::off())
+    let split_windows = Windows::of(&plan, &split, fire.classes(), fire.patch_classes(), &boundaries, Copies::off(), test_slots())
         .expect("a fragmented window is a slow path, not a fault");
-    let grouped_windows = Windows::of(&plan, &grouped, fire.classes(), fire.patch_classes(), &boundaries, Copies::off())
+    let grouped_windows = Windows::of(&plan, &grouped, fire.classes(), fire.patch_classes(), &boundaries, Copies::off(), test_slots())
         .expect("a grouped window is one window");
 
     let mut checked = 0usize;
@@ -258,7 +264,7 @@ fn the_segment_lists_are_staged_beside_the_boundaries_in_the_one_copy() {
     let lanes = one_lane_per_class(&grouped);
     let fire = compose(&grouped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
-    let mut windows = Windows::of(&plan, &grouped, fire.classes(), fire.patch_classes(), &indptr(&rows), Copies::off()).expect("the windows");
+    let mut windows = Windows::of(&plan, &grouped, fire.classes(), fire.patch_classes(), &indptr(&rows), Copies::off(), test_slots()).expect("the windows");
 
     let packed = windows.packed();
     // A base that is not zero, so an implementation that forgot to add it
@@ -438,7 +444,7 @@ fn naming_the_shells_grouped_ops_moves_the_withdrawal_onto_them() {
     let fire = compose(&shipped, &budget(), &lanes).expect("eight lanes compose");
     let rows: Vec<u32> = fire.lanes().iter().map(|lane| lane.rows).collect();
     let windows =
-        Windows::of(&trace, &shipped, fire.classes(), fire.patch_classes(), &indptr(&rows), Copies::off())
+        Windows::of(&trace, &shipped, fire.classes(), fire.patch_classes(), &indptr(&rows), Copies::off(), test_slots())
             .expect("the windows");
     // A segment list where the artifact answered `Grouped` and NOWHERE ELSE:
     // one window, `r` segments; and every region the table said nothing about

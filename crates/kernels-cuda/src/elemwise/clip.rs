@@ -12,7 +12,7 @@
 
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
 use crate::tensor::Tensor;
 
 const FILE: &str = "elemwise/clip.cuh";
@@ -52,7 +52,19 @@ pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
         OP,
         Fire::at(FILE, symbol(&format!("::pie::elemwise::clamp<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
-        &[x.arg(), lo.arg(), hi.arg(), n.arg()],
+        &[
+            x.arg(),
+            lo.arg(),
+            hi.arg(),
+            n.arg(),
+            // The element-form seat's width: this launch is flat over
+            // `rows * width`, so the kernel needs the row's width to read the
+            // staged row count and row start as elements.
+            stated(OP, x.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -117,6 +129,18 @@ pub fn clamp_learned(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::elemwise::clamp_learned<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
-        &[x.arg(), lo.arg(), hi.arg(), n.arg()],
+        &[
+            x.arg(),
+            lo.arg(),
+            hi.arg(),
+            n.arg(),
+            // The element-form seat's width: this launch is flat over
+            // `rows * width`, so the kernel needs the row's width to read the
+            // staged row count and row start as elements.
+            stated(OP, x.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }

@@ -548,12 +548,12 @@ impl Context {
     /// "Everything enqueued" has to include the SETTLEMENTS, or the word means
     /// less than it says. A settlement callback releases a staging slot,
     /// returns an event to its pool and bumps the settled count that
-    /// `record::Graphs` reads before it rebinds or destroys an exec — and it
-    /// runs on the notify stream, which the compute stream's synchronize does
-    /// not touch. Drained only on the compute side, a caller that had just
-    /// waited for its fire would still see every seat as possibly-in-flight,
-    /// and the fold's ping-pong would stop turning: measured, as `swaps` and
-    /// `prebinds` falling to zero in `fold_gate`.
+    /// `record::Graphs` reads before it destroys an exec — and it runs on the
+    /// notify stream, which the compute stream's synchronize does not touch.
+    /// Drained only on the compute side, a caller that had just waited for its
+    /// fire would still see every resident body as possibly-in-flight, and
+    /// `record::Graphs::insert_body` would decline every capture and every
+    /// re-capture for the life of the load.
     ///
     /// So the compute stream first (the work), then the notify stream (what
     /// the work's completion set in motion). After this call, `issued` and

@@ -1393,7 +1393,7 @@ mod tests {
     fn fp8_per_row() -> QuantSpec {
         QuantSpec {
             scheme: QuantScheme::Fp8E4M3,
-            logical_dtype: DType::Fp8E4m3,
+            logical_dtype: DType::E4m3,
             bits_per_element: 8,
             group_size: 1,
             channel_axis: Some(Axis(0)),
@@ -1977,7 +1977,7 @@ mod tests {
     #[test]
     fn a_wildcard_is_measured_in_the_type_being_named() {
         let ty = check_one(
-            Expr::src("q_proj").transmute(TensorType::raw(vec![2048, -1], DType::Fp8E4m3)),
+            Expr::src("q_proj").transmute(TensorType::raw(vec![2048, -1], DType::E4m3)),
             &qwen3(),
         )
         .unwrap();
@@ -1992,14 +1992,14 @@ mod tests {
         let err = check_one(
             Expr::src("q_proj")
                 .slice(0, 0, 1024)
-                .transmute(TensorType::raw(vec![1024, 4096], DType::Fp8E4m3)),
+                .transmute(TensorType::raw(vec![1024, 4096], DType::E4m3)),
             &qwen3(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("whole"), "{err}");
         // The same rename of the whole tensor is fine.
         check_one(
-            Expr::src("q_proj").transmute(TensorType::raw(vec![2048, 4096], DType::Fp8E4m3)),
+            Expr::src("q_proj").transmute(TensorType::raw(vec![2048, 4096], DType::E4m3)),
             &qwen3(),
         )
         .unwrap();

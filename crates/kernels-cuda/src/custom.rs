@@ -74,9 +74,13 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     let rows = count(OP, "rows", packed.rows)?;
 
     let hnd_layout = pool.layout != 0;
-    // The rope-table and per-lane-window seats, absent on this point.
+    // The rope-table seat, absent on this point.
     let rope_table = ArgValue::ABSENT;
-    let window = ArgValue::ABSENT;
+    // The staged-geometry seat, which the device text already reads
+    // (`qkv_fused.cuh`'s `if (win != nullptr && r >= win[0]) return;`): the
+    // region's live-rows word when a body replay armed one, and the null
+    // seat (`ABSENT`) otherwise.
+    let window = ctx.stage();
 
     let warped = match head_dim {
         64 => {

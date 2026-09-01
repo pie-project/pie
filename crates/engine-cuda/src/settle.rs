@@ -8,8 +8,8 @@
 //! One monotone counter for steps ISSUED a settlement and one for steps whose
 //! settlement callback has RUN. Their difference is how far ahead of the
 //! device this shell is; their absolute values are what the graph cache reads
-//! to answer the only question eviction and the prebind ever needed: *is the
-//! exec I am about to overwrite one the device may still be running?* F1
+//! to answer the only question its eviction ever needed: *is the exec I am
+//! about to destroy one the device may still be running?* F1
 //! answered it with "every fire ends synchronized". F2b answers it with
 //! arithmetic, which is the same answer at depth 1 and a true one above it.
 //!
@@ -109,8 +109,8 @@ impl Airborne {
     /// The one question `record::Graphs` asks before it overwrites or destroys
     /// a `cudaGraphExec_t`, and the arithmetic that replaced "every fire ends
     /// synchronized". [`Airborne::NEVER`] answers `true`: an exec no fire has
-    /// launched cannot be one the device is running, and a freshly
-    /// instantiated ping-pong twin is exactly that case.
+    /// launched cannot be one the device is running, and a body captured this
+    /// fire and not yet replayed is exactly that case.
     #[must_use]
     pub fn settled_past(&self, seq: u64) -> bool {
         seq == Airborne::NEVER || self.counts.settled.load(Ordering::Acquire) > seq

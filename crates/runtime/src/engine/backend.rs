@@ -305,24 +305,6 @@ pub fn envelopes_resolved() -> u64 {
     engine_cuda::Shell::envelopes_resolved()
 }
 
-/// The CUDA fold's motion counters —
-/// `(folds, rebinds, rebind_us, swaps, prebinds, prebind_us, twins)` —
-/// re-exported on [`envelopes_resolved`]'s argument exactly: the shell is a
-/// private link of this crate, the instance lives behind `Box<dyn Engine>` on
-/// a scheduler lane thread, and what a runtime-level fold gate diffs is this
-/// process-global mirror before and after a serving loop. `prebinds` moving is
-/// the one observable that the runtime's own next-fire hint
-/// (`Engine::expect_fire`, stated from `scheduler::worker::fire_frame`)
-/// reached the shell — nothing else in the runtime can say so, because a hint
-/// that lands leaves no trace in any completion. The two micros columns split
-/// the same binding work into its on-critical-path and hidden halves, which is
-/// the number the `PIE_CUDA_PIPELINE` A/B moves.
-#[cfg(feature = "_engine-cuda")]
-#[must_use]
-pub fn fold_observed() -> (u64, u64, u64, u64, u64, u64, u64) {
-    engine_cuda::Shell::fold_observed()
-}
-
 struct EngineRegistration {
     spec: EngineSpec,
     /// The engine, until a scheduler claims it.

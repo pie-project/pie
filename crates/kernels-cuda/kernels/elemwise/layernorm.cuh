@@ -35,13 +35,24 @@ __device__ __forceinline__ void layernorm_row(
     const T* __restrict__ bias,
     T* __restrict__ y,
     int hidden,
-    float eps)
+    float eps,
+    const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows START: with a stage armed `x` and
+    // `y` arrive at the plane's base, so this block's row is its block index
+    // shifted by that start; with none they arrive pre-shifted. `weight` and
+    // `bias` are indexed by column and never move.
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+
     const int tid = threadIdx.x;
 
-    const T* xr = x + static_cast<long long>(row) * hidden;
-    T* yr = y + static_cast<long long>(row) * hidden;
+    const T* xr = x + static_cast<long long>(plane_row) * hidden;
+    T* yr = y + static_cast<long long>(plane_row) * hidden;
 
     __shared__ float buf[BLOCK];
 
@@ -84,9 +95,10 @@ __global__ void layernorm_no_scale(
     const T* __restrict__ x,
     T* __restrict__ y,
     int hidden,
-    float eps)
+    float eps,
+    const u32* __restrict__ win)
 {
-    layernorm_row<T, BLOCK, false>(x, nullptr, nullptr, y, hidden, eps);
+    layernorm_row<T, BLOCK, false>(x, nullptr, nullptr, y, hidden, eps, win);
 }
 
 /// **THE WHOLE `nn.LayerNorm`, IN ONE LAUNCH** (`.wiki/alto/next.md` B5).
@@ -119,9 +131,10 @@ __global__ void layernorm(
     const T* __restrict__ bias,
     T* __restrict__ y,
     int hidden,
-    float eps)
+    float eps,
+    const u32* __restrict__ win)
 {
-    layernorm_row<T, BLOCK, true>(x, weight, bias, y, hidden, eps);
+    layernorm_row<T, BLOCK, true>(x, weight, bias, y, hidden, eps, win);
 }
 
 }

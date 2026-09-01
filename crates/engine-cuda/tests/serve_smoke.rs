@@ -271,7 +271,10 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         ordinal: 0,
         // The golden path. Every claim in this file is about what the model
         // says, and the recorded path is diffed against it in
-        // `graph_replay.rs` rather than substituted for it here.
+        // `bodies_gate.rs` rather than substituted for it here. (It was
+        // `graph_replay.rs` until the tier-2 campaign deleted the keyed path
+        // that suite was the A/B for; the two claims of it that were not about
+        // keying moved into the bodies gate.)
         graphs: engine_cuda::Graphs::Off,
         knobs: engine_cuda::Knobs::default(),
         program_cache_dir: None,

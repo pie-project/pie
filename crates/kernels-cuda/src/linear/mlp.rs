@@ -51,7 +51,14 @@ pub fn swiglu(ctx: &Ctx, packed: Tensor, intermediate: u32, y: &mut Tensor) -> R
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::linear::mlp_swiglu<{t}>"))).apply(launch),
-        &[packed.arg(), y.arg(), width.arg()],
+        &[
+            packed.arg(),
+            y.arg(),
+            width.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -72,7 +79,15 @@ pub fn swiglu_clamp(
             symbol(&format!("::pie::linear::mlp_swiglu_clamp<{t}>")),
         )
         .apply(launch),
-        &[packed.arg(), y.arg(), width.arg(), limit.arg()],
+        &[
+            packed.arg(),
+            y.arg(),
+            width.arg(),
+            limit.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -94,7 +109,16 @@ pub fn swiglu_clamp_alpha(
             symbol(&format!("::pie::linear::mlp_swiglu_clamp_alpha<{t}>")),
         )
         .apply(launch),
-        &[packed.arg(), y.arg(), width.arg(), limit.arg(), alpha.arg()],
+        &[
+            packed.arg(),
+            y.arg(),
+            width.arg(),
+            limit.arg(),
+            alpha.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -113,7 +137,19 @@ pub fn geglu_tanh(ctx: &Ctx, gate: Tensor, up: Tensor, y: &mut Tensor) -> Result
         OP,
         Fire::at(FILE, symbol(&format!("::pie::linear::mlp_geglu_tanh<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
-        &[gate.arg(), up.arg(), y.arg(), stated(OP, lanes)?.arg()],
+        &[
+            gate.arg(),
+            up.arg(),
+            y.arg(),
+            stated(OP, lanes)?.arg(),
+            // The element-form seat's width: this launch is flat over
+            // `rows * width`, so the kernel needs the row's width to read the
+            // staged row count and row start as elements.
+            stated(OP, y.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -144,7 +180,18 @@ pub fn gelu_tanh(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         OP,
         Fire::at(FILE, symbol(&format!("::pie::linear::mlp_gelu_tanh<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
-        &[x.arg(), y.arg(), stated(OP, lanes)?.arg()],
+        &[
+            x.arg(),
+            y.arg(),
+            stated(OP, lanes)?.arg(),
+            // The element-form seat's width: this launch is flat over
+            // `rows * width`, so the kernel needs the row's width to read the
+            // staged row count and row start as elements.
+            stated(OP, y.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -164,7 +211,14 @@ pub fn geglu_tanh_packed(
             symbol(&format!("::pie::linear::mlp_geglu_tanh_packed<{t}>")),
         )
         .apply(launch),
-        &[packed.arg(), y.arg(), width.arg()],
+        &[
+            packed.arg(),
+            y.arg(),
+            width.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -193,6 +247,9 @@ pub fn situ(
             width.arg(),
             beta.arg(),
             up_cap.unwrap_or(0.0).arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

@@ -134,6 +134,12 @@ struct BatchDecodeParams {
   IdType* kv_chunk_size_ptr;
   bool* block_valid_mask;
   bool partition_kv;
+  // PIE: the query row each request's single row begins at, appended so the
+  // decode kernel can address a plane it was handed unsliced.  Upstream reads
+  // `q + batch_idx * q_stride_n`; with this vector it reads
+  // `q + q_indptr[batch_idx] * q_stride_n`, which is the same row whenever
+  // the vector is the launch's own (one row per decode request).
+  IdType* q_indptr;
 
   __device__ __host__ BatchDecodeParams()
       : q(nullptr),
@@ -156,7 +162,8 @@ struct BatchDecodeParams {
         o_indptr(nullptr),
         kv_chunk_size_ptr(nullptr),
         block_valid_mask(nullptr),
-        partition_kv(false) {}
+        partition_kv(false),
+        q_indptr(nullptr) {}
 
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_rope_offset,
                                         paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
@@ -184,7 +191,8 @@ struct BatchDecodeParams {
         o_indptr(nullptr),
         kv_chunk_size_ptr(nullptr),
         block_valid_mask(nullptr),
-        partition_kv(false) {}
+        partition_kv(false),
+        q_indptr(nullptr) {}
 
   __host__ __device__ __forceinline__ int32_t get_qo_len(int32_t batch_idx) const { return 1; }
 

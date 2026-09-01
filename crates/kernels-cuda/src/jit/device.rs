@@ -195,8 +195,9 @@ pub(crate) fn take(
     {
         return Ok(slab.ptr);
     }
-    // Growth is `cudaFree` + `cudaMalloc`; under capture that poisons the
-    // graph, so an un-warmed slab is a refusal, not a corruption.
+    // Growth allocates (fresh block, old one retired — see `grow` below),
+    // and an allocation under capture is illegal host work, so an un-warmed
+    // slab is a refusal, not a corruption.
     if capture_status(stream)
         .is_some_and(|s| s != rt::cudaStreamCaptureStatus::cudaStreamCaptureStatusNone)
     {

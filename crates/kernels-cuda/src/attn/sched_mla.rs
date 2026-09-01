@@ -7,7 +7,7 @@
 
 use crate::error::Error;
 
-use crate::attn::plan::{Built, Device, MlaPlanInfo};
+use crate::attn::plan::{Built, Device, Live, MlaPlanInfo};
 use crate::attn::sched::{
     AlignedAllocator, at, CostHeap, Staging, cost_function, lengths, narrow, packed_causal_kv_end,
     spans,
@@ -25,7 +25,22 @@ pub struct Request<'a> {
     pub kv_indptr: &'a [i32],
     /// Host per-request kv lengths, in tokens — `[batch_size]`.
     pub kv_len_arr: &'a [i32],
+    /// The row and lane counts this schedule is CARVED for — the two numbers
+    /// the cluster split below averages, and the only two inputs the hashed
+    /// half of this payload has (`MlaPlanInfo::num_blks_x`/`num_blks_y`).
+    ///
+    /// **AND THEY ARE A PAIR, WHICH IS WHY BOTH ARE HERE.** The average is
+    /// `rows * heads / lanes`, so a carve that raised one and left the other
+    /// on the fire's own count would be neither the fire's answer nor the
+    /// key's. `Run::planning` raises both under one predicate; a caller with
+    /// no ceiling passes this fire's own two and gets the schedule this fire
+    /// would have carved.
+    pub total_num_rows: u32,
     pub batch_size: u32,
+    /// **AND WHAT THIS FIRE ACTUALLY BROUGHT** ([`Live`]) — one reader here:
+    /// the lane walk that carves the kv spans and stages the work lists, off
+    /// this fire's own three host vectors.
+    pub live: Live,
     pub num_heads: u32,
     pub head_dim_o: u32,
     pub causal: bool,
@@ -87,7 +102,12 @@ pub fn kv_len_limit_step(x: u64) -> u64 {
 
 #[allow(clippy::too_many_lines)]
 pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<Schedule, Error> {
-    let batch = req.batch_size as usize;
+    // The three host vectors are this fire's, so every walk over them — the
+    // packed extents, the kv total, the work lists — is the live lane count;
+    // the carved `total_num_rows`/`batch_size` pair beside it is what the
+    // cluster size averages over, and it is the only thing this schedule's
+    // hashed half is a function of.
+    let batch = req.live.requests as usize;
     if batch == 0 {
         return Err(refuse(op, "the batch is empty"));
     }
@@ -116,9 +136,35 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
         narrow(op, "mla_kv_len", i64::from(kv_len))?;
     }
 
-    let total_packed: u64 = packed_qo_lens.iter().map(|&p| u64::from(p)).sum();
-    let avg_packed_qo_len = total_packed / u64::from(req.batch_size);
+    // **THE ONE HEURISTIC IN THIS BUILDER, AND IT IS READ OFF THE CARVE.**
+    // The packed query axis is `rows x heads` however the rows are split
+    // between lanes, so the average packed extent is `rows * heads / lanes`
+    // exactly — no walk of `packed_qo_lens` says anything the two carved
+    // counts do not, which is what lets the number be a function of the
+    // CARVE rather than of the fire. Off a ceiling the two are this fire's
+    // own rows and lanes and this is byte for byte the sum it replaced
+    // (`sum(qo_lens) == rows`, the qo indptr bounds this window's rectangle).
+    let avg_packed_qo_len =
+        u64::from(req.total_num_rows) * u64::from(req.num_heads) / u64::from(req.batch_size);
 
+    // **AND ITS ANSWER PICKS THE GRID** — `cluster_size` is
+    // `MlaPlanInfo::num_blks_x`, `num_clusters` beneath it is `num_blks_y`,
+    // and both ride `Run::schedule_shape`. Under the bucket ceiling this is a
+    // HEURISTIC THAT HAS BEEN FROZEN, on `sched_prefill::determine_cta_tile_q`'s
+    // terms and for its reason: the carved counts do not move inside a
+    // `record::BodyKey`, so one key captures ONE cluster grid.
+    //
+    // **THE PERFORMANCE CONSEQUENCE IS REAL AND THE CORRECTNESS ONE IS NOT.**
+    // The carve's average is the bucket's, so a SMALL FIRE IN A BIG BUCKET
+    // RIDES THE BIG-CLUSTER SPLIT: a handful of lanes whose own average would
+    // have chosen one CTA per cluster run the two-CTA split, at half the
+    // clusters and twice the query tile, and the tiles they do not fill are
+    // work items the walk never emits. What they do not pay is a wrong
+    // answer — the cluster size says how many CTAs cooperate on one query
+    // tile and how wide that tile is, the kv extents each work item runs to
+    // are `effective`'s and not the tile's, and the split-kv merge is booked
+    // off the same walk either way. Which is exactly why this number is
+    // allowed to be a function of the key rather than of the fire.
     let cluster_size: u32 = if avg_packed_qo_len > 64 { 2 } else { 1 };
     let num_clusters = device.num_sm / cluster_size;
     if num_clusters == 0 {

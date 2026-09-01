@@ -76,6 +76,9 @@ pub fn embed(
             vocab.arg(),
             rows.arg(),
             stated(OP, per_row)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -115,6 +118,9 @@ pub fn split_qkv(
             v.arg(),
             q_dim.arg(),
             kv_dim.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -152,6 +158,9 @@ pub fn split_q_gate(
             stated(OP, q.rows)?.arg(),
             stated(OP, heads)?.arg(),
             stated(OP, head_dim)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -187,6 +196,9 @@ pub fn split_rows(
             right.arg(),
             left_dim.arg(),
             right_dim.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -234,6 +246,9 @@ pub fn select(
             stated(OP, table.width)?.arg(),
             stated(OP, offset)?.arg(),
             stated(OP, width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -264,7 +279,7 @@ fn row_bytes(op: &'static str, handle: Tensor) -> Result<u64, Error> {
     let elem = match handle.dtype {
         Dtype::Bf16 | Dtype::F16 => 2,
         Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
-        Dtype::U8 | Dtype::I8 | Dtype::Fp8E4m3 | Dtype::E8m0 => 1,
+        Dtype::U8 | Dtype::I8 | Dtype::E4m3 | Dtype::E8m0 => 1,
         other => return Err(Error::DtypeUnsupported { op, dtype: other }),
     };
     Ok(u64::from(handle.width) * elem)

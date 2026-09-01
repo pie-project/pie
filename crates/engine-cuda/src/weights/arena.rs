@@ -542,7 +542,7 @@ impl CudaArena {
         let (rows, cols) = self.extent_2d(op)?;
         let scales = self.encode_scales(op)?;
         let w = Tensor::new(self.device_ptr(op.src.offset), rows, cols, Dtype::Bf16);
-        let mut fp8 = Tensor::new(self.device_ptr(op.dst.offset), rows, cols, Dtype::Fp8E4m3);
+        let mut fp8 = Tensor::new(self.device_ptr(op.dst.offset), rows, cols, Dtype::E4m3);
         let mut scale_inv = Tensor::new(self.device_ptr(scales.offset), rows, 1, Dtype::F32);
         let fired =
             quant::quantize_bf16_to_fp8_e4m3_per_channel(&self.ctx(), w, &mut fp8, &mut scale_inv);

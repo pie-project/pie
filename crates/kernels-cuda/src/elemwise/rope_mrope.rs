@@ -203,6 +203,9 @@ fn fire(
             stated(OP, sections[0])?.arg(),
             stated(OP, sections[1])?.arg(),
             stated(OP, sections[2])?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

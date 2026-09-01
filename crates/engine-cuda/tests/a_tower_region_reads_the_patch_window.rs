@@ -30,6 +30,12 @@ use model_compiler::{
 };
 use model_exec::fire::{FireDescriptor, Lane, compose_axes};
 use model_ir::ops::Elementwise;
+
+/// A slot table generously above every hand-built fire below — the tests ask
+/// about window semantics, not the carve, so the ceiling only has to hold.
+fn test_slots() -> engine_cuda::window::Slots {
+    engine_cuda::window::Slots::new(8, 512, 8, 1)
+}
 use model_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
     ValueId,
@@ -65,6 +71,7 @@ impl Build {
                 caches: vec![CacheRow::State {
                     name: "state".to_string(),
                     slab: vec![1],
+                    dtype: Dtype::Bf16,
                 }],
                 values: Vec::new(),
                 nodes: Vec::new(),
@@ -178,6 +185,7 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
         fire.patch_classes(),
         &indptr(&[5, 3, 4]),
         Copies::off(),
+        test_slots(),
     )
     .expect("every region seats a window");
 
@@ -272,6 +280,7 @@ fn a_fire_with_no_image_gets_the_token_windows_it_always_had() {
             fire.patch_classes(),
             &boundaries,
             Copies::off(),
+            test_slots(),
         )
         .expect("every region seats a window")
     };

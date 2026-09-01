@@ -117,6 +117,9 @@ pub fn ngram_ids(
                 ptr: std::ptr::from_ref(&h).cast(),
                 len: size_of::<PleHash>(),
             },
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -162,6 +165,15 @@ pub fn ngram_ids_chunked(
                 ptr: std::ptr::from_ref(&h).cast(),
                 len: size_of::<PleHash>(),
             },
+            // **THE STAGED-GEOMETRY SEAT, READ ON THE LANE AXIS** (the
+            // chunked-arm wave). One block per REQUEST, so this arm spends
+            // `win[2]` where the decode form above spends `win[0]`, and
+            // `win[3]` to name the fire lane of its window-local request `r` —
+            // the tables `Run::recurrent_absolute` hands over whole. `win[1]`
+            // shifts the token and table planes; the window's own CSR stays on
+            // the launch-local ordinal. Passed UNCONDITIONALLY, which is what
+            // puts the name on `engine_cuda::SHIFTED`.
+            ctx.stage(),
         ],
     )
 }

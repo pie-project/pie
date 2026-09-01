@@ -659,7 +659,7 @@ impl Model {
         // four codes to a word rather than eight. `qwen_3::Model::new` reads
         // its own gates the same way and for the same reason.
         let gate = match w {
-            Dtype::MlxU4 => Dtype::MlxU8,
+            Dtype::U4g64 => Dtype::U8g64,
             other => other,
         };
         let q_heads = d.q_heads / tp;

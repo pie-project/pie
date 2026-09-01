@@ -782,14 +782,8 @@ pub(crate) fn write_cuda_startup_toml(
     if let Some(pad) = opts.pad {
         insert_bool(&mut engine, "pad", pad);
     }
-    if let Some(fold) = opts.fold {
-        insert_bool(&mut engine, "fold", fold);
-    }
-    if let Some(pipeline) = opts.pipeline {
-        insert_bool(&mut engine, "pipeline", pipeline);
-    }
-    if let Some(policy) = opts.fold_disable.as_deref() {
-        insert_str(&mut engine, "fold_disable", policy);
+    if let Some(bodies) = opts.bodies {
+        insert_bool(&mut engine, "bodies", bodies);
     }
     if let Some(copies) = opts.fallback_copy {
         insert_bool(&mut engine, "fallback_copy", copies);
@@ -1455,9 +1449,8 @@ mod tests {
         let stated = write(
             &CudaNativeEngineOptions {
                 graphs: Some("on".into()),
-                fold: Some(true),
+                bodies: Some(false),
                 pad: Some(false),
-                fold_disable: Some("library".into()),
                 side_streams: Some(0),
                 ..CudaNativeEngineOptions::default()
             },
@@ -1465,16 +1458,14 @@ mod tests {
         );
         let engine = &stated["engine"];
         assert_eq!(engine["graphs"].as_str().unwrap(), "on");
-        assert_eq!(engine["fold"].as_bool().unwrap(), true);
+        assert_eq!(engine["bodies"].as_bool().unwrap(), false);
         assert_eq!(engine["pad"].as_bool().unwrap(), false);
-        assert_eq!(engine["fold_disable"].as_str().unwrap(), "library");
         assert_eq!(engine["side_streams"].as_integer().unwrap(), 0);
         // **AND THE FRACTION IS THERE WITHOUT BEING ASKED FOR** — the one key
         // an operator cannot omit from this table, because the config type has
         // already turned its absence into `0.90`.
         assert_eq!(engine["gpu_mem_utilization"].as_float().unwrap(), 0.90);
         // And nothing the operator did not state.
-        assert!(engine.get("pipeline").is_none());
         assert!(engine.get("grouped").is_none());
         assert!(engine.get("fallback_copy").is_none());
     }

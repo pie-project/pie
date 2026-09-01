@@ -49,9 +49,17 @@ impl Run<'_> {
         };
         let lane_offset = self.window().span.lane_offset;
         let mut slab = seat.slab;
+        // **AND THE OBSERVATION TAKES THE WINDOW BACK** (chunk 2c-b). The arm
+        // above is on `crate::SHIFTED` now and may be handed the plane's
+        // base; this launch is not an IR op at all, its grid is
+        // `[requests, heads]`, and it reads `q + indptr[blockIdx.x]` off the
+        // REBASED boundaries. So it wants the rectangle every other path
+        // resolves — see `Run::windowed`.
+        let mut q_rows = self.ragged(q);
+        q_rows.data = self.windowed(q_rows.data);
         kernels_cuda::attn_score::capture(
             self.ctx(),
-            self.ragged(q),
+            q_rows,
             self.prefill_plan(plan),
             &self.pool(cache),
             window,
@@ -109,6 +117,7 @@ impl Run<'_> {
                         &seat.kv_indptr,
                         &seat.kv_len,
                         seat.shape,
+                        seat.live,
                         seat.window,
                         fire.capture,
                         max_grid,
@@ -148,14 +157,21 @@ impl Run<'_> {
                     let fire = self.bindings();
                     let seat = self.planning(*kv_indptr, *plan);
                     let spans = self.mask_indptr();
+                    // The row axis's half of `Run::planning`'s pin: what the
+                    // builders CARVE at is `seat.rows`, which the ceiling
+                    // raises to the bucket for every kind that reads a row
+                    // total, and the staged row-total word stays on
+                    // `live.rows`'s side of the split.
+                    debug_assert_eq!(seat.live.rows, self.total_tokens());
                     match self.declared(*plan) {
                         StructKind::AttnPrefillPlan => {
                             let built = plan::plan_prefill(
                                 self.qo_indptr_host(),
                                 &seat.kv_indptr,
                                 &seat.kv_len,
-                                self.total_tokens(),
+                                seat.rows,
                                 seat.shape,
+                                seat.live,
                                 seat.window,
                                 true,
                                 fire.capture,
@@ -171,8 +187,22 @@ impl Run<'_> {
                                 self.qo_indptr_host(),
                                 &seat.kv_indptr,
                                 &seat.kv_len,
-                                self.total_tokens(),
+                                // `seat.rows` on this arm too, and since
+                                // chunk 5 it is the BUCKET here as well:
+                                // `sched_sm90` already took the carved pair
+                                // (`total_num_rows`, `batch_size`) and only
+                                // ever got the fire's, so freezing
+                                // `same_schedule_for_all_heads` and the eight
+                                // int offsets under it was a change to
+                                // `Run::planning`'s clause and to nothing
+                                // else. Hash hygiene and not a live path: the
+                                // launcher answers a typed refusal before it
+                                // launches an sm90 prefill at all
+                                // (`attn::prefill_sm90`), so no gate can
+                                // exercise this and none claims to.
+                                seat.rows,
                                 seat.shape,
+                                seat.live,
                                 true,
                                 fire.capture,
                                 &fire.device,
@@ -200,9 +230,9 @@ impl Run<'_> {
                 o,
             } => attn::decode(
                 self.ctx(),
-                self.tensor(*q),
+                self.ragged_q(*q),
                 self.decode_plan(*plan),
-                &self.pool(*cache),
+                &self.pool_absolute(*cache),
                 *window,
                 *head_dim,
                 *sm_scale,
@@ -211,6 +241,26 @@ impl Run<'_> {
             // A prefill plan can hold either kind the trace declared; the
             // arm follows the slot. The sm90 launcher still answers a typed
             // refusal in its own name (`attn::prefill_sm90`).
+            //
+            // **AND THE Q AXIS IS `ragged_q` AND NOT `ragged`** (bodies
+            // design, chunk 2c-a). FIVE launches in this family hand FA2 a
+            // by-value params block with no seat in it — `bufs.qo_indptr`
+            // becomes `PrefillPagedParams::q_indptr`, and since chunk 2c-b
+            // `BatchDecodeParams::q_indptr` too, and the kernel computes
+            // `q + q_indptr[req] * stride` with no `win[1]` to add — so their
+            // CSR has to match whatever `q`'s POINTER is, which under a plane
+            // base is not the window's first row. Every other `ragged` in this
+            // file feeds a SEATED kernel that adds the start itself and wants
+            // the window-local reading it always had; `Run::ragged_q` argues
+            // both halves.
+            //
+            // **AND THE LANE AXIS RIDES BESIDE IT** (chunk 2c-b): the five
+            // names are on `crate::SHIFTED` now, so these regions CAN be
+            // `plane_base`, and where the q pointer goes absolute the pool's
+            // per-lane tables and the schedule's request numbers go with it —
+            // `Run::pool_absolute` here, `Run::planning` at the plan op. All
+            // five arms take that door for that reason, and nothing else in
+            // this file does.
             Attention::Prefill {
                 q,
                 plan,
@@ -223,7 +273,7 @@ impl Run<'_> {
             } => match self.slot(*plan) {
                 StructSlot::PrefillSm90(sm90) => attn::prefill_sm90(
                     self.ctx(),
-                    self.ragged(*q),
+                    self.ragged_q(*q),
                     sm90,
                     &self.pool(*cache),
                     *window,
@@ -234,9 +284,9 @@ impl Run<'_> {
                 ),
                 _ => attn::prefill(
                     self.ctx(),
-                    self.ragged(*q),
+                    self.ragged_q(*q),
                     self.prefill_plan(*plan),
-                    &self.pool(*cache),
+                    &self.pool_absolute(*cache),
                     *window,
                     *head_dim,
                     *kv_heads,
@@ -258,10 +308,10 @@ impl Run<'_> {
                 o,
             } => attn::masked(
                 self.ctx(),
-                self.ragged(*q),
+                self.ragged_q(*q),
                 self.prefill_plan(*plan),
                 self.tensor(*mask),
-                &self.pool(*cache),
+                &self.pool_absolute(*cache),
                 *window,
                 *head_dim,
                 *sm_scale,
@@ -301,9 +351,9 @@ impl Run<'_> {
                 lse,
             } => attn::decode_lse(
                 self.ctx(),
-                self.tensor(*q),
+                self.ragged_q(*q),
                 self.decode_plan(*plan),
-                &self.pool(*cache),
+                &self.pool_absolute(*cache),
                 *window,
                 *head_dim,
                 *sm_scale,
@@ -323,9 +373,9 @@ impl Run<'_> {
             } => {
                 attn::prefill_lse(
                     self.ctx(),
-                    self.ragged(*q),
+                    self.ragged_q(*q),
                     self.prefill_plan(*plan),
-                    &self.pool(*cache),
+                    &self.pool_absolute(*cache),
                     *window,
                     *head_dim,
                     *kv_heads,
@@ -451,7 +501,19 @@ impl Run<'_> {
                         self.qo_indptr_host(),
                         &seat.kv_indptr,
                         &seat.kv_len,
+                        // **THE CARVED PAIR** (chunk 5): `seat.rows` and
+                        // `seat.shape.num_requests`, which `Run::planning`
+                        // raises together to the numbers the `record::BodyKey`
+                        // spells — the fire's bucket and its lane ceiling on a
+                        // whole-fire body, and since the ceiling design's
+                        // Option B this window's own classes' lattice rungs on
+                        // a windowed one — and leaves at this window's own
+                        // together everywhere else. The latent builder
+                        // averages them into `cluster_size`, which is the only
+                        // number of this payload that ever followed the fire.
+                        seat.rows,
                         seat.shape.num_requests,
+                        seat.live,
                         seat.shape.num_q_heads,
                         seat.shape.head_dim,
                         self.multi_token(),
@@ -702,12 +764,30 @@ impl Run<'_> {
                 y,
             } => {
                 self.rs_move("attention.ssm_causal_conv1d_chunked", *x, self.tensor(*x))?;
-                let tail = self.recurrent_tail(*state);
+                // **THE ABSOLUTE LANE DOOR, AND ONLY THE CHUNKED ARMS TAKE
+                // IT** (`Run::recurrent_absolute`): a body bakes the slot map
+                // it is handed, `lane_offset` is not a function of its key, so
+                // the map goes over whole and the kernel finds its lane at
+                // `r + win[3]`. Off a plane base this is the sliced reading
+                // the per-step conv above takes, byte for byte.
+                //
+                // **AND `ragged_lanes` IS THE OTHER HALF OF THE SAME
+                // SENTENCE** (the grid-at-ceiling wave). This arm's grid is
+                // one block per REQUEST and it counts them off the CSR's
+                // length, so a body captured at one batch could serve no
+                // larger one until the length became a function of the key:
+                // the vector is the same rebased boundaries `ragged` hands
+                // over, declared out to the ceiling the ladder spells, and
+                // `win[2]` retires the requests past this fire's own. Nothing
+                // in this arm's dispatch computes a grid — the count still
+                // arrives as the shape of an operand, which is where every
+                // other grid in this file comes from too.
+                let tail = self.recurrent_tail_absolute(*state);
                 attn::ssm::causal_conv1d_chunked(
                     self.ctx(),
-                    self.ragged(*x),
+                    self.ragged_lanes(*x),
                     self.tensor(*weight),
-                    &self.recurrent(*state),
+                    &self.recurrent_absolute(*state),
                     *conv_width,
                     *dilation,
                     &mut self.tensor(*y),
@@ -715,7 +795,7 @@ impl Run<'_> {
                 let Some(tail) = tail else { return Ok(()) };
                 attn::ssm::causal_conv1d_chunked(
                     self.ctx(),
-                    self.ragged(*x),
+                    self.ragged_lanes(*x),
                     self.tensor(*weight),
                     &tail,
                     *conv_width,
@@ -757,11 +837,11 @@ impl Run<'_> {
                 heads_per_ngram,
                 ngram_ids,
             } => {
-                let tail = self.recurrent_tail(*state);
+                let tail = self.recurrent_tail_absolute(*state);
                 kernels_cuda::attn_ple::ngram_ids_chunked(
                     self.ctx(),
-                    self.ragged(*ids),
-                    &self.recurrent(*state),
+                    self.ragged_lanes(*ids),
+                    &self.recurrent_absolute(*state),
                     *eos,
                     mults,
                     primes,
@@ -772,7 +852,7 @@ impl Run<'_> {
                 let Some(tail) = tail else { return Ok(()) };
                 kernels_cuda::attn_ple::ngram_ids_chunked(
                     self.ctx(),
-                    self.ragged(*ids),
+                    self.ragged_lanes(*ids),
                     &tail,
                     *eos,
                     mults,
@@ -838,13 +918,13 @@ impl Run<'_> {
                 v_dim,
                 y,
             } => {
-                let tail = self.recurrent_tail(*state);
+                let tail = self.recurrent_tail_absolute(*state);
                 attn::ssm::gated_delta_chunked(
                     self.ctx(),
-                    self.ragged(*qkv),
+                    self.ragged_lanes(*qkv),
                     self.tensor(*z),
                     self.tensor(*gates),
-                    &self.recurrent(*state),
+                    &self.recurrent_absolute(*state),
                     *k_heads,
                     *v_heads,
                     *k_dim,
@@ -854,7 +934,7 @@ impl Run<'_> {
                 let Some(tail) = tail else { return Ok(()) };
                 attn::ssm::gated_delta_chunked(
                     self.ctx(),
-                    self.ragged(*qkv),
+                    self.ragged_lanes(*qkv),
                     self.tensor(*z),
                     self.tensor(*gates),
                     &tail,
@@ -902,12 +982,12 @@ impl Run<'_> {
                 y,
             } => attn::ssm::kda_chunked(
                 self.ctx(),
-                self.ragged(*mixed),
+                self.ragged_lanes(*mixed),
                 self.tensor(*f),
                 self.tensor(*b),
                 self.tensor(*dt_bias),
                 self.tensor(*a_log),
-                &self.recurrent(*state),
+                &self.recurrent_absolute(*state),
                 *heads,
                 *head_dim,
                 *norm_eps,

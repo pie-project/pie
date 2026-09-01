@@ -33,7 +33,7 @@
 //!
 //! # Gating
 //!
-//! As `graph_replay.rs`: skipped at run time when the machine or the artifact
+//! As `serve_smoke.rs`: skipped at run time when the machine or the artifact
 //! is missing, rather than `#[ignore]`d. The overlay is not in the hugging
 //! face cache and has no canonical home, so it is named by environment and
 //! nothing is guessed.
@@ -50,8 +50,9 @@ const SKU: &str = "qwen35-d0.8b-eagle-bf16-kv-bf16";
 const PROMPT: &str = "The capital of France is";
 
 /// How many greedy steps each arm takes. Long enough that the capture happens
-/// well inside it — a key is recorded on its third fire — and that a body
-/// which ran when it should not have has somewhere to show up.
+/// well inside it — a body is recorded on its key's third fire
+/// (`record::WARM_FIRES`) — and that a launch which ran when it should not
+/// have has somewhere to show up.
 const STEPS: usize = 12;
 
 fn budget() -> Budget {
@@ -114,7 +115,15 @@ fn shell(checkpoint: &Path, container: &Path) -> Shell {
         slots: 4,
         ordinal: 0,
         graphs: Graphs::Off,
-        knobs: engine_cuda::Knobs::default(),
+        // `bodies` stated rather than inherited: it defaults to true since the
+        // keyed path died, and saying it here is what makes the recorded arm
+        // below a BODY by declaration rather than by default. The load's mode
+        // is `Off`, so nothing is armed at boot and the recorded arm's
+        // counters belong to its own fires.
+        knobs: engine_cuda::Knobs {
+            bodies: true,
+            ..engine_cuda::Knobs::default()
+        },
         program_cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         weight_cache_dir: None,
@@ -170,7 +179,7 @@ fn the_eagle_overlay_answers_the_same_tokens_recorded_as_it_does_eagerly() {
     // **THE PRECONDITION, ASKED FIRST AND WITHOUT A DEVICE.** If this row
     // stopped baking a conditional, everything below would pass while testing
     // nothing — a graphs=on/off identity over an always-launch artifact is
-    // `graph_replay`'s claim and not this one.
+    // `bodies_gate.rs`'s claim and not this one.
     let trace = model::trace_of(SKU).expect("the catalog ships the SKU");
     let baked = compile(&trace(Platform::Cuda), &budget(), &DeviceProfile::default())
         .expect("the overlay's plan bakes");
@@ -199,16 +208,28 @@ fn the_eagle_overlay_answers_the_same_tokens_recorded_as_it_does_eagerly() {
     shell.set_mode(Graphs::On);
     let recorded = greedy(&mut shell, &prompt);
 
-    let stats = shell.graph_stats();
+    let stats = shell.body_stats();
     eprintln!(
-        "`{SKU}`: region {} is baked `If`; {} captures, {} execs, {} nodes\n  \
+        "`{SKU}`: region {} is baked `If`; {} captures, {} hits, {} nodes\n  \
          eager    {eager:?}\n  recorded {recorded:?}",
-        conditional[0], stats.captures, stats.execs, stats.nodes,
+        conditional[0], stats.captures, stats.hits, stats.nodes,
     );
     assert!(
         stats.captures > 0,
         "the recorded arm never captured, so the conditional was never \
-         recorded and both arms are the same eager walk",
+         recorded and both arms are the same eager walk: {stats}",
+    );
+    // **AND THE HIT IS WHAT SAYS THE BRACKET RAN FROM THE GRAPH.** A body that
+    // captured and never replayed leaves the recorded arm an eager walk with a
+    // capture on the side, which is the same two token streams and no claim.
+    // (The overlay is ONE capture unit — a draft head runs on the token axis —
+    // so it is not the multi-unit refusal `CompiledModel::fold_refused`
+    // states, and a zero here would be an admissibility finding worth chasing
+    // rather than a known limit.)
+    assert!(
+        stats.hits >= 1,
+        "the drafting row's body never replayed, so the conditional was \
+         recorded and never served: {stats}",
     );
     assert_eq!(
         eager, recorded,

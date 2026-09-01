@@ -205,6 +205,9 @@ fn write_kv_bf16(
             pool.page_size.arg(),
             kv_heads.arg(),
             head_dim.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )?;
 
@@ -304,6 +307,9 @@ fn write_kv_quantised(
                 kv_heads.arg(),
                 head_dim.arg(),
                 FP8_E4M3.arg(),
+                // The staged-geometry seat: the region's live-rows word when a
+                // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                ctx.stage(),
             ],
         ),
         scheme @ (KvScheme::Int8PerTokenHead | KvScheme::Fp8PerTokenHead) => {
@@ -333,6 +339,9 @@ fn write_kv_quantised(
                     pool.page_size.arg(),
                     kv_heads.arg(),
                     head_dim.arg(),
+                    // The staged-geometry seat: the region's live-rows word when a
+                    // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                    ctx.stage(),
                 ],
             )
         }
@@ -362,6 +371,9 @@ fn write_kv_quantised(
                     kv_heads.arg(),
                     head_dim.arg(),
                     block_size.arg(),
+                    // The staged-geometry seat: the region's live-rows word when a
+                    // body replay armed one, and the null seat (`ABSENT`) otherwise.
+                    ctx.stage(),
                 ],
             )
         }

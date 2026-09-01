@@ -12,17 +12,27 @@ __global__ void embed(
     const i32* __restrict__ token_ids,
     const bf16* __restrict__ weight,
     bf16* __restrict__ y,
-    int hidden, int vocab, int num_tokens, int per_row)
+    int hidden, int vocab, int num_tokens, int per_row,
+    const u32* __restrict__ win)
 {
     const int idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= num_tokens * per_row) return;
     const int n = idx / per_row;
     const int h = idx % per_row;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start. `token_ids` and `y` are row
+    // planes handed at their base and move with it; `weight` is the VOCAB
+    // bank, whose row axis is the id the vector yields, and never moves. The
+    // `idx >= num_tokens * per_row` bound above is the LAUNCH's, and stays.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
-    const i32 tid_raw = token_ids[n];
+    const i32 tid_raw = token_ids[plane_row];
     const int tid = (tid_raw >= 0 && tid_raw < vocab) ? tid_raw : 0;
     const bf16* row = weight + static_cast<long long>(tid) * hidden;
-    bf16* out = y + static_cast<long long>(n) * hidden;
+    bf16* out = y + static_cast<long long>(plane_row) * hidden;
 
     if constexpr (VEC) {
         reinterpret_cast<float4*>(out)[h] =
@@ -88,16 +98,25 @@ __global__ void split_q_gate(
     const T* __restrict__ packed,
     T* __restrict__ q_out,
     T* __restrict__ gate_out,
-    int N, int num_heads, int head_dim)
+    int N, int num_heads, int head_dim,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
     const int h = blockIdx.y;
     if (n >= N || h >= num_heads) return;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `packed`, `q_out` and
+    // `gate_out` are row planes handed at their base and move together. The
+    // `n >= N` bound above is the LAUNCH's, and stays on the raw index.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
 
     const int twod = 2 * head_dim;
-    const T* row = packed + ((long long)n * num_heads + h) * twod;
-    T* q_row     = q_out   + ((long long)n * num_heads + h) * head_dim;
-    T* gate_row  = gate_out + ((long long)n * num_heads + h) * head_dim;
+    const T* row = packed + ((long long)plane_row * num_heads + h) * twod;
+    T* q_row     = q_out   + ((long long)plane_row * num_heads + h) * head_dim;
+    T* gate_row  = gate_out + ((long long)plane_row * num_heads + h) * head_dim;
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         q_row[i]    = row[i];
         gate_row[i] = row[head_dim + i];
@@ -144,13 +163,22 @@ __global__ void split_rows(
     const T* __restrict__ src,
     T* __restrict__ left,
     T* __restrict__ right,
-    int left_dim, int right_dim)
+    int left_dim, int right_dim,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `src` and the two halves
+    // are row planes handed at their base and move together.
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int total = left_dim + right_dim;
-    const T* row = src + (long long)n * total;
-    T* l = left + (long long)n * left_dim;
-    T* r = right + (long long)n * right_dim;
+    const T* row = src + (long long)plane_row * total;
+    T* l = left + (long long)plane_row * left_dim;
+    T* r = right + (long long)plane_row * right_dim;
     for (int i = threadIdx.x; i < total; i += blockDim.x) {
         if (i < left_dim) {
             l[i] = row[i];
@@ -166,11 +194,21 @@ __global__ void select(
     T* __restrict__ out,
     int stride,
     int offset,
-    int width)
+    int width,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    const T* src = table + (long long)n * stride + offset;
-    T* dst = out + (long long)n * width;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: `table` is stacked slices
+    // PER ROW, so its row axis is this launch's, and `out` shares it. The
+    // `offset` picks a column and is untouched by the shift.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const T* src = table + (long long)row * stride + offset;
+    T* dst = out + (long long)row * width;
     for (int i = threadIdx.x; i < width; i += blockDim.x) {
         dst[i] = src[i];
     }
@@ -202,25 +240,35 @@ __global__ void split_qkv(
     T* __restrict__ q_out,
     T* __restrict__ k_out,
     T* __restrict__ v_out,
-    i32 q_dim, i32 kv_dim)
+    i32 q_dim, i32 kv_dim,
+    const u32* __restrict__ win)
 {
     const int n = static_cast<int>(blockIdx.y);
+    // The staged-geometry seat (qkv_fused.cuh's idiom): the rows ride
+    // `blockIdx.y` here, and a replay carved at a bucket retires its padded
+    // ones off the LIVE-ROWS word the fire staged — one word, not
+    // `split_qkv_devwin`'s `(start, count)` pair below.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows START: `src` and the three
+    // destinations are row planes handed at their base and move together.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
     const int stride = q_dim + 2 * kv_dim;
-    const T* src_row = src + static_cast<long long>(n) * stride;
+    const T* src_row = src + static_cast<long long>(row) * stride;
 
     for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < q_dim;
          j += static_cast<int>(blockDim.x * gridDim.x)) {
-        q_out[static_cast<long long>(n) * q_dim + j] = src_row[j];
+        q_out[static_cast<long long>(row) * q_dim + j] = src_row[j];
     }
 
     for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < kv_dim;
          j += static_cast<int>(blockDim.x * gridDim.x)) {
-        k_out[static_cast<long long>(n) * kv_dim + j] = src_row[q_dim + j];
+        k_out[static_cast<long long>(row) * kv_dim + j] = src_row[q_dim + j];
     }
 
     for (int j = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); j < kv_dim;
          j += static_cast<int>(blockDim.x * gridDim.x)) {
-        v_out[static_cast<long long>(n) * kv_dim + j] = src_row[q_dim + kv_dim + j];
+        v_out[static_cast<long long>(row) * kv_dim + j] = src_row[q_dim + kv_dim + j];
     }
 }
 
@@ -230,12 +278,16 @@ __global__ void split_qkv_devwin(
     T* __restrict__ q_out,
     T* __restrict__ k_out,
     T* __restrict__ v_out,
-    const u32* __restrict__ win,
+    const u32* __restrict__ devwin,
     i32 q_dim, i32 kv_dim)
 {
     const int n = static_cast<int>(blockIdx.y);
-    const int w0 = static_cast<int>(win[0]);
-    const int w1 = static_cast<int>(win[1]);
+    // `devwin` is the pre-staged device window pair, `(start, count)`:
+    // word 0 is a START. The staged-geometry seat's `win` is `(count,
+    // start)` — same pointer shape, opposite word order, and the rename
+    // is what keeps one from ever arming the other.
+    const int w0 = static_cast<int>(devwin[0]);
+    const int w1 = static_cast<int>(devwin[1]);
     if (n < w0 || n >= w0 + w1) return;
     const int stride = q_dim + 2 * kv_dim;
     const T* src_row = src + static_cast<long long>(n) * stride;

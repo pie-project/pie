@@ -52,7 +52,12 @@ const FIRE_PATH: [&str; 13] = [
 /// **THIS LIST IS THE CLAIM.** A file joining it is a file that can reach
 /// adapter residency, and the question to ask of it is when it runs — between
 /// fires, or during one.
-const NAMERS: [&str; 1] = ["serve.rs"];
+///
+/// `adapter.rs` joined with eta-ir (`d04e847a4`): it names [`blob::Site`] for
+/// the slot numbering its registration table shares with the residency table,
+/// and registration runs between fires — the question above, asked and
+/// answered. The pin lagged the commit; this row records the answer.
+const NAMERS: [&str; 2] = ["adapter.rs", "serve.rs"];
 
 /// The only methods of `Shell` that may touch the store. Every one runs
 /// BETWEEN fires, on the host, exactly as `register_adapter` does.

@@ -296,7 +296,7 @@ pub fn device_demand(trace: &Trace) -> Result<u64> {
 /// `no element size` this shell answered a gpt-oss load with until wave W-5.
 ///
 /// The refusal STAYS for a storage element that genuinely has no byte size
-/// (`Dtype::Fp4`, a nibble with no declared packing): a plane whose length
+/// (`Dtype::E2m1`, a nibble with no declared packing): a plane whose length
 /// cannot be computed is not a plane a store can reserve, and it is said by
 /// name rather than guessed at.
 ///
@@ -317,10 +317,10 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
                 // The shape is logical and the element is a nibble: two codes
                 // to a byte, and an odd row rounds up rather than overlapping
                 // the next one.
-                Dtype::MlxU4 | Dtype::MlxU4G32 => rows.saturating_mul(width).div_ceil(2),
+                Dtype::U4g64 | Dtype::U4g32 => rows.saturating_mul(width).div_ceil(2),
                 // The same bank at eight bits: one whole byte a code, so the
                 // logical rectangle IS the byte count and nothing rounds.
-                Dtype::MlxU8 => rows.saturating_mul(width),
+                Dtype::U8g64 => rows.saturating_mul(width),
                 other => {
                     let element =
                         model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {
@@ -1402,9 +1402,9 @@ fn packed(
         Dtype::Mxfp4 => place.width,
         // Two codes to a byte; `plane_bytes` rounds the TOTAL up, and a
         // row's width is even for every whole-group bank this arm serves.
-        Dtype::MlxU4 | Dtype::MlxU4G32 => place.width.div_ceil(2),
+        Dtype::U4g64 | Dtype::U4g32 => place.width.div_ceil(2),
         // One byte a code.
-        Dtype::MlxU8 => place.width,
+        Dtype::U8g64 => place.width,
         other => model_compiler::arena::elem_bytes(other)
             .and_then(|element| u32::try_from(element).ok())
             .map(|element| place.width.saturating_mul(element))

@@ -45,6 +45,14 @@ fn rows_per_head(op: &'static str, rows: u32, width: u32, head_dim: u32) -> Resu
     Ok(Launch::per_row(blocks, BLOCK))
 }
 
+/// The head count [`rows_per_head`] flattens into `blockIdx.x`, which the
+/// seated kernels divide by to recover the token row: one, when the launch is
+/// one block per row. Read only after [`rows_per_head`] has refused a width
+/// the head does not divide, so the division is exact here.
+const fn per_head_split(width: u32, head_dim: u32) -> u32 {
+    if head_dim == 0 { 1 } else { width / head_dim }
+}
+
 /// One thread per element, flattened — refused rather than truncated when
 /// the extent outgrows a 32-bit launch, because a clamped grid would leave
 /// the tail unwritten.
@@ -98,6 +106,10 @@ fn rms_row(
         )?,
     )?;
     let launch = rows_per_head(op, y.rows, y.width, per_head_dim)?;
+    // How many blocks stand in one token row. The PER-HEAD launch flattens
+    // `rows x heads` into `blockIdx.x`; the whole-row launch is the same
+    // flattening with one head, which is why the kernel needs no second arm.
+    let heads = stated(op, per_head_split(y.width, per_head_dim))?;
     ctx.fire(
         op,
         Fire::at(
@@ -115,6 +127,13 @@ fn rms_row(
             hidden.arg(),
             hidden.arg(),
             eps.arg(),
+            heads.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // A PER-HEAD launch flattens `rows x heads` into `blockIdx.x`, and
+            // the kernel divides by `heads` to find the row again, so this
+            // seat is unconditional too.
+            ctx.stage(),
         ],
     )
 }
@@ -215,6 +234,7 @@ pub fn rmsnorm_no_scale(
         )?,
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
+    let heads = stated(OP, per_head_split(y.width, head_dim))?;
     ctx.fire(
         OP,
         Fire::at(
@@ -222,7 +242,19 @@ pub fn rmsnorm_no_scale(
             symbol(&format!("::pie::elemwise::rmsnorm_no_scale<{t}, 256>")),
         )
         .apply(launch),
-        &[x.arg(), y.arg(), hidden.arg(), eps.arg()],
+        &[
+            x.arg(),
+            y.arg(),
+            hidden.arg(),
+            eps.arg(),
+            heads.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // A PER-HEAD launch flattens `rows x heads` into `blockIdx.x`, and
+            // the kernel divides by `heads` to find the row again, so this
+            // seat is unconditional too.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -251,6 +283,7 @@ pub fn rmsnorm_gated(
         )?,
     )?;
     let launch = rows_per_head(OP, y.rows, y.width, head_dim)?;
+    let heads = stated(OP, per_head_split(y.width, head_dim))?;
     ctx.fire(
         OP,
         Fire::at(
@@ -266,6 +299,13 @@ pub fn rmsnorm_gated(
             hidden.arg(),
             eps.arg(),
             i32::from(sigmoid_gate).arg(),
+            heads.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            // A PER-HEAD launch flattens `rows x heads` into `blockIdx.x`, and
+            // the kernel divides by `heads` to find the row again, so this
+            // seat is unconditional too.
+            ctx.stage(),
         ],
     )
 }
@@ -312,6 +352,9 @@ pub fn rmsnorm_grouped_plus_one(
             stated(OP, group)?.arg(),
             stated(OP, groups)?.arg(),
             eps.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -366,6 +409,9 @@ pub fn rmsnorm_gated_by(
             stated(OP, heads)?.arg(),
             stated(OP, d)?.arg(),
             eps.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -378,7 +424,18 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::elemwise::residual_add<{t}>"))).apply(launch),
-        &[y.arg(), x.arg(), n.arg()],
+        &[
+            y.arg(),
+            x.arg(),
+            n.arg(),
+            // The element-form seat's width: this launch is flat over
+            // `rows * width`, so the kernel needs the row's width to read the
+            // staged row count and row start as elements.
+            stated(OP, y.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -392,7 +449,14 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> 
         OP,
         Fire::at(FILE, symbol(&format!("::pie::elemwise::add_bias<{t}>")))
             .apply(route_rows(out.rows, out.width)),
-        &[out.arg(), bias.arg(), width.arg()],
+        &[
+            out.arg(),
+            bias.arg(),
+            width.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -405,7 +469,18 @@ pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::elemwise::silu_scaled<{t}>"))).apply(launch),
-        &[x.arg(), s.arg(), n.arg()],
+        &[
+            x.arg(),
+            s.arg(),
+            n.arg(),
+            // The element-form seat's width: this launch is flat over
+            // `rows * width`, so the kernel needs the row's width to read the
+            // staged row count and row start as elements.
+            stated(OP, x.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -416,7 +491,18 @@ pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::elemwise::mul_scalar<{t}>"))).apply(launch),
-        &[x.arg(), s.arg(), n.arg()],
+        &[
+            x.arg(),
+            s.arg(),
+            n.arg(),
+            // The element-form seat's width: this launch is flat over
+            // `rows * width`, so the kernel needs the row's width to read the
+            // staged row count and row start as elements.
+            stated(OP, x.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 
@@ -428,7 +514,18 @@ pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
     ctx.fire(
         OP,
         Fire::at(FILE, symbol(&format!("::pie::elemwise::scale<{t}>"))).apply(launch),
-        &[x.arg(), s.arg(), n.arg()],
+        &[
+            x.arg(),
+            s.arg(),
+            n.arg(),
+            // The element-form seat's width: this launch is flat over
+            // `rows * width`, so the kernel needs the row's width to read the
+            // staged row count and row start as elements.
+            stated(OP, x.width)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
+        ],
     )
 }
 

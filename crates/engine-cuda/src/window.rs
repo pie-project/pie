@@ -121,6 +121,103 @@
 //! Grouped → 1 window:     (3,11), segments [(0,4), (6,5)], one launch
 //! ```
 //!
+//! # And the live-rows seat, which is a window fact on a different index
+//!
+//! A recorded graph is carved at a bucket, and a replay of it that means to
+//! serve fewer rows than it was carved at cannot say so in a node parameter —
+//! the parameters are baked. The bodies design's answer is a device word per
+//! launch that the kernels READ (`kernels_cuda::Ctx::arm_stage`, and the
+//! `if (win != nullptr && r >= win[0]) return;` every supporting entry
+//! carries), and this table is where its host side lives, because the number
+//! it holds is a WINDOW's row count and nothing else here knows one.
+//!
+//! **INDEXED BY REGION, NOT BY WINDOW**, which is why it is [`Windows::live`]
+//! and not another vector inside [`Windows::packed`]. The packed blob is one
+//! entry per DISTINCT window — deduplicated — and the seat's address has to be
+//! a multiplication from the cursor's two `u32`s ([`Windows::live_at`]). Two
+//! indices, two carves, one traversal each. Both are laid at a FIXED STRIDE
+//! now, and for one reason ([`Slots`]).
+//!
+//! The value every window contributes is its FULL row count, so a launch that
+//! reads it admits every row it was already going to run: arming the seat is
+//! arithmetically the identity, and the fire path stages nothing into it until
+//! a caller means something else by it.
+//!
+//! **AND THE SEAT IS FOUR WORDS, TWO PER AXIS** (the chunked-arm wave):
+//! `[rows, row_offset, lanes, lane_offset]`. Words 0 and 1 are the row axis
+//! and mean exactly what they always meant, which is why they stay first —
+//! every guard shipped reads `win[0]` and every shift `win[1]`, and a seat
+//! that moved either would turn a correct kernel into a wrong one without
+//! touching it. Words 2 and 3 are their LANE twins, read only by a kernel
+//! whose grid counts requests rather than rows: `win[2]` retires the lanes a
+//! ceiling grid padded in, and `win[3]` turns a window request number into a
+//! FIRE lane for the tables a body may not bake a slice of. A kernel that
+//! reads neither is unaffected by their existence, which is what makes the
+//! widening free.
+//!
+//! # And why the packed blob is laid out at a fixed stride
+//!
+//! **A BODY BAKES THESE ADDRESSES, SO THE LAYOUT HAS TO BE A FUNCTION OF THE
+//! KEY AND NOT OF THE FIRE.** A recorded body is captured once and replayed
+//! for every fire that keys to it (`record::BodyKey`: the bucket and which
+//! classes have rows — and NOT the per-class counts). Two
+//! consumers bake a window's device address into a graph node: a seated pie
+//! kernel takes its window's `indptr` pointer as a launch argument, and
+//! `Cursor::count_of` hands the same pointer to a conditional setter. If a
+//! window's address were `base + Σ_{j<i} (that fire's j-th window's words)`,
+//! only slot 0 would survive a replay — the lane counts move between fires of
+//! one key, so every slot behind the first would name somebody else's CSR.
+//!
+//! So a slot's address is `base + slot * stride`, where the stride is the
+//! CEILING one slot can ever need — `max_lanes + 1 + 2 * max_segs` — and the
+//! per-window vectors are laid at their slot's own offset with the tail of the
+//! slot left as padding. **THE PADDING IS BYTES THAT ALREADY EXISTED**:
+//! `Inputs::reserve` has always carved the blob at `slots × that same
+//! ceiling`, because the carve is a reserve and a reserve cannot measure a
+//! fire it has not seen. [`Slots`] is that arithmetic, written once and read
+//! by both halves, so the carve cannot become a ceiling the layout disagrees
+//! with.
+//!
+//! And the SLOT itself is a function of the key: [`seat`] deduplicates on the
+//! window's span, and within one `BodyKey` two masks have equal spans in one
+//! fire exactly when they have equal spans in every fire of that key — the
+//! argument is at [`seat`], and the two host tests at the bottom of this file
+//! pin both halves.
+//!
+//! # And which regions of a fire a body may HOLD (tier 2)
+//!
+//! Everything above is the shell's answer to "what does this launch run
+//! over". [`Windows::admits`] is the one question `record.rs` asks of that
+//! answer: per template region, may a captured graph hold this region's
+//! launches, or must the body re-issue them ([`Admit`])? The clauses are the
+//! ones this header already argued — a gathered window is numbered from a
+//! scratch slab's own zero, a grouped one's span is a union with foreign rows
+//! in the gaps, and a windowed one whose ops do not all read the seat's
+//! `start` wants a pointer the host advanced — and what tier 2 changed is
+//! only what a caller SPENDS them on. A region the rule refuses is an
+//! ISLAND, not a refused composition: `record::cuts` cuts the template into
+//! maximal runs of one answer, the captured stretches become execs and the
+//! islands are walked eagerly between them.
+//!
+//! **AND WHAT A CALLER SPENDS IS THIS TABLE WIDENED** (`record::widen`).
+//! Some cuts are not legal — a boundary inside a fork group, one between two
+//! arms of a conditional, a schedule on the far side of one from its readers
+//! — and the answer to an illegal boundary is to GROW the island until it is
+//! legal, never to refuse the composition. That is a pure function of this
+//! table and of the template, so everything this header claims about the
+//! table being a function of the `record::BodyKey` survives it, and the
+//! shell derives it exactly once per key (`Shell::segmentation`) so the
+//! `Run`, the capture loop and the cut script cannot read different
+//! answers.
+//!
+//! Which makes one property of this table load-bearing, and it is argued in
+//! full at [`Windows::admits`]: **every entry is a function of the
+//! `record::BodyKey`** — the present SET and the BUCKET — because a body is
+//! captured once and every fire of its key replays the same script. The
+//! shell memoizes the table per key on that argument (`Shell::segments`), and
+//! `record::Graphs::fire_body` asserts the island list on every hit rather
+//! than believing it.
+//!
 //! # How a `Run` learns which region it is in
 //!
 //! `Dispatch::exec` takes a `&Node` and the walk's signature is fixed
@@ -130,6 +227,16 @@
 //! counts regions into an [`At`] the `Run` also holds a shared reference to,
 //! and writes the run index beside it for the same reason and at the same
 //! instant. No signature moves, and the state involved is two `u32`s.
+//!
+//! **AND "EVERY REGION, IN ORDER" IS LITERAL, WHICH IS WHAT MAKES A SEGMENTED
+//! CAPTURE WORK.** `model_exec::fire::walk` filters DISPATCH and never
+//! structure, so a pass restricted to one segment still announces every
+//! region to this cursor — every stream switch, every event record, every
+//! event wait. So a region's number means one thing in every pass of one
+//! fire (this cursor's whole contract), and every fork pair a segment's
+//! capture states is MATCHED, which is the condition
+//! `cudaStreamEndCapture` will not finish a graph without
+//! (`record::walk_capture_cut` states the cost of it).
 //!
 //! [`Run`]: crate::run::Run
 
@@ -155,6 +262,24 @@ use crate::store::kv::Geometry;
 /// `[lanes + 1]` entries, the first of them 0 — device-side for the launches
 /// and host-side for the plan builders that walk the contents (the duality
 /// [`CachePlanning`](crate::run::CachePlanning) states per cache space).
+///
+/// **AND A WINDOW HAS A SECOND READING OF THOSE SAME BOUNDARIES, WHICH IS NOT
+/// HERE** (bodies design, chunk 2c-a). The vectors above are rebased because
+/// the pointer beside them is the WINDOW's first row. A region on
+/// [`crate::SHIFTED`] under a body is handed the PLANE's base instead
+/// (`Run::cut`, `Run::plane_base`), and a CSR counting from the window's zero
+/// beside a pointer counting from the plane's would address rows the launch
+/// does not own. That reading is one fire-wide `[lanes + 1]` vector
+/// ([`Windows::qo_absolute`]) and it goes over WHOLE:
+/// `Run::qo_indptr_absolute` hands back the base and cuts nothing — not even
+/// by lane, because a body BAKES that pointer and `lane_offset` moves between
+/// fires of one key, so a sliced absolute reading would be stale on every
+/// replay but its recording one. Which entries are a launch's requests is the
+/// SCHEDULE's business, not the pointer's.
+///
+/// Which consumer takes which: every seated pie kernel, `Cursor::count_of`
+/// and both plan builders take the REBASED pair below; the FA2 params' q axis
+/// takes the absolute one, and only where its region moves its own plane.
 #[derive(Debug, Clone)]
 pub struct Window {
     /// The rows and lanes this window covers, in fire coordinates.
@@ -336,6 +461,78 @@ impl Copies<'_> {
     }
 }
 
+/// **THE FIXED CARVE THE PACKED WINDOW BLOB IS LAID OUT IN** — one slot per
+/// distinct window, every slot the same width, and the gathered payloads
+/// behind all of them.
+///
+/// **ONE ARITHMETIC, TWO READERS.** [`Inputs::reserve`](crate::inputs::Inputs::reserve)
+/// carves the blob's bytes from this object and [`Windows::packed`] /
+/// [`Windows::bind`] place the vectors inside it from the same object, so the
+/// reserve cannot become a ceiling the layout disagrees with. That is the
+/// whole reason it is a type rather than two expressions that happen to
+/// match.
+///
+/// **AND THE STRIDE IS THE CEILING THE RESERVE WAS ALREADY PAYING.** A window
+/// slot holds a rebased `[lanes + 1]` boundary vector and a `[segs][2]`
+/// segment list; the most either can ever be is the budget's lane count and
+/// the artifact's own `model_exec::fire::max_runs`, and the reserve has always
+/// multiplied that ceiling by the slot count because a reserve cannot measure
+/// a fire it has not seen. Laying each slot AT that ceiling therefore costs no
+/// device byte that was not already carved — it spends the padding the reserve
+/// bought — and buys the one thing a recorded body needs: an address that is a
+/// function of the slot and not of the fire (this file's header argues why).
+///
+/// **SLOT COUNT.** `k` classes give at most `k(k+1)/2` contiguous runs of the
+/// class order plus the zero window every empty region shares, and a GATHERED
+/// window is a slot beyond those — [`seat`] deliberately does not dedupe one
+/// against a plain window of the same extent — so the count is
+/// `k(k+1)/2 + 1 + fragmentable`. A fire that somehow wanted more is refused
+/// by `Inputs::write_host`'s ceiling with a named fault rather than writing
+/// past the carve.
+///
+/// `Slots::default()` is the empty carve, and only the derived
+/// [`Windows::default`] mints one — every table a fire walks is handed the
+/// load's, from [`Inputs::window_slots`](crate::inputs::Inputs::window_slots).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Slots {
+    /// Words per slot: `max_lanes + 1 + 2 * max_segs`.
+    stride: u64,
+    /// How many slots the carve holds.
+    slots: u64,
+}
+
+impl Slots {
+    /// The carve for one load: `classes` from the artifact's class table,
+    /// `lanes` from the budget, `segs` from `model_exec::fire::max_runs` and
+    /// `gathered` from `model_exec::fire::fragmentable`.
+    #[must_use]
+    pub fn new(classes: usize, lanes: u64, segs: u32, gathered: usize) -> Slots {
+        Slots {
+            stride: lanes + 1 + 2 * u64::from(segs.max(1)),
+            slots: (classes * (classes + 1) / 2 + 1 + gathered) as u64,
+        }
+    }
+
+    /// Words per slot.
+    #[must_use]
+    pub fn stride(&self) -> u64 {
+        self.stride
+    }
+
+    /// How many `i32`s the fixed slot region occupies — where the gathered
+    /// payloads begin.
+    #[must_use]
+    pub fn tail(&self) -> u64 {
+        self.slots * self.stride
+    }
+
+    /// The word offset of one slot's vectors, from the blob's base.
+    #[must_use]
+    pub fn at(&self, slot: usize) -> u64 {
+        slot as u64 * self.stride
+    }
+}
+
 /// Every region's windows, deduplicated.
 ///
 /// Deduplicated because a plan has hundreds of regions and at most a handful
@@ -358,6 +555,87 @@ pub struct Windows {
     runs: Vec<u32>,
     /// Region index → `(where its runs start, how many)`.
     of_region: Vec<(u32, u32)>,
+    /// **THE CARVE [`packed`](Windows::packed) LAYS ITSELF OUT IN** — the load's,
+    /// handed down from `Inputs::reserve` so that the blob's offsets and the
+    /// blob's bytes are the one arithmetic ([`Slots`]).
+    slots: Slots,
+
+    /// **THE LIVE-ROWS SEAT'S HOST SIDE**: FOUR `u32` per (REGION ORDINAL,
+    /// run), flat at `4 * (region * max_runs() + run)`, holding that launch's
+    /// full geometry — `[rows, row_offset, lanes, lane_offset]`.
+    ///
+    /// **NOT PART OF [`packed`](Windows::packed), AND THE INDEX IS THE WHOLE
+    /// REASON.** The packed blob is one vector per DISTINCT window — [`seat`]
+    /// deduplicates, so two regions with the same span share one boundary
+    /// vector and the blob is addressed by SLOT. The seat is addressed by
+    /// REGION: an address stamped onto a context per region has to be
+    /// reachable by a multiplication from the region ordinal, and a
+    /// deduplicated table has no such multiplication. Two indices, so two
+    /// vectors — both at a fixed stride, for the one reason this file's header
+    /// gives.
+    ///
+    /// **AND THE VALUE IS THE IDENTITY.** A window's full row count is the
+    /// number that admits every row the launch already runs over, so a kernel
+    /// reading `r >= win[0]` off it retires nothing — and the same holds one
+    /// axis over, where `win[2]` is the window's own lane count. That is
+    /// deliberate: the seat is built so that arming it changes no arithmetic,
+    /// and only a caller that means to serve fewer rows than the graph was
+    /// carved at writes anything else here.
+    ///
+    /// **AND THE CEILINGS DO NOT TOUCH THESE FOUR WORDS, WHICH WAS WORTH
+    /// SAYING RATHER THAN ASSUMING.** The ceiling design's Option B carves a
+    /// windowed class's SCHEDULE at the key's rungs — its rows, its lanes and
+    /// the reach in front of it — and every one of those numbers rides the
+    /// plan payload. What is written here stays the FIRE's own four, because
+    /// that is what the word means on this side of the seam: the capture is
+    /// made over the window's live grid and the seat is what a later, smaller
+    /// fire retires it to. A seat that held a ceiling would be a launch told
+    /// to run rows no fire brought, which is the exact inversion of what it
+    /// is for.
+    live_words: Vec<u32>,
+    /// The stride [`live_words`](Windows::live_words) is addressed at —
+    /// [`max_runs`](Windows::max_runs), held rather than recomputed because
+    /// [`live_at`](Windows::live_at) is asked once per DISPATCHED NODE and
+    /// `max_runs` is a scan of every region.
+    live_stride: u32,
+    /// Where [`live`](Windows::live) landed on the device, or `0` for a fire
+    /// that staged none — [`bind_live`](Windows::bind_live) is what sets it,
+    /// and `0` is the disarmed seat `kernels_cuda::Ctx::stage` answers
+    /// `ArgValue::ABSENT` for.
+    live_base: u64,
+
+    /// **THE FIRE'S QO BOUNDARIES, UN-REBASED** — `[lanes + 1]`, exactly the
+    /// vector [`Windows::of`] was handed and each window's own copy was
+    /// rebased out of.
+    ///
+    /// Kept whole and kept ONCE, because there is nothing per-window about it:
+    /// the DEVICE reading is the whole vector at the fire's own base, and the
+    /// only lane slice anybody takes is a HOST one
+    /// (`Run::qo_indptr_absolute_host`), read by the fire that made it and
+    /// baked into nothing. [`qo_absolute`](Windows::qo_absolute) and
+    /// [`qo_absolute_host`](Windows::qo_absolute_host) are the two sides.
+    qo_absolute_host: Vec<i32>,
+    /// Where [`qo_absolute_host`](Windows::qo_absolute_host) landed on the
+    /// device, or `0` for a fire that staged none —
+    /// [`bind_qo_absolute`](Windows::bind_qo_absolute) sets it, and `0` is the
+    /// unbound reading that answers `None` rather than an address past a
+    /// carve nobody wrote.
+    qo_absolute_base: u64,
+    /// **HOW MANY LANES THE STAGED READING OF THAT VECTOR COVERS**, or `0`
+    /// for "exactly the ones [`qo_absolute_host`](Windows::qo_absolute_host)
+    /// holds" — which is every fire but a bodied one.
+    ///
+    /// A bodied fire stages a COPY padded out to the key's ladder reach
+    /// (`serve::prepare` step 4d), so the device vector reaches further than
+    /// the table's own; and since the decode ceiling
+    /// (`Run::planning`) a schedule may be carved at that far, which makes a
+    /// launch's `q_indptr` a vector with `ceiling + 1` bounds in it. The
+    /// table is the one place that states this vector's SHAPE
+    /// ([`Handles::qo_absolute`](crate::inputs::Handles::qo_absolute) is a
+    /// bare base for that reason), so the shell tells it what it staged
+    /// ([`stage_qo_absolute`](Windows::stage_qo_absolute)) and
+    /// [`qo_absolute`](Windows::qo_absolute) dresses the wider reading.
+    qo_absolute_lanes: u32,
 }
 
 /// Is this region's work something the copy path can actually serve?
@@ -477,6 +755,11 @@ impl Windows {
     /// slow path, and is served here as `Fallback::Split { r }` — or, where
     /// `copies` says this fire's bucket asks for a copy and the region's
     /// operands admit one, as a single [`Gathered`] window.
+    /// `slots` is the load's window carve, from
+    /// [`Inputs::window_slots`](crate::inputs::Inputs::window_slots) — the
+    /// same object the blob's BYTES were reserved from, so that
+    /// [`packed`](Windows::packed) lays a slot exactly where the reserve put
+    /// one.
     pub fn of(
         trace: &Trace,
         compiled: &CompiledModel,
@@ -484,6 +767,7 @@ impl Windows {
         patches: &WindowTable,
         indptr_host: &[i32],
         copies: Copies<'_>,
+        slots: Slots,
     ) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
         let mut runs: Vec<u32> = Vec::with_capacity(compiled.template().len());
@@ -629,11 +913,60 @@ impl Windows {
             }
         }
 
-        Ok(Windows {
+        let mut table = Windows {
             windows,
             runs,
             of_region,
-        })
+            slots,
+            live_words: Vec::new(),
+            live_stride: 0,
+            live_base: 0,
+            // **THE SAME VECTOR THE REBASE WAS TAKEN OUT OF, KEPT.** Every
+            // window above subtracted its own first bound off a slice of this;
+            // the second reading is that slice with the subtraction left out,
+            // so holding the source is the whole of what it costs.
+            qo_absolute_host: indptr_host.to_vec(),
+            qo_absolute_base: 0,
+            qo_absolute_lanes: 0,
+        };
+        // **THE LIVE-GEOMETRY SEAT, FILLED WITH THE IDENTITY.** FOUR words per
+        // (region, run) at the stride [`Windows::live_at`] multiplies by, and
+        // the ORDER IS A CONTRACT: word 0 is the window's row COUNT, word 1 its
+        // row START, word 2 its LANE count and word 3 its LANE start. Count
+        // first, because the device guards shipped ahead of this seat read
+        // `win[0]` as "how many rows are live" and a seat that put the start
+        // there would turn every guard into a wrong one; start second, read
+        // only by an entry that has learned to address a plane from its base
+        // rather than from a pre-shifted pointer.
+        //
+        // **AND THE LANE PAIR IS SECOND, NOT INTERLEAVED, FOR THE SAME
+        // REASON.** Words 0 and 1 mean today exactly what they meant when the
+        // seat held nothing else, so every kernel already reading them is
+        // untouched by the widening; a kernel whose grid counts REQUESTS reads
+        // 2 and 3 instead — `win[2]` retires the lanes a ceiling grid padded
+        // in, and `win[3]` turns this window's request number into a fire lane
+        // for the tables a body may not bake a slice of (`Run::recurrent_absolute`).
+        // Filled with the identity on both axes — the counts are the window's
+        // own and the starts its own offsets — so a kernel that reads the seat
+        // admits exactly the work the launch was already going to do. Built
+        // here, beside the windows it is read off, and staged only by a caller
+        // that asks for it (`inputs::Fire::live`).
+        let stride = table.max_runs();
+        let wide = stride as usize;
+        let mut live = vec![0u32; table.of_region.len() * wide * 4];
+        for region in 0..table.of_region.len() as u32 {
+            for run in 0..table.runs(region) {
+                let span = table.at(region, run).span;
+                let seat = 4 * (region as usize * wide + run as usize);
+                live[seat] = span.rows;
+                live[seat + 1] = span.row_offset;
+                live[seat + 2] = span.lanes;
+                live[seat + 3] = span.lane_offset;
+            }
+        }
+        table.live_words = live;
+        table.live_stride = stride;
+        Ok(table)
     }
 
     /// How many distinct windows this fire has.
@@ -648,21 +981,83 @@ impl Windows {
         self.windows.is_empty()
     }
 
-    /// Every window's `i32` vectors, end to end — what the shell stages in
-    /// one copy.
+    /// Every window's `i32` vectors, at their slot's own offset — what the
+    /// shell stages in one copy.
     ///
-    /// **ONE BLOB, AND [`bind`](Windows::bind) WALKS IT IN THE SAME ORDER.**
-    /// A window contributes its rebased boundaries; a GATHERED one
-    /// contributes its row map and its per-space pool tables behind them.
-    /// The two functions are written as one traversal in two directions for
-    /// exactly the reason the copy's own two halves are: an order that could
+    /// **SLOT `i` STARTS AT `i * stride` AND NOT WHERE SLOT `i-1` ENDED**, and
+    /// the tail of each slot is padding. That is the H2 fix and this file's
+    /// header carries the whole of it: a body bakes a window's `indptr`
+    /// pointer into a graph node, the lane counts move between fires of one
+    /// `record::BodyKey`, and a tightly packed blob therefore has exactly one
+    /// address — slot 0's — that survives a replay. At a fixed stride every
+    /// slot's address is `base + slot * stride`, which is a function of the
+    /// KEY. The bytes are not new: [`Slots`] is the ceiling `Inputs::reserve`
+    /// has always multiplied by the slot count.
+    ///
+    /// A GATHERED window's payload — its row map and its per-space pool
+    /// tables — rides BEHIND every slot, packed tight from [`Slots::tail`],
+    /// because a gathered region is refused a body outright
+    /// ([`covers_fire`](Windows::covers_fire): its rows were compacted into a
+    /// plane of their own and no seat word names them), so nothing bakes those
+    /// addresses and the reserve pays them per fragmentable mask rather than
+    /// per slot.
+    ///
+    /// **AND [`bind`](Windows::bind) WALKS THE SAME OFFSETS.** The two
+    /// functions are written as one traversal in two directions for exactly
+    /// the reason the copy's own two halves are: an arithmetic that could
     /// drift is an address that could point at another window's vector.
+    ///
+    /// **THE FIXED SLOT REGION IS STAGED WHOLE, TAIL AND ALL** — which it was
+    /// not until the grid-at-ceiling wave, and the reason it is now is that a
+    /// slot's tail acquired a reader. The four chunked recurrent arms count
+    /// their requests off the LENGTH of the boundary vector they are handed,
+    /// so a bodied fire declares that vector out to the key's lane ceiling
+    /// (`Run::ragged_lanes`) — and while the words past `[lanes + 1]` are
+    /// never dereferenced (`win[2]` retires those requests before the kernel
+    /// reads the CSR), a vector whose declared bytes were last fire's is a
+    /// promise this table should not be making. Zeroing them costs
+    /// `slots * stride` `i32`s of H2D — a few hundred bytes on any bake — and
+    /// buys the wider reading a defined tail. The GATHERED payloads behind
+    /// [`Slots::tail`] are still cut off after their last written word, for
+    /// the reason the whole blob used to be: nothing declares a length into
+    /// them.
     #[must_use]
     pub fn packed(&self) -> Vec<i32> {
         let mut out: Vec<i32> = Vec::new();
-        for window in &self.windows {
+        // Each slot is opened by padding out to its own offset. The windows
+        // are walked in slot order, so `resize` only ever grows.
+        let open = |out: &mut Vec<i32>, at: u64| {
+            let at = at as usize;
+            debug_assert!(out.len() <= at, "a window overran its slot's stride");
+            // GROW ONLY. A table past its carve is a `Fault::Ceiling` at
+            // `Inputs::write_host`, and a truncation here would be that fault
+            // served as silently wrong bytes instead.
+            if out.len() < at {
+                out.resize(at, 0);
+            }
+        };
+        for (slot, window) in self.windows.iter().enumerate() {
+            open(&mut out, self.slots.at(slot));
             out.extend_from_slice(&window.indptr_host);
             out.extend_from_slice(&window.segments_host);
+        }
+        // **THE INVARIANT THE RESERVE AND THIS LAYOUT SHARE**: a slot holds a
+        // `[lanes + 1]` boundary vector and a `[segs][2]` segment list, and
+        // `Slots::stride` is the load's ceiling on exactly that sum. A fire
+        // past it would be a fire past `Inputs::reserve`'s own carve, which
+        // `Inputs::write_host` refuses by name.
+        debug_assert!(
+            self.windows.iter().enumerate().all(|(slot, window)| {
+                let words = (window.indptr_host.len() + window.segments_host.len()) as u64;
+                words <= self.slots.stride() && self.slots.at(slot) < self.slots.tail()
+            }),
+            "the packed window layout does not fit the carve it was reserved in",
+        );
+        // Unconditional since the grid-at-ceiling wave — see this function's
+        // own note. It was `if any window gathered`, because the gathered
+        // payloads are what used to need the fixed region closed behind them.
+        open(&mut out, self.slots.tail());
+        for window in &self.windows {
             let Some(gathered) = &window.gathered else {
                 continue;
             };
@@ -679,30 +1074,176 @@ impl Windows {
 
     /// Seat the staged vectors: `base` is where [`packed`](Windows::packed)
     /// landed on the device.
+    ///
+    /// The offsets are [`packed`](Windows::packed)'s, arrived at the same way
+    /// — slot by slot at the fixed stride, then the gathered payloads behind
+    /// the slots.
     pub fn bind(&mut self, base: u64) {
-        let mut at = base;
+        let slots = self.slots;
         // `cols` because a segment list is `[segs][2]` where every other
         // staged vector is `[n][1]`; the byte stride is the same and only the
         // shape the consumer reads it at differs.
-        let mut take = |entries: usize, cols: u32| {
-            let here = at;
-            at += entries as u64 * 4;
+        let take = |at: &mut u64, entries: usize, cols: u32| {
+            let here = *at;
+            *at += entries as u64 * 4;
             Tensor::new(here, entries as u32 / cols.max(1), cols, Dtype::I32)
         };
+        for (slot, window) in self.windows.iter_mut().enumerate() {
+            // **THE SLOT'S OWN OFFSET, NOT WHERE THE LAST ONE ENDED.**
+            let mut at = base + slots.at(slot) * 4;
+            window.indptr = take(&mut at, window.indptr_host.len(), 1);
+            window.segments = take(&mut at, window.segments_host.len(), 2);
+        }
+        let mut at = base + slots.tail() * 4;
         for window in &mut self.windows {
-            window.indptr = take(window.indptr_host.len(), 1);
-            window.segments = take(window.segments_host.len(), 2);
             let Some(gathered) = &mut window.gathered else {
                 continue;
             };
-            gathered.rows = take(gathered.rows_host.len(), 1);
+            gathered.rows = take(&mut at, gathered.rows_host.len(), 1);
             for space in &mut gathered.spaces {
-                space.page_indptr = take(space.page_indptr_host.len(), 1);
-                space.page_indices = take(space.page_indices_host.len(), 1);
-                space.last_page_lens = take(space.last_page_lens_host.len(), 1);
-                space.kv_len = take(space.kv_len_host.len(), 1);
+                space.page_indptr = take(&mut at, space.page_indptr_host.len(), 1);
+                space.page_indices = take(&mut at, space.page_indices_host.len(), 1);
+                space.last_page_lens = take(&mut at, space.last_page_lens_host.len(), 1);
+                space.kv_len = take(&mut at, space.kv_len_host.len(), 1);
             }
         }
+    }
+
+    /// The carve this table lays its packed blob out in — what a caller that
+    /// wants a window's offset without a device base asks.
+    #[must_use]
+    pub fn slots(&self) -> Slots {
+        self.slots
+    }
+
+    /// The live-rows seat's words, in the order [`live_at`](Windows::live_at)
+    /// addresses them — four per (region, run), `[rows, row_offset, lanes,
+    /// lane_offset]` — what a shell that means to stage the seat hands
+    /// `inputs::Fire::live`.
+    ///
+    /// A SECOND BLOB AND NOT A TAIL OF [`packed`](Windows::packed), and the
+    /// index is the reason: this one is addressed by region ordinal and that
+    /// one by deduplicated window slot.
+    #[must_use]
+    pub fn live(&self) -> &[u32] {
+        &self.live_words
+    }
+
+    /// Seat the live-rows words: `base` is where [`live`](Windows::live)
+    /// landed on the device, or `None` for a fire that staged none.
+    ///
+    /// Separate from [`bind`](Windows::bind) because it seats a separate
+    /// carve — `bind` walks one packed blob in `packed`'s own order, and a
+    /// second base threaded through that traversal would be a cursor with
+    /// nothing to do.
+    pub fn bind_live(&mut self, base: Option<u64>) {
+        self.live_base = base.unwrap_or(0);
+    }
+
+    /// The fire's qo boundaries with nothing subtracted, host side — what a
+    /// shell that means to stage the second reading stages, and what a
+    /// window's lane slice of that reading is taken out of.
+    ///
+    /// **THIS VECTOR IS THE FIRE'S OWN LANES AND STAYS THEM.** What the shell
+    /// hands `inputs::Fire::qo_absolute` on the bodies path is a COPY padded
+    /// out to the key's LADDER REACH (`serve::prepare` step 4d): the
+    /// device tail is what a ceiling plan will read, and this vector is what
+    /// every window's rebased slice was cut from and what
+    /// `Run::qo_indptr_absolute_host` slices — so the padded BYTES belong to
+    /// the staging and not to the table. What the table does keep is the
+    /// padded LENGTH ([`qo_absolute_lanes`](Windows::qo_absolute_lanes)),
+    /// because the shape of the device reading is this table's to state and
+    /// a ceiling-carved schedule reads out to that lane. So this vector
+    /// stays `[fire lanes + 1]` — it is what tells `Run::planning` how many
+    /// lanes the fire actually brought — and
+    /// [`qo_absolute`](Windows::qo_absolute)'s rectangle is the wider one.
+    #[must_use]
+    pub fn qo_absolute_host(&self) -> &[i32] {
+        &self.qo_absolute_host
+    }
+
+    /// Seat that vector: `base` is where
+    /// [`qo_absolute_host`](Windows::qo_absolute_host) landed on the device,
+    /// or `None` for a fire that staged none.
+    ///
+    /// Its own call for [`bind_live`](Windows::bind_live)'s reason — a third
+    /// carve is a third base, and threading one through `bind`'s slot walk
+    /// would be a cursor with nothing to advance.
+    pub fn bind_qo_absolute(&mut self, base: Option<u64>) {
+        self.qo_absolute_base = base.unwrap_or(0);
+    }
+
+    /// **AND HOW MANY LANES OF IT WENT OVER** — the key's ladder reach on the
+    /// bodies path, and never asked at all on any other, where the staged
+    /// vector is the table's own.
+    ///
+    /// Its own call rather than an argument to
+    /// [`bind_qo_absolute`](Windows::bind_qo_absolute) because the two facts
+    /// are known at two instants: the padding is decided in `prepare`, beside
+    /// the lane tables it pads with, and the base is not known until the
+    /// staging slot has committed. Never shrinks, for
+    /// `model_exec::store::kv::Geometry::pad_to`'s reason — the vector the
+    /// shell staged is this table's own vector plus a tail.
+    pub fn stage_qo_absolute(&mut self, lanes: u32) {
+        self.qo_absolute_lanes = self.qo_absolute_lanes.max(lanes);
+    }
+
+    /// **THE WHOLE FIRE'S BOUNDARIES, ABSOLUTE**, or `None` for a fire that
+    /// staged none — and WHOLE is the contract rather than a convenience.
+    /// `Run::qo_indptr_absolute` hands this straight to a launch without
+    /// cutting it: a body bakes the pointer, this fire's LIVE `lane_offset`
+    /// is not a function of a `record::BodyKey` (the ladder fixes a bound on
+    /// it, not the number), and a sliced absolute vector would therefore be
+    /// stale on every replay but its recording one. The fire's own base is the
+    /// only address that holds.
+    ///
+    /// `[fire lanes + 1]` rows of one `i32` column, or `[ceiling + 1]` for a
+    /// bodied fire that padded it (see
+    /// [`qo_absolute_lanes`](Windows::qo_absolute_lanes)).
+    #[must_use]
+    pub fn qo_absolute(&self) -> Option<Tensor> {
+        if self.qo_absolute_base == 0 || self.qo_absolute_host.is_empty() {
+            return None;
+        }
+        Some(Tensor::new(
+            self.qo_absolute_base,
+            // **AT WHAT WAS STAGED, WHICH IS THE TABLE'S OWN LENGTH UNTIL A
+            // BODIED FIRE PADS IT** — see
+            // [`qo_absolute_lanes`](Windows::qo_absolute_lanes). A launch
+            // whose schedule was carved at the key's lane ceiling reads
+            // `q_indptr` out to that lane, and `kernels_cuda::attn`'s door
+            // (`lanes_carry`) refuses a vector that does not say it reaches
+            // there.
+            (self.qo_absolute_lanes + 1).max(self.qo_absolute_host.len() as u32),
+            1,
+            Dtype::I32,
+        ))
+    }
+
+    /// **THE ADDRESS OF ONE (REGION, RUN)'S LIVE-GEOMETRY WORDS** — its
+    /// `[rows, row_offset, lanes, lane_offset]`, in that order — or `0` for a
+    /// fire that bound no seat.
+    ///
+    /// A multiplication and not a lookup: `live_base + 16 * (region *
+    /// max_runs + run)`. That is what lets [`Run::ctx`](crate::run::Run) stamp
+    /// it onto a context with the walk's cursor already on the node — the
+    /// cursor holds two `u32`s and this turns them into an address without
+    /// consulting the deduplicated window table.
+    ///
+    /// `0` is the disarmed seat, and it is the same `0` `Ctx::stage` answers
+    /// `ArgValue::ABSENT` with — so an unbound fire's launches take the null
+    /// pointer they have always taken. A region or run this table does not
+    /// hold answers `0` for the same reason rather than an address past the
+    /// carve.
+    #[must_use]
+    pub fn live_at(&self, region: u32, run: u32) -> u64 {
+        if self.live_base == 0 {
+            return 0;
+        }
+        if region as usize >= self.of_region.len() || run >= self.live_stride {
+            return 0;
+        }
+        self.live_base + 16 * (u64::from(region) * u64::from(self.live_stride) + u64::from(run))
     }
 
     /// How many launches a region costs in this fire — `1` for a window P4
@@ -785,6 +1326,259 @@ impl Windows {
                 )
             })
     }
+
+    /// **WHAT ONE RECORDED BODY MAY BE REPLAYED OVER** — the admissibility
+    /// rule of the bodies path (`record::BodyKey`), asked of the WHOLE table
+    /// and asked BEFORE a walk rather than during one.
+    ///
+    /// **THE SEAT HAS TWO WORDS AND THEY RETIRE TWO DIFFERENT THINGS.** A
+    /// body is a graph recorded at one bucket and replayed for every fire
+    /// that keys to it, and the only thing that may differ between those
+    /// fires is what the staged `(count, start)` seat says. The COUNT retires
+    /// a TAIL: a launch's grid was carved at the bucket, and a kernel that
+    /// reads `win[0]` drops the blocks past the live rows, which is why a
+    /// shorter fire is served as a prefix of a longer one. The START moves a
+    /// BASE: a kernel that also reads `win[1]` addresses `start + r` off a
+    /// pointer handed at the plane's own base, which is what lets a region
+    /// that does NOT begin at the fire's row zero be replayed at all. Two
+    /// words, two clauses, and a region is admissible under whichever of them
+    /// its ops actually read.
+    ///
+    /// **SO THERE ARE TWO READINGS OF THIS QUESTION, AND THIS IS THE NARROW
+    /// ONE.** [`covers_fire`](Windows::covers_fire) waives nothing: every
+    /// present region's window must BE the whole fire — `row_offset == 0`,
+    /// `rows >= the fire's` — which is `Run::whole_fire`'s clauses one for
+    /// one, differing only in the quantifier and the instant. In practice it
+    /// is `true` for a SINGLE-CLASS composition and false the moment two
+    /// classes have rows, because a two-class fire is exactly a fire whose
+    /// regions are windowed.
+    /// [`covers_fire_shifted`](Windows::covers_fire_shifted) is the wide
+    /// reading: it waives the offset and the rows for a region whose every op
+    /// reads BOTH seat words, and waives nothing else.
+    ///
+    /// **AND TWO CLAUSES NO SEAT WORD CAN EXPRESS, WAIVED BY NEITHER.** A
+    /// GATHERED window is its own plane: its rows were compacted out of the
+    /// fire's into a fresh rectangle, so `start + r` names a row of that copy
+    /// and not of the fire, and there is no offset into the fire that would
+    /// make the two agree. A GROUPED window is a union with foreign gaps: its
+    /// span covers rows belonging to somebody else, and one `(count, start)`
+    /// pair describes an interval, which a union of intervals is not. Both are
+    /// refusals about the SHAPE of the rows, and the seat only ever says where
+    /// an interval of them begins and how many are live.
+    ///
+    /// A region with NO rows is not asked, in either reading — an absent
+    /// window is not a window whose geometry a launch reads, and its absence
+    /// is a fact about the composition, which is the thing a caller keys on
+    /// rather than the thing it has to check.
+    ///
+    /// **WHO ASKS, AND WHY IT CANNOT WAIT FOR THE WALK.** The seat has to be
+    /// staged in `prepare`, before the first stream touch, and
+    /// `Run::whole_fire` first answers halfway through the walk. So the same
+    /// question is asked twice, of one table, from two instants: this is the
+    /// host's reading and `Run::whole_fire` is the launch's, and the day they
+    /// disagreed the launch's would win — it arms the seat per region, and a
+    /// region it declines simply arms nothing.
+    #[must_use]
+    pub fn covers_fire(&self, rows: u32) -> bool {
+        (0..self.of_region.len() as u32).all(|region| {
+            (0..self.runs(region)).all(|run| {
+                let window = self.at(region, run);
+                window.span.rows == 0
+                    || (window.span.row_offset == 0
+                        && window.span.rows >= rows
+                        && window.gathered.is_none()
+                        && window.segs() == 0)
+            })
+        })
+    }
+
+    /// **THE SAME QUESTION, ASKED OF A TABLE WHOSE REGIONS CAN MOVE THEIR OWN
+    /// BASE** — [`covers_fire`](Windows::covers_fire) with the offset and the
+    /// rows waived per region, and nothing else waived at all.
+    ///
+    /// `shifted[region]` is `exports::regions_shifting`'s answer:
+    /// every op in that template region is on [`crate::SHIFTED`], so given the
+    /// plane's base pointers and an armed seat it computes over rows
+    /// `[start, start + count)` and touches no other row. For such a region
+    /// the two INTERVAL clauses are what the seat says, not what the window
+    /// has to be, so a windowed one is admissible. The two SHAPE clauses —
+    /// gathered, and a segment list — are never waived, for the reason the
+    /// doc above gives: neither is an interval, and the seat has no word for
+    /// anything else. The zero-row exemption is unchanged.
+    ///
+    /// A region index past the end of `shifted` reads as NOT shifting. The
+    /// slice is the load's, one entry per template region, and the table is
+    /// cut from the same template; a short slice is a shell that has lost
+    /// track of which is which, and the safe answer to that is the narrow one.
+    ///
+    /// **THIS IS THE `bodied` PREDICATE'S READING NOW** (chunk 2b-ii), and it
+    /// is only sound because the launch plane moved with it. A windowed region
+    /// admitted here is one `Run::plane_base` hands the PLANE's base pointers
+    /// and `Run::live_at` arms the seat for, so `start + r` is what addresses
+    /// its rows; admitting one while the launch plane still pre-shifted would
+    /// have captured advanced pointers under a disarmed seat and replayed them
+    /// at a different row split — the right number of rows read from the wrong
+    /// place, silently. Both halves read this same `shifted` slice
+    /// (`Shell::shifted`), which is what keeps them one answer.
+    ///
+    /// [`covers_fire`](Windows::covers_fire) stays as the narrow reading and
+    /// as this one's own argument: it is what this waives clauses OF, and the
+    /// tests below diff the two.
+    ///
+    /// **AND SINCE THE TIER-2 CAMPAIGN THIS IS A READING OF
+    /// [`admits`](Windows::admits) RATHER THAN AN ARITHMETIC OF ITS OWN** —
+    /// "every region is [`Admit::Captured`]". The clauses did not move and
+    /// nothing about the answer changed; what changed is that a caller can
+    /// now ask WHERE the table stops being uniform, which is where a
+    /// segmented capture is cut. This form survives because a load still has
+    /// one question that wants the collapse: whether the whole composition
+    /// fits in one graph, which is the fire that pays no eager launch at all.
+    #[must_use]
+    pub fn covers_fire_shifted(&self, rows: u32, shifted: &[bool]) -> bool {
+        (0..self.of_region.len() as u32)
+            .all(|region| self.admit(region, rows, shifted) == Admit::Captured)
+    }
+
+    /// **WHICH REGIONS OF THIS FIRE A BODY MAY HOLD, AND WHICH ONES IT MUST
+    /// RE-ISSUE** — the admissibility rule answered PER REGION instead of
+    /// collapsed to one `bool` (the tier-2 campaign).
+    ///
+    /// [`covers_fire_shifted`](Windows::covers_fire_shifted) is this table
+    /// read as "every entry is [`Admit::Captured`]", and until tier 2 that
+    /// was the only reading anybody wanted: a composition with one
+    /// unrecordable region was a composition no body served, so the fire
+    /// walked and was counted. Tier 2 keeps the arithmetic and spends the
+    /// answer differently — the CAPTURED stretches are recorded as graph
+    /// segments and the ISLANDS between them are re-issued eagerly on the
+    /// same stream — so what the callers need is not whether the table is
+    /// uniform but WHERE it changes.
+    ///
+    /// # This table is a function of the [`record::BodyKey`](crate::record::BodyKey), which is what makes segmentation stable
+    ///
+    /// A body is captured once and replayed by every fire of its key, so the
+    /// CUTS have to be the same cuts for every one of those fires — a body
+    /// whose second fire wanted its islands somewhere else would be a body
+    /// replaying somebody else's launches. They are, and each of the three
+    /// clauses is a key function for its own reason:
+    ///
+    /// * **gathered** is `fallback::copies`' answer, which reads the artifact
+    ///   and the fire's BUCKET (`model_exec::fire::fallback::copies` is
+    ///   bucket-keyed, `model_compiler::layout`'s `CROSSOVER_ROWS`) — and the
+    ///   bucket is the key's first coordinate. The `copyable` scan beside it
+    ///   reads the trace alone;
+    /// * **a segment list** is `fallback::grouped`'s answer, which reads the
+    ///   artifact and nothing else;
+    /// * **the interval clauses** — whether a window IS the whole fire, and
+    ///   whether it is in pieces at all — are functions of the PRESENT SET
+    ///   and of the artifact ([`seat`]'s note argues it: two masks resolve to
+    ///   the same span exactly when their present classes are the same set),
+    ///   and the present set is the key's second coordinate;
+    /// * **`shifted`** is `exports::regions_shifting` read once at LOAD.
+    ///
+    /// So `(present set, bucket)` — which IS the [`record::BodyKey`](crate::record::BodyKey) — decides
+    /// every entry here, and a capture may freeze the cuts it derives.
+    /// `record::Graphs::fire_body` asserts it on every hit rather than merely
+    /// believing it: the segments a fire derives are compared against the
+    /// ones its resident body was cut at.
+    ///
+    /// # One clause of that proof has a hole, and it is [`Copies::enabled`]
+    ///
+    /// The gathered clause reads `fallback::copies`, and `fallback::copies` is
+    /// asked only when this table was built with copies ENABLED — which is
+    /// `[engine] fallback_copy`, a load constant, AND "did this fire stage
+    /// mask bits", which is not one. A masked fire takes the split
+    /// ([`Copies::enabled`]'s own note says why: the mask slab is addressed by
+    /// absolute per-lane byte offsets, so a gather would have to compact it
+    /// too). So on a deployment with a masked axis AND a P4 copy row at some
+    /// bucket, two fires of ONE key can answer this table differently: the
+    /// unmasked one calls the copy region an [`Admit::Island`], the masked one
+    /// calls it [`Admit::Captured`], and a body captured under the second is
+    /// one the first would replay whole over launches baked for the split.
+    ///
+    /// **IT IS UNREACHABLE TODAY AND IT IS NOT GUARDED.** `crate::GROUPED`
+    /// and the copy table are exercised on qwen texts, which declare no masked
+    /// axis at all, so no fire in the tree presents the pair — which is why
+    /// this reads as a note rather than as a clause. Two answers are on the
+    /// table for the day it does: put the word in the [`record::BodyKey`](crate::record::BodyKey), or
+    /// refuse a body to a fire whose copy answer is the FIRE's rather than the
+    /// LOAD's (`bodied && !(copies && any lane masked)`), which costs bodies
+    /// on masked fires of a copying SKU and costs nothing anywhere else.
+    /// `record::Graphs::fire_body`'s `debug_assert` is what would find it, and
+    /// `Shell::segments` stores the word beside each memoized table so that a
+    /// memo can never be the thing that hides it.
+    ///
+    /// **AND A REGION IS ONE OR THE OTHER, NEVER PART OF EACH.** The question
+    /// is asked of every RUN and the region takes the conjunction, because a
+    /// cut is a boundary between template regions and there is no way to
+    /// record half of one. A split region's runs all answer alike anyway —
+    /// `Windows::of` gives a gathered or grouped region exactly one run, so a
+    /// region with several has neither shape — but the conjunction is written
+    /// rather than inferred, because the day a fire produced a mixed region
+    /// the safe answer is the island and the inferred one would be the
+    /// segment.
+    ///
+    /// A region with NO rows is [`Admit::Captured`], for the reason the bool
+    /// reading exempted it: an absent window is not a window whose geometry a
+    /// launch reads. It dispatches nothing in either pass, so which side of a
+    /// cut it lands on is immaterial — and putting it on the CAPTURED side is
+    /// what keeps an empty region from splitting one segment into two.
+    #[must_use]
+    pub fn admits(&self, rows: u32, shifted: &[bool]) -> Vec<Admit> {
+        (0..self.of_region.len() as u32)
+            .map(|region| self.admit(region, rows, shifted))
+            .collect()
+    }
+
+    /// One region's entry of [`admits`](Windows::admits) — the clauses, in one
+    /// place, so that the table and the `bool` cannot part.
+    #[must_use]
+    fn admit(&self, region: u32, rows: u32, shifted: &[bool]) -> Admit {
+        let moves = shifted.get(region as usize).copied().unwrap_or(false);
+        let held = (0..self.runs(region)).all(|run| {
+            let window = self.at(region, run);
+            window.span.rows == 0
+                || (window.gathered.is_none()
+                    && window.segs() == 0
+                    && (moves || (window.span.row_offset == 0 && window.span.rows >= rows)))
+        });
+        if held { Admit::Captured } else { Admit::Island }
+    }
+}
+
+/// **MAY A BODY HOLD THIS REGION'S LAUNCHES, OR MUST IT RE-ISSUE THEM?** —
+/// one entry of [`Windows::admits`], one per TEMPLATE region (the tier-2
+/// campaign).
+///
+/// Two words and no third, because the seat has two words and the question is
+/// exactly whether they can speak for this region's rows. What is not here is
+/// a "why": a caller that has to act on the answer acts on it identically
+/// whichever clause failed, and the clauses themselves are argued once, at
+/// [`Windows::admits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit {
+    /// **A GRAPH MAY HOLD IT.** Every run of this region either has no rows
+    /// at all, or is a window the staged `(count, start)` seat can speak for:
+    /// it IS the whole fire, or its every op reads the seat's start
+    /// (`crate::SHIFTED`) and the launch takes the plane's base. A capture of
+    /// such a region is replayable at every split of its key, because the
+    /// only thing that moves between two fires of one key is what the seat
+    /// says.
+    Captured,
+    /// **IT HAS TO BE RE-ISSUED, EVERY FIRE.** Some run of this region is
+    /// gathered (its rows were compacted into a scratch slab and numbered
+    /// from that slab's own zero), or carries a segment list (its span is a
+    /// union with foreign rows in the gaps), or is windowed without every op
+    /// reading the seat's start (so its launch wants a pre-shifted pointer,
+    /// which is a fire's address and not a key's).
+    ///
+    /// **AND "RE-ISSUED" IS THE WHOLE OF WHAT IT COSTS.** The region walks
+    /// eagerly between the execs around it, at this fire's own live geometry
+    /// — no ceiling, no seat, no plane base (`Run::captured` is the one gate
+    /// all three hang off) — which is byte for byte the launch the eager path
+    /// would have made. What it gives up is the launch overhead of its own
+    /// nodes and P6's overlap across its span; what it buys is every other
+    /// region of the composition replaying from a graph.
+    Island,
 }
 
 /// **THE BAKE-TIME HALF OF THE WINDOW ARGUMENT**: no attention schedule may
@@ -876,6 +1670,39 @@ fn union_of(spans: &[MaskSpan]) -> MaskSpan {
 /// look like — and they are not the same window: one reads its rows where
 /// they lie and the other reads them out of a slab. Comparing the runs beside
 /// the span is what keeps a region from being handed the other one's.
+///
+/// **AND THE POSITION IT GIVES IS A FUNCTION OF THE `BodyKey`, NOT OF THE
+/// FIRE** — which is the second half of the H2 fix, and it holds of the span
+/// comparison as written rather than needing a different key. The argument:
+///
+/// * a `record::BodyKey` fixes WHICH CLASSES HAVE ROWS (and the bucket, and
+///   the ceiling each class is carved to); it deliberately drops the
+///   per-class COUNTS, which is the whole of what the bodies path buys. Only
+///   the presence half is read below, so the ceiling design's Option B —
+///   which added the rungs beside the presences — left this argument exactly
+///   where it was, and the tier-1 collapse, which made those rungs functions
+///   of the bucket, cannot touch it either;
+/// * `WindowTable::spans_into` skips a zero-row class and merges the rest by
+///   adjacency, so the span list a mask resolves to is determined by
+///   `mask ∩ present` — the counts move the OFFSETS, never which classes
+///   contribute or where the runs break;
+/// * every present class has rows, so the prefix sums are strictly
+///   increasing: two masks resolve to the same span exactly when their
+///   present classes are the same set. That is a fact about the KEY. Two
+///   masks that share a slot in one fire of a key share it in every fire of
+///   that key, and two that do not, never do.
+///
+/// So the dedupe is a re-encoding of `mask ∩ present` and not a coincidence of
+/// this fire's arithmetic — which is also why the slot COUNT stays inside the
+/// `k(k+1)/2 + 1` the reserve carves: each equivalence class is one contiguous
+/// run of the class order. Keying on the raw mask instead would split two
+/// masks that differ only in classes this key has no rows for, and buy nothing
+/// for slots the carve then has to grow for.
+///
+/// (The patch axis is the caveat: a patch region's spans come from the patch
+/// table, whose class presence `BodyKey` does not carry. A fire with a patch
+/// rectangle does not reach the bodies path today; the day it does, the key is
+/// what has to learn about the second axis.)
 fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
     let same = |held: &Window| {
         held.span == window.span
@@ -1087,8 +1914,8 @@ pub struct Conditionals<'a> {
 ///
 /// **ONLY AN EAGER CURSOR IS GIVEN ONE.** A captured graph is replayed without
 /// the walk that owns the pump's issue cursor, so a recording cursor that
-/// pumped would bake one fire's copies into a graph replayed for every
-/// composition; the fold declines a rotating load by name instead
+/// pumped would bake one fire's copies into a graph replayed for every fire of
+/// its key; the router refuses to record a rotating load at all instead
 /// (`crate::rotate`'s header carries the argument, and `serve.rs` is where the
 /// decline is taken).
 #[derive(Clone, Copy)]
@@ -1297,8 +2124,16 @@ impl<'a> Cursor<'a> {
     /// carries no rebased qo boundaries at all — `indptr_host` is empty by
     /// construction, because that vector is the token rectangle's per-lane
     /// bounds and a tower region's span indexes images, while its staged
-    /// `Tensor` is a zero-length seat whose address is the NEXT window's first
-    /// int. Reading a count out of that would be reading somebody else's.
+    /// `Tensor` is a zero-length seat at the head of its own slot. Reading a
+    /// count out of that would be reading whatever the padding holds.
+    ///
+    /// **THE ADDRESS THIS RETURNS MAY BE BAKED INTO A GRAPH**, and is safe to
+    /// bake: a conditional setter is a recorded node and the pointer it takes
+    /// is `blob base + slot * stride` ([`Windows::packed`]), where the slot is
+    /// a function of the `record::BodyKey` ([`seat`]) and the stride is the
+    /// load's. Every fire of one key therefore finds this region's CSR at the
+    /// address the capture froze — which is exactly what the H2 fix is for,
+    /// and what a tightly packed blob could not promise past slot 0.
     fn count_of(&self, cond: Conditionals<'a>, region: u32) -> (u64, u32, bool) {
         match cond.windows.runs(region) {
             1 if !cond.windows.at(region, 0).indptr_host.is_empty() => {
@@ -1807,6 +2642,113 @@ mod tests {
         assert_eq!(rebase(&indptr, prefill), vec![0, 7, 10]);
     }
 
+    /// **THE SECOND READING IS THE FIRST ONE'S SLICE, UN-SUBTRACTED** (bodies
+    /// design, chunk 2c-a) — the identity `Run::qo_indptr_absolute_host` is
+    /// built on, pinned here because it is what makes the two readings one
+    /// fact. A window's absolute boundaries are `indptr[lane_offset ..=
+    /// lane_offset + lanes]` with nothing done to them, and subtracting that
+    /// slice's own first entry is exactly [`rebase`].
+    ///
+    /// **THIS IS THE HOST READING AND ONLY THE HOST READING.** The slice is
+    /// legal here because it is taken by the fire that made it; the DEVICE
+    /// reading is handed over whole, and the test below is why.
+    #[test]
+    fn the_rebased_reading_is_the_whole_vector_s_lane_slice_minus_its_own_base() {
+        let indptr = [0, 7, 10, 11, 12, 13];
+        for set in [ClassSet::of([0]), ClassSet::of([1]), ClassSet::of([0, 1])] {
+            let span = table()
+                .span(&set)
+                .expect("consecutive")
+                .expect("non-empty");
+            let first = span.lane_offset as usize;
+            let absolute = &indptr[first..=first + span.lanes as usize];
+            let rebased = rebase(&indptr, span);
+            assert_eq!(absolute.len(), rebased.len(), "both are `[lanes + 1]`");
+            assert!(
+                absolute
+                    .iter()
+                    .zip(&rebased)
+                    .all(|(there, here)| there - absolute[0] == *here),
+                "{absolute:?} minus its own first entry is not {rebased:?}",
+            );
+        }
+        // And the two readings are NOT the same vector wherever a window does
+        // not begin at the fire's lane zero, which is the case the seam
+        // exists for.
+        let decode = table()
+            .span(&ClassSet::of([1]))
+            .expect("consecutive")
+            .expect("non-empty");
+        assert_eq!(&indptr[2..=5], &[10, 11, 12, 13], "absolute");
+        assert_eq!(rebase(&indptr, decode), vec![0, 1, 2, 3], "rebased");
+    }
+
+    /// **THE DEVICE READING IS HANDED OVER WHOLE, AND THAT IS THE WHOLE OF
+    /// WHAT MAKES IT SAFE TO BAKE.** A body records the pointer it is given
+    /// and replays it at another fire of the same `record::BodyKey`, and
+    /// `lane_offset` is the sum of the lanes of the classes in front of the
+    /// window — a number the key does not fix. So `base + lane_offset * 4`
+    /// would be a stale address on every replay but the recording one, which
+    /// is exactly the staleness the absolute seam exists to remove; the fire
+    /// vector's own base is a function of the LOAD and does not move at all.
+    ///
+    /// Which entries are a launch's requests is the SCHEDULE's business, not
+    /// the pointer's — a sliced absolute vector would be the worst of both
+    /// readings, a moving pointer AND values counting from somewhere else.
+    #[test]
+    fn the_absolute_reading_does_not_move_with_the_window() {
+        // Two windows of one fire, the second one well off lane zero.
+        let mut first = plain(0, 7);
+        first.span.lane_offset = 0;
+        first.span.lanes = 2;
+        let mut second = plain(7, 6);
+        second.span.lane_offset = 2;
+        second.span.lanes = 4;
+        let mut table = windows(&[vec![first], vec![second]]);
+        table.qo_absolute_host = vec![0, 7, 10, 11, 12, 13];
+
+        const BASE: u64 = 0x7000;
+        table.bind_qo_absolute(Some(BASE));
+        let whole = table.qo_absolute().expect("bound");
+        assert_eq!(whole.ptr, BASE, "the fire's own base, and no window's");
+        assert_eq!(
+            whole.rows,
+            table.qo_absolute_host().len() as u32,
+            "the FIRE's lanes + 1, not any window's",
+        );
+        // The address a lane slice would have produced for the second window
+        // — the one a body would have baked and replayed stale.
+        assert_ne!(whole.ptr, BASE + 2 * 4, "the reading is not cut at lane_offset");
+        // And there is no per-window reading at all to disagree with it: the
+        // table answers one vector for the fire, asked from anywhere.
+        assert_eq!(table.qo_absolute().expect("bound").ptr, whole.ptr);
+    }
+
+    /// **AN UNBOUND SECOND READING IS READ BY NOBODY.** The vector is staged
+    /// only for a fire the shell routed to a body (`inputs::Fire::qo_absolute`
+    /// is empty otherwise), so the table answers `None` and every ragged view
+    /// keeps the rebased boundaries it always took — which is what makes this
+    /// chunk inert on every path but the bodied one.
+    #[test]
+    fn an_unbound_absolute_qo_vector_answers_none() {
+        let mut table = windows(&[vec![plain(0, 13)]]);
+        assert!(table.qo_absolute().is_none(), "no vector, nothing bound");
+
+        table.qo_absolute_host = vec![0, 7, 10, 11, 12, 13];
+        assert!(table.qo_absolute().is_none(), "a vector, still nothing bound");
+
+        const BASE: u64 = 0x7000;
+        table.bind_qo_absolute(Some(BASE));
+        let whole = table.qo_absolute().expect("bound");
+        assert_eq!(whole.ptr, BASE, "the vector is the FIRE's, so it starts at the base");
+        assert_eq!(whole.rows, 6, "lanes + 1");
+        assert_eq!(whole.width, 1);
+        assert_eq!(table.qo_absolute_host(), &[0, 7, 10, 11, 12, 13]);
+
+        table.bind_qo_absolute(None);
+        assert!(table.qo_absolute().is_none(), "unbinding is the off switch");
+    }
+
     /// **THE EASIEST THING IN THE SPLIT TO GET SILENTLY WRONG.** A window's qo
     /// boundaries are offsets INTO the rectangle it cuts, so every run of a
     /// fragmented window needs its OWN vector, rebased to its own zero over
@@ -1854,5 +2796,439 @@ mod tests {
             vec![0, 2, 4],
             "the second run starts at ITS zero, not the fire's",
         );
+    }
+
+    // ── THE LIVE-ROWS SEAT (bodies design). Pure arithmetic over a table
+    //    built by hand: `Windows::of` wants a `Trace` and a `CompiledModel`,
+    //    and none of what these three assert is about either.
+
+    /// A window with nothing but a span — every other field at the shape an
+    /// ordinary (ungathered, ungrouped) one has.
+    fn plain(row_offset: u32, rows: u32) -> Window {
+        Window {
+            span: MaskSpan {
+                row_offset,
+                rows,
+                lane_offset: 0,
+                lanes: 1,
+            },
+            indptr_host: Vec::new(),
+            indptr: Tensor::new(0, 0, 1, Dtype::I32),
+            segments_host: Vec::new(),
+            segments: Tensor::new(0, 0, 2, Dtype::I32),
+            segment_cap: 0,
+            gathered: None,
+            patch: MaskSpan::default(),
+        }
+    }
+
+    /// A table of `spans[region][run]`, seated the way `Windows::of` seats
+    /// one — one window per run, and the live words filled with the identity.
+    fn windows(spans: &[Vec<Window>]) -> Windows {
+        let mut table = Windows {
+            windows: Vec::new(),
+            runs: Vec::new(),
+            of_region: Vec::new(),
+            // A carve wide enough for anything these tables hold: two classes,
+            // eight lanes, one run. `Windows::of` takes the load's.
+            slots: Slots::new(2, 8, 1, 1),
+            live_words: Vec::new(),
+            live_stride: 0,
+            live_base: 0,
+            // The second reading is a fire-wide vector these span-only tables
+            // have no fire for; the tests that want one fill it themselves.
+            qo_absolute_host: Vec::new(),
+            qo_absolute_base: 0,
+            qo_absolute_lanes: 0,
+        };
+        for region in spans {
+            let start = table.runs.len() as u32;
+            for window in region {
+                table.runs.push(table.windows.len() as u32);
+                table.windows.push(window.clone());
+            }
+            table.of_region.push((start, region.len() as u32));
+        }
+        let stride = table.max_runs();
+        let wide = stride as usize;
+        let mut live = vec![0u32; table.of_region.len() * wide * 4];
+        for region in 0..table.of_region.len() as u32 {
+            for run in 0..table.runs(region) {
+                let span = table.at(region, run).span;
+                let seat = 4 * (region as usize * wide + run as usize);
+                live[seat] = span.rows;
+                live[seat + 1] = span.row_offset;
+                live[seat + 2] = span.lanes;
+                live[seat + 3] = span.lane_offset;
+            }
+        }
+        table.live_words = live;
+        table.live_stride = stride;
+        table
+    }
+
+    /// **THE IDENTITY, WORD FOR WORD.** The seat's contract is `[rows,
+    /// row_offset, lanes, lane_offset]` per (region, run) at a fixed stride,
+    /// and every word of it is the window's own — which is what makes arming
+    /// it change no arithmetic on either axis.
+    #[test]
+    fn the_live_seat_is_every_windows_own_rows_and_offset_at_a_fixed_stride() {
+        let table = windows(&[
+            vec![plain(0, 13)],
+            vec![plain(0, 10), plain(10, 3)],
+            vec![plain(3, 5)],
+        ]);
+        let stride = table.max_runs() as usize;
+        assert_eq!(stride, 2, "the widest region cuts two runs");
+        assert_eq!(
+            table.live().len(),
+            table.of_region.len() * stride * 4,
+            "regions x max_runs x 4, and no run's words are missing",
+        );
+        for region in 0..table.of_region.len() as u32 {
+            for run in 0..table.runs(region) {
+                let seat = 4 * (region as usize * stride + run as usize);
+                let span = table.at(region, run).span;
+                assert_eq!(table.live()[seat], span.rows, "row count first");
+                assert_eq!(table.live()[seat + 1], span.row_offset, "row start second");
+                assert_eq!(table.live()[seat + 2], span.lanes, "lane count third");
+                assert_eq!(
+                    table.live()[seat + 3],
+                    span.lane_offset,
+                    "lane start fourth",
+                );
+            }
+        }
+        // The words of a run the table did not cut are untouched zeros — the
+        // stride is a rectangle and region 0 has one run in a two-run one.
+        assert_eq!(&table.live()[4..8], &[0, 0, 0, 0]);
+    }
+
+    /// **THE ADDRESS IS A MULTIPLICATION, AND `0` IS THE DISARMED SEAT.**
+    #[test]
+    fn a_bound_seat_answers_base_plus_sixteen_per_slot_and_an_unbound_one_answers_zero() {
+        let mut table = windows(&[vec![plain(0, 10), plain(10, 3)], vec![plain(0, 13)]]);
+        let stride = u64::from(table.max_runs());
+
+        assert_eq!(table.live_at(0, 0), 0, "nothing is bound yet");
+        assert_eq!(table.live_at(1, 0), 0);
+
+        const BASE: u64 = 0x4000;
+        table.bind_live(Some(BASE));
+        for (region, run) in [(0, 0), (0, 1), (1, 0)] {
+            assert_eq!(
+                table.live_at(region, run),
+                BASE + 16 * (u64::from(region) * stride + u64::from(run)),
+                "region {region} run {run}",
+            );
+        }
+        // Past the table in either index is the disarmed seat and not an
+        // address past the carve.
+        assert_eq!(table.live_at(2, 0), 0, "no such region");
+        assert_eq!(table.live_at(0, 2), 0, "no such run");
+
+        // And unbinding puts it back, without touching what `bind` seated.
+        table.bind(0x9000);
+        let packed = table.at(0, 1).indptr;
+        table.bind_live(None);
+        assert_eq!(table.live_at(0, 0), 0, "`None` re-disarms the seat");
+        assert_eq!(
+            table.at(0, 1).indptr,
+            packed,
+            "unbinding the seat moved a packed tensor",
+        );
+    }
+
+    /// **THE BODIES PATH'S ADMISSIBILITY RULE**, which is `Run::whole_fire`
+    /// over the whole table: an absent window is not asked, and one windowed
+    /// region is enough to refuse.
+    #[test]
+    fn a_fire_covers_itself_only_when_every_region_with_rows_holds_all_of_them() {
+        let whole = windows(&[vec![plain(0, 13)], vec![plain(0, 13)], vec![plain(0, 0)]]);
+        assert!(whole.covers_fire(13), "one class, and the absent region is not asked");
+        assert!(whole.covers_fire(4), "a shorter fire is a prefix of it");
+
+        let split = windows(&[vec![plain(0, 10)], vec![plain(10, 3)]]);
+        assert!(!split.covers_fire(13), "region 1 starts above the fire's zero");
+
+        let short = windows(&[vec![plain(0, 10)]]);
+        assert!(!short.covers_fire(13), "ten rows is not thirteen");
+
+        let mut grouped = plain(0, 13);
+        grouped.segments_host = vec![0, 3, 8, 5];
+        assert!(
+            !windows(&[vec![grouped]]).covers_fire(13),
+            "a segment list's span is a union and says nothing about the rows it owns",
+        );
+    }
+
+    /// A window that gathered its rows out of the fire's — every other field
+    /// at [`plain`]'s shape, because only `gathered` is under test.
+    fn compacted(row_offset: u32, rows: u32) -> Window {
+        Window {
+            gathered: Some(Gathered {
+                runs: vec![MaskSpan {
+                    row_offset,
+                    rows,
+                    lane_offset: 0,
+                    lanes: 1,
+                }],
+                rows_host: (0..rows as i32).collect(),
+                rows: Tensor::new(0, 0, 1, Dtype::I32),
+                spaces: Vec::new(),
+            }),
+            ..plain(row_offset, rows)
+        }
+    }
+
+    /// **THE WIDE READING OF THE SAME RULE**: a region whose every op reads
+    /// both seat words may be windowed, and the two shape clauses are waived
+    /// for nobody.
+    #[test]
+    fn a_shifting_region_may_be_windowed_and_a_guard_only_one_may_not() {
+        // Region 1 holds rows 10..13 of a 13-row fire. Whether that is
+        // admissible is now a question about region 1's OPS.
+        let split = windows(&[vec![plain(0, 10)], vec![plain(10, 3)]]);
+        assert!(
+            split.covers_fire_shifted(13, &[true, true]),
+            "both regions move their own base off the seat's start",
+        );
+        assert!(
+            !split.covers_fire_shifted(13, &[true, false]),
+            "region 1 is windowed and reads only the seat's count",
+        );
+        // A short slice is not a licence: region 0 covers the fire on the
+        // narrow clauses and region 1 is windowed with no flag to stand on.
+        let tail = windows(&[vec![plain(0, 13)], vec![plain(10, 3)]]);
+        assert!(tail.covers_fire_shifted(13, &[false, true]));
+        assert!(
+            !tail.covers_fire_shifted(13, &[]),
+            "a region past the end of the slice is not shifting",
+        );
+
+        // The narrow reading is untouched by the argument, and the wide one
+        // agrees with it wherever nothing is windowed.
+        let whole = windows(&[vec![plain(0, 13)], vec![plain(0, 13)], vec![plain(0, 0)]]);
+        assert!(!split.covers_fire(13), "the narrow reading still refuses it");
+        assert!(whole.covers_fire_shifted(13, &[false, false, false]));
+
+        // A region with no rows is exempt whatever its ops read: there is no
+        // window for a seat word to be wrong about.
+        let absent = windows(&[vec![plain(0, 13)], vec![plain(0, 0)]]);
+        assert!(
+            absent.covers_fire_shifted(13, &[false, false]),
+            "the absent region is not asked",
+        );
+    }
+
+    /// **THE TWO SHAPES THE SEAT HAS NO WORD FOR**, refused whether or not
+    /// the region's ops read the start.
+    #[test]
+    fn a_gathered_or_grouped_region_is_refused_however_its_ops_address() {
+        let gathered = windows(&[vec![compacted(0, 13)]]);
+        assert!(
+            !gathered.covers_fire_shifted(13, &[true]),
+            "a compacted rectangle is its own plane; no offset into the fire names its rows",
+        );
+        assert!(!gathered.covers_fire_shifted(13, &[false]));
+
+        let mut segmented = plain(0, 13);
+        segmented.segments_host = vec![0, 3, 8, 5];
+        let grouped = windows(&[vec![segmented]]);
+        assert!(
+            !grouped.covers_fire_shifted(13, &[true]),
+            "a union of intervals is not an interval, whatever the start says",
+        );
+        assert!(!grouped.covers_fire_shifted(13, &[false]));
+    }
+
+    /// **THE TABLE, AND THE BOOL IS ITS COLLAPSE** (the tier-2 campaign).
+    ///
+    /// The clause arithmetic is asserted twice over above; what this asserts
+    /// is the thing tier 2 actually spends — that the answer is PER REGION, so
+    /// one region losing its shift makes ONE island rather than refusing the
+    /// composition, and that
+    /// [`covers_fire_shifted`](Windows::covers_fire_shifted) is exactly "every
+    /// entry is [`Admit::Captured`]" and not a second arithmetic beside it.
+    #[test]
+    fn one_region_that_cannot_be_captured_makes_one_island_and_not_a_refusal() {
+        // Region 0 is the fire's first ten rows, region 1 the last three, and
+        // region 2 has none at all.
+        let table = windows(&[
+            vec![plain(0, 10)],
+            vec![plain(10, 3)],
+            vec![plain(0, 0)],
+        ]);
+
+        // Everything shifting: a body holds the whole composition, and the
+        // collapsed reading says so.
+        let whole = table.admits(13, &[true, true, true]);
+        assert!(whole.iter().all(|admit| *admit == Admit::Captured));
+        assert!(table.covers_fire_shifted(13, &[true, true, true]));
+
+        // Take the shift away from the WINDOWED region and exactly one entry
+        // moves. The collapsed reading refuses — which is what it is for — and
+        // the table is what says the refusal costs one region.
+        let crippled = table.admits(13, &[true, false, true]);
+        assert_eq!(
+            crippled,
+            vec![Admit::Captured, Admit::Island, Admit::Captured],
+            "one region lost its shift and the table blamed somebody else",
+        );
+        assert!(!table.covers_fire_shifted(13, &[true, false, true]));
+
+        // And an EMPTY region is capturable whatever its ops read, which is
+        // what keeps a region no composition demands from splitting one
+        // segment into two.
+        assert_eq!(crippled[2], Admit::Captured);
+
+        // A gathered region is an island under every reading of the slice —
+        // the shape clauses are waived for nobody.
+        let gathered = windows(&[vec![plain(0, 10)], vec![compacted(10, 3)]]);
+        assert_eq!(
+            gathered.admits(13, &[true, true]),
+            vec![Admit::Captured, Admit::Island],
+        );
+    }
+
+    // ── **THE H2 FIX**: the packed blob's per-window addresses are a function
+    //    of the `record::BodyKey` and not of the fire, because a body bakes
+    //    them (this file's header, `Windows::packed`, `seat`). Both halves are
+    //    host arithmetic and neither needs a `Trace`.
+
+    /// A plain window carrying the one vector the packed blob is made of: a
+    /// rebased `[lanes + 1]` boundary list, which is the thing whose LENGTH
+    /// moves between fires of one key.
+    fn bounded(span: MaskSpan) -> Window {
+        Window {
+            span,
+            indptr_host: (0..=span.lanes as i32).collect(),
+            ..plain(0, 0)
+        }
+    }
+
+    /// The three spans a two-class fire resolves for the masks `{A}`, `{A,B}`
+    /// and `{B}`, the way `WindowTable::spans_into` resolves them: a class
+    /// with no rows contributes nothing and an empty mask is the zero window.
+    /// `a` and `b` are each `(rows, lanes)`.
+    fn resolved(a: (u32, u32), b: (u32, u32)) -> [MaskSpan; 3] {
+        let one = |(rows, lanes): (u32, u32), row_offset, lane_offset| MaskSpan {
+            row_offset,
+            rows,
+            lane_offset,
+            lanes,
+        };
+        let first = if a.0 == 0 { MaskSpan::default() } else { one(a, 0, 0) };
+        let second = if b.0 == 0 { MaskSpan::default() } else { one(b, a.0, a.1) };
+        let both = match (a.0 == 0, b.0 == 0) {
+            (false, false) => one((a.0 + b.0, a.1 + b.1), 0, 0),
+            (false, true) => first,
+            (true, false) => second,
+            (true, true) => MaskSpan::default(),
+        };
+        [first, both, second]
+    }
+
+    /// **ONE KEY, TWO LANE SPLITS, THE SAME ADDRESSES.** The defect this pins:
+    /// a tightly packed blob puts window `i` at `base + Σ_{j<i} words_j`, the
+    /// lane counts move between fires of one `BodyKey`, and a graph that baked
+    /// window 1's `indptr` pointer would read window 0's tail on the next
+    /// fire. At a fixed stride only the slot index is in the address.
+    #[test]
+    fn a_slot_lands_at_the_same_address_however_the_fire_split_its_lanes() {
+        // Three regions over the two-class fire's three masks, so that the
+        // table has a slot 0, a slot 1 and a slot 2 to be wrong about.
+        let table_of = |a, b| {
+            let [first, both, second] = resolved(a, b);
+            windows(&[
+                vec![bounded(both)],
+                vec![bounded(first)],
+                vec![bounded(second)],
+            ])
+        };
+        const BASE: u64 = 0x8000;
+        let mut wide = table_of((10, 2), (3, 3));
+        let mut narrow = table_of((4, 1), (6, 6));
+        wide.bind(BASE);
+        narrow.bind(BASE);
+
+        let stride = wide.slots().stride() * 4;
+        assert_eq!(stride, narrow.slots().stride() * 4, "one load, one carve");
+        for region in 0..3 {
+            let (here, there) = (wide.at(region, 0).indptr, narrow.at(region, 0).indptr);
+            assert_eq!(
+                here.ptr, there.ptr,
+                "region {region}'s rebased CSR moved with the lane split",
+            );
+            assert_eq!(
+                here.ptr,
+                BASE + u64::from(region) * stride,
+                "a slot's address is base + slot * stride and nothing else",
+            );
+            assert_ne!(here.rows, there.rows, "the two fires really are different fires");
+        }
+
+        // And the words the shell stages agree with the addresses it bound:
+        // every slot's vector is at its own offset, with padding behind it.
+        for table in [&wide, &narrow] {
+            let blob = table.packed();
+            for region in 0..3u32 {
+                let window = table.at(region, 0);
+                let at = table.slots().at(region as usize) as usize;
+                assert_eq!(
+                    &blob[at..at + window.indptr_host.len()],
+                    window.indptr_host.as_slice(),
+                    "region {region}'s boundaries are not at its slot",
+                );
+            }
+            assert!(
+                blob.len() as u64 <= table.slots().tail(),
+                "the blob outgrew the carve it was reserved in",
+            );
+        }
+    }
+
+    /// **AND THE SLOT ITSELF IS THE KEY'S**, which is `seat`'s half of the
+    /// same argument: the span is this fire's encoding of `mask ∩ present`,
+    /// so which masks share a slot is fixed by which classes have rows — and
+    /// that is exactly what a `BodyKey` carries.
+    #[test]
+    fn two_masks_share_a_slot_in_every_fire_of_a_key_or_in_none_of_them() {
+        // Four regions over three masks — `{A}`, `{A,B}`, `{A}` again, `{B}`
+        // — seated the way `Windows::of` seats them.
+        let seated = |a, b| {
+            let [first, both, second] = resolved(a, b);
+            let mut held: Vec<Window> = Vec::new();
+            let map: Vec<u32> = [first, both, first, second]
+                .into_iter()
+                .map(|span| seat(&mut held, bounded(span)))
+                .collect();
+            (map, held.len())
+        };
+
+        let wide = seated((10, 2), (3, 3));
+        assert_eq!(wide.0, vec![0, 1, 0, 2], "three distinct masks, three slots");
+        assert_eq!(
+            seated((4, 1), (6, 6)),
+            wide,
+            "the lane split moved every span and no slot",
+        );
+        assert_eq!(
+            seated((1, 1), (1, 1)),
+            wide,
+            "nor does the row split, down to one row a class",
+        );
+
+        // **THE ONE SPLIT THAT DOES MOVE THE SHARING MOVES THE KEY WITH IT.**
+        // A class with no rows is absent from `BodyKey::classes`, so `{A,B}`
+        // collapsing onto `{A}` is a different body — recorded against this
+        // table, never replayed against the other one's addresses.
+        let absent = seated((10, 2), (0, 0));
+        assert_eq!(
+            absent.0,
+            vec![0, 0, 0, 1],
+            "the both-classes mask is the A mask when B has no rows",
+        );
+        assert_ne!(absent.0, wide.0, "and that is a different key, so a different body");
     }
 }

@@ -656,7 +656,7 @@ fn encode_fusion(facts: &TileMapFacts, target: &StorageTarget) -> TransformFusio
     let fusable = target.fusion_mask & FUSION_FP8_TO_MXFP4 != 0
         && facts.transform_to == Some(QuantScheme::Mxfp4E2M1E8M0)
         && facts.has_source
-        && facts.source_dtype == Some(DType::Fp8E4m3);
+        && facts.source_dtype == Some(DType::E4m3);
     if fusable {
         TransformFusion::Fp8ToMxfp4
     } else {

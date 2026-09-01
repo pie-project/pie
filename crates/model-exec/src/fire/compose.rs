@@ -896,20 +896,38 @@ fn patch_bucket_of(ladder: Option<&PatchLadder>, patches: u32) -> Result<u32> {
 }
 
 fn bucket_of(budget: &Budget, rows: u32) -> Result<u32> {
-    if budget.buckets.is_empty() {
-        return Ok(rows);
+    match budget.buckets.last().copied() {
+        Some(top) if rows > top => Err(Error::Fire(Fault::NoBucket { rows, top })),
+        _ => Ok(rung_of(&budget.buckets, rows)),
     }
-    budget
-        .buckets
+}
+
+/// **THE SMALLEST RUNG OF THIS LATTICE THAT HOLDS `rows`, FOR A COUNT THAT IS
+/// PART OF A FIRE THE CEILING ABOVE HAS ALREADY ADMITTED.**
+///
+/// [`bucket_of`]'s arithmetic without [`bucket_of`]'s refusal, and it is one
+/// reading rather than two: the refusal is about the FIRE's total, which is
+/// the only count a budget's top rung is a ceiling on. Every count this
+/// answers for is a part of that total — one CLASS's rows, out of the same
+/// seriation the total was summed over — so it is bounded by a number already
+/// checked, and an empty lattice answers `rows` here for the reason it
+/// answers `rows` there: a deployment that chose no lattice quantizes
+/// nothing.
+///
+/// **AND THE SAME LATTICE, DELIBERATELY.** The rungs quantize arithmetic
+/// drift wherever rows are COUNTED — that is what
+/// [`Composition::bucket`](Composition::bucket) means and it is not a claim
+/// about the fire's total in particular — so a per-class ladder built on a
+/// second, coarser ladder would be a second answer to the same question. The
+/// caller that reads this is `engine_cuda::record::Ladder`, which puts one
+/// rung per present class into the body key.
+#[must_use]
+pub fn rung_of(buckets: &[u32], rows: u32) -> u32 {
+    buckets
         .iter()
         .copied()
-        .find(|bucket| *bucket >= rows)
-        .ok_or_else(|| {
-            Error::Fire(Fault::NoBucket {
-                rows,
-                top: budget.buckets.last().copied().unwrap_or(0),
-            })
-        })
+        .find(|rung| *rung >= rows)
+        .unwrap_or(rows)
 }
 
 #[cfg(test)]

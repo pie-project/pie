@@ -175,6 +175,9 @@ fn dense_affine(
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
             ArgValue::Ptr(seat.cell),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

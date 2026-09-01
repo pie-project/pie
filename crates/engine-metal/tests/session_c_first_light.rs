@@ -206,7 +206,7 @@ const QWEN: Family = Family {
 ///
 /// So the row this arm serves is a NEW one,
 /// `gptoss-20b-mlxu4-mxfp4-kv-bf16`, and landing it took the tree's first
-/// eight-bit weight: see `dtype::Dtype::MlxU8`, whose doc carries the
+/// eight-bit weight: see `dtype::Dtype::U8g64`, whose doc carries the
 /// `quant_predicate` that is the reason a router gate is coarser than the
 /// stack around it. Nothing below the model text moved — the affine points
 /// were already stamped at both widths and already read their `bits` off the

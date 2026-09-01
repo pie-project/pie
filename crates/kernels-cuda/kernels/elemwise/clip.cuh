@@ -17,15 +17,27 @@ namespace pie::elemwise {
 /// an f32 bound the element cannot represent would let a value land one
 /// rounding past the bound the text stated.
 template <class T>
-__global__ void clamp(T* __restrict__ x, float lo, float hi, usize n)
+__global__ void clamp(T* __restrict__ x, float lo, float hi, usize n,
+                      int width, const u32* __restrict__ win)
 {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
+    // lane is not a row here, so the live-rows word bounds `win[0] * width`
+    // elements, and `win[1] * width` is where they begin. Armed, `x` arrives
+    // at its plane base and this lane owns element `at`; null, it arrived
+    // pre-shifted and `i` is the element already. The bounds are not a row
+    // plane either way, and are read where they are.
+    if (win != nullptr &&
+        i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
+    const usize at = win != nullptr
+        ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
+        : i;
 
     const float lo_r = Elem<T>::to_f32(Elem<T>::from_f32(lo));
     const float hi_r = Elem<T>::to_f32(Elem<T>::from_f32(hi));
-    const float v = Elem<T>::to_f32(x[i]);
-    x[i] = Elem<T>::from_f32(fminf(fmaxf(v, lo_r), hi_r));
+    const float v = Elem<T>::to_f32(x[at]);
+    x[at] = Elem<T>::from_f32(fminf(fmaxf(v, lo_r), hi_r));
 }
 
 
@@ -46,15 +58,28 @@ __global__ void clamp_learned(
     T* __restrict__ x,
     const T* __restrict__ lo,
     const T* __restrict__ hi,
-    usize n)
+    usize n,
+    int width,
+    const u32* __restrict__ win)
 {
     const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    // The staged-geometry seat, in the ELEMENT form this flat launch needs: a
+    // lane is not a row here, so the live-rows word bounds `win[0] * width`
+    // elements, and `win[1] * width` is where they begin. Armed, `x` arrives
+    // at its plane base and this lane owns element `at`; null, it arrived
+    // pre-shifted and `i` is the element already. The bounds are not a row
+    // plane either way, and are read where they are.
+    if (win != nullptr &&
+        i >= static_cast<usize>(win[0]) * static_cast<usize>(width)) return;
+    const usize at = win != nullptr
+        ? i + static_cast<usize>(win[1]) * static_cast<usize>(width)
+        : i;
 
     const float lo_v = Elem<T>::to_f32(lo[0]);
     const float hi_v = Elem<T>::to_f32(hi[0]);
-    const float v = Elem<T>::to_f32(x[i]);
-    x[i] = Elem<T>::from_f32(fminf(fmaxf(v, lo_v), hi_v));
+    const float v = Elem<T>::to_f32(x[at]);
+    x[at] = Elem<T>::from_f32(fminf(fmaxf(v, lo_v), hi_v));
 }
 
 }

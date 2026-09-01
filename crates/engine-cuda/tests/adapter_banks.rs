@@ -647,16 +647,39 @@ fn a_correction_reaches_no_row_outside_its_window() {
 
 /// **A REGISTRATION IS A POOL WRITE AND A TABLE ROW** (decision 17).
 ///
-/// The graph key is a fire's COMPOSITION — which classes have how many rows
-/// and lanes — and a bank's contents are not in it. The bank's addresses were
-/// reserved at load and do not move. So a deployment adds its eighth adapter
-/// between two fires of one shape and the second one replays the first's
-/// graph.
+/// The graph key is a fire's COMPOSITION — a lattice point and which classes
+/// have rows (`record::BodyKey`) — and a bank's contents are not in it. The
+/// bank's addresses were reserved at load and do not move. So a deployment
+/// adds its eighth adapter between two fires of one shape and the second one
+/// replays the first's body.
 ///
 /// Watched through the capture COUNTER, because "it did not recapture" is not
 /// a property any output has. The counter is also what says the graph path was
 /// exercised at all: a run in which nothing ever captured would pass a
-/// no-recapture assertion vacuously.
+/// no-recapture assertion vacuously. **AND `captures` IS ONLY EVIDENCE
+/// BECAUSE THIS LOAD ARMS NOTHING** — it states `Graphs::Off` and turns the
+/// mode on between fires, so every capture below belongs to the fires below.
+/// A load that stated the tiered mode would have armed its lattice before the
+/// first fire and the counter would open nonzero.
+///
+/// # Why an adapted fire reaches a body at all, and which adapted fires do not
+///
+/// `linear.lora_correct` is the one op `crate::GROUPED` names, and a GROUPED
+/// window carries segments — which `Windows::admits` calls an island, alongside
+/// gathered ones. That is not this test's composition, and the difference is
+/// the number of lanes. A window is only cut into segments when the mask it
+/// stands over is FRAGMENTED (`spans.len() > 1`); the fires here are ONE
+/// adapted lane, so the correction's mask is the whole fire, one span, no
+/// segments, whole-fire — captured, with no island in the body at all.
+///
+/// **THE MIXED ADAPTED FIRE IS SERVED FROM A SEGMENTED BODY SINCE THE TIER-2
+/// CAMPAIGN**, and the tests above are full of them: two adapted lanes with a
+/// base lane between them cut the correction's mask in two and the grouped
+/// fallback unions them into one segmented window. That window is an
+/// `Admit::Island` — the body is cut around it and it is re-issued eagerly
+/// between the execs — where it used to turn the whole composition away.
+/// [`a_mixed_adapted_fire_replays_around_its_correction`] is the claim; the
+/// tests above assert on LOGITS and are indifferent to the path either way.
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn registering_another_adapter_captures_nothing() {
@@ -671,16 +694,18 @@ fn registering_another_adapter_captures_nothing() {
     }
     shell.set_mode(Graphs::On);
 
-    // Warm and capture this composition. A key captures on its SECOND fire —
-    // the first is the eager pass that warms the scratch slabs, the JIT and
-    // the autotuner (build log 11) — so the loop below is deliberately longer
-    // than two.
+    // Warm and capture this composition. A body captures behind
+    // `record::WARM_FIRES` eager passes — they warm the scratch slabs, the JIT
+    // and the autotuner (build log 11) — so the loop below is deliberately
+    // longer than that.
     let (first, _) = solo(&mut shell, 0, &prompt, Some(0), 4);
-    let after_first = shell.graph_stats();
+    let after_first = shell.body_stats();
     assert!(
         after_first.captures > 0,
-        "nothing captured, so a no-recapture assertion would be vacuous \
-         (stats: {after_first:?})"
+        "nothing captured, so a no-recapture assertion would be vacuous. A \
+         moved `refusals` says the adapted composition was turned away from \
+         the body path, which for a SINGLE adapted lane would be a finding \
+         (see this test's header): {after_first}"
     );
 
     // Seven more adapters, one after another, and a fire of the SAME shape
@@ -690,13 +715,13 @@ fn registering_another_adapter_captures_nothing() {
         let built = loud_adapter(&shell, id as usize);
         register(&mut shell, id, &built);
     }
-        let before = shell.graph_stats().captures;
+        let before = shell.body_stats().captures;
         let (said, _) = solo(&mut shell, 0, &prompt, Some(0), 4);
-        let after = shell.graph_stats();
+        let after = shell.body_stats();
         assert_eq!(
             after.captures, before,
             "registering adapter {id} cost {} capture(s); a bank's contents are \
-             not in the graph key",
+             not in the body key",
             after.captures - before
         );
         assert_eq!(
@@ -708,10 +733,10 @@ fn registering_another_adapter_captures_nothing() {
         );
     }
 
-    let end = shell.graph_stats();
+    let end = shell.body_stats();
     eprintln!(
-        "eight adapters registered: captures {} -> {}, replays {}, nodes {}",
-        after_first.captures, end.captures, end.replays, end.nodes,
+        "eight adapters registered: captures {} -> {}; {end}",
+        after_first.captures, end.captures,
     );
     assert_eq!(
         end.captures, after_first.captures,
@@ -719,9 +744,9 @@ fn registering_another_adapter_captures_nothing() {
         end.captures - after_first.captures
     );
     assert!(
-        end.replays > after_first.replays,
+        end.hits > after_first.hits,
         "no fire replayed after the registrations, so the counter is watching \
-         nothing"
+         nothing: {end}"
     );
 }
 
@@ -843,6 +868,139 @@ fn an_adapter_and_a_word_that_disagree_are_refused() {
 
 // ── the load ─────────────────────────────────────────────────────────────
 
+/// **A MIXED ADAPTED FIRE REPLAYS, AND WHAT IT REPLAYS AROUND IS ITS
+/// CORRECTION** (the tier-2 campaign).
+///
+/// # The composition, and why it was refused until this campaign
+///
+/// Two adapted lanes with a base lane BETWEEN them. The correction's mask
+/// covers the adapted classes and the base lane's rows stand in the middle of
+/// it, so the window is two intervals — `spans.len() > 1` — and
+/// `linear.lora_correct` is the one name `crate::GROUPED` carries, so P4's
+/// grouped fallback unions the two into ONE window carrying a segment list.
+///
+/// A segment list is not an interval, and the staged seat's `(count, start)`
+/// says nothing else, so no captured pointer can name that window's rows
+/// twice. Until tier 2 that refused the whole composition
+/// (`Windows::covers_fire_shifted` collapsed to one `bool`), and the file's
+/// own header asked for this test by name. The rule has not moved: the region
+/// is an `Admit::Island`. What moved is what an island costs — the body holds
+/// every stretch around it and the fire path re-issues the correction eagerly
+/// between the execs.
+///
+/// # What is asserted, and why `hits` rather than `captures`
+///
+/// ```text
+/// (1) the composition REPLAYS  — `BodyStats::hits` moves
+/// (2) its body is SEGMENTED    — `BodyStats::islands` is nonzero
+/// (3) and every lane says what it said on the eager walk, token for token
+/// ```
+///
+/// `captures` alone would be satisfied by a body that was recorded and never
+/// launched; `hits` is what says a fire found one and ran it. And (3) is the
+/// load-bearing half: the correction is exactly the stretch a segmented body
+/// could get wrong, because its launches are re-issued from the host every
+/// fire and a ceiling taken there would grid them past the rows the grouped
+/// window actually owns (`Run::captured` is the one gate that stands them
+/// down).
+///
+/// **THIS LOAD ARMS NOTHING**, like its neighbour above: it states
+/// `Graphs::Off` and turns the mode on between fires, so the map is never
+/// sealed and every body below was minted by the fires below, through the
+/// ordinary `record::WARM_FIRES` ladder.
+#[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
+fn a_mixed_adapted_fire_replays_around_its_correction() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the segmented adapted body") else {
+        return;
+    };
+    let prompt = tok.encode(PROMPT);
+    {
+        let built = loud_adapter(&shell, 0);
+        register(&mut shell, 0, &built);
+    }
+    {
+        let built = loud_adapter(&shell, 3);
+        register(&mut shell, 1, &built);
+    }
+
+    // The mixed fire, as a closure so the two modes fire the same composition:
+    // adapted, base, adapted — the base lane's rows BETWEEN the two adapted
+    // classes, which is what cuts the correction's mask in two.
+    let fire = |shell: &mut Shell| -> Vec<u32> {
+        shell.open(0).expect("slot 0 opens");
+        shell.open(1).expect("slot 1 opens");
+        shell.open(2).expect("slot 2 opens");
+        let out = shell
+            .fire_seated(&[
+                Seated::adapted(
+                    Lane {
+                        slot: 1,
+                        word: word(prompt.len() as u32, true),
+                        tokens: &prompt,
+                    },
+                    0,
+                ),
+                Seated::of(Lane {
+                    slot: 0,
+                    word: word(prompt.len() as u32, false),
+                    tokens: &prompt,
+                }),
+                Seated::adapted(
+                    Lane {
+                        slot: 2,
+                        word: word(prompt.len() as u32, true),
+                        tokens: &prompt,
+                    },
+                    1,
+                ),
+            ])
+            .expect("the mixed adapted fire");
+        out.iter().map(|lane| argmax(lane)).collect()
+    };
+
+    // The golden: the eager walk, warmed twice so the dense tuner has settled
+    // (build log 11 — every identity in this file is between steady states).
+    shell.set_mode(Graphs::Off);
+    let _ = fire(&mut shell);
+    let eager = fire(&mut shell);
+
+    // And the tiered router. The first `record::WARM_FIRES` fires walk and the
+    // one after them captures, so the loop is deliberately longer than that.
+    shell.set_mode(Graphs::On);
+    shell.set_bodies(true);
+    for _ in 0..4 {
+        let _ = fire(&mut shell);
+    }
+    let tiered = fire(&mut shell);
+    let stats = shell.body_stats();
+    eprintln!("the segmented adapted body: {stats}");
+
+    assert!(
+        stats.hits >= 1,
+        "the mixed adapted composition replayed nothing. Its correction window \
+         is an island the body is cut around, not a refusal: {stats}"
+    );
+    assert!(
+        stats.islands >= 1,
+        "the body that served a grouped correction holds no island, so a \
+         segmented window reached a graph — which is what `Windows::admits` \
+         exists to refuse: {stats}"
+    );
+    assert_eq!(
+        tiered,
+        eager,
+        "the segmented body answered {:?} where the eager walk answered {:?}. \
+         The island is the stretch that could differ: it is re-issued from the \
+         host every fire and must plan, grid and address at the fire's own live \
+         geometry",
+        tok.decode(&tiered, false),
+        tok.decode(&eager, false),
+    );
+}
+
+
 fn snapshot() -> Option<PathBuf> {
     if let Ok(stated) = std::env::var("PIE_SMOKE_SNAPSHOT") {
         let path = PathBuf::from(stated);
@@ -926,7 +1084,14 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         slots: 4,
         ordinal: 0,
         graphs: Graphs::Off,
-        knobs: engine_cuda::Knobs::default(),
+        // The golden at load — the one gate here that records states its own
+        // mode, and stating `Off` here is what keeps the arming pass from
+        // capturing a lattice before the first fire. `bodies` is written out
+        // because it defaults to TRUE now.
+        knobs: engine_cuda::Knobs {
+            bodies: true,
+            ..engine_cuda::Knobs::default()
+        },
         program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing

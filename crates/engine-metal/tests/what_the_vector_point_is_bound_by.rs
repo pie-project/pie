@@ -82,7 +82,7 @@ fn qmv_bandwidth() {
 
     let handles = Handles::new();
     let bind = |b: &Buffer| handles.bind(b, 0, b.bytes()).expect("bind");
-    let t_codes = Tensor::new(bind(&codes), N, K, Dtype::MlxU4);
+    let t_codes = Tensor::new(bind(&codes), N, K, Dtype::U4g64);
     let t_scales = Tensor::new(bind(&scales), N, K / GROUP, Dtype::Bf16);
     let t_biases = Tensor::new(bind(&biases), N, K / GROUP, Dtype::Bf16);
     let t_x = Tensor::new(bind(&act), ROWS, K, Dtype::Bf16);

@@ -167,10 +167,10 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         Dtype::U32 => raw(writer, param, ztensor::DType::U32, None, 4),
         Dtype::U8 => raw(writer, param, ztensor::DType::U8, None, 1),
         Dtype::I8 => raw(writer, param, ztensor::DType::I8, None, 1),
-        Dtype::Fp8E4m3 => raw(writer, param, ztensor::DType::U8, Some("f8_e4m3fn"), 1),
+        Dtype::E4m3 => raw(writer, param, ztensor::DType::U8, Some("f8_e4m3fn"), 1),
         Dtype::E8m0 => raw(writer, param, ztensor::DType::U8, Some("f8_e8m0"), 1),
         Dtype::Mxfp4 => codes(writer, param),
-        Dtype::Fp4 => panic!(
+        Dtype::E2m1 => panic!(
             "`{}` is declared fp4, which names a kv-page scheme and no stored plane",
             param.name
         ),
@@ -180,7 +180,7 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         // above reaches this arm, and stating an affine bank here would mean
         // inventing a canonical layout for the codes plus a `.scales` and a
         // `.biases` — a claim about bytes no load in this file reads.
-        Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => panic!(
+        Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => panic!(
             "`{}` is declared {:?}, which this fixture does not state; the \
              affine rows are exercised through `Model::import`, not `load`",
             param.name,
@@ -190,7 +190,20 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         // SKU in the catalog declares a weight in one, so this fixture has
         // never had to state one, and inventing a layout here would be a
         // claim about a plane no model ships.
-        Dtype::Fp8E5m2 | Dtype::I64 | Dtype::I16 | Dtype::U64 | Dtype::U16 | Dtype::Bool => {
+        Dtype::E5m2
+        | Dtype::I64
+        | Dtype::I16
+        | Dtype::U64
+        | Dtype::U16
+        | Dtype::Bool
+        | Dtype::Nvfp4
+        | Dtype::U2g16k
+        | Dtype::I3g16k
+        | Dtype::U4g32k
+        | Dtype::U5g32k
+        | Dtype::I6g16k
+        | Dtype::E4m3row
+        | Dtype::E4m3tile128 => {
             panic!(
                 "`{}` is declared {:?}, which no SKU in the catalog stores",
                 param.name, param.dtype
@@ -319,7 +332,7 @@ fn nodes(expr: &Expr, wanted: &dyn Fn(&Expr) -> bool) -> usize {
 
 /// **AND THE 4-BIT ROWS ARE EXEMPT, BY THE FIXTURE'S OWN ARGUMENT.**
 ///
-/// `state`'s `MlxU4` arm refuses to write a plane: an affine bank would mean
+/// `state`'s `U4g64` arm refuses to write a plane: an affine bank would mean
 /// inventing a canonical layout for the codes plus a `.scales` and a
 /// `.biases`, which is a claim about bytes no load in this file reads. The
 /// `*-mlxu4-kv-bf16` rows are landed through `Model::import` off a real MLX

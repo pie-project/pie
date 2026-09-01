@@ -46,9 +46,9 @@
 //!
 //! # Capture legality: DECLINED BY NAME, and the reason is the census
 //!
-//! The rotation runs on the EAGER (keyed) path only, and a load that rotates
-//! declines graph recording the way a buffered fire does (`serve.rs`, design
-//! §6's own sentence). Two reasons, and the first is enough:
+//! The rotation runs on the EAGER path only, and a load that rotates declines
+//! graph recording the way a buffered fire does (`serve.rs`, design §6's own
+//! sentence). Two reasons, and the first is enough:
 //!
 //! 1. **A replay does not walk.** A captured graph is launched without the
 //!    host loop that owns the issue cursor, so a captured rotation would have
@@ -56,15 +56,16 @@
 //!    schedule being fire-invariant — and then the ring's backpressure becomes
 //!    intra-graph edges fixed at record time rather than a cursor. That is a
 //!    different design, not this one.
-//! 2. **`Tapped`'s census places nodes by their position in the parent
-//!    chain**, read off the capture frontier at each region boundary
-//!    (`record.rs`, commit e6e44d296). Copy nodes and event nodes forked onto
-//!    a second stream stand in no such position, so a fold that recorded one
-//!    would build a binding map with a hole in it — the same sentence the fold
-//!    already says about a conditional, for the same reason.
+//! 2. **The copies and their events are not in the walk's own order.** A copy
+//!    node and the event node behind it are forked onto a second stream, so
+//!    they stand in no position of the parent chain the capture frontier
+//!    walks — and a captured region whose nodes cannot be placed is a region
+//!    a replay cannot stand for.
 //!
-//! So: a typed decline at the arm beats a wrong graph at the replay, and the
-//! keyed path serves these loads today.
+//! So: a typed decline at the router beats a wrong graph at the replay, and
+//! the EAGER walk serves these loads today — counted, not silent
+//! (`record::BodyStats::eager_rotating`, and the boot line `Shell::load`
+//! prints when a load arms a rotor under a recording mode).
 //!
 //! # What is NOT rotated, and why that is not a failure
 //!

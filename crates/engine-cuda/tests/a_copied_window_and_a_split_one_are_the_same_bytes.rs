@@ -636,24 +636,51 @@ fn what_a_copy_and_a_split_cost_on_this_device() {
 
 // ── (f) and the recorded graph carries it ────────────────────────────────
 
-/// **A COPY UNDER `Graphs::On`**, which is the one place the scratch slab's
-/// own contract could bite.
+/// **A COPY UNDER `Graphs::On`** — and what that mode means for a gathered
+/// window is: A SEGMENTED BODY, with the copy as its island.
 ///
-/// `Ctx::scratch` grows by `cudaFree` + `cudaMalloc`, which under
-/// `cudaStreamBeginCapture` is a typed refusal rather than a corruption. The
-/// record path's answer for every other scratch consumer is that a key's
-/// first fires are EAGER and at the same shape (`record::WARM_FIRES`), so the
-/// slab a capture pass reads has already been grown by the eager pass in
-/// front of it — and the copy slab is sized off the window table, which is
-/// what `record::Key` IS. So the argument says this works; this is the gate
-/// for it, and a `Fault::Unwarmed` here would be the argument failing rather
-/// than a surprise.
+/// # What the tiered router does with this composition
 ///
-/// The composition is repeated so it reaches a capture and then a replay,
-/// which is `export_axes`'s own recipe for the split.
+/// `Fallback::Copy` compacts its rows into a gathered rectangle whose payload
+/// sits at a fire-dependent offset behind `Slots::tail()`, so no captured
+/// pointer names those rows twice — which is why `Windows::admits` calls the
+/// region an `Admit::Island` with no clause anywhere in it that reads a
+/// policy. The tier-2 campaign made that a statement about the REGION rather
+/// than about the composition: `record::cuts` cuts the template around the
+/// island, each captured stretch becomes its own exec, and the island's
+/// `[gather … the region's launches … scatter]` is re-issued by the eager walk
+/// between them, on the same stream, at this fire's own live geometry.
+///
+/// The scratch-slab contract is what makes that safe and it is unchanged:
+/// `Ctx::scratch` grows by allocating fresh and RETIRING the old block, so the
+/// addresses the segments around the island baked stay mapped however far the
+/// island's own rectangle grows — and the island grows it OUTSIDE a capture,
+/// which is the whole difference between an island and a segment.
+///
+/// # What is asserted
+///
+/// ```text
+/// (1) the composition REPLAYS — `BodyStats::hits` moves, which is the
+///     evidence a body exists and was launched, where `captures` alone would
+///     only say the boot armed something
+/// (2) the body it replays is SEGMENTED — `BodyStats::islands` is nonzero,
+///     because a gathered region cannot be in a graph and this file's whole
+///     premise is that this composition has one
+/// (3) and the numbers are the golden's, bit for bit — same logits, same
+///     captured mass, with the copy path engaged on both arms
+///     (`FireCost::copied`)
+/// ```
+///
+/// **THE IDENTITY IS STILL THE LOAD-BEARING HALF.** A replay that answered
+/// different bytes would be worse than no replay at all, and the island is
+/// exactly the part of the fire where a segmented body could get it wrong: its
+/// launches are re-issued from the host every fire, and if any of them had
+/// taken the key's ceiling instead of the fire's live span
+/// (`Run::captured` is the one gate that stands them down) they would be
+/// gridded past the rectangle the gather filled.
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
-fn a_copied_window_replays_out_of_a_recorded_graph_identically() {
+fn a_copied_window_says_under_the_tiered_router_what_it_says_eagerly() {
     let _serial = serialized();
     let Some((mut shell, tok)) = ready("the recorded copy") else {
         return;
@@ -673,31 +700,57 @@ fn a_copied_window_replays_out_of_a_recorded_graph_identically() {
     assert!(eager_cost.copied > 0, "the eager half copied nothing");
 
     shell.set_mode(Graphs::On);
-    // Three fires: the first two are eager passes of the key, the third is
-    // the capture, and everything after replays. `WARM_FIRES` is 2.
+    shell.set_bodies(true);
+    // Four fires, the last one read. **THIS LOAD STATES `Graphs::Off` AT
+    // BOOT**, so its arming pass never ran and the map was never sealed — the
+    // body below is minted by these fires, through the ordinary warm ladder:
+    // the first two walk eagerly (`record::WARM_FIRES`, for the dense tuner's
+    // reason) and the third captures the segments off the second's warmed
+    // slabs. The loop is deliberately longer than that so the last fire is a
+    // replay and not a capture, and the repetition is also what the SLAB
+    // argument wants: the island grows the copy slab on every one of these
+    // fires, outside any capture, while the segments around it go on launching
+    // the addresses they baked. (A load that stated the tiered mode would have
+    // armed this composition at boot instead — `Shell::arm_bodies`' fragmenting
+    // arm is the one that reaches a shape P4 wrote a `Fallback` row for — and
+    // `an_island_body_replays_at_another_split.rs` is that claim.)
     for _ in 0..3 {
         let _ = fire_it(&mut shell, &fed);
     }
-    let (replay_out, replay_mass, replay_cost) = fire_it(&mut shell, &fed);
-    let stats = shell.graph_stats();
+    let (tiered_out, tiered_mass, tiered_cost) = fire_it(&mut shell, &fed);
+    let stats = shell.body_stats();
     eprintln!(
-        "recorded copy: {} captures, {} replays, {} warming, {} declined; \
-         {} launches, {} gathered",
-        stats.captures,
-        stats.replays,
-        stats.warming,
-        stats.declined,
-        replay_cost.launches,
-        replay_cost.copied,
+        "the tiered router over a copy: {stats}; {} launches, {} gathered",
+        tiered_cost.launches, tiered_cost.copied,
     );
     assert!(
-        stats.captures > 0,
-        "nothing was captured, so nothing replayed"
+        tiered_cost.copied > 0,
+        "the tiered half copied nothing, so the two arms are not the same \
+         composition and the identity below is about the wrong thing"
     );
-    assert!(stats.replays > 0, "no fire replayed out of a graph");
+    // **THE REPLAY, ASSERTED AS HITS AND NOT AS CAPTURES.** A boot that armed
+    // this key makes `captures` true whether or not anything ever replayed;
+    // `hits` is the number that says a fire found its body and launched it.
+    assert!(
+        stats.hits >= 1,
+        "a fire with a gathered window replayed nothing. Its key is armed by \
+         `Shell::arm_bodies`' fragmenting arm and its gathered region is an \
+         island the body is cut around, so a hit is what this composition owes: \
+         {stats}"
+    );
+    // **AND THE BODY IS SEGMENTED, WHICH IS THE OTHER HALF.** A hit with no
+    // island would mean the gathered region had been captured — the corruption
+    // `Windows::admits` exists to refuse — or that this fire never gathered at
+    // all, which the `copied` assertion above already denies.
+    assert!(
+        stats.islands >= 1,
+        "the body that served a gathered composition holds no island, so either \
+         the copy window reached a graph or the cut was made somewhere else: \
+         {stats}"
+    );
 
-    same_logits(&eager_out, &replay_out, "the recorded copy");
-    same_mass(&eager_mass, &replay_mass, "the recorded copy");
+    same_logits(&eager_out, &tiered_out, "the tiered copy");
+    same_mass(&eager_mass, &tiered_mass, "the tiered copy");
 }
 
 // ── the load ─────────────────────────────────────────────────────────────
@@ -787,8 +840,13 @@ fn load(what: &str, budget: Budget, slots: u32) -> Option<(Shell, tokenizer::Tok
         slots,
         ordinal: 0,
         graphs: Graphs::Off,
+        // The golden at load; the tiered gate below states its own mode. And
+        // `bodies` is written out because it defaults to TRUE now — this load
+        // says `Off`, which is what keeps the arming pass from running, so the
+        // word here is documentation rather than a lever.
         knobs: engine_cuda::Knobs {
             grouped: false,
+            bodies: true,
             ..engine_cuda::Knobs::default()
         },
         program_cache_dir: None,

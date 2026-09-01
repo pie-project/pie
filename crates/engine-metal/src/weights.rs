@@ -713,12 +713,12 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
             let (rows, width) = rectangle(&param.shape);
             Ok(match param.dtype {
                 Dtype::Mxfp4 => rows.saturating_mul(width),
-                Dtype::MlxU4 | Dtype::MlxU4G32 => rows.saturating_mul(width).div_ceil(2),
+                Dtype::U4g64 | Dtype::U4g32 => rows.saturating_mul(width).div_ceil(2),
                 // The same logical rectangle at a whole byte a code — see
-                // `dtype::Dtype::MlxU8`, and note that the `div_ceil` above is
+                // `dtype::Dtype::U8g64`, and note that the `div_ceil` above is
                 // the one thing that does NOT carry over: an eight-bit code
                 // owns its byte, so no row can round up into the next.
-                Dtype::MlxU8 => rows.saturating_mul(width),
+                Dtype::U8g64 => rows.saturating_mul(width),
                 other => {
                     let element =
                         model_compiler::arena::elem_bytes(other).ok_or_else(|| Fault::Param {

@@ -25,7 +25,7 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
         "qwen38-flash-mlxu4-kv-bf16",
         1,
         model_dsl::trace_hybrid,
-        Model::flash(Dtype::MlxU4, Dtype::Bf16, 1)
+        Model::flash(Dtype::U4g64, Dtype::Bf16, 1)
     ),
     (
         "qwen38-flash-bf16-kv-bf16",
@@ -37,7 +37,7 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
 
 pub const IMPORTS: &[crate::ImportRow] = &[
     ("qwen38-flash-mlxu4-kv-bf16", |src| {
-        Model::flash(Dtype::MlxU4, Dtype::Bf16, 1).import(src)
+        Model::flash(Dtype::U4g64, Dtype::Bf16, 1).import(src)
     }),
     ("qwen38-flash-bf16-kv-bf16", |src| {
         Model::flash(Dtype::Bf16, Dtype::Bf16, 1).import(src)

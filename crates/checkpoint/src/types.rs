@@ -43,7 +43,7 @@ pub use dtype::Dtype as DType;
 /// about checkpoints.
 #[must_use]
 pub fn is_block_scaled(dtype: DType) -> bool {
-    matches!(dtype, DType::Fp8E4m3 | DType::Fp8E5m2)
+    matches!(dtype, DType::E4m3 | DType::E5m2)
 }
 
 /// Which on-disk format a checkpoint file is.

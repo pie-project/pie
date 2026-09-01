@@ -646,14 +646,23 @@ fn the_masked_arm_says_what_the_causal_arm_says() {
     );
 }
 
-/// **CAPTURE COVERS A MASKED COMPOSITION.** A new key captures once and
-/// replays identically.
+/// **A BODY COVERS A MASKED COMPOSITION.** A new `record::BodyKey` captures
+/// once and replays identically.
 ///
 /// The masked class is a third window in the fire, a third attention schedule
 /// in the prepare phase and a mask slab whose span table is sliced per window
 /// — every one of which is a pointer or an extent a capture could freeze at
 /// this fire's value instead of this KEY's. The counter is watched because
 /// "it did not capture again" is not a property any output has.
+///
+/// **AND THE KEY IT IS ASKED OF IS A COMPOSITION NOW.** This gate was written
+/// over the exact-shape keyed cache, where the masked fire's own `(rows,
+/// lanes)` was the key; the tier-2 campaign deleted that path, so the subject
+/// is the body the tiered router captures for this composition and the
+/// counters are `BodyStats`. Nothing about the claim moves with it — a mask
+/// slab frozen at the wrong span is exactly as wrong under either key — and
+/// what the change buys the gate is that `Graphs::On` is now the SHIPPING
+/// path rather than one of two.
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_masked_composition_captures_once_and_replays_identically() {
@@ -690,15 +699,14 @@ fn a_masked_composition_captures_once_and_replays_identically() {
     let shaped = run(engine_cuda::Graphs::Shaped);
     let replayed = run(engine_cuda::Graphs::On);
 
-    let stats = shell.graph_stats();
-    eprintln!(
-        "masked capture: {} captured ({} nodes), {} replayed, {} declined",
-        stats.captures, stats.nodes, stats.replays, stats.declined,
-    );
+    let stats = shell.body_stats();
+    eprintln!("masked capture: {stats}");
     assert!(
-        stats.captures >= 1 && stats.replays >= 1,
-        "the masked composition neither captured nor replayed, so this compared \
-         eager against eager: {stats:?}"
+        stats.hits >= 1,
+        "the masked composition was never served from a body, so this compared \
+         eager against eager. `refusals` says whether the admissibility rule \
+         turned the masked window away and `declines` whether its schedule \
+         refused to be graph-shaped: {stats}"
     );
     assert_eq!(
         eager, shaped,
@@ -990,7 +998,14 @@ mod maskless {
             slots: 4,
             ordinal: 0,
             graphs: engine_cuda::Graphs::Off,
-            knobs: engine_cuda::Knobs::default(),
+            // The golden at load; the one gate here that records states its
+            // own mode. `bodies` is written out because it defaults to TRUE
+            // now, and a load stating `Off` is what keeps the arming pass from
+            // running rather than the word being absent.
+            knobs: engine_cuda::Knobs {
+                bodies: true,
+                ..engine_cuda::Knobs::default()
+            },
             program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and read
             // its numbers, so a deeper ring would carve slots nothing claims.
@@ -1638,7 +1653,14 @@ mod gemma {
             slots: 4,
             ordinal: 0,
             graphs: engine_cuda::Graphs::Off,
-            knobs: engine_cuda::Knobs::default(),
+            // The golden at load; the one gate here that records states its
+            // own mode. `bodies` is written out because it defaults to TRUE
+            // now, and a load stating `Off` is what keeps the arming pass from
+            // running rather than the word being absent.
+            knobs: engine_cuda::Knobs {
+                bodies: true,
+                ..engine_cuda::Knobs::default()
+            },
             program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing

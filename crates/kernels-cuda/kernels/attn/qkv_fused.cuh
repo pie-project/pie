@@ -32,15 +32,23 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     const int r = blockIdx.x;
 
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows START: `packed`, `q_out`,
+    // `positions`, `rope_table`, `row_valid` and the staged `w_page` / `w_off`
+    // write tables are all row planes handed at their base, and move with it.
+    // The `kv_page_indptr` / `kv_last_page_lens` FALLBACK below stays on the
+    // raw block index: those are per-REQUEST prefix sums, and a window that
+    // starts anywhere but row zero is admissible through the staged write
+    // tables only.
+    const int row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     const int head_idx = blockIdx.y;
     const bool is_q = head_idx < num_q_heads;
-    if (!is_q && row_valid != nullptr && row_valid[r] == 0) return;
+    if (!is_q && row_valid != nullptr && row_valid[row] == 0) return;
     const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
     const int q_dim = num_q_heads * head_dim;
     const int kv_dim = num_kv_heads * head_dim;
     const int packed_stride = q_dim + 2 * kv_dim;
     const bf16* src_row =
-        packed + static_cast<long long>(r) * packed_stride;
+        packed + static_cast<long long>(row) * packed_stride;
     const bf16* src = is_q
         ? src_row + local_head * head_dim
         : src_row + q_dim + local_head * head_dim;
@@ -75,14 +83,14 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     bf16* dst = nullptr;
     bf16* v_dst = nullptr;
     if (is_q) {
-        dst = q_out + (static_cast<long long>(r) * num_q_heads + local_head) *
+        dst = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
                       head_dim;
     } else {
         int actual_page;
         int offset_in_page;
         if (w_page != nullptr && w_off != nullptr) {
-            actual_page = static_cast<int>(w_page[r]);
-            offset_in_page = static_cast<int>(w_off[r]);
+            actual_page = static_cast<int>(w_page[row]);
+            offset_in_page = static_cast<int>(w_off[row]);
         } else {
             const int pages_first = kv_page_indptr[r];
             const int pages_last = kv_page_indptr[r + 1];
@@ -123,9 +131,9 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv(
     const float* rope_row = nullptr;
     int pos = 0;
     if constexpr (USE_ROPE_TABLE) {
-        rope_row = rope_table + static_cast<long long>(r) * head_dim;
+        rope_row = rope_table + static_cast<long long>(row) * head_dim;
     } else {
-        pos = positions[r];
+        pos = positions[row];
     }
     for (int dim_pair = threadIdx.x; dim_pair < half; dim_pair += BLOCK) {
         const float a = bf16_to_f32(src[dim_pair]) *
@@ -188,15 +196,24 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const int r = unit / total_qk_heads;
 
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows START: `packed`, `q_out`,
+    // `positions`, `rope_table`, `row_valid` and the staged `w_page` / `w_off`
+    // write tables are all row planes handed at their base, and move with it.
+    // The `kv_page_indptr` / `kv_last_page_lens` FALLBACK below stays on the
+    // raw block index: those are per-REQUEST prefix sums, and a window that
+    // starts anywhere but row zero is admissible through the staged write
+    // tables only.
+    const int row = win != nullptr ? r + static_cast<int>(win[1]) : r;
+    // `head_idx` un-flattens the LAUNCH unit and keeps the raw `r`.
     const int head_idx = unit - r * total_qk_heads;
     const bool is_q = head_idx < num_q_heads;
-    if (!is_q && row_valid != nullptr && row_valid[r] == 0) return;
+    if (!is_q && row_valid != nullptr && row_valid[row] == 0) return;
     const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
     const int q_dim = num_q_heads * HEAD_DIM;
     const int kv_dim = num_kv_heads * HEAD_DIM;
     const int packed_stride = q_dim + 2 * kv_dim;
     const bf16* src_row =
-        packed + static_cast<long long>(r) * packed_stride;
+        packed + static_cast<long long>(row) * packed_stride;
     const bf16* src = is_q
         ? src_row + local_head * HEAD_DIM
         : src_row + q_dim + local_head * HEAD_DIM;
@@ -235,9 +252,9 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     const float* rope_row = nullptr;
     int pos = 0;
     if constexpr (USE_ROPE_TABLE) {
-        rope_row = rope_table + static_cast<long long>(r) * HEAD_DIM;
+        rope_row = rope_table + static_cast<long long>(row) * HEAD_DIM;
     } else {
-        pos = positions[r];
+        pos = positions[row];
     }
 #pragma unroll
     for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
@@ -263,14 +280,14 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     bf16* dst = nullptr;
     bf16* v_dst = nullptr;
     if (is_q) {
-        dst = q_out + (static_cast<long long>(r) * num_q_heads + local_head) *
+        dst = q_out + (static_cast<long long>(row) * num_q_heads + local_head) *
                       HEAD_DIM;
     } else {
         int actual_page;
         int offset_in_page;
         if (w_page != nullptr && w_off != nullptr) {
-            actual_page = static_cast<int>(w_page[r]);
-            offset_in_page = static_cast<int>(w_off[r]);
+            actual_page = static_cast<int>(w_page[row]);
+            offset_in_page = static_cast<int>(w_off[row]);
         } else {
             const int pages_first = kv_page_indptr[r];
             const int pages_last = kv_page_indptr[r + 1];

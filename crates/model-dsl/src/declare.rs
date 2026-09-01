@@ -110,7 +110,7 @@ impl Weight {
             .unwrap_or_else(|| panic!("`{}` is {:?} and has no axis {i}", self.name, self.shape))
     }
 
-    /// The dtype activations see through this weight. Mxfp4 and MlxU4 banks
+    /// The dtype activations see through this weight. Mxfp4 and U4g64 banks
     /// store codes and compute in bf16; the rest of `Dtype` names kv-cache
     /// schemes, index layouts, and the companion planes a bank interns beside
     /// itself — never a weight an author declares.
@@ -138,19 +138,19 @@ impl Weight {
             // bank that dequantizes to the right spread around the wrong
             // centre, silently.
             // **BOTH AFFINE WIDTHS TAKE THIS ARM, AND THE WIDTH IS THE ONLY
-            // THING THAT DIFFERS.** `MlxU8` is `MlxU4`'s scheme at eight bits
+            // THING THAT DIFFERS.** `U8g64` is `U4g64`'s scheme at eight bits
             // a code — `mlx_lm`'s `quant_predicate` raises a MoE router gate
             // to it while the stack around it stays at four (see
-            // `dtype::Dtype::MlxU8`) — and everything below is a fact about
+            // `dtype::Dtype::U8g64`) — and everything below is a fact about
             // the SCHEME rather than the width or the group: the codes keep
             // the logical shape and both companions are one bf16 per group.
             // So the plane carries `self.dtype` and the arm is shared; a
             // width- or group-specific arm here would be copies of one
             // paragraph with one number changed — and the group IS that one
-            // number (`MlxU4G32` is the 160-wide-row reading, see its doc).
-            Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => {
+            // number (`U4g32` is the 160-wide-row reading, see its doc).
+            Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => {
                 let group = match self.dtype {
-                    Dtype::MlxU4G32 => 32,
+                    Dtype::U4g32 => 32,
                     _ => 64,
                 };
                 let (&k, lead) = self
@@ -212,6 +212,23 @@ impl Weight {
                     },
                 ]
             }
+            // Served formats no model TEXT declares yet: they reach the
+            // engine through an import plan, not through a family's weight
+            // declaration, so a declaration naming one has no plane story to
+            // intern. The day a text declares one, its author lands here and
+            // writes that story — which is this panic's whole job.
+            Dtype::Nvfp4
+            | Dtype::U2g16k
+            | Dtype::I3g16k
+            | Dtype::U4g32k
+            | Dtype::U5g32k
+            | Dtype::I6g16k
+            | Dtype::E4m3row
+            | Dtype::E4m3tile128 => panic!(
+                "`{}`: {:?} is served but not yet a weight representation a \
+                 model text declares",
+                self.name, self.dtype
+            ),
             Dtype::Bf16
             | Dtype::F16
             | Dtype::F32
@@ -219,10 +236,10 @@ impl Weight {
             | Dtype::U32
             | Dtype::U8
             | Dtype::I8
-            | Dtype::Fp8E4m3
-            | Dtype::Fp4
+            | Dtype::E4m3
+            | Dtype::E2m1
             | Dtype::E8m0
-            | Dtype::Fp8E5m2
+            | Dtype::E5m2
             | Dtype::I64
             | Dtype::I16
             | Dtype::U64
@@ -275,7 +292,7 @@ pub fn biases_name(of: &str) -> String {
 /// dtype no weight is declared in.
 ///
 /// Asked of the dtype rather than of the weight so a model text can state a
-/// bank's neighbours without owning a bank: a norm beside an MlxU4 projection
+/// bank's neighbours without owning a bank: a norm beside an U4g64 projection
 /// is bf16 BECAUSE the projection computes in bf16, and saying so here is what
 /// keeps a quantized SKU from being a second family text whose norms happen to
 /// have been remembered. [`Weight::compute_dtype`] is this function plus the
@@ -286,15 +303,25 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         Dtype::Bf16 => Some(Dtype::Bf16),
         Dtype::F16 => Some(Dtype::F16),
         Dtype::F32 => Some(Dtype::F32),
-        Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 | Dtype::MlxU4G32 => Some(Dtype::Bf16),
+        Dtype::Mxfp4 | Dtype::U4g64 | Dtype::U8g64 | Dtype::U4g32 => Some(Dtype::Bf16),
+        // Served formats no model text declares (yet): a plan lands them,
+        // an author does not, so they have no compute story here either.
+        Dtype::Nvfp4
+        | Dtype::U2g16k
+        | Dtype::I3g16k
+        | Dtype::U4g32k
+        | Dtype::U5g32k
+        | Dtype::I6g16k
+        | Dtype::E4m3row
+        | Dtype::E4m3tile128 => None,
         Dtype::I32
         | Dtype::U32
         | Dtype::U8
         | Dtype::I8
-        | Dtype::Fp8E4m3
-        | Dtype::Fp4
+        | Dtype::E4m3
+        | Dtype::E2m1
         | Dtype::E8m0
-        | Dtype::Fp8E5m2
+        | Dtype::E5m2
         | Dtype::I64
         | Dtype::I16
         | Dtype::U64

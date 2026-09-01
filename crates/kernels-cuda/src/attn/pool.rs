@@ -285,6 +285,9 @@ pub fn attention_lse(
             ratio.arg(),
             entries.page_size.arg(),
             sm_scale.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

@@ -703,7 +703,7 @@ impl LoadPlan {
             .filter(|t| {
                 matches!(
                     &t.encoding,
-                    Encoding::Quant(spec) if spec.scheme == QuantScheme::Mxfp4E2M1E8M0
+                    Encoding::Quant(spec) if spec.is_mxfp4()
                 )
             })
             .map(|t| t.name.clone())
@@ -741,11 +741,7 @@ impl LoadPlan {
             .tensors
             .iter()
             .filter_map(|t| match &t.encoding {
-                Encoding::Quant(spec)
-                    if spec.scheme != QuantScheme::Mxfp4E2M1E8M0 && spec.group_size > 0 =>
-                {
-                    Some((spec.group_size, u32::from(spec.bits_per_element)))
-                }
+                Encoding::Quant(spec) => spec.affine_point(),
                 _ => None,
             })
             .collect();
@@ -780,14 +776,7 @@ impl LoadPlan {
         self.tensors
             .iter()
             .filter_map(|t| match &t.encoding {
-                Encoding::Quant(spec)
-                    if spec.scheme != QuantScheme::Mxfp4E2M1E8M0 && spec.group_size > 0 =>
-                {
-                    Some((
-                        t.name.clone(),
-                        (spec.group_size, u32::from(spec.bits_per_element)),
-                    ))
-                }
+                Encoding::Quant(spec) => spec.affine_point().map(|p| (t.name.clone(), p)),
                 _ => None,
             })
             .collect()
@@ -809,11 +798,7 @@ impl LoadPlan {
             .iter()
             .find(|t| t.name == name)
             .and_then(|t| match &t.encoding {
-                Encoding::Quant(spec)
-                    if spec.scheme != QuantScheme::Mxfp4E2M1E8M0 && spec.group_size > 0 =>
-                {
-                    Some((spec.group_size, u32::from(spec.bits_per_element)))
-                }
+                Encoding::Quant(spec) => spec.affine_point(),
                 _ => None,
             })
     }
@@ -825,10 +810,9 @@ impl LoadPlan {
             let Encoding::Quant(spec) = &t.encoding else {
                 continue;
             };
-            if spec.scheme == QuantScheme::Mxfp4E2M1E8M0 || spec.group_size == 0 {
+            let Some(point) = spec.affine_point() else {
                 continue;
-            }
-            let point = (spec.group_size, u32::from(spec.bits_per_element));
+            };
             if !out.iter().any(|(p, _)| *p == point) {
                 out.push((point, t.name.clone()));
             }

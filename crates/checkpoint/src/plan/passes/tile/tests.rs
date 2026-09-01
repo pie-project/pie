@@ -63,7 +63,7 @@ fn fp8_sources_are_never_tiled() {
     // An FP8 source carries a [rows/128, cols/128] block scale, so an arbitrary
     // row split would cut a scale block in half. Budget is irrelevant: even a
     // 1 KiB budget must not tile.
-    for dtype in [DType::Fp8E4m3, DType::Fp8E5m2] {
+    for dtype in [DType::E4m3, DType::E5m2] {
         assert_eq!(
             rows_per_tile(&facts(dtype, 4096, 4096, 1024)),
             0,
@@ -107,7 +107,7 @@ fn a_target_with_no_block_scale_layout_tiles_an_fp8_source() {
         block_scale_rows: 0,
         ..cuda_target(false)
     };
-    let facts = facts(DType::Fp8E4m3, 4096, 4096, 4 * MIB);
+    let facts = facts(DType::E4m3, 4096, 4096, 4 * MIB);
     assert_eq!(lower_tile_map(&facts, &target).rows_per_tile, 341);
 }
 
@@ -170,7 +170,7 @@ fn an_unresolvable_shape_or_dtype_declines_to_tile() {
 fn only_encode_is_lowered() {
     // Cast and Reblock have no scratch to budget; the executor streams them.
     for kind in [TileMapKind::Cast, TileMapKind::Reblock] {
-        let mut f = facts(DType::Fp8E4m3, 4096, 4096, 4 * MIB);
+        let mut f = facts(DType::E4m3, 4096, 4096, 4 * MIB);
         f.kind = kind;
         assert_eq!(cuda_lower(&f, true), TileLowering::default(), "{kind:?}");
     }
@@ -178,7 +178,7 @@ fn only_encode_is_lowered() {
 
 #[test]
 fn fusion_needs_every_conjunct() {
-    let base = facts(DType::Fp8E4m3, 4096, 4096, 4 * MIB);
+    let base = facts(DType::E4m3, 4096, 4096, 4 * MIB);
     assert_eq!(cuda_lower(&base, true).fusion, TransformFusion::Fp8ToMxfp4);
 
     // The engine's opt-out, formerly PIE_CUDA_DISABLE_FUSED_TRANSCODE.
@@ -197,7 +197,7 @@ fn fusion_needs_every_conjunct() {
 
     // E5M2 is not the format the fused kernel decodes.
     let mut e5m2 = base;
-    e5m2.source_dtype = Some(DType::Fp8E5m2);
+    e5m2.source_dtype = Some(DType::E5m2);
     assert_eq!(cuda_lower(&e5m2, true).fusion, TransformFusion::None);
 }
 
@@ -230,7 +230,7 @@ fn backends_without_transform_kernels_decide_nothing() {
         block_scale_rows: 128,
         ..StorageTarget::default()
     };
-    let facts = facts(DType::Fp8E4m3, 4096, 4096, 4 * MIB);
+    let facts = facts(DType::E4m3, 4096, 4096, 4 * MIB);
     assert_eq!(lower_tile_map(&facts, &target), TileLowering::default());
 }
 
@@ -245,7 +245,7 @@ fn the_reference_backend_declines_every_optimization() {
         block_scale_rows: 128,
         ..StorageTarget::default()
     };
-    let facts = facts(DType::Fp8E4m3, 4096, 4096, 4 * MIB);
+    let facts = facts(DType::E4m3, 4096, 4096, 4 * MIB);
     assert_eq!(lower_tile_map(&facts, &target), TileLowering::default());
 }
 
@@ -341,7 +341,7 @@ fn only_tile_map(plan: &LoadPlan) -> (&TileSpec, &TransformSpec) {
 
 #[test]
 fn lowering_writes_decisions_back_into_the_instruction() {
-    let mut plan = encode_plan(Encoding::Raw(DType::Fp8E4m3), 4096, 4096);
+    let mut plan = encode_plan(Encoding::Raw(DType::E4m3), 4096, 4096);
     lower(&mut plan);
     let (tile, transform) = only_tile_map(&plan);
     assert_eq!(tile.rows_per_tile, 0);
@@ -358,7 +358,7 @@ fn a_quantized_source_resolves_to_its_logical_dtype() {
     let mut plan = encode_plan(
         Encoding::Quant(QuantSpec {
             scheme: QuantScheme::Fp8E4M3,
-            logical_dtype: DType::Fp8E4m3,
+            logical_dtype: DType::E4m3,
             bits_per_element: 8,
             group_size: 0,
             channel_axis: None,

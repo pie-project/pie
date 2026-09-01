@@ -464,13 +464,18 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 #endif
     // apply rotary embedding to q matrix
     q_vec = vec_apply_llama_rope<vec_size, bdx>(
-        q + batch_idx * q_stride_n + qo_head_idx * q_stride_h, freq, q_rope_offset_val);
+        q + params.q_indptr[batch_idx] * q_stride_n + qo_head_idx * q_stride_h, freq,
+        q_rope_offset_val);
   } else {
 // do not apply rotary embedding to q matrix
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
 #endif
-    q_vec.cast_load(q + batch_idx * q_stride_n + qo_head_idx * q_stride_h + tx * vec_size);
+    // PIE: the request's query row, read from `q_indptr` rather than taken as
+    // `batch_idx` -- the same row when the vector is the launch's own, and the
+    // plane's row when `batch_idx` is a fire lane.
+    q_vec.cast_load(q + params.q_indptr[batch_idx] * q_stride_n + qo_head_idx * q_stride_h +
+                    tx * vec_size);
   }
 
   // preload k/v tiles

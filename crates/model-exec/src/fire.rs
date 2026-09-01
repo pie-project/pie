@@ -66,14 +66,14 @@ pub mod walk;
 
 pub use compose::{
     ClassWindow, Composition, Lane, LaneRow, MaskSpan, RowSpan, WindowTable, compose,
-    compose_axes,
+    compose_axes, rung_of,
 };
 pub use descriptor::{
     ABI_VERSION, CLASS_BYTES, FireDescriptor, HEADER_BYTES, LANE_BYTES, MAGIC, PATCH_LANE_BYTES,
 };
 pub use fallback::{Serve, answers as fallback_answers, fragmentable, max_runs};
 pub use sink::{EagerSink, EventId, Sink};
-pub use walk::{Phases, Units, walk, walk_phases, walk_units};
+pub use walk::{Phases, Regions, Units, walk, walk_phases, walk_regions, walk_units};
 
 /// What the fire substrate refuses, and why.
 ///

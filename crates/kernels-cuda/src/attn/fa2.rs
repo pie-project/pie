@@ -367,6 +367,15 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
             split.max_seq_len.arg(),
             ArgValue::Ptr(split.seq_len),
             split.num_heads.arg(),
+            // **THE FOLD IS WHERE FA2 TOUCHES THE PLANE**, so it is the one
+            // launch of this family that takes the seat. Under a split
+            // schedule the attention itself writes only the partial planes
+            // in the plan's workspace; `v_merged`/`s_merged` are the fire's
+            // own output and log-sum-exp rectangles, and a region handed
+            // those UNSLICED needs `win[1]` to find its rows. A null seat is
+            // row zero and the whole extent, which is every fire that is not
+            // a body's.
+            ctx.stage(),
         ],
     )
 }

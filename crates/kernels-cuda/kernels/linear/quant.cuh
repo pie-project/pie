@@ -1015,13 +1015,18 @@ __global__ void matmul_mlx_affine(
     T* __restrict__ out,
     int n,
     int k,
-    const MoeGroupBases* __restrict__ bases)
+    const MoeGroupBases* __restrict__ bases,
+    const u32* __restrict__ win)
 {
     constexpr int kRows = kRowsT;
     constexpr int kPerWord = 32 / kBits;
     constexpr int kWords = 64 / kPerWord;
     constexpr unsigned kMask = (1u << kBits) - 1u;
     const int token = blockIdx.x;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && token >= static_cast<int>(win[0])) return;
     const int warp_in_block = threadIdx.x >> 5;
     const int lane_id = threadIdx.x & 31;
     const int row0 = (blockIdx.y * (blockDim.x >> 5) + warp_in_block) * kRows;

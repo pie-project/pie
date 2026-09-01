@@ -34,12 +34,23 @@ __global__ void embed_weighted(
     T* __restrict__ y,
     int hidden,
     int vocab,
-    int taps)
+    int taps,
+    const u32* __restrict__ win)
 {
     const int n = blockIdx.x;
-    const i32* row_ids = ids + static_cast<long long>(n) * taps;
-    const float* row_w = weights + static_cast<long long>(n) * taps;
-    T* out = y + static_cast<long long>(n) * hidden;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): a replay whose grid
+    // was carved at a bucket retires its padded rows here, off a word the
+    // fire staged, not a parameter the recording baked.
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    // And `win[1]` is where those live rows start: the `[rows, taps]` `ids`
+    // and `weights` streams and `y` are row planes handed at their base and
+    // move together. `table` is the GRID the ids read, whose row axis is the
+    // id's and not this launch's, and never moves.
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const i32* row_ids = ids + static_cast<long long>(row) * taps;
+    const float* row_w = weights + static_cast<long long>(row) * taps;
+    T* out = y + static_cast<long long>(row) * hidden;
 
     for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
         float acc = 0.f;

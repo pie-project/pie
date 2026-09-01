@@ -9,7 +9,7 @@ use core::cmp::Reverse;
 
 use crate::error::Error;
 
-use crate::attn::plan::{Built, Device, PrefillPlanSm90Info};
+use crate::attn::plan::{Built, Device, Live, PrefillPlanSm90Info};
 use crate::attn::sched::{
     AlignedAllocator, at, CostHeap, Staging, cost_function, lengths, narrow, narrow_all,
     packed_causal_kv_end, spans,
@@ -24,8 +24,14 @@ pub struct Request<'a> {
     pub kv_indptr: &'a [i32],
     /// Host per-request kv lengths, in tokens — `[batch_size]`.
     pub kv_len_arr: &'a [i32],
+    /// The row and lane counts this schedule is CARVED for: what the
+    /// per-head work bound and the allocations behind it are sized at.
     pub total_num_rows: u32,
     pub batch_size: u32,
+    /// **AND WHAT THIS FIRE ACTUALLY BROUGHT** ([`Live`]) — one reader here:
+    /// the lane walk that builds the work lists, whose ids and lengths come
+    /// off this fire's own three host vectors.
+    pub live: Live,
     pub num_qo_heads: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
@@ -81,7 +87,10 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
             ),
         ));
     }
-    let batch = req.batch_size as usize;
+    // The three host vectors are this fire's, so the walk that turns them
+    // into work items is the live lane count; the carved `batch_size` beside
+    // it sizes the bound below.
+    let batch = req.live.requests as usize;
     let qo_lens = spans(op, "qo_indptr", req.qo_indptr, batch)?;
     spans(op, "kv_indptr", req.kv_indptr, batch)?;
     let kv_lens = lengths(op, "kv length table", req.kv_len_arr, batch)?;
@@ -110,6 +119,18 @@ pub fn schedule(op: &'static str, req: &Request<'_>, device: &Device) -> Result<
     let mut heap = CostHeap::new(num_ctas);
     let mut ctas = vec![CtaWork::default(); num_ctas as usize];
 
+    // **THE ONE HEURISTIC AND EVERY ALLOCATION UNDER IT, OFF THE CARVED
+    // PAIR.** `max_num_works_per_head` bounds `max_total_num_works`, which is
+    // what `plan` sizes all eight int vectors at, and its own threshold picks
+    // `same_schedule_for_all_heads` — the one bool on
+    // `PrefillPlanSm90Info`. Both inputs are the CARVED row and lane counts,
+    // so under the bucket ceiling this whole payload is a function of the key
+    // (`engine_cuda::Run::planning`, the plan-at-bucket-ceiling design's
+    // chunk 5) rather than of whichever fire warmed the body. Hash hygiene
+    // and not a live path: the launcher this schedule feeds answers a typed
+    // refusal before it launches (`attn::prefill_sm90`), so nothing exercises
+    // the freeze — it is here so the day the refusal lifts, the symmetry with
+    // `sched_prefill` is already true.
     let max_num_works_per_head = (u64::from(req.total_num_rows).div_ceil(u64::from(cta_tile_q))
         + u64::from(req.batch_size)
         - 1) as usize;

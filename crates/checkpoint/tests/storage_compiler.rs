@@ -1755,7 +1755,7 @@ fn a_block_scaled_fp8_source_carries_its_scale_tensor() {
             format: CheckpointFormat::Safetensors,
         }],
         tensors: vec![
-            sized_raw(0, "w.weight", 0, 4096, &[64, 64], DType::Fp8E4m3),
+            sized_raw(0, "w.weight", 0, 4096, &[64, 64], DType::E4m3),
             sized_raw(1, "w.weight_scale_inv", 4096, 4, &[1, 1], DType::F32),
         ],
     };
@@ -2162,7 +2162,7 @@ fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
             format: CheckpointFormat::Safetensors,
         }],
         tensors: vec![
-            sized_raw(0, "w.weight", 0, 4096, &[64, 64], DType::Fp8E4m3),
+            sized_raw(0, "w.weight", 0, 4096, &[64, 64], DType::E4m3),
             sized_raw(1, "w.scale", 4096, 4, &[1, 1], DType::F32),
         ],
     };
@@ -2173,7 +2173,7 @@ fn scales_the_checkpoint_shipped_are_paired_by_the_contract() {
                 "runtime.w",
                 Expr::src("w.weight"),
                 vec![64, 64],
-                Encoding::Raw(DType::Fp8E4m3),
+                Encoding::Raw(DType::E4m3),
             ),
             TensorContract::new(
                 "runtime.w_scale",
@@ -2312,7 +2312,7 @@ fn scales_may_name_a_tensor_declared_after_them() {
         }],
         tensors: vec![
             sized_raw(0, "w.scale", 0, 4, &[1, 1], DType::F32),
-            sized_raw(1, "w.weight", 4096, 4096, &[64, 64], DType::Fp8E4m3),
+            sized_raw(1, "w.weight", 4096, 4096, &[64, 64], DType::E4m3),
         ],
     };
     let contract = ModelContract {
@@ -2335,7 +2335,7 @@ fn scales_may_name_a_tensor_declared_after_them() {
                 "runtime.w",
                 Expr::src("w.weight"),
                 vec![64, 64],
-                Encoding::Raw(DType::Fp8E4m3),
+                Encoding::Raw(DType::E4m3),
             ),
         ],
         groups: Vec::new(),

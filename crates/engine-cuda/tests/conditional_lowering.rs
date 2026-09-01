@@ -12,11 +12,14 @@
 //!    byte-identical by construction and not by luck. The one region in the
 //!    whole catalog that clears both gates is qwen36-27b's MTP head, and that
 //!    SKU does not fit this card.
-//! 2. **An empty window's launches are already not in the graph.** Build log
-//!    10's exec key is the per-class `(rows, lanes)` vector, zeros included,
-//!    and the walk skips a zero-row region at RECORD time — so an all-decode
-//!    exec holds only the all-decode launches. Measured here as the captured
-//!    node count of one key against another.
+//! 2. **An empty window's launches are already not in the graph.** WHICH
+//!    CLASSES HAVE ROWS is half of what a capture is keyed on — build log 10
+//!    spelled it as a per-class `(rows, lanes)` vector and `record::BodyKey`
+//!    spells it as a lattice point and a PRESENT SET, and the half that
+//!    matters here survived the change intact — and the walk skips a zero-row
+//!    region at RECORD time. So an all-decode body holds only the all-decode
+//!    launches. Measured here as the captured node count of one key against
+//!    another.
 //! 3. **A conditionalized artifact RECORDS, and says what the eager walk
 //!    says.** An eager walk may ignore the bracket and be right; a recording
 //!    one may not, and since the graphs wave it does not have to — it places a
@@ -29,7 +32,7 @@
 //!
 //! # Gating
 //!
-//! As `graph_replay.rs`: skipped at run time when the machine, the checkpoint
+//! As `serve_smoke.rs`: skipped at run time when the machine, the checkpoint
 //! or the tokenizer is missing, rather than `#[ignore]`d.
 //!
 //! ```text
@@ -46,7 +49,7 @@ use engine_cuda::{Boot, Graphs, Lane, Shell};
 use model_compiler::{CompiledModel, Budget, DeviceProfile, Lowering, Phase, compile};
 use model_dsl::{Classify, Platform, Request};
 
-/// The catalog row this suite serves, as `graph_replay` serves it.
+/// The catalog row this suite serves, as `serve_smoke` serves it.
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
 /// The prompt.
@@ -161,7 +164,16 @@ fn ready(
         slots: 4,
         ordinal: 0,
         graphs: Graphs::Off,
-        knobs: engine_cuda::Knobs::default(),
+        // The load states the golden and every test below states the mode it
+        // means. `bodies` is stated too — it defaults to true since the keyed
+        // path died, so saying it is documentation rather than a change — and
+        // stating it at a load whose mode is `Off` arms nothing: the arming
+        // pass returns on a mode that records nothing, so the bodies each test
+        // reads about are captured by ITS OWN fires.
+        knobs: engine_cuda::Knobs {
+            bodies: true,
+            ..engine_cuda::Knobs::default()
+        },
         program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
@@ -301,7 +313,7 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
         millis.push(at.elapsed().as_secs_f64() * 1000.0);
         carried = argmax(&out[0]);
     }
-    let alone = shell.graph_stats();
+    let alone = shell.body_stats();
     let decode_nodes = alone.nodes;
     let decode_ms = {
         let warm = &millis[millis.len() / 2..];
@@ -332,12 +344,17 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
         // the same key rather than a longer prefill.
         shell.open(1).expect("slot 1 reopens");
     }
-    let mixed = shell.graph_stats();
+    let mixed = shell.body_stats();
+    // `BodyStats::nodes` names the MOST RECENTLY CAPTURED body, not a running
+    // total — which is exactly what this comparison wants, and why the two
+    // readings are taken on either side of the second composition's capture
+    // rather than differenced.
+    let mixed_nodes = mixed.nodes;
 
     eprintln!(
-        "captured graphs: all-decode {decode_nodes} nodes at {decode_ms:.3} ms/fire, \
-         decode+prefill {} nodes; {} execs, {} captures",
-        mixed.nodes, mixed.execs, mixed.captures,
+        "captured bodies: all-decode {decode_nodes} nodes at {decode_ms:.3} ms/fire, \
+         decode+prefill {mixed_nodes} nodes; {} resident, {} captures",
+        mixed.bodies, mixed.captures,
     );
 
     // **THE RULING.** The all-decode exec holds strictly fewer nodes than the
@@ -348,11 +365,17 @@ fn an_all_decode_graph_already_holds_no_empty_launch() {
     // and the ms it would save is 0.000 by arithmetic rather than by
     // measurement.
     assert!(
-        decode_nodes < mixed.nodes,
-        "the all-decode exec holds {decode_nodes} nodes and the mixed one \
-         {} — if they were equal, the empty windows WOULD be in the graph and \
-         a conditional would have something to skip",
-        mixed.nodes,
+        mixed.captures >= 2,
+        "two compositions captured {} bodies between them, so the reading \
+         below is one graph counted twice rather than two graphs compared: \
+         {mixed}",
+        mixed.captures,
+    );
+    assert!(
+        decode_nodes < mixed_nodes,
+        "the all-decode body holds {decode_nodes} nodes and the mixed one \
+         {mixed_nodes} — if they were equal, the empty windows WOULD be in the \
+         graph and a conditional would have something to skip",
     );
 }
 
@@ -459,16 +482,29 @@ fn a_conditionalized_artifact_records_its_nodes_and_replays_what_the_eager_walk_
         recorded.push(carried);
     }
 
-    let stats = shell.graph_stats();
+    let stats = shell.body_stats();
     eprintln!(
-        "{forced} regions conditionalized; {} captures, {} execs, {} nodes
+        "{forced} regions conditionalized; {} captures, {} hits, {} nodes
            eager    {eager:?}
   recorded {recorded:?}",
-        stats.captures, stats.execs, stats.nodes,
+        stats.captures, stats.hits, stats.nodes,
     );
     assert!(
         stats.captures > 0,
-        "no capture happened, so nothing recorded a conditional node and the          two arms are the same eager walk twice",
+        "no capture happened, so nothing recorded a conditional node and the \
+         two arms are the same eager walk twice: {stats}",
+    );
+    // **AND A CAPTURE ALONE IS NOT THE CLAIM.** A conditional node that
+    // recorded and never ran would leave `captures` moved and prove nothing
+    // about the bracket; what says the recorded arm was SERVED from the graph
+    // is a hit. (This load states `Graphs::Off`, so nothing was armed at boot
+    // and both counters belong to the fires above — on an armed load
+    // `captures` would be nonzero before the first fire and only `hits` would
+    // mean anything.)
+    assert!(
+        stats.hits >= 1,
+        "the conditionalized body captured and never replayed, so the tokens \
+         below are the eager walk twice: {stats}",
     );
     assert_eq!(
         eager, recorded,
@@ -565,16 +601,21 @@ fn a_switch_group_records_its_arms_and_replays_what_the_eager_walk_said() {
     shell.set_mode(Graphs::On);
     let recorded = arm_of(&mut shell);
 
-    let stats = shell.graph_stats();
+    let stats = shell.body_stats();
     eprintln!(
         "one-lane `{SKU}`: {groups} switch groups over {arms} arms; \
-         {} captures, {} execs, {} nodes\n  \
+         {} captures, {} hits, {} nodes\n  \
          eager    {eager:?}\n  recorded {recorded:?}",
-        stats.captures, stats.execs, stats.nodes,
+        stats.captures, stats.hits, stats.nodes,
     );
     assert!(
         stats.captures > 0,
-        "the recorded arm never captured, so no switch node was recorded",
+        "the recorded arm never captured, so no switch node was recorded: {stats}",
+    );
+    assert!(
+        stats.hits >= 1,
+        "the switch-grouped body captured and never replayed, so the two token \
+         streams below are one eager walk run twice: {stats}",
     );
     assert_eq!(
         eager, recorded,

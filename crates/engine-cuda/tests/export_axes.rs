@@ -456,13 +456,21 @@ fn a_capturing_lane_beside_two_others_leaves_them_the_fire_they_had_alone() {
 
 /// **THE RECORDED GRAPH HAS TO CARRY THE NEW COMPOSITION TOO.**
 ///
-/// The capture arm is a new class, so a fire that holds one is a new
-/// `record::Key` and a graph this shell has never recorded. What is asked is
-/// the same thing `masked_axis` asks of the masked composition: the eager walk
-/// (the serialization of the DAG) and the replayed graph agree token for
-/// token, and the mass they capture agrees bit for bit — which is the stronger
-/// half here, because a graph that replayed a stale arena address would still
-/// produce the right tokens and the wrong capture.
+/// The capture arm is a new class, so a fire that holds one presents a
+/// `record::BodyKey` — a lattice point and a present set — this shell has
+/// never recorded a body for. What is asked is the same thing `masked_axis`
+/// asks of the masked composition: the eager walk (the serialization of the
+/// DAG) and the replayed body agree token for token, and the mass they capture
+/// agrees bit for bit — which is the stronger half here, because a graph that
+/// replayed a stale arena address would still produce the right tokens and the
+/// wrong capture.
+///
+/// **AND THE COMPOSITION IS BODY-ADMISSIBLE, WHICH IS NOT FREE.** One lane, on
+/// the capture arm: every region this fire presents is whole-fire or empty, so
+/// `Windows::admits` calls all of them capturable without needing anything on
+/// `crate::SHIFTED` at all — a body with no island in it. The sibling gate below — three lanes, the capture
+/// class in two pieces — is the one that leans on the shifted list, and it
+/// says so.
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_capture_composition_captures_once_and_replays_identically() {
@@ -478,19 +486,18 @@ fn a_capture_composition_captures_once_and_replays_identically() {
     shell.set_mode(Graphs::On);
     let (replayed, replay_mass) = solo(&mut shell, 0, &prompt, true, STEPS);
 
-    let stats = shell.graph_stats();
+    let stats = shell.body_stats();
     eprintln!(
-        "capture replay: {} captured ({} nodes), {} replayed | eager {:?} / replay {:?}",
-        stats.captures,
-        stats.nodes,
-        stats.replays,
+        "capture replay: {stats} | eager {:?} / replay {:?}",
         tok.decode(&eager, false),
         tok.decode(&replayed, false),
     );
     assert!(
-        stats.captures >= 1 && stats.replays >= 1,
-        "the graph mode neither captured nor replayed, so this compared eager \
-         against eager"
+        stats.hits >= 1,
+        "the capture composition was never served from a body, so this \
+         compared eager against eager. `refusals` would say the admissibility \
+         rule turned it away, which on a whole-fire composition would be a \
+         finding rather than this wave's known limit: {stats}"
     );
     assert_eq!(
         eager, replayed,
@@ -535,7 +542,7 @@ fn a_fire_no_lane_captured_costs_the_axis_nothing() {
         "a lane that captured nothing was handed {} capture column(s)",
         mass.len(),
     );
-    let plain_nodes = shell.graph_stats().nodes;
+    let plain_nodes = shell.body_stats().nodes;
 
     // Now capture on another slot, then fire the plain composition again. Its
     // graph is already recorded and keyed by the composition, so a plain fire
@@ -544,14 +551,18 @@ fn a_fire_no_lane_captured_costs_the_axis_nothing() {
     let (_, captured) = solo(&mut shell, 1, &prompt, true, STEPS);
     assert!(!captured.is_empty(), "the capturing run captured nothing");
     let (plain_again, _) = solo(&mut shell, 0, &prompt, false, STEPS);
-    let after = shell.graph_stats();
+    let after = shell.body_stats();
 
+    // The census names the MOST RECENTLY CAPTURED body, so the two numbers
+    // are two different compositions' graphs — the plain one and the capturing
+    // one — and not a before and after of the same graph. Printed for that
+    // reason rather than asserted. What the assertion below rests on is the
+    // plain lane's continuation, which is the observable that would move if
+    // the plain composition's launches had changed.
     eprintln!(
-        "uncaptured floor: {plain_nodes} nodes before, {} after; {} captures / {} replays; \
+        "uncaptured floor: {plain_nodes} nodes before, {} after; {after}; \
          continuation {:?}",
         after.nodes,
-        after.captures,
-        after.replays,
         tok.decode(&plain, false),
     );
     assert_eq!(
@@ -740,12 +751,26 @@ fn a_capturing_prefill_beside_a_capturing_decode_is_two_launches_and_the_same_to
 /// **AND THE RECORDED GRAPH CARRIES THE SPLIT TOO.**
 ///
 /// A split's launch count is a function of the fire's WINDOW TABLE — where
-/// each class's rows stand, which classes have any — and `record::Key` IS that
-/// table (see `engine_cuda::record`). So every fire that replays a captured
-/// exec has the same table the capture was walked at, and therefore the same
-/// number of runs over the same intervals; the graph can hold the split the
-/// way it holds everything else about a composition. That is an argument, and
-/// this is the gate for it.
+/// each class's rows stand, which classes have any — and WHICH CLASSES HAVE
+/// ROWS is exactly what `record::BodyKey` names beside its lattice point (see
+/// `engine_cuda::record`). So every fire that replays a captured body presents
+/// the same class set the capture was walked at, and therefore the same number
+/// of runs over the same intervals; the graph can hold the split the way it
+/// holds everything else about a composition. That is an argument, and this is
+/// the gate for it.
+///
+/// **AND IT IS THE GATE FOR `crate::SHIFTED` TOO, WHICH THE SINGLE-LANE
+/// SIBLING ABOVE IS NOT.** A split window is not whole-fire — its rows begin
+/// somewhere inside the plane and end before its end — so
+/// `Windows::admits` calls this composition's regions capturable only through
+/// its SHIFTING clause: every op in a fragmented region has to be one that
+/// takes its lanes off the plan's staged tables rather than off a grid
+/// coordinate. The capture arm (`attention.prefill_lse`) and this hybrid's
+/// chunked mixer arms are on that list, which is why this fire is held WHOLE
+/// by its body. A region that left the list would not refuse the composition
+/// since the tier-2 campaign — it would become an island the body is cut
+/// around — so what names it now is `BodyStats::islands` rather than
+/// `refusals`.
 ///
 /// The fragmented composition is repeated rather than passed through once:
 /// lane 1's slot is RE-OPENED every step, so it prefills the same rows every
@@ -793,8 +818,8 @@ fn a_split_composition_captures_once_and_replays_identically() {
         let mut captured = Vec::new();
         for step in 0..steps {
             // The late lane starts over every step, so it prefills the same
-            // rows every step and the window table — which IS the graph key —
-            // never moves.
+            // rows every step and the window table — whose present set is half
+            // of what a `record::BodyKey` names — never moves.
             shell.open(1).expect("slot 1 re-opens");
             let mut mass: Vec<Vec<LayerScores>> = Vec::new();
             let out = shell
@@ -825,15 +850,14 @@ fn a_split_composition_captures_once_and_replays_identically() {
     shell.set_mode(Graphs::On);
     let (replayed, replay_mass) = repeat(&mut shell, &first, &late, &plain, FIRES);
 
-    let stats = shell.graph_stats();
-    eprintln!(
-        "split replay: {} captured ({} nodes), {} replayed",
-        stats.captures, stats.nodes, stats.replays,
-    );
+    let stats = shell.body_stats();
+    eprintln!("split replay: {stats}");
     assert!(
-        stats.captures >= 1 && stats.replays >= 1,
-        "the graph mode neither captured nor replayed a split key, so this \
-         compared eager against eager"
+        stats.hits >= 1,
+        "the split composition was never served from a body, so this compared \
+         eager against eager. A moved `refusals` names the region whose ops are \
+         not on `crate::SHIFTED` — the fragmented window has nowhere else to \
+         be admitted from: {stats}"
     );
     assert_eq!(
         eager, replayed,
@@ -1086,7 +1110,14 @@ mod gemma {
             slots: 4,
             ordinal: 0,
             graphs: engine_cuda::Graphs::Off,
-            knobs: engine_cuda::Knobs::default(),
+            // The golden at load; the gates that record state their own mode.
+            // `bodies` is written out because it defaults to TRUE now — the
+            // word is documentation here, and `Off` is what keeps the arming
+            // pass from running.
+            knobs: engine_cuda::Knobs {
+                bodies: true,
+                ..engine_cuda::Knobs::default()
+            },
             program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
@@ -1171,7 +1202,12 @@ fn the_drafting_sku_does_not_fit_this_device() {
         slots: 4,
         ordinal: 0,
         graphs: Graphs::Off,
-        knobs: engine_cuda::Knobs::default(),
+        // As above: the golden at load, `bodies` said out loud because it is
+        // true by default now.
+        knobs: engine_cuda::Knobs {
+            bodies: true,
+            ..engine_cuda::Knobs::default()
+        },
         program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing
@@ -1330,7 +1366,12 @@ fn ready(what: &str) -> Option<(Shell, tokenizer::Tokenizer)> {
         slots: 4,
         ordinal: 0,
         graphs: Graphs::Off,
-        knobs: engine_cuda::Knobs::default(),
+        // As above: the golden at load, `bodies` said out loud because it is
+        // true by default now.
+        knobs: engine_cuda::Knobs {
+            bodies: true,
+            ..engine_cuda::Knobs::default()
+        },
         program_cache_dir: None,
         // F1's depth, kept: these gates fire one step at a time and
         // read its numbers, so a deeper ring would carve slots nothing

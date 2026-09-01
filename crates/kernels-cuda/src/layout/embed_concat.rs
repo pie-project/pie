@@ -50,6 +50,9 @@ pub fn embed_concat(
             stated(OP, heads)?.arg(),
             stated(OP, width)?.arg(),
             stated(OP, vocab)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -132,6 +135,9 @@ pub fn embed_concat_mlxu4(
             stated(OP, vocab)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -215,6 +221,9 @@ pub fn embed_mlx_affine(
             stated(OP, vocab)?.arg(),
             crate::jit::ArgValue::Ptr(seat.cell),
             crate::jit::ArgValue::Ptr(seat.hits),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

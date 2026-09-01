@@ -361,6 +361,8 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
  * \param seq_len_ptr The current sequence length (number of positions populated in indptr).
  * \param num_heads The number of heads of v.
  * \param head_dim The dimension of each head.
+ * \param win PIE: the staged-geometry seat -- (live positions, first plane row),
+ *   or nullptr for the whole extent from row zero.
  * \note s are logsumexp values with base 2.
  */
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
@@ -368,11 +370,17 @@ template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stage
 __global__ void PersistentVariableLengthMergeStatesKernel(
     DTypeIn* __restrict__ V, float* __restrict__ S, IdType* indptr, DTypeO* __restrict__ v_merged,
     float* __restrict__ s_merged, uint32_t max_seq_len, uint32_t* __restrict__ seq_len_ptr,
-    uint32_t num_heads) {
+    uint32_t num_heads, const uint32_t* __restrict__ win) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
-  const uint32_t seq_len = seq_len_ptr ? *seq_len_ptr : max_seq_len;
+  // PIE: the staged-geometry seat.  `win[0]` is how many positions of the
+  // merge are this launch's own and `win[1]` is where they sit in the plane
+  // `v_merged` points at; a null seat is one launch over the whole extent
+  // from row zero, which is what upstream always did.
+  const uint32_t staged = seq_len_ptr ? *seq_len_ptr : max_seq_len;
+  const uint32_t seq_len = (win != nullptr && win[0] < staged) ? win[0] : staged;
+  const uint32_t row_base = win != nullptr ? win[1] : 0;
   uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
   constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
   constexpr uint32_t head_dim = vec_size * bdx;
@@ -397,9 +405,9 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
     if (num_index_sets == 0) {
       vec_t<DTypeO, vec_size> v;
       v.fill(DTypeO(0.f));
-      v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+      v.store(v_merged + ((row_base + pos) * num_heads + head_idx) * head_dim + tx * vec_size);
       if (s_merged != nullptr) {
-        s_merged[pos * num_heads + head_idx] = -math::inf;
+        s_merged[(row_base + pos) * num_heads + head_idx] = -math::inf;
       }
       continue;
     }
@@ -407,9 +415,9 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
     if (num_index_sets == 1) {
       vec_t<DTypeO, vec_size> v;
       v.cast_load(V + (indptr[pos] * num_heads + head_idx) * head_dim + tx * vec_size);
-      v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+      v.store(v_merged + ((row_base + pos) * num_heads + head_idx) * head_dim + tx * vec_size);
       if (s_merged != nullptr) {
-        s_merged[pos * num_heads + head_idx] = S[indptr[pos] * num_heads + head_idx];
+        s_merged[(row_base + pos) * num_heads + head_idx] = S[indptr[pos] * num_heads + head_idx];
       }
       continue;
     }
@@ -456,9 +464,10 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
     threadblock_sync_state<bdx, bdy, vec_size>(st, v_smem, s_smem);
     st.normalize();
 
-    st.o.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    st.o.cast_store(v_merged + ((row_base + pos) * num_heads + head_idx) * head_dim +
+                    tx * vec_size);
     if (s_merged != nullptr) {
-      s_merged[pos * num_heads + head_idx] = st.get_lse();
+      s_merged[(row_base + pos) * num_heads + head_idx] = st.get_lse();
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -472,11 +481,15 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
                                                            DTypeO* __restrict__ v_sum,
                                                            uint32_t max_seq_len,
                                                            uint32_t* __restrict__ seq_len_ptr,
-                                                           uint32_t num_heads) {
+                                                           uint32_t num_heads,
+                                                           const uint32_t* __restrict__ win) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
-  const uint32_t seq_len = seq_len_ptr ? *seq_len_ptr : max_seq_len;
+  // PIE: the staged-geometry seat, as on the merge kernel above.
+  const uint32_t staged = seq_len_ptr ? *seq_len_ptr : max_seq_len;
+  const uint32_t seq_len = (win != nullptr && win[0] < staged) ? win[0] : staged;
+  const uint32_t row_base = win != nullptr ? win[1] : 0;
   uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
   constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
   constexpr uint32_t head_dim = vec_size * bdx;
@@ -499,14 +512,14 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
     if (num_index_sets == 0) {
       vec_t<DTypeO, vec_size> v;
       v.fill(DTypeO(0.f));
-      v.store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+      v.store(v_sum + ((row_base + pos) * num_heads + head_idx) * head_dim + tx * vec_size);
       continue;
     }
 
     if (num_index_sets == 1) {
       vec_t<DTypeO, vec_size> v;
       v.cast_load(V + (indptr[pos] * num_heads + head_idx) * head_dim + tx * vec_size);
-      v.store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+      v.store(v_sum + ((row_base + pos) * num_heads + head_idx) * head_dim + tx * vec_size);
       continue;
     }
 
@@ -545,7 +558,8 @@ __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__
 
     threadblock_sum<bdx, bdy, vec_size>(v_sum_vec, v_smem);
 
-    v_sum_vec.cast_store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    v_sum_vec.cast_store(v_sum + ((row_base + pos) * num_heads + head_idx) * head_dim +
+                         tx * vec_size);
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");

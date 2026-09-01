@@ -16,6 +16,19 @@
 //! process-global scratch, the JIT and the dense autotuner (build log 11) and
 //! whichever arm ran first would otherwise be the cold one.
 //!
+//! # What holds the graph these blocks measure
+//!
+//! A BODY, since the tier-2 campaign deleted the exact-shape keyed cache: the
+//! router is bodies-or-eager, `Graphs::On` means tiered, and the fork's one
+//! observable — `nodes` and `edges` over a captured topology — moved onto
+//! `BodyStats` with the path that used to carry it. Each arm below therefore
+//! stands `bodies` down at LOAD and turns it on afterwards, which is the one
+//! deployment-unlike thing this file does and is argued where it is written:
+//! an armed load captures its whole lattice at boot and seals the map, and the
+//! three-class masked fire under test is not a shape that enumeration
+//! synthesizes, so it would meet the seal and walk. An eager fire has no
+//! topology, and a fork that cannot be seen cannot be measured.
+//!
 //! # What is measured, and what it is not
 //!
 //! Whole-fire wall clock around `fire_seated`, which synchronizes: the
@@ -50,12 +63,21 @@ struct Block {
     mean_ms: f64,
     tokens: (u32, u32, u32),
     captures: u64,
-    replays: u64,
+    /// Fires served FROM a recorded body — `BodyStats::hits`. It was
+    /// `Stats::replays` while there were two recording paths; the keyed one is
+    /// gone and a replay is a hit.
+    hits: u64,
     nodes: usize,
     /// **THE ONLY OBSERVABLE A FORK HAS.** Capture lowers an event record and
     /// the wait behind it into a graph EDGE, not into nodes, so a forked
     /// capture and a sequential one hold the same launches and a different
     /// topology. See `device::graph::Graph::edges`.
+    ///
+    /// **AND IT RIDES `BodyStats` NOW.** The counter used to live on the keyed
+    /// cache's own stats; when the tier-2 campaign deleted that path the pair
+    /// (`nodes`, `edges`) moved onto the bodies stats rather than dying with
+    /// it, precisely because this file is their only reader and the claim
+    /// below is the only place a fork is observable from outside at all.
     edges: usize,
     /// What P6 baked for this arm: `(streams, events, forked regions, side
     /// streams opened)`.
@@ -100,11 +122,11 @@ fn the_three_class_fire_says_the_same_thing_with_the_streams_on_and_here_is_the_
         for (at, block) in arm.iter().enumerate() {
             eprintln!(
                 "{name} run {at}: median {:.3} ms  mean {:.3} ms  \
-                 (captures {} replays {} nodes {} edges {} forks {:?})",
+                 (captures {} hits {} nodes {} edges {} forks {:?})",
                 block.median_ms,
                 block.mean_ms,
                 block.captures,
-                block.replays,
+                block.hits,
                 block.nodes,
                 block.edges,
                 block.streams,
@@ -218,11 +240,11 @@ fn a_qwen_decode_beside_a_prefill_says_the_same_thing_with_the_streams_on() {
         for (at, block) in arm.iter().enumerate() {
             eprintln!(
                 "{name} run {at}: median {:.3} ms  mean {:.3} ms  \
-                 (captures {} replays {} nodes {} edges {} forks {:?})",
+                 (captures {} hits {} nodes {} edges {} forks {:?})",
                 block.median_ms,
                 block.mean_ms,
                 block.captures,
-                block.replays,
+                block.hits,
                 block.nodes,
                 block.edges,
                 block.streams,
@@ -393,7 +415,19 @@ mod gemma {
             // (`model_exec::fire::EagerSink`), so an eager arm would measure
             // nothing and prove nothing.
             graphs: engine_cuda::Graphs::On,
-            knobs: engine_cuda::Knobs::default(),
+            // **`bodies` STOOD DOWN AT LOAD AND TURNED ON BELOW.** A load
+            // that states the word arms its lattice and seals the map inside
+            // `Shell::load`, so every capture happens at boot and a fire of a
+            // composition the enumeration did not synthesize — this file's
+            // three-class masked fire is one — meets a sealed map and walks
+            // eagerly. An eager fire has no topology to count edges on, which
+            // is this whole file's observable. Stood down, the map stays open
+            // and the warm block below captures the composition actually under
+            // test.
+            knobs: engine_cuda::Knobs {
+                bodies: false,
+                ..engine_cuda::Knobs::default()
+            },
             program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
@@ -429,6 +463,9 @@ mod gemma {
     /// the measurement says whether the effect is a size effect or a ceiling.
     pub fn measure(side_streams: u32, rows: usize) -> Block {
         let (mut shell, tok) = load(side_streams);
+        // The word, said here rather than at load, for the reason `load`
+        // states: an armed load has nothing left for these fires to capture.
+        shell.set_bodies(true);
         let carried =
             tok.encode(&turn("What is the capital of France? Answer in one word."));
         let fresh = padded(&tok, "Name the largest planet. One word.", rows);
@@ -480,25 +517,29 @@ mod gemma {
             )
         };
 
-        // Warm: the tuner tunes on the second sighting and the key captures on
-        // the fire after that (`record::WARM_FIRES`), so three fires are
+        // Warm: the tuner tunes on the second sighting and the body captures
+        // on the fire after that (`record::WARM_FIRES`), so three fires are
         // thrown away before the clock means anything.
         let mut discard = Vec::new();
         let mut tokens = (0, 0, 0);
         for _ in 0..3 {
             tokens = one(&mut shell, &mut discard);
         }
-        let before = shell.graph_stats().replays;
+        let before = shell.body_stats().hits;
 
         let mut timed = Vec::with_capacity(FIRES);
         for _ in 0..FIRES {
             let said = one(&mut shell, &mut timed);
             assert_eq!(said, tokens, "a fire changed its answer mid-block");
         }
-        let stats = shell.graph_stats();
+        let stats = shell.body_stats();
         assert!(
-            stats.replays > before,
-            "the block replayed nothing, so it measured the eager walk",
+            stats.hits > before,
+            "the block replayed nothing, so it measured the eager walk and \
+             there is no captured topology under the numbers below. A moved \
+             `refusals` says the admissibility rule turned this composition \
+             away, which would be a finding about the composition rather than \
+             about the fork: {stats}",
         );
 
         let mut sorted = timed.clone();
@@ -508,7 +549,7 @@ mod gemma {
             mean_ms: timed.iter().sum::<f64>() / timed.len() as f64,
             tokens,
             captures: stats.captures,
-            replays: stats.replays,
+            hits: stats.hits,
             nodes: stats.nodes,
             edges: stats.edges,
             streams: shell.streams(),
@@ -606,7 +647,19 @@ mod qwen {
             slots: 4,
             ordinal: 0,
             graphs: engine_cuda::Graphs::On,
-            knobs: engine_cuda::Knobs::default(),
+            // **`bodies` STOOD DOWN AT LOAD AND TURNED ON BELOW.** A load
+            // that states the word arms its lattice and seals the map inside
+            // `Shell::load`, so every capture happens at boot and a fire of a
+            // composition the enumeration did not synthesize — this file's
+            // three-class masked fire is one — meets a sealed map and walks
+            // eagerly. An eager fire has no topology to count edges on, which
+            // is this whole file's observable. Stood down, the map stays open
+            // and the warm block below captures the composition actually under
+            // test.
+            knobs: engine_cuda::Knobs {
+                bodies: false,
+                ..engine_cuda::Knobs::default()
+            },
             program_cache_dir: None,
             // F1's depth, kept: these gates fire one step at a time and
             // read its numbers, so a deeper ring would carve slots nothing
@@ -632,6 +685,9 @@ mod qwen {
 
     pub fn measure(side_streams: u32) -> Block {
         let (mut shell, tok) = load(side_streams);
+        // The word, said here rather than at load, for the reason `load`
+        // states: an armed load has nothing left for these fires to capture.
+        shell.set_bodies(true);
         let carried = tok.encode("The capital of France is");
         let fresh = tok.encode("The largest planet in the solar system is");
 
@@ -671,17 +727,21 @@ mod qwen {
         for _ in 0..3 {
             tokens = one(&mut shell, &mut discard);
         }
-        let before = shell.graph_stats().replays;
+        let before = shell.body_stats().hits;
 
         let mut timed = Vec::with_capacity(FIRES);
         for _ in 0..FIRES {
             let said = one(&mut shell, &mut timed);
             assert_eq!(said, tokens, "a fire changed its answer mid-block");
         }
-        let stats = shell.graph_stats();
+        let stats = shell.body_stats();
         assert!(
-            stats.replays > before,
-            "the block replayed nothing, so it measured the eager walk",
+            stats.hits > before,
+            "the block replayed nothing, so it measured the eager walk and \
+             there is no captured topology under the numbers below. A moved \
+             `refusals` says the admissibility rule turned this composition \
+             away, which would be a finding about the composition rather than \
+             about the fork: {stats}",
         );
 
         let mut sorted = timed.clone();
@@ -691,7 +751,7 @@ mod qwen {
             mean_ms: timed.iter().sum::<f64>() / timed.len() as f64,
             tokens,
             captures: stats.captures,
-            replays: stats.replays,
+            hits: stats.hits,
             nodes: stats.nodes,
             edges: stats.edges,
             streams: shell.streams(),

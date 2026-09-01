@@ -395,8 +395,8 @@ fn dtype_of(dtype: ZDType, ltype: Option<&str>) -> Result<DType, Error> {
     // has a dtype for it, that is the dtype to use.
     if let Some(ltype) = ltype {
         return Ok(match ltype {
-            "f8_e4m3fn" | "f8_e4m3fnuz" => DType::Fp8E4m3,
-            "f8_e5m2" | "f8_e5m2fnuz" => DType::Fp8E5m2,
+            "f8_e4m3fn" | "f8_e4m3fnuz" => DType::E4m3,
+            "f8_e5m2" | "f8_e5m2fnuz" => DType::E5m2,
             "f8_e8m0" => DType::E8m0,
             "bool" => DType::Bool,
             // f4_e2m1 has no loader dtype of its own: MXFP4 payloads ride on

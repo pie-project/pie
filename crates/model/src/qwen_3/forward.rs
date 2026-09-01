@@ -364,7 +364,7 @@ impl ForwardHybrid for Model {
                     // by name, before a kernel could read a scales plane as
                     // codes — and the sentence that was wrong was this one.
                     let select = |act: &Value, bank: &Weight| match bank.dtype {
-                        Dtype::Mxfp4 | Dtype::MlxU4 | Dtype::MlxU8 => {
+                        Dtype::Mxfp4 | Dtype::U4g64 | Dtype::U8g64 => {
                             ops::linear::moe_matmul_select_quant(act, bank, &routes, *top_k)
                         }
                         _ => ops::linear::moe_matmul_select(act, bank, &routes, *top_k),

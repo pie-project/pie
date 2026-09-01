@@ -112,6 +112,39 @@ fn lse_plane(op: &'static str, lse: &Tensor, rows: u32, heads: u32) {
     );
 }
 
+/// **THE BOUNDARY VECTOR MUST REACH EVERY LANE THE SCHEDULE NAMES.**
+///
+/// BOTH SIDES ARE DRIVER-BOUND — the ragged boundary vector is one the
+/// windowing rule names, the plan's shape is the engine's, and no op names
+/// either — so a disagreement is refused rather than asserted (the boundary
+/// rule at `refuse`). Asserted, a release build reads past the end of a
+/// shorter vector and takes the kv pool's spans from whatever follows it.
+///
+/// **AND IT IS `>=` AND NOT `==` BECAUSE THE VECTOR HAS TWO READINGS.** A
+/// launch cut to its window is handed its own `[lanes + 1]` boundaries and
+/// `lane_offset` is zero, which is the equality this door always checked. A
+/// launch handed the PLANE's base takes the FIRE's whole vector, whose length
+/// is the fire's lanes and not this window's — so what is left to check is
+/// the thing that was ever wrong: a vector too SHORT for the last request
+/// `lane_offset + num_requests - 1` the schedule staged.
+fn lanes_carry(
+    op: &'static str,
+    q: &RaggedTensor,
+    lane_offset: u32,
+    num_requests: u32,
+) -> Result<(), Error> {
+    let carried = q.indptr.rows.saturating_sub(1);
+    if carried >= lane_offset.saturating_add(num_requests) {
+        return Ok(());
+    }
+    Err(refuse(
+        op,
+        format!(
+            "the fire's indptr spells {carried} lanes and this schedule names              {num_requests} requests from lane {lane_offset}"
+        ),
+    ))
+}
+
 fn pool_buffers(q_ptr: u64, pool: &KvPool, plan_ws: plan::Workspace, o_ptr: u64) -> Buffers {
     Buffers {
         q: q_ptr,
@@ -134,7 +167,7 @@ fn pool_buffers(q_ptr: u64, pool: &KvPool, plan_ws: plan::Workspace, o_ptr: u64)
 fn fa2_decode(
     ctx: &Ctx,
     op: &'static str,
-    q: Tensor,
+    q: RaggedTensor,
     plan: &DecodePlan,
     pool: &KvPool,
     window: Option<u32>,
@@ -143,9 +176,35 @@ fn fa2_decode(
     o: &mut Tensor,
     lse: Option<&mut Tensor>,
 ) -> Result<(), Error> {
-    dtype_dispatch!(op, q.dtype, { Bf16 => () });
-    attention_lands(op, q, o);
+    dtype_dispatch!(op, q.data.dtype, { Bf16 => () });
+    attention_lands(op, q.data, o);
     let window_left = plan::window_left(op, window)?;
+    // **THE BOUNDARIES ARE AN ARGUMENT NOW**, because `decode.cuh` reads
+    // `q + q_indptr[batch_idx] * q_stride_n` where it used to take
+    // `batch_idx` itself. The two are the same number for a launch handed
+    // its own rebased vector — a decode request is one query row, so entry
+    // `l` of that vector IS `l` — and they part company exactly where they
+    // must: `batch_idx` is `lane_offset + r` and the rows it names are the
+    // plane's. Both readings are checked here, and the check is the one the
+    // prefill door keeps: a vector with fewer boundaries than the schedule
+    // names lets every work item past the first read whatever follows it.
+    lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
+    // **AND AN UNSPLIT DECODE HAS NO ABSOLUTE READING OF ITS OUTPUT.**
+    // `decode.cuh` writes `o + bx * ...` at the WORK ITEM, which is a row of
+    // whatever `o` points at and nothing the schedule can shift; under a
+    // split it writes the plan's partial plane instead and the fold behind it
+    // carries the window on the staged seat. A schedule naming fire lanes is
+    // one whose `o` is the plane's base, so the two cannot meet. They never
+    // do — a plane base means a body, a body means `Graphs::On`, and both
+    // decode planners take the split unconditionally under a graph-shaped
+    // build — and this is the refusal that says so out loud rather than the
+    // comment that hoped so.
+    if plan.shape.lane_offset > 0 && !plan.info.split_kv {
+        return Err(refuse(
+            op,
+            "this schedule names fire lanes and did not split kv, so its              output rows would be the launch's own and not the plane's",
+        ));
+    }
 
     let _ = kv::dequant_active(
         ctx,
@@ -155,9 +214,10 @@ fn fa2_decode(
         stated(op, head_dim)?,
     );
 
-    let mut bufs = pool_buffers(q.ptr, pool, plan.workspace, o.ptr);
+    let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
+    bufs.qo_indptr = q.indptr.ptr;
     if let Some(lse) = &lse {
-        lse_plane(op, lse, q.rows, plan.shape.num_q_heads);
+        lse_plane(op, lse, q.data.rows, plan.shape.num_q_heads);
         bufs.lse = lse.ptr;
     }
     let arm = fa2::decode_arm(plan.full_attention_variant(), window_left, NO_SOFT_CAP);
@@ -214,23 +274,7 @@ fn fa2_prefill(
         stated(op, head_dim)?,
     );
 
-    // The fire's indptr spells the batch this schedule was planned at, and
-    // BOTH SIDES ARE DRIVER-BOUND — the ragged boundary vector is one the rule
-    // names, the plan's shape is the engine's, and no op names either — so a
-    // disagreement is refused rather than asserted (the boundary rule at
-    // `refuse`). Asserted, a release build reads `num_requests + 1`
-    // boundaries off a shorter indptr and takes the kv pool's spans from
-    // whatever follows it.
-    if q.indptr.rows.checked_sub(1) != Some(plan.shape.num_requests) {
-        return Err(refuse(
-            op,
-            format!(
-                "the fire's indptr spells {} requests and this schedule was planned at {}",
-                q.indptr.rows.saturating_sub(1),
-                plan.shape.num_requests
-            ),
-        ));
-    }
+    lanes_carry(op, &q, plan.shape.lane_offset, plan.shape.num_requests)?;
     let mut bufs = pool_buffers(q.data.ptr, pool, plan.workspace, o.ptr);
     bufs.qo_indptr = q.indptr.ptr;
     if let Some(lse) = &lse {
@@ -269,7 +313,7 @@ fn fa2_prefill(
 #[allow(clippy::too_many_arguments)]
 pub fn decode(
     ctx: &Ctx,
-    q: Tensor,
+    q: RaggedTensor,
     plan: &DecodePlan,
     pool: &KvPool,
     window: Option<u32>,
@@ -285,7 +329,7 @@ pub fn decode(
 #[allow(clippy::too_many_arguments)]
 pub fn decode_lse(
     ctx: &Ctx,
-    q: Tensor,
+    q: RaggedTensor,
     plan: &DecodePlan,
     pool: &KvPool,
     window: Option<u32>,
@@ -465,6 +509,9 @@ pub fn sink(
             rows.arg(),
             stated(OP, heads)?.arg(),
             stated(OP, head_dim)?.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -521,6 +568,9 @@ pub fn merge_lse(
             lse.arg(),
             heads.arg(),
             head_dim.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }
@@ -630,6 +680,32 @@ pub fn res_blend(
             ),
         ));
     }
+    // **THE PITCH THIS ENTRY PASSES IS THE WINDOW'S, AND THE KERNEL NEEDS THE
+    // PLANE'S** — the one finding that keeps `elementwise.res_blend` off
+    // `engine_cuda::SHIFTED`, written here because this is where the number is
+    // chosen. The kernel walks `blocks + (j * block_rows + row) * hidden`, and
+    // `block_rows` is `y.rows` below: the WINDOW's row count, which is what
+    // `Run::cut` hands a shifting region while its pointers stay the plane's
+    // base. The stride between two stacked candidate planes is the PLANE's row
+    // capacity, and the two coincide only when the window is the whole plane.
+    //
+    // **THIS ENTRY CANNOT DERIVE THE PLANE'S CAPACITY.** A `Tensor` carries
+    // `ptr`, `rows`, `width`, `dtype` and no height; `rows` is the window's by
+    // the paragraph above. The only other witness in the room is the GAP
+    // between two consecutive candidate pointers — which is the true pitch,
+    // and is why the refusal below can be written at all — but it exists only
+    // when there are two of them, and a lone candidate never multiplies
+    // `block_rows` by anything. So the gap answers the case the kernel reads
+    // and says nothing in the case it does not, which is a coincidence to rest
+    // an addressing rule on rather than a derivation.
+    //
+    // **AND THE REFUSAL BELOW IS THE HONEST GUARD MEANWHILE**: it compares the
+    // pointers against the pitch this entry is about to pass, so a windowed
+    // fire whose planes are taller than its window is REFUSED here rather than
+    // blended off the wrong rows. What the name is owed is the plane's height,
+    // from the side that knows it — the engine's arena — either as a field on
+    // the handle or as a fifth seat word (the seat holds four now, and this
+    // entry reads only the row pair). Neither is this crate's to add.
     let plane_bytes = u64::from(y.rows) * u64::from(y.width) * 2;
     for pair in blocks.windows(2) {
         if pair[1].ptr != pair[0].ptr.wrapping_add(plane_bytes) {
@@ -658,6 +734,9 @@ pub fn res_blend(
             hidden.arg(),
             rows.arg(),
             eps.arg(),
+            // The staged-geometry seat: the region's live-rows word when a
+            // body replay armed one, and the null seat (`ABSENT`) otherwise.
+            ctx.stage(),
         ],
     )
 }

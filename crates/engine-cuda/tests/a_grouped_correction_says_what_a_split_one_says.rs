@@ -13,16 +13,67 @@
 //!
 //! ```text
 //! (a) bit for bit     every lane's logits, every step, f32 bits compared
-//! (b) fewer launches  the captured graph holds exactly 2 x nodes x (r - 1)
-//!                     fewer — two kernels per correction site, r - 1 of the
-//!                     intervals no longer launched for
+//! (b) fewer launches  the fragmented WALK enqueues exactly regions x (r - 1)
+//!                     fewer trips — one region carrying the correction is one
+//!                     trip per interval of its window in the split answer and
+//!                     one trip altogether in the grouped one
 //! ```
 //!
 //! **(b) IS THE HALF THAT CANNOT BE FAKED.** A grouped answer that was
 //! secretly still splitting would pass (a) trivially — it would BE the split —
-//! and the node count is what says it is not. It is read off the recorded
-//! graph rather than off a counter this file keeps, because a graph node is a
-//! launch that was actually enqueued.
+//! and the launch count is what says it is not.
+//!
+//! # Where (b) is read, and why it is no longer read off a graph
+//!
+//! It used to be the node census of the captured graph, because a graph node
+//! is a launch that was actually enqueued. **THE CORRECTION'S OWN LAUNCHES DO
+//! NOT REACH A GRAPH IN EITHER ARM**, which is what moved it. A graph may hold
+//! a region only when its window is whole-fire or shifting
+//! (`Windows::admits`), and the correction's window is neither: the grouped
+//! answer makes it one window carrying SEGMENTS, and the split answer makes it
+//! `r` windows that are not whole-fire, whose op — `linear.lora_correct`, the
+//! one name in `crate::GROUPED` — is not on `crate::SHIFTED` and so cannot be
+//! shifted into.
+//!
+//! So (b) is read off `FireCost::launches` — the shell's own count of what the
+//! walk enqueued for the last fire — asked of the walk rather than of an
+//! artifact of the walk.
+//!
+//! **AND ITS UNIT IS A TRIP AND NOT A KERNEL**, which is the one thing the
+//! move changed and the file did not. `Windows::launches` sums the RUN COUNT
+//! of every template region — one per (region, interval) — so a correction
+//! site's two kernels are one number here where the node census counted them
+//! twice, and what a grouped answer saves is `r - 1` trips per region carrying
+//! a correction. The arithmetic at the bottom of this file is that sentence;
+//! it used to be the census's `2 x nodes x (r - 1)`, which is the same claim
+//! priced in the wrong unit.
+//!
+//! **AND IT IS MEASURED ON THE EAGER ROUND OF EACH ARM.** The economy is a
+//! property of the walk — one launch over a segment list against `r` launches
+//! over `r` windows — so it is priced where the walk happens, which since the
+//! tier-2 campaign is no longer the `Graphs::On` round (see below).
+//!
+//! # And what `Graphs::On` does with it since the tier-2 campaign
+//!
+//! The region is an `Admit::Island`, and an island no longer refuses its
+//! composition: `record::cuts` cuts the body around it, the stretches on
+//! either side are captured, and the correction is re-issued by the eager walk
+//! between the execs. So the tiered arm must REPLAY (`BodyStats::hits` moves),
+//! its body must be SEGMENTED (`BodyStats::islands` is nonzero), and it must
+//! still answer the eager walk's tokens exactly — the identity being the
+//! load-bearing half, because the island is precisely the stretch a segmented
+//! body could get wrong.
+//!
+//! **AND ITS ENQUEUED LAUNCH COUNT DROPS**, which is a claim about the ROUTER
+//! and not about the answer: what the host still enqueues on a hit is the
+//! ISLAND's launches and nothing else, where the eager arm enqueues the whole
+//! fire's. That is asserted as an inequality rather than a number, because how
+//! many stretches this artifact cuts into is the artifact's business — and it
+//! is asserted beside the round that produced it, in `arm`, rather than
+//! subtracted across the two arms. Two tiered counts differ by the two arms'
+//! ISLAND trips, which is not the quantity (b) is about; the launch economy is
+//! priced on the eager round, where the whole fragmented walk is in the
+//! number.
 //!
 //! # The two artifacts, and why they are one row order
 //!
@@ -223,17 +274,29 @@ fn register(shell: &mut Shell, built: &[(String, Vec<u8>)]) {
 /// prefilling, `STEPS` times, one lane per class.
 ///
 /// **THE FRESH LANES ARE RE-OPENED EVERY STEP**, which is what makes the
-/// composition repeat and therefore capture: slots 4..8 prefill the same
-/// prompt over and over while slots 0..4 decode, so the class table — and so
-/// the graph key — is the same from the first mixed fire on.
+/// composition repeat: slots 4..8 prefill the same prompt over and over while
+/// slots 0..4 decode, so the class table — and so the fire's whole window
+/// geometry — is the same from the first mixed fire on. (It used to be phrased
+/// as "and therefore capture". It does not capture any more; the repetition
+/// still matters, because the two arms have to be the same script for their
+/// launch counts to be comparable.)
 ///
 /// **THE CARRIED PREFILL RUNS UNDER `Graphs::Off` WHATEVER `mode` SAYS**, so
-/// the mixed key is the only one this shell ever captures and
-/// `Stats::nodes` — the most recently captured graph — is unambiguously the
-/// fragmented one. Without that, the last capture is the four-lane prefill,
-/// whose adapter window is one interval and whose node count is the same in
-/// both arms: a green test of the wrong graph.
-fn sequence(shell: &mut Shell, mode: Graphs, carried: &[u32], fresh: &[u32]) -> Vec<Vec<f32>> {
+/// the only composition this shell ever routes through the tiered mode is the
+/// FRAGMENTED one — which is the composition both claims are about. Without
+/// that, the opening four-lane prefill (whose adapter window is one interval,
+/// and whose launch count is therefore the same in both arms) would be riding
+/// the same mode and muddying what a counter reading means.
+///
+/// Returns every readout in fire order, and the LAST fragmented fire's launch
+/// count (`FireCost::launches`) — read immediately after that fire, so it is
+/// unambiguously that fire's and not the opening prefill's.
+fn sequence(
+    shell: &mut Shell,
+    mode: Graphs,
+    carried: &[u32],
+    fresh: &[u32],
+) -> (Vec<Vec<f32>>, u32) {
     shell.set_mode(Graphs::Off);
     for slot in 0..8 {
         shell.open(slot).expect("the slot opens");
@@ -269,7 +332,7 @@ fn sequence(shell: &mut Shell, mode: Graphs, carried: &[u32], fresh: &[u32]) -> 
         fed = said.iter().take(4).map(|out| [argmax(out)]).collect();
         out.extend(said);
     }
-    out
+    (out, shell.last_fire_cost().launches)
 }
 
 /// What one arm produced.
@@ -278,8 +341,24 @@ struct Arm {
     logits: Vec<Vec<f32>>,
     /// The greedy tokens, for the sentence a failure prints.
     said: Vec<u32>,
-    /// Nodes in the graph the fragmented key captured — (b)'s number.
-    nodes: usize,
+    /// Launches the fragmented fire enqueued **ON THE EAGER ARM** — (b)'s
+    /// number, off `FireCost::launches` and taken from the `Graphs::Off`
+    /// round, because the economy (b) prices is a property of the WALK: a
+    /// grouped region is one trip over a segment list where a split region is
+    /// `r` trips, and a trip is what that counter counts.
+    ///
+    /// **NOT OFF THE TIERED ROUND, WHICH SINCE THE TIER-2 CAMPAIGN MEASURES
+    /// SOMETHING ELSE.** A hit re-issues the ISLANDS and replays every other
+    /// stretch, so its `launches` is the island's trips and not the fire's —
+    /// a smaller number on both arms, by a different amount on each, and the
+    /// difference between two of them prices nothing. The tiered round has its
+    /// own claims (identity, `hits`, `islands`, and its count not exceeding
+    /// the eager one) and they are asserted where it is fired.
+    launches: u32,
+    /// The same number on the TIERED round, for the sentence `arm` prints —
+    /// so a reader of the log can see both economies side by side rather than
+    /// inferring one from the other.
+    tiered_launches: u32,
     /// How many `Grouped` rows the loaded artifact owes for the correction,
     /// and how many `Split`/`Copy` ones. The premise, read off the bake.
     grouped_rows: usize,
@@ -288,6 +367,13 @@ struct Arm {
     runs: usize,
     /// How many correction nodes the plan states.
     corrections: usize,
+    /// **HOW MANY TEMPLATE REGIONS CARRY ONE**, which is the number (b) is
+    /// arithmetic in and is not the same as `corrections`. `FireCost::launches`
+    /// counts one trip per (region, run) — not one per kernel — so what the
+    /// grouped answer saves is `r - 1` trips per REGION whose window it
+    /// groups, however many correction nodes that region's run holds and
+    /// however many kernels each of those nodes dispatches.
+    sites: usize,
 }
 
 /// Load a shell, register the adapter, and run the fragmented sequence three
@@ -346,9 +432,13 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
     // against Copy under a name that says otherwise. (The grouped arm never
     // reaches it — `walk` gives `Grouped` the tie — but it is off on both so
     // that ONE word differs between them.)
+    // `bodies` is stated true — its default, said out loud — because this
+    // file's tiered arm asserts a REFUSAL, and a refusal proved on a shell
+    // with the path switched off would be proving nothing.
     let knobs = engine_cuda::Knobs {
         grouped,
         copies: false,
+        bodies: true,
         ..engine_cuda::Knobs::default()
     };
 
@@ -433,6 +523,16 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         .find(|region| region.nodes.clone().any(|node| corrections.contains(&node)))
         .map(|region| region.mask.clone())
         .expect("some region holds a correction");
+    // **AND HOW MANY REGIONS CARRY ONE**, which is the unit `FireCost::launches`
+    // counts in: a region is one trip per interval of its window, whatever its
+    // node run holds. Read off the same template the launch count comes from,
+    // so (b)'s arithmetic is the artifact's and not this file's guess about
+    // how P2 grouped the correction nodes into runs.
+    let sites = compiled
+        .template()
+        .iter()
+        .filter(|region| region.nodes.clone().any(|node| corrections.contains(&node)))
+        .count();
     let mut mixed: Vec<model_exec::fire::Lane> = Vec::with_capacity(8);
     for &(adapted, captures) in &CLASSES {
         mixed.push(model_exec::fire::Lane::new(word(1, adapted, captures), 1));
@@ -448,46 +548,95 @@ fn arm(what: &str, grouped: bool) -> Option<Arm> {
         .len();
 
     // ── the fires ────────────────────────────────────────────────────────
+    //
+    // **THREE ROUNDS AND EACH CLAIM IS MEASURED ON THE ONE IT LIVES ON.** The
+    // warm round is the tuner's first sighting; the `Graphs::Off` round is the
+    // GOLDEN — its logits are what (a) compares and its launch count is what
+    // (b) prices, because the launch economy is a property of the eager walk;
+    // the `Graphs::On` round is the ROUTER's, and what it owes is identity
+    // with the golden, a hit, an island, and a count that does not exceed the
+    // walk it replaced.
     let _warm = sequence(&mut shell, Graphs::Off, &carried, &fresh);
-    let golden = sequence(&mut shell, Graphs::Off, &carried, &fresh);
-    let replayed = sequence(&mut shell, Graphs::On, &carried, &fresh);
-    let stats = shell.graph_stats();
+    let (golden, launches) = sequence(&mut shell, Graphs::Off, &carried, &fresh);
+    let (tiered, tiered_launches) = sequence(&mut shell, Graphs::On, &carried, &fresh);
+
+    // **THE REPLAY, STATED AS A CLAIM, AND READ OFF `hits`.** A boot that armed
+    // this key makes `captures` true whether or not anything replayed; `hits`
+    // is what says a fire found its body and launched it.
+    let stats = shell.body_stats();
     assert!(
-        stats.captures >= 1,
-        "{what}: nothing captured, so the launch count below is nobody's: {stats:?}",
+        stats.hits >= 1,
+        "{what}: a fire of this composition replayed nothing. Its correction \
+         window is an island the body is cut around, not a refusal: {stats}",
+    );
+    // **AND THE BODY IS SEGMENTED.** A hit with no island would mean the
+    // correction's window had reached a graph — one window carrying segments,
+    // or `r` windows under an op that reads no seat start — which is the
+    // corruption `Windows::admits` exists to refuse.
+    assert!(
+        stats.islands >= 1,
+        "{what}: the body that served this composition holds no island, so the \
+         correction's window reached a graph: {stats}",
     );
     let said: Vec<u32> = golden.iter().map(|out| argmax(out)).collect();
     assert_eq!(
         said,
-        replayed.iter().map(|out| argmax(out)).collect::<Vec<_>>(),
-        "{what}: the replayed fires disagreed with the eager ones they were \
-         captured from, which is a `graph_replay` failure and not this file's",
+        tiered.iter().map(|out| argmax(out)).collect::<Vec<_>>(),
+        "{what}: the tiered mode disagreed with the eager walk it IS for this \
+         composition — a refused fire and a `Graphs::Off` fire are the same \
+         walk, so this is a routing bug and not a numerics one",
+    );
+    // **AND THE OTHER END OF THE SAME CLAIM.** On a hit the host enqueues the
+    // ISLAND's launches and nothing else — every other stretch is one
+    // `cudaGraphLaunch` — so the tiered arm's count cannot exceed the eager
+    // arm's, and on any artifact that captures anything at all it is strictly
+    // under it. Asserted as an inequality because how many stretches this
+    // template cuts into is the artifact's business and not this file's.
+    assert!(
+        tiered_launches <= launches,
+        "{what}: the tiered mode enqueued {tiered_launches} launches where the \
+         eager walk enqueued {launches}; a segmented body enqueues its islands \
+         and replays everything else",
     );
 
+    // **AND THE NARRATION NAMES WHICH ARM EACH NUMBER IS FROM**, because the
+    // two are no longer the same measurement: the eager count is the whole
+    // fragmented walk and the tiered one is what the host still enqueues
+    // around the execs, which on this composition is the correction's own
+    // islands.
     eprintln!(
-        "{what}: r={runs}, {} correction nodes, {grouped_rows} grouped rows / \
-         {split_rows} split rows, {} graph nodes over {} captures",
+        "{what}: r={runs}, {} correction nodes in {sites} region(s), \
+         {grouped_rows} grouped rows / {split_rows} split rows; \
+         {launches} launches per fragmented fire walking eagerly, \
+         {tiered_launches} enqueued per fire under the tiered router; {stats}",
         corrections.len(),
-        stats.nodes,
-        stats.captures,
     );
 
     Some(Arm {
         logits: golden,
         said,
-        nodes: stats.nodes,
+        launches,
+        tiered_launches,
         grouped_rows,
         split_rows,
         runs,
         corrections: corrections.len(),
+        sites,
     })
 }
 
 // ── the gate ─────────────────────────────────────────────────────────────
 
 /// **THE A/B.** Same fires, same rows, two answers for one withdrawn consumer:
-/// the logits must be identical to the bit, and the recorded graph must hold
-/// exactly `2 x nodes x (r - 1)` fewer launches.
+/// the logits must be identical to the bit, and the grouped WALK must enqueue
+/// exactly `regions x (r - 1)` fewer trips than the split one.
+///
+/// **EACH CLAIM ON THE ROUND THAT CARRIES IT.** Both numbers below are the
+/// `Graphs::Off` rounds' — the launch economy is a property of the eager walk,
+/// and a hit enqueues its islands rather than its fire — and the tiered
+/// round's own claims (identity, `hits`, `islands`, and a count that does not
+/// exceed the walk it replaced) are asserted in `arm`, beside the fires that
+/// produced them.
 #[test]
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_grouped_correction_is_bit_identical_to_a_split_one_and_costs_fewer_launches() {
@@ -565,29 +714,51 @@ fn a_grouped_correction_is_bit_identical_to_a_split_one_and_costs_fewer_launches
 
     // ── (b) fewer launches, by exactly the right number ──────────────────
     //
-    // A correction site is TWO launches — the routed projection and the
-    // accumulate (`kernels_cuda::linear::lora`) — so a split pays `2r` per
-    // node and a grouped answer pays 2. Everything else in the graph is the
-    // same artifact over the same composition, so the difference is exactly
-    // the launches the grouped answer did not make.
-    let saved = 2 * split.corrections * (split.runs - 1);
+    // **MEASURED ON THE EAGER ARM OF EACH SIDE, BECAUSE THAT IS WHERE THE
+    // CLAIM LIVES.** `Fallback::Grouped` is a statement about the WALK: a
+    // region P4 could not seat is one trip per interval of its window, and
+    // the grouped answer makes it ONE trip handed the interval list. Both
+    // `launches` above are the `Graphs::Off` round's, so the difference is
+    // exactly the trips the grouped answer did not make and nothing else.
+    //
+    // **AND THE UNIT IS A TRIP, NOT A KERNEL.** A correction site dispatches
+    // two kernels — the routed projection and the accumulate
+    // (`kernels_cuda::linear::lora`) — and `FireCost::launches` counts neither
+    // of them: it sums `Windows::runs` over the template, which is one number
+    // per (region, run). So the saving is `r - 1` per REGION carrying a
+    // correction, and the count of those regions is read off the template
+    // (`Arm::sites`) rather than assumed equal to the node count. This
+    // assertion used to spell `2 x nodes x (r - 1)`, which was the kernel
+    // census the number was read off before it moved to the walk's own
+    // counter; two of the three factors were right and the file kept the
+    // sentence rather than the arithmetic.
+    assert_eq!(split.sites, grouped.sites, "one template, two answers");
+    let saved =
+        u32::try_from(split.sites * (split.runs - 1)).expect("a launch saving fits a u32");
     assert_eq!(
-        split.nodes.checked_sub(grouped.nodes),
+        split.launches.checked_sub(grouped.launches),
         Some(saved),
-        "the grouped graph holds {} nodes against the split graph's {}; the \
-         answer is worth {saved} launches and this is not it",
-        grouped.nodes,
-        split.nodes,
+        "the grouped walk enqueued {} launches against the split walk's {}; \
+         {} region(s) carry a correction and the window covers {} intervals, \
+         so the answer is worth {saved} trips and this is not it",
+        grouped.launches,
+        split.launches,
+        split.sites,
+        split.runs,
     );
 
     eprintln!(
-        "GROUPED vs SPLIT on {SKU}: r={}, {} correction nodes, {} graph nodes \
-         against {} ({saved} launches saved), every logit bit-identical over \
+        "GROUPED vs SPLIT on {SKU}: r={}, {} correction nodes in {} region(s), \
+         {} launches against {} walking eagerly ({saved} saved), {} against {} \
+         enqueued under the tiered router, every logit bit-identical over \
          {} readouts",
         split.runs,
         split.corrections,
-        grouped.nodes,
-        split.nodes,
+        split.sites,
+        grouped.launches,
+        split.launches,
+        grouped.tiered_launches,
+        split.tiered_launches,
         split.logits.len(),
     );
 }
