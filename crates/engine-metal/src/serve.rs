@@ -1722,6 +1722,24 @@ impl Shell {
         self.pools.watermark()
     }
 
+    /// **DID THIS LOAD MAP ITS CHECKPOINT INSTEAD OF READING IT?** — the warm
+    /// arm's one observable (§M-5), and what `LoadFacts::weights_from_cache`
+    /// publishes.
+    ///
+    /// `true` says the model came out of the file where it lies: every plane
+    /// the artifact stores is a view onto its own pages, no store was
+    /// reserved for them and no weight byte was copied. Not every plane —
+    /// a handful the load COMPUTES rather than reads are landed the ordinary
+    /// way into a reservation of a few hundred bytes, and
+    /// [`Weights::warm`](crate::weights::Weights::warm) states the ceiling
+    /// that keeps "a handful" true. `false` is every other load, including a
+    /// serving artifact the warm arm declined — which says on the way past
+    /// which fact it declined on.
+    #[must_use]
+    pub fn weights_warm(&self) -> bool {
+        self.weights.warm()
+    }
+
     /// What this load holds: weights, arena, pools, inputs — in bytes.
     #[must_use]
     pub fn footprint(&self) -> (u64, u64, u64, u64) {
@@ -2217,17 +2235,42 @@ impl Shell {
     }
 
     /// **`(the streamed source's backing file size, its link count)`**, or
-    /// `None` for a full-residency load, which opens no file.
+    /// `None` for a full-residency load, which has no source at all.
     ///
-    /// What a gate holds `crate::host_source`'s claim with: the routed bands
-    /// this load streams are in a mapping of a real file the kernel may page
-    /// them out to, and that file is unlinked, so nothing outside this process
-    /// can reach it and nothing survives the process.
+    /// What a gate holds the reclaimability claim with: the routed bands this
+    /// load streams are in a mapping of a REAL FILE the kernel may page them
+    /// out to, rather than in anonymous memory only swap could take.
+    ///
+    /// **WHICH file depends on the arm, and so does the second number** — read
+    /// [`Shell::expert_source_kind`] beside it. A cold load stages the bands
+    /// into a file it created and unlinked, so the pair is `(source bytes, 0)`
+    /// and the zero is the claim that nothing outside this process can reach
+    /// it. A warm one reads them out of the serving artifact it is already
+    /// mapping, so the pair is `(the artifact's bytes, its links)` — at least
+    /// one, because the operator named that file and this load did not create
+    /// it. Asserting zero links without asking the kind is asserting the load
+    /// was cold.
     #[must_use]
     pub fn expert_source(&self) -> Option<(u64, u64)> {
         self.weights
             .tier()
             .and_then(|tier| tier.borrow().source())
+    }
+
+    /// **Which source this load's seat copies read from**: `"landed"` for the
+    /// cold arm's staging file, `"artifact"` for the warm arm's mapped
+    /// serving artifact — `None` for a full-residency load, which streams
+    /// nothing.
+    ///
+    /// The word that makes [`Shell::expert_source`]'s pair readable, and the
+    /// one observable that separates a warm streamed load from its cold twin
+    /// on the streaming side (`weights_warm` separates them on the binding
+    /// side).
+    #[must_use]
+    pub fn expert_source_kind(&self) -> Option<&'static str> {
+        self.weights
+            .tier()
+            .map(|tier| tier.borrow().source_kind())
     }
 
     /// The banks this load declared: name, capacity, and bytes per slot.

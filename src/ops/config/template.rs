@@ -107,9 +107,8 @@ name = "default"
 model = "Qwen/Qwen3.5-0.8B"
 # weight_cache_dir = ""       # empty derives $PIE_HOME/models
 # weight_dtype     = "bfloat16"  # what the CHECKPOINT holds. activation_dtype
-                                 # and kv_cache_dtype are what the engine
-                                 # computes and stores in, so they are engine
-                                 # keys and this is a model one.
+                                 # is what the engine computes in, so that is
+                                 # an engine key and this is a model one.
 "#;
 
 // `METAL_MODEL_BLOCK` STOOD HERE, beside `MLX_MODEL_BLOCK` below: Metal's
@@ -172,8 +171,7 @@ device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 gpu_mem_utilization = 0.90
-# kv_cache_dtype  = "auto"
-# kv_page_size    = 32      # omit: the memory planner derives one
+# kv_page_size    = 32      # omit: the engine derives one
 # max_total_pages = 4096    # omit: derived from gpu_mem_utilization
 # random_seed     = 42
 "#;

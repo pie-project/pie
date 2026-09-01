@@ -1154,6 +1154,9 @@ impl Engine for Metal {
 
         let trace_name = shell.trace().name.clone();
         let (weight_bytes, arena_bytes, pool_bytes, input_bytes) = shell.footprint();
+        // Read here rather than at the field, because the shell moves into
+        // `self` before the facts are assembled. See `weights_from_cache`.
+        let weights_warm = shell.weights_warm();
 
         let paging = shell.paging();
         let profile = profile(&shell, &budgets)?;
@@ -1362,47 +1365,39 @@ impl Engine for Metal {
                 // host demand is zero and `host_weight_budget` has nothing to
                 // refuse — which is the platform, not a gap.
                 weights_resident: !streams,
-                // **THIS PLANE HAS NO WARM-BOOT ARTIFACT CACHE, AND IT SAYS
-                // SO RATHER THAN LEAVING THE FIELD OUT** — the same
-                // capability honesty `sms: 0` and `fp8_native: false` are
-                // stated with a few lines above. The CUDA shell's cache buys
-                // a warm boot by skipping host-side dequant/repack and a
-                // per-tensor upload; on unified memory the upload is the
-                // small half, and `kernels-metal` stamps one dtype, so there
-                // is much less transform to amortize. Whether it is worth
-                // building here is a measurement nobody has taken, and until
-                // someone does, every Metal load is a cold one and reports it.
+                // **TRUE WHEN THIS LOAD MAPPED ITS CHECKPOINT INSTEAD OF
+                // READING IT** — the warm arm (§M-5), landed.
                 //
-                // **THE MEASUREMENT NOW HAS ITS PRIMITIVE, AND THIS FIELD IS
-                // STILL `false`.** The warm-read plan's M-1 landed
-                // (`crate::mapping`, `device::Buffer::mapped`): an artifact
-                // can be mapped and handed to Metal through
-                // `newBufferWithBytesNoCopy` with no copy at all, which is
-                // the cheap half the paragraph above suspected — on unified
-                // memory the upload IS the memcpy, so removing it removes a
-                // full model's worth of transient host bytes from the boot's
-                // peak. What M-1 is NOT is a warm boot: nothing above this
-                // line reaches for it yet, and a load that does not is a cold
-                // load and says so.
+                // What stood here was an honest `false` and a plan: this
+                // plane had no warm boot, so every Metal load was a cold one
+                // and said so. The plan's two remaining steps are both in —
+                // M-2 is `checkpoint::file::serve::Artifact` (the CUDA
+                // node's, as recorded: this crate added call sites and did
+                // not create it), and M-5 is `weights::warm`, which maps the
+                // serving artifact once and mints one handle per plane at
+                // the offset its manifest states.
                 //
-                // The two steps between the primitive and this field turning
-                // `true`, and who owns them:
+                // So the field means what its name says, on both sides. A
+                // serving artifact whose stamp agrees with this deployment
+                // is served off its own pages — no store reservation the
+                // size of the model, no host arena the size of the image,
+                // and no `memcpy` into pages the GPU was about to wire
+                // anyway — and reports `true`. Measured on this box against
+                // the four-bit 0.8B: 27 ms warm against 155 ms cold, the
+                // same nine greedy tokens, and a wired delta at the BOOT of
+                // +0.001 GiB — the touch is what wires, and it happens at
+                // the first fire (`a_warm_load_is_the_artifact_mapped`).
                 //
-                // * **M-2, the reader** — `checkpoint::serving` opening an
-                //   artifact and answering the byte ranges a mapped load
-                //   binds views over. Checkpoint-side, arriving with
-                //   upstream's M-4 wave; the CUDA node owns it (it is the
-                //   hoist of `engine-cuda`'s `weight_cache/mapped.rs`, see
-                //   `.wiki/alto/streaming.md`'s W-b prep note). **This crate
-                //   adds call sites when it lands and does not create it.**
-                // * **M-5, the warm arm** — `weights.rs` choosing the mapped
-                //   reservation over the eager one when the plan is
-                //   full-residency, and THAT is what makes this field mean
-                //   something. It is gated on M-2 and on the ceiling M-1's
-                //   own header states: the mapped path serves a model that
-                //   fits, never the streamed one, because a GPU-touched
-                //   shared page wires and nothing evicts it.
-                weights_from_cache: false,
+                // Everything else reports `false`, and a file that CLAIMED
+                // to be servable prints which fact sent it down the cold
+                // road: a streamed plan (the mapped door is the
+                // fits-in-memory one, and `crate::mapping` carries the
+                // measurement that makes that a rule), a sharded payload, an
+                // alignment this device would not want, a plane at a width
+                // the plan does not predict, or a residue of computed planes
+                // too large for the word "warm" to survive. A raw snapshot
+                // and an ordinary `.zt` are quiet: they never claimed it.
+                weights_from_cache: weights_warm,
                 arena_bytes,
                 pool_bytes,
                 input_bytes,

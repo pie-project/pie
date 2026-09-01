@@ -82,7 +82,7 @@ use checkpoint::contract::{BiasBy, Expr, ScaleFactor, TensorContract};
 use checkpoint::executor::Progress;
 use checkpoint::executor::sink::TensorSink;
 use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
-use checkpoint::types::{CheckpointFormat, Encoding, TensorDecl, Visibility};
+use checkpoint::types::{CheckpointFormat, DType, Encoding, TensorDecl, Visibility};
 use checkpoint::verify::ContractView;
 
 use checkpoint::file::Attributes;
@@ -1872,6 +1872,7 @@ fn promote_import_transforms(
         }
     }
     close_over_the_declared_pairings(&mut promoted, &mut kept);
+    keep_the_width_a_surviving_read_declares(sku, materialization, &kept);
     if promoted.is_empty() {
         return Ok((Vec::new(), Some(sku)));
     }
@@ -2226,6 +2227,89 @@ fn refuse_a_name_two_parties_claim(
         );
     }
     Ok(())
+}
+
+/// Spares from the narrowing every plane a SURVIVING READ declares at a raw
+/// dtype that is not BF16 — the width the model text asked for, kept.
+///
+/// [`materialize_contract`] narrows every `Raw(F16)` and `Raw(F32)` object to
+/// BF16, and it decides that from the SOURCE ENCODING ALONE — it lives in the
+/// loader, it names no family convention, and that is the property that lets
+/// it live there at all. Its justification, though, is a claim about the
+/// CONSUMER: *every device kernel pie ships reads BF16*. That claim was true
+/// when it was written and this tree now falsifies it in its own source —
+/// `kernels_cuda::attn::ssm` opens with
+/// `debug_assert_eq!(a_log.dtype, Dtype::F32, "reads an f32 decay bank")`, and
+/// four model texts declare thirteen weights `Dtype::F32` for that reason.
+///
+/// So the narrowing was overriding the contract, silently, and in two ways
+/// that are worth separating because only one of them is arithmetic:
+///
+/// * **It moved a width the text had settled.** Qwen3.5-0.8B stores exactly
+///   36 F32 objects — 18 `linear_attn.A_log` and 18 `linear_attn.norm.weight`
+///   — which are exactly the two weights `qwen_3` declares `Dtype::F32`.
+///   Source width and declared width AGREED, so the read was an identity and
+///   nothing was cast at load. Narrowing them manufactured a disagreement that
+///   did not exist, and the load grew a widening `Cast(Src, F32)` per plane:
+///   36 planes that could be bound where they lie, landing through a residue
+///   path at every boot forever, to undo a conversion nobody asked for.
+/// * **And on one of the two it dropped bits.** Measured over all 18 layers:
+///   `A_log` is bf16-exact in 18 of 18 planes — an F32 container holding BF16
+///   values, so narrowing it is a lossless re-spelling — while
+///   `linear_attn.norm.weight` is bf16-exact in 0 of 18, worst relative error
+///   3.9e-3. That is the module doc's own invariant broken in words it chose
+///   itself: *it drops exactly the bits the runtime drops at load, so the
+///   artifact serves what a cold load would have served.* A cold load serves
+///   this norm at F32, because the text and the kernel both say F32.
+///
+/// The fix belongs HERE and not in the loader, for the reason the loader's
+/// blindness is a feature: this is the first point that holds both the
+/// checkpoint and the SKU's contract, so it is the first point that can ask
+/// what the plane is FOR. `kept` is the right set to ask — a `promoted` entry
+/// writes its own plane at its own declared encoding and its legs are dropped
+/// from `decoded` below regardless.
+///
+/// Spared planes move to `passthrough`, which copies them byte for byte at the
+/// source's width, and their narrowing entry is dropped from the contract that
+/// writes — the same three-set discipline the retains below keep, for the same
+/// reason: a plane left in both sets is an artifact holding it twice.
+///
+/// A leg two entries read at two different widths is spared by the wider
+/// claim, which is the answer that costs a cast rather than bits.
+fn keep_the_width_a_surviving_read_declares(
+    sku: &str,
+    materialization: &mut Materialization,
+    kept: &[TensorContract],
+) {
+    let mut spared: BTreeSet<String> = BTreeSet::new();
+    for tensor in kept {
+        let Encoding::Raw(dtype) = &tensor.encoding else {
+            continue;
+        };
+        if *dtype == DType::Bf16 {
+            continue;
+        }
+        for leg in tensor.expr.sources() {
+            if materialization.decoded.iter().any(|name| name == leg) {
+                spared.insert(leg.to_string());
+            }
+        }
+    }
+    if spared.is_empty() {
+        return;
+    }
+    materialization.decoded.retain(|name| !spared.contains(name));
+    materialization
+        .contract
+        .tensors
+        .retain(|tensor| !spared.contains(&tensor.name));
+    materialization.passthrough.extend(spared.iter().cloned());
+    materialization.passthrough.sort();
+    println!(
+        "convert: {sku} declares {} plane(s) at a raw dtype of its own, so they are copied at \
+         the source's width instead of narrowed to bf16",
+        spared.len(),
+    );
 }
 
 /// Does this chain state a transform this command should run ONCE, so that a
@@ -3612,6 +3696,71 @@ mod tests {
             ["layer.0.o_proj"],
             "and a plane that pairs with nothing promoted stays where it was"
         );
+    }
+
+    /// A plane the SKU reads at its own raw dtype is COPIED AT THE SOURCE'S
+    /// WIDTH, and one read at bf16 is still narrowed.
+    ///
+    /// Both arms, because the whole content of the rule is that it
+    /// DISCRIMINATES. `materialize_contract` narrows from the source encoding
+    /// alone and is right to — it names no family convention, which is what
+    /// lets it live in the loader — so a rule that spared every F32 plane
+    /// would undo the narrowing wholesale and hand every mlx affine factor
+    /// back to the engine to rewrite at boot. The bf16 arm is what says it
+    /// does not.
+    ///
+    /// The mlx factors are safe for a second and stronger reason than this
+    /// test: `checkpoint_dsl::factors` builds a scales or biases entry with
+    /// `want = encoding(Dtype::Bf16)` and no branch, so a companion plane
+    /// CANNOT declare a width for this rule to spare, whatever the file holds.
+    /// The bf16 arm below is the guard for that being true by accident.
+    #[test]
+    fn a_plane_the_text_declares_wide_is_copied_at_its_width_and_a_bf16_read_is_not() {
+        use checkpoint::contract::{Expr, ModelContract, TensorContract};
+
+        // What the loader leaves: both legs narrowed, keyed by source name.
+        let narrowing = |name: &str| {
+            TensorContract::new(
+                name,
+                Expr::src(name).cast(Encoding::Raw(DType::Bf16)),
+                vec![16],
+                Encoding::Raw(DType::Bf16),
+            )
+        };
+        let decay = "model.layers.0.linear_attn.A_log";
+        let gate = "model.layers.0.mlp.gate.weight";
+        let mut m = Materialization {
+            contract: ModelContract {
+                alignment: 1,
+                tensors: vec![narrowing(decay), narrowing(gate)],
+                groups: Vec::new(),
+            },
+            decoded: vec![decay.into(), gate.into()],
+            passthrough: Vec::new(),
+            meta: Vec::new(),
+        };
+
+        // What the text says: the decay bank at f32 -- `qwen_3`'s own
+        // declaration, and the width `kernels_cuda::attn::ssm` debug-asserts
+        // -- and the gate at the bf16 every other kernel reads.
+        let read = |name: &str, from: &str, dtype: DType| {
+            TensorContract::new(
+                name,
+                Expr::src(from),
+                vec![16],
+                Encoding::Raw(dtype),
+            )
+        };
+        let kept = [
+            read("layer.0.a_log", decay, DType::F32),
+            read("layer.0.mlp.gate", gate, DType::Bf16),
+        ];
+        keep_the_width_a_surviving_read_declares("qwen35-d0.8b-bf16-kv-bf16", &mut m, &kept);
+
+        assert_eq!(m.decoded, vec![gate.to_string()], "only the bf16 read still narrows");
+        assert_eq!(m.passthrough, vec![decay.to_string()], "the f32 read is copied as stored");
+        let written: Vec<&str> = m.contract.tensors.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(written, vec![gate], "the spared plane's narrowing entry is dropped");
     }
 
     /// A promoted plane whose name the artifact already holds is refused, and

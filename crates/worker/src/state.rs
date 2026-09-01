@@ -7,8 +7,8 @@
 //!
 //! This is deliberately a description of the tree, not of the code that writes
 //! it. The one coupling that matters is the engine cache root: this module
-//! names `cache/`, and `embedded_engine::set_cache_dir` is what tells the
-//! engines to write there. Its *contents* are enumerated from disk rather than
+//! names `cache/`, and the boot path hands it to every engine as a
+//! `DeviceBoot` field. Its *contents* are enumerated from disk rather than
 //! listed here, because the subdirectory names (`cubins`, `gemm-algos`, and
 //! whatever the C++ side chooses) belong to the crates that write them, and a
 //! list here would be a second copy free to drift from them.
@@ -19,10 +19,6 @@
 //! `$PIE_HOME` and so outside everything below. They take their subdirectory
 //! off the same root now and are counted and reclaimed with the rest.
 //!
-//! The exception is [`PLANNER_PROFILE_FILE`], and it is named here precisely
-//! *because* it does not share the reclaim semantics of everything around it.
-//! See its own doc comment.
-//!
 //! **Entries do not nest.** Two entries whose paths contain one another would
 //! double-count in a size report and delete each other in a reclaim, so the
 //! ones carved out of `cache/` are subtracted from it via [`Entry::keep`] and
@@ -30,34 +26,18 @@
 
 use std::path::PathBuf;
 
-/// The engine's measured planner shape, inside the engine cache but not of it.
-///
-/// Named here — the one filename this module spells out — because it is the
-/// only thing under `cache/` that a boot does **not** re-derive. Every sibling
-/// (compiled ETA, GEMM autotuning) is rebuilt on the next cold start; this
-/// file is written *only* by a boot that was explicitly asked to calibrate,
-/// which is stage one of `pie config tune` and costs a dedicated bootstrap
-/// that serves nothing. Clearing it with the rest would look like reclaiming a
-/// cache and would actually discard a measurement, so it is its own entry with
-/// its own reclaim policy.
-///
-/// The C++ side owns the spelling (`store/planner_profile_cache.cpp`); this is
-/// the one place the Rust side repeats it, and `pie doctor` reads it from here
-/// rather than spelling it a third time.
-pub const PLANNER_PROFILE_FILE: &str = "cuda_memory_profiles.json";
-
-/// The advisory lock `planner_profile_cache_store` holds across its
-/// read-merge-rename. Kept beside the profile for the same reason: deleting it
-/// out from under a calibrating process would let a second one take a lock on
-/// a fresh inode and believe it holds the same lock.
-pub const PLANNER_PROFILE_LOCK: &str = "cuda_memory_profiles.json.lock";
+// `PLANNER_PROFILE_FILE` and its lock STOOD HERE — `cuda_memory_profiles.json`,
+// the one thing under `cache/` a boot did not re-derive, written only by a
+// calibration boot (`store/planner_profile_cache.cpp`, C++). Writer and reader
+// both left with that engine, so a leftover file is one more derived-looking
+// thing the `engine` entry sweeps, not a measurement to protect.
 
 /// The root every engine-side disk cache derives from.
 ///
-/// Defined here rather than at the call site so the registry below and
-/// `embedded_engine::set_cache_dir` -- the thing that actually tells the
-/// engines where to write -- cannot drift. A `pie cache clear` that looked in
-/// a directory nothing writes to would report success and reclaim nothing.
+/// Defined here rather than at the call site so the registry below and the
+/// boot path that actually tells the engines where to write -- a `DeviceBoot`
+/// field now -- cannot drift. A `pie cache clear` that looked in a directory
+/// nothing writes to would report success and reclaim nothing.
 pub fn engine_cache_dir() -> PathBuf {
     crate::paths::pie_home().join("cache")
 }
@@ -70,11 +50,6 @@ pub fn engine_cache_dir() -> PathBuf {
 /// at all.
 pub fn weight_cache_dir() -> PathBuf {
     engine_cache_dir().join("weights")
-}
-
-/// Where the engine records the planner shape it measured on this machine.
-pub fn planner_profile_path() -> PathBuf {
-    engine_cache_dir().join(PLANNER_PROFILE_FILE)
 }
 
 /// Whether an entry may be deleted to reclaim space.
@@ -103,10 +78,9 @@ pub struct Entry {
     /// neither counted in this entry's size nor removed with it.
     ///
     /// This is what keeps the registry a flat list over a nested tree. `cache/`
-    /// physically contains the weight cache and the planner profile, but each
-    /// of those has its own reclaim policy — so an `engine` entry that swallowed
-    /// them would report their bytes twice and delete a measurement while
-    /// claiming to reclaim a cache.
+    /// physically contains the weight cache, which has its own reclaim policy —
+    /// so an `engine` entry that swallowed it would report its bytes twice and
+    /// delete it while claiming to reclaim something else.
     pub keep: &'static [&'static str],
 }
 
@@ -117,21 +91,12 @@ pub struct Entry {
 pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
     let home = crate::paths::pie_home();
     let mut entries = vec![
-        Entry {
-            name: "launch",
-            path: crate::embedded_engine::launch_state_root(),
-            what: "Per-launch engine bootstrap TOMLs. Dead as soon as the engines \
-                   they configured are down; swept at boot for pids that are gone.",
-            reclaim: Reclaim::Safe,
-            keep: &[],
-        },
+        // The "launch" entry STOOD FIRST HERE -- `$PIE_HOME/standalone/<pid>`,
+        // the per-launch bootstrap TOMLs with their pid sweep. The boot config
+        // crosses as a typed struct now, so nothing writes that tree at all.
         Entry {
             name: "engine",
             path: engine_cache_dir(),
-            // No longer says "planner profiles": that file is its own entry
-            // below, because it is the one thing here a cold boot does not
-            // rebuild. The claim "deleting costs one cold rebuild" is true of
-            // what is left, and was false while it covered the profile.
             // The GEMM half of this sentence was FALSE until the cache roots
             // came together: `kernels-cuda` resolved its own path from
             // `$XDG_CACHE_HOME`, so its cubins and its measured cuBLASLt table
@@ -143,7 +108,7 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
                    cubins, GEMM autotuning results. All keyed and \
                    self-invalidating; deleting costs one cold rebuild.",
             reclaim: Reclaim::Safe,
-            keep: &["weights", PLANNER_PROFILE_FILE, PLANNER_PROFILE_LOCK],
+            keep: &["weights"],
         },
         Entry {
             name: "programs",
@@ -190,22 +155,6 @@ pub fn entries(hf_cache: Option<PathBuf>) -> Vec<Entry> {
                    quant scheme + TP layout + ABI version. One cold load to \
                    rebuild; valid only for this build.",
             reclaim: Reclaim::Safe,
-            keep: &[],
-        },
-        Entry {
-            name: "planner-profile",
-            path: planner_profile_path(),
-            // `OnRequest`, alone among the things under `cache/`. Everything
-            // else there is rebuilt by the next boot that needs it; this is
-            // written only by a boot explicitly asked to calibrate, and no
-            // amount of ordinary serving regenerates it. Sweeping it up with
-            // `pie cache clear` would read as reclaiming a cache and would in
-            // fact throw away a measurement of this machine.
-            what: "The forward step as measured on THIS machine, read by the \
-                   planner instead of its analytic score. Only `pie config \
-                   optimize` writes it -- serving never does, so losing it \
-                   costs another calibration run.",
-            reclaim: Reclaim::OnRequest,
             keep: &[],
         },
         Entry {
@@ -407,12 +356,6 @@ mod tests {
         for entry in &all {
             for kept in entry.keep {
                 let path = entry.path.join(kept);
-                // The lock file is the one carve-out with no entry of its own:
-                // it belongs to the planner profile, and is held rather than
-                // reclaimed.
-                if path == engine_cache_dir().join(PLANNER_PROFILE_LOCK) {
-                    continue;
-                }
                 assert!(
                     all.iter().any(|other| other.path == path),
                     "{}'s carve-out {kept} is claimed by no entry, so nothing \
@@ -421,35 +364,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The planner profile is never swept up by a bare `pie cache clear`.
-    ///
-    /// It sits under `cache/` with the compiled modules and the GEMM tuning,
-    /// and reads like one more derived thing. It is not: only `pie config
-    /// optimize` writes it, so clearing it discards a measurement that no
-    /// amount of serving brings back.
-    #[test]
-    fn the_planner_profile_is_not_reclaimed_by_default() {
-        let profile = entries(None)
-            .into_iter()
-            .find(|e| e.name == "planner-profile")
-            .expect("the planner profile is its own entry");
-        assert_eq!(profile.reclaim, Reclaim::OnRequest);
-        assert_eq!(profile.path, planner_profile_path());
-
-        let engine = entries(None)
-            .into_iter()
-            .find(|e| e.name == "engine")
-            .expect("the engine cache is an entry");
-        assert!(
-            engine.keep.contains(&PLANNER_PROFILE_FILE),
-            "clearing the engine cache would take the profile with it",
-        );
-        assert!(
-            !engine.what.contains("planner profile"),
-            "the description still claims to cover a file it no longer does",
-        );
     }
 
     #[test]
@@ -500,10 +414,6 @@ mod tests {
         };
         assert_eq!(by_name("engine"), engine_cache_dir());
         assert_eq!(by_name("weights"), weight_cache_dir());
-        assert_eq!(
-            by_name("launch"),
-            crate::embedded_engine::launch_state_root()
-        );
     }
 
     #[test]

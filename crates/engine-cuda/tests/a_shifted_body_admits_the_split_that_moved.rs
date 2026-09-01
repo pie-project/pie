@@ -255,6 +255,21 @@ fn shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
 
 /// The fire-wide qo boundaries, in the composed row order the windows are cut
 /// against.
+/// **AND THE LANE AXIS'S ANSWER FOR THIS SUBJECT**, which is `true`
+/// everywhere and is a statement rather than a waiver
+/// (`exports::regions_lane_shifting`, `engine_cuda::LANE_SHIFTED`).
+///
+/// That reading admits a region when every op in it either finds its own lane
+/// absolutely or NAMES NOTHING LANE-INDEXED — no cache space, no lane-shaped
+/// rectangle. This subject is `elementwise.layernorm_no_scale` end to end over
+/// row-shaped values and declares no cache at all, so no op in it can be
+/// handed a `lane_offset`-advanced pointer and the second clause answers for
+/// every region. Which is the point: this file varies where a window's ROWS
+/// begin, and the lane clause is not what it is testing.
+fn lane_shifting(compiled: &CompiledModel) -> Vec<bool> {
+    vec![true; compiled.template().len()]
+}
+
 fn boundaries(fire: &Composition) -> Vec<i32> {
     let mut lanes: Vec<(u32, u32)> = fire
         .lanes()
@@ -350,7 +365,7 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
          windowed and proves nothing",
     );
     assert!(
-        table.covers_fire_shifted(fire.rows(), &shifted),
+        table.covers_fire_shifted(fire.rows(), &shifted, &lane_shifting(&compiled)),
         "every region of this fire is either the whole fire or one whose ops \
          all read the seat's start, and the wide gate refused it anyway",
     );
@@ -369,7 +384,7 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
         .expect("(a) found a windowed region");
     crippled[windowed] = false;
     assert!(
-        !table.covers_fire_shifted(fire.rows(), &crippled),
+        !table.covers_fire_shifted(fire.rows(), &crippled, &lane_shifting(&compiled)),
         "a windowed region that does NOT move its own base was admitted; the \
          launch plane would hand it pre-shifted pointers under a disarmed seat",
     );
@@ -382,7 +397,7 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
     // region below is an `Admit::Island`, the stretches around it are captured,
     // and the island is re-issued eagerly between the execs. So exactly one
     // entry moves, and it is the one whose shift was taken away.
-    let table_admits = table.admits(fire.rows(), &crippled);
+    let table_admits = table.admits(fire.rows(), &crippled, &lane_shifting(&compiled));
     assert_eq!(
         table_admits[windowed],
         engine_cuda::window::Admit::Island,
@@ -400,7 +415,7 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
     );
     assert!(
         table
-            .admits(fire.rows(), &shifted)
+            .admits(fire.rows(), &shifted, &lane_shifting(&compiled))
             .iter()
             .all(|admit| *admit == engine_cuda::window::Admit::Captured),
         "the uncrippled slice left an island behind, so the collapsed reading \

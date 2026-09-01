@@ -1,5 +1,5 @@
-//! **`[engine] gpu_mem_utilization` REACHES A SHELL** (alto streaming §3
-//! item 5, `.wiki/alto/next.md` B1 and B2).
+//! **THE OPERATOR'S `gpu_mem_utilization` REACHES A SHELL** (alto streaming
+//! §3 item 5, `.wiki/alto/next.md` B1 and B2).
 //!
 //! The key was declared in `worker::config`, defaulted to `0.90`, validated in
 //! `(0.0, 1.0]` and put in the config schema — and `grep` found no reader in
@@ -8,12 +8,15 @@
 //! workspace serves from, 34.4 GB where an operator who wrote `0.90` asked for
 //! 29.6.
 //!
-//! This file is the route, gated at every hop that does not need a device:
+//! This file is the route, gated at every hop that does not need a device.
+//! The fraction rides `Knobs::gpu_mem_utilization` on the typed `DeviceBoot`
+//! now — a field cannot fail to arrive the way the old boot document's key
+//! did — so the hop this file once made about parsing is about VALIDATION:
 //!
 //! ```text
 //! worker::config            declares, defaults, validates   (its own tests)
-//! boot document `[engine]`  the fraction is written there   (worker tests)
-//! engine_cuda::boot         reads it into `Knobs`           HERE
+//! DeviceBoot.knobs          the fraction arrives typed      (the compiler)
+//! engine_cuda::open         refuses an illegal fraction     HERE
 //! elastic::budget_bytes     turns it into the pool's bytes  HERE
 //! store::Accounting         states the whole sum, ahead     HERE
 //! Shell::load               refuses / opens the pool        the GPU smoke
@@ -35,6 +38,7 @@
 
 use engine_cuda::device::elastic::{budget_bytes, safety_floor_bytes};
 use engine_cuda::store::Accounting;
+use engine_cuda::{DeviceBoot, Knobs};
 
 /// The card the gap was measured on: an L40S, 48,305,799,168 bytes.
 const CARD: u64 = 48_305_799_168;
@@ -43,85 +47,77 @@ const CARD: u64 = 48_305_799_168;
 /// number, and the reason the fraction matters at all.
 const WEIGHTS: u64 = 13_761_281_792;
 
-/// A boot document with an `[engine]` table, spelled as the worker writes one.
-fn boot_doc(engine: &str) -> Vec<u8> {
-    format!("[model]\ndevice = \"cuda:0\"\n\n[engine]\n{engine}\n").into_bytes()
+/// A boot with the operator's fraction stated, everything else the default.
+fn boot_with(fraction: f64) -> DeviceBoot {
+    DeviceBoot {
+        knobs: Knobs {
+            gpu_mem_utilization: fraction,
+            ..Knobs::default()
+        },
+        ..DeviceBoot::default()
+    }
 }
 
-/// **HOP 3: the boot document's `[engine]` table becomes `Knobs`.**
+/// A contract lookup for a gate that never loads: `open` must not need one.
+fn no_contract() -> engine_cuda::ContractFor {
+    |_, _| Err("this gate opens a boot and never loads a model".to_string())
+}
+
+/// **HOP 2/3: the fraction the boot states is the fraction the shell holds,
+/// and absence is the config's own default.**
 ///
-/// The one hop that was missing. `weight_cache_dir` had exactly this failure
-/// for a whole rewrite — written by the worker, parsed by nobody — and the
-/// only thing that would have caught it is a test that reads the answer back.
+/// The parsing half of this hop died with the boot document — a struct field
+/// cannot fail to arrive the way `weight_cache_dir` once did — so what is
+/// left to state is the DEFAULT: `Knobs::default()` must mean what the absent
+/// config key has always meant.
 #[test]
-fn the_boot_document_carries_the_fraction_to_the_knobs() {
-    let stated = engine_cuda::boot::read(&boot_doc("gpu_mem_utilization = 0.75"))
-        .expect("a fraction in range opens");
-    assert!(
-        (stated.knobs.gpu_mem_utilization - 0.75).abs() < f64::EPSILON,
-        "the fraction the document stated is the fraction the shell holds"
-    );
+fn the_boot_carries_the_fraction_and_absence_is_the_configs_default() {
+    engine_cuda::open(boot_with(0.75), no_contract()).expect("a fraction in range opens");
 
     // ABSENT IS THE CONFIG'S OWN DEFAULT, not the whole card: `0.90` is what
     // `worker::config` has meant by an absent key since before the palo
     // rewrite, so the shell's absence and the operator's absence are one
     // number.
-    let quiet = engine_cuda::boot::read(&boot_doc("graphs = \"on\""))
-        .expect("a document that states no fraction opens");
     assert!(
-        (quiet.knobs.gpu_mem_utilization
-            - engine_cuda::DEFAULT_GPU_MEM_UTILIZATION)
-            .abs()
+        (Knobs::default().gpu_mem_utilization - engine_cuda::DEFAULT_GPU_MEM_UTILIZATION).abs()
             < f64::EPSILON,
     );
     assert!(
         (engine_cuda::DEFAULT_GPU_MEM_UTILIZATION - 0.90).abs() < f64::EPSILON,
         "and that default is 0.90, which is what the worker's config says"
     );
-
-    // A document with no `[engine]` table at all is the same answer, and it is
-    // what every hand-written boot config is.
-    let bare = engine_cuda::boot::read(b"[model]\ndevice = \"cuda:0\"\n")
-        .expect("a document with no engine table opens");
     assert!(
-        (bare.knobs.gpu_mem_utilization - 0.90).abs() < f64::EPSILON
+        (DeviceBoot::default().knobs.gpu_mem_utilization - 0.90).abs() < f64::EPSILON,
+        "a boot that states nothing is the same answer"
     );
 
     // The whole card is a legal statement, and it has to be: it is the
     // arithmetic the pool had before the fraction reached it, so an operator
     // must be able to ask for it back by name.
-    let whole = engine_cuda::boot::read(&boot_doc("gpu_mem_utilization = 1.0"))
-        .expect("the whole card opens");
-    assert!((whole.knobs.gpu_mem_utilization - 1.0).abs() < f64::EPSILON);
-
-    // `1` and `1.0` are one operator statement. Refusing the integer spelling
-    // would be a schema this document has nowhere to publish — the same ruling
-    // `boot::knobs`' `flag` makes about `pad = "off"`.
-    let integer = engine_cuda::boot::read(&boot_doc("gpu_mem_utilization = 1"))
-        .expect("the integer spelling of the whole card opens");
-    assert!((integer.knobs.gpu_mem_utilization - 1.0).abs() < f64::EPSILON);
+    engine_cuda::open(boot_with(1.0), no_contract()).expect("the whole card opens");
 }
 
-/// **A fraction outside `(0.0, 1.0]` refuses AT BOOT, by the key's name.**
+/// **A fraction outside `(0.0, 1.0]` refuses AT BOOT, by the knob's name.**
 ///
 /// Clamping would be the silent-wrongness answer: `1.7` would serve as `1.0`
 /// and `0.0` would serve as a pool of nothing, and in neither case would the
 /// operator learn that the number they wrote is not the number in force.
+/// The refusal moved from the document reader to [`engine_cuda::open`] when
+/// the boot became a struct; it is the one semantic check the reader did
+/// that the type system cannot.
 #[test]
-fn an_out_of_range_fraction_refuses_at_boot_by_the_keys_name() {
-    for spelling in [
-        "gpu_mem_utilization = 0.0",
-        "gpu_mem_utilization = 1.5",
-        "gpu_mem_utilization = -0.25",
-        "gpu_mem_utilization = nan",
-        "gpu_mem_utilization = \"most of it\"",
-    ] {
-        let refusal = engine_cuda::boot::read(&boot_doc(spelling))
+fn an_out_of_range_fraction_refuses_at_boot_by_the_knobs_name() {
+    for fraction in [0.0, 1.5, -0.25, f64::NAN, f64::INFINITY] {
+        let refusal = engine_cuda::open(boot_with(fraction), no_contract())
             .err()
-            .unwrap_or_else(|| panic!("`{spelling}` is not a deployment"));
+            .unwrap_or_else(|| panic!("`{fraction}` is not a deployment"));
         assert!(
             refusal.contains("gpu_mem_utilization"),
-            "the refusal names the key; got: {refusal}"
+            "the refusal names the knob; got: {refusal}"
+        );
+        assert!(
+            refusal.contains(&format!("{fraction}")) || fraction.is_nan(),
+            "and the value it was given; got: {refusal}"
         );
     }
 }
@@ -154,7 +150,11 @@ fn the_whole_card_is_the_arithmetic_the_pool_had_before() {
 #[test]
 fn the_fraction_is_of_the_card_and_charges_what_is_already_on_it() {
     let floor = safety_floor_bytes(CARD);
-    assert_eq!(floor, 128 * 1024 * 1024, "min(128 MiB, card/10) on this card");
+    assert_eq!(
+        floor,
+        128 * 1024 * 1024,
+        "min(128 MiB, card/10) on this card"
+    );
 
     // The measured situation: an uncapped gpt-oss load, then the pool opens.
     let free = CARD - WEIGHTS;

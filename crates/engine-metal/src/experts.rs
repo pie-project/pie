@@ -120,6 +120,7 @@
 //! file existed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use kernels_metal::Tensor;
 use model_compiler::CompiledModel;
@@ -129,6 +130,7 @@ use model_ir::{Def, Linear, Operands, Operation, Trace, ValueId};
 use crate::device::{Buffer, Handles};
 use crate::error::{Fault, Result};
 use crate::host_source::HostSource;
+use crate::mapping::Mapping;
 
 /// A param's other device planes, by `Trace::params` index — the pairing
 /// `weights::pairings` reads off the load plan, in the one shape this module
@@ -397,9 +399,16 @@ impl Plan {
         0
     }
 
-    /// How many bytes the host band table holds — the source side of every
-    /// seat copy, and the size [`HostSource::open`](crate::host_source::HostSource::open)
-    /// backs with a file.
+    /// How many bytes the host band table holds — the size
+    /// [`HostSource::open`](crate::host_source::HostSource::open) backs with a
+    /// file for the COLD arm.
+    ///
+    /// **IT IS THE STAGING FILE'S SIZE AND NOT "WHAT THE SEAT COPIES READ",**
+    /// and the two parted company at §M-6. A warm load streams out of the
+    /// serving artifact it already mapped ([`Source::artifact`]) and opens no
+    /// staging file at all, so this number is what it WOULD have written and
+    /// nothing it did. [`Tier::source`] is what a load's actual source
+    /// answers for.
     #[must_use]
     pub fn source_bytes(&self) -> u64 {
         self.host_bytes
@@ -709,6 +718,179 @@ pub struct GroupResidency {
     pub in_seat: Vec<Option<u32>>,
 }
 
+/// The host bytes themselves, under whichever arm produced them.
+#[derive(Debug)]
+enum Bytes {
+    /// The cold arm's staging: a `MAP_SHARED` mapping of an unlinked
+    /// temporary file, written once by the landing sink.
+    Landed(HostSource),
+    /// The warm arm's: the serving artifact's own `PROT_READ` mapping — the
+    /// same `Arc<Mapping>` the resident planes are bound through.
+    Artifact(Arc<Mapping>),
+}
+
+/// **WHERE A SEAT COPY READS FROM**, and the whole of the difference between
+/// the two load arms.
+///
+/// A seat copy is `store.write(seat, &source[expert])` and nothing else, so
+/// what the tier needs of a source is exactly two things: a `&[u8]` the CPU
+/// may read, and the byte offset of expert 0 of every streamed band inside
+/// it. The two arms answer them differently and share nothing else:
+///
+/// * [`Source::landed`] — **the COLD arm.** The landing sink wrote every
+///   expert of every band into a [`HostSource`], laid out in the plan's own
+///   host-table order: bands in param order, each whole, packed contiguously
+///   from zero. The offsets are [`Plan::host_at`]'s, which is the one
+///   arithmetic the sink and the tier share.
+/// * [`Source::artifact`] — **the WARM arm.** The bytes are already on this
+///   machine, in the serving artifact the load has just mapped, and staging
+///   them into a second file to read them back out of it would be the copy
+///   the warm arm exists to remove. So the source IS the artifact's mapping,
+///   and the offsets come per-band out of the serving manifest.
+///
+/// # The per-band table IS the translation, and it is why there is no base
+///
+/// The two layouts are different on purpose. The host table packs bands
+/// CONTIGUOUSLY in param order because nothing else ever reads it; the
+/// artifact lays its planes out in the SERVING order — hotness-ranked, at the
+/// writer's own alignment, after a manifest — with every other plane of the
+/// model interleaved between them. There is no offset, no scale and no
+/// permutation that carries one into the other, and a tier that walked either
+/// with one base and a running sum would, on the other, read somebody else's
+/// experts and answer finite deterministic nonsense.
+///
+/// So NEITHER arm gets a base. Both state `param -> byte offset of expert 0`
+/// outright, and what survives as shared arithmetic is only the step INSIDE a
+/// band — `offset + expert * stride` — which is a fact about the band's own
+/// rectangle and is true wherever the band lies.
+///
+/// # And the GPU touches neither
+///
+/// Both are CPU-read-only sources of the copy INTO the wired slab, which is
+/// what `.wiki/alto/streaming.md`'s measurement demands: a GPU-touched shared
+/// page WIRES and the pager takes none of it back, so a band the device read
+/// in place would convert the whole bank into wired memory and defeat the
+/// budget that made this load stream.
+///
+/// That the artifact's mapping is ALSO bound to an `MTLBuffer` does not
+/// weaken it, because binding is not touching (`crate::mapping`'s header
+/// carries the measurement, and §M-5 measured +0.001 GiB wired at the bind).
+/// What wires a page is a kernel addressing it, and no weight row of a warm
+/// streamed load names a band's file offset: a band's `Tensor` is a view into
+/// the STORE, at its seats. The pages this enum reads are read by `memcpy`
+/// and by nothing else.
+#[derive(Debug)]
+pub struct Source {
+    bytes: Bytes,
+    /// `param index -> byte offset of expert 0 of that band`, in `bytes`.
+    bands: BTreeMap<usize, u64>,
+}
+
+impl Source {
+    /// The cold arm's source: the staging file the landing sink filled, at the
+    /// plan's own host-table offsets.
+    #[must_use]
+    pub fn landed(plan: &Plan, host: HostSource) -> Source {
+        Source {
+            bytes: Bytes::Landed(host),
+            bands: plan.host_of.clone(),
+        }
+    }
+
+    /// The warm arm's source: the mapped artifact, at the per-band offsets
+    /// `bands` recovered from its serving manifest.
+    ///
+    /// `map` is the SAME `Arc` the resident planes are bound through — one
+    /// mapping of one file, and no second copy of the bands anywhere.
+    #[must_use]
+    pub fn artifact(map: Arc<Mapping>, bands: BTreeMap<usize, u64>) -> Source {
+        Source {
+            bytes: Bytes::Artifact(map),
+            bands,
+        }
+    }
+
+    /// **What this source is made of**, as one word — the observable half of
+    /// the two arms, and the reason [`Source::backing`]'s second number reads
+    /// differently under each.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self.bytes {
+            Bytes::Landed(_) => "landed",
+            Bytes::Artifact(_) => "artifact",
+        }
+    }
+
+    /// **What is actually behind these bytes**: `(the backing file's size, its
+    /// link count)`, or `None` for a source with no file at all.
+    ///
+    /// The two arms answer the SECOND number differently and both answers are
+    /// the truth about a different file. A `landed` source says `(source
+    /// bytes, 0)`: a mapping of a real file this process created and unlinked,
+    /// which is what makes its pages reclaimable and what nothing outside this
+    /// process can reach. An `artifact` source says `(the artifact's bytes,
+    /// its links)` — at least one, because the artifact is a file the operator
+    /// named and this load did not create — and its pages are reclaimable for
+    /// the plainer reason that they are clean: this arm never wrote one.
+    ///
+    /// A gate that wants "the source is not anonymous memory" reads the pair;
+    /// one that wants to know WHICH claim it is holding reads [`Source::kind`]
+    /// first. Asserting `0` links without asking the kind is asserting that
+    /// the load was cold.
+    #[must_use]
+    pub fn backing(&self) -> Option<(u64, u64)> {
+        match &self.bytes {
+            Bytes::Landed(host) => host.backing(),
+            Bytes::Artifact(map) => Some((map.backing()?, map.links()?)),
+        }
+    }
+
+    /// Where expert 0 of `param`'s band lies in these bytes.
+    fn at(&self, param: usize) -> Option<u64> {
+        self.bands.get(&param).copied()
+    }
+
+    /// `len` bytes at `from`, or `None` for a span that leaves the source.
+    fn get(&self, from: usize, len: usize) -> Option<&[u8]> {
+        let all: &[u8] = match &self.bytes {
+            Bytes::Landed(host) => host,
+            Bytes::Artifact(map) => map,
+        };
+        all.get(from..from.checked_add(len)?)
+    }
+
+    /// How many bytes the source holds — the bound a refusal names.
+    fn len(&self) -> u64 {
+        match &self.bytes {
+            Bytes::Landed(host) => host.len() as u64,
+            Bytes::Artifact(map) => map.len(),
+        }
+    }
+
+    /// **Hand the source to the pager**, once, after the landing and the
+    /// identity prefix have finished with it.
+    ///
+    /// For a `landed` source this is [`HostSource::settle`]'s two calls, and
+    /// they are argued there.
+    ///
+    /// For an `artifact` source it is deliberately NOTHING, and that is not an
+    /// omission. `msync` schedules writeback for DIRTY pages and this arm
+    /// dirtied none — the mapping is `PROT_READ`, so its pages are clean the
+    /// instant they fault in and dropping one already costs nothing. And a
+    /// `MADV_DONTNEED` here would be advice about an address range this
+    /// process has ALSO bound to an `MTLBuffer` for the resident planes: the
+    /// bands' pages are not that buffer's business, but the advice is a range
+    /// and the wired frames beneath the resident planes are inside it. There
+    /// is no reclaim to buy — the pages are already clean — so there is
+    /// nothing worth aiming a range call at a live buffer for.
+    fn settle(&mut self) {
+        match &mut self.bytes {
+            Bytes::Landed(host) => host.settle(),
+            Bytes::Artifact(_) => {}
+        }
+    }
+}
+
 /// **The tier**: the host band table, a wired slab per group, and the seat
 /// bookkeeping between them.
 ///
@@ -724,17 +906,17 @@ pub struct GroupResidency {
 pub struct Tier {
     /// A retain of the weight store — where seats live.
     store: Buffer,
-    /// Every expert of every streamed band, in a `MAP_SHARED` mapping of an
-    /// unlinked temporary file ([`HostSource`]) — bytes the kernel may write
-    /// back and reclaim, rather than the anonymous `Vec<u8>` W-a held that
-    /// only swap could take.
+    /// Every expert of every streamed band, in a file-backed mapping — the
+    /// cold arm's staging file or the warm arm's artifact ([`Source`] argues
+    /// the two and the per-band offsets that separate them).
     ///
     /// **THE CPU IS THE ONLY THING THAT READS IT.** It is the `&[u8]` source
-    /// of the seat copies in [`Tier::copy`] and it is bound to no `MTLBuffer`
-    /// anywhere, because a mapped page the GPU touches WIRES and stops being
+    /// of the seat copies in [`Tier::copy`] and no kernel addresses a byte of
+    /// it, because a mapped page the GPU touches WIRES and stops being
     /// reclaimable at all (`.wiki/alto/streaming.md`, measured); the module
-    /// header of [`crate::host_source`] states the whole rule.
-    host: HostSource,
+    /// header of [`crate::host_source`] states the whole rule and
+    /// [`Source`]'s says why the warm arm's artifact does not break it.
+    source: Source,
     slabs: Vec<Slab>,
     /// `routes value -> slab index`.
     of_routes: BTreeMap<u32, usize>,
@@ -746,8 +928,14 @@ pub struct Tier {
 
 impl Tier {
     /// Open the tier `plan` describes, over a weight store whose streamed
-    /// bands are reserved at `slots` seats and whose host table `host` holds
-    /// whole.
+    /// bands are reserved at `slots` seats, reading experts out of `source`.
+    ///
+    /// `offsets` is `param index -> byte offset of seat 0 inside the store`,
+    /// which is the layout of whichever reservation the calling arm made;
+    /// `source` states the other side of every copy and where each band's
+    /// expert 0 lies in it. **THE TWO ARE INDEPENDENT AND ARE MEANT TO BE** —
+    /// that is the whole of what lets one tier serve a cold load out of its
+    /// staging file and a warm one out of the artifact it is already mapping.
     ///
     /// **THE INITIAL SEATING IS THE IDENTITY PREFIX** — seat `i` holds expert
     /// `i` — and it is copied in here rather than left to the first segment,
@@ -758,11 +946,12 @@ impl Tier {
     /// # Errors
     ///
     /// [`Fault::Ceiling`] for a seat span that leaves the store or a source
-    /// span that leaves the host table, [`Fault::Deviceless`] off Apple.
-    pub fn open(plan: &Plan, store: &Buffer, host: HostSource, offsets: &[u64]) -> Result<Tier> {
+    /// span that leaves the source, [`Fault::Residency`] for a band the
+    /// source states no offset for, [`Fault::Deviceless`] off Apple.
+    pub fn open(plan: &Plan, store: &Buffer, source: Source, offsets: &[u64]) -> Result<Tier> {
         let mut tier = Tier {
             store: store.clone(),
-            host,
+            source,
             slabs: Vec::with_capacity(plan.groups.len()),
             of_routes: BTreeMap::new(),
             swaps: 0,
@@ -774,14 +963,26 @@ impl Tier {
                 .iter()
                 .map(|&band| {
                     let band = &plan.bands[band];
-                    Band {
+                    // A band the source cannot place is a source and a plan
+                    // that were not built from each other, and seating it at
+                    // a guessed offset is the failure this whole type is
+                    // arranged to make impossible. It is refused by name.
+                    let from = tier.source.at(band.param).ok_or_else(|| {
+                        Fault::Residency(format!(
+                            "the seat source states no offset for band `{}` (param {}), \
+                             which this plan streams — the residency plan and the bytes \
+                             behind it were not built from each other",
+                            band.name, band.param,
+                        ))
+                    })?;
+                    Ok(Band {
                         name: band.name.clone(),
                         at: offsets[band.param],
-                        from: plan.host_of[&band.param],
+                        from,
                         stride: band.stride,
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<Band>>>()?;
             tier.of_routes.insert(group.routes.0, at);
             tier.slabs.push(Slab {
                 experts: group.experts,
@@ -812,8 +1013,9 @@ impl Tier {
         //    without a writeback the pager would have to schedule under
         //    pressure; after it they are clean and deactivated, and a seat copy
         //    that wants one faults it back from the file it already lives in.
-        //    [`HostSource::settle`] argues the two calls.
-        tier.host.settle();
+        //    [`Source::settle`] argues the two calls, and why the warm arm's
+        //    artifact needs neither of them.
+        tier.source.settle();
         Ok(tier)
     }
 
@@ -996,19 +1198,16 @@ impl Tier {
             // **ONE COPY, NOT TWO.** The band used to be `.to_vec()`'d out of
             // the host table and the temporary handed to `write` — a whole
             // expert band allocated, filled and freed per seat copy, for no
-            // reason but to end a borrow of `self.host` before `self.store`
+            // reason but to end a borrow of `self.source` before `self.store`
             // was borrowed mutably. The two fields are disjoint, so the
             // reborrow below says that directly and the allocation is gone:
             // what remains is exactly the copy that IS the mechanism, from
             // the reclaimable mapping into the wired slab.
-            let source = self
-                .host
-                .get(from..from + len)
-                .ok_or_else(|| Fault::Ceiling {
-                    what: "bytes of the host band table",
-                    need: (from + len) as u64,
-                    have: self.host.len() as u64,
-                })?;
+            let source = self.source.get(from, len).ok_or_else(|| Fault::Ceiling {
+                what: "bytes of the seat source",
+                need: (from + len) as u64,
+                have: self.source.len(),
+            })?;
             self.store.write(into, source)?;
             self.swaps += 1;
         }
@@ -1041,14 +1240,31 @@ impl Tier {
     /// **What the source is actually made of**: `(the backing file's size, its
     /// link count)`, or `None` when this tier has no file behind it at all.
     ///
-    /// The observable half of [`crate::host_source`]'s claim, and the only one
-    /// a gate can hold honestly. `(source_bytes, 0)` says the streamed bands
-    /// live in a mapping of a real, unlinked file — which is what makes the
-    /// pages RECLAIMABLE, since the kernel has somewhere to put them. Whether
-    /// it takes them is the kernel's business under a pressure this box cannot
-    /// stage without measuring the box instead of the mechanism.
+    /// The observable half of the reclaimability claim, and the only one a
+    /// gate can hold honestly — but it is TWO claims now and the pair alone
+    /// does not say which, so read [`Tier::source_kind`] beside it.
+    /// `("landed", source_bytes, 0)` is the cold arm: a mapping of a real,
+    /// unlinked file nothing outside this process can reach.
+    /// `("artifact", artifact_bytes, links >= 1)` is the warm one: the
+    /// serving artifact itself, which this load did not create and will not
+    /// unlink, and whose pages are reclaimable because no arm ever dirties
+    /// them. Whether the kernel TAKES them is the kernel's business under a
+    /// pressure this box cannot stage without measuring the box instead of the
+    /// mechanism.
     #[must_use]
     pub fn source(&self) -> Option<(u64, u64)> {
-        self.host.backing()
+        self.source.backing()
+    }
+
+    /// **Which source this tier's seat copies read from** — `"landed"` for
+    /// the cold arm's staging file, `"artifact"` for the warm arm's mapped
+    /// serving artifact ([`Source`]).
+    ///
+    /// The word that makes [`Tier::source`]'s pair readable: the link count
+    /// means opposite things under the two arms, and a gate that asserts one
+    /// without asking this is asserting which arm ran.
+    #[must_use]
+    pub fn source_kind(&self) -> &'static str {
+        self.source.kind()
     }
 }

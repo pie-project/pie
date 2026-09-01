@@ -712,7 +712,10 @@ fn what_a_captured_graph_says_about_its_own_arguments() {
             nodes::exec_footprint(graph, 8).expect("eight execs instantiate");
         eprintln!(
             "\n   one exec of {} nodes: {:.1} KiB of device memory, {:.2} ms to instantiate",
-            graph.nodes(),
+            // `None` is a count the driver refused, which this probe reports
+            // as a zero because it is printing rather than deciding — see
+            // `Graph::nodes` for the one caller that must tell them apart.
+            graph.nodes().unwrap_or(0),
             bytes / 1024.0,
             millis,
         );

@@ -18,11 +18,15 @@
 //!   PER REGION instead of per class: which regions hold nothing but ops that
 //!   address off the staged seat's start ([`crate::SHIFTED`]), and can
 //!   therefore be replayed somewhere other than the fire's row zero.
+//! * [`regions_lane_shifting`] — the same reading one AXIS over
+//!   ([`crate::LANE_SHIFTED`]): which regions hold nothing but ops that find
+//!   their own LANE inside the fire, and can therefore be replayed somewhere
+//!   other than the fire's lane zero.
 //!
 //! [`Shell::load`]: crate::serve::Shell::load
 
 use model_compiler::CompiledModel;
-use model_ir::{Trace, ValueId};
+use model_ir::{Operands, Trace, ValueId};
 
 use crate::error::{Fault, Result};
 
@@ -137,7 +141,6 @@ impl Exports {
 /// the writing node is the one reading that cannot be fooled by a model text
 /// reusing an op.
 fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> model_ir::ClassSet {
-    use model_ir::Operands;
     let mut outputs: Vec<ValueId> = Vec::new();
     let mut writers: Vec<u32> = Vec::new();
     for (at, node) in trace.nodes.iter().enumerate() {
@@ -311,6 +314,114 @@ pub(crate) fn regions_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<b
             })
         })
         .collect()
+}
+
+/// **WHICH TEMPLATE REGIONS FIND THEIR OWN LANE** — one `bool` per region of
+/// [`CompiledModel::template`], in region order, `true` when every op in it
+/// either is named by [`crate::LANE_SHIFTED`] / [`crate::PLANNED`] or NAMES
+/// NOTHING THAT IS LANE-INDEXED.
+///
+/// [`regions_shifting`]'s twin one axis over, and everything that function's
+/// note argues about ALL-rather-than-ANY, about answering per REGION rather
+/// than per class, and about an empty region reading `true` holds here word
+/// for word.
+///
+/// **AND IT IS AN OPERAND WALK WHERE ITS TWIN IS A NAME LOOKUP, WHICH IS THE
+/// ONE REAL DIFFERENCE AND IS FORCED BY WHERE THE HAZARD LIVES.** The row
+/// axis's hazard is what a KERNEL does with the pointer it is handed, so only
+/// a name can answer it. The lane axis's hazard is what THIS SHELL hands over:
+/// `Run::pool` advances the page bounds and last-page fills by `lane_offset`,
+/// `Run::recurrent` advances the slot map, the fold predicate and the commit
+/// length, and `Run::cut`'s lane column advances every operand whose leading
+/// `Dim` counts lanes or images. Those are the three doors, and an op reaches
+/// them through its OPERANDS — a `Def::Cache` space for the first two, a lane
+/// -shaped rectangle for the third. So an op that names neither cannot be
+/// handed a `lane_offset`-baked pointer at all, whatever it is called, and
+/// refusing it would cost a body for no hazard.
+///
+/// **WHICH LEAVES EXACTLY TWO WAYS TO PASS**, and they are the two
+/// [`crate::LANE_SHIFTED`] enumerates and the one this walk adds:
+///
+/// * the op is on that list, so the tables it names are handed over WHOLE and
+///   it finds its lane in a staged datum or off the seat's `win[3]`;
+/// * or the op is a planner ([`crate::PLANNED`]), which puts no node in the
+///   captured graph and rebuilds its schedule every fire against that fire's
+///   own staged geometry, lane offset included;
+/// * or the op names nothing lane-indexed, and the question does not arise.
+///
+/// A node index the trace does not hold, an operand the trace does not
+/// declare, and an op family this walk cannot collect all read as NOT
+/// lane-shifting — which refuses the region. That is the safe direction on the
+/// axis where being wrong reads another lane's state, and it is
+/// [`regions_shifting`]'s own tie-break.
+#[must_use]
+pub(crate) fn regions_lane_shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
+    compiled
+        .template()
+        .iter()
+        .map(|region| {
+            region
+                .nodes
+                .clone()
+                .all(|node| lane_shifting_node(trace, node))
+        })
+        .collect()
+}
+
+/// One node's answer for [`regions_lane_shifting`] — the name lookup first,
+/// because it is the cheap one and because a name on the list has already
+/// argued its operands.
+fn lane_shifting_node(trace: &Trace, node: u32) -> bool {
+    let Some(node) = trace.nodes.get(node as usize) else {
+        return false;
+    };
+    let name = Operands::name(&node.op);
+    if crate::LANE_SHIFTED.contains(&name) || crate::PLANNED.contains(&name) {
+        return true;
+    }
+    // **INPUTS AND OUTPUTS BOTH**, `window::copyable`'s reason exactly: a
+    // rectangle this op WRITES is resolved through the same `Run::cut` the
+    // ones it reads are, and a lane-shaped output would be advanced by the
+    // same number.
+    let mut operands: Vec<ValueId> = Vec::new();
+    node.op.inputs(&mut operands);
+    node.op.outputs(&mut operands);
+    operands.iter().all(|id| {
+        let Some(decl) = trace.values.get(id.0 as usize) else {
+            return false;
+        };
+        // **A CACHE SPACE IS THE FIRST DOOR, PAGED AND RECURRENT ALIKE.** Both
+        // `Run::pool` and `Run::recurrent` slice their per-lane tables at
+        // `lane_offset`, and only the absolute doors beside them
+        // (`pool_absolute`, `recurrent_absolute`) do not — which is what the
+        // names on the list took and what nothing off it did.
+        if matches!(&decl.def, model_ir::Def::Cache(_)) {
+            return false;
+        }
+        // **AND A LANE-SHAPED RECTANGLE IS THE SECOND**, whatever declared it:
+        // `Run::cut`'s lane column is `(span.lane_offset, span.lanes + k)` for
+        // every one of these, which is a pointer advanced by a number the key
+        // does not fix. `GeomKind::Indices` is spelled `Dim::Lanes` and cut is
+        // excluded from slicing it — but its BOUNDS are not, and an op naming
+        // one names the other, so nothing is bought by carving an exception
+        // here.
+        let model_ir::Ty::Tensor { shape, .. } = &decl.ty else {
+            // A plan payload is host state resolved through `Run::slot`, and
+            // its own window is the region that BUILT it — which is this one,
+            // because a schedule may only be read where it was built
+            // (`model`'s `no_schedule_straddles_its_readers`).
+            return true;
+        };
+        !matches!(
+            shape.first(),
+            Some(
+                model_ir::Dim::Lanes
+                    | model_ir::Dim::LanesPlus(_)
+                    | model_ir::Dim::Images
+                    | model_ir::Dim::ImagesPlus(_)
+            )
+        )
+    })
 }
 
 /// The union of the region masks whose regions run a node `wanted` accepts.

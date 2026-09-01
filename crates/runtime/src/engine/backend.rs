@@ -41,9 +41,11 @@
 //! price was that this crate named five of a shell's types and adding a
 //! backend meant editing a crate that is not the backend.
 //!
-//! They are `engine_cuda::boot` and `engine_metal::boot` now. What is left is
-//! three lines per entry point, and the whole of what a new shell costs THIS
-//! crate is:
+//! They went to `engine_cuda::boot` and `engine_metal::boot`, and the CUDA
+//! half has since stopped being a reader at all: the boot crosses as the
+//! shell's own typed `engine_cuda::DeviceBoot`, re-exported below as the one
+//! door the worker reaches it through. What is left is three lines per entry
+//! point, and the whole of what a new shell costs THIS crate is:
 //!
 //! ```text
 //!   Cargo.toml   one optional path dependency + its feature line
@@ -61,8 +63,8 @@
 use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Result, anyhow};
-use engine::transfer::MemoryDomain;
 use engine::Engine;
+use engine::transfer::MemoryDomain;
 use eta_ir::registry::PortMask;
 
 /// One execution device, behind the contract.
@@ -130,10 +132,11 @@ impl EngineSpec {
 /// could not otherwise have heard of, and a backend could not be added without
 /// editing a crate that is not the backend.
 ///
-/// The reader is `engine_cuda::boot` and `engine_metal::boot` now, one per
-/// shell, each reading only the keys it parses into its own type. There is
-/// still exactly one reader per key, which is all the drift argument ever
-/// asked for; what changed is which crate it is in.
+/// The metal reader is `engine_metal::boot` now, reading only the keys it
+/// parses into its own type; the CUDA door goes further and takes the typed
+/// [`engine_cuda::DeviceBoot`] itself, so there is no CUDA reader to drift —
+/// the struct is the schema. There is still exactly one authority per key,
+/// which is all the drift argument ever asked for.
 ///
 /// Free functions rather than `EngineBox::*_create` constructors, because
 /// `EngineBox` is an alias for `Box<dyn Engine>` and has no inherent impl to
@@ -162,13 +165,13 @@ pub mod open {
     ///
     /// # Errors
     ///
-    /// No device, or a boot config that shell refuses. The sentence is the
-    /// shell's; this crate only gives it an `anyhow` skin, because the two
-    /// sides of this seam have different error vocabularies and neither
-    /// should have to name the other's.
+    /// A boot that shell refuses — today that is one knob out of range. The
+    /// sentence is the shell's; this crate only gives it an `anyhow` skin,
+    /// because the two sides of this seam have different error vocabularies
+    /// and neither should have to name the other's.
     #[cfg(feature = "_engine-cuda")]
-    pub fn cuda(config_bytes: &[u8]) -> Result<EngineBox> {
-        engine_cuda::open(config_bytes, crate::engine::load::contract_for)
+    pub fn cuda(boot: engine_cuda::DeviceBoot) -> Result<EngineBox> {
+        engine_cuda::open(boot, crate::engine::load::contract_for)
             .map(|engine| Box::new(engine) as EngineBox)
             .map_err(::anyhow::Error::msg)
     }
@@ -192,29 +195,29 @@ pub mod open {
     /// never elided; descriptor rank-replicated".
     ///
     /// **THE REFUSAL IS THIS CRATE'S AND STAYED WHEN THE READER LEFT.** Every
-    /// other line of the CUDA door moved to `engine_cuda::boot`, and this one
-    /// did not, because what it refuses is not a device fact. `engine_cuda::
-    /// open` takes ONE document and answers ONE `Cuda`; it is never handed a
+    /// other line of the CUDA door moved to `engine_cuda`, and this one did
+    /// not, because what it refuses is not a device fact. `engine_cuda::
+    /// open` takes ONE boot and answers ONE `Cuda`; it is never handed a
     /// list and has no way to learn that a launcher held three. The fan-out
-    /// being refused is a shape of this crate's registry — N boot documents
+    /// being refused is a shape of this crate's registry — N boots
     /// collapsing into one `EngineId` — so the arity policy belongs to the
     /// party that owns the registry. The shell's half of the same claim is
     /// already stated, and stated better, by `open`'s signature: it takes
-    /// `&[u8]`, singular.
+    /// one `DeviceBoot`, singular.
     ///
     /// It is also why a third shell does not owe the workspace a `*_group`.
-    /// This exists because `worker`'s CUDA launch path fans a `Vec<Vec<u8>>`,
-    /// not because opening a device needs it.
+    /// This exists because `worker`'s CUDA launch path fans a list of rank
+    /// boots, not because opening a device needs it.
     ///
     /// # Errors
     ///
     /// An empty rank list, more than one rank, or a device that failed to
     /// open.
     #[cfg(feature = "_engine-cuda")]
-    pub fn cuda_group(config_blobs: Vec<Vec<u8>>) -> Result<(EngineBox, usize)> {
-        match config_blobs.len() {
+    pub fn cuda_group(mut boots: Vec<engine_cuda::DeviceBoot>) -> Result<(EngineBox, usize)> {
+        match boots.len() {
             0 => Err(super::anyhow!("a cuda group requires at least one rank")),
-            1 => Ok((cuda(&config_blobs[0])?, 1)),
+            1 => Ok((cuda(boots.remove(0))?, 1)),
             ranks => Err(super::anyhow!(
                 "this build serves one cuda rank and was asked for {ranks}: \
                  tensor parallelism is palo B-tp, and a group opened as a \
@@ -227,18 +230,18 @@ pub mod open {
     /// wave M-1: `.wiki/alto/zt-as-serving-artifact.md`).
     ///
     /// The door `pie model import` reaches the CUDA shell through. It opens a
-    /// device from the SAME boot document [`cuda`] above is given, runs the
-    /// cold half of a load — bake, land, write the tier artifact — and tears
-    /// the device down without arming a thing. No engine is registered and
-    /// nothing is returned: what survives the call is the file in `[model]
-    /// weight_cache_dir`, which is what makes the deployment's first real
-    /// serve a warm one.
+    /// device from the SAME [`engine_cuda::DeviceBoot`] [`cuda`] above is
+    /// given, runs the cold half of a load — bake, land, write the tier
+    /// artifact — and tears the device down without arming a thing. No
+    /// engine is registered and nothing is returned: what survives the call
+    /// is the file in the boot's `weight_cache_dir`, which is what makes the
+    /// deployment's first real serve a warm one.
     ///
     /// It sits in this module rather than beside `Engine`'s verbs because
     /// preparing is not one: there is no load to be a verb ABOUT. It is the
-    /// same shape as `cuda` — a boot document in, a device errand run — and
-    /// the same argument makes it live here, in the crate that links both the
-    /// shell and the catalog the load door reads.
+    /// same shape as `cuda` — a boot in, a device errand run — and the same
+    /// argument makes it live here, in the crate that links both the shell
+    /// and the catalog the load door reads.
     ///
     /// # Errors
     ///
@@ -246,8 +249,8 @@ pub mod open {
     /// claims, or whatever the bake and the landing said. The sentence is the
     /// shell's, in an `anyhow` skin, for [`cuda`]'s reason.
     #[cfg(feature = "_engine-cuda")]
-    pub fn prepare_cuda(config_bytes: &[u8], request: engine::LoadRequest) -> Result<()> {
-        let engine = engine_cuda::open(config_bytes, crate::engine::load::contract_for)
+    pub fn prepare_cuda(boot: engine_cuda::DeviceBoot, request: engine::LoadRequest) -> Result<()> {
+        let engine = engine_cuda::open(boot, crate::engine::load::contract_for)
             .map_err(::anyhow::Error::msg)?;
         engine.prepare(request).map_err(::anyhow::Error::from)
     }
@@ -273,6 +276,15 @@ pub mod open {
             .map_err(::anyhow::Error::msg)
     }
 }
+
+/// **THE ONE DOOR THE WORKER REACHES THE CUDA BOOT TYPES THROUGH.** The
+/// worker has no `engine-cuda` dependency of its own — that is the point of
+/// this registry — so the boot it assembles for [`open::cuda`] is spelled in
+/// types re-exported here, and `ordinal_of` beside them because "which
+/// ordinal does `cuda:1` name" is a CUDA naming fact no other crate should
+/// re-derive.
+#[cfg(feature = "_engine-cuda")]
+pub use engine_cuda::{DeviceBoot, Graphs, Knobs, ordinal_of};
 
 // `settle_control` STOOD HERE. A seam whose memory is coherent — where
 // `copy_kv` is a `memmove` — had nobody to hand a completion target to, so it

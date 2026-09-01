@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use engine::{Budgets, Lane, Readout, Step};
 use model_ir::Platform;
-use runtime::engine::backend::open;
+use runtime::engine::backend::{DeviceBoot, Graphs, open};
 
 const SKU: &str = "qwen35-d0.8b-bf16-kv-bf16";
 
@@ -62,11 +62,11 @@ fn an_adapter_registered_through_the_contract_corrects_the_lane_that_names_it() 
 
     // ── 1. BASE, captured. No adapter registered, no lane routed: the
     //    reference every other run is compared against.
-    let base = run(&checkpoint, &prompt, Graphs::Captured, Routing::Base);
+    let base = run(&checkpoint, &prompt, Graphs::On, Routing::Base);
 
     // ── 2. CORRECTED, captured. One adapter registered through
     //    `engine::AdapterRegistration`, one lane routed to it.
-    let corrected = run(&checkpoint, &prompt, Graphs::Captured, Routing::Adapter(0));
+    let corrected = run(&checkpoint, &prompt, Graphs::On, Routing::Adapter(0));
     assert_eq!(
         corrected.len(),
         base.len(),
@@ -84,7 +84,7 @@ fn an_adapter_registered_through_the_contract_corrects_the_lane_that_names_it() 
     //    one interpreter, two sinks — so the SAME corrected fire through the
     //    golden walk has to answer the same numbers. This is what says the
     //    arm ran RIGHT rather than merely ran.
-    let golden = run(&checkpoint, &prompt, Graphs::Eager, Routing::Adapter(0));
+    let golden = run(&checkpoint, &prompt, Graphs::Off, Routing::Adapter(0));
     let drift = max_abs_difference(&corrected, &golden);
     eprintln!("captured vs eager (both corrected): max |delta| = {drift}");
     assert_eq!(
@@ -96,7 +96,7 @@ fn an_adapter_registered_through_the_contract_corrects_the_lane_that_names_it() 
 
     // And the eager base is the eager corrected's own control, so a reader
     // does not have to take the captured comparison's word for the axis.
-    let golden_base = run(&checkpoint, &prompt, Graphs::Eager, Routing::Base);
+    let golden_base = run(&checkpoint, &prompt, Graphs::Off, Routing::Base);
     assert!(
         max_abs_difference(&golden_base, &golden) > 1e-2,
         "the eager walk shows no correction either"
@@ -110,16 +110,6 @@ fn an_adapter_registered_through_the_contract_corrects_the_lane_that_names_it() 
 }
 
 // ── the run ──────────────────────────────────────────────────────────────
-
-/// Which walk the shell takes. Article 6's two sinks, as a boot key.
-#[derive(Clone, Copy)]
-enum Graphs {
-    /// `[engine] graphs = "on"` — the recorded graph, replayed.
-    Captured,
-    /// `[engine] graphs = "off"` — the eager walk, this workspace's golden
-    /// model, kept off the serving path rather than deleted.
-    Eager,
-}
 
 /// Whether this fire's lane routes to an adapter row.
 #[derive(Clone, Copy)]
@@ -135,11 +125,14 @@ enum Routing {
 /// gate in this workspace follows, and a run that ended is a shell that
 /// dropped.
 fn run(checkpoint: &Path, prompt: &[u32], graphs: Graphs, routing: Routing) -> Vec<f32> {
-    let boot = match graphs {
-        Graphs::Captured => "[model]\ndevice = \"cuda:0\"\n[engine]\ngraphs = \"on\"\n",
-        Graphs::Eager => "[model]\ndevice = \"cuda:0\"\n[engine]\ngraphs = \"off\"\n",
-    };
-    let mut engine = open::cuda(boot.as_bytes()).expect("the cuda seam opens");
+    // The shell's own `Graphs`, stated on the typed boot — `On` is the
+    // recorded graph, replayed; `Off` is the eager walk, this workspace's
+    // golden model, kept off the serving path rather than deleted.
+    let mut engine = open::cuda(DeviceBoot {
+        graphs,
+        ..DeviceBoot::default()
+    })
+    .expect("the cuda seam opens");
 
     // **THE SEATS ARE THE MODEL TEXT'S OWN CAPACITY, ASKED FOR IN FULL.**
     // `max_adapters` is what the DEPLOYMENT intends to register and a bank's
@@ -237,7 +230,8 @@ fn run(checkpoint: &Path, prompt: &[u32], graphs: Graphs, routing: Routing) -> V
         attachments: Vec::new(),
         media: Vec::new(),
     };
-    step.validate().expect("the submission is one the contract describes");
+    step.validate()
+        .expect("the submission is one the contract describes");
     let frame = engine::FrameSubmission::of(step);
     let mut ticket = engine.submit(&frame).expect("the fire is admitted");
     engine

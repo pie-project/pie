@@ -61,8 +61,8 @@
 mod common;
 
 use engine::{
-    Budgets, FrameSubmission, KvCopy, KvDelta, KvMove, Lane, MemoryDomain, Readout,
-    RsReset, RsVerb, StateCopy, StateMove, Step,
+    Budgets, FrameSubmission, KvCopy, KvDelta, KvMove, Lane, MemoryDomain, Readout, RsReset,
+    RsVerb, StateCopy, StateMove, Step,
 };
 use model_ir::Platform;
 use runtime::engine::backend::open;
@@ -144,7 +144,8 @@ fn a_grafted_page_run_decodes_exactly_as_the_run_it_was_copied_from() {
         .expect("the checkpoint's tokenizer loads");
 
     // 1. THE LOAD, through the same door the runtime uses.
-    let mut engine = open::cuda(b"[model]\ndevice = \"cuda:0\"\n").expect("the cuda seam opens");
+    let mut engine =
+        open::cuda(runtime::engine::backend::DeviceBoot::default()).expect("the cuda seam opens");
     let budgets = Budgets {
         max_lanes: 4,
         // Small on purpose: the arena reserves `max_tokens` rows of a
@@ -197,18 +198,15 @@ fn a_grafted_page_run_decodes_exactly_as_the_run_it_was_copied_from() {
     // 3. THE PARENT. Twenty tokens over the caller's own two pages.
     let prompt = tokenizer.encode("The capital of France is");
     assert!(!prompt.is_empty(), "the prompt tokenizes to something");
-    let tokens: Vec<u32> = prompt
-        .iter()
-        .copied()
-        .cycle()
-        .take(HELD as usize)
-        .collect();
+    let tokens: Vec<u32> = prompt.iter().copied().cycle().take(HELD as usize).collect();
     let prefill = FrameSubmission::of(Step {
         lanes: vec![lane(0, &PARENT, 0, tokens.clone(), Readout::Last)],
         attachments: Vec::new(),
         media: Vec::new(),
     });
-    prefill.validate().expect("the parent prefill is well formed");
+    prefill
+        .validate()
+        .expect("the parent prefill is well formed");
     let mut ticket = engine.submit(&prefill).expect("the parent prefill fires");
     engine
         .settle_frame(&mut ticket)
@@ -255,7 +253,9 @@ fn a_grafted_page_run_decodes_exactly_as_the_run_it_was_copied_from() {
             })
             .collect(),
     };
-    graft.validate().expect("the graft is a plan the contract describes");
+    graft
+        .validate()
+        .expect("the graft is a plan the contract describes");
     engine.copy_kv(&graft).expect("the pages graft");
 
     // 5. **ONE FRAME, TWO LANES, ONE WALK.** The control decode and the forked

@@ -12,12 +12,9 @@ name = "engine_cuda"
 path = "src/lib.rs"
 
 [dependencies]
-# The boot document's format, for `boot.rs` — this shell's own `[model]`,
-# `[engine]` and `[cache]` keys, read into its own `DeviceBoot`. The reader
-# used to live in `runtime`, which is where this line used to be; it moved with
-# the code, because the crate that parses into a type should be the crate that
-# declares it. The FORMAT is still the runtime's (see `boot.rs`'s header): this
-# manifest names a parser, not a schema.
+# For `blob.rs`'s `adapter.toml` manifest — the one document this crate still
+# reads. The boot document's parser left with the typed `DeviceBoot` seam, so
+# the mount's manifest is the only reason a parser is linked at all.
 toml = "1.1"
 # The vocabulary the resolver routes on: `ValueDecl`, `Def`, `RuntimeInput`,
 # `StructKind` — and the 15 family enums the dispatch arms destructure.

@@ -65,13 +65,10 @@ use std::sync::Arc;
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFacts};
-use engine::channel::{
-    ChannelId, ChannelRegistration, HostMirror, RegisteredChannel,
-};
+use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
-    Step,
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{
@@ -93,8 +90,7 @@ use crate::serve::{Attached, Boot, Graphs, Knobs, Lane, Seated, Shell};
 /// See the module header: the contract has no seat for a `ModelContract` and
 /// this crate must not know a model family, so the party that links the
 /// catalog supplies the lookup.
-pub type ContractFor =
-    fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
+pub type ContractFor = fn(&Trace, &Path) -> std::result::Result<ModelContract, String>;
 
 /// The device knobs a boot config states, before any model is loaded.
 ///
@@ -153,7 +149,7 @@ pub struct DeviceBoot {
     /// nothing is stored, which costs time and never an answer.
     pub cache_dir: Option<std::path::PathBuf>,
     /// **Where this deployment keeps its shared adapters** (alto adapter
-    /// §3.3), from `[model] adapter_dir`.
+    /// §3.3), from `model.adapter_dir`.
     ///
     /// A read-only directory whose subdirectories are adapters: one
     /// `adapter.toml` and the plane files it names. It is a deployment fact
@@ -416,7 +412,11 @@ impl Cuda {
             page_size: budgets.page_size,
             context: budgets.max_context,
             slots: budgets.slots,
-            ordinal: if ordinal >= 0 { ordinal } else { self.boot.ordinal },
+            ordinal: if ordinal >= 0 {
+                ordinal
+            } else {
+                self.boot.ordinal
+            },
             graphs: self.boot.graphs,
             knobs: self.boot.knobs,
             weight_cache_dir: self.boot.weight_cache_dir.as_deref(),
@@ -531,9 +531,9 @@ impl Cuda {
     }
 
     fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {
-        self.shell.as_mut().ok_or_else(|| {
-            Error::Load("the cuda engine has no model loaded".into())
-        })
+        self.shell
+            .as_mut()
+            .ok_or_else(|| Error::Load("the cuda engine has no model loaded".into()))
     }
 }
 
@@ -557,6 +557,10 @@ fn fault(fault: Fault) -> Error {
         | Fault::Param { .. }
         | Fault::Unbound { .. }
         | Fault::Unlowered { .. } => Error::Load(fault.to_string()),
+        // A mount that lies — a missing manifest, a plane the manifest names
+        // and the directory does not hold — is a LOAD-CLASS fault: the fix is
+        // on disk, not in the schedule.
+        Fault::Blob { .. } => Error::Load(fault.to_string()),
         // AN EXHAUSTION, AND THE CONTRACT HAS THE SHAPE FOR IT. `Exhausted`
         // carries the two numbers structurally rather than only in a sentence,
         // which is what a control plane deciding where to place a model wants.
@@ -596,9 +600,7 @@ fn fault(fault: Fault) -> Error {
         // the banks cannot seat is `Load`: capacity is a shape the model text
         // declared, so nothing the caller frees makes room and the fix is the
         // model text.
-        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => {
-            Error::Invalid(fault.to_string())
-        }
+        Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
         // The two export axes' four, sorted by the same rule and for the same
         // reason: a lane that asked for a draft or a capture the artifact does
         // not declare, or that asked in a way its word does not agree with, is
@@ -611,17 +613,12 @@ fn fault(fault: Fault) -> Error {
         | Fault::Scoreless { .. }
         | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
-        // The shared-adapter mount's two, and they sort apart. A blob refusal
-        // is the deployment's — a name that is not in the mount, a manifest
-        // that disagrees with the model text's banks — and nothing a caller
-        // frees changes it, so it is `Load` beside the registration above.
-        // Slot exhaustion is the only one of the axis that a caller CAN clear:
-        // `slots` bounds concurrent residency, so a bind that waits for
-        // another instance to finish is a real answer.
-        Fault::Blob { .. } => Error::Load(fault.to_string()),
-        // One slot wanted, none reclaimable — the numbers are about what is
-        // FREE and not what exists, because a table whose every seat is
-        // pinned has no free one whatever its width.
+        // Slot exhaustion is the one refusal of the adapter axis a caller
+        // CAN clear: `slots` bounds concurrent residency, so a bind that
+        // waits for another instance to finish is a real answer. One slot
+        // wanted, none reclaimable — the numbers are about what is FREE and
+        // not what exists, because a table whose every seat is pinned has no
+        // free one whatever its width.
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
             wanted: 1,
@@ -726,7 +723,6 @@ pub(crate) fn default_lattice(max_tokens: u32) -> Vec<u32> {
 /// with a number on it, and a deployment that measures otherwise on its own
 /// hardware states its own `Budget::buckets`.
 pub(crate) const LATTICE_FLOOR: u32 = 8;
-
 
 /// **THE SHAPE LATTICE POLICY, AT THE DOOR** (alto wave P, article 9).
 ///
@@ -999,7 +995,10 @@ fn adapter_of(
         })
         .collect();
     shell
-        .bind_adapter(crate::AdapterSource::Own { instance, planes: &planes })
+        .bind_adapter(crate::AdapterSource::Own {
+            instance,
+            planes: &planes,
+        })
         .map(Some)
         .map_err(fault)
 }
@@ -1113,7 +1112,11 @@ intended for diagnostics, not serving",
             // one: `LoadRequest::ordinal` is the contract's field for "which
             // device, when the shell serves more than one", and a boot config
             // that also named one is the deployment's default.
-            ordinal: if ordinal >= 0 { ordinal } else { self.boot.ordinal },
+            ordinal: if ordinal >= 0 {
+                ordinal
+            } else {
+                self.boot.ordinal
+            },
             graphs: self.boot.graphs,
             // The deployment's words, unchanged per load — the `[engine]`
             // table is a fact about this machine's shell, not about one model.
@@ -1141,7 +1144,7 @@ intended for diagnostics, not serving",
         // BAKE: the banks are, and they came off the model text above. Where
         // the shared adapters live is the deployment's, it outlives every
         // load, and §3.3's hot-add is a file drop into it — so it arrives as
-        // a verb, typed off the boot document, and never out of the
+        // a verb, typed off the boot struct, and never out of the
         // environment (article 9).
         shell.mount_adapters(self.boot.adapter_dir.clone());
 
@@ -1164,9 +1167,7 @@ intended for diagnostics, not serving",
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cuda".to_string(),
-                domain: MemoryDomain::CudaDevice(
-                    u32::try_from(shell.ordinal()).unwrap_or(0),
-                ),
+                domain: MemoryDomain::CudaDevice(u32::try_from(shell.ordinal()).unwrap_or(0)),
                 sms: shell.sms(),
                 unified_memory: false,
                 // Neither is probed. Both are load-time answers about the
@@ -1218,9 +1219,7 @@ intended for diagnostics, not serving",
                 max_tokens: budgets.max_tokens,
                 // Every lane may name its whole slot's block, and a fire may
                 // carry `max_lanes` of them.
-                max_page_refs: paging
-                    .pages_per_slot
-                    .saturating_mul(budgets.max_lanes),
+                max_page_refs: paging.pages_per_slot.saturating_mul(budgets.max_lanes),
                 max_context: paging.context(),
             },
             profile,
@@ -1693,7 +1692,9 @@ intended for diagnostics, not serving",
         // into this ring itself, through the addresses `ChannelBinding`
         // published; it owns a host ring of its own now and hands the bytes
         // over here (`runtime::engine::channel`'s header, and the trait's).
-        self.instance(instance)?.publish(channel, cell).map_err(fault)
+        self.instance(instance)?
+            .publish(channel, cell)
+            .map_err(fault)
     }
 
     fn take_channel(
@@ -1934,13 +1935,10 @@ impl Cuda {
         let id = self.next_fire;
         self.next_fire = self.next_fire.wrapping_add(1);
 
-        let done = self
-            .sink
-            .as_ref()
-            .map(|sink| crate::serve::Done {
-                at,
-                sink: std::sync::Arc::clone(sink),
-            });
+        let done = self.sink.as_ref().map(|sink| crate::serve::Done {
+            at,
+            sink: std::sync::Arc::clone(sink),
+        });
         // ── **WHICH LANE CARRIES WHICH ADAPTER** (alto adapter §6.4: the plan
         //    says WHETHER, the bind says WHICH). A lane's adapter is the slot
         //    its ATTACHED INSTANCE landed at bind — never a channel this fire
@@ -2098,7 +2096,8 @@ impl Cuda {
             if lane.channels.is_empty() {
                 continue;
             }
-            if let Some(why) = shell.program_ticket_disagreement(attachment.instance, &lane.channels)
+            if let Some(why) =
+                shell.program_ticket_disagreement(attachment.instance, &lane.channels)
             {
                 return Err(Error::Program(format!(
                     "this fire's channel predictions and the engine's disagree: {why}"
@@ -2237,7 +2236,11 @@ impl Cuda {
                 readouts: Vec::new(),
             },
             PendingStep {
-                readout: submission.lanes.iter().map(|lane| lane.readout.clone()).collect(),
+                readout: submission
+                    .lanes
+                    .iter()
+                    .map(|lane| lane.readout.clone())
+                    .collect(),
                 settled,
             },
         ))
@@ -2260,15 +2263,20 @@ impl Cuda {
 /// activation element this marshal cannot write. `Fp8` and the quantized
 /// codes are weight elements and no activation is stated in one, so the arm
 /// that would encode them is a refusal rather than a guess.
-fn patch_bytes(patches: &[f32], element: model_ir::Dtype) -> std::result::Result<Vec<u8>, &'static str> {
+fn patch_bytes(
+    patches: &[f32],
+    element: model_ir::Dtype,
+) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
         model_ir::Dtype::Bf16 => Ok(patches
             .iter()
             .flat_map(|&v| crate::adapter::bf16_bits(v).to_le_bytes())
             .collect()),
         model_ir::Dtype::F32 => Ok(patches.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err("a media submission against a plan whose activation element is neither \
-                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in"),
+        _ => Err(
+            "a media submission against a plan whose activation element is neither \
+                  `bf16` nor `f32`, which is the pair every tower in this catalog computes in",
+        ),
     }
 }
 
@@ -2442,16 +2450,23 @@ mod tests {
     /// rungs it gets are whole images from the patch lattice's own floor.
     #[test]
     fn a_tower_plan_derives_a_ladder_from_nothing_but_its_own_declaration() {
-        let ladder = patch_ladder(&trace_with(vec![Dim::Patches, Dim::Const(768)]), &LoadBudgets::default())
-            .expect("a plan that states patch rows gets a ladder");
-        assert_eq!(ladder.max_patches, 4096, "two whole images at the native grid");
+        let ladder = patch_ladder(
+            &trace_with(vec![Dim::Patches, Dim::Const(768)]),
+            &LoadBudgets::default(),
+        )
+        .expect("a plan that states patch rows gets a ladder");
+        assert_eq!(
+            ladder.max_patches, 4096,
+            "two whole images at the native grid"
+        );
         assert_eq!(
             ladder.buckets,
             vec![64, 128, 256, 512, 1024, 2048, 4096],
             "rungs double from the patch lattice's floor to the ceiling"
         );
         assert_eq!(
-            ladder.max_images, 4096 / PATCH_LATTICE_FLOOR,
+            ladder.max_images,
+            4096 / PATCH_LATTICE_FLOOR,
             "as many images as the ceiling holds at the smallest whole image"
         );
 
@@ -2479,7 +2494,10 @@ mod tests {
                 "at max_tokens = {max_tokens} the patch ceiling should be {want}"
             );
             assert!(
-                ladder.buckets.iter().all(|rung| *rung <= ladder.max_patches),
+                ladder
+                    .buckets
+                    .iter()
+                    .all(|rung| *rung <= ladder.max_patches),
                 "a rung past the ceiling is what `model_compiler` refuses by name"
             );
             assert!(
@@ -2709,8 +2727,16 @@ mod serving_stamp_tests {
         let why = refuse(&foreign, "cuda", "qwen_3", 1, "mlxu4")
             .expect_err("a metal artifact is not servable here");
         let said = format!("{why}");
-        for wanted in ["backend", "\"metal\"", "\"cuda\"", "pie model import --force"] {
-            assert!(said.contains(wanted), "the refusal does not say {wanted:?}: {said}");
+        for wanted in [
+            "backend",
+            "\"metal\"",
+            "\"cuda\"",
+            "pie model import --force",
+        ] {
+            assert!(
+                said.contains(wanted),
+                "the refusal does not say {wanted:?}: {said}"
+            );
         }
         // Its own deployment takes it.
         refuse(&artifact(&dir, "cuda", 1), "cuda", "qwen_3", 1, "mlxu4")
@@ -2812,7 +2838,10 @@ mod serving_stamp_tests {
             dir.join("absent.zt"),
         ] {
             refuse(&path, "cuda", "qwen_3", 1, "mlxu4").unwrap_or_else(|why| {
-                panic!("{} is not a serving artifact and was refused as one: {why}", path.display())
+                panic!(
+                    "{} is not a serving artifact and was refused as one: {why}",
+                    path.display()
+                )
             });
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -2838,8 +2867,7 @@ mod serving_stamp_tests {
     fn an_ordinary_checkpoint_passes_and_a_factless_request_does_not() {
         let dir = tmp("plain");
         let plain = dir.join("plain.zt");
-        let mut writer =
-            checkpoint::file::write::Writer::create(&plain, &BTreeMap::new()).unwrap();
+        let mut writer = checkpoint::file::write::Writer::create(&plain, &BTreeMap::new()).unwrap();
         let decl = checkpoint::types::TensorDecl {
             id: checkpoint::types::TensorId(0),
             name: "w".to_string(),

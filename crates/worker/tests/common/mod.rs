@@ -52,43 +52,13 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
     // Context::save/open over `/scratch`) work; harmless for fs-free inferlets.
     let scratch = std::env::temp_dir().join("pie-cuda-test-scratch");
     let _ = std::fs::create_dir_all(&scratch);
-    // Weight streaming is off unless asked for. A run with it on must produce
-    // the same tokens as a run with it off, which is the whole point of
-    // comparing across two processes -- one boot per process is the harness's
-    // standing constraint.
-    let streaming = if std::env::var("PIE_CUDA_TEST_STREAM_EXPERTS").as_deref() == Ok("1") {
-        // The two knobs are `ByteSize` and carry a UNIT -- `expert_cache` and
-        // `expert_host_cache`, not `expert_cache_gb` / `expert_host_cache_gb`,
-        // which is what this wrote until a run answered
-        //
-        //     invalid [model.engine.options] for engine type CudaNative:
-        //     unknown field `expert_cache_gb`
-        //
-        // The ENV knobs keep their `_GB` names, because a fraction of a GiB is
-        // how an operator thinks about a slab meant to be too small (0.0004
-        // GiB is under half a mebibyte, which forces an eviction per layer and
-        // is the only way the eviction path runs at all). Rendered in bytes so
-        // no fraction is lost on the way.
-        let gib = |name: &str| -> Option<u64> {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .filter(|v| *v > 0.0)
-                .map(|v| (v * 1024.0 * 1024.0 * 1024.0) as u64)
-        };
-        // Omitted rather than zero when unset: the field is `Option<ByteSize>`
-        // and its doc says an absent key means "derive one at bootstrap",
-        // while a zero would be a slab with no slots in it.
-        let slab = gib("PIE_CUDA_TEST_EXPERT_CACHE_GB")
-            .map(|b| format!("expert_cache = \"{b}B\"\n"))
-            .unwrap_or_default();
-        let host = gib("PIE_CUDA_TEST_EXPERT_HOST_CACHE_GB")
-            .map(|b| format!("expert_host_cache = \"{b}B\"\n"))
-            .unwrap_or_default();
-        format!("stream_routed_experts = true\n{slab}{host}")
-    } else {
-        String::new()
-    };
+    // The `stream_routed_experts` / `expert_cache` / `expert_host_cache`
+    // block STOOD HERE, keyed off `PIE_CUDA_TEST_STREAM_EXPERTS`. The three
+    // keys were retired with the boot document -- no engine read them, and a
+    // config stating one now refuses by name -- so the streamed arm's config
+    // is the resident arm's. `cuda_moe_streaming` still refuses a
+    // `PIE_CUDA_TEST_STREAM_EXPERTS=1` run before it boots; expert residency
+    // is `[model] device_weight_budget` / `host_weight_budget` now.
     // The KV cache is otherwise sized from whatever VRAM is left, so changing
     // the expert slab silently changes the page count -- and with it the
     // attention plan and its reduction order. Two runs meant to differ only in
@@ -115,7 +85,7 @@ pub fn cuda_toml_for(snapshot_path: &str) -> String {
          device = [\"cuda:0\"]\n\
          gpu_mem_utilization = 0.90\n\
          memory_profile = \"latency\"\n\
-         {kv}{streaming}",
+         {kv}",
         scratch = scratch.display(),
     )
 }

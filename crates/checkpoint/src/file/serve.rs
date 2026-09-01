@@ -280,6 +280,68 @@ impl Artifact {
             .map_err(Error::from)
     }
 
+    /// **A plane's PADDED extent**, for a reader that needs the span a layout
+    /// tiles with rather than the bytes the tensor publishes.
+    ///
+    /// [`part`](Artifact::part) answers a part's own length, which is what
+    /// almost every reader wants. A tier does not: it seats each plane at
+    /// `reserved` — the published length rounded up to the alignment its
+    /// layout tiles with — and hands a kernel a pointer it treats as that
+    /// wide. Reading `reserved` bytes out of a `length`-long slice is reading
+    /// past it, however certain one is that the bytes are there.
+    ///
+    /// They ARE there: a writer places each blob on its alignment and §2.4
+    /// requires every byte between blobs to be `0x00`, so the padding after a
+    /// plane is real, readable and zero. This is the accessor that says so,
+    /// and it is the whole of what a deferred seat needed that the serving
+    /// reader did not already have.
+    ///
+    /// **KEYED BY NAME AND NOT BY OFFSET**, deliberately. A `(offset, len)`
+    /// door is one typo from returning a neighbouring plane's bytes at the
+    /// right length — the failure that reads as data rather than as an error
+    /// — and a name is what this artifact addresses by everywhere else.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Checkpoint`] for an object or part this file does not carry,
+    /// and for a `len` reaching past what the file holds after the blob:
+    /// asking for more padding than was written is refused rather than
+    /// answered with the next object.
+    pub fn span(&self, object: &str, part: &str, len: u64) -> Result<&[u8], Error> {
+        let bytes = self.part(object, part)?;
+        let published = bytes.len() as u64;
+        if len <= published {
+            let upto = usize::try_from(len).unwrap_or(usize::MAX);
+            return Ok(&bytes[..upto]);
+        }
+        // Past the published bytes, so the answer is in the file's own
+        // padding. The mapping is the whole payload; the blob's offset plus
+        // `len` has to land inside it and inside this blob's own room, which
+        // is the distance to whatever the writer placed next.
+        let spans = self.spans();
+        let padded = serving::padded_spans(&spans);
+        let at = spans
+            .iter()
+            .position(|span| span.object == object && span.part == part)
+            .ok_or_else(|| {
+                Error::Checkpoint(format!(
+                    "the serving artifact {} carries no {object:?}/{part:?} span",
+                    self.path.display(),
+                ))
+            })?;
+        let room = padded[at];
+        if len > room {
+            return Err(Error::Checkpoint(format!(
+                "{object:?}/{part:?} publishes {published} bytes and the writer left it                  {room} before the next blob; a reader asking for {len} is asking for                  padding this file does not have",
+            )));
+        }
+        // SAFETY: the blob is mapped and `len <= room`, and `room` is the
+        // distance from this blob's offset to the next one the writer placed
+        // — so the bytes between `published` and `len` are inside the same
+        // mapping and are the padding §2.4 requires to be zero.
+        Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr(), usize::try_from(len).unwrap_or(0)) })
+    }
+
     /// **One part's block digest table**, borrowed from the attribute that
     /// holds it, with its length checked against the part it describes.
     ///

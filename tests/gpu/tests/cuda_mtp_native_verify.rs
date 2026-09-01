@@ -31,14 +31,13 @@ use client::client::Client;
 
 mod common;
 
-/// Draft window k, kept in lockstep with the engine's `max_drafts`.
+/// Draft window k, kept in lockstep between the boot label and the guest.
 ///
-/// The guest asks for `k` draft rows via `intrinsics::mtp_logits(k)`, and the
-/// engine sizes `max_drafts` from `mtp_num_drafts`. Two defaults for one number
-/// is a trap -- a guest wanting 4 drafts against an engine built for some other
-/// count fails deep in frame prepare with "MtpLogits draft-row requirement
-/// exceeds the production layout" -- so this ONE value feeds both: pass it to
-/// `boot_cuda_mtp` and to the guest. `PIE_MTP_DRAFT_TOKENS` overrides it.
+/// The guest asks for `k` draft rows via `intrinsics::mtp_logits(k)`. The
+/// engine used to size `max_drafts` from `mtp_num_drafts`; that key retired
+/// with the boot document, so the engine's own draft-window default rules and
+/// this ONE value now only keeps the harness's two callers agreeing with each
+/// other. `PIE_MTP_DRAFT_TOKENS` overrides it.
 fn draft_k() -> u32 {
     std::env::var("PIE_MTP_DRAFT_TOKENS")
         .ok()

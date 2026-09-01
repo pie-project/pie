@@ -701,6 +701,7 @@ fn affine_planes(
     let mut codes = Vec::new();
     let mut scales = Vec::new();
     let mut biases = Vec::new();
+    let mut legs = Vec::new();
     for part in &parts {
         let stem = part
             .strip_suffix(".weight")
@@ -712,10 +713,12 @@ fn affine_planes(
                 ),
             })?;
         let unpacked = unpacked_extents(src, w, part)?;
+        legs.push(unpacked.clone());
         codes.push(Expr::src(part.clone()).transmute(TensorType::new(unpacked, grouped(w))));
         scales.push(model_dsl::scales_name(stem));
         biases.push(model_dsl::biases_name(stem));
     }
+    holds_the_declared_rectangle(w, axis, &legs)?;
     let pairing = scaling(w);
     let counted = divided(
         &extents(w),
@@ -782,6 +785,7 @@ fn tiled_planes(
     let mut codes = Vec::new();
     let mut scales = Vec::new();
     let mut biases = Vec::new();
+    let mut legs = Vec::new();
     for part in &parts {
         let stem = part
             .strip_suffix(".weight")
@@ -793,10 +797,14 @@ fn tiled_planes(
                 ),
             })?;
         let unpacked = unpacked_extents(src, w, part)?;
+        legs.push(unpacked.clone());
         codes.push(Expr::src(part.clone()).transmute(TensorType::new(unpacked, grouped(w))));
         scales.push(model_dsl::scales_name(stem));
         biases.push(model_dsl::biases_name(stem));
     }
+    // Against the flat rectangle, which is what the legs join into; the band
+    // order below is a relabelling of that same shape and not another one.
+    holds_the_declared_rectangle(w, axis, &legs)?;
     let pairing = scaling(w);
     // The row-major rectangle the legs join into, and the banded one they are
     // relaid into. `divided` sizes the companions off whichever it is handed,
@@ -874,6 +882,7 @@ fn dequant_planes(
     let mut codes = Vec::new();
     let mut scales = Vec::new();
     let mut biases = Vec::new();
+    let mut legs = Vec::new();
     for part in &parts {
         let stem = part
             .strip_suffix(".weight")
@@ -885,10 +894,14 @@ fn dequant_planes(
                 ),
             })?;
         let unpacked = unpacked_extents(src, &file, part)?;
+        legs.push(unpacked.clone());
         codes.push(Expr::src(part.clone()).transmute(TensorType::new(unpacked, grouped(&file))));
         scales.push(model_dsl::scales_name(stem));
         biases.push(model_dsl::biases_name(stem));
     }
+    // Against `file`, whose extents are `w`'s: the two differ in dtype alone,
+    // and the rectangle a dequant lands is the one the file stores.
+    holds_the_declared_rectangle(&file, axis, &legs)?;
     let pairing = scaling(&file);
     let counted = divided(
         &extents(&file),
@@ -978,6 +991,79 @@ fn unpacked_extents(src: &ztensor::Source, w: &Weight, name: &str) -> Result<Vec
     };
     *words *= word_codes(w.dtype);
     Ok(dims)
+}
+
+/// **THE LEGS JOIN INTO THE RECTANGLE THIS TEXT DECLARED, OR THIS ROW DOES NOT
+/// READ THIS FILE.**
+///
+/// A packed bank's contract is [`TensorContract::inferred`] — the transmute in
+/// [`affine_planes`] already stated each leg's logical shape, so declaring the
+/// joined rectangle a second time would state it in two arithmetics. The cost
+/// of inferring it was that NOTHING compared the file's widths to the ones the
+/// model text asks for, and a contract that never looks at a width is a
+/// contract that cannot miss on one.
+///
+/// **WHICH MADE `identify` READ BANKS IT WAS NOT WRITTEN FOR, SILENTLY.** The
+/// A3B width-invariance fleet is where it surfaced: `mini-l5-e16-k8` and
+/// `mini-l5-e64-k8` hold the same 227 tensor NAMES and differ only in the
+/// routed bank's leading axis, so the sixteen-expert row claimed the
+/// sixty-four-expert carve — first in the walk — and served a bank of 64 as a
+/// bank of 16: forty-eight experts the router could never reach, and not one
+/// error anywhere. The dense path never had this hole, because [`declare`]
+/// states [`extents`] on a raw plane and a bf16 row that misread a width fails
+/// on the byte count. This is that same guarantee, for the planes the packing
+/// made inferred.
+///
+/// It is checked against the JOINED shape and not per leg, because a fused
+/// bank's legs are not each the declaration: `gate_up` is one `Weight` and two
+/// stored tensors that meet at [`pack_axis`], and a qkv pack's legs are not
+/// even the same width as each other. So the legs must agree everywhere off
+/// the seam and sum to the declaration on it.
+///
+/// The contract is always built at `tp == 1` — [`Builder::read`] and its
+/// siblings pass through `whole_checkpoint` first — so [`extents`] here is the
+/// whole model's rectangle, and no sharding can make an honest file disagree
+/// with an honest declaration.
+fn holds_the_declared_rectangle(w: &Weight, axis: u8, legs: &[Vec<i64>]) -> Result<(), Error> {
+    let declared = extents(w);
+    let refuse = |detail: String| Error::Illegible {
+        name: w.name.clone(),
+        detail,
+    };
+    let Some(first) = legs.first() else {
+        return Ok(());
+    };
+    let mut joined = first.clone();
+    let at = axis as usize;
+    for leg in &legs[1..] {
+        if leg.len() != joined.len() {
+            return Err(refuse(format!(
+                "its stored parts are rank {} and rank {}, and parts that join \
+                 into one bank have one rank",
+                joined.len(),
+                leg.len(),
+            )));
+        }
+        for (i, (into, part)) in joined.iter_mut().zip(leg).enumerate() {
+            if i == at {
+                *into += *part;
+            } else if *into != *part {
+                return Err(refuse(format!(
+                    "its stored parts differ at axis {i} ({into} against \
+                     {part}), which is not the axis {at} they join on, so they \
+                     are not two halves of one rectangle"
+                )));
+            }
+        }
+    }
+    if joined != declared {
+        return Err(refuse(format!(
+            "the file stores it {joined:?} and this text declares it \
+             {declared:?}; a text reads the widths it states, so this row is \
+             not the one that reads this checkpoint"
+        )));
+    }
+    Ok(())
 }
 
 /// The companion planes the checkpoint SHIPPED beside `of`, said as

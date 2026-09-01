@@ -1043,10 +1043,22 @@ fn a_load_that_stands_the_word_down_arms_nothing_at_all() {
 /// **AND NEITHER WALL WOULD REFUSE THE COMPOSITION TODAY**, which is worth
 /// saying because it changes what a failure here MEANS. Since the tier-2
 /// campaign a region the rule turns away is an island: the body is cut around
-/// it and this fire would replay with `LastCapture::islands` nonzero. So the
-/// claim below is sharper than it was — this composition's every windowed
-/// region is on `SHIFTED` or `PLANNED` or empty, so its body should hold NO
-/// island, and a hit is the whole of what is owed.
+/// it and this fire replays with `LastCapture::islands` nonzero. So a hit is
+/// the whole of what is owed, and the ISLAND COUNT IS NOT ASSERTED — which is
+/// a change from what this note used to promise and is the lane axis's doing.
+///
+/// **THE LANE AXIS TAKES ONE REGION BACK ON THIS SKU, AND THAT IS CORRECT**
+/// (`crate::LANE_SHIFTED`). `SHIFTED` speaks for ROWS; a region admitted on it
+/// alone is handed the plane's base and then reads its per-lane tables off
+/// pointers this shell advanced by `lane_offset`, which a body bakes and a
+/// `record::BodyKey` does not fix. The gdn DECODE region is exactly that: it
+/// runs the per-STEP scans, whose slot map, fold predicate and commit length
+/// arrive sliced (`Run::recurrent`), and on a mixed fire its window begins
+/// above lane zero. So it is an island now, the stretches around it are
+/// captured, and it is re-issued eagerly at this fire's own lane offset. The
+/// PREFILL mixer regions begin at lane zero and are untouched, and so is every
+/// full-attention class region, whose two names took the absolute door in
+/// chunk 2c-b.
 ///
 /// **THE MODEL THIS GATE LOADS IS AN SSM HYBRID, AND THAT USED TO BE THE
 /// WALL.** `qwen35-d0.8b` runs three gated-delta layers to every full
@@ -1080,7 +1092,31 @@ fn a_load_that_stands_the_word_down_arms_nothing_at_all() {
 #[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
 fn a_mixed_fire_says_at_one_split_what_the_eager_walk_says_at_another() {
     let _serial = serialized();
-    let Some((mut shell, tokenizer)) = ready("the mixed-fire bodies gate", false) else {
+    // **THE LADDER GATE'S DEPLOYMENT, AND FOR THE LADDER GATE'S REASON** —
+    // which this test did not need until its script started moving the LANE
+    // SPLIT, and needs absolutely now. `Ladder::lane_reach` states the
+    // inequality a mixed key's second class needs before it can take a lane
+    // ceiling at all: `max_lanes >= 2 x min(slots, max_lanes, max_tokens)`,
+    // because step 4d clamps its lane padding at `max_lanes` and
+    // `Carve::lanes` carves the second class between the prefix sum in front
+    // of it and that clamp. `ready`'s four-and-four is UNDER it — lane ceiling
+    // four, prefix four, nothing left to carve — so the decode class's
+    // `Shape::num_requests` and `Shape::lane_offset` fall back to following
+    // this fire's batch (`Run::planning`'s `None` arm), and a hashed number
+    // that follows the batch is a reshape on every fire whose split moved.
+    //
+    // While every round fired the same 2+2 that cost nothing: the fallback
+    // answered `lane_offset = 2` five times running and the hash sat still.
+    // Round 4 moves the split, so it is the first fire of this file that could
+    // ever have seen it — the tokens stayed identical (the fallback is
+    // CORRECT, it is only unhashable) and the replay went away. `(8, 16, 0)`
+    // is the sibling gate's deployment and satisfies the inequality: lane
+    // ceiling eight, reach sixteen, `max_lanes` sixteen — so both classes
+    // carve, both hashed numbers are key functions, and the moved split
+    // replays instead of reshaping.
+    let Some((mut shell, tokenizer)) =
+        ready_with("the mixed-fire bodies gate", Graphs::On, false, 8, 16, 0)
+    else {
         return;
     };
     let prompt = tokenizer.encode(PROMPT);
@@ -1088,11 +1124,11 @@ fn a_mixed_fire_says_at_one_split_what_the_eager_walk_says_at_another() {
     // ONE LOAD, TWO ARMS — `a_fire_served_from_a_body_...`'s reason exactly.
     shell.set_mode(Graphs::Off);
     shell.set_bodies(false);
-    let (eager, _) = mixed(&mut shell, &prompt);
+    let (eager, _, _) = mixed(&mut shell, &prompt);
 
     shell.set_mode(Graphs::On);
     shell.set_bodies(true);
-    let (bodied, moved) = mixed(&mut shell, &prompt);
+    let (bodied, moved, split_move) = mixed(&mut shell, &prompt);
 
     let bodies = shell.body_stats();
     eprintln!("{bodies}");
@@ -1137,17 +1173,17 @@ fn a_mixed_fire_says_at_one_split_what_the_eager_walk_says_at_another() {
     // assertion under this one is that claim on its own.)
     assert!(
         bodies.tally.hits >= 1,
-        "no mixed replay: a composition whose every windowed region is on \
-         `SHIFTED` or `PLANNED` was not served from a body. A refusal here \
-         names a region this shell still will not shift — read it off the \
-         counters, because it is a NEW wall and not the chunked-arm one: \
-         {bodies}"
+        "no mixed replay: a composition whose windowed regions are on \
+         `SHIFTED` or `PLANNED`, cut around the ones the LANE axis turns away, \
+         was not served from a body at all. A refusal here names a region this \
+         shell will not shift OR will not cut — read it off the counters, \
+         because it is a NEW wall and not the chunked-arm one: {bodies}"
     );
     // **AND THE LAST ROUND IS A DIFFERENT CLAIM FROM THE ONES BEFORE IT**
-    // (plan-at-bucket-ceiling, chunk 4). Rounds 0-3 re-split eight rows
+    // (plan-at-bucket-ceiling, chunk 4). Rounds 0-4 re-split eight rows
     // between two prefill lanes; the totals never move, so the prefill plan's
     // hashed image could not move either and the replay there says nothing
-    // about the row axis. Round 4 fires `5 + 2` — seven prefill rows against
+    // about the row axis. Round 5 fires `5 + 2` — seven prefill rows against
     // eight, nine fire rows against ten, the SAME bucket (16), the same
     // classes, the same lane counts.
     //
@@ -1158,6 +1194,39 @@ fn a_mixed_fire_says_at_one_split_what_the_eager_walk_says_at_another() {
     // device through the staged image alone, so the body captured on an
     // earlier round serves this one. A moved `reshapes` is the whole failure:
     // it says some hashed prefill number is still following the fire's rows.
+    //
+    // **AND THE MOVED-SPLIT ROUND IS ITS OWN CLAIM, ONE AXIS OVER**
+    // (`mixed`'s own header). Round 4 puts eight prefill rows on ONE lane
+    // where the rounds around it put them on two: same classes, same per-class
+    // row totals, same rungs, same bucket, so the key does not move and a body
+    // captured earlier is eligible. What DOES move is where the decode class's
+    // window begins — lane 2 becomes lane 1 — and a shell that baked a
+    // per-lane pointer at the first split reads ANOTHER LANE's state at the
+    // second, which is the defect `cuda_width_invariance` found. The token
+    // diff above is the oracle; these two clauses are what say the diff was
+    // taken over a REPLAY, because a round that reshaped instead would have
+    // re-captured at the new split and hidden the fault.
+    assert_eq!(
+        split_move.1, 0,
+        "the moved-split round RESHAPED rather than replaying, so this gate \
+         still cannot see a body read at a lane offset other than its \
+         recording one. Nothing in a `record::BodyKey` moved between that fire \
+         and the ones around it, so a reshape names a hashed schedule number \
+         that is following the LANE SPLIT. Read the DEPLOYMENT first: \
+         `Ladder::lane_reach` needs `max_lanes >= 2 x min(slots, max_lanes, \
+         max_tokens)` before a mixed key's second class can take a lane \
+         ceiling at all, and this test is seated at the sibling gate's \
+         `(8, 16)` precisely so that it can. Under that inequality this \
+         failure is the deployment; at or above it, it is a schedule field \
+         `Run::planning` has not frozen: {split_move:?} — {bodies}"
+    );
+    assert!(
+        split_move.0 >= 1,
+        "the round that moves the lane split did not replay at all, so the \
+         lane axis was never crossed under a body and the token diff above \
+         proves only what the rounds before it proved: {split_move:?} — \
+         {bodies}"
+    );
     assert_eq!(
         moved,
         (1, 0),
@@ -1169,21 +1238,56 @@ fn a_mixed_fire_says_at_one_split_what_the_eager_walk_says_at_another() {
     );
 }
 
-/// The mixed script both arms run: two primed decode lanes beside two prefill
-/// lanes, fired at one split, then at a second, then at a THIRD whose row
-/// total is different.
+/// The mixed script both arms run: two primed decode lanes beside a prefill
+/// class fired at one split, then at a second, then at a third that moves the
+/// prefill class's LANE COUNT, then at a fourth whose row total is different.
 ///
 /// Rounds 0-3 move the rows only INSIDE the prefill class, so those fires
 /// present the same classes, the same lane counts and the same per-window row
-/// totals. Round 4 moves the TOTAL — the whole fire carries nine rows where
+/// totals. Round 5 moves the TOTAL — the whole fire carries nine rows where
 /// the others carried ten — and it lands in the same bucket (16), which is the
 /// case chunk 4 exists for.
 ///
-/// Returns the tokens, and the `(hits, reshapes)` the LAST round alone moved.
-fn mixed(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, (u64, u64)) {
-    /// The two prefill lanes' chunk widths, round by round. Rounds 0-3 hold
-    /// the sum at 8 and the last one drops it to 7.
-    const SPLITS: [(u32, u32); 5] = [(6, 2), (6, 2), (6, 2), (4, 4), (5, 2)];
+/// # AND ROUND 4 MOVES THE SPLIT ITSELF, WHICH IS WHAT THIS SCRIPT USED TO
+/// MISS
+///
+/// Every round of this script used to fire TWO decode lanes beside TWO prefill
+/// lanes. The rows moved; the lane counts never did. So the second class's
+/// window began at `lane_offset = 2` in every fire of the key, every pointer
+/// this shell advances by that number was baked and re-read at the SAME
+/// number, and the one thing a mixed body can get wrong on the lane axis was
+/// the one thing no round crossed.
+///
+/// `cuda_width_invariance` crossed it by accident — a decode probe beside ONE
+/// prefill neighbour, replaying a body armed against SEVEN — and answered
+/// eleven logits wrong with a flipped argmax and no fault anywhere. Round 4 is
+/// that fire's coordinates inside this gate's key: EIGHT prefill rows on ONE
+/// lane where the rounds around it put eight rows on two. Same classes, same
+/// per-class row totals, same rungs, same bucket — so the key does not move
+/// and the body captured on an earlier round is eligible — while the decode
+/// class's window slides from lane 2 to lane 1. A shell that bakes a per-lane
+/// pointer at one split and replays it at another reads another lane's state
+/// here, and the token diff is what says so.
+///
+/// **AND A ROUND THAT MOVES THE SPLIT ASKS SOMETHING OF THE DEPLOYMENT THAT
+/// THE OTHERS DID NOT.** A hashed schedule number that follows the batch costs
+/// nothing while every fire brings the same batch, and costs a RESHAPE the
+/// moment one does not — so the caller has to be seated above
+/// `record::Ladder::lane_reach`'s inequality before this round can replay at
+/// all. The test above says which seating and why; an author adding a sixth
+/// round that moves the split again inherits the same requirement.
+///
+/// Returns the tokens, the `(hits, reshapes)` the LAST round alone moved, and
+/// the same pair for the MOVED-SPLIT round — because a round that reshaped
+/// instead of replaying would prove nothing at all.
+fn mixed(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, (u64, u64), (u64, u64)) {
+    /// The PREFILL class's chunk widths, round by round — one entry per
+    /// prefill lane. Rounds 0-4 hold the class's row total at 8 and the last
+    /// one drops it to 7; round 4 is the one that holds the total while
+    /// moving the LANE COUNT, which is what slides the decode class's window.
+    const SPLITS: [&[u32]; 6] = [&[6, 2], &[6, 2], &[6, 2], &[4, 4], &[8], &[5, 2]];
+    /// Which round moves the split rather than the rows.
+    const MOVED_SPLIT: usize = 4;
 
     for slot in 0..4 {
         shell.open(slot).unwrap_or_else(|why| panic!("slot {slot} opens: {why}"));
@@ -1211,27 +1315,30 @@ fn mixed(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, (u64, u64)) {
     // the tokenizer's output.
     let filler = vec![prompt[0]; 8];
     let mut last = (0, 0);
-    for (round, (long, short)) in SPLITS.iter().copied().enumerate() {
+    let mut split_move = (0, 0);
+    for (round, chunks) in SPLITS.iter().copied().enumerate() {
         // The counters bracketing the LAST round, so the claim is about the
-        // fire whose row total moved and not about the four in front of it.
+        // fire whose row total moved and not about the ones in front of it —
+        // and the same bracket around the round that moves the SPLIT.
         let before = shell.body_stats();
         let a = [fed[0]];
         let b = [fed[1]];
+        // The two decode lanes first, then one prefill lane per chunk. The
+        // prefill slots start at 2 so a round with fewer lanes drops the
+        // LAST of them rather than renumbering the ones that stay.
+        let mut lanes = vec![
+            Lane { slot: 0, word: word(1), tokens: &a },
+            Lane { slot: 1, word: word(1), tokens: &b },
+        ];
+        for (at, chunk) in chunks.iter().copied().enumerate() {
+            lanes.push(Lane {
+                slot: at as u32 + 2,
+                word: word(chunk),
+                tokens: &filler[..chunk as usize],
+            });
+        }
         let answered = shell
-            .fire(&[
-                Lane { slot: 0, word: word(1), tokens: &a },
-                Lane { slot: 1, word: word(1), tokens: &b },
-                Lane {
-                    slot: 2,
-                    word: word(long),
-                    tokens: &filler[..long as usize],
-                },
-                Lane {
-                    slot: 3,
-                    word: word(short),
-                    tokens: &filler[..short as usize],
-                },
-            ])
+            .fire(&lanes)
             .unwrap_or_else(|why| panic!("mixed round {round} fires: {why}"));
         // Every lane's answer goes into the diff, not only the decodes': a
         // lane axis read one place off would show up in whichever lane it
@@ -1241,15 +1348,20 @@ fn mixed(shell: &mut Shell, prompt: &[u32]) -> (Vec<u32>, (u64, u64)) {
         }
         fed[0] = argmax(&answered[0]);
         fed[1] = argmax(&answered[1]);
-        if round + 1 == SPLITS.len() {
+        if round + 1 == SPLITS.len() || round == MOVED_SPLIT {
             let after = shell.body_stats();
-            last = (
+            let moved = (
                 after.tally.hits - before.tally.hits,
                 after.tally.reshapes - before.tally.reshapes,
             );
+            if round == MOVED_SPLIT {
+                split_move = moved;
+            } else {
+                last = moved;
+            }
         }
     }
-    (produced, last)
+    (produced, last, split_move)
 }
 
 /// **THE GROWTH-AFTER-CAPTURE GATE** — the regression the grown-slab commit

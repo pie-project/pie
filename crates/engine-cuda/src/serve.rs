@@ -128,7 +128,8 @@
 //! ```text
 //! tier 1  a body whose every region a graph holds — one exec, one launch
 //! tier 2  a body cut around its ISLANDS — the regions no capture can name
-//!         (gathered, grouped, unshifted-windowed) are walked eagerly between
+//!         (gathered, grouped, unshifted-windowed, lane-windowed without the
+//!         lane axis) are walked eagerly between
 //!         the execs, GROWN to the nearest legal boundary (`record::widen`),
 //!         and the cuts are a function of the key
 //! tier 3  the eager walk, and a COUNTER. What reaches it is a composition no
@@ -233,8 +234,8 @@ use engine::fire::{Boundary, LayerScores, Masking, Readout, RsReset, RsVerb};
 use crate::program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
 use crate::record::{self, Graphs as GraphCache};
 use crate::run::RsMove;
-use crate::store::kv::{self, Paging, Seat};
 use crate::store::Pools;
+use crate::store::kv::{self, Paging, Seat};
 use crate::store::rs::Buffers;
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
@@ -243,7 +244,7 @@ use crate::window::Windows;
 // they compute is not.
 use crate::exports::{
     Exports, corrected_classes, decoding_classes, masked_classes, media_classes,
-    regions_shifting,
+    regions_lane_shifting, regions_shifting,
 };
 // THE TWO PHASES, AND WHAT ONLY THEY READ (this wave). `GuestBatch` is a
 // field of `Shell` and `reap_guest_fires` is what the door below calls, so
@@ -290,6 +291,28 @@ impl Graphs {
     #[must_use]
     pub fn records(self) -> bool {
         matches!(self, Graphs::On)
+    }
+}
+
+impl std::str::FromStr for Graphs {
+    type Err = String;
+
+    /// The spellings the boot key `graphs` has always accepted, exactly:
+    /// `on` (or `graph`), `shaped`, and `off` (or `eager`).
+    ///
+    /// An unknown word is refused BY NAME rather than defaulted — what an
+    /// absent word means is the caller's ruling, and a misspelled one
+    /// silently meaning the default is how a diagnostic run serves traffic.
+    fn from_str(word: &str) -> std::result::Result<Graphs, String> {
+        match word {
+            "off" | "eager" => Ok(Graphs::Off),
+            "shaped" => Ok(Graphs::Shaped),
+            "on" | "graph" => Ok(Graphs::On),
+            other => Err(format!(
+                "`{other}` does not name a graph mode; the spellings are \
+                 `on` (or `graph`), `shaped`, and `off` (or `eager`)"
+            )),
+        }
     }
 }
 
@@ -388,8 +411,11 @@ pub struct Knobs {
     /// per region through [`Shell::shifted`]) — for the second kind the launch
     /// plane hands the plane's base and the device does the shifting
     /// (`Run::plane_base`). Everything else is an ISLAND — gathered and
-    /// grouped windows always, and any windowed region holding one guard-only
-    /// op — and since the tier-2 campaign an island does not refuse the key:
+    /// grouped windows always, any windowed region holding one guard-only op,
+    /// and any region beginning above the fire's LANE zero whose ops do not
+    /// find their own lane ([`crate::LANE_SHIFTED`], per region through
+    /// [`Shell::lane_shifted`]) — and since the tier-2 campaign an island does
+    /// not refuse the key:
     /// the body is captured in SEGMENTS around it and the island is re-issued
     /// eagerly between the execs ([`record::Cut`],
     /// [`record::LastCapture::islands`]). The FA2 attention arms and the four
@@ -920,27 +946,30 @@ const MROPE_COORDS: usize = 3;
 /// cannot drift, and so "the plan does not declare it" and "the plan declares
 /// it zero wide" are one answer rather than two.
 fn declared_width(trace: &model_ir::Trace, which: model_ir::RuntimeInput) -> u64 {
-    trace.values.iter().find_map(|decl| {
-        let (model_ir::Def::Input(named), model_ir::Ty::Tensor { shape, .. }) =
-            (&decl.def, &decl.ty)
-        else {
-            return None;
-        };
-        if *named != which {
-            return None;
-        }
-        Some(
-            shape
-                .iter()
-                .skip(1)
-                .map(|dim| match dim {
-                    model_ir::Dim::Const(n) => *n,
-                    _ => 1,
-                })
-                .product(),
-        )
-    })
-    .unwrap_or(0)
+    trace
+        .values
+        .iter()
+        .find_map(|decl| {
+            let (model_ir::Def::Input(named), model_ir::Ty::Tensor { shape, .. }) =
+                (&decl.def, &decl.ty)
+            else {
+                return None;
+            };
+            if *named != which {
+                return None;
+            }
+            Some(
+                shape
+                    .iter()
+                    .skip(1)
+                    .map(|dim| match dim {
+                        model_ir::Dim::Const(n) => *n,
+                        _ => 1,
+                    })
+                    .product(),
+            )
+        })
+        .unwrap_or(0)
 }
 
 /// **HOW MANY PATCH ROWS THIS PLAN FOLDS INTO ONE** (multimodal §17) — the
@@ -1249,6 +1278,19 @@ pub struct Shell {
     /// admitted region its plane's base and to arm its seat. One slice, so the
     /// host's answer and the launch's cannot be two answers.
     shifted: Vec<bool>,
+    /// **WHICH REGIONS FIND THEIR OWN LANE INSIDE THE FIRE** —
+    /// `exports::regions_lane_shifting` read once at load, one entry per
+    /// TEMPLATE REGION, [`shifted`](Shell::shifted)'s twin one axis over.
+    ///
+    /// [`crate::LANE_SHIFTED`] carries the whole account of why the row axis's
+    /// answer could not speak for this one: a region admitted on `shifted`
+    /// alone is handed the PLANE's base and then reads its per-lane tables off
+    /// pointers advanced by `lane_offset`, which a body bakes and a
+    /// `record::BodyKey` does not fix. Read here beside its twin so that the
+    /// two facts are one lookup, and spent in exactly one place —
+    /// [`Windows::admits`](crate::window::Windows::admits)' lane clause, which
+    /// only a window above the fire's lane zero ever asks.
+    lane_shifted: Vec<bool>,
     /// **WHICH BIT OF A FACT WORD PUTS A LANE IN THE CORRECTION'S WINDOW**
     /// (alto adapter §6.4), or `None` for a bake where no single bit does.
     ///
@@ -1546,8 +1588,10 @@ fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // gets the powers of two up to its ceiling rather than the empty
     // lattice, because an empty lattice makes P4's bucket ranges collapse
     // to one position and D4's padding round every fire up to itself.
-    boot.budget.buckets =
-        crate::api::lattice(std::mem::take(&mut boot.budget.buckets), boot.budget.max_tokens);
+    boot.budget.buckets = crate::api::lattice(
+        std::mem::take(&mut boot.budget.buckets),
+        boot.budget.max_tokens,
+    );
 
     // Costs are input (design §6's `layout/` lineage row): the shell
     // measured the device once at bind, and hands the numbers to a
@@ -1571,7 +1615,10 @@ fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // entries claim a workspace no second launch may be inside. See
     // [`crate::EXCLUSIVE`] — the profile's own doc argues why it is data
     // and not knowledge.
-    profile.exclusive = crate::EXCLUSIVE.iter().map(|op| (*op).to_string()).collect();
+    profile.exclusive = crate::EXCLUSIVE
+        .iter()
+        .map(|op| (*op).to_string())
+        .collect();
     // And the other kernel-table fact, stated the same way and for the
     // same reason: which ops this shell can run over a SEGMENT LIST in one
     // launch, which is what lets P4 answer `Fallback::Grouped` for a
@@ -1629,7 +1676,10 @@ impl Shell {
         // here: a `cudaStreamCreate` on the fire path would be host work
         // between two launches, and inside a capture it is what
         // `Graph::capture`'s thread-local mode refuses by name.
-        device.open_lanes(compiled.streams.streams.saturating_sub(1), compiled.streams.events)?;
+        device.open_lanes(
+            compiled.streams.streams.saturating_sub(1),
+            compiled.streams.events,
+        )?;
         // **AND THE CONDITIONAL BODY'S STREAM, FOR AN ARTIFACT THAT BAKED
         // ONE** (palo design §4). P3 stamps a `Lowering` other than
         // always-launch on exactly the regions worth guarding — one region in
@@ -1737,6 +1787,10 @@ impl Shell {
         // the staged seat's start, and can therefore carry a body's replay
         // somewhere other than the fire's row zero (`Shell::shifted`).
         let shifted = regions_shifting(&boot.trace, &compiled);
+        // And its twin one axis over: which regions hold nothing but ops that
+        // find their own LANE, and can therefore carry a body's replay
+        // somewhere other than the fire's lane zero (`Shell::lane_shifted`).
+        let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
         let paging = Paging::of(boot.page_size, boot.context, boot.slots)?;
         // ── **THE UNIFIED ACCOUNTING SENTENCE, AHEAD OF EVERY BYTE** (alto
         //    streaming §3 item 5, `next.md` B2). Weight tier + elastic pool +
@@ -1820,8 +1874,10 @@ impl Shell {
         // that states no patch row, pays not one byte.
         let patch_seat = boot.patches.as_ref().and_then(|ladder| {
             boot.trace.values.iter().find_map(|decl| {
-                let (model_ir::Def::Input(model_ir::RuntimeInput::Patches), model_ir::Ty::Tensor { shape, dtype }) =
-                    (&decl.def, &decl.ty)
+                let (
+                    model_ir::Def::Input(model_ir::RuntimeInput::Patches),
+                    model_ir::Ty::Tensor { shape, dtype },
+                ) = (&decl.def, &decl.ty)
                 else {
                     return None;
                 };
@@ -1858,7 +1914,10 @@ impl Shell {
         // plan's declaration and nothing else, so a text that never names it
         // reserves no bytes and assembles no vector.
         let mrope_seat = boot.trace.values.iter().any(|decl| {
-            matches!(decl.def, model_ir::Def::Input(model_ir::RuntimeInput::MropePositions))
+            matches!(
+                decl.def,
+                model_ir::Def::Input(model_ir::RuntimeInput::MropePositions)
+            )
         });
         // **AND WHETHER A TOWER ROW MAY SAY IT LANDS NOWHERE** (multimodal
         // §8.6), read off the NODES rather than the values because it is an op
@@ -1914,13 +1973,15 @@ impl Shell {
         let score_heads = exports
             .scores
             .first()
-            .and_then(|export| match &boot.trace.values[export.value.0 as usize].ty {
-                model_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
-                    model_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
-                    _ => None,
-                }),
-                model_ir::Ty::Struct(_) => None,
-            })
+            .and_then(
+                |export| match &boot.trace.values[export.value.0 as usize].ty {
+                    model_ir::Ty::Tensor { shape, .. } => shape.get(1).and_then(|dim| match dim {
+                        model_ir::Dim::Const(heads) => u32::try_from(*heads).ok(),
+                        _ => None,
+                    }),
+                    model_ir::Ty::Struct(_) => None,
+                },
+            )
             .unwrap_or(0);
         let score_values: Vec<model_ir::ValueId> =
             exports.scores.iter().map(|export| export.value).collect();
@@ -1986,6 +2047,7 @@ impl Shell {
             decoding,
             media,
             shifted,
+            lane_shifted,
             // **SEATED OFF THE BANKS AND MOUNTED NOWHERE.** How many adapters
             // can be resident at once is the model text's declaration (alto
             // adapter §3.3: `slots` is residency, not a catalog); WHERE the
@@ -2030,7 +2092,8 @@ impl Shell {
             // consumers of that root, and the one that would otherwise be
             // entitled to spell a subdirectory the others also use.
             programs: ProgramPlane::new(crate::program::compile::Disk::rooted(
-                boot.cache_dir.map(|dir| dir.join(kernels_cuda::disk::CUBINS)),
+                boot.cache_dir
+                    .map(|dir| dir.join(kernels_cuda::disk::CUBINS)),
             )),
             // One event per in-flight step: the same depth as the staging
             // ring, because a step holds exactly one of each between `settle`
@@ -2370,17 +2433,19 @@ impl Shell {
     /// [`Fault::Blob`] for a mount, a manifest or a shape that disagrees with
     /// this load's banks; [`Fault::AdapterSlots`] when every slot is pinned;
     /// [`Fault::Adapter`] and [`Fault::Device`] from the landing itself.
-    pub fn bind_adapter(&mut self, source: crate::blob::Source<'_>) -> Result<crate::blob::Binding> {
+    pub fn bind_adapter(
+        &mut self,
+        source: crate::blob::Source<'_>,
+    ) -> Result<crate::blob::Binding> {
         let seats = self.weights.seats();
         // Two disjoint fields, borrowed apart: the residency table decides
         // WHICH slot on the host and the weight store writes it on the
         // device, and keeping the decision testable without a GPU is the
         // reason the landing arrives as a closure.
         let weights = &mut self.weights;
-        self.adapters
-            .bind(source, &seats, |slot, planes| {
-                weights.register_adapter(slot, planes)
-            })
+        self.adapters.bind(source, &seats, |slot, planes| {
+            weights.register_adapter(slot, planes)
+        })
     }
 
     /// Give a bind back.
@@ -2843,8 +2908,15 @@ impl Shell {
         //    interleaves is `prepare` of the next step with `enqueue` of this
         //    one. Neither is possible while the three are one function, and
         //    both are a call-site edit now that they are not.
-        let prepared =
-            FrameShell::prepare(self, StepView { lanes, attachments, media }, None)?;
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes,
+                attachments,
+                media,
+            },
+            None,
+        )?;
         let enqueued = FrameShell::enqueue(self, prepared)?;
         let mut settled = FrameShell::settle(self, enqueued)?;
         // **AND THEN THE NUMBERS DOOR**, because this verb's whole contract is
@@ -3568,7 +3640,6 @@ impl Shell {
     pub fn drain(&mut self) -> Result<()> {
         self.device.synchronize()
     }
-
 }
 
 impl Drop for Shell {
@@ -3624,7 +3695,10 @@ fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) 
         }
         let decides = classes.classes.iter().enumerate().all(|(at, class)| {
             let runs = corrected.contains(at);
-            class.words.iter().all(|word| ((word >> bit) & 1 == 1) == runs)
+            class
+                .words
+                .iter()
+                .all(|word| ((word >> bit) & 1 == 1) == runs)
         });
         if decides {
             if found.is_some() {

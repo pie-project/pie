@@ -271,6 +271,21 @@ impl Mapping {
     pub fn backing(&self) -> Option<u64> {
         self.file.metadata().ok().map(|it| it.len())
     }
+
+    /// **How many names the backing file has**, as `fstat` reports it now.
+    ///
+    /// The other half of the pair a streamed load's source observable answers
+    /// with ([`Tier::source`](crate::experts::Tier::source)), and it reads the
+    /// opposite way from the staging file's: `0` there says "unlinked, so
+    /// nothing outside this process can reach it", and at least one HERE says
+    /// "this is the artifact the operator named, which this load opened and
+    /// did not create". A warm streamed load asserting zero links would be
+    /// asserting it had staged a copy.
+    #[must_use]
+    pub fn links(&self) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        self.file.metadata().ok().map(|it| it.nlink())
+    }
 }
 
 impl std::ops::Deref for Mapping {

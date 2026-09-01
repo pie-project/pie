@@ -511,6 +511,78 @@ fn an_armed_island_body_replays_at_another_split_and_its_sibling_walks() {
     same_logits(&eager_sibling, &bodied_sibling, "the unarmed sibling");
 }
 
+/// **THE SAME FIRE, THREE TIMES, BIT FOR BIT** — the repeatability gate, on a
+/// SEGMENTED key.
+///
+/// # Why this claim needs a gate of its own
+///
+/// Everything else in this file diffs a body against the EAGER WALK, which is
+/// the right oracle and is not this one. A body can agree with nothing at all
+/// and still be wrong in a way no A/B here can see: if a replay launches
+/// FEWER kernels than it should — or none — the frame still settles, the hit
+/// is still counted, and the caller still reads a readout rectangle. It just
+/// reads the one the LAST fire that actually ran left behind. Two identical
+/// fires then answer differently, deterministically, with no fault raised and
+/// no counter moved, and every diff-against-eager in this tree passes because
+/// the eager arm is never the one that broke.
+///
+/// That is not hypothetical. `tests/gpu/tests/cuda_width_invariance` caught it
+/// by accident — it takes its own baseline TWICE before reading anything, and
+/// the two disagreed — on a load whose captured stretches had all been dropped
+/// for holding zero nodes (`record::Graphs::fire_body`'s empty-script
+/// refusal, and `device::graph::Graph::nodes`' `Option`, are the two halves of
+/// the fix). A gate that asserts a replay equals a replay is the one that
+/// states the property directly, and it belongs here because the composition
+/// this file already arranges is the hard case: a SEGMENTED body, where each
+/// fire re-issues its island eagerly between two execs and the scratch, the
+/// slabs and the arena all carry whatever the fire before it left.
+///
+/// # Three and not two
+///
+/// Two fires separate "repeatable" from "not". Three separate the two ways it
+/// can fail: `1 != 2 == 3` is a first fire that differed from a steady state
+/// (something the load left behind, spent once), and `1 != 2 != 3` is a
+/// RATCHET — every fire reading what the one before it wrote, which is what an
+/// empty script produces and what a two-fire gate would report as the same
+/// verdict.
+#[test]
+#[ignore = "real-hardware: needs a CUDA device and a local model snapshot; run it with `-- --ignored`, which the self-hosted `pie-worker (engine-cuda)` job does"]
+fn a_segmented_body_answers_the_same_bytes_every_fire() {
+    let _serial = serialized();
+    let Some((mut shell, tok)) = ready("the replay repeatability gate") else {
+        return;
+    };
+    register_loud(&mut shell, ADAPTER);
+
+    // The premise, read before any fire: this load armed a body with an
+    // island in it, so the fires below replay a SCRIPT — exec, island, exec —
+    // rather than one graph launch.
+    let armed = shell.body_stats();
+    assert!(
+        armed.census.segmented >= 1,
+        "this load armed no segmented body, so the fires below would not be \
+         exercising the island seam this gate exists for: {armed}"
+    );
+
+    let witness = witness_at(&tok, FIRST);
+    let (first, _) = fire_it(&mut shell, &witness);
+    let (second, _) = fire_it(&mut shell, &witness);
+    let (third, _) = fire_it(&mut shell, &witness);
+
+    // **AND THE HITS ARE COUNTED, WHICH IS WHAT MAKES THE EQUALITY MEAN
+    // SOMETHING.** Three eager walks would also be identical; the claim is
+    // about three REPLAYS.
+    let served = shell.body_stats();
+    assert!(
+        served.tally.hits >= 3,
+        "the three fires did not replay a body, so this gate proved the eager \
+         walk repeats and nothing else: {served}"
+    );
+
+    same_logits(&first, &second, "the same segmented fire, twice");
+    same_logits(&second, &third, "the same segmented fire, a third time");
+}
+
 // ── the adapter, which is what makes class 6 reachable ───────────────────
 
 /// A LOUD adapter — big enough that its correction is visibly not the

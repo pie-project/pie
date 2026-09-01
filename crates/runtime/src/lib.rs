@@ -11,8 +11,9 @@
 // and eight more. `as _` because there is nothing to call.
 // THE CUTOVER, and it is one line because it has to be: the Rust shell
 // exports the same thirteen `pie_cuda_*` symbols, so which crate supplies
-// them is a link question. The boot reader (`engine_cuda::boot`, and
-// `backend/cuda.rs` when this was written) never learns which one it reached.
+// them is a link question. The boot seam (`engine_cuda::open` over a typed
+// `DeviceBoot`; a TOML reader when this was written) never learns which one
+// it reached.
 #[cfg(feature = "_engine-cuda")]
 extern crate engine_cuda as _;
 
@@ -29,8 +30,8 @@ pub mod inferlet;
 /// `models::serve` outright: what an artifact carries and what a fleet calls a
 /// model are facts about serving, and this is the serving fabric.
 pub mod model;
-pub(crate) mod pipeline;
 pub mod offload;
+pub(crate) mod pipeline;
 pub mod planner;
 pub mod scheduler;
 pub mod server;

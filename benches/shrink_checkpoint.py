@@ -28,6 +28,38 @@ parity fixture rather than a mock.
 Usage:
     python benches/shrink_checkpoint.py --repo zai-org/GLM-5.2 \
         --out ~/models/glm5.2-mini --experts 8
+
+Nothing is read from disk: the source is always the HF repo over HTTP range
+requests, so the same command reproduces the same artifact on a box that has
+never seen the full checkpoint.
+
+The width-invariance fixture (`qwen3.6-a3b mini-l5-e16-k8`), byte-identical on
+any box, 0.76 GiB down and 227 tensors written, in about two minutes:
+
+    uv run --with numpy python benches/shrink_checkpoint.py \
+        --repo mlx-community/Qwen3.6-35B-A3B-4bit \
+        --layers 0-4 --experts 16 \
+        --out ~/.cache/huggingface/hub/\
+models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/mini-l5-e16-k8
+
+And its sharper twin, `mini-l5-e64-k8` — the SAME command with `--experts 64`,
+1.15 GiB down and the same 227 tensors, because the bank moves shapes and never
+names:
+
+    uv run --with numpy python benches/shrink_checkpoint.py \
+        --repo mlx-community/Qwen3.6-35B-A3B-4bit \
+        --layers 0-4 --experts 64 \
+        --out ~/.cache/huggingface/hub/\
+models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/mini-l5-e64-k8
+
+The 16-expert carve reproduced the tiled path's fault structure on the CUDA
+node (routed delta 0.078) without the delta ever crossing an expert boundary:
+at 8-of-16 the eighth-to-ninth logit gap is wider than the perturbation, so the
+routing decision never changed. Sixty-four leaves fifty-six rejected experts in
+that tail instead of eight and contracts the gap with them, which is the whole
+reason the second row exists. Both land their own SKU
+(`qwen36-35b-a3b-mini-mlxu4-kv-bf16` and `…-mini64-…`) and both are held by
+`crates/models/tests/the_a3b_text_reads_the_routed_miniature.rs`.
 """
 
 from __future__ import annotations
@@ -440,6 +472,41 @@ def _rewrite_qwen3_5_moe(cfg: dict, plan: Plan) -> None:
     # number of periods keeps the ratio the model was trained with.
     if isinstance(tc.get("layer_types"), list):
         tc["layer_types"] = _slice_list(tc["layer_types"], plan.src_layers)
+        _check_attn_period(tc, plan)
+
+
+def _check_attn_period(tc: dict, plan: Plan) -> None:
+    """`layer_types` and `full_attention_interval` must still name one pattern.
+
+    The checkpoint says which layers are full-attention TWICE: once as the
+    explicit `layer_types` list, and once as the period
+    `full_attention_interval`, which a reader that does not read the list
+    derives from instead (layer `i` is full when `(i + 1) % interval == 0`).
+    In the source they agree. A selection that is a whole number of periods
+    starting at 0 keeps them agreeing; an arbitrary one silently does not, and
+    the artifact then ships two different models depending on which field its
+    reader trusts.
+
+    That is not the same thing as demanding whole periods. Five layers of a
+    period-4 pattern is 1.25 periods, and it still agrees: the truncated list
+    is [linear, linear, linear, full, linear] and the derivation puts its only
+    full layer at 3 as well. So the check is the agreement itself, not the
+    divisibility -- which is what lets the width-invariance carve take the five
+    layers it wants.
+    """
+    interval = tc.get("full_attention_interval")
+    if not isinstance(interval, int) or interval <= 0:
+        return
+    types = tc["layer_types"]
+    derived = ["full_attention" if (i + 1) % interval == 0 else "linear_attention"
+               for i in range(len(types))]
+    if types != derived:
+        raise SystemExit(
+            f"{plan.family}: --layers {plan.src_layers} truncates layer_types to "
+            f"{types}, but full_attention_interval {interval} derives {derived}. "
+            f"The artifact would say two different things about which layers are "
+            f"full-attention; select a block that keeps the two in step (one "
+            f"starting at 0 does).")
 
 
 def _rewrite_qwen4_exp(cfg: dict, plan: Plan) -> None:
@@ -881,6 +948,95 @@ FAMILIES: dict[str, dict[str, Any]] = {
         config_rewrite=_rewrite_qwen3_5_moe,
         text_cfg_key="text_config",
         keep_res=(re.compile(r"^model\.visual\."),),
+    ),
+    # The same architecture as `mlx_lm.convert` leaves it, which is a different
+    # *checkpoint* -- the `deepseek_v4` / `deepseek_v4_mlx` split again. Two
+    # things move: the wrapper and the trunk swap places, so the prefix is
+    # `language_model.model.layers.` where upstream writes
+    # `model.language_model.layers.`, and every projection becomes a quantised
+    # `weight`/`scales`/`biases` trio. The routed bank stays stacked on dim 0,
+    # but as a `switch_mlp` triple (`gate_proj`/`up_proj`/`down_proj`) rather
+    # than upstream's fused `gate_up_proj`. `resolve_family` tells the two
+    # apart by which prefix the index actually uses.
+    #
+    # **THE CARVE THIS ARM EXISTS FOR** is the CUDA node's width-invariance
+    # gate, and it is why the arm shrinks so little. The fault under test is
+    # accumulation ORDER over K in the tiled `Linear::Matmul` + `LmHead`
+    # kernels: a tiled projection lands a ulp off, the ulp moves a router
+    # logit, and the token takes a different expert. Every dimension on that
+    # chain therefore keeps its production width -- `hidden_size`,
+    # `moe_intermediate_size`, the attention block (which computes the router's
+    # own input), and the vocabulary (`lm_head` is the other tiled entry, and
+    # the readout is where the delta is finally observed). Halving any of them
+    # halves the partial sums and can hide the thing the artifact exists to
+    # expose.
+    #
+    # What is left to shrink is depth and the expert bank, and the bank cannot
+    # go far either: the failure needs a CONTESTED top-k, several experts whose
+    # logits sit within a ulp of each other, so the bank is chosen against the
+    # source's `num_experts_per_tok` 8 -- 8-of-8 is not a choice at all and
+    # 8-of-256 spreads the gaps too wide for a ulp to cross.
+    #
+    # **TWO CARVES COME OFF THIS ARM, AND ONLY `--experts` SEPARATES THEM.**
+    # `--experts 16` was the first, and it proved the fault structure on the
+    # CUDA node (routed delta 0.078) while crossing no expert boundary: at
+    # 8-of-16 the gap between the eighth and ninth logit is simply wider than
+    # the perturbation. `--experts 64` is the sharper vehicle -- fifty-six
+    # rejected experts in the tail rather than eight, so the gap contracts until
+    # a ulp has somewhere to cross -- and it is still short of 256 on purpose,
+    # because the artifact has to stay one download rather than become the
+    # model. Both are declared rows (`Model::a3b_mini`, `Model::a3b_mini64`);
+    # neither may claim the other's file, which their leading expert axis
+    # settles in both directions.
+    "qwen3_5_moe_mlx": dict(
+        model_type="qwen3_5_moe",
+        layer_prefix="language_model.model.layers.",
+        expert_re=None,
+        router_suffixes=(
+            # The router itself: dim 0 IS the expert axis (one row of logits
+            # per expert), so it slices with the bank it selects from. It is
+            # also the one plane the mixed-precision recipe overrides to 8-bit,
+            # which is what makes `carry_quant_overrides` load-bearing here.
+            "mlp.gate.weight",
+            "mlp.gate.scales",
+            "mlp.gate.biases",
+            "mlp.switch_mlp.gate_proj.weight",
+            "mlp.switch_mlp.gate_proj.scales",
+            "mlp.switch_mlp.gate_proj.biases",
+            "mlp.switch_mlp.up_proj.weight",
+            "mlp.switch_mlp.up_proj.scales",
+            "mlp.switch_mlp.up_proj.biases",
+            "mlp.switch_mlp.down_proj.weight",
+            "mlp.switch_mlp.down_proj.scales",
+            "mlp.switch_mlp.down_proj.biases",
+        ),
+        # `mlp.shared_expert.*` and `mlp.shared_expert_gate.*` are deliberately
+        # NOT here. The shared expert runs for every token and is one expert,
+        # not a bank -- its dim 0 is a row space, not an expert index, and
+        # slicing it would cut the tensor in half rather than select experts.
+        globals_keep=("language_model.model.embed_tokens.weight",
+                      "language_model.model.embed_tokens.scales",
+                      "language_model.model.embed_tokens.biases",
+                      "language_model.model.norm.weight",
+                      "language_model.lm_head.weight",
+                      "language_model.lm_head.scales",
+                      "language_model.lm_head.biases"),
+        # Five layers, 0-4. `full_attention_interval` is 4 (three
+        # `linear_attention` then one `full_attention`), so this is 1.25
+        # periods -- not the whole-period block the upstream arm takes, but
+        # `_check_attn_period` shows the two declarations still agree, and the
+        # gate wants the mechanism to HAPPEN per layer rather than accumulate
+        # over a deep stack. Both attention kinds and both cache kinds are in.
+        default_layers="0-4",
+        config_rewrite=_rewrite_qwen3_5_moe,
+        text_cfg_key="text_config",
+        # **NO `keep_res`, SO THE 333-PLANE VISION TOWER IS DROPPED**, as
+        # `qwen4_exp` drops its own. The reason is not size (0.83 GiB) but the
+        # reader: `models::qwen_3::Model::a3b` declares `tower: None`, so the
+        # SKU this artifact has to land on opens no `vision_tower.*` plane at
+        # all. Carrying the tower would put a third of the artifact's names
+        # outside the census with nothing reading them, and the miniature is
+        # here to be a bijection with the text.
     ),
     "glm_moe_dsa": dict(
         layer_prefix="model.layers.",

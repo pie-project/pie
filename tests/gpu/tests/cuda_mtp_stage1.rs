@@ -5,9 +5,11 @@
 //! This is FUNCTIONAL cross-backend parity + an HONEST throughput number — NOT a
 //! claimed perf win (mac-master: MTP is a perf LOSS at K=1, tied 248K lm_head).
 //!
-//! K (native draft tokens) is `[model.engine.options].mtp_num_drafts` (clamp
-//! 0..32; K=0 disables the drafter = the non-spec baseline), which this suite
-//! picks from `PIE_MTP_DRAFT_TOKENS` as a harness parameter. Only the first
+//! K (native draft tokens) was `[model.engine.options].mtp_num_drafts` (clamp
+//! 0..32; K=0 disables the drafter = the non-spec baseline) until that key
+//! retired with the boot document; this suite still picks a K from
+//! `PIE_MTP_DRAFT_TOKENS` as a harness parameter, but it labels the run
+//! rather than reaching the engine. Only the first
 //! boot in a process succeeds, so spec vs non-spec is a CROSS-INVOCATION
 //! comparison (run twice, K=0 then K=2), NOT two boots in one process. Each run
 //! records `{k, tokens, elapsed}` to a temp file; the second run reads the first

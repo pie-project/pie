@@ -1861,11 +1861,15 @@ impl Windows {
     /// whole composition fit in one graph" asks for, plus the tests that diff
     /// it against [`covers_fire`](Windows::covers_fire).
     #[must_use]
-    pub fn covers_fire_shifted(&self, rows: u32, shifted: &[bool]) -> bool {
+    pub fn covers_fire_shifted(&self, rows: u32, shifted: &[bool], lane_shifted: &[bool]) -> bool {
         (0..self.of_region.len() as u32)
             .all(|region| {
-                self.admit_axes(region, model_ir::PerAxis::new([rows, 0]), shifted)
-                    == Admit::Captured
+                self.admit_axes(
+                    region,
+                    model_ir::PerAxis::new([rows, 0]),
+                    shifted,
+                    lane_shifted,
+                ) == Admit::Captured
             })
     }
 
@@ -2003,8 +2007,8 @@ impl Windows {
     /// the relationship `model_exec::fire::compose` has to `compose_axes`,
     /// kept on purpose, and it is the G4 invariant on this surface.
     #[must_use]
-    pub fn admits(&self, rows: u32, shifted: &[bool]) -> Vec<Admit> {
-        self.admits_axes(model_ir::PerAxis::new([rows, 0]), shifted)
+    pub fn admits(&self, rows: u32, shifted: &[bool], lane_shifted: &[bool]) -> Vec<Admit> {
+        self.admits_axes(model_ir::PerAxis::new([rows, 0]), shifted, lane_shifted)
     }
 
     /// **THE SAME TABLE FOR AN ARTIFACT WITH TWO ROW AXES** — [`admits`](Windows::admits)
@@ -2081,9 +2085,10 @@ impl Windows {
         &self,
         totals: model_ir::PerAxis<u32>,
         shifted: &[bool],
+        lane_shifted: &[bool],
     ) -> Vec<Admit> {
         (0..self.of_region.len() as u32)
-            .map(|region| self.admit_axes(region, totals, shifted))
+            .map(|region| self.admit_axes(region, totals, shifted, lane_shifted))
             .collect()
     }
 
@@ -2110,15 +2115,52 @@ impl Windows {
     /// region counts, so a third rectangle is one more element at the two
     /// call sites rather than a third arm here.
     #[must_use]
-    fn admit_axes(&self, region: u32, totals: model_ir::PerAxis<u32>, shifted: &[bool]) -> Admit {
+    fn admit_axes(
+        &self,
+        region: u32,
+        totals: model_ir::PerAxis<u32>,
+        shifted: &[bool],
+        lane_shifted: &[bool],
+    ) -> Admit {
         let moves = shifted.get(region as usize).copied().unwrap_or(false);
+        // **AND THE SAME QUESTION ONE AXIS OVER** (`crate::LANE_SHIFTED`).
+        // A region index this slice does not hold reads as `false`, which
+        // refuses — `regions_shifting`'s own reason, and the safe direction
+        // on the axis where being wrong reads another lane's state.
+        let finds_its_lane = lane_shifted.get(region as usize).copied().unwrap_or(false);
         let total = totals[self.axis_of(region)];
         let held = (0..self.runs(region)).all(|run| {
             let window = self.at(region, run);
             let span = window.span();
             span.rows == 0
                 || (window.is_interval()
-                    && (moves || (span.row_offset == 0 && span.rows >= total)))
+                    && (moves || (span.row_offset == 0 && span.rows >= total))
+                    // **THE LANE AXIS'S OWN CLAUSE, AND IT IS ASKED OF EVERY
+                    // RUN FOR THE ROW CLAUSES' REASON.** `crate::SHIFTED`
+                    // speaks for ROWS and says so; nothing spoke for lanes,
+                    // and a region admitted here on the row clauses alone is
+                    // handed the PLANE's base by `Run::cut` and then reads
+                    // its per-lane tables off pointers this shell advanced by
+                    // `lane_offset` — `Run::pool`'s page bounds and last-page
+                    // fills, `Run::recurrent`'s slot map and fold predicate
+                    // and commit length, and `Run::cut`'s own lane column.
+                    // A body BAKES those, and `lane_offset` is the sum of the
+                    // LANES of the classes in front of this window, which a
+                    // `record::BodyKey` deliberately does not fix (it fixes
+                    // the sum of their row RUNGS, which is a bound on that
+                    // number and not that number). So a capture taken at one
+                    // split replays at another and the launch reads ANOTHER
+                    // LANE's state — silently, with no fault and no shape
+                    // error, which is the shape of the bug this clause exists
+                    // to refuse.
+                    //
+                    // **AND A WINDOW THAT BEGINS AT LANE ZERO ASKS NOTHING OF
+                    // IT.** There the sliced reading and the absolute one are
+                    // the same address, so every whole-fire region and the
+                    // FIRST class of every split is admitted exactly as it
+                    // was; what pays is a later class of a mixed fire whose
+                    // ops did not earn the lane axis, and it pays one island.
+                    && (span.lane_offset == 0 || finds_its_lane))
         });
         if held { Admit::Captured } else { Admit::Island }
     }
@@ -2136,18 +2178,22 @@ impl Windows {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admit {
     /// **A GRAPH MAY HOLD IT.** Every run of this region either has no rows
-    /// at all, or is a window the staged `(count, start)` seat can speak for:
-    /// it IS the whole fire, or its every op reads the seat's start
-    /// (`crate::SHIFTED`) and the launch takes the plane's base. A capture of
-    /// such a region is replayable at every split of its key, because the
-    /// only thing that moves between two fires of one key is what the seat
-    /// says.
+    /// at all, or is a window the staged seat can speak for: it IS the whole
+    /// fire, or its every op reads the seat's start (`crate::SHIFTED`) and the
+    /// launch takes the plane's base — AND, where the window begins above the
+    /// fire's lane zero, its every op finds its own lane as well
+    /// (`crate::LANE_SHIFTED`). A capture of such a region is replayable at
+    /// every split of its key, because the only thing that moves between two
+    /// fires of one key is what the seat says.
     Captured,
     /// **IT HAS TO BE RE-ISSUED, EVERY FIRE.** Some run of this region is not
     /// an interval — [`WindowShape`] enumerates the two ways and argues both
     /// — or is windowed without every op reading the seat's start (so its
     /// launch wants a pre-shifted pointer, which is a fire's address and not
-    /// a key's).
+    /// a key's), or begins above the fire's LANE zero holding an op whose
+    /// per-lane tables this shell hands over sliced (so its launch wants a
+    /// pointer advanced by a number the key does not fix, which is the same
+    /// complaint one axis over).
     ///
     /// **AND "RE-ISSUED" IS THE WHOLE OF WHAT IT COSTS.** The region walks
     /// eagerly between the execs around it, at this fire's own live geometry
@@ -3604,19 +3650,19 @@ mod tests {
         // admissible is now a question about region 1's OPS.
         let split = windows(&[vec![plain(0, 10)], vec![plain(10, 3)]]);
         assert!(
-            split.covers_fire_shifted(13, &[true, true]),
+            split.covers_fire_shifted(13, &[true, true], &[]),
             "both regions move their own base off the seat's start",
         );
         assert!(
-            !split.covers_fire_shifted(13, &[true, false]),
+            !split.covers_fire_shifted(13, &[true, false], &[]),
             "region 1 is windowed and reads only the seat's count",
         );
         // A short slice is not a licence: region 0 covers the fire on the
         // narrow clauses and region 1 is windowed with no flag to stand on.
         let tail = windows(&[vec![plain(0, 13)], vec![plain(10, 3)]]);
-        assert!(tail.covers_fire_shifted(13, &[false, true]));
+        assert!(tail.covers_fire_shifted(13, &[false, true], &[]));
         assert!(
-            !tail.covers_fire_shifted(13, &[]),
+            !tail.covers_fire_shifted(13, &[], &[]),
             "a region past the end of the slice is not shifting",
         );
 
@@ -3624,13 +3670,13 @@ mod tests {
         // agrees with it wherever nothing is windowed.
         let whole = windows(&[vec![plain(0, 13)], vec![plain(0, 13)], vec![plain(0, 0)]]);
         assert!(!split.covers_fire(13), "the narrow reading still refuses it");
-        assert!(whole.covers_fire_shifted(13, &[false, false, false]));
+        assert!(whole.covers_fire_shifted(13, &[false, false, false], &[]));
 
         // A region with no rows is exempt whatever its ops read: there is no
         // window for a seat word to be wrong about.
         let absent = windows(&[vec![plain(0, 13)], vec![plain(0, 0)]]);
         assert!(
-            absent.covers_fire_shifted(13, &[false, false]),
+            absent.covers_fire_shifted(13, &[false, false], &[]),
             "the absent region is not asked",
         );
     }
@@ -3641,19 +3687,19 @@ mod tests {
     fn a_gathered_or_grouped_region_is_refused_however_its_ops_address() {
         let gathered = windows(&[vec![compacted(0, 13)]]);
         assert!(
-            !gathered.covers_fire_shifted(13, &[true]),
+            !gathered.covers_fire_shifted(13, &[true], &[]),
             "a compacted rectangle is its own plane; no offset into the fire names its rows",
         );
-        assert!(!gathered.covers_fire_shifted(13, &[false]));
+        assert!(!gathered.covers_fire_shifted(13, &[false], &[]));
 
         let mut segmented = plain(0, 13);
         segmented.segments_host = vec![0, 3, 8, 5];
         let grouped = windows(&[vec![segmented]]);
         assert!(
-            !grouped.covers_fire_shifted(13, &[true]),
+            !grouped.covers_fire_shifted(13, &[true], &[]),
             "a union of intervals is not an interval, whatever the start says",
         );
-        assert!(!grouped.covers_fire_shifted(13, &[false]));
+        assert!(!grouped.covers_fire_shifted(13, &[false], &[]));
     }
 
     /// **THE TABLE, AND THE BOOL IS ITS COLLAPSE** (the tier-2 campaign).
@@ -3676,20 +3722,20 @@ mod tests {
 
         // Everything shifting: a body holds the whole composition, and the
         // collapsed reading says so.
-        let whole = table.admits(13, &[true, true, true]);
+        let whole = table.admits(13, &[true, true, true], &[]);
         assert!(whole.iter().all(|admit| *admit == Admit::Captured));
-        assert!(table.covers_fire_shifted(13, &[true, true, true]));
+        assert!(table.covers_fire_shifted(13, &[true, true, true], &[]));
 
         // Take the shift away from the WINDOWED region and exactly one entry
         // moves. The collapsed reading refuses — which is what it is for — and
         // the table is what says the refusal costs one region.
-        let crippled = table.admits(13, &[true, false, true]);
+        let crippled = table.admits(13, &[true, false, true], &[]);
         assert_eq!(
             crippled,
             vec![Admit::Captured, Admit::Island, Admit::Captured],
             "one region lost its shift and the table blamed somebody else",
         );
-        assert!(!table.covers_fire_shifted(13, &[true, false, true]));
+        assert!(!table.covers_fire_shifted(13, &[true, false, true], &[]));
 
         // And an EMPTY region is capturable whatever its ops read, which is
         // what keeps a region no composition demands from splitting one
@@ -3700,8 +3746,58 @@ mod tests {
         // the shape clauses are waived for nobody.
         let gathered = windows(&[vec![plain(0, 10)], vec![compacted(10, 3)]]);
         assert_eq!(
-            gathered.admits(13, &[true, true]),
+            gathered.admits(13, &[true, true], &[]),
             vec![Admit::Captured, Admit::Island],
+        );
+    }
+
+    /// [`plain`]'s window moved off the fire's LANE zero — every other field
+    /// unchanged, because only `lane_offset` is under test.
+    fn at_lane(row_offset: u32, rows: u32, lane_offset: u32) -> Window {
+        let mut window = plain(row_offset, rows);
+        window.spans[model_ir::RowAxis::PRIMARY].lane_offset = lane_offset;
+        window
+    }
+
+    /// **THE LANE AXIS'S OWN CLAUSE** — the defect the width-invariance gate
+    /// found and the reason [`crate::LANE_SHIFTED`] exists.
+    ///
+    /// A mixed fire's second class begins above the fire's lane zero, and the
+    /// launches in its window are handed per-lane tables this shell already
+    /// advanced by `lane_offset` — a pointer a body BAKES against a number the
+    /// key does not fix. Shifting on the ROW axis does not answer that, and
+    /// until this clause the table spent it as though it did.
+    #[test]
+    fn a_region_that_begins_above_lane_zero_needs_the_lane_axis_too() {
+        // Region 0 is the first class, region 1 the second: same rows, and
+        // the only difference between them is where their lanes start.
+        let table = windows(&[vec![at_lane(0, 10, 0)], vec![at_lane(10, 3, 2)]]);
+
+        // Row-shifting alone used to admit both, and that is the bug: the
+        // second region's baked `base + 2 * stride` is right for the fire
+        // that recorded it and wrong for every other split of its key.
+        assert_eq!(
+            table.admits(13, &[true, true], &[false, false]),
+            vec![Admit::Captured, Admit::Island],
+            "a region above lane zero whose ops do not find their own lane \
+             must be re-issued, not replayed",
+        );
+
+        // Say the second region's ops DO find their own lane and it is
+        // captured again — which is what keeps chunk 2c-b's windowed FA2
+        // class replaying.
+        assert_eq!(
+            table.admits(13, &[true, true], &[false, true]),
+            vec![Admit::Captured, Admit::Captured],
+        );
+
+        // And a region at lane zero never asks: its sliced reading and its
+        // absolute one are the same address, so the empty slice — every entry
+        // `false` — costs it nothing.
+        let first = windows(&[vec![at_lane(0, 10, 0)], vec![at_lane(10, 3, 0)]]);
+        assert_eq!(
+            first.admits(13, &[true, true], &[]),
+            vec![Admit::Captured, Admit::Captured],
         );
     }
 

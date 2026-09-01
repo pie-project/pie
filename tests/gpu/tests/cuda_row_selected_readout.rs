@@ -257,7 +257,8 @@ fn a_lane_reads_back_the_interior_rows_it_names_in_the_order_it_names_them() {
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    let mut engine = open::cuda(b"[model]\ndevice = \"cuda:0\"\n").expect("the cuda seam opens");
+    let mut engine =
+        open::cuda(runtime::engine::backend::DeviceBoot::default()).expect("the cuda seam opens");
     let budgets = Budgets {
         max_lanes: 4,
         max_tokens: 256,
@@ -349,7 +350,8 @@ fn a_lane_reads_back_the_interior_rows_it_names_in_the_order_it_names_them() {
     let text = tokenizer.decode(&[argmax(row(2))], false);
     eprintln!("row {} continues: {text:?}", n - 1);
     assert_eq!(
-        text, EXPECTED,
+        text,
+        EXPECTED,
         "the greedy continuation of {PROMPT:?} off row {} was {text:?}",
         n - 1
     );
@@ -464,9 +466,7 @@ fn a_lane_reads_back_the_interior_rows_it_names_in_the_order_it_names_them() {
             "three rows in, three tokens out for {named:?}"
         );
         for (at, &want_row) in named.iter().enumerate() {
-            let mirrored = argmax(
-                &mirror.values[at * vocab as usize..(at + 1) * vocab as usize],
-            );
+            let mirrored = argmax(&mirror.values[at * vocab as usize..(at + 1) * vocab as usize]);
             assert_eq!(
                 device[at], mirrored,
                 "readout {named:?} (consecutive={consecutive}): at position {at} — row \

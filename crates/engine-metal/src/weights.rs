@@ -126,11 +126,17 @@ use std::path::Path;
 // beside `parse_metadata` would say nothing about which of the two doors
 // this line opened.
 use checkpoint::file::read::parse_metadata;
+use checkpoint::file::Metadata;
 use checkpoint::file::serve;
 use checkpoint::file::zt;
-use checkpoint::contract::ModelContract;
+use checkpoint::contract::{ModelContract, TensorContract};
 use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
+// The warm arm's reader (§M-2, the CUDA node's): `Artifact::open` maps and
+// hashes nothing, `spans` answers where every plane LIES, and `part` is the
+// published bytes at that place — which is what the offsets are checked
+// against before a handle names one.
+use checkpoint::file::serve::Artifact;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 // The `pie.serving/1` vocabulary, consumed and never re-spelled: `Stamp::of`
 // is the constructor that fills the four policy fields from the profile's own
@@ -142,8 +148,9 @@ use model_ir::{Dtype, ParamSource, Trace};
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
-use crate::experts::{Attachments, Plan, Tier};
+use crate::experts::{Attachments, Plan, Source, Tier};
 use crate::host_source::HostSource;
+use crate::mapping::Mapping;
 use crate::run::{WeightRow, WeightTable};
 
 /// What a matrix operand wants, and what a Metal buffer's own base is already
@@ -175,7 +182,31 @@ pub struct AdapterPlane<'a> {
 /// banks'.
 #[derive(Debug)]
 pub struct Weights {
+    /// **The WRITABLE reservation**, and what it holds depends on which arm
+    /// landed this load.
+    ///
+    /// A cold load's is the whole store: every plane, at [`places`]'s
+    /// offsets, copied in by [`Landing`]. A WARM load's holds only what this
+    /// shell WRITES, because the checkpoint's planes are views onto
+    /// [`Weights::mapped`] and that is `PROT_READ`. Three things are written:
+    /// an adapter bank (`register_adapter`, between fires), a residue plane
+    /// the load computes rather than reads, and — since §M-6 — a streamed
+    /// band's `slots` expert SEATS, which the tier rewrites at every segment
+    /// cut. A full-residency load that declares no bank gets a zero-length
+    /// reservation, which allocates nothing.
+    ///
+    /// Either way [`Bank::offset`] is an offset INTO THIS BUFFER, which is
+    /// what lets `register_adapter` stay one sentence.
     store: Buffer,
+    /// **The artifact itself, mapped and bound whole** — `Some` for a warm
+    /// load and `None` for every cold one (`crate::mapping`).
+    ///
+    /// The one reservation a warm load makes over the checkpoint, and it
+    /// costs no copy: the weight rows are handles into THIS, at the byte
+    /// offsets the serving manifest states, so the pages fault out of the
+    /// file straight into the frames the kernel reads. It is held for the
+    /// load's whole life because every weight row names it.
+    mapped: Option<Buffer>,
     table: WeightTable,
     /// **The routed-expert tier, opened only for a streamed load**
     /// (`crate::experts`): the host band table, the wired slabs, and the seat
@@ -246,12 +277,25 @@ pub struct BankSeat {
 /// adapter's slot is everything after it. `A` and `B` are two independent
 /// banks here — the op pairs them, this module does not, and a registration
 /// names each by the name the plan gave it.
-fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
+///
+/// `seat` answers where a bank's first slot sits in the WRITABLE reservation,
+/// which is the one thing the two load arms do not agree on: a cold load's
+/// store holds every plane and a bank is at its [`Place::offset`], while a
+/// warm load's holds the banks alone and packs them in declaration order. It
+/// is a parameter rather than a branch here because everything else about a
+/// bank — capacity, slot, rectangle, element — is the param's own and is read
+/// the same way on both roads.
+fn banks(
+    trace: &Trace,
+    places: &[Place],
+    seat: impl Fn(usize) -> u64,
+) -> BTreeMap<String, Bank> {
     trace.params
         .iter()
         .zip(places)
-        .filter(|(param, _)| param.source == ParamSource::Registered)
-        .map(|(param, place)| {
+        .enumerate()
+        .filter(|(_, (param, _))| param.source == ParamSource::Registered)
+        .map(|(at, (param, place))| {
             let adapters =
                 u32::try_from(param.shape.first().copied().unwrap_or(0)).unwrap_or(u32::MAX);
             // The DECLARED plane, not the reserved one: an adapter bank is
@@ -270,7 +314,7 @@ fn banks(trace: &Trace, places: &[Place]) -> BTreeMap<String, Bank> {
             (
                 param.name.clone(),
                 Bank {
-                    offset: place.offset,
+                    offset: seat(at),
                     adapters,
                     slot,
                     rows,
@@ -360,15 +404,66 @@ impl Weights {
         let landing = compile(&metadata, contract, target.clone())?;
 
         let places = places(trace, plan)?;
-        let total = places.last().map_or(0, |p| p.offset + p.reserved);
-        let mut store = Buffer::zeroed(device, total)?;
-
         let index: BTreeMap<&str, usize> = trace
             .params
             .iter()
             .enumerate()
             .map(|(at, param)| (param.name.as_str(), at))
             .collect();
+        // **READ BEFORE EITHER ARM, BECAUSE BOTH ARMS SEAT THE SAME BANKS.**
+        // A quantized weight is three `Trace::params` rows and one
+        // `WeightRow::Planes`, and which three is a fact about the compiled
+        // LOAD PLAN rather than about where the bytes came from — so the
+        // warm arm reads it here rather than growing a second opinion about
+        // what a bank is. It costs the compile above and no bytes at all.
+        let pairings = pairings(&landing, &index)?;
+
+        // ── **THE WARM ARM** (§M-5), and it is tried before anything is
+        //    reserved. A serving artifact whose stamp already agreed (the
+        //    line above) holds every plane LANDED — `pie model import` ran
+        //    this same contract through this same compile and wrote the
+        //    results — so there is nothing left to transform and the whole
+        //    of a load is: map the file once, and mint one handle per param
+        //    at the offset the serving manifest states. No store
+        //    reservation, no host staging, no executor, no copy.
+        //
+        //    **ANY MISS FALLS BACK TO THE COLD PATH AND SAYS WHY.** The warm
+        //    arm serves a file it can serve WHOLE — every plane resolved, at
+        //    the length the plan predicted, in one unsharded payload — and
+        //    a half-warm load is not a thing this returns. So the failure
+        //    is a sentence and not a fault: a raw snapshot, an ordinary
+        //    `.zt`, a streamed plan and a plane the artifact does not carry
+        //    are all ordinary loads, and the operator reads which one it was.
+        match warm(
+            device,
+            handles,
+            trace,
+            contract,
+            &metadata,
+            snapshot,
+            target.clone(),
+            path,
+            plan,
+            &places,
+            &pairings,
+        ) {
+            Ok(weights) => return Ok(weights),
+            // `None` is a checkpoint that never claimed to be a serving
+            // artifact — a snapshot directory, an ordinary `.zt` — and is the
+            // road every load in this tree took before the profile existed.
+            // Saying "loads cold" about one would put a line on every gate in
+            // the suite that means nothing. `Some` is a file that DID claim
+            // it, and could not be served whole: that is the surprising one,
+            // and it says which fact it turned on.
+            Err(None) => {}
+            Err(Some(why)) => {
+                eprintln!("engine-metal: {} loads cold — {why}", path.display());
+            }
+        }
+
+        let total = places.last().map_or(0, |p| p.offset + p.reserved);
+        let mut store = Buffer::zeroed(device, total)?;
+
         // The host band table, sized off the plan and empty for a
         // full-residency load — where a streamed band's bytes go instead of
         // into the store.
@@ -446,8 +541,6 @@ impl Weights {
             landed
         };
 
-        let pairings = pairings(&landing, &index)?;
-
         let mut table = Vec::with_capacity(places.len());
         for (at, place) in places.iter().enumerate() {
             // A REGISTERED PLANE IS ONE THE CHECKPOINT DOES NOT HAVE, and
@@ -491,15 +584,36 @@ impl Weights {
             .streams()
             .then(|| {
                 let offsets: Vec<u64> = places.iter().map(|place| place.offset).collect();
-                Tier::open(plan, &store, host, &offsets).map(RefCell::new)
+                Tier::open(plan, &store, Source::landed(plan, host), &offsets).map(RefCell::new)
             })
             .transpose()?;
         Ok(Weights {
             store,
+            mapped: None,
             table: WeightTable(table),
             tier,
-            banks: banks(trace, &places),
+            banks: banks(trace, &places, |at| places[at].offset),
         })
+    }
+
+    /// **Did this load MAP its checkpoint instead of reading it?** — what
+    /// `LoadFacts::weights_from_cache` publishes, and the one observable
+    /// that separates the two arms after the fact.
+    ///
+    /// `true` is a warm load: the checkpoint was MAPPED and not read, and
+    /// every plane it carries is served off its own pages. On a full-residency
+    /// load that is every weight row, a view, and no weight byte copied at
+    /// all. On a STREAMED one (§M-6) it is every dense plane the same way,
+    /// plus routed bands whose seats the tier fills by copying experts out of
+    /// that same mapping — bounded by the budget, and never the second
+    /// staging file the cold path would have written.
+    ///
+    /// `false` is every other load in this tree — a raw snapshot, an ordinary
+    /// `.zt`, or a serving artifact the warm arm could not serve whole and
+    /// said so on the way past.
+    #[must_use]
+    pub fn warm(&self) -> bool {
+        self.mapped.is_some()
     }
 
     /// **The routed-expert tier this load opened, or `None` for a
@@ -637,10 +751,18 @@ impl Weights {
         &self.table
     }
 
-    /// Every byte the store holds.
+    /// Every byte this load's weight reservations hold.
+    ///
+    /// A cold load's is the store. A WARM load's is the mapped artifact plus
+    /// whatever the banks took — and the artifact's number is the FILE's, so
+    /// it carries the manifest and the footer beside the planes. That is the
+    /// honest reading of "what this load holds": the reservation really is
+    /// the whole file, the few hundred kilobytes past the payload really are
+    /// bound, and rounding them out would be reporting a buffer that was
+    /// never minted.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.store.bytes()
+        self.store.bytes() + self.mapped.as_ref().map_or(0, Buffer::bytes)
     }
 }
 
@@ -1153,6 +1275,680 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
         .collect()
 }
 
+/// Where one param's bytes are, once the warm arm has resolved them.
+///
+/// Two seats and not one because a warm load has two reservations, and the
+/// split is not arbitrary: the artifact is `PROT_READ`, and the two things a
+/// warm load still WRITES — an adapter bank, and a plane the plan computes
+/// rather than reads — cannot live in it.
+#[derive(Debug, Clone, Copy)]
+enum Seat {
+    /// A view onto the mapped artifact, at the offset its serving manifest
+    /// states. Every plane the file holds as stored, which is the whole model
+    /// but for a handful.
+    Artifact(u64),
+    /// A slot of the small writable reservation, at the offset the warm arm
+    /// packed it to: an adapter bank, or a residue plane the landing below
+    /// computes.
+    Store(u64),
+}
+
+/// **How much of a plane the offset probe compares.**
+///
+/// The head and the tail, and not the middle: a manifest offset that is
+/// wrong is wrong by a whole blob — the two candidate readings of a
+/// container's `offset` differ by a header, and every plane in the file
+/// would shift by it — so what a probe has to catch is a shift, and the
+/// first and last bytes of every plane catch one. Reading the whole payload
+/// to compare it against itself would be the copy this arm exists to
+/// remove.
+const PROBE: usize = 32;
+
+/// **THE WARM ARM: serve the artifact off its own mapped pages** (§M-5).
+///
+/// The payoff of the hot-format arc on this plane. `pie model import` wrote
+/// every plane of this trace, under this trace's own names, in landed form —
+/// so a load whose stamp already agreed has nothing left to compute, and the
+/// cold path's whole apparatus (a store reservation the size of the model, a
+/// host arena the size of the image, an executor walking every tensor, and a
+/// `memcpy` per plane into pages the GPU was about to wire anyway) is
+/// answering a question that was answered at import time.
+///
+/// What replaces it is two calls and a loop: [`Mapping::of`] over the file,
+/// [`Buffer::mapped`] over the mapping, and one [`Handles::bind`] per param
+/// at the offset [`Artifact::spans`] states. **No weight byte is read by this
+/// process at all** — the pages fault out of the file when a kernel touches
+/// them, into the frames it reads.
+///
+/// # ONE MAPPING WITH PLANE VIEWS, AND NOT "THE MAPPING IS THE STORE"
+///
+/// The tempting shape is to make the artifact's payload BE the store: bind
+/// it whole and let [`places`]'s offsets address it. It does not hold, and
+/// the reason is worth stating because it is not a defect of either side.
+/// [`places`] lays the store out in `Trace::params` order at [`ALIGN`], from
+/// zero, with no file header in front of it; the artifact lays its payload
+/// out in the SERVING order (hotness-ranked, `checkpoint::serving::sequence`)
+/// at the writer's own alignment, after a manifest. The two are different
+/// layouts of the same set of planes on purpose — one is a device store and
+/// the other is a read order — and a shell that demanded they coincide would
+/// be forbidding the artifact from being ranked.
+///
+/// So the mapping is bound ONCE and the plan's layout is not used at all on
+/// this road: a weight row is a handle into the file at the file's own
+/// offset. That works here and would not work on the CUDA plane, because
+/// this shell's `Tensor` is an index into [`Handles`] — a buffer AND an
+/// offset — where its sibling's is a bare address into one slab. The handle
+/// table is what makes "one reservation, many views at arbitrary offsets"
+/// cost nothing.
+///
+/// **AND IT IS WHY THE PADDING TRAP IS NOT THIS ARM'S.** A reader that
+/// SCATTERS a serving artifact into buffers of its own owes the inter-plane
+/// gaps a zeroing — the block tables tile a part's decoded size, so a
+/// per-plane read writes the published length and no more, and a gap in a
+/// destination nothing zeroed holds whatever the allocator left there. This
+/// arm scatters nothing: the gaps it binds around are the FILE's own bytes,
+/// which the profile makes a spec `0x00`, and no reservation of this load's
+/// covers a byte the artifact does not. `serving::padded_spans` and
+/// `Artifact::span` are the copying arm's tools and are deliberately not
+/// reached for here.
+///
+/// **THE OFFSETS ARE 256-ALIGNED BY THE PROFILE, AND IT IS CHECKED.**
+/// `pie.serving/1` floors every blob offset at 4096 and `pie model import`
+/// writes at 2 MiB; both are multiples of [`ALIGN`], which is what a matrix
+/// operand on this device wants. A file whose recovered
+/// [`alignment`](checkpoint::serving::alignment) is not is refused into the
+/// cold path rather than bound at an offset a kernel would read slowly or
+/// wrongly.
+///
+/// # The banks are the one thing that cannot be a view
+///
+/// A mapped reservation is `PROT_READ` and `register_adapter` WRITES, so a
+/// `ParamSource::Registered` bank served off the mapping would fault the
+/// process at the first registration. It is also not IN the artifact —
+/// `Stamp::adapters_zeroed` says as much, and the cold path already reserves
+/// registered planes without landing them — so the warm arm gives the banks
+/// a writable reservation of their own, holding them and nothing else, and
+/// [`banks`] seats them in it. A plan that declares none asks for zero bytes
+/// and gets a reservation that allocates nothing.
+///
+/// # The residue, because an artifact does not hold EVERY plane
+///
+/// `pie model import` promotes the transforms it can pay for once and copies
+/// the rest through under the source file's own names, so a trace's planes
+/// land in the artifact in three shapes and this arm reads all three:
+///
+/// * **Landed under the plan's name** — the whole model, bound where it lies.
+/// * **Stored under the checkpoint's name**, when the contract reads it whole
+///   (`Expr::Src` and nothing around it). Same bind, different key.
+/// * **Not there at all**, when the load COMPUTES it. Eighteen planes of the
+///   four-bit 0.8B are `Cast(Src(A_log), F32)`, because the import narrowed
+///   the source on the way past and the model text declares f32 — a few
+///   hundred bytes that a mapping cannot answer for. Those get a seat in the
+///   writable reservation and a landing of their own: a contract of the
+///   residue ALONE, compiled and run, reading what it names and nothing else.
+///
+/// **AND THE RESIDUE HAS A CEILING**, checked before anything is reserved. A
+/// "warm" load that landed a third of the model the cold way would be a
+/// slower cold load wearing the word; a sixteenth of what the file stores is
+/// the bar, and on this SKU the residue is five parts in a million.
+///
+/// # What it refuses, and it refuses rather than half-serves
+///
+/// Every answer here is for the caller to fall back on, never a [`Fault`]:
+/// nothing this function declines is an error, because the cold path serves
+/// all of it. `None` is a checkpoint that never claimed to be a serving
+/// artifact — a snapshot DIRECTORY, an ordinary `.zt` — which is every load
+/// this tree ran before the profile existed and is not worth a line.
+/// `Some(why)` is a file that DID claim it: a sharded payload (this shell maps
+/// one file), an alignment the device would not want, a plane at a length the
+/// plan does not predict, a residue over the ceiling or one that does not
+/// land, or a routed band the plan streams and the artifact does not carry.
+///
+/// # The streamed arm (§M-6)
+///
+/// A streamed plan used to be the first refusal here, on the fits-in-memory
+/// rule, and it is not one any more — the rule is about what the DEVICE
+/// reads, and a streamed band is not read by the device off the mapping. It
+/// gets `slots` seats in the writable reservation, exactly as the cold path
+/// gives it, and [`Tier`] copies experts into them out of the artifact's own
+/// pages instead of out of a staging file the cold path would have written
+/// first. Two tables come out of the resolution pass instead of one: the
+/// SEATS, which are this arm's own packing of the writable store, and the
+/// per-band SOURCE offsets, which are the artifact's. `Source::artifact`
+/// carries the second, and its header argues why there is no base.
+///
+/// **AND IT RESOLVES EVERY PLANE BEFORE IT BINDS ONE.** A warm attempt that
+/// minted rows and then gave up would leave the handle table holding views
+/// no weight row names, below the load's own seal. So the resolution is a
+/// pass of its own, over the manifest alone, and the device is not touched
+/// until the whole model is known to be servable.
+///
+/// # The probe, and what it is for
+///
+/// `spans` reports a blob's offset out of the manifest and [`Artifact::part`]
+/// hands back that blob's bytes out of the artifact's own mapping. This
+/// function uses the FIRST to address the SECOND's bytes through a mapping of
+/// its own, and those are two readings of one number that nothing in the type
+/// system pairs. A wrong pairing does not crash: it binds every plane shifted
+/// by a constant, and this shell answers finite, deterministic nonsense —
+/// which is the exact failure §M-4c's stamp gate exists to prevent from the
+/// other direction. So the two readings are checked against each other, per
+/// plane, at [`PROBE`] bytes of head and tail, and a disagreement falls back
+/// rather than serving. It costs one page fault per plane in a mapping that
+/// shares this one's page cache.
+// Eleven, and every one of them is a fact the caller already computed: the
+// two reservations' device, the handle table, the trace, the contract, the
+// checkpoint's metadata and directory, the storage target, the path, the
+// residency plan, the store layout and the bank pairings. Bundling them into
+// a struct would be inventing a type whose only reader is this function and
+// whose only writer is its one caller.
+#[allow(clippy::too_many_arguments)]
+fn warm(
+    device: &Context,
+    handles: &Handles,
+    trace: &Trace,
+    contract: &ModelContract,
+    metadata: &Metadata,
+    snapshot: &Path,
+    target: StorageTarget,
+    path: &Path,
+    plan: &Plan,
+    places: &[Place],
+    pairings: &BTreeMap<&str, Pairing>,
+) -> std::result::Result<Weights, Option<String>> {
+    // A snapshot directory is a set of source files and not one container, so
+    // there is nothing to map. Asked first, because `Artifact::open` on one
+    // refuses for a reason that has nothing to do with serving.
+    if path.is_dir() {
+        return Err(None);
+    }
+    // **THE FITS-IN-MEMORY RULE, AND WHAT IT IS ACTUALLY ABOUT** (§M-6). A
+    // GPU-touched `StorageModeShared` page wires and the pager takes none of
+    // it back (`crate::mapping`'s header carries the measurement), so a load
+    // that BOUND an over-budget artifact whole and fired it would convert the
+    // whole model into wired memory — the swap-death `crate::experts`'
+    // streaming tier exists to avoid.
+    //
+    // The rule is about what the DEVICE READS, and it was enforced here as a
+    // refusal of the whole warm arm because the two halves had not been put
+    // together yet. They compose exactly: a streamed plan's routed bands are
+    // not bound off the mapping at all — they get seats in the writable
+    // reservation and the tier copies experts into them — and a seat copy is
+    // a `memcpy` the CPU does, out of pages nothing wires. What is left bound
+    // to the mapped buffer is the DENSE floor, which is the term the budget
+    // admitted as resident in the first place, plus band pages no weight row
+    // names and no kernel addresses.
+    //
+    // So a warm streamed load's wired set is the same one its cold twin had —
+    // dense planes plus `slots` seats — and what it stops paying is the copy.
+    // An ordinary checkpoint refuses here, and SILENTLY: it carries no
+    // `pie.serving/1` block, so it is not a file that failed to be an
+    // artifact — it is a file that never said it was one.
+    let artifact = Artifact::open(path).map_err(|_| None)?;
+    let spans = artifact.spans();
+    // The alignment the writer used, recovered off the offsets themselves —
+    // the profile stores none, on the rule that it is observable.
+    let align = serving::alignment(&spans);
+    if align == 0 || !align.is_multiple_of(ALIGN) {
+        return Err(Some(format!(
+            "its serving offsets are aligned to {align} and a matrix operand on this \
+             device wants {ALIGN}"
+        )));
+    }
+    // Every plane of the payload, by the name a `Trace::param` calls it.
+    // `data` is the only part a serving object has — the writer declares one
+    // per object and a split bank is two OBJECTS, not two parts — and a
+    // sharded blob is one this shell has no second mapping for.
+    let mut at: BTreeMap<&str, &serving::Span<'_>> = BTreeMap::new();
+    for span in &spans {
+        if span.part != "data" {
+            continue;
+        }
+        if span.shard.is_some() {
+            return Err(Some(format!(
+                "its plane `{}` lives in shard {:?} and this arm maps the one containing \
+                 file",
+                span.object,
+                span.shard.unwrap_or_default(),
+            )));
+        }
+        at.insert(span.object, span);
+    }
+
+    // **THE PLANES THE ARTIFACT KEEPS UNDER THE CHECKPOINT'S OWN NAME.**
+    //
+    // An artifact does NOT hold every plane of the trace under the trace's
+    // spelling, and the reason is written down in `models::qwen_3::import`:
+    // `pie model import` promotes the transforms it can PAY FOR ONCE, and a
+    // plane whose chain states no transform at all is not one of them — it is
+    // copied through, under the name the source file gave it, because
+    // renaming it would be work with nothing to amortize. On the four-bit
+    // 0.8B that is 36 of 562: `linear_attn.A_log` and `linear_attn.dt_bias`
+    // per gated-delta layer, stored at exactly the width this text declares.
+    //
+    // So a name miss is not the end of the lookup, and answering it is one
+    // question asked of the CONTRACT: **is this plane a verbatim read of a
+    // stored object?** `Expr::Src(name)` and nothing around it is precisely
+    // that sentence — no cast, no slice, no concat, no decode — so the bytes
+    // under `name` ARE the plane, and a view over them is the same view the
+    // landed spelling would have got. Every other expression is a plane this
+    // load would have to COMPUTE, and there is nothing in a mapping to
+    // compute it from: those fall back, whole.
+    //
+    // Read off the contract rather than off the compiled plan on purpose.
+    // The plan says how the bytes MOVE — an allocate, a bulk write, a
+    // finalize — and recovering "this was a whole verbatim blob" from three
+    // instructions is an analysis that can be wrong quietly. The contract
+    // says what the plane IS, in one node, and the width check below is what
+    // holds it to that.
+    let verbatim: BTreeMap<&str, &str> = contract
+        .tensors
+        .iter()
+        .filter_map(|tensor| match &tensor.expr {
+            checkpoint::contract::Expr::Src(from) => {
+                Some((tensor.name.as_str(), from.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // ── the resolution pass: every param seated, or none.
+    let mut seats = Vec::with_capacity(places.len());
+    let mut objects: Vec<&str> = Vec::with_capacity(places.len());
+    let mut landed: Vec<TensorContract> = Vec::new();
+    let mut store_bytes = 0u64;
+    let mut residue_bytes = 0u64;
+    // **WHERE EVERY PLANE THIS ARM READS OUT OF THE FILE LIES**, param-indexed
+    // — the resident ones AND the streamed bands, which is what lets the probe
+    // below check one rule over both. `stored` is their declared bytes, the
+    // denominator the residue ceiling is a sixteenth of: a streamed band is
+    // read from the artifact exactly as a resident plane is, one expert at a
+    // time instead of all at once, so leaving it out would make a mixture
+    // model look like a load that reads almost nothing warm.
+    let mut from_file: Vec<Option<u64>> = vec![None; places.len()];
+    // `param index -> offset of expert 0`, for the streamed bands alone:
+    // `Source::artifact`'s whole argument, and the translation from the host
+    // table's packed layout to the artifact's ranked one.
+    let mut bands: BTreeMap<usize, u64> = BTreeMap::new();
+    let mut stored = 0u64;
+    for (index, param) in trace.params.iter().enumerate() {
+        let place = &places[index];
+        // A REGISTERED PLANE IS ONE THE ARTIFACT DOES NOT HAVE, by the same
+        // rule the cold path states: it is declared by the model text,
+        // reserved at capacity, and zero until something registers into it.
+        if param.source == ParamSource::Registered {
+            seats.push(Seat::Store(store_bytes));
+            objects.push(param.name.as_str());
+            store_bytes += place.reserved;
+            continue;
+        }
+        // The plane's own name first, and the name it is stored under second
+        // — see `verbatim`.
+        let object = at
+            .get(param.name.as_str())
+            .map(|_| param.name.as_str())
+            .or_else(|| {
+                verbatim
+                    .get(param.name.as_str())
+                    .copied()
+                    .filter(|from| at.contains_key(from))
+            });
+        let Some(object) = object else {
+            // **THE RESIDUE**, and it is landed rather than refused. A plane
+            // the artifact holds in neither form is one this load COMPUTES —
+            // `layer.N.a_log` on the four-bit 0.8B is `Cast(Src(A_log), F32)`,
+            // because the import narrowed the source to bf16 on the way past
+            // and the model text declares f32 — and there is nothing in a
+            // mapping to compute it from. Refusing the whole model over it
+            // would be spending a gigabyte of copy on eighteen planes of a
+            // hundred bytes. So it gets a seat in the writable reservation and
+            // a landing of its own, below; what keeps that honest is the
+            // ceiling this function checks afterwards, which is what makes
+            // "warm" still mean warm.
+            // **AND A STREAMED BAND IS NEVER A RESIDUE.** The residue is
+            // landed into the writable reservation at its DECLARED size, and
+            // a streamed band's seat there is `slots` experts wide — so
+            // landing one would write a whole bank into a slab-sized hole.
+            // It is also the wrong trade by an order of magnitude: a residue
+            // is a few hundred bytes and a band is the model. The cold path
+            // is the honest answer.
+            if place.streamed {
+                return Err(Some(format!(
+                    "its routed band `{}` is a plane this load streams and the artifact \
+                     carries in no form — a band is seated `slots` experts wide and \
+                     cannot be landed whole into that seat",
+                    param.name,
+                )));
+            }
+            let Some(residue_of) = residue_of(contract, &param.name) else {
+                return Err(Some(format!(
+                    "it carries no plane `{}` and this contract declares none — the \
+                     artifact and the trace were not written from each other",
+                    param.name,
+                )));
+            };
+            landed.push(residue_of);
+            seats.push(Seat::Store(store_bytes));
+            objects.push(param.name.as_str());
+            store_bytes += place.reserved;
+            residue_bytes += place.full;
+            continue;
+        };
+        let span = &at[object];
+        // The plan's own width check, kept, and it is the DECLARED width on
+        // both roads: `full` is what the checkpoint publishes and what the
+        // landing sink checked an arriving tensor against, so it is what the
+        // artifact's blob has to be. `bytes` is what the STORE reserves, and
+        // the two part company for exactly one shape — a streamed band, whose
+        // seat is `slots` experts of a bank the file holds whole. So the
+        // second half of this check is asked of the resident planes alone.
+        if span.length != place.full || (!place.streamed && place.bytes != place.full) {
+            return Err(Some(format!(
+                "its plane `{}` (stored as `{object}`) is {} bytes and this plan declares \
+                 {}",
+                param.name, span.length, place.full,
+            )));
+        }
+        from_file[index] = Some(span.offset);
+        stored += place.full;
+        objects.push(object);
+        if place.streamed {
+            // ── **THE STREAMED BAND, AND THE ONE PLACE THE TWO HALVES MEET.**
+            //    Its bytes are IN the artifact, at `span.offset`, whole and in
+            //    landed form — `pie model import` ran this same contract. What
+            //    it does NOT get is a view: a band's `Tensor` is `slots` seats
+            //    in the WRITABLE reservation, because the tier writes experts
+            //    into it between segments and the mapping is `PROT_READ`.
+            //
+            //    So the plane is resolved twice, into two different tables. The
+            //    seat below is the DESTINATION side, laid out here beside the
+            //    banks and the residue; `bands` is the SOURCE side, the offset
+            //    the artifact states, which is what `Source::artifact` hands
+            //    the tier in place of the host table the cold path would have
+            //    staged and this arm never writes.
+            bands.insert(index, span.offset);
+            seats.push(Seat::Store(store_bytes));
+            store_bytes += place.reserved;
+            continue;
+        }
+        seats.push(Seat::Artifact(span.offset));
+    }
+
+    // **AND THE RESIDUE HAS A CEILING, WHICH IS WHAT KEEPS `warm` HONEST.**
+    // The arm's whole claim is that a load stops reading the model, and a
+    // "warm" load that landed a third of it the old way would be a slower
+    // cold load wearing the word. The bar is a sixteenth of what the file
+    // stores: an artifact whose residue is that large is not one this
+    // deployment's import produced from this contract, and the cold path is
+    // the honest answer for it. On the four-bit 0.8B the residue is 18 planes
+    // of `v_heads` floats against 411 MiB — five parts in a million.
+    if residue_bytes.saturating_mul(16) > stored {
+        return Err(Some(format!(
+            "{} of its {} plane(s) are ones this load computes rather than reads — {} \
+             bytes against {stored} stored, which is not a warm load with a residue but \
+             a cold load with a mapping",
+            landed.len(),
+            places.len(),
+            residue_bytes,
+        )));
+    }
+
+    // ── the mapping, and the probe that says the offsets are the file's.
+    let map = Mapping::of(path).map_err(|why| Some(why.to_string()))?;
+    for (index, param) in trace.params.iter().enumerate() {
+        // Every plane this arm reads OUT OF THE FILE, which is the resident
+        // ones bound where they lie and the streamed bands the tier will copy
+        // experts out of. The rule is the same for both — a manifest offset
+        // and the container's own published bytes are two readings of one
+        // number — and a band read at a shifted offset is the worse failure of
+        // the two, because it is re-read at every segment cut.
+        let Some(offset) = from_file[index] else {
+            continue;
+        };
+        let length = places[index].full;
+        let from = usize::try_from(offset).unwrap_or(usize::MAX);
+        let upto = usize::try_from(offset.saturating_add(length)).unwrap_or(usize::MAX);
+        let mine = map.get(from..upto).ok_or_else(|| {
+            Some(format!(
+                "its plane `{}` lies at {offset}..{upto} and the file holds {} bytes",
+                param.name,
+                map.len(),
+            ))
+        })?;
+        let published = artifact
+            .part(objects[index], "data")
+            .map_err(|why| {
+                Some(format!(
+                    "its plane `{}` has no zero-copy view ({why})",
+                    param.name
+                ))
+            })?;
+        let ends = |bytes: &[u8]| {
+            let head = bytes.get(..PROBE.min(bytes.len())).unwrap_or_default().to_vec();
+            let tail = bytes
+                .get(bytes.len().saturating_sub(PROBE)..)
+                .unwrap_or_default()
+                .to_vec();
+            (head, tail)
+        };
+        if published.len() != mine.len() || ends(published) != ends(mine) {
+            return Err(Some(format!(
+                "its manifest puts `{}` at {offset} and the bytes there are not the ones \
+                 the container publishes for it — two readings of one offset that do not \
+                 agree, so nothing here binds either",
+                param.name,
+            )));
+        }
+    }
+
+    // ── the two reservations, and the residue landed into the small one.
+    let mut store = Buffer::zeroed(device, store_bytes).map_err(|why| Some(why.to_string()))?;
+    if !landed.is_empty() {
+        let into: BTreeMap<&str, (u64, u64)> = trace
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(index, param)| match seats[index] {
+                Seat::Store(offset) if param.source != ParamSource::Registered => {
+                    Some((param.name.as_str(), (offset, places[index].full)))
+                }
+                _ => None,
+            })
+            .collect();
+        // A contract of the residue ALONE, compiled and run on its own. The
+        // executor reads what this plan names and nothing else, so the whole
+        // of it is eighteen tensors of a few hundred bytes — against a load
+        // whose other five hundred planes were bound where they lie.
+        let only = ModelContract {
+            alignment: contract.alignment,
+            tensors: landed,
+            // Emptied deliberately: a group is an interchangeable SET
+            // (`crate::experts`' subject), and `residue_of` admits only a
+            // leaf that names no other entry — so a residue plane is never a
+            // member of one, and carrying the declarations would be carrying
+            // tensors this plan does not land.
+            groups: Vec::new(),
+        };
+        let plan = compile(metadata, &only, target).map_err(|why| {
+            Some(format!(
+                "the {} plane(s) it does not store do not compile ({why})",
+                only.tensors.len(),
+            ))
+        })?;
+        let mut scratch = vec![0u8; usize::try_from(plan.memory.arena_bytes()).unwrap_or(0)];
+        let mut backing: &mut [u8] = &mut scratch;
+        let mut sink = Residue {
+            store: &mut store,
+            into: &into,
+            landed: 0,
+        };
+        Execution::new(&plan, snapshot)
+            .arena(&mut backing)
+            .sink(&mut sink)
+            .run()
+            .map_err(|why| Some(format!("the plane(s) it does not store do not land ({why})")))?;
+        if sink.landed != only.tensors.len() {
+            return Err(Some(format!(
+                "the residue landing published {} of {} plane(s)",
+                sink.landed,
+                only.tensors.len(),
+            )));
+        }
+    }
+    let file = Buffer::mapped(device, std::sync::Arc::clone(&map)).map_err(|why| Some(why.to_string()))?;
+    let row = |index: usize| -> std::result::Result<Tensor, Option<String>> {
+        let place = &places[index];
+        let handle = match seats[index] {
+            Seat::Artifact(offset) => handles.bind(&file, offset, place.bytes),
+            Seat::Store(offset) => handles.bind(&store, offset, place.bytes),
+        }
+        .map_err(|why| Some(format!("`{}` does not bind ({why})", trace.params[index].name)))?;
+        Ok(Tensor::new(handle, place.rows, place.width, place.dtype))
+    };
+    let mut table = Vec::with_capacity(places.len());
+    for (index, param) in trace.params.iter().enumerate() {
+        table.push(Some(match pairings.get(param.name.as_str()) {
+            Some(pairing) => WeightRow::Planes(kernels_metal::Bank {
+                codes: row(index)?,
+                scales: row(pairing.scales)?,
+                biases: pairing.biases.map(row).transpose()?,
+                group: pairing.group,
+                bits: pairing.bits,
+            }),
+            None => WeightRow::Dense(row(index)?),
+        }));
+    }
+    // The banks' seats are the WRITABLE reservation's, which on this road is
+    // a buffer of banks alone — see `banks`.
+    let seated: Vec<u64> = seats
+        .iter()
+        .map(|seat| match seat {
+            Seat::Store(offset) | Seat::Artifact(offset) => *offset,
+        })
+        .collect();
+    // ── **THE TIER, OVER THE ARTIFACT ITSELF** (§M-6).
+    //
+    //    The cold path opens one after its landing, at the instant where the
+    //    staging file is full and no command buffer has been committed. This
+    //    arm has the same instant and none of the staging: the bands' bytes
+    //    were already on this machine, in landed form, before the process
+    //    started. So the source is `Arc::clone(&map)` — the SAME mapping the
+    //    resident planes are bound through, not a second one and not a second
+    //    file — and the offsets are `bands`, straight out of the manifest.
+    //
+    //    `seated` is the destination side, and it is this arm's own packing
+    //    rather than `places`': a warm store holds the banks, the residue and
+    //    the seats and nothing else, so a band's seat is where THIS function
+    //    put it. `Tier::open` takes the two tables independently for exactly
+    //    that reason.
+    //
+    //    The identity prefix it copies in is the load's only weight-byte
+    //    movement, and it is bounded by the budget: `slots` experts per band,
+    //    into seats the store already reserved.
+    let tier = plan
+        .streams()
+        .then(|| {
+            Tier::open(
+                plan,
+                &store,
+                Source::artifact(std::sync::Arc::clone(&map), bands),
+                &seated,
+            )
+            .map(RefCell::new)
+        })
+        .transpose()
+        .map_err(|why| Some(format!("its routed tier does not open ({why})")))?;
+    Ok(Weights {
+        store,
+        mapped: Some(file),
+        table: WeightTable(table),
+        tier,
+        banks: banks(trace, places, |at| seated[at]),
+    })
+}
+
+/// **CAN THE WARM ARM LAND THIS PLANE ON ITS OWN?** — the residue rule.
+///
+/// A plane the artifact holds in no form is one the load COMPUTES, and the
+/// warm arm answers it by compiling a contract of exactly those planes and
+/// running it (see `warm`). That only works for an entry that is
+/// SELF-CONTAINED, and this is where that word is checked:
+///
+/// * **It names no other entry.** [`Expr::Out`] is a reference to a tensor
+///   some other [`TensorContract`] produces, so an entry that carries one is
+///   the top of a chain whose other links are not in the residue — and
+///   pulling them in transitively would be reconstructing the whole contract
+///   one edge at a time, which is the cold path with extra steps.
+/// * **It is paired with nothing.** A quantized plane's scales and zero
+///   points are two more entries and one [`QuantAttachment`], and a residue
+///   that landed a bank without them would seat a `WeightRow::Planes` whose
+///   other two rows are views onto an artifact that never held this bank.
+///   Nothing in this tree produces such a residue — the planes that reach
+///   here are dense casts of a narrowed source — and the day one does, the
+///   cold path is the right answer rather than a partial pairing.
+///
+/// `None` for an entry the contract does not declare at all, which is a
+/// contract and a trace that were not written from each other and is refused
+/// by the caller in those words.
+///
+/// [`QuantAttachment`]: checkpoint::plan::QuantAttachment
+/// [`Expr::Out`]: checkpoint::contract::Expr::Out
+fn residue_of(contract: &ModelContract, name: &str) -> Option<TensorContract> {
+    let entry = contract.tensors.iter().find(|it| it.name == name)?;
+    if entry.scales.is_some() || entry.zero_points.is_some() {
+        return None;
+    }
+    let mut names_another = false;
+    entry.expr.visit(&mut |node| {
+        if matches!(node, checkpoint::contract::Expr::Out(_)) {
+            names_another = true;
+        }
+    });
+    (!names_another).then(|| entry.clone())
+}
+
+/// The sink the residue landing publishes into: the small writable
+/// reservation, at the offsets the warm arm packed its planes to.
+///
+/// [`Landing`]'s sibling and deliberately not a mode of it. That one answers
+/// three questions at once — the store, the host band table, and which of the
+/// two a param's residency plan sends it to — and none of them arise here: a
+/// warm load never streams, and every plane this sink is handed is one it
+/// reserved a seat for by name. What the two DO share is the width check,
+/// because a plane that lands at the wrong width is a model that computes.
+struct Residue<'a> {
+    store: &'a mut Buffer,
+    /// Published name -> (offset in the store, the bytes the plan declares).
+    into: &'a BTreeMap<&'a str, (u64, u64)>,
+    /// How many planes actually arrived, which the caller compares against
+    /// how many it asked for: a contract that published nothing would
+    /// otherwise leave a zeroed plane behind and no sentence about it.
+    landed: usize,
+}
+
+impl TensorSink for Residue<'_> {
+    fn publish(&mut self, name: &str, bytes: &[u8]) -> std::result::Result<(), LoadError> {
+        let Some((offset, full)) = self.into.get(name).copied() else {
+            // Not a refusal: a contract entry may compute an internal tensor
+            // the trace does not name, and the caller counts what it asked
+            // for rather than what came past.
+            return Ok(());
+        };
+        if bytes.len() as u64 != full {
+            return Err(LoadError::Contract(format!(
+                "`{name}` lands {} bytes and the plan declares {full} — a plane read at \
+                 the wrong width is a model that computes",
+                bytes.len(),
+            )));
+        }
+        self.store
+            .write(offset, bytes)
+            .map_err(|fault| LoadError::Internal(fault.to_string()))?;
+        self.landed += 1;
+        Ok(())
+    }
+}
+
 /// The store's layout, decided before a byte is read.
 ///
 /// STATED AHEAD, NOT ACCUMULATED, so that the length the checkpoint publishes
@@ -1274,9 +2070,67 @@ impl TensorSink for Landing<'_> {
 
 #[cfg(test)]
 mod tests {
+    use checkpoint::contract::Expr;
+    use checkpoint::types::{DType, Encoding};
     use model_ir::Platform;
 
     use super::*;
+
+    /// **THE RESIDUE RULE, PINNED.** The warm arm lands a plane the artifact
+    /// holds in no form by compiling a contract of exactly that plane — which
+    /// only works for an entry that names nothing else, so this is the line
+    /// between "a leaf this arm can run on its own" and "the top of a chain
+    /// whose other links are not here".
+    #[test]
+    fn the_residue_is_a_leaf_and_a_chain_is_not() {
+        let entry = |name: &str, expr: Expr| TensorContract {
+            name: name.to_string(),
+            expr,
+            shape: None,
+            encoding: Encoding::Raw(DType::F32),
+            scales: None,
+            zero_points: None,
+            visibility: Default::default(),
+        };
+        let contract = ModelContract {
+            alignment: 256,
+            tensors: vec![
+                // A cast of one stored tensor: exactly the `a_log` shape, and
+                // the whole reason the residue path exists.
+                entry(
+                    "leaf",
+                    Expr::Cast {
+                        src: Box::new(Expr::Src("stored".into())),
+                        to: Encoding::Raw(DType::F32),
+                    },
+                ),
+                // The top of a chain. Landing it alone would run a plan whose
+                // other link this contract slice does not carry.
+                entry(
+                    "chained",
+                    Expr::Cast {
+                        src: Box::new(Expr::Out("leaf".into())),
+                        to: Encoding::Raw(DType::F32),
+                    },
+                ),
+            ],
+            groups: Vec::new(),
+        };
+
+        assert!(
+            residue_of(&contract, "leaf").is_some(),
+            "a cast of one stored tensor is a plane this arm can land by itself"
+        );
+        assert!(
+            residue_of(&contract, "chained").is_none(),
+            "an entry that names another entry is a chain, and the cold path is what \
+             runs chains"
+        );
+        assert!(
+            residue_of(&contract, "nowhere").is_none(),
+            "a plane the contract does not declare is not a residue at all"
+        );
+    }
 
     #[test]
     fn the_store_is_laid_out_aligned_disjoint_and_in_plan_order() {

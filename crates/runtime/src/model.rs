@@ -314,6 +314,24 @@ pub const ROWS: &[Row] = &[
         vocab: 248_320,
         arch: "qwen3_5",
     },
+    // The `mini-l5-e16-k8` carve of that same artifact: five of its forty
+    // layers, its vocabulary whole.
+    Row {
+        id: "qwen36-35b-a3b-mini-mlxu4-kv-bf16",
+        layers: 5,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
+    // And its `mini-l5-e64-k8` twin, which differs from the row above only in
+    // the routed bank's width — a fact this table does not carry, so the two
+    // rows read identically here and that is correct: depth, vocabulary and
+    // arch are what a front-end dispatches on, and the carves share all three.
+    Row {
+        id: "qwen36-35b-a3b-mini64-mlxu4-kv-bf16",
+        layers: 5,
+        vocab: 248_320,
+        arch: "qwen3_5",
+    },
     Row {
         id: "qwen35-d0.8b-mlxu4-kv-bf16",
         layers: 24,

@@ -542,37 +542,112 @@ struct Dims {
 
 impl Model {
     pub fn a3b(w: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(
-            w,
-            kv,
-            tp,
-            Dims {
-                hidden: 2048,
-                layers: 40,
-                attn_every: 4,
-                q_heads: 16,
-                kv_heads: 2,
-                head_dim: 256,
-                rotary_dim: 64,
-                theta: 10_000_000.0,
-                k_heads: 16,
-                v_heads: 32,
-                k_dim: 128,
-                v_dim: 128,
-                conv_kernel: 4,
-                mlp: MlpDims::Routed(MoeDims {
-                    experts: 256,
-                    top_k: 8,
-                    inter: 512,
-                    shared_inter: 512,
-                }),
-                vocab: 248_320,
-                tied: false,
-                norm_eps: 1e-6,
-                tower: None,
-                draft: None,
-            },
-        )
+        Model::new(w, kv, tp, Model::a3b_dims())
+    }
+
+    /// The shipped A3B geometry, factored out so the miniature below can move
+    /// the two numbers it moves and nothing else.
+    fn a3b_dims() -> Dims {
+        Dims {
+            hidden: 2048,
+            layers: 40,
+            attn_every: 4,
+            q_heads: 16,
+            kv_heads: 2,
+            head_dim: 256,
+            rotary_dim: 64,
+            theta: 10_000_000.0,
+            k_heads: 16,
+            v_heads: 32,
+            k_dim: 128,
+            v_dim: 128,
+            conv_kernel: 4,
+            mlp: MlpDims::Routed(MoeDims {
+                experts: 256,
+                top_k: 8,
+                inter: 512,
+                shared_inter: 512,
+            }),
+            vocab: 248_320,
+            tied: false,
+            norm_eps: 1e-6,
+            tower: None,
+            draft: None,
+        }
+    }
+
+    /// **THE WIDTH-INVARIANCE FIXTURE'S ROW** — `mini-l5-e16-k8`, the snapshot
+    /// `benches/shrink_checkpoint.py --family qwen3_5_moe_mlx` carves out of
+    /// `mlx-community/Qwen3.6-35B-A3B-4bit`.
+    ///
+    /// It is a catalog row, unlike `a3b_micro`: a real checkpoint ships it and
+    /// `identify` has to land on it, which is the whole point — the CUDA node
+    /// gates its tiled `Linear::Matmul` and `LmHead` on this artifact, and a
+    /// gate reads a file only if a SKU claims it.
+    ///
+    /// **TWO NUMBERS MOVE, AND ONLY TWO.** Depth goes to five and the routed
+    /// bank to sixteen. Everything else is `a3b_dims()` verbatim, and that is
+    /// the fixture's substance rather than an economy: the fault under test is
+    /// accumulation ORDER over K, so `hidden`, the expert `inter`, the whole
+    /// attention block that computes the router's input, and `vocab` — the
+    /// other tiled entry, and where the delta is finally read — all keep
+    /// production width. Halving any of them halves the partial sums and can
+    /// hide the thing the artifact exists to expose.
+    ///
+    /// `top_k` stays 8 against 16 experts because the failure needs a
+    /// CONTESTED tail: several experts whose logits sit within a ulp of each
+    /// other, so a ulp moved by the tiled projection changes which expert a
+    /// token takes. 8-of-8 is not a choice at all, and 8-of-256 spreads the
+    /// gaps wider than a ulp can cross.
+    ///
+    /// See [`Model::a3b_mini64`] for the sharper vehicle at the same five
+    /// layers; this row does not move, because it is the one the CUDA gate is
+    /// already standing on.
+    pub fn a3b_mini(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::a3b_mini_dims(16))
+    }
+
+    /// **THE SAME FIXTURE WITH A CROWDED TAIL** — `mini-l5-e64-k8`, carved by
+    /// the same one command with `--experts 64`.
+    ///
+    /// This row exists because the 16-expert carve did its job and then stopped
+    /// short of the last claim. Run on the CUDA node it reproduced the tiled
+    /// path's fault structure exactly — the routed delta came out at 0.078 —
+    /// but 0.078 crossed no expert boundary: at 8-of-16 the gap between the
+    /// eighth and ninth logit is wider than the perturbation, so the routing
+    /// decision never actually changed and the gate measured a numeric delta
+    /// rather than a behavioural one.
+    ///
+    /// Sixty-four is the same bet [`Model::a3b_mini`]'s doc makes, taken one
+    /// notch further along the axis it names. Top-k stays 8, so the tail the
+    /// router has to break ties in goes from eight rejected experts to
+    /// fifty-six, and the eighth-to-ninth gap contracts with it — a ulp now has
+    /// somewhere to cross. It is still short of the shipped 256, whose gaps the
+    /// original doc calls wider than a ulp can cross, and short of it
+    /// deliberately: the artifact has to stay a fixture (a few gibibytes, one
+    /// download) rather than become the model.
+    ///
+    /// **AND ONLY THE BANK MOVES BETWEEN THE TWO ROWS.** Both are
+    /// `a3b_mini_dims`, so depth, `hidden`, the expert `inter`, the attention
+    /// block that computes the router's input and `vocab` are production width
+    /// in both — which is what lets a difference between the two gates' verdicts
+    /// be read as the bank's crowding and nothing else.
+    pub fn a3b_mini64(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::a3b_mini_dims(64))
+    }
+
+    /// The miniature's geometry, with the one number the two rows disagree on
+    /// passed in. Everything else is [`Model::a3b_dims`] verbatim, and the two
+    /// public rows above are thin on purpose: a fixture whose contraction could
+    /// drift between its own two widths would be measuring the drift.
+    fn a3b_mini_dims(experts: u32) -> Dims {
+        let mut d = Model::a3b_dims();
+        d.layers = 5;
+        let MlpDims::Routed(moe) = &mut d.mlp else {
+            unreachable!("the a3b dims carry a routed MLP")
+        };
+        moe.experts = experts;
+        d
     }
 
     /// **A ROUTED MoE THIS FAMILY'S SHAPE, SMALL ENOUGH TO HOLD TWICE** — the

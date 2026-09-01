@@ -79,7 +79,8 @@ impl Shell {
     /// and that is not this method's claim to make: `Windows::admits` argues
     /// it clause by clause — gathered is `fallback::copies`' bucket-keyed
     /// answer, a segment list is the artifact's, the interval clauses are the
-    /// present set's, `shifted` is read once at load. A key therefore has ONE
+    /// present set's, and `shifted` and `lane_shifted` are both read once at
+    /// load. A key therefore has ONE
     /// table for the life of the load, which is exactly what a body captured
     /// at that key replays: `record::Graphs::fire_body` still `debug_assert`s
     /// its island list on every hit, and what that now compares is the
@@ -171,7 +172,7 @@ impl Shell {
                 admits.as_ref()
                     == record::widen(
                         &self.compiled,
-                        &windows.admits_axes(totals, &self.shifted)
+                        &windows.admits_axes(totals, &self.shifted, &self.lane_shifted)
                     ),
                 "the admissibility table for {key} is not what this key derived \
                  before, so `Windows::admits` has grown an input the key does \
@@ -185,7 +186,7 @@ impl Shell {
         let admits: std::sync::Arc<[crate::window::Admit]> =
             record::widen(
                 &self.compiled,
-                &windows.admits_axes(totals, &self.shifted),
+                &windows.admits_axes(totals, &self.shifted, &self.lane_shifted),
             )
             .into();
         // **AND THE MAP IS BOUNDED, ON `record::Graphs::body_warm`'S OWN

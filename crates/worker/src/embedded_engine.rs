@@ -2,17 +2,17 @@
 //!
 //! This module exposes:
 //!   * [`EngineCapabilities`] — typed engine capability payloads.
-//!   * [`write_cuda_startup_toml`] — emits the per-launch TOML the one hosted
-//!     engine reads at creation. Its Metal, Vulkan and wgpu counterparts stood
-//!     beside it and left with the engines that read them.
+//!   * `device_boot` — maps the operator's options onto the cuda shell's own
+//!     [`DeviceBoot`], which crosses the seam as a struct. The per-launch
+//!     bootstrap TOML it replaced is gone with the file round-trip.
 //!   * [`create_engine_backend`] — build a runtime-owned [`::runtime::engine::EngineBox`]
 //!     plus its caps before `::runtime::bootstrap`.
 
+use std::path::Path;
+// `PathBuf` appears only in cuda-gated signatures (`prepare_weight_artifact`,
+// `device_boot`), so the import is gated as they are.
 #[cfg(feature = "_engine-cuda")]
-use std::ffi::CStr;
-#[cfg(feature = "_engine-cuda")]
-use std::os::raw::{c_char, c_int};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // `Context` is NOT cuda-gated, though it was: `register_operator_adapters`
 // reads its plane files and registers them on every build, so a gate that
@@ -20,15 +20,13 @@ use std::path::{Path, PathBuf};
 // builds the lib with `cfg(test)` false) unable to resolve `with_context`.
 use anyhow::{Context, Result, anyhow};
 
+#[cfg(feature = "_engine-cuda")]
+use ::runtime::engine::backend::{DeviceBoot, Graphs, Knobs, ordinal_of};
+
+#[cfg(any(feature = "_engine-cuda", test))]
+use crate::config::CudaNativeEngineOptions;
 #[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
 use crate::config::MetalEngineOptions;
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-#[cfg(any(feature = "_engine-cuda", test))]
-use crate::config::{CudaMemoryProfile, CudaNativeEngineOptions};
 use crate::engine_ffi::Flavor;
 
 // THE TWO LINK ANCHORS ARE GONE WITH THE C++ THEY SERVED.
@@ -43,36 +41,11 @@ use crate::engine_ffi::Flavor;
 // through their own types, and there is nothing on the far side of an FFI
 // boundary to keep alive.
 
-#[cfg(feature = "_engine-cuda")]
-#[repr(C)]
-struct NcclUniqueId {
-    internal: [u8; 128],
-}
-
-#[cfg(feature = "_engine-cuda")]
-unsafe extern "C" {
-    fn ncclGetUniqueId(unique_id: *mut NcclUniqueId) -> c_int;
-    fn ncclGetErrorString(result: c_int) -> *const c_char;
-}
-
-#[cfg(feature = "_engine-cuda")]
-fn nccl_unique_id_hex() -> Result<String> {
-    let mut id = NcclUniqueId { internal: [0; 128] };
-    let rc = unsafe { ncclGetUniqueId(&mut id as *mut NcclUniqueId) };
-    if rc != 0 {
-        let msg = unsafe { CStr::from_ptr(ncclGetErrorString(rc)) }
-            .to_string_lossy()
-            .into_owned();
-        return Err(anyhow!("ncclGetUniqueId: {msg}"));
-    }
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(id.internal.len() * 2);
-    for b in id.internal {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    Ok(out)
-}
+// THE NCCL UNIQUE-ID MINT STOOD HERE — an `extern "C"` pair
+// (`ncclGetUniqueId`, `ncclGetErrorString`), the only NCCL symbols in the
+// workspace, minting the id a TP group rendezvoused on. Its one consumer was
+// the boot TOML's `[distributed]` table, which no engine read; both left with
+// the file, and `build.rs` lost its `-lnccl` with them.
 
 /// Per-flavor engine options, passed to native-engine creation helpers so the
 /// caller doesn't have to discriminate on `EngineKind` in two places.
@@ -114,101 +87,10 @@ impl EngineOptions {
     }
 }
 
-/// Read only by the startup-TOML writers and the state-dir path, which are
-/// linked only when a real engine is. With no engine feature the descriptor is
-/// still THREADED (`create_engine_backend` takes `Option<&TpLaunch>` in every
-/// build) but never inspected -- so the allow is scoped to exactly that build,
-/// and a field that dies under an engine build is still caught.
-///
-#[cfg_attr(
-    not(any(feature = "_engine-cuda", test)),
-    allow(dead_code, reason = "read by the cfg-gated TOML writers")
-)]
-#[derive(Clone)]
-pub(crate) struct TpLaunch {
-    size: usize,
-    rank: usize,
-    nccl_unique_id_hex: String,
-}
-
-#[cfg(feature = "_engine-cuda")]
-pub(crate) fn tp_launches(size: usize) -> Result<Vec<TpLaunch>> {
-    let nccl_unique_id_hex = nccl_unique_id_hex()?;
-    Ok((0..size)
-        .map(|rank| TpLaunch {
-            size,
-            rank,
-            nccl_unique_id_hex: nccl_unique_id_hex.clone(),
-        })
-        .collect())
-}
-
-/// This model's materialized-weight artifact directory, installed once before
-/// any engine is created and written into every bootstrap TOML from there.
-///
-/// Install-at-bootstrap rather than a parameter because the TOML writers sit
-/// five call layers below the only place holding a parsed `Config`. First
-/// writer wins, so a directory a live engine is already using cannot move.
-static WEIGHT_CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Install the resolved weight-artifact directory. The caller resolves the
-/// `$PIE_HOME/models` default, because `$PIE_HOME` is the bin/worker layer's
-/// to know and the engine has never been told it.
-pub fn set_weight_cache_dir(dir: String) {
-    let _ = WEIGHT_CACHE_DIR.set(dir);
-}
-
-/// Read back by `write_cuda_startup_toml`, which is the only thing that
-/// puts this on the wire -- so the reader is gated exactly as the writer is.
-#[cfg(any(feature = "_engine-cuda", test))]
-fn weight_cache_dir() -> String {
-    WEIGHT_CACHE_DIR.get().cloned().unwrap_or_default()
-}
-
-/// **THIS DEPLOYMENT'S SHARED-ADAPTER MOUNT**, installed once before any
-/// engine is created and written into every bootstrap TOML from there
-/// (alto adapter §3.3).
-///
-/// Install-at-bootstrap for the reason [`WEIGHT_CACHE_DIR`] gives: the TOML
-/// writers sit five call layers below the only place holding a parsed
-/// `Config`. There is no derivation beside it — an operator who stated no
-/// `[model] adapter_dir` mounted nothing, and the engines read an absent key
-/// as the feature off rather than as a directory to guess at.
-static ADAPTER_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Install the shared-adapter mount. First writer wins, so a mount a live
-/// engine is already serving cannot move.
-pub fn set_adapter_dir(dir: String) {
-    let _ = ADAPTER_DIR.set(dir);
-}
-
-/// Read back by the two startup-TOML writers, and gated as they are.
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn adapter_dir() -> String {
-    ADAPTER_DIR.get().cloned().unwrap_or_default()
-}
-
-/// Emit `[model] adapter_dir` into an engine's bootstrap TOML, or nothing.
-///
-/// **OMITTED WHEN UNSET RATHER THAN WRITTEN EMPTY**, because the engines read
-/// an empty string as the feature off anyway and a key nobody stated should
-/// not appear in the record of what the launch actually asked for.
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn insert_adapter_dir(model: &mut toml::Table) {
-    let dir = adapter_dir();
-    if dir.is_empty() {
-        return;
-    }
-    insert_str(model, "adapter_dir", dir);
-}
+// `TpLaunch` STOOD HERE. Its only real consumers were the boot TOML's
+// `[distributed]` table — written, read by no engine — and the launch state
+// dir's rank suffix; both are gone, and `open::cuda_group` still refuses a
+// multi-rank launch by name until `palo B-tp` builds one.
 
 /// **WHERE THIS DEPLOYMENT'S MATERIALIZED WEIGHTS GO, DECIDED ONCE.**
 ///
@@ -222,8 +104,8 @@ fn insert_adapter_dir(model: &mut toml::Table) {
 /// and one ABI version, rebuilt by a single cold load. Sharing a directory
 /// left `.weights` files sitting in a store that scans for `.zt`.
 ///
-/// **TWO CALLERS, ONE ANSWER** (§M wave M-1). `::runtime::boot` installs it
-/// before any engine bootstrap TOML is written, and `pie model import` reads
+/// **TWO CALLERS, ONE ANSWER** (§M wave M-1). The serving boot resolves it
+/// once and threads it into every `DeviceBoot`, and `pie model import` reads
 /// it to decide whether there is anywhere to prepare INTO. A second
 /// derivation would be a second chance for the two to disagree about where a
 /// hundred gigabytes live.
@@ -238,268 +120,13 @@ pub fn resolved_weight_cache_dir(cfg: &crate::config::Config) -> String {
     }
 }
 
-/// The root every engine-side disk cache derives from: `$PIE_HOME/cache`.
-///
-/// Location is convention, not configuration -- there is no config field for
-/// it, and `$PIE_HOME` is the one lever that moves it. Before this the engine
-/// caches derived from `$XDG_CACHE_HOME`/`$HOME/.cache` instead, not as a
-/// choice but because the engine had never been told `$PIE_HOME`. That split
-/// pie's state across two roots: `pie serve` wrote programs, logs and
-/// optimized checkpoints under one and compiled ETA, GEMM tuning and planner
-/// profiles under another.
-static CACHE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// Install the resolved cache root, before any engine is created. First writer
-/// wins, so a cache a live engine is already using cannot move.
-pub fn set_cache_dir(dir: String) {
-    let _ = CACHE_DIR.set(dir);
-}
-
-/// Gated as `write_cuda_startup_toml` is, like `weight_cache_dir` above and
-/// for the same reason: emitting a bootstrap TOML is all this and the nine
-/// helpers under it are for, and the one seam still emitting one is cuda's.
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn cache_dir() -> String {
-    CACHE_DIR.get().cloned().unwrap_or_default()
-}
-
-/// Emit `[cache] dir` into an engine's bootstrap TOML.
-///
-/// Omitted when unset so an engine launched with a hand-written TOML (its own
-/// `dev.toml`, say) keeps the XDG derivation rather than losing its cache to
-/// an empty path.
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn insert_cache_table(doc: &mut toml::Table) {
-    let dir = cache_dir();
-    if dir.is_empty() {
-        return;
-    }
-    let mut table = toml::Table::new();
-    insert_str(&mut table, "dir", dir);
-    insert_table(doc, "cache", table);
-}
-
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn insert_int(table: &mut toml::Table, key: &str, value: impl Into<i64>) {
-    table.insert(key.into(), toml::Value::Integer(value.into()));
-}
-
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn insert_str(table: &mut toml::Table, key: &str, value: impl Into<String>) {
-    table.insert(key.into(), toml::Value::String(value.into()));
-}
-
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn insert_bool(table: &mut toml::Table, key: &str, value: bool) {
-    table.insert(key.into(), toml::Value::Boolean(value));
-}
-
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn insert_table(doc: &mut toml::Table, key: &str, table: toml::Table) {
-    doc.insert(key.into(), toml::Value::Table(table));
-}
-
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn path_string(path: &Path) -> String {
-    path.display().to_string()
-}
-
-/// Writes the checkpoint's config beside the bootstrap TOML and names it in
-/// `[model]`.
-///
-/// Beside rather than inlined: the engine already takes a path, and opening a
-/// second one is less machinery than teaching TOML to carry a JSON document.
-///
-/// Unconditional. It was optional while a snapshot reached the engine without
-/// one and each engine parsed `config.json` itself; `weights.rs` lifts that
-/// case now, so there is one lifter and every boot writes this file. The type
-/// says so, which is what keeps the deleted branch from growing back.
-///
-/// Named `config` rather than `descriptor` because that is what it is. The
-/// old name meant a `pie.model/1` document — ~40 resolved fields, a schema, a
-/// reader in each engine — and that document is deleted. What travels here is
-/// the checkpoint's own `config.json`, verbatim, read for exactly one field.
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn write_config_beside(out_path: &Path, config: &[u8], model: &mut toml::Table) -> Result<()> {
-    let beside = out_path.with_file_name("model.config.json");
-    std::fs::write(&beside, config).with_context(|| format!("write model config {beside:?}"))?;
-    insert_str(model, "config", path_string(&beside));
-    Ok(())
-}
-
-/// Name the model in `[model] id`, when the operator named one.
-///
-/// # What crosses the boundary
-///
-/// A string, and a config path read for one field. The `pie.model/1`
-/// document that used to travel here is gone: the worker wrote a JSON
-/// blob of ~40 resolved fields, named its path here, and each engine
-/// parsed it back — `engine-cuda` through `model::descriptor` into an
-/// `HfConfig`, `engine-metal` through its OWN reader into its OWN
-/// `ModelFacts`, with its own defaulting rules. Two readers of one
-/// document, under two failure policies: the facts reader swallowed a
-/// missing field with a default, the descriptor reader refused. So the
-/// two sides could hold different beliefs about one checkpoint and
-/// neither would say anything.
-///
-/// An id cannot do that, because both engines link the same `const`
-/// table. A wrong id fails to resolve — at the door, with the nearest
-/// ids named — and a right one reaches a row that answers every question
-/// the same way on both sides, because it is the same row.
-///
-/// What still travels beside it is the checkpoint's own `config.json`,
-/// verbatim and unresolved, and an engine reads ONE field out of it —
-/// the declared quantization, which is the thing no row can state
-/// because the same model is published at four bits and at eight. It is
-/// not a second answer to "what is this model"; it is the answer to
-/// "how was this copy of it encoded", and the two cannot be confused
-/// because only one of them is a row.
-///
-/// # Why it is optional
-///
-/// Because the checkpoint can answer for itself. Absent an id, an engine
-/// matches the TENSORS against the catalog, which is the answer that
-/// does not depend on anyone having written anything down. The id is an
-/// OVERRIDE, for the case where a checkpoint is genuinely a known model
-/// under an unknown name — a fine-tune, a re-upload, a mirror that
-/// renamed the directory — and it does not skip the manifest check.
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn insert_model_id(model: &mut toml::Table, id: Option<&str>) {
-    if let Some(id) = id.filter(|s| !s.is_empty()) {
-        insert_str(model, "id", id);
-    }
-}
-
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple"),
-    test
-))]
-fn write_toml_table(out_path: &Path, doc: toml::Table) -> Result<()> {
-    let serialized = toml::to_string(&doc).map_err(|e| anyhow!("serialize bootstrap TOML: {e}"))?;
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("create bootstrap toml dir {parent:?}: {e}"))?;
-    }
-    std::fs::write(out_path, serialized)
-        .map_err(|e| anyhow!("write bootstrap toml {out_path:?}: {e}"))?;
-    Ok(())
-}
-
-/// Default per-launch state directory: `$PIE_HOME/standalone/<pid>/`.
-/// We use a per-pid subdir so concurrent invocations of `pie` (rare
-/// but legal — different ports) don't clobber each other's TOML or
-/// aux sockets.
-pub fn launch_state_dir() -> PathBuf {
-    launch_state_root().join(std::process::id().to_string())
-}
-
-/// Root of the per-launch state directories. Public so `state::entries` names
-/// the same path the sweep walks -- a listing that pointed elsewhere would
-/// report nothing and reclaim nothing.
-pub fn launch_state_root() -> PathBuf {
-    crate::paths::pie_home().join("standalone")
-}
-
-/// Whether a process id is still running.
-///
-/// `kill(pid, 0)` delivers no signal and only reports reachability: `Ok` means
-/// alive, `EPERM` means alive but not ours, `ESRCH` means gone. Anything other
-/// than a definite `ESRCH` is treated as alive, because the cost of the two
-/// mistakes is not symmetric — a stale directory is a few bytes, deleting a
-/// live launch's bootstrap TOML is an engine that cannot boot.
-#[cfg(unix)]
-fn pid_is_alive(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(not(unix))]
-fn pid_is_alive(_pid: u32) -> bool {
-    true
-}
-
-/// Remove `$PIE_HOME/standalone/<pid>` directories whose process is gone.
-///
-/// Each launch writes an engine bootstrap TOML under its own pid and nothing ever
-/// removed it, so every `pie serve` left a directory behind for the life of
-/// the machine. Sweeping at boot rather than only at shutdown is what makes it
-/// bounded: the leak's whole population is launches that did NOT exit cleanly.
-///
-/// Best-effort throughout. A directory that cannot be read or removed is left
-/// alone: this runs on the boot path and must never be the reason a start
-/// fails.
-pub fn sweep_stale_launch_state() {
-    let root = launch_state_root();
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return;
-    };
-    let self_pid = std::process::id();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
-            // Not a pid directory — not ours to reason about.
-            continue;
-        };
-        if pid == self_pid || pid_is_alive(pid) {
-            continue;
-        }
-        let path = entry.path();
-        if let Err(error) = std::fs::remove_dir_all(&path) {
-            tracing::debug!(?path, %error, "could not sweep stale launch state");
-        }
-    }
-}
-
-/// Remove this process's launch state directory. Called on clean shutdown; the
-/// boot sweep is what covers the unclean ones.
-pub fn remove_launch_state() {
-    let dir = launch_state_dir();
-    if let Err(error) = std::fs::remove_dir_all(&dir)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::debug!(?dir, %error, "could not remove launch state");
-    }
-}
+// THE CACHE-ROOT `OnceLock`, THE NINE TOML HELPERS AND THE LAUNCH-STATE
+// DIRECTORY STOOD HERE. `$PIE_HOME/cache` — the root every engine-side disk
+// cache derives from, convention rather than configuration — crosses as a
+// `DeviceBoot` field now instead of through a process global, and with no
+// per-launch TOML to write there is no `$PIE_HOME/standalone/<pid>` tree to
+// create, sweep at boot, or remove at shutdown. `state::engine_cache_dir`
+// is still the one spelling of the root.
 
 /// What a load answered about itself.
 ///
@@ -587,6 +214,89 @@ fn cuda_budgets(
     }
 }
 
+/// The cuda boot, as the shell's own type — `write_cuda_startup_toml`'s
+/// successor, and the spec of what actually crosses: the shell reads the
+/// device, the two cache directories and the `[engine]` knobs, and nothing
+/// else the old TOML carried was read by anything.
+///
+/// **ONLY WHAT THE OPERATOR STATED DEVIATES FROM THE SHELL'S OWN DEFAULTS.**
+/// The knob fields on [`CudaNativeEngineOptions`] are `Option`s for exactly
+/// this: an absent knob takes `Knobs::default()` — the ENGINE's answer —
+/// rather than a default this layer invented, so the two sides cannot hold
+/// different beliefs about what "unstated" means. `gpu_mem_utilization` is
+/// the one knob with no absence to express: the config type has already
+/// turned its absence into `0.90`, so it always crosses.
+///
+/// # Errors
+///
+/// A `[engine] graphs` spelling the shell does not speak — the config layer
+/// does not police that word, so this is the first and only refusal.
+#[cfg(feature = "_engine-cuda")]
+fn device_boot(
+    opts: &CudaNativeEngineOptions,
+    weight_cache_dir: &Path,
+    cache_dir: &Path,
+    adapter_dir: Option<&Path>,
+) -> Result<DeviceBoot> {
+    let graphs = match opts.graphs.as_deref() {
+        None => Graphs::default(),
+        Some(word) => word
+            .parse::<Graphs>()
+            .map_err(|error| anyhow!("[engine] graphs: {error}"))?,
+    };
+    let mut knobs = Knobs {
+        gpu_mem_utilization: opts.gpu_mem_utilization,
+        ..Knobs::default()
+    };
+    if let Some(pad) = opts.pad {
+        knobs.pad = pad;
+    }
+    if let Some(bodies) = opts.bodies {
+        knobs.bodies = bodies;
+    }
+    if let Some(megabytes) = opts.bodies_mem {
+        knobs.bodies_mem = megabytes;
+    }
+    if let Some(copies) = opts.fallback_copy {
+        knobs.copies = copies;
+    }
+    if let Some(grouped) = opts.grouped {
+        knobs.grouped = grouped;
+    }
+    if let Some(streams) = opts.side_streams {
+        knobs.side_streams = Some(streams);
+    }
+    Ok(DeviceBoot {
+        ordinal: ordinal_of(&opts.device),
+        graphs,
+        knobs,
+        weight_cache_dir: Some(weight_cache_dir.to_path_buf()),
+        cache_dir: Some(cache_dir.to_path_buf()),
+        adapter_dir: adapter_dir.map(Path::to_path_buf),
+    })
+}
+
+/// A one-way, human-readable record of what a boot actually asked for, under
+/// `$PIE_HOME/logs/` — the successor to the operator-readable `engine.toml`.
+///
+/// **NOTHING MAY EVER READ THIS BACK.** It is a dump, not a wire: the struct
+/// already crossed, and a reader here would be a second boot format growing in
+/// a log directory. Best-effort for the same reason the launch-state sweep
+/// was: a dump must never be why a boot fails.
+#[cfg(feature = "_engine-cuda")]
+fn dump_device_boot(boot: &DeviceBoot, group_id: usize, rank: Option<usize>) {
+    let dir = crate::paths::pie_home().join("logs");
+    let name = match rank {
+        Some(rank) => format!("engine-boot-g{group_id}-r{rank}.txt"),
+        None => format!("engine-boot-g{group_id}.txt"),
+    };
+    if let Err(error) = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(dir.join(&name), format!("{boot:#?}\n")))
+    {
+        tracing::warn!(%error, name, "could not write the engine boot dump");
+    }
+}
+
 /// **PREPARE ONE FRESHLY IMPORTED ARTIFACT'S WEIGHT TIERS** (§M wave M-1:
 /// `.wiki/alto/zt-as-serving-artifact.md`).
 ///
@@ -603,7 +313,7 @@ fn cuda_budgets(
 ///
 /// ```text
 ///   flavor + options   preflight::{resolve_flavor, build_embedded_options}
-///   the boot document  write_cuda_startup_toml — the file an operator reads
+///   the boot struct    device_boot — dumped one-way under logs/ when verbose
 ///   the token budget   cuda_budgets, off the same `[engine] options`
 ///   the two weight     ModelConfig::residency — `[model] device_weight_budget`
 ///     budgets          and `[model] host_weight_budget`
@@ -663,43 +373,32 @@ pub fn prepare_weight_artifact(cfg: &crate::config::Config, artifact: &Path) -> 
         ));
     };
 
-    // Installed before the boot document is written, for `load_model_engines`'
-    // reason: the TOML writers read both back out of a `OnceLock`, and
-    // `$PIE_HOME` is this layer's to know.
-    set_cache_dir(
-        crate::state::engine_cache_dir()
-            .to_string_lossy()
-            .into_owned(),
-    );
-    let cache_dir = resolved_weight_cache_dir(cfg);
-    set_weight_cache_dir(cache_dir.clone());
-    let cache_dir = PathBuf::from(cache_dir);
+    // `$PIE_HOME` is this layer's to know; both directories cross as
+    // `DeviceBoot` fields, resolved here exactly as the serving boot resolves
+    // them.
+    let engine_cache_dir = crate::state::engine_cache_dir();
+    let cache_dir = PathBuf::from(resolved_weight_cache_dir(cfg));
     std::fs::create_dir_all(&cache_dir)
         .with_context(|| format!("create the weight cache directory {cache_dir:?}"))?;
 
-    // The checkpoint's own config, lifted in one open — what the boot document
-    // carries beside itself. The same call the serving path makes, so an
-    // artifact that cannot answer refuses here rather than at the first serve.
-    let lifted = crate::weights::resolve(&artifact.to_string_lossy())
+    // The same open the serving path makes, kept for its refusal: an artifact
+    // that cannot answer its metadata fails here rather than at the first
+    // serve. The config it lifts used to travel beside the boot TOML; nothing
+    // read it, and nothing crosses here now.
+    crate::weights::resolve(&artifact.to_string_lossy())
         .with_context(|| format!("resolving the artifact {artifact:?}"))?
         .metadata()
         .with_context(|| format!("reading the model metadata for {artifact:?}"))?;
 
-    let state_dir = local_engine_state_dir(0, None)?;
-    let toml_path = state_dir.join("engine.toml");
-    write_cuda_startup_toml(
-        &toml_path,
+    let boot = device_boot(
         opts,
-        &m.weight_dtype,
-        artifact,
-        0,
-        None,
-        &lifted.config,
+        &cache_dir,
+        &engine_cache_dir,
+        m.adapter_mount().as_deref(),
     )?;
-    // THE DOCUMENT, not the path to it — see `create_engine_backend` for what
-    // handing over the path cost.
-    let boot_doc = std::fs::read(&toml_path)
-        .with_context(|| format!("read the engine boot config just written to {toml_path:?}"))?;
+    if cfg.server.verbose {
+        dump_device_boot(&boot, 0, None);
+    }
 
     let request = ::runtime::engine::load::request_of(
         stated_sku(m, artifact),
@@ -710,12 +409,7 @@ pub fn prepare_weight_artifact(cfg: &crate::config::Config, artifact: &Path) -> 
         -1,
         u8::try_from(cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
     )?;
-    // The bootstrap directory goes whether the prepare worked or not: it holds
-    // one TOML and one config blob, and a command that exits leaves no engine
-    // behind to read them.
-    let prepared = ::runtime::engine::backend::open::prepare_cuda(&boot_doc, request);
-    remove_launch_state();
-    prepared?;
+    ::runtime::engine::backend::open::prepare_cuda(boot, request)?;
     Ok(cache_dir)
 }
 
@@ -729,8 +423,8 @@ pub fn prepare_weight_artifact(cfg: &crate::config::Config, artifact: &Path) -> 
 fn stated_sku<'a>(m: &'a crate::config::ModelConfig, artifact: &Path) -> Option<&'a str> {
     let sku = m.sku.as_deref()?;
     let resolved = crate::weights::resolve(&m.model).ok()?;
-    let same = std::fs::canonicalize(resolved.path()).ok()?
-        == std::fs::canonicalize(artifact).ok()?;
+    let same =
+        std::fs::canonicalize(resolved.path()).ok()? == std::fs::canonicalize(artifact).ok()?;
     same.then_some(sku)
 }
 
@@ -849,10 +543,7 @@ fn register_operator_adapters(
             planes,
         };
         ::runtime::engine::verbs::register_adapter(backend, &registration).with_context(|| {
-            format!(
-                "registering adapter {} into this model's banks",
-                adapter.id
-            )
+            format!("registering adapter {} into this model's banks", adapter.id)
         })?;
         tracing::info!(
             id = adapter.id,
@@ -863,295 +554,17 @@ fn register_operator_adapters(
     Ok(())
 }
 
-/// Write the cuda engine's bootstrap TOML. Schema mirrors
-/// `crates/engine-cuda/csrc/src/config.hpp`: `[model]` with
-/// `snapshot_dir`/`device`/`dtype` plus model-execution knobs,
-/// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
-/// with the server verbosity flag.
-///
-/// `[distributed]` is emitted only for TP launches; single-rank uses the
-/// cuda engine's default (`tp_size=1, tp_rank=0`).
-// Gated with `test` as well as the feature ON PURPOSE. Emitting the startup
-// TOML is pure string work -- it needs no CUDA, no nvcc and no GPU -- so its
-// tests run on every host, which is the only reason they run at all here.
-#[cfg(any(feature = "_engine-cuda", test))]
-pub(crate) fn write_cuda_startup_toml(
-    out_path: &Path,
-    opts: &CudaNativeEngineOptions,
-    weight_dtype: &str,
-    snapshot_dir: &Path,
-    _group_id: usize,
-    tp: Option<&TpLaunch>,
-    config: &[u8],
-) -> Result<()> {
-    let mut doc = toml::Table::new();
-
-    let mut model = toml::Table::new();
-    insert_str(&mut model, "snapshot_dir", path_string(snapshot_dir));
-    insert_str(&mut model, "weight_cache_dir", weight_cache_dir());
-    insert_adapter_dir(&mut model);
-    write_config_beside(out_path, config, &mut model)?;
-    insert_model_id(&mut model, opts.model_id.as_deref());
-    insert_str(&mut model, "device", &opts.device);
-    // A `[model]` key, so it arrives beside the options rather than inside
-    // them: what the checkpoint holds is a fact about the weights, and the
-    // engine's own `[model]` table is where it lands.
-    insert_str(&mut model, "dtype", weight_dtype);
-    insert_int(&mut model, "mtp_num_drafts", opts.mtp_num_drafts);
-    insert_bool(
-        &mut model,
-        "stream_routed_experts",
-        opts.stream_routed_experts,
-    );
-    // Omitted when absent rather than written as a sentinel: the engine's
-    // own default IS the derivation, so an absent key and a "0 means derive"
-    // key would be two spellings of one thing.
-    // The engine still speaks GiB floats; the unit lives in the config type,
-    // not on the wire.
-    if let Some(size) = opts.expert_cache {
-        model.insert(
-            "expert_cache_gb".into(),
-            toml::Value::Float(size.as_gib_f64()),
-        );
-    }
-    if let Some(size) = opts.expert_host_cache {
-        model.insert(
-            "expert_host_cache_gb".into(),
-            toml::Value::Float(size.as_gib_f64()),
-        );
-    }
-    insert_bool(
-        &mut model,
-        "enable_system_speculation",
-        opts.enable_system_speculation,
-    );
-    insert_table(&mut doc, "model", model);
-
-    let mut batching = toml::Table::new();
-    insert_str(
-        &mut batching,
-        "memory_profile",
-        match opts.memory_profile {
-            CudaMemoryProfile::Auto => "auto",
-            CudaMemoryProfile::Latency => "latency",
-            CudaMemoryProfile::Throughput => "throughput",
-        },
-    );
-    if let Some(size) = opts.kv_page_size {
-        insert_int(&mut batching, "kv_page_size", size);
-    }
-    insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
-    if let Some(pages) = opts.max_total_pages {
-        insert_int(&mut batching, "total_pages", pages);
-    }
-    // Omitted when absent, like the other derived keys: the engine defaults
-    // them to "let the planner choose", so writing a sentinel would be a
-    // second spelling of an absent key.
-    if let Some(tokens) = opts.max_forward_tokens {
-        insert_int(&mut batching, "max_forward_tokens", tokens);
-    }
-    if let Some(requests) = opts.max_forward_requests {
-        insert_int(&mut batching, "max_forward_requests", requests);
-    }
-    insert_str(&mut batching, "kv_cache_dtype", opts.kv_cache_dtype.clone());
-    // Written only when asked for, like the derived keys above: the engine
-    // defaults it to false too, so emitting `false` would be a second spelling
-    // of an absent key. It also keeps the bootstrap TOML saying nothing about
-    // calibration on every ordinary boot.
-    if opts.calibrate_planner {
-        insert_bool(&mut batching, "calibrate_planner", true);
-    }
-    insert_table(&mut doc, "batching", batching);
-
-    let mut runtime = toml::Table::new();
-    insert_bool(&mut runtime, "verbose", opts.verbose);
-    insert_table(&mut doc, "runtime", runtime);
-
-    // **`[engine]`: THE SHELL'S OWN WORDS** (alto article 9 — shells read no
-    // environment). Nine `PIE_CUDA_*` variables were read inside the shell at
-    // load and are typed `Boot` fields now; this is the table they arrive
-    // through, and `engine_cuda::boot::knobs` is the one reader. It was
-    // `runtime::engine::backend::cuda::knobs` until the reader moved into the
-    // shell that declares the `Knobs` it parses into; what this comment claims
-    // — ONE reader — is what the move preserved.
-    //
-    // EVERY KEY IS OMITTED WHEN THE OPERATOR STATED NOTHING, like the derived
-    // keys above and for the same reason: the shell's own default IS the
-    // answer for an absent key, so writing one would be a second spelling of
-    // absence — and, here, a second place the default is written down.
-    let mut engine = toml::Table::new();
-    // **AND THE FRACTION MOVED HERE FROM `[batching]`, BECAUSE HERE IT HAS A
-    // READER** (alto streaming §3 item 5, `next.md` B1). `gpu_mem_utilization`
-    // was written into `[batching]` for the C++ engine that read that table,
-    // and when the shell became Rust nothing read `[batching]` at all: the key
-    // was declared, defaulted, validated and schema'd, and reached no engine.
-    // `engine_cuda::boot` reads the `[engine]` table and only the `[engine]`
-    // table, so this is where the number has to be written for the elastic
-    // pool to see it. Moved rather than duplicated — two spellings of one
-    // operator statement is the drift `backend.rs`' header warns about.
-    //
-    // ALWAYS WRITTEN, unlike the optional keys below it: the field is an `f64`
-    // with a default rather than an `Option`, so what the operator stated and
-    // what the config defaulted to are the same number by the time it reaches
-    // here, and there is no absence left to express.
-    engine.insert(
-        "gpu_mem_utilization".into(),
-        toml::Value::Float(opts.gpu_mem_utilization),
-    );
-    if let Some(graphs) = opts.graphs.as_deref() {
-        insert_str(&mut engine, "graphs", graphs);
-    }
-    if let Some(pad) = opts.pad {
-        insert_bool(&mut engine, "pad", pad);
-    }
-    if let Some(bodies) = opts.bodies {
-        insert_bool(&mut engine, "bodies", bodies);
-    }
-    if let Some(megabytes) = opts.bodies_mem {
-        insert_int(&mut engine, "bodies_mem", i64::from(megabytes));
-    }
-    if let Some(copies) = opts.fallback_copy {
-        insert_bool(&mut engine, "fallback_copy", copies);
-    }
-    if let Some(grouped) = opts.grouped {
-        insert_bool(&mut engine, "grouped", grouped);
-    }
-    if let Some(streams) = opts.side_streams {
-        insert_int(&mut engine, "side_streams", i64::from(streams));
-    }
-    // The guard predates the fraction, which is always written, so the table is
-    // never empty now. Kept rather than deleted: it is the rule for the keys
-    // BELOW it — every one of them omitted when the operator stated nothing —
-    // and a future where the fraction moves back out should not have to
-    // rediscover it.
-    if !engine.is_empty() {
-        insert_table(&mut doc, "engine", engine);
-    }
-
-    insert_cache_table(&mut doc);
-
-    if let Some(tp) = tp {
-        let mut distributed = toml::Table::new();
-        insert_int(&mut distributed, "tp_size", tp.size as i64);
-        insert_int(&mut distributed, "tp_rank", tp.rank as i64);
-        insert_str(
-            &mut distributed,
-            "nccl_unique_id_hex",
-            tp.nccl_unique_id_hex.clone(),
-        );
-        insert_table(&mut doc, "distributed", distributed);
-    }
-
-    write_toml_table(out_path, doc)
-}
-
-#[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
-/// Emit the metal engine's bootstrap TOML — same `[model]` + `[batching]` +
-/// `[runtime]` layout consumed by `crates/engine-metal/csrc/src/config.hpp`. The metal
-/// launch state is identical apart from the `metal:N` backend selector.
-///
-/// Not gated on `engine-metal`: what it produces is a TOML file, and whether
-/// the operator's settings survive into that file is a question a machine
-/// without a Metal device can still answer. Gating it would put the test out
-/// of reach of every machine that is not a Mac.
-pub(crate) fn write_metal_startup_toml(
-    out_path: &Path,
-    options: &MetalEngineOptions,
-    snapshot_dir: &Path,
-    _group_id: usize,
-    config: &[u8],
-) -> Result<()> {
-    let mut doc = toml::Table::new();
-
-    let mut model = toml::Table::new();
-    insert_str(&mut model, "hf_path", path_string(snapshot_dir));
-    // Same arrangement as the CUDA engine, and the same key: the mount is one
-    // deployment fact, read by `engine_metal::boot` out of the same
-    // `[model] adapter_dir` the CUDA door reads.
-    insert_adapter_dir(&mut model);
-    write_config_beside(out_path, config, &mut model)?;
-    insert_model_id(&mut model, options.model_id.as_deref());
-    insert_str(&mut model, "backend", &options.device);
-    insert_bool(
-        &mut model,
-        "stream_routed_experts",
-        options.stream_routed_experts,
-    );
-    // Omitted when unset rather than written as 0: the engine reads an absent
-    // key as "the whole bank stays resident", which is the same statement.
-    if let Some(bytes) = options.expert_slab_bytes {
-        model.insert(
-            "expert_slab_bytes".into(),
-            toml::Value::Integer(bytes as i64),
-        );
-    }
-    insert_table(&mut doc, "model", model);
-
-    let mut batching = toml::Table::new();
-    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
-    insert_int(&mut batching, "total_pages", options.total_pages);
-    insert_int(
-        &mut batching,
-        "max_forward_tokens",
-        options.max_forward_tokens,
-    );
-    insert_int(
-        &mut batching,
-        "max_forward_requests",
-        options.max_forward_requests,
-    );
-    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
-    insert_str(
-        &mut batching,
-        "kv_cache_dtype",
-        options.kv_cache_dtype.clone(),
-    );
-    // Omitted when unset rather than written as 0: the engine reads absent and
-    // zero the same way, and a config that does not mention the knob is the
-    // honest record of a run that did not use it.
-    if let Some(len) = options.max_model_len {
-        insert_int(&mut batching, "max_model_len", len);
-    }
-    insert_table(&mut doc, "batching", batching);
-
-    let mut runtime = toml::Table::new();
-    insert_bool(&mut runtime, "verbose", options.verbose);
-    insert_table(&mut doc, "runtime", runtime);
-    insert_cache_table(&mut doc);
-
-    // `[metal]`: the device-wide knobs the shell reads out of the boot document
-    // into its `DeviceBoot`, parallel to the CUDA engine's `[engine]` table.
-    // Today that is `gpu_mem_utilization` — the fraction of the wired ceiling
-    // (`recommendedMaxWorkingSetSize`) pie may hold resident, which
-    // `engine_metal::boot::open` reads and `store::accounting` admits against.
-    let mut metal = toml::Table::new();
-    metal.insert(
-        "gpu_mem_utilization".into(),
-        toml::Value::Float(options.gpu_mem_utilization),
-    );
-    insert_table(&mut doc, "metal", metal);
-
-    write_toml_table(out_path, doc)
-}
-
 // -----------------------------------------------------------------------------
 // Native engine creation helpers.
 // -----------------------------------------------------------------------------
-
-#[cfg(any(
-    feature = "_engine-cuda",
-    all(feature = "engine-metal", target_vendor = "apple")
-))]
-fn local_engine_state_dir(group_id: usize, tp: Option<&TpLaunch>) -> Result<PathBuf> {
-    let rank_suffix = tp
-        .as_ref()
-        .map(|tp| format!("-r{}", tp.rank))
-        .unwrap_or_default();
-    let state_dir = launch_state_dir().join(format!("g{group_id}{rank_suffix}"));
-    std::fs::create_dir_all(&state_dir)
-        .map_err(|e| anyhow!("create state dir {state_dir:?}: {e}"))?;
-    Ok(state_dir)
-}
+//
+// `write_cuda_startup_toml`, `write_metal_startup_toml` and the per-launch
+// state directory they wrote into STOOD HERE, ~350 lines between them. Of the
+// ~30 keys the cuda writer emitted, the shell read four subjects — the
+// device, the two cache directories, and the `[engine]` knobs — and they are
+// `DeviceBoot` fields now; the metal shell read exactly one key, and it
+// crosses as in-memory bytes at the call site. Everything else on that wire
+// was written and read by nothing.
 
 /// What an engine may be pointed at: a `.zt` artifact, or a snapshot directory.
 ///
@@ -1176,11 +589,12 @@ fn validate_snapshot_dir(snapshot_dir: &Path) -> Result<()> {
 #[cfg(feature = "_engine-cuda")]
 pub(crate) fn create_engine_backend_group(
     rank_options: &[EngineOptions],
-    weight_dtype: &str,
     snapshot_dir: &Path,
-    config: &[u8],
+    weight_cache_dir: &Path,
+    cache_dir: &Path,
+    // The shared-adapter mount, or `None` for the feature off (alto adapter §3.3).
+    adapter_dir: Option<&Path>,
     group_id: usize,
-    tp_launches: &[TpLaunch],
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     adapters: &crate::config::AdapterConfig,
@@ -1188,7 +602,7 @@ pub(crate) fn create_engine_backend_group(
     // **THE SECOND ROW AXIS'S CEILINGS, OR BOTH `None` TO DERIVE THEM** (alto
     // multimodal §5.5) — `[model] max_patches` / `[model] max_images`, threaded
     // as VALUES beside `residency` for W-3's reason: this layer holds a boot
-    // document and an adapter roster, not the worker's `Config`.
+    // struct and an adapter roster, not the worker's `Config`.
     patch_ceilings: (Option<u32>, Option<u32>),
     // `[model] sku`, or `None` to identify one — see `land`.
     sku: Option<&str>,
@@ -1197,24 +611,17 @@ pub(crate) fn create_engine_backend_group(
     if rank_options.is_empty() {
         return Err(anyhow!("cuda group requires at least one rank"));
     }
-    if rank_options.len() != tp_launches.len() {
-        return Err(anyhow!(
-            "cuda group rank options ({}) and tp launches ({}) length mismatch",
-            rank_options.len(),
-            tp_launches.len()
-        ));
-    }
 
-    let mut config_blobs = Vec::with_capacity(rank_options.len());
-    for (rank_options, tp) in rank_options.iter().zip(tp_launches.iter()) {
+    let mut boots = Vec::with_capacity(rank_options.len());
+    for (rank, rank_options) in rank_options.iter().enumerate() {
         // THE `else` IS UNREACHABLE IN ONE BUILD AND LOAD-BEARING IN EVERY
         // OTHER. `EngineOptions`' variants are feature-gated, so a binary
         // built with CUDA and nothing else has a one-variant enum and the
         // pattern is irrefutable; add `engine-metal` or `engine-vulkan` and
         // the refusal below is the only thing standing between a metal
-        // option set and `write_cuda_startup_toml`. Allowed rather than
-        // rewritten, because the rewrite is to delete a check that a
-        // different feature list needs.
+        // option set and `device_boot`. Allowed rather than rewritten,
+        // because the rewrite is to delete a check that a different feature
+        // list needs.
         #[allow(
             irrefutable_let_patterns,
             reason = "`EngineOptions` has one variant in a CUDA-only build"
@@ -1230,26 +637,17 @@ pub(crate) fn create_engine_backend_group(
                  LoadPlan boot contract"
             ));
         }
-        let state_dir = local_engine_state_dir(group_id, Some(tp))?;
-        let toml_path = state_dir.join("engine.toml");
-        write_cuda_startup_toml(
-            &toml_path,
-            opts,
-            weight_dtype,
-            snapshot_dir,
-            group_id,
-            Some(tp),
-            config,
-        )?;
-        // THE DOCUMENT, not the path to it. See the single-rank arm in
-        // `create_engine_backend` for what handing over the path cost.
-        config_blobs.push(std::fs::read(&toml_path).with_context(|| {
-            format!("read the engine boot config just written to {toml_path:?}")
-        })?);
+        // One boot per rank, each naming its own device; the struct crosses
+        // directly, so a field cannot silently fail to arrive.
+        let boot = device_boot(opts, weight_cache_dir, cache_dir, adapter_dir)?;
+        if opts.verbose {
+            dump_device_boot(&boot, group_id, Some(rank));
+        }
+        boots.push(boot);
     }
 
-    let ranks = rank_options.len();
-    let (mut backend, opened) = ::runtime::engine::backend::open::cuda_group(config_blobs)?;
+    let ranks = boots.len();
+    let (mut backend, opened) = ::runtime::engine::backend::open::cuda_group(boots)?;
     if opened != ranks {
         return Err(anyhow!(
             "cuda group opened {opened} ranks for {ranks} rank configs"
@@ -1300,11 +698,12 @@ pub(crate) fn create_engine_backend_group(
 )]
 pub(crate) fn create_engine_backend(
     options: &EngineOptions,
-    weight_dtype: &str,
     snapshot_dir: &Path,
-    config: &[u8],
+    weight_cache_dir: &Path,
+    cache_dir: &Path,
+    // The shared-adapter mount, or `None` for the feature off (alto adapter §3.3).
+    adapter_dir: Option<&Path>,
     group_id: usize,
-    tp: Option<&TpLaunch>,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
     adapters: &crate::config::AdapterConfig,
@@ -1312,13 +711,13 @@ pub(crate) fn create_engine_backend(
     // **THE SECOND ROW AXIS'S CEILINGS, OR BOTH `None` TO DERIVE THEM** (alto
     // multimodal §5.5) — `[model] max_patches` / `[model] max_images`, threaded
     // as VALUES beside `residency` for W-3's reason: this layer holds a boot
-    // document and an adapter roster, not the worker's `Config`.
+    // struct and an adapter roster, not the worker's `Config`.
     patch_ceilings: (Option<u32>, Option<u32>),
     // `[model] sku`, or `None` to identify one — see `land`.
     sku: Option<&str>,
 ) -> Result<crate::translate::GroupEngine> {
     // Each is used only inside a `#[cfg(feature = "engine-…")]` arm below.
-    let _ = (group_id, tp, config, weight_dtype);
+    let _ = (group_id, weight_cache_dir, cache_dir, adapter_dir);
     validate_snapshot_dir(snapshot_dir)?;
 
     // TYPED, because with no `engine-*` feature `EngineOptions` has no
@@ -1331,128 +730,111 @@ pub(crate) fn create_engine_backend(
         engine::Budgets,
         model_ir::Platform,
     ) = match options {
-            #[cfg(not(any(
-                feature = "_engine-cuda",
-                all(feature = "engine-metal", target_vendor = "apple")
-            )))]
-            _ => unreachable!("`EngineOptions` has no variants in this build"),
-            #[cfg(feature = "_engine-cuda")]
-            EngineOptions::CudaNative(opts) => {
-                if opts.mtp_assistant_snapshot_dir.is_some() {
-                    return Err(anyhow!(
-                        "mtp_assistant_snapshot_dir is not supported by the single-model \
+        #[cfg(not(any(
+            feature = "_engine-cuda",
+            all(feature = "engine-metal", target_vendor = "apple")
+        )))]
+        _ => unreachable!("`EngineOptions` has no variants in this build"),
+        #[cfg(feature = "_engine-cuda")]
+        EngineOptions::CudaNative(opts) => {
+            if opts.mtp_assistant_snapshot_dir.is_some() {
+                return Err(anyhow!(
+                    "mtp_assistant_snapshot_dir is not supported by the single-model \
                      LoadPlan boot contract"
-                    ));
-                }
-                let state_dir = local_engine_state_dir(group_id, tp)?;
-                let toml_path = state_dir.join("engine.toml");
-                write_cuda_startup_toml(
-                    &toml_path,
-                    opts,
-                    weight_dtype,
-                    snapshot_dir,
-                    group_id,
-                    tp,
-                    config,
-                )?;
-                // THE DOCUMENT, not the path to it.
-                //
-                // This handed over `toml_path.to_string_lossy()`, and the
-                // engine parses what it is given as TOML: `Shell::open` ->
-                // `load::create_impl` does `from_utf8(bytes).parse::<toml::
-                // Table>().ok().unwrap_or_default()`. A PATH is valid UTF-8
-                // and is not TOML, so it parsed to nothing and every boot key
-                // fell back to a default IN SILENCE -- `[model] config`,
-                // `[model] id` and `[engine] runahead`, all written into the
-                // file and none of them read.
-                //
-                // The tolerance that hid it was the runtime's own boot
-                // reader, which took bytes "that are a PATH rather than a
-                // document" for "the operator stated nothing". That reader
-                // had no callers left and is gone; this seam hands over the
-                // document, so there is nothing left to tolerate.
-                let boot_doc = std::fs::read(&toml_path).with_context(|| {
-                    format!("read the engine boot config just written to {toml_path:?}")
-                })?;
-                let backend = ::runtime::engine::backend::open::cuda(&boot_doc)?;
-                (
-                    backend,
-                    cuda_budgets(opts, adapters.seats(), patch_ceilings),
-                    model_ir::Platform::Cuda,
-                )
+                ));
             }
-            // METAL, BACK AT P5, AND IT HANDS OVER THE DOCUMENT — the same
-            // shape as the CUDA arm above, which it did NOT have before R3.
-            // `open::metal` used to be given the PATH, on the reading that the
-            // engine opened the file itself; the engine does not, and says so:
-            // `Shell::open` takes `[model] id` already parsed, because "a boot
-            // TOML is the runtime's format, and an engine that read one would be
-            // the second thing entitled to an opinion about its shape." The
-            // file is still written — it is what an operator reads to see what
-            // the launch actually asked for — and then read back, so exactly
-            // one thing parses it.
+            // THE STRUCT, not a document describing it. The TOML this
+            // replaced was written, re-read and parsed on the far side,
+            // and a key nobody read fell back to a default IN SILENCE;
+            // a typed field cannot fail to arrive.
+            let boot = device_boot(opts, weight_cache_dir, cache_dir, adapter_dir)?;
+            if opts.verbose {
+                dump_device_boot(&boot, group_id, None);
+            }
+            let backend = ::runtime::engine::backend::open::cuda(boot)?;
+            (
+                backend,
+                cuda_budgets(opts, adapters.seats(), patch_ceilings),
+                model_ir::Platform::Cuda,
+            )
+        }
+        // METAL, BACK AT P5. The document it hands over is built in
+        // memory: of the ~14 keys the old bootstrap file carried, the
+        // shell reads exactly ONE — `[metal] gpu_mem_utilization` — and
+        // `[metal.tuning]` is the shell's own file, never this layer's to
+        // write. No file, no launch-state directory, one parser.
+        //
+        // THE VULKAN AND WGPU ARMS STOOD HERE TOO and are still out:
+        // neither engine has the baker executor R3 named as the condition
+        // of its return.
+        #[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
+        EngineOptions::Metal(opts) => {
+            // `{:?}` so the float keeps its decimal point: `1.0` written
+            // `{}` is `1`, which TOML reads as an integer and the shell's
+            // float reader would pass over.
+            let mut boot_doc = format!(
+                "[metal]\ngpu_mem_utilization = {:?}\n",
+                opts.gpu_mem_utilization
+            );
+            // The one `[model]` key the metal door reads (alto adapter
+            // §3.3); quoted through `toml::Value` so an unusual path
+            // cannot break the document.
+            if let Some(mount) = adapter_dir {
+                boot_doc.push_str(&format!(
+                    "\n[model]\nadapter_dir = {}\n",
+                    toml::Value::String(mount.display().to_string())
+                ));
+            }
+            let backend = ::runtime::engine::backend::open::metal(boot_doc.as_bytes())?;
+            let page_size = opts.kv_page_size.max(1);
+            let max_context = opts
+                .max_model_len
+                .unwrap_or_else(|| engine::Budgets::default().max_context);
+            // **`total_pages` IS A PAGE COUNT AND `slots` IS A SEAT
+            // COUNT**, and the budget below handed the first over as the
+            // second until this line existed. `Paging::of` gives every
+            // seat a block of `max_context / page_size` pages and reserves
+            // the product (`model_exec::store::kv::Paging::pages`), so
+            // 1024 PAGES read as 1024 SEATS reserved 131072 pages — a
+            // hundred and twenty-eight times the pool the operator asked
+            // for. On qwen35-d0.8b that is 8 GiB of KV per attention
+            // layer, and what it buys is a first command buffer that
+            // either fails with `kIOGPUCommandBufferCallbackError
+            // OutOfMemory` or hangs the device outright.
             //
-            // THE VULKAN AND WGPU ARMS STOOD HERE TOO and are still out:
-            // neither engine has the baker executor R3 named as the condition
-            // of its return.
-            #[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
-            EngineOptions::Metal(opts) => {
-                let state_dir = local_engine_state_dir(group_id, tp)?;
-                let toml_path = state_dir.join("engine.toml");
-                write_metal_startup_toml(&toml_path, opts, snapshot_dir, group_id, config)?;
-                let boot_doc = std::fs::read(&toml_path).with_context(|| {
-                    format!("read the engine boot config just written to {toml_path:?}")
-                })?;
-                let backend = ::runtime::engine::backend::open::metal(&boot_doc)?;
-                let page_size = opts.kv_page_size.max(1);
-                let max_context = opts
-                    .max_model_len
-                    .unwrap_or_else(|| engine::Budgets::default().max_context);
-                // **`total_pages` IS A PAGE COUNT AND `slots` IS A SEAT
-                // COUNT**, and the budget below handed the first over as the
-                // second until this line existed. `Paging::of` gives every
-                // seat a block of `max_context / page_size` pages and reserves
-                // the product (`model_exec::store::kv::Paging::pages`), so
-                // 1024 PAGES read as 1024 SEATS reserved 131072 pages — a
-                // hundred and twenty-eight times the pool the operator asked
-                // for. On qwen35-d0.8b that is 8 GiB of KV per attention
-                // layer, and what it buys is a first command buffer that
-                // either fails with `kIOGPUCommandBufferCallbackError
-                // OutOfMemory` or hangs the device outright.
-                //
-                // The division is `cuda_budgets`' own, and that function's
-                // header already says why it is the only honest one: "the
-                // shell's paging hands each seated sequence one block of
-                // `max_context / page_size` pages: how many sequences fit is
-                // that division, not a third knob to keep in step". Both arms
-                // read the operator's page cap as a page cap now.
-                let pages_per_slot = max_context.div_ceil(page_size).max(1);
-                (
-                    backend,
-                    engine::Budgets {
-                        max_lanes: opts.max_forward_requests.max(1),
-                        max_tokens: opts.max_forward_tokens.max(1),
-                        buckets: Vec::new(),
-                        // The same one number the CUDA arm takes. `[model]`
-                        // rather than `[model.engine.options]` is what makes
-                        // it portable: debt 6's complaint was that Metal had
-                        // no configuration at all, and an adapter seat count
-                        // is not a fact about a backend.
-                        max_adapters: adapters.seats(),
-                        page_size,
-                        max_context,
-                        slots: (opts.total_pages / pages_per_slot).max(1),
-                        // The metal mirror binds no patch seat and refuses
-                        // every patch-axis input by name, so a ladder here
-                        // would be a ceiling on a rectangle this plane cannot
-                        // resolve. `None` is the honest answer, not a default.
-                        max_patches: None,
-                        max_images: None,
-                    },
-                    model_ir::Platform::Metal,
-                )
-            }
-        };
+            // The division is `cuda_budgets`' own, and that function's
+            // header already says why it is the only honest one: "the
+            // shell's paging hands each seated sequence one block of
+            // `max_context / page_size` pages: how many sequences fit is
+            // that division, not a third knob to keep in step". Both arms
+            // read the operator's page cap as a page cap now.
+            let pages_per_slot = max_context.div_ceil(page_size).max(1);
+            (
+                backend,
+                engine::Budgets {
+                    max_lanes: opts.max_forward_requests.max(1),
+                    max_tokens: opts.max_forward_tokens.max(1),
+                    buckets: Vec::new(),
+                    // The same one number the CUDA arm takes. `[model]`
+                    // rather than `[model.engine.options]` is what makes
+                    // it portable: debt 6's complaint was that Metal had
+                    // no configuration at all, and an adapter seat count
+                    // is not a fact about a backend.
+                    max_adapters: adapters.seats(),
+                    page_size,
+                    max_context,
+                    slots: (opts.total_pages / pages_per_slot).max(1),
+                    // The metal mirror binds no patch seat and refuses
+                    // every patch-axis input by name, so a ladder here
+                    // would be a ceiling on a rectangle this plane cannot
+                    // resolve. `None` is the honest answer, not a default.
+                    max_patches: None,
+                    max_images: None,
+                },
+                model_ir::Platform::Metal,
+            )
+        }
+    };
     // Uniform across backends now that the load is a request rather than a
     // compiled plan (§10.3). Unreachable in a build with no `engine-*`
     // feature, where the match above diverges on an empty enum.
@@ -1540,19 +922,6 @@ mod tests {
         assert_eq!(cuda_budgets(&opts, 8, (None, None)).max_adapters, 8);
     }
 
-    /// A stand-in checkpoint config for the tests that are about something
-    /// else. The writers move the bytes without reading them, so the smallest
-    /// valid document is the honest fixture: anything richer would suggest
-    /// these tests check the config's content, and none of them do
-    /// (`the_startup_toml_always_carries_the_config` is the one that checks
-    /// it arrives).
-    const CONFIG: &[u8] = br#"{}"#;
-
-    /// What `[model] weight_dtype` defaults to. It is a model key rather than
-    /// an engine option, so these tests state it the way the caller does
-    /// instead of reading it off `CudaNativeEngineOptions::default()`.
-    const DTYPE: &str = "bfloat16";
-
     // `caps_json_round_trips` STOOD HERE. It deserialized a
     // `EngineCapabilities` from a JSON document with an `abi_version` in it
     // and asserted the round trip — a test about a 30-field flat struct with
@@ -1603,420 +972,125 @@ mod tests {
         assert!(error.contains("neither a .zt artifact"), "{error}");
     }
 
+    // THE TEN TOML ROUND-TRIP TESTS STOOD HERE — cache root, knob omission,
+    // schema match, the pid sweep, calibration, the `[distributed]` block and
+    // the carried config. They pinned a wire that no longer exists; the facts
+    // that survive the wire are about `device_boot` and are pinned below.
+    //
+    // The tests below need `DeviceBoot`, which exists only under
+    // `_engine-cuda`, so they run only in a cuda-featured test build
+    // (`cargo test -p worker --features engine-cuda-13`).
+
+    /// **ONLY OPERATOR-STATED KNOBS DEVIATE FROM THE ENGINE'S DEFAULTS** —
+    /// what `the_startup_toml_writes_only_the_engine_knobs_an_operator_stated`
+    /// pinned about the old wire, restated about the mapping: an absent knob
+    /// takes `Knobs::default()`, the shell's own answer, never one this layer
+    /// invented. The fraction is the exception with no absence to express —
+    /// the config type has already turned its absence into `0.90`.
     #[cfg(feature = "_engine-cuda")]
     #[test]
-    fn tp_launches_share_nccl_id_and_assign_all_ranks() {
-        let launches = tp_launches(3).unwrap();
-        assert_eq!(launches.len(), 3);
-        assert!(!launches[0].nccl_unique_id_hex.is_empty());
-        assert!(
-            launches
-                .iter()
-                .all(|launch| launch.nccl_unique_id_hex == launches[0].nccl_unique_id_hex)
-        );
-        assert_eq!(
-            launches
-                .iter()
-                .map(|launch| launch.rank)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2]
-        );
-        assert!(launches.iter().all(|launch| launch.size == 3));
-    }
-
-    #[test]
-    fn the_startup_toml_carries_the_cache_root() {
-        // The engine derives every disk cache from this. Without it the caches
-        // fall back to XDG, which is what split pie's state across two roots.
-        //
-        // NOTE: this installs a process-global OnceLock that outlives the test,
-        // so every later test in this binary sees `[cache]` emitted. Nothing
-        // asserts its absence today; a test that needs it unset cannot share a
-        // process with this one.
-        set_cache_dir("/pie-home/cache".to_string());
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("engine.toml");
-        let snap = dir.path().join("snapshot");
-        write_cuda_startup_toml(
-            &out,
-            &CudaNativeEngineOptions::default(),
-            DTYPE,
-            &snap,
-            0,
-            None,
-            CONFIG,
-        )
-        .unwrap();
-        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-        assert_eq!(val["cache"]["dir"].as_str().unwrap(), "/pie-home/cache");
-    }
-
-    /// **THE SHARED-ADAPTER MOUNT REACHES THE ENGINE, OR NOTHING DOES**
-    /// (alto adapter §3.3).
-    ///
-    /// `[model] adapter_dir` is the one key the shells read to decide whether
-    /// a shared bind has a namespace to be in, and a key nobody writes is a
-    /// key nobody can set — the failure `[model] weight_cache_dir` had for a
-    /// whole rewrite, and the one this test exists to prevent for the mount.
-    ///
-    /// NOTE: as `the_startup_toml_carries_the_cache_root`, this installs a
-    /// process-global OnceLock that outlives the test, so every later test in
-    /// this binary sees `[model] adapter_dir` emitted. Nothing asserts its
-    /// absence.
-    #[test]
-    fn the_startup_toml_carries_the_shared_adapter_mount() {
-        set_adapter_dir("/srv/pie/shared".to_string());
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("engine.toml");
-        let snap = dir.path().join("snapshot");
-        write_cuda_startup_toml(
-            &out,
-            &CudaNativeEngineOptions::default(),
-            DTYPE,
-            &snap,
-            0,
-            None,
-            CONFIG,
-        )
-        .unwrap();
-        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-        assert_eq!(
-            val["model"]["adapter_dir"].as_str().unwrap(),
-            "/srv/pie/shared",
-            "the mount the operator stated has to arrive at the engine that serves it"
-        );
-
-        // The Metal writer emits the SAME key, because it is one deployment
-        // fact and both shells read it out of `[model] adapter_dir`.
-        #[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
-        {
-            let out = dir.path().join("metal.toml");
-            write_metal_startup_toml(&out, &MetalEngineOptions::default(), &snap, 0, CONFIG)
-                .unwrap();
-            let val: toml::Value =
-                toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-            assert_eq!(
-                val["model"]["adapter_dir"].as_str().unwrap(),
-                "/srv/pie/shared"
-            );
-        }
-    }
-
-    /// **THE `[engine]` TABLE, WRITTEN** (alto wave P, article 9). The nine
-    /// `PIE_CUDA_*` words the shell used to read are `[engine]` keys now, and a
-    /// key nobody writes is a key nobody can set — the same failure
-    /// `[model] weight_cache_dir` had for a whole rewrite.
-    ///
-    /// A default boot writes ONLY `gpu_mem_utilization`, because the shell's
-    /// own default is the answer for an absent key and a second spelling of
-    /// absence is a second place the default is written down — and the
-    /// fraction is the one key with no absence to spell: it is an `f64` with a
-    /// default rather than an `Option`, so by the time it reaches this writer
-    /// the operator's statement and the config's default are one number
-    /// (`next.md` B1).
-    #[test]
-    fn the_startup_toml_writes_only_the_engine_knobs_an_operator_stated() {
-        let dir = tempfile::tempdir().unwrap();
-        let snap = dir.path().join("snapshot");
-
-        let write = |opts: &CudaNativeEngineOptions, name: &str| -> toml::Value {
-            let out = dir.path().join(name);
-            write_cuda_startup_toml(&out, opts, DTYPE, &snap, 0, None, CONFIG).unwrap();
-            toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap()
+    fn only_stated_knobs_deviate_from_the_engines_defaults() {
+        let boot = |opts: &CudaNativeEngineOptions| {
+            device_boot(opts, Path::new("/w"), Path::new("/c"), None).unwrap()
         };
 
-        let quiet = write(&CudaNativeEngineOptions::default(), "quiet.toml");
-        let quiet_engine = quiet["engine"].as_table().unwrap();
-        assert_eq!(
-            quiet_engine.len(),
-            1,
-            "a boot that stated no knob writes the fraction and nothing else: {quiet:?}"
-        );
-        assert_eq!(
-            quiet_engine["gpu_mem_utilization"].as_float().unwrap(),
-            0.90
-        );
+        let quiet = boot(&CudaNativeEngineOptions::default());
+        let stock = Knobs::default();
+        assert_eq!(quiet.knobs.gpu_mem_utilization, 0.90);
+        assert_eq!(quiet.knobs.pad, stock.pad);
+        assert_eq!(quiet.knobs.bodies, stock.bodies);
+        assert_eq!(quiet.knobs.bodies_mem, stock.bodies_mem);
+        assert_eq!(quiet.knobs.copies, stock.copies);
+        assert_eq!(quiet.knobs.grouped, stock.grouped);
+        assert_eq!(quiet.knobs.side_streams, stock.side_streams);
 
-        let stated = write(
+        let stated = boot(&CudaNativeEngineOptions {
+            pad: Some(false),
+            bodies: Some(false),
+            bodies_mem: Some(256),
+            fallback_copy: Some(false),
+            grouped: Some(false),
+            side_streams: Some(0),
+            ..Default::default()
+        });
+        assert!(!stated.knobs.pad);
+        assert!(!stated.knobs.bodies);
+        assert_eq!(stated.knobs.bodies_mem, 256);
+        assert!(!stated.knobs.copies);
+        assert!(!stated.knobs.grouped);
+        assert_eq!(stated.knobs.side_streams, Some(0));
+    }
+
+    /// The graphs word is the shell's to parse, and a spelling it does not
+    /// speak refuses by the key's name — the config layer never polices it,
+    /// so this is the one refusal on that word.
+    #[cfg(feature = "_engine-cuda")]
+    #[test]
+    fn the_graphs_word_parses_or_refuses_by_the_keys_name() {
+        let boot = |graphs: Option<&str>| {
+            device_boot(
+                &CudaNativeEngineOptions {
+                    graphs: graphs.map(String::from),
+                    ..Default::default()
+                },
+                Path::new("/w"),
+                Path::new("/c"),
+                None,
+            )
+        };
+        assert!(
+            matches!(boot(None).unwrap().graphs, Graphs::On),
+            "absent takes the shell's own default, which is the served path"
+        );
+        assert!(matches!(boot(Some("off")).unwrap().graphs, Graphs::Off));
+        assert!(matches!(
+            boot(Some("shaped")).unwrap().graphs,
+            Graphs::Shaped
+        ));
+        assert!(matches!(boot(Some("on")).unwrap().graphs, Graphs::On));
+        let error = boot(Some("sideways")).unwrap_err().to_string();
+        assert!(error.contains("graphs"), "{error}");
+    }
+
+    /// The device string, both cache directories and the shared-adapter
+    /// mount arrive — the four deployment facts (with the knobs) that were
+    /// ever actually read off the old wire. The mount half is what
+    /// `[model] adapter_dir`'s writer commit exists for: a key nobody
+    /// emitted was a key nobody could set, and a field cannot go unemitted.
+    #[cfg(feature = "_engine-cuda")]
+    #[test]
+    fn the_device_the_dirs_and_the_mount_cross_into_the_boot() {
+        let boot = device_boot(
             &CudaNativeEngineOptions {
-                graphs: Some("on".into()),
-                bodies: Some(false),
-                bodies_mem: Some(256),
-                pad: Some(false),
-                side_streams: Some(0),
-                ..CudaNativeEngineOptions::default()
+                device: "cuda:1".to_string(),
+                ..Default::default()
             },
-            "stated.toml",
-        );
-        let engine = &stated["engine"];
-        assert_eq!(engine["graphs"].as_str().unwrap(), "on");
-        assert_eq!(engine["bodies"].as_bool().unwrap(), false);
-        assert_eq!(engine["bodies_mem"].as_integer().unwrap(), 256);
-        assert_eq!(engine["pad"].as_bool().unwrap(), false);
-        assert_eq!(engine["side_streams"].as_integer().unwrap(), 0);
-        // **AND THE FRACTION IS THERE WITHOUT BEING ASKED FOR** — the one key
-        // an operator cannot omit from this table, because the config type has
-        // already turned its absence into `0.90`.
-        assert_eq!(engine["gpu_mem_utilization"].as_float().unwrap(), 0.90);
-        // And nothing the operator did not state.
-        assert!(engine.get("grouped").is_none());
-        assert!(engine.get("fallback_copy").is_none());
-    }
-
-    #[test]
-    fn the_sweep_reclaims_dead_pids_and_spares_live_ones() {
-        let home = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded test; PIE_HOME is read, never written, by
-        // the code under test.
-        unsafe { std::env::set_var("PIE_HOME", home.path()) };
-
-        let root = home.path().join("standalone");
-        let self_pid = std::process::id();
-        // A pid that cannot be running: pid 0 is the kernel's, never a
-        // reachable user process, so `kill(0, 0)` reports it as not ours.
-        let dead = root.join("999999999");
-        let live = root.join(self_pid.to_string());
-        let foreign = root.join("not-a-pid");
-        for d in [&dead, &live, &foreign] {
-            std::fs::create_dir_all(d).unwrap();
-            std::fs::write(d.join("engine.toml"), "x").unwrap();
-        }
-
-        sweep_stale_launch_state();
-
-        assert!(!dead.exists(), "a dead pid's state must be reclaimed");
-        assert!(
-            live.exists(),
-            "the running process's own state must survive"
-        );
-        assert!(
-            foreign.exists(),
-            "a directory that is not a pid is not ours to remove"
-        );
-    }
-
-    /// A calibration request reaches the engine, and only ever from memory.
-    ///
-    /// This is the whole route that replaced `[engine] calibrate_planner`:
-    /// `pie config tune` sets `server.calibrate_planner` on a config it
-    /// derived, `::runtime::apply_embedded_calibration` puts it on the engine
-    /// options, and this is where it becomes something the C++ side reads. The
-    /// per-launch bootstrap TOML is the only file it ever appears in, and that
-    /// file is regenerated every boot -- so the request cannot outlive the boot
-    /// that made it.
-    #[test]
-    fn a_calibration_request_reaches_the_engine_and_stops_there() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("cuda.toml");
-        let snap = tmp.path().join("snap");
-        let opts = CudaNativeEngineOptions {
-            device: "cuda:0".to_string(),
-            calibrate_planner: true,
-            ..Default::default()
-        };
-
-        write_cuda_startup_toml(&out, &opts, DTYPE, &snap, 0, None, CONFIG).unwrap();
-        let val: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+            Path::new("/pie/cache/weights"),
+            Path::new("/pie/cache"),
+            Some(Path::new("/srv/adapters")),
+        )
+        .unwrap();
+        assert_eq!(boot.ordinal, 1);
         assert_eq!(
-            val["batching"]["calibrate_planner"].as_bool(),
-            Some(true),
-            "the engine never hears the request"
+            boot.weight_cache_dir.as_deref(),
+            Some(Path::new("/pie/cache/weights"))
         );
-
-        // And the field is not part of the file format: a user config that
-        // spells it is refused, so this value can only have come from memory.
-        let asked = "\
-[model]
-name = \"m\"
-model = \"x\"
-[engine]
-type = \"cuda_native\"
-device = [\"cuda:0\"]
-calibrate_planner = true
-";
-        let err = crate::config::Config::parse(asked)
-            .expect_err("a measurement is not a setting")
-            .to_string();
-        assert!(err.contains("calibrate_planner"), "got: {err}");
-    }
-
-    #[test]
-    fn cuda_startup_toml_matches_engine_schema() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("cuda.toml");
-        let snap = tmp.path().join("snap");
-        let opts = CudaNativeEngineOptions {
-            device: "cuda:0".to_string(),
-            ..Default::default()
-        };
-
-        write_cuda_startup_toml(&out, &opts, DTYPE, &snap, 0, None, CONFIG).unwrap();
-
-        // Re-parse the emitted TOML to confirm the schema the cuda
-        // engine expects matches what we wrote (engine-side parsing
-        // in crates/engine-cuda/csrc/src/config.hpp).
-        let text = std::fs::read_to_string(&out).unwrap();
-        let val: toml::Value = toml::from_str(&text).unwrap();
-        assert!(
-            val["model"].get("model").is_none(),
-            "cuda derives from snapshot_dir"
-        );
+        assert_eq!(boot.cache_dir.as_deref(), Some(Path::new("/pie/cache")));
         assert_eq!(
-            val["model"]["snapshot_dir"].as_str().unwrap(),
-            snap.to_str().unwrap()
+            boot.adapter_dir.as_deref(),
+            Some(Path::new("/srv/adapters"))
         );
-        assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
-        assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
-        assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
-        // Derived values are OMITTED, not written as a sentinel. The engine's
-        // own default is the derivation, so emitting `0 = derive` would be a
-        // second spelling of an absent key.
-        assert!(val["batching"].get("kv_page_size").is_none());
-        assert_eq!(val["batching"]["kv_cache_dtype"].as_str().unwrap(), "auto");
-        // **THE FRACTION IS AN `[engine]` KEY**, because `[engine]` is the only
-        // table `engine_cuda::boot` reads: it sat in `[batching]` for the C++
-        // engine and reached no Rust shell at all (`next.md` B1). Asserted
-        // ABSENT from `[batching]` as well as present here, so the move cannot
-        // silently become a duplication.
-        assert!(val["batching"].get("gpu_mem_utilization").is_none());
+
+        let unstated = device_boot(
+            &CudaNativeEngineOptions::default(),
+            Path::new("/w"),
+            Path::new("/c"),
+            None,
+        )
+        .unwrap();
         assert_eq!(
-            val["engine"]["gpu_mem_utilization"].as_float().unwrap(),
-            0.90
+            unstated.adapter_dir, None,
+            "no mount stated is the feature off"
         );
-        assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
-        assert!(val["batching"].get("total_pages").is_none());
-        // An ordinary boot says nothing about calibration: it is one run of a
-        // measurement, not a setting every bootstrap file restates. The only
-        // thing that ever turns it on is `pie config tune`, on a config it
-        // derived in memory -- see `CudaNativeEngineOptions::calibrate_planner`
-        // for why it cannot come from a file.
-        assert!(val["batching"].get("calibrate_planner").is_none());
-        // Three, not four: the fraction is `[engine]`'s now.
-        assert_eq!(val["batching"].as_table().unwrap().len(), 3);
-        assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
-        // Expert streaming is off unless an operator asks for it: for a model
-        // that fits it is strictly slower, and it costs graph capture besides.
-        assert!(!val["model"]["stream_routed_experts"].as_bool().unwrap());
-        assert!(val["model"].get("expert_cache_gb").is_none());
-        assert!(val["model"].get("expert_host_cache_gb").is_none());
-        assert!(!val["runtime"]["verbose"].as_bool().unwrap());
-    }
-
-    #[test]
-    fn cuda_startup_toml_emits_runtime_verbose_when_set() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("cuda.toml");
-        let snap = tmp.path().join("snap");
-        let opts = CudaNativeEngineOptions {
-            device: "cuda:0".to_string(),
-            verbose: true,
-            ..Default::default()
-        };
-
-        write_cuda_startup_toml(&out, &opts, DTYPE, &snap, 0, None, CONFIG).unwrap();
-
-        let text = std::fs::read_to_string(&out).unwrap();
-        let val: toml::Value = toml::from_str(&text).unwrap();
-        assert!(val["runtime"]["verbose"].as_bool().unwrap());
-    }
-
-    #[test]
-    fn cuda_startup_toml_keeps_runtime_quant_out_of_engine_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("cuda.toml");
-        let snap = tmp.path().join("snap");
-        let opts = CudaNativeEngineOptions {
-            device: "cuda:1".to_string(),
-            runtime_quant: "fp8".to_string(),
-            ..Default::default()
-        };
-
-        write_cuda_startup_toml(&out, &opts, DTYPE, &snap, 3, None, CONFIG).unwrap();
-
-        let text = std::fs::read_to_string(&out).unwrap();
-        let val: toml::Value = toml::from_str(&text).unwrap();
-        assert!(val["model"].get("runtime_quant").is_none());
-        assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:1");
-    }
-
-    #[test]
-    fn cuda_startup_toml_keeps_mxfp4_policy_out_of_engine_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("cuda.toml");
-        let snap = tmp.path().join("snap");
-        let opts = CudaNativeEngineOptions {
-            device: "cuda:0".to_string(),
-            mxfp4_moe: "bf16".to_string(),
-            ..Default::default()
-        };
-
-        write_cuda_startup_toml(&out, &opts, DTYPE, &snap, 0, None, CONFIG).unwrap();
-
-        let text = std::fs::read_to_string(&out).unwrap();
-        let val: toml::Value = toml::from_str(&text).unwrap();
-        assert!(val["model"].get("mxfp4_moe").is_none());
-    }
-
-    #[test]
-    fn cuda_startup_toml_emits_distributed_block_for_tp() {
-        let tmp = tempfile::tempdir().unwrap();
-        let out = tmp.path().join("cuda.toml");
-        let snap = tmp.path().join("snap");
-        let opts = CudaNativeEngineOptions {
-            device: "cuda:1".to_string(),
-            ..Default::default()
-        };
-        let tp = TpLaunch {
-            size: 2,
-            rank: 1,
-            nccl_unique_id_hex: "abcd".to_string(),
-        };
-
-        write_cuda_startup_toml(&out, &opts, DTYPE, &snap, 4, Some(&tp), CONFIG).unwrap();
-
-        let text = std::fs::read_to_string(&out).unwrap();
-        let val: toml::Value = toml::from_str(&text).unwrap();
-        assert_eq!(val["distributed"]["tp_size"].as_integer().unwrap(), 2);
-        assert_eq!(val["distributed"]["tp_rank"].as_integer().unwrap(), 1);
-        assert_eq!(
-            val["distributed"]["nccl_unique_id_hex"].as_str().unwrap(),
-            "abcd",
-        );
-        assert!(
-            val["distributed"].get("startup_barrier_path").is_none(),
-            "startup_barrier_path no longer emitted (replaced by in-process std::barrier)"
-        );
-    }
-
-    /// The checkpoint's config travels beside the bootstrap TOML — always.
-    ///
-    /// This used to assert the other half too: that the key is *absent* for a
-    /// snapshot, which is what let each engine keep a `config.json` parser for
-    /// the absent case. `weights.rs` lifts a snapshot's config now, so there
-    /// is no absent case to pin and the parsers are gone. The writers still
-    /// take it as an argument rather than deriving it from the path — lifting
-    /// it is the resolver's job, done once — so this is about the *contract*,
-    /// not about where the bytes came from.
-    ///
-    /// The Metal and Vulkan writers were pinned here beside it, taking the
-    /// same argument; both left with the engines that read them.
-    #[test]
-    fn the_startup_toml_always_carries_the_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let snapshot = dir.path().join("snap");
-        std::fs::create_dir(&snapshot).unwrap();
-        let body = br#"{"version":"pie.model/1","hidden_size":64}"#;
-
-        let out = dir.path().join("cuda").join("engine.toml");
-        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
-        let cuda = CudaNativeEngineOptions::default();
-        write_cuda_startup_toml(&out, &cuda, DTYPE, &snapshot, 0, None, body).unwrap();
-
-        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
-        let carried = doc["model"]
-            .get("config")
-            .and_then(|v| v.as_str())
-            .map(|path| std::fs::read(path).unwrap());
-        assert_eq!(carried.as_deref(), Some(body.as_slice()));
     }
 }

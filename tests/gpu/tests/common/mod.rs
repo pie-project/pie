@@ -81,17 +81,12 @@ pub fn cuda_standalone_toml_capped(
     gpu_mem_utilization: f64,
     total_pages: u32,
 ) -> String {
-    // cpu_pages (the runtime KV stash pool for suspend/restore) is derived from
-    // the cuda engine's `swap_pool_size` (translate.rs:117). MANDATORY > 0 for
-    // suspend/restore (with swap_pool_size=0 the runtime cpu_pages=0 → every suspend is
-    // all-cold → the fix makes suspends inert (freed_now=0 → decline), and pre-fix
-    // it silently dropped written KV → "slot 0 has no written page"). Default 512
-    // (host RAM is cheap; must hold the fleet's stashed overage). Override via
-    // PIE_KV_CPU_PAGES.
-    let swap_pool_size: u32 = std::env::var("PIE_KV_CPU_PAGES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(512);
+    // `swap_pool_size` STOOD HERE (with a PIE_KV_CPU_PAGES override): it fed
+    // the runtime's cpu_pages stash pool for suspend/restore while the boot
+    // document carried it to the C++ engine. The key retired with that
+    // document -- `crates/worker/src/translate.rs` states `cpu_pages: 0` for
+    // every engine, so there is no host stash to size and a config stating the
+    // key refuses by name.
     format!(
         "         [server]\n\
          port = 0\n\
@@ -105,8 +100,7 @@ pub fn cuda_standalone_toml_capped(
          device = [\"cuda:0\"]\n\
          \n\
          gpu_mem_utilization = {gpu_mem_utilization}\n\
-         {cap}\
-         swap_pool_size = {swap_pool_size}\n",
+         {cap}",
         // Omitted rather than zeroed: `0 = derive` was retired when the
         // sentinels went, and `max_total_pages` is an Option now -- absence IS
         // the request to derive from gpu_mem_utilization.
@@ -197,7 +191,11 @@ pub fn resolve_qwen35_snapshot() -> Result<String> {
 /// [`cuda_standalone_toml`] but `name = "default"` so the engine auto-detects
 /// the architecture (GDN + MTP head) from the snapshot's `config.json` rather
 /// than being pinned to the dense `qwen3` path.
-pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
+/// `mtp_num_drafts` is gone from the TOML: the key retired with the boot
+/// document (no engine read it), so K has no config spelling and the engine's
+/// own draft-window default rules. The parameter is kept so the A/B harnesses
+/// keep their call shape and their logs keep saying which arm was asked for.
+pub fn cuda_mtp_standalone_toml(hf_repo: &str, _mtp_num_drafts: u32) -> String {
     format!(
         "         [server]\n\
          port = 0\n\
@@ -210,16 +208,15 @@ pub fn cuda_mtp_standalone_toml(hf_repo: &str, mtp_num_drafts: u32) -> String {
          type = \"cuda_native\"\n\
          device = [\"cuda:0\"]\n\
          \n\
-         gpu_mem_utilization = 0.85\n\
-         mtp_num_drafts = {mtp_num_drafts}\n"
+         gpu_mem_utilization = 0.85\n"
     )
 }
 
 /// Boot the embedded standalone with the real CUDA engine against
-/// [`QWEN35_0_8B_REPO`]. K (native draft tokens) is `mtp_num_drafts`, passed
-/// through `[model.engine.options]` like any other engine setting -- 0 disables
-/// speculation and gives the non-spec baseline. Client edge at
-/// `handle.listen_addr`.
+/// [`QWEN35_0_8B_REPO`]. K (native draft tokens) no longer crosses --
+/// `mtp_num_drafts` retired with the boot document, so the argument only
+/// names which arm the caller intended (see `cuda_mtp_standalone_toml`).
+/// Client edge at `handle.listen_addr`.
 pub async fn boot_cuda_mtp(mtp_num_drafts: u32) -> Result<pie::StandaloneHandle> {
     let snapshot = resolve_qwen35_snapshot()?;
     let (controller, gateway, worker) =
@@ -252,8 +249,7 @@ pub fn serving_standalone_toml(checkpoint: &str) -> String {
          kv_page_size = 16\n\
          max_forward_tokens = 512\n\
          max_forward_requests = 8\n\
-         max_total_pages = 2048\n\
-         swap_pool_size = 0\n"
+         max_total_pages = 2048\n"
     )
 }
 
@@ -322,8 +318,9 @@ pub async fn boot_serving_frame(frame_size: Option<u32>) -> Result<pie::Standalo
 }
 
 /// K for the MTP suites, from `PIE_MTP_DRAFT_TOKENS`. A harness parameter, not
-/// runtime config: it selects which arm of a manual A/B to boot, and is handed
-/// to the engine as `mtp_num_drafts`.
+/// runtime config: it selects which arm of a manual A/B to boot. It used to be
+/// handed to the engine as `mtp_num_drafts`; that key retired with the boot
+/// document, so it now only labels the run.
 pub fn mtp_draft_tokens(default_k: u32) -> u32 {
     std::env::var("PIE_MTP_DRAFT_TOKENS")
         .ok()

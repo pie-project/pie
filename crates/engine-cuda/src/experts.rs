@@ -1795,6 +1795,27 @@ pub enum Fill {
     /// and give up this arm's whole reason to exist, or narrow the promise so
     /// the image is never hashed. The first is the cheap one — the padding is
     /// a spec MUST of `0x00` in the file and a `memset` per plane here.
+    ///
+    /// # AND THE TRAP IS THIS ARM'S ALONE, WHICH DECIDES THE PORT ORDER
+    ///
+    /// The mac-engine session drew the line while briefing their own warm arm
+    /// and it is the sharper statement: **it is not the `.zt` that lacks the
+    /// padding, it is the COPY.** A reader that BINDS the artifact's own
+    /// mapping sees the file's real bytes in every gap — and those bytes are
+    /// `0x00`, because §2.4 makes inter-blob padding a spec MUST. Only a
+    /// reader that SCATTERS into a buffer it allocated leaves gaps nobody
+    /// wrote.
+    ///
+    /// [`Fill::Deferred`] binds: it serves each T1 image out of the mapping
+    /// where it lies. So it carries no padding trap at all and ports on the
+    /// strength of `Artifact::part` alone.
+    ///
+    /// [`Fill::Restored`] copies into page-locked memory it did not zero.
+    /// That is the one that owes the `memset`, and it owes it precisely
+    /// BECAUSE it is the arm whose reason for existing is not zeroing.
+    ///
+    /// Port order follows: the binding arm first, because it is the one with
+    /// no hazard, and the copying arm second with its padding written.
     Restored,
     /// **THE DEFERRED SEAT** (§L.1, phase L-1): no page-locked image at all,
     /// yet. The tier serves each T1 image out of the artifact where it lies,

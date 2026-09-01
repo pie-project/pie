@@ -403,22 +403,20 @@ fn check_gpus() -> Vec<(String, String, Status)> {
 /// measured?
 ///
 /// The plan's §7 makes this mandatory rather than nice. `pie config tune`
-/// writes both of the things below: its first stage measures the forward shape
-/// and its second the batching knobs. A machine where it has not run gets the
-/// analytic planner's judgement, which is a model of the machine rather than
-/// the machine.
+/// measures the batching knobs on this machine; the forward-shape keys are
+/// stated by the operator or left to the engine's own defaults. A machine
+/// where neither has happened runs on numbers measured somewhere else.
 /// That is a perfectly serviceable state -- it is what every deployment has had
 /// until now -- but it is not one an operator should have to infer from the
 /// absence of keys in a file.
 ///
 /// Warnings, never failures. An unmeasured machine serves.
 ///
-/// This briefly grew a blocking check for a `calibrate_planner` left on in the
-/// config. The check is gone because what it guarded is gone: calibration is a
-/// stage of `pie config tune` now, set on a config derived in memory, and
-/// the key is `#[serde(skip)]` — a file cannot carry it, so it cannot be left
-/// on. Guarding a state that no longer exists is how a checklist grows a step
-/// nobody can explain.
+/// Two checks retired from here, each because what it guarded is gone: a
+/// blocking check for a `calibrate_planner` left on in the config (the key
+/// became unwritable, then left the config altogether), and a "planner
+/// profile" row over `cuda_memory_profiles.json` (the planner that wrote and
+/// read that file left with the boot document).
 fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> {
     let file: toml::Value = std::fs::read_to_string(config_path)
         .ok()
@@ -452,7 +450,8 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
         )),
         (None, None) => checks.push((
             "forward shape".to_string(),
-            "derived by the planner's analytic score (`pie config tune --for ...`)".to_string(),
+            "derived from the engine's own defaults; state them to pin this machine's shape"
+                .to_string(),
             Status::Warn,
         )),
     }
@@ -478,28 +477,6 @@ fn check_tuning(config_path: &std::path::Path) -> Vec<(String, String, Status)> 
             "batching".to_string(),
             format!("{} of 3 knobs set in this config", pinned.len()),
             Status::Pass,
-        )
-    });
-
-    // The engine's own measurement, keyed by (device, model, tp, kv format) --
-    // so its mere presence is not proof it applies HERE. Saying "measured on
-    // some machine" would be worse than saying nothing, hence the wording.
-    let profile_cache = worker::state::planner_profile_path();
-    checks.push(if profile_cache.is_file() {
-        (
-            "planner profile".to_string(),
-            format!(
-                "{} exists; the engine checks its key at boot",
-                crate::ui::short_path(&profile_cache)
-            ),
-            Status::Pass,
-        )
-    } else {
-        (
-            "planner profile".to_string(),
-            "none; the forward step has never been timed here (`pie config tune` measures it)"
-                .to_string(),
-            Status::Warn,
         )
     });
 

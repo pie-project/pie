@@ -156,35 +156,56 @@ impl Graph {
         self.raw
     }
 
-    /// How many nodes it recorded.
+    /// How many NODES it recorded, or `None` when the driver would not say.
     ///
-    /// Reported, not used: it is the number the rebind arithmetic of decision
-    /// #15 would be multiplied by (~0.11 µs per node, measured in
-    /// `tart/evidence/layout_planning.md`), and the honest way to compare a
-    /// per-fire rebind against a per-key capture is to say it out loud.
+    /// Reported, and read by one caller that must not misread it: it is the
+    /// number the rebind arithmetic of decision #15 would be multiplied by
+    /// (~0.11 µs per node, measured in `tart/evidence/layout_planning.md`),
+    /// and it is what `record::Graphs::fire_body` asks to find a captured
+    /// stretch that holds nothing.
+    ///
+    /// # A REFUSED QUERY IS NOT AN EMPTY GRAPH, AND CONFLATING THEM ARMED
+    /// EMPTY BODIES
+    ///
+    /// The count used to come from the RUNTIME spelling with an `else { 0 }`
+    /// under it, while [`crate::device::conditional`] records
+    /// `CU_GRAPH_NODE_TYPE_CONDITIONAL` through the DRIVER one — a node type
+    /// the runtime query cannot represent and refuses. `record`'s capture loop
+    /// read that refusal as "this stretch recorded nothing" and dropped the
+    /// stretch, so every body holding a conditional was seated with an EMPTY
+    /// SCRIPT, counted armed at load, and then "replayed" by launching
+    /// nothing at all: the fire was reported served and the caller read
+    /// whatever the readout rectangle held from the last fire that wrote it.
+    /// Deterministic, coherent, and with no fault anywhere and no counter
+    /// moving — which is why it took a gate that checks its own baseline
+    /// twice to see it.
+    ///
+    /// `cuGraphGetNodes` is the spelling [`crate::device::conditional`]
+    /// already committed this module to, for the reason its header states:
+    /// the `cu*` names are present and identical under both runtimes this
+    /// crate builds for, and the `cuda*` ones are not. The `Option` is the
+    /// other half — it keeps "no nodes" and "no answer" apart AT EVERY
+    /// CALLER, so the day a third node type outruns a query the answer is a
+    /// `None` somebody has to handle rather than a zero that reads as a
+    /// verdict.
     #[must_use]
-    pub fn nodes(&self) -> usize {
+    pub fn nodes(&self) -> Option<usize> {
         #[cfg(feature = "_cuda")]
         {
+            use cudarc::driver::sys as dr;
+
             let mut count: usize = 0;
             // SAFETY: a null node array with a live count is the documented
-            // way to ask for the count alone.
-            let status = unsafe {
-                cudarc::runtime::sys::cudaGraphGetNodes(
-                    self.raw.cast(),
-                    core::ptr::null_mut(),
-                    &raw mut count,
-                )
+            // way to ask for the count alone, and `raw` is this graph's
+            // handle — a `cudaGraph_t` and a `CUgraph` are one pointer.
+            let code = unsafe {
+                dr::cuGraphGetNodes(self.raw.cast(), core::ptr::null_mut(), &raw mut count)
             };
-            if status == cudarc::runtime::sys::cudaError::cudaSuccess {
-                count
-            } else {
-                0
-            }
+            (code == dr::CUresult::CUDA_SUCCESS).then_some(count)
         }
         #[cfg(not(feature = "_cuda"))]
         {
-            0
+            None
         }
     }
 
@@ -194,7 +215,7 @@ impl Graph {
     /// turns a `cudaEventRecord` and the `cudaStreamWaitEvent` behind it into
     /// a DEPENDENCY between the launches on either side rather than into nodes
     /// of their own, which is exactly the lowering one wants and exactly what
-    /// makes `cudaGraphGetNodes` answer the same number for a sequential
+    /// makes `cuGraphGetNodes` answer the same number for a sequential
     /// capture and a forked one. The topology is where the difference lives: a
     /// capture on one stream is a chain, `N` nodes and `N-1` edges, and every
     /// fork/join pair adds one edge that the chain does not have while
@@ -203,15 +224,25 @@ impl Graph {
     /// So this is what a measurement asks to say its two arms are two
     /// different graphs, and it is the only thing on either handle that a
     /// mis-wired side stream could not fake.
+    ///
+    /// **`None` FOR A QUERY THE DRIVER REFUSED**, and driver-spelled, for
+    /// [`nodes`](Graph::nodes)' reasons in full: the two counts are one
+    /// question asked of one graph, and a graph whose nodes cannot be
+    /// enumerated cannot have its edges enumerated either.
     #[must_use]
-    pub fn edges(&self) -> usize {
+    pub fn edges(&self) -> Option<usize> {
         #[cfg(feature = "_cuda")]
         {
+            use cudarc::driver::sys as dr;
+
             let mut count: usize = 0;
-            // SAFETY: two null endpoint arrays with a live count is the
-            // documented way to ask for the count alone.
-            let status = unsafe {
-                cudarc::runtime::sys::cudaGraphGetEdges(
+            // SAFETY: null endpoint (and edge-data) arrays with a live count
+            // is the documented way to ask for the count alone, on this
+            // graph's own handle. This cudarc ships only the `_v2` spelling,
+            // whose extra argument is the per-edge data array — null here for
+            // the same reason the endpoints are.
+            let code = unsafe {
+                dr::cuGraphGetEdges_v2(
                     self.raw.cast(),
                     core::ptr::null_mut(),
                     core::ptr::null_mut(),
@@ -219,15 +250,11 @@ impl Graph {
                     &raw mut count,
                 )
             };
-            if status == cudarc::runtime::sys::cudaError::cudaSuccess {
-                count
-            } else {
-                0
-            }
+            (code == dr::CUresult::CUDA_SUCCESS).then_some(count)
         }
         #[cfg(not(feature = "_cuda"))]
         {
-            0
+            None
         }
     }
 
@@ -259,7 +286,12 @@ impl Graph {
             }
             let exec = GraphExec {
                 raw: raw.cast(),
-                nodes: self.nodes(),
+                // **A COUNT THE DRIVER WOULD NOT GIVE IS REPORTED AS ZERO AND
+                // DECIDES NOTHING** ([`Graph::nodes`]). This field is the
+                // boot line's census and the rebind arithmetic's multiplier;
+                // the one reader that acts on the count asks `Graph::nodes`
+                // itself and handles the `None`.
+                nodes: self.nodes().unwrap_or(0),
             };
             // SAFETY: the exec was just created and the stream is the shell's.
             unsafe {

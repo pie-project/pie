@@ -18,7 +18,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use controller_api::{ControlClient, Role, WorkerInfo};
 use ids::WorkerId;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config;
 use crate::embedded_engine::{EngineCapabilities, EngineOptions};
@@ -207,10 +207,6 @@ impl WorkerHandle {
             WorkerKind::Decode(engine) => engine.shutdown().await,
             WorkerKind::Executor(executor) => executor.shutdown().await,
         }
-        // The bootstrap TOMLs under `$PIE_HOME/standalone/<pid>` are read once at
-        // engine creation and never again, so they are dead the moment the
-        // engines are down. The boot sweep covers the unclean exits.
-        crate::embedded_engine::remove_launch_state();
     }
 }
 
@@ -420,26 +416,14 @@ fn model_identity(
     hasher.update(format!("{:?}", user_cfg.model.engine.kind).as_bytes());
     hasher.update(user_cfg.model.engine.activation_dtype.as_bytes());
     // A `[model]` key rather than an engine option: what the checkpoint holds
-    // is a fact about the weights, so it discriminates for every kind and is
-    // read off the model rather than out of the options bag below.
+    // is a fact about the weights, so it discriminates for every kind.
     hasher.update(user_cfg.model.weight_dtype.as_bytes());
-    match user_cfg.model.engine.kind {
-        config::EngineKind::CudaNative => {
-            let options: config::CudaNativeEngineOptions =
-                toml::Value::Table(user_cfg.model.engine.options.clone())
-                    .try_into()
-                    .context("normalizing CUDA options for model identity")?;
-            hasher.update(options.runtime_quant.as_bytes());
-            hasher.update(options.mxfp4_moe.as_bytes());
-        }
-        // Nothing to add for any of the three. The identity already carries
-        // the kind itself, and none of them has an option that changes what
-        // the weights ARE -- no requantization, no expert lowering choice, and
-        // wgpu's one knob is a page count that sizes a pool. An option folded
-        // in here would make two runs that serve the same bytes trade no
-        // cached layout.
-        config::EngineKind::Metal | config::EngineKind::Vulkan | config::EngineKind::Wgpu => {}
-    }
+    // And nothing from the engine options, for any kind. The identity already
+    // carries the kind itself, and no option changes what the weights ARE. A
+    // CUDA arm stood here folding in `runtime_quant` and `mxfp4_moe` from the
+    // days an engine requantized by them; once those keys reached nothing,
+    // the fold-in was pure harm -- an option folded in here makes two runs
+    // that serve the same bytes trade no cached layout.
     Ok(crate::executor::ModelIdentity {
         hash: *hasher.finalize().as_bytes(),
         component,
@@ -533,35 +517,16 @@ fn load_model_engines(
     user_cfg: &config::Config,
     component: crate::executor::ModelComponent,
 ) -> Result<LoadedModelEngines> {
-    // Process housekeeping, once per boot and before anything writes under
-    // `$PIE_HOME/standalone/<pid>`: reclaim the directories left by launches
-    // that did not exit cleanly.
-    crate::embedded_engine::sweep_stale_launch_state();
-
-    // Every engine-side disk cache derives from this. Resolved here because
-    // `$PIE_HOME` is the worker layer's to know; the engine has never been
-    // told it, which is the only reason those caches used to sit under XDG.
-    crate::embedded_engine::set_cache_dir(
-        crate::state::engine_cache_dir()
-            .to_string_lossy()
-            .into_owned(),
-    );
-
-    // Resolve the weight-artifact directory here, before any engine bootstrap
-    // TOML is written. `$PIE_HOME` is this layer's to know: the engine has
-    // never been told it, which is why the old env-var form fell back to XDG.
-    // The rule itself is `embedded_engine::resolved_weight_cache_dir`, because
-    // `pie model import` reads the same answer to decide whether it has
-    // anywhere to prepare into (§M wave M-1).
-    crate::embedded_engine::set_weight_cache_dir(
-        crate::embedded_engine::resolved_weight_cache_dir(user_cfg),
-    );
-
-    // **AND THE SHARED-ADAPTER MOUNT, IF THE OPERATOR STATED ONE** (alto
-    // adapter §3.3). Unlike the two above there is no derivation and no
-    // default: an unstated mount is the feature OFF, because a directory pie
-    // invented would be a namespace of adapters nobody wrote.
-    crate::embedded_engine::set_adapter_dir(user_cfg.model.adapter_dir.clone());
+    // Every engine-side disk cache derives from these two, resolved once here
+    // because `$PIE_HOME` is the worker layer's to know — the engine has never
+    // been told it, which is the only reason those caches used to sit under
+    // XDG. Both cross as `DeviceBoot` fields, threaded down through
+    // `create_engine_group`; the weight rule itself is
+    // `embedded_engine::resolved_weight_cache_dir`, because `pie model import`
+    // reads the same answer to decide where to prepare into (§M wave M-1).
+    let engine_cache_dir = crate::state::engine_cache_dir();
+    let weight_cache_dir =
+        PathBuf::from(crate::embedded_engine::resolved_weight_cache_dir(user_cfg));
 
     let (engine_groups, snapshot_dir, metadata) = {
         let m = &user_cfg.model;
@@ -591,7 +556,6 @@ fn load_model_engines(
 
         let mut embedded_base_opts = preflight::build_embedded_options(m, flavor)?;
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
-        apply_embedded_calibration(&mut embedded_base_opts, user_cfg.server.calibrate_planner);
         let resolved_model = weights::resolve(&m.model)
             .with_context(|| format!("resolving the model for {:?}", m.name))?;
         // A SECOND STEP STOOD HERE -- weights::prefer_runtime, which asked
@@ -605,15 +569,15 @@ fn load_model_engines(
         // was moving the family transforms offline, and that returns when a
         // command writes one again.
         //
-        // Lifted once, here, in one open. The engines get the compiled model
-        // config beside their bootstrap TOML; the runtime gets the whole of it.
-        // Nobody downstream re-opens the artifact or re-decides what it is —
-        // and for a snapshot, nobody re-parses `config.json`, which is what
-        // this one call replaced on both sides.
+        // Lifted once, here, in one open, and the runtime gets the whole of
+        // it through `ModelMetadata`. Nobody downstream re-opens the artifact
+        // or re-decides what it is — and for a snapshot, nobody re-parses
+        // `config.json`, which is what this one call replaced on both sides.
+        // The engines no longer get a copy at all: the `model.config.json`
+        // written beside their bootstrap TOML was read by nothing.
         let lifted = resolved_model
             .metadata()
             .with_context(|| format!("reading the model metadata for {:?}", m.name))?;
-        let config = lifted.config.clone();
         let snapshot_dir = resolved_model.path().to_path_buf();
         let mut group_engines: Vec<GroupEngine> = Vec::with_capacity(topology.len());
         for (group_idx, group) in topology.iter().enumerate() {
@@ -624,7 +588,8 @@ fn load_model_engines(
                 flavor,
                 &embedded_base_opts,
                 &snapshot_dir,
-                &config,
+                &weight_cache_dir,
+                &engine_cache_dir,
                 tp_degree,
                 component,
                 // **THE ONE RUN-AHEAD NUMBER, HANDED OVER AT THE LOAD** — the
@@ -1046,7 +1011,7 @@ async fn assemble_distributed<C: ControlLink>(
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "nine independent inputs to one engine launch; a struct here \
+    reason = "independent inputs to one engine launch; a struct here \
               would be a parameter list with a name"
 )]
 #[cfg_attr(
@@ -1065,7 +1030,8 @@ fn create_engine_group(
     flavor: Flavor,
     base_opts: &EngineOptions,
     snapshot_dir: &Path,
-    config: &[u8],
+    weight_cache_dir: &Path,
+    cache_dir: &Path,
     tp_degree: usize,
     component: crate::executor::ModelComponent,
     frames_in_flight: u8,
@@ -1074,14 +1040,13 @@ fn create_engine_group(
     {
         if flavor == Flavor::Cuda && tp_degree > 1 {
             let rank_opts = cuda_rank_options(m, group_idx, group, base_opts)?;
-            let tp_launches = crate::embedded_engine::tp_launches(rank_opts.len())?;
             return crate::embedded_engine::create_engine_backend_group(
                 &rank_opts,
-                &m.weight_dtype,
                 snapshot_dir,
-                config,
+                weight_cache_dir,
+                cache_dir,
+                m.adapter_mount().as_deref(),
                 group_idx,
-                &tp_launches,
                 component,
                 frames_in_flight,
                 &m.adapters,
@@ -1123,11 +1088,11 @@ fn create_engine_group(
 
     crate::embedded_engine::create_engine_backend(
         &opts,
-        &m.weight_dtype,
         snapshot_dir,
-        config,
+        weight_cache_dir,
+        cache_dir,
+        m.adapter_mount().as_deref(),
         group_idx,
-        None,
         component,
         frames_in_flight,
         &m.adapters,
@@ -1154,31 +1119,10 @@ fn embedded_opts_for_device(base_opts: &EngineOptions, device: String) -> Engine
     }
 }
 
-/// Carry a calibration request from the in-memory config onto the engine
-/// options, the same way `verbose` travels.
-///
-/// CUDA only, because it is the only engine with a memory planner to calibrate.
-/// A request against any other engine is silently nothing rather than an error:
-/// the caller asked for a measurement this backend does not have, and refusing
-/// the boot over it would be worse than doing the ordinary thing.
-fn apply_embedded_calibration(options: &mut EngineOptions, calibrate: bool) {
-    // ONE VARIANT OR SEVERAL, depending on the feature list. `if let` is
-    // how this reads "the CUDA options, if these are them", and in a build
-    // whose only engine is CUDA there is nothing else it could be -- so the
-    // pattern is irrefutable there and refutable everywhere else. The `if`
-    // is kept because the other builds need it.
-    #[cfg(feature = "_engine-cuda")]
-    #[allow(
-        irrefutable_let_patterns,
-        reason = "`EngineOptions` has one variant in a CUDA-only build"
-    )]
-    if let EngineOptions::CudaNative(opts) = options {
-        opts.calibrate_planner = calibrate;
-    }
-
-    #[cfg(not(feature = "_engine-cuda"))]
-    let _ = (options, calibrate);
-}
+// `apply_embedded_calibration` STOOD HERE, carrying `server.calibrate_planner`
+// onto the CUDA options the way `verbose` still travels below. Its own doc
+// called it "a request nobody hears" once the boot TOML went; the tune stage
+// that set it retired, so the carrier went too.
 
 fn apply_embedded_verbose(options: &mut EngineOptions, verbose: bool) {
     #[cfg(feature = "_engine-cuda")]

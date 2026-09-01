@@ -111,8 +111,8 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
         // NO DEVICE SELECTOR, unlike the arm above. `Shell::open` takes the
         // DEFAULT Metal 4 device and offers no way to name another, so filling
         // one in here would be a setting nothing acts on —
-        // `MetalEngineOptions::device` exists for the startup TOML an operator
-        // reads, and is `#[serde(skip)]` for the same reason.
+        // `MetalEngineOptions::device` fed the deleted startup TOML and now
+        // feeds nothing, and it is `#[serde(skip)]` for the same reason.
         #[cfg(all(feature = "engine-metal", target_vendor = "apple"))]
         Flavor::Metal => {
             let p: MetalEngineOptions = m

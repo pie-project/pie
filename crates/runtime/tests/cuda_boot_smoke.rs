@@ -10,14 +10,14 @@
 //! actually uses:
 //!
 //! ```text
-//!   backend::open::cuda(boot document)   -> Box<dyn Engine>
+//!   backend::open::cuda(DeviceBoot)      -> Box<dyn Engine>
 //!   engine::load::request(checkpoint)    -> LoadRequest { plan, .. }
 //!   Engine::load(request)                -> Loaded { facts, caps }
 //!   Engine::fire(Step{lanes})  -> FireTicket { readouts }
 //! ```
 //!
-//! Four things can be wrong here that no test under it can see: the boot
-//! document's device key does not reach the shell, the runtime's tracing door
+//! Four things can be wrong here that no test under it can see: the boot's
+//! device ordinal does not reach the shell, the runtime's tracing door
 //! picks the wrong SKU for a checkpoint, the `Capabilities` the load answers
 //! do not describe the load, and a `Step` the runtime builds is not
 //! one the shell composes. Each of them is a fire that runs and says the
@@ -41,7 +41,7 @@
 
 use std::path::{Path, PathBuf};
 
-use engine::{Budgets, Step, Lane, Readout};
+use engine::{Budgets, Lane, Readout, Step};
 use model_ir::Platform;
 use runtime::engine::backend::open;
 
@@ -117,9 +117,10 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    // 1. THE DOOR. A boot document, exactly the shape `worker` writes, and
-    //    the seam reads the one key it is about.
-    let mut engine = open::cuda(b"[model]\ndevice = \"cuda:0\"\n").expect("the cuda seam opens");
+    // 1. THE DOOR. A typed boot, exactly the struct `worker` assembles —
+    //    device 0, every knob the default.
+    let mut engine =
+        open::cuda(runtime::engine::backend::DeviceBoot::default()).expect("the cuda seam opens");
     assert_eq!(engine.kind(), "cuda");
     assert!(
         engine.device_facts().is_none(),
@@ -150,18 +151,17 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
     // still running and empty readouts, and the numbers are asked for — and
     // waited for — by name. One frame in flight because that is what this
     // gate does; a deeper ring would carve slots nothing ever claims.
-    let request =
-        runtime::engine::load::request(
-            &checkpoint,
-            Platform::Cuda,
-            budgets.clone(),
-            // Uncapped: every load in this workspace is fully resident
-            // (alto design §7 — the tiers are D2's).
-            engine::Residency::uncapped(),
-            0,
-            1,
-        )
-            .expect("the checkpoint identifies and its SKU traces");
+    let request = runtime::engine::load::request(
+        &checkpoint,
+        Platform::Cuda,
+        budgets.clone(),
+        // Uncapped: every load in this workspace is fully resident
+        // (alto design §7 — the tiers are D2's).
+        engine::Residency::uncapped(),
+        0,
+        1,
+    )
+    .expect("the checkpoint identifies and its SKU traces");
     assert_eq!(
         request.trace.name, SKU,
         "the checkpoint identifies as the row this smoke is about"
@@ -180,7 +180,7 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
     assert_eq!(
         caps.device.domain,
         engine::MemoryDomain::CudaDevice(0),
-        "the pages this load holds live on the device the boot document named"
+        "the pages this load holds live on the device the boot named"
     );
     assert_eq!(caps.pools.kv_page_size, budgets.page_size);
     assert_eq!(caps.limits.max_lanes, budgets.max_lanes);
@@ -210,9 +210,7 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
     // gated on real bytes; this line is only about the negotiation.
     assert!(caps.kv_copy.device_to_device);
     assert!(
-        !caps.kv_copy.device_to_host
-            && !caps.kv_copy.host_to_device
-            && !caps.kv_copy.host_to_host
+        !caps.kv_copy.device_to_host && !caps.kv_copy.host_to_device && !caps.kv_copy.host_to_host
     );
     assert!(matches!(
         engine.copy_kv(&Default::default()),
@@ -263,11 +261,16 @@ fn a_checkpoint_loads_through_the_contract_and_fires_once() {
         .expect("and the numbers door hands back what the fire computed");
 
     assert_eq!(ticket.steps.len(), 1, "one step in, one receipt out");
-    assert_eq!(ticket.steps[0].readouts.len(), 1, "one lane in, one readout out");
+    assert_eq!(
+        ticket.steps[0].readouts.len(),
+        1,
+        "one lane in, one readout out"
+    );
     let readout = &ticket.steps[0].readouts[0];
     assert_eq!(readout.rows, 1, "`Readout::Last` is one row");
     assert_eq!(
-        readout.width as usize, readout.values.len(),
+        readout.width as usize,
+        readout.values.len(),
         "the readout's stated width is the values it carries"
     );
     assert_eq!(

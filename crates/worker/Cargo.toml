@@ -171,8 +171,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # TEXT in a `//!` census, which is prose about another crate's message and
 # needs no edge. `[build-dependencies]` stood below it with no entries, which
 # is a section header for a `build.rs` this crate does not have.
-
-# `kill(pid, 0)` for the stale-launch-state sweep: reachability only, never a
-# signal. Unix-only; the sweep is a no-op elsewhere.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"

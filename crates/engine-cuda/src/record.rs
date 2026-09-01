@@ -3029,10 +3029,25 @@ impl Graphs {
     /// synthetic fires refused, declined or were evicted before the loop
     /// looked, and the caller counts it as unarmed for the same reason it
     /// asks the cache rather than the return value of the fire.
+    ///
+    /// **AND NOTHING THE LOAD ARMS MAY BE EMPTY** (the empty-script wave).
+    /// The boot line's `armed a of b` is the sentence an operator trusts when
+    /// they stop looking, so it is the one place where "a key the map holds"
+    /// and "a key that will launch something" must be the same claim. The
+    /// capture refuses to seat an empty script at all
+    /// ([`Graphs::fire_body`]), which makes this an assertion rather than a
+    /// branch: a `false` here would mean the map grew an entry down a path
+    /// that is not the capture.
     pub fn body_armed(&mut self, key: &BodyKey) -> bool {
         let Some(body) = self.bodies.get_mut(key) else {
             return false;
         };
+        debug_assert!(
+            !body.script.is_empty(),
+            "the arming pass is about to count {key} armed and its body holds no steps; \
+             a load that armed it would report every fire of that composition served \
+             while launching nothing",
+        );
         body.pinned = true;
         self.bstats.armed_at_load += 1;
         true
@@ -3254,21 +3269,30 @@ impl Graphs {
         // now, so a fire whose total did not grow can still ask a region for
         // more rows than the grid the capture froze. The comparison walks the
         // same (region, run) pairs the capture wrote and allocates nothing.
-        let (short, moved) = match self.bodies.get(&key) {
+        let (short, moved, empty) = match self.bodies.get(&key) {
             Some(body) => {
                 let short = grew_past(&body.grids, at, &carve);
                 // Counted where the shape is the WHOLE reason. A body that is
                 // also too short walks for `Body::grids`'s reason and
                 // re-captures either way, and tallying it here would blur the
                 // one number thrash has to show up in.
-                (short, !short && body.shape != shape)
+                //
+                // **AND THE THIRD WORD IS THE BELT** (the empty-script wave):
+                // a resident body with no steps launches nothing, and a fire
+                // that launches nothing must never be reported served. The
+                // capture refuses to seat one at all now, so nothing should
+                // ever reach this line holding one; the clause stands because
+                // the failure it refuses is silent in every other reading —
+                // the hit is counted, the frame settles, and the caller reads
+                // the last fire's readout rectangle.
+                (short, !short && body.shape != shape, body.script.is_empty())
             }
-            None => (false, false),
+            None => (false, false, false),
         };
         if moved {
             self.bstats.reshapes += 1;
         }
-        let replays = !short && !moved;
+        let replays = !short && !moved && !empty;
         if replays && let Some(body) = self.bodies.get_mut(&key) {
             // **THE HIT PATH, AND SINCE THE TIER-2 CAMPAIGN IT IS A SCRIPT
             // RATHER THAN A LIST OF EXECS** ([`Body::script`]). One host
@@ -3325,6 +3349,17 @@ impl Graphs {
                  for. `Windows::admits` is a function of the key, so two fires of one \
                  key cut the template in the same places; if they did not, the \
                  admissibility table has grown an input the key does not carry",
+            );
+            // **AND A SCRIPT OF NOTHING NEVER GETS HERE** (the empty-script
+            // wave). The word above already refuses it and the capture
+            // refuses to seat one; this says so where the launches are, so
+            // that a build with assertions on names the body rather than
+            // running a loop that turns zero times and returns "served".
+            debug_assert!(
+                !body.script.is_empty(),
+                "the resident body for {key} holds no steps, so replaying it launches \
+                 nothing and reports the fire served — the caller would read whatever \
+                 the readout rectangle held from the last fire that ran",
             );
             for step in &body.script {
                 match step {
@@ -3485,7 +3520,18 @@ impl Graphs {
             // call to do nothing. Dropped here rather than launched, which is
             // also what keeps a one-segment SKU at exactly one exec however
             // its prepare regions were admitted.
-            if graph.nodes() == 0 {
+            //
+            // **AND ONLY ON A COUNT THE DRIVER ACTUALLY GAVE.** `Some(0)` and
+            // not `== 0`: a stretch this build cannot COUNT is not a stretch
+            // it may drop, and the only honest reading of a refused query is
+            // "unknown". Dropping on unknown is what armed EMPTY BODIES — a
+            // conditional node is recorded through the driver API and the
+            // runtime count could not represent it, so a captured stretch
+            // holding one read as zero, was dropped, and left a key seated
+            // with a script that launches nothing
+            // ([`crate::device::graph::Graph::nodes`] carries the whole of
+            // it). The pin below is the belt; this line is the fix.
+            if graph.nodes() == Some(0) {
                 continue;
             }
             // **AND THE ONE INSTANTIATION IS WEIGHED AS IT IS MADE**
@@ -3508,7 +3554,10 @@ impl Graphs {
                 bytes += before.saturating_sub(after);
             }
             nodes += exec.nodes();
-            edges += graph.edges();
+            // Report-only, so a refused query charges nothing here for the
+            // reason the byte reading above charges nothing: the census
+            // under-reports and no decision is taken on it.
+            edges += graph.edges().unwrap_or(0);
             steps.push(Step::Exec(exec));
             if self.keep {
                 self.kept.push((key.clone(), graph));
@@ -3517,6 +3566,39 @@ impl Graphs {
         self.last_capture.nodes = nodes;
         self.last_capture.edges = edges;
         self.last_capture.islands = islands;
+        // ── **A BODY WHOSE SCRIPT IS EMPTY IS NOT A BODY** (the empty-script
+        //    wave), and this is the pin the campaign was missing.
+        //
+        //    Every stretch was dropped and no island was cut, so a "hit" on
+        //    this key would walk a `Vec` of nothing, launch nothing, and
+        //    return — and `fire_body` would count it a HIT and the shell
+        //    would report the fire SERVED. What the caller then reads is the
+        //    readout rectangle as the last fire that actually ran left it:
+        //    coherent logits, deterministic, drifting one fire behind, with
+        //    no fault raised and no counter moved. That is the worst shape a
+        //    cache can fail in, and nothing above this line refused it: the
+        //    capture loop drops empty stretches by design, `insert_body`
+        //    weighs bytes rather than steps, and `Graphs::body_armed` asks
+        //    only whether the map holds the key.
+        //
+        //    So the key is refused through the door every other refusal uses
+        //    ([`Graphs::body_refuse`]): `Shell::prepare` reads
+        //    `body_refused` before it calls a fire bodied, so every later
+        //    fire of this composition walks EAGERLY for the life of the load
+        //    — which is the right answer and the one the eager pass three
+        //    phases up already produced — and the boot line reports the key
+        //    in the refused column instead of the armed one, because
+        //    `body_armed` will not find it.
+        //
+        //    **IT IS A REFUSAL AND NOT A RETRY.** What made the script empty
+        //    is a property of the KEY's template — which regions it holds and
+        //    what the driver will say about them — not of this fire, so a
+        //    second attempt would spend `WARM_FIRES` walks and a capture to
+        //    learn the same thing again.
+        if steps.is_empty() {
+            self.body_refuse(key);
+            return Ok(());
+        }
         let grids = launch_grids(at, &carve);
         let _ = self.insert_body(key, Body {
             script: steps.into_boxed_slice(),
@@ -3620,6 +3702,20 @@ impl Graphs {
     /// [`BodyTally::evictions`] has already been moved, so nothing claims a
     /// capture that is not in the map.
     fn insert_body(&mut self, key: BodyKey, body: Body) -> bool {
+        // **THE MAP HOLDS NO EMPTY BODY** (the empty-script wave). This is the
+        // one door into `bodies`, so it is where the invariant can be stated
+        // as a fact about the map rather than as a habit of its caller:
+        // whatever seats a key here, a fire that finds it will launch
+        // something. [`Graphs::fire_body`] already refuses an empty capture
+        // by name — this is the belt under it, and it is the clause a host
+        // test can hold without a device.
+        //
+        // Neither counter moves. An empty body is not a capture (nothing was
+        // recorded) and not an eviction (nothing was in the way); the refusal
+        // that names it is the one `fire_body` took.
+        if body.script.is_empty() {
+            return false;
+        }
         // **A REPLACEMENT IS NOT AN INSERT.** This key already holds a body
         // that is too short for the traffic (`Body::grids`), so what happens
         // here is a swap: the map does not grow, the eviction order does not
@@ -4362,7 +4458,11 @@ mod tests {
     /// simply the one the census has to add up.
     fn weighing(bytes: usize) -> Body {
         Body {
-            script: Vec::new().into_boxed_slice(),
+            // One island step: a script must not be empty (`insert_body`'s
+            // refusal is the pin these tests now live under), and an island
+            // is the one step a host test can build without a device.
+            script: vec![Step::Island(Cut { unit: 0, from: 0, upto: 1, island: true })]
+                .into_boxed_slice(),
             grids: Vec::new().into_boxed_slice(),
             shape: 0,
             // Never launched, so `Airborne::settled_past` answers `true` and
@@ -4606,5 +4706,59 @@ mod tests {
                 "a ceiling under the live rows is a launch that stops short",
             );
         }
+    }
+    /// **A BODY WHOSE SCRIPT IS EMPTY IS NEVER SEATED AND NEVER COUNTED
+    /// ARMED** — the empty-script wave's host gate.
+    ///
+    /// The fault this holds down was found by
+    /// `tests/gpu/tests/cuda_width_invariance`'s own baseline check, which is
+    /// the wrong place to find it: a captured stretch whose node count the
+    /// driver refused to give read as "recorded nothing", every stretch of
+    /// the body was dropped, and the key was seated with a script of zero
+    /// steps. A fire of that key then "replayed" it by walking a `Vec` that
+    /// turns zero times — launching nothing, counting a HIT, and settling a
+    /// frame whose readout rectangle still held the last fire that ran. Two
+    /// identical fires answered differently, deterministically, with no fault
+    /// raised and no counter moved.
+    ///
+    /// [`Graphs::fire_body`] refuses such a capture by name now
+    /// ([`Graphs::body_refuse`]) and [`Graphs::insert_body`] is the belt.
+    /// This asks the belt, because it is the one that can be asked without a
+    /// device — and it asks the three things an operator's trust rests on:
+    /// the map does not hold it, the boot line cannot count it armed, and
+    /// nothing was counted a capture.
+    #[test]
+    fn the_map_never_seats_a_body_whose_script_is_empty() {
+        let mut graphs = Graphs::new();
+        let classes = table(&[(8, 1)]);
+        let key = BodyKey::of(&classes, 8, &prefill_only(), LANES);
+        let empty = Body {
+            script: Box::new([]),
+            grids: Box::new([]),
+            shape: 0,
+            launched_at: crate::settle::Airborne::NEVER,
+            pinned: false,
+            bytes: 0,
+        };
+
+        assert!(
+            !graphs.insert_body(key.clone(), empty),
+            "the map seated a body with no steps: a fire of {key} would launch nothing \
+             and be reported served",
+        );
+        assert!(
+            !graphs.holds_body(&key),
+            "an empty body was refused a seat and the map holds it anyway",
+        );
+        assert!(
+            !graphs.body_armed(&key),
+            "the arming pass would count {key} armed, and the boot line's `armed a of b` \
+             is the sentence an operator stops looking at",
+        );
+        assert_eq!(
+            graphs.body_stats().tally.captures,
+            0,
+            "an empty body is not a capture: nothing was recorded",
+        );
     }
 }

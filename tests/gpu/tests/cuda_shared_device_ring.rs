@@ -109,10 +109,7 @@ fn putter() -> TraceContainer {
         ports: Vec::new(),
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
-            ops: vec![
-                Op::ChanTake(0),
-                Op::ChanPut { chan: 1, value: 0 },
-            ],
+            ops: vec![Op::ChanTake(0), Op::ChanPut { chan: 1, value: 0 }],
         }],
     }
 }
@@ -143,10 +140,7 @@ fn taker() -> TraceContainer {
         ports: Vec::new(),
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
-            ops: vec![
-                Op::ChanTake(0),
-                Op::ChanPut { chan: 1, value: 0 },
-            ],
+            ops: vec![Op::ChanTake(0), Op::ChanPut { chan: 1, value: 0 }],
         }],
     }
 }
@@ -167,19 +161,13 @@ fn loop_carried() -> TraceContainer {
         ports: Vec::new(),
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
-            ops: vec![
-                Op::ChanTake(0),
-                Op::ChanPut { chan: 0, value: 0 },
-            ],
+            ops: vec![Op::ChanTake(0), Op::ChanPut { chan: 0, value: 0 }],
         }],
     }
 }
 
 /// One container, all the way to what `Engine::register_program` takes.
-fn registration(
-    container: TraceContainer,
-    profile: &ModelProfile,
-) -> engine::ProgramRegistration {
+fn registration(container: TraceContainer, profile: &ModelProfile) -> engine::ProgramRegistration {
     let bound = eta_ir::validate::bind(container, profile.clone())
         .unwrap_or_else(|why| panic!("the gate's program does not bind: {why:?}"));
     let stages = eta_compiler::plan::compile_bound(&bound);
@@ -228,8 +216,7 @@ fn host_channel(id: u64, role: HostRole) -> ChannelRegistration {
 
 /// One prefill lane, which is only ever the thing the epilogue hangs off.
 fn fire(tokens: &[u32], attachment: Attachment) -> FrameSubmission {
-    let classify =
-        runtime::engine::load::classify(SKU).expect("this build ships the gate's SKU");
+    let classify = runtime::engine::load::classify(SKU).expect("this build ships the gate's SKU");
     FrameSubmission::of(Step {
         lanes: vec![Lane {
             slot: 0,
@@ -271,7 +258,8 @@ fn a_device_only_ring_carries_a_cell_from_one_instance_to_another() {
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    let mut engine = open::cuda(b"[model]\ndevice = \"cuda:0\"\n").expect("the cuda seam opens");
+    let mut engine =
+        open::cuda(runtime::engine::backend::DeviceBoot::default()).expect("the cuda seam opens");
     let budgets = Budgets {
         max_lanes: 4,
         max_tokens: 256,
@@ -392,7 +380,10 @@ fn a_device_only_ring_carries_a_cell_from_one_instance_to_another() {
         crossed, CROSSES,
         "the cell that came out of the shared ring is not the cell that went in"
     );
-    eprintln!("shared ring carried {crossed:#x} from instance {} to {}", putting.id, taking.id);
+    eprintln!(
+        "shared ring carried {crossed:#x} from instance {} to {}",
+        putting.id, taking.id
+    );
 
     // ── CLAIM 3: eight seats, and the ninth refused by name.
     engine

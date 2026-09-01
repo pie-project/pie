@@ -2799,6 +2799,18 @@ impl<'c> Run<'c> {
     /// launch that then adds `win[1]` would be read twice-shifted. The two
     /// LANE-indexed tables stay sliced under exactly the same condition, which
     /// is [`crate::SHIFTED`]'s lane-axis caveat and is the law here.
+    ///
+    /// **AND THAT SLICE IS AN ADDRESS A BODY BAKES**, which is the paged twin
+    /// of the sentence [`recurrent_cut`](Run::recurrent_cut) now pins. `base +
+    /// lane_offset` is right for the fire that recorded it and stale for every
+    /// other split of its key, so a region reaching THIS door above the fire's
+    /// lane zero may not ride a body at all: [`crate::LANE_SHIFTED`] names the
+    /// readers that take [`pool_absolute`](Run::pool_absolute) instead, and
+    /// `Windows::admits` makes an island of a windowed region holding anything
+    /// else that names a cache space. The pin is spelled on the recurrent door
+    /// rather than here because this one is reached on the way to the absolute
+    /// reading — `pool_absolute` calls it and then replaces the two tables —
+    /// so an assertion here would fire on the path that is correct.
     pub(crate) fn pool(&self, id: ValueId) -> KvPool {
         match self.cache(id) {
             CachePool::Kv { space, pool } => {
@@ -3016,6 +3028,36 @@ impl<'c> Run<'c> {
         match self.cache(id) {
             CachePool::Recurrent(pool) => {
                 let window = self.window().span();
+                // **THE PIN THE WIDTH-INVARIANCE GATE BOUGHT, AND IT IS THE
+                // ONE INVARIANT THIS SEAM NEVER WROTE DOWN.** The sliced arm
+                // below is `base + lane_offset * 4`, and every argument for it
+                // — the per-step scans index their tables at the ordinal their
+                // own grid counts — is an argument about the CONTENT and none
+                // at all about the ADDRESS. A body bakes the address, and
+                // `lane_offset` is the sum of the LANES of the classes in front
+                // of this window, which a `record::BodyKey` deliberately does
+                // not fix. So this reading is legal under a plane base only
+                // where the number it advances by is zero, and
+                // `Windows::admits`' lane clause (`crate::LANE_SHIFTED`) is
+                // what now makes that true: a region above lane zero holding
+                // an op that reaches this door is an ISLAND, and an island is
+                // `Held::Eager`, where `plane_base` is false and the pointer is
+                // this fire's own.
+                //
+                // Before that clause a mixed decode class captured at one split
+                // replayed at another and read the recurrent bank of whatever
+                // lane the RECORDING sat on — the width-2 fire of
+                // `cuda_width_invariance`, eleven logits and a flipped argmax,
+                // with no fault anywhere. The four pins already on this path all
+                // held; this is the one that was never written.
+                debug_assert!(
+                    absolute || !self.plane_base() || window.lane_offset == 0,
+                    "value {} takes the window-local recurrent lane door under a \
+                     plane base at lane offset {}; a body would bake that slice \
+                     and replay it at another split (`crate::LANE_SHIFTED`)",
+                    id.0,
+                    window.lane_offset,
+                );
                 // **ONE PREDICATE FOR ALL FOUR VECTORS**, because a launch
                 // reads them at ONE index: `slot_ids`, the fold predicate, the
                 // commit length and the segment origin are all `[r]` in
@@ -3458,6 +3500,24 @@ impl<'c> Run<'c> {
             // still name the fire's own lanes. The allocation between the two
             // is a dead prefix, which is exactly what that vector's own note
             // in `sched_prefill::schedule` says it is.
+            // **AND THE `None` ARM IS THIS FIRE'S OWN LANE ORIGIN, WHICH IS
+            // CORRECT AND UNHASHABLE, AND THE DIFFERENCE MATTERS**
+            // (`record::Ladder::lane_reach`). A window that could take no
+            // ceiling still has to reach its own live lanes — the pins below
+            // say so, and `sched_prefill` sizes its absolutely-indexed
+            // `o_indptr` off this — so the fallback is the live origin and
+            // every launch it feeds reads the right lane. What it is NOT is a
+            // function of the key: `Run::schedule_shape` hashes this field, so
+            // a body whose fires move their split RESHAPES once per split
+            // rather than replaying. That is a counted demotion and never a
+            // wrong answer, and it is reachable on exactly one shape of
+            // deployment — `max_lanes < 2 x min(slots, max_lanes, max_tokens)`,
+            // where step 4d's clamp leaves the second class nothing to carve
+            // between the prefix in front of it and the staging. The
+            // inequality and its remedy are `Ladder::lane_reach`'s;
+            // `bodies_gate`'s two mixed gates are both seated above it on
+            // purpose, and `record::BodyTally::reshapes` is what says a
+            // deployment slipped under.
             lane_offset: match ceiling {
                 Some((first, _)) => first,
                 None if standing.plane() => span.lane_offset,

@@ -452,21 +452,13 @@ pub struct ServerConfig {
     /// Largest blob a client may upload in one request.
     #[serde(default = "default_max_upload")]
     pub max_upload: ByteSize,
-    /// Ask this boot to measure the memory planner instead of scoring it.
-    ///
-    /// Set by `pie config tune` on the config it derives in memory, never
-    /// read from a file — `#[serde(skip)]`, so it cannot be written down and
-    /// cannot outlive the boot that asked for it. See
-    /// [`CudaNativeEngineOptions::calibrate_planner`] for why a measurement
-    /// must not be a persisted setting.
-    ///
-    /// It rides here rather than in `[model.engine.options]` because that table
-    /// is the file's, and this never comes from the file. Same route as
-    /// `verbose`: a typed field the server applies to whatever engine options it
-    /// builds.
-    #[serde(skip)]
-    pub calibrate_planner: bool,
 }
+
+// `calibrate_planner` STOOD HERE — the `#[serde(skip)]` field `pie config
+// tune`'s stage one set on a config derived in memory. The C++ memory planner
+// it asked to measure left with the boot document, so the request reached
+// nothing; the field, the tune stage that set it and the engine option it was
+// copied onto went together.
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -477,7 +469,6 @@ impl Default for ServerConfig {
             registry: default_registry(),
             worker_threads: default_worker_threads(),
             max_upload: default_max_upload(),
-            calibrate_planner: false,
         }
     }
 }
@@ -737,9 +728,9 @@ pub struct ModelConfig {
     /// narrower weights and wider compute is a normal combination.
     ///
     /// A model fact rather than an engine one -- it is what the checkpoint
-    /// holds -- which is why it sits here and `activation_dtype` and
-    /// `kv_cache_dtype`, the dtypes the engine computes and stores in, sit in
-    /// `[engine]`.
+    /// holds -- which is why it sits here and `activation_dtype`, the dtype
+    /// the engine computes in, sits in `[engine]`. (The KV store's dtype is
+    /// the loaded SKU's own -- the `-kv-bf16` in its name -- not a key.)
     #[serde(default = "default_weight_dtype")]
     pub weight_dtype: String,
     /// **How many weight bytes this load may keep on the DEVICE**, written
@@ -932,6 +923,14 @@ impl AdapterConfig {
 }
 
 impl ModelConfig {
+    /// The shared-adapter mount as the boot seam spells it: `Some(path)` when
+    /// the operator stated one, `None` (the feature off) for the empty
+    /// default — the engines treat an absent mount as "shared binds refuse
+    /// by name", never as a directory to invent.
+    pub fn adapter_mount(&self) -> Option<std::path::PathBuf> {
+        (!self.adapter_dir.is_empty()).then(|| std::path::PathBuf::from(&self.adapter_dir))
+    }
+
     /// **The two weight budgets, in the form the engine's load contract
     /// states them** (alto design §7) -- what `[model] device_weight_budget`
     /// and `[model] host_weight_budget` are for.
@@ -1265,8 +1264,8 @@ pub struct EngineConfig {
     #[serde(default = "default_tp_size")]
     pub tensor_parallel_size: u32,
     /// Compute dtype for activations, e.g. `"bfloat16"`. Separate from
-    /// `weight_dtype` and `kv_cache_dtype`: a deployment can store weights
-    /// narrower than it computes.
+    /// `weight_dtype`: a deployment can store weights narrower than it
+    /// computes.
     #[serde(default = "default_activation_dtype")]
     pub activation_dtype: String,
     /// Seed for sampling. Also mixed into the artifact digest, so two workers
@@ -1326,7 +1325,6 @@ impl EngineConfig {
                         )
                     })?;
                 opts.validate()?;
-                validate_kv_cache_dtype(&opts.kv_cache_dtype)?;
             }
             // The Metal engine grew one device knob worth refusing a bad value
             // for: `gpu_mem_utilization`, the fraction of the wired ceiling pie
@@ -1352,27 +1350,6 @@ impl EngineConfig {
         }
         Ok(())
     }
-}
-
-fn validate_kv_cache_dtype(value: &str) -> Result<()> {
-    const VALID: &[&str] = &[
-        "auto",
-        "bf16",
-        "bfloat16",
-        "fp8_e4m3",
-        "fp8_e5m2",
-        "int8_per_token_head",
-        "fp8_per_token_head",
-        "fp4_e2m1",
-        "nvfp4",
-    ];
-    ensure!(
-        VALID.contains(&value),
-        "invalid kv_cache_dtype {:?}; expected one of: {}",
-        value,
-        VALID.join(", ")
-    );
-    Ok(())
 }
 
 /// Which engine a `[model.engine] type` names.
@@ -1463,22 +1440,23 @@ where
 
 /// `[model.engine.options]` for `type = "cuda_native"`.
 /// Mirrors `pie/src/pie_driver_cuda_native/config.py::CudaNativeDriverConfig`.
+///
+/// **ELEVEN KEYS RETIRED WITH THE BOOT DOCUMENT.** `model_id`,
+/// `kv_cache_dtype`, `swap_pool_size`, `runtime_quant`, `mxfp4_moe`,
+/// `mtp_num_drafts`, `stream_routed_experts`, `expert_cache`,
+/// `expert_host_cache`, `enable_system_speculation` and the `#[serde(skip)]`
+/// `calibrate_planner` were declared, defaulted, validated and schema'd here
+/// and written into a TOML only the deleted C++ engine could have read — the
+/// Rust shell's `DeviceBoot`/`Budgets` never had a seat for any of them. Their
+/// live successors, where one exists: naming a row is `[model] sku`; the KV
+/// dtype is the loaded SKU's own (`-kv-bf16` in its name); expert residency is
+/// `[model] device_weight_budget` / `host_weight_budget`
+/// (`engine::Residency`); the MoE lowering is the dispatch arm's decision. A
+/// config still stating one is refused by name (`deny_unknown_fields`) rather
+/// than silently ignored.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CudaNativeEngineOptions {
-    /// `[model] id`: the operator's answer to "which model is this".
-    ///
-    /// Absent — the ordinary case — the engine identifies the checkpoint
-    /// from its TENSORS against the catalog every engine links. Present,
-    /// it names a row directly, for a checkpoint that is genuinely a
-    /// known model under an unknown name: a fine-tune, a re-upload, a
-    /// mirror that renamed the directory.
-    ///
-    /// It is an OVERRIDE and not a bypass. The named row's manifest is
-    /// still matched, so this cannot be used to load a checkpoint as
-    /// something it is not — which is the failure the whole arrangement
-    /// exists to prevent.
-    pub model_id: Option<String>,
     /// Fraction of each GPU's memory pie may use, weights included.
     ///
     /// What is left after the weights becomes the KV pool, so this is the
@@ -1489,7 +1467,8 @@ pub struct CudaNativeEngineOptions {
     /// `[batching]` table, which the C++ engine read and the Rust shell never
     /// did, so for four waves it was declared, defaulted, validated and
     /// schema'd here and read by nothing: the elastic pool took ~100% of
-    /// whatever the card had free. It is an `[engine]` key on the wire now and
+    /// whatever the card had free. It crosses as a typed `Knobs` field on the
+    /// shell's `DeviceBoot` now, and
     /// `engine_cuda::device::elastic::budget_bytes` is the one arithmetic that
     /// reads it -- `total x utilization - (total - free) - floor`, which at
     /// `1.0` is byte for byte the pool this deployment had before.
@@ -1505,12 +1484,6 @@ pub struct CudaNativeEngineOptions {
     /// `PIE_CUDA_KV_PAGE_SIZE` could pin it. Setting it pins it, and the
     /// planner searches a single-candidate lattice.
     pub kv_page_size: Option<u32>,
-    /// Dtype KV pages are stored in. `"auto"` follows the activation dtype;
-    /// a narrower one buys pages at some accuracy.
-    pub kv_cache_dtype: String,
-    /// Host-memory KV pages to swap into, reaching the engine as its
-    /// `cpu_pages`. `0` disables swapping.
-    pub swap_pool_size: u32,
     /// HARD cap on the runtime KV page count. **Omit to derive it from
     /// `gpu_mem_utilization`.** Setting it forces a tiny deterministic pool
     /// for contention/preempt tests + CI, independent of the forward-layout
@@ -1530,10 +1503,6 @@ pub struct CudaNativeEngineOptions {
     /// `kv_page_size` does — which is the point: a value measured on this
     /// machine beats one scored by a model of it.
     ///
-    /// `pie config tune` and `calibrate_planner` are how you get a number
-    /// worth pinning. A guess here is worse than absence, because absence still
-    /// gets the planner's judgement.
-    ///
     /// Named for the same quantity Metal calls `max_forward_tokens`, because
     /// here they ARE the same quantity — unlike `total_pages`, where one name
     /// covered two different things and this engine's field had to be renamed
@@ -1546,40 +1515,6 @@ pub struct CudaNativeEngineOptions {
     /// when that key is absent: admission derives from the engine's request
     /// cap, so the two are one decision. Set both, or neither.
     pub max_forward_requests: Option<u32>,
-    /// Measure the forward step on this boot instead of scoring it.
-    ///
-    /// The memory planner picks `max_forward_tokens` by scoring a candidate
-    /// lattice with an analytic model, and where that model disagreed with
-    /// reality the engine grew per-(model, GPU) special cases carrying
-    /// hand-measured constants. Setting this times the real forward body across
-    /// the budget ladder on THIS device and caches the winner, so the next boot
-    /// selects by evidence instead.
-    ///
-    /// **Not settable, and not a setting.** `pie config tune` turns it on
-    /// for the one boot it runs and never writes it anywhere; see below for why
-    /// it cannot be a key.
-    ///
-    /// It arrived as `PIE_CUDA_PLANNER_CALIBRATE`, and when the flag-deletion
-    /// rule removed that, it came back here — the choice was framed as "config
-    /// or environment variable", and both are wrong in the same way. This is not
-    /// a description of a deployment; it is one run of a measurement. Written
-    /// down, it needs the operator to perform a three-step ritual ("turn it on,
-    /// boot once, turn it off"), and forgetting the third step is not a
-    /// hypothetical failure: the planner abandons its score on a calibration
-    /// boot and builds the LARGEST forward shape it can fit, accepting the
-    /// starved KV pool that leaves, on the stated reasoning that such a boot
-    /// serves nothing. Nothing made that true. So the ritual is gone and the
-    /// third step cannot be forgotten, because there is no step to forget.
-    ///
-    /// `#[serde(skip)]` for the same reason `device` and `verbose` below are:
-    /// pie populates it, a config file does not. It also means the struct's
-    /// `deny_unknown_fields` refuses a hand-written `calibrate_planner = true`
-    /// rather than honouring it.
-    ///
-    /// Refused for `tensor_parallel_size > 1` and for recurrent-state models,
-    /// with a reason on stderr — see `batch/planner_calibration.hpp`.
-    #[serde(skip)]
-    pub calibrate_planner: bool,
     /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
     /// from `model.engine.device`; set on the C++ side via
     /// `cudaSetDevice` (see `crates/engine-cuda/csrc/src/engine.cpp`).
@@ -1589,47 +1524,11 @@ pub struct CudaNativeEngineOptions {
     /// than written here.
     #[serde(skip)]
     pub verbose: bool,
-    /// Runtime quantization mode applied during CUDA layout-plan
-    /// materialization. Empty = none; `"fp8"` and `"int8"` enable
-    /// per-channel symmetric quantization for supported projection weights.
-    pub runtime_quant: String,
-    /// GPT-OSS MXFP4 MoE policy. `"auto"` selects native packed MXFP4 GEMM
-    /// on supported Blackwell-class GPUs/builds and routed dequant on legacy
-    /// GPUs; `"routed_dequant"`/`"packed"` force the packed-weight
-    /// BF16-scratch fallback; `"bf16"`/`"dequant"` eagerly materialize BF16
-    /// experts; `"native"` requires true MXFP4 GEMM kernels.
-    pub mxfp4_moe: String,
     /// Gemma-4 native MTP assistant checkpoint used by
     /// `.system_speculation()` on cuda_native. **Omit to let the CUDA engine
     /// auto-discover** the paired `-assistant` checkpoint from the Hugging
     /// Face cache when available.
     pub mtp_assistant_snapshot_dir: Option<String>,
-    /// Maximum number of MTP draft tokens returned per system-spec step.
-    pub mtp_num_drafts: u32,
-    /// Page routed MoE experts through a bounded VRAM slab instead of keeping
-    /// every expert resident. Bounds the resident set by the slab rather than
-    /// by the model, which is what lets a large MoE run on a GPU that cannot
-    /// hold it. Off by default: for a model that fits, this is strictly
-    /// slower, and it disables CUDA graph capture besides.
-    pub stream_routed_experts: bool,
-    /// The expert slab, in GiB. **Omit to derive one** at bootstrap from what
-    /// is left after the resident weights and the KV pool. Ignored unless
-    /// `stream_routed_experts` is set.
-    pub expert_cache: Option<ByteSize>,
-    /// A pinned host DRAM tier behind the slab, in GiB. **Omit for none.**
-    ///
-    /// The slab bounds what the GPU holds; this bounds what host memory holds
-    /// behind it, in the same slot-shaped form. A miss the tier can serve is
-    /// one host-to-device copy of bytes already in the form the kernels read,
-    /// instead of a checkpoint read, a plan and a transform -- so it is worth
-    /// setting exactly when the experts do not fit in VRAM but do fit in RAM.
-    /// Ignored unless `stream_routed_experts` is set.
-    pub expert_host_cache: Option<ByteSize>,
-    /// Operator opt-in for system speculation (MTP). Default false: the runtime
-    /// drives the auto-drafter only when this is true. Speculation is a
-    /// latency-regime win (helps at low batch, costs at compute saturation), so
-    /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
-    pub enable_system_speculation: bool,
     /// **HOW MUCH OF A FIRE THE SHELL RECORDS**: `"off"` (the golden eager
     /// path), `"shaped"` (eager, with graph-shaped padded schedules — the
     /// attribution arm) or `"on"` (bodies: captured at load, replayed after).
@@ -1638,8 +1537,8 @@ pub struct CudaNativeEngineOptions {
     /// serve one, because an uncaptured decode pays ~470 kernel launches of
     /// host time per token-step.
     ///
-    /// Written into the boot document as `[engine] graphs`, which the runtime
-    /// has read since the palo rewrite and which nothing wrote until now.
+    /// Crosses as `DeviceBoot::graphs`, parsed into the shell's own `Graphs`
+    /// at boot construction — a spelling it does not speak refuses there.
     pub graphs: Option<String>,
     /// **D4's PAD.** Before each walk the CUDA shell stamps the fire's rows and
     /// its bucket onto every stream context, and the entries that hand a shape
@@ -1745,26 +1644,15 @@ pub enum CudaMemoryProfile {
 impl Default for CudaNativeEngineOptions {
     fn default() -> Self {
         Self {
-            model_id: None,
             gpu_mem_utilization: 0.90,
             memory_profile: CudaMemoryProfile::Auto,
             kv_page_size: None,
-            kv_cache_dtype: "auto".to_string(),
-            swap_pool_size: 0,
             max_total_pages: None,
             max_forward_tokens: None,
             max_forward_requests: None,
-            calibrate_planner: false,
             device: String::new(),
             verbose: false,
-            runtime_quant: String::new(),
-            mxfp4_moe: "auto".to_string(),
             mtp_assistant_snapshot_dir: None,
-            mtp_num_drafts: 3,
-            stream_routed_experts: false,
-            expert_cache: None,
-            expert_host_cache: None,
-            enable_system_speculation: false,
             graphs: None,
             pad: None,
             bodies: None,
@@ -1884,8 +1772,9 @@ pub struct MetalEngineOptions {
     /// Unlike the CUDA key it is `[model.engine.options]` rather than
     /// `[engine]`, because the Metal engine has no separate `[engine]` table on
     /// the wire — its device knobs ride the options block the runtime already
-    /// writes for it, reaching the shell as `[metal] gpu_mem_utilization` in the
-    /// boot document.
+    /// writes for it, reaching the shell as `[metal] gpu_mem_utilization` in an
+    /// in-memory boot document — the one key of the old bootstrap file the
+    /// shell ever read.
     pub gpu_mem_utilization: f64,
     /// Metal device string, e.g. `"metal:0"`. Populated from
     /// `model.engine.device` rather than written here.
@@ -1925,41 +1814,9 @@ impl CudaNativeEngineOptions {
                 && self.gpu_mem_utilization <= 1.0,
             "engine.gpu_mem_utilization must be finite and in (0.0, 1.0]"
         );
-        const MXFP4: &[&str] = &[
-            "auto",
-            "routed_dequant",
-            "packed",
-            "bf16",
-            "dequant",
-            "eager_bf16",
-            "native",
-        ];
-        ensure!(
-            self.mxfp4_moe.is_empty() || MXFP4.contains(&self.mxfp4_moe.as_str()),
-            "engine.mxfp4_moe must be one of {:?}",
-            MXFP4
-        );
-        ensure!(
-            self.mtp_num_drafts <= 32,
-            "engine.mtp_num_drafts must be in 0..=32"
-        );
         // Present means the operator chose a size, so a present zero is a
         // contradiction rather than a way to say "derive" -- that is what
         // omitting the key is for.
-        if let Some(size) = self.expert_cache {
-            ensure!(
-                size.as_bytes() > 0,
-                "engine.expert_cache must be > 0; \
-                 omit it to derive one at bootstrap"
-            );
-        }
-        if let Some(size) = self.expert_host_cache {
-            ensure!(
-                size.as_bytes() > 0,
-                "engine.expert_host_cache must be > 0; \
-                 omit it for no host tier"
-            );
-        }
         if let Some(pages) = self.max_total_pages {
             ensure!(
                 pages > 0,
@@ -2257,7 +2114,10 @@ device = ["cpu"]
         );
         let cfg: Config = toml::from_str(&past).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("adapter id 5 is past the 2 seat"), "got: {err}");
+        assert!(
+            err.contains("adapter id 5 is past the 2 seat"),
+            "got: {err}"
+        );
 
         let relative = MINIMAL_METAL.replace(
             "model = \"Qwen/Qwen3-0.6B\"",
@@ -2268,7 +2128,11 @@ device = ["cpu"]
         );
         let cfg: Config = toml::from_str(&relative).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("must be \n             an absolute path") || err.contains("absolute path"), "got: {err}");
+        assert!(
+            err.contains("must be \n             an absolute path")
+                || err.contains("absolute path"),
+            "got: {err}"
+        );
 
         // And a near-miss of a key is still refused, as everywhere else.
         let typo = MINIMAL_METAL.replace(
@@ -2623,10 +2487,7 @@ device = ["cuda:0"]
 [model.engine.options]
 gpu_mem_utilization = 0.90
 memory_profile = "throughput"
-runtime_quant = "fp8"
-mxfp4_moe = "routed_dequant"
 mtp_assistant_snapshot_dir = "/models/gemma4-mtp"
-mtp_num_drafts = 6
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
@@ -2634,17 +2495,13 @@ mtp_num_drafts = 6
         let opts: CudaNativeEngineOptions = cfg.model.engine.options.clone().try_into().unwrap();
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Throughput);
-        assert_eq!(opts.runtime_quant, "fp8");
-        assert_eq!(opts.mxfp4_moe, "routed_dequant");
         assert_eq!(
             opts.mtp_assistant_snapshot_dir.as_deref(),
             Some("/models/gemma4-mtp")
         );
-        assert_eq!(opts.mtp_num_drafts, 6);
         assert_eq!(cfg.model.weight_dtype, "bfloat16"); // default
         // Absent = derive: the planner scores candidates unless pinned.
         assert_eq!(opts.kv_page_size, None);
-        assert_eq!(opts.kv_cache_dtype, "auto"); // default
     }
 
     #[test]
@@ -2653,9 +2510,8 @@ mtp_num_drafts = 6
         // streaming §3 item 5, `next.md` B1), so its range is load-bearing
         // rather than decorative: `0.0` is a deployment with no pool at all
         // and anything over `1.0` is a fraction of a card that does not exist.
-        // Both refuse HERE, by the key's name, and again in
-        // `engine_cuda::boot` for a boot document nobody wrote through this
-        // config.
+        // Both refuse HERE, by the key's name, and again at the shell's own
+        // door, for a boot nobody built through this config.
         for fraction in ["0.0", "1.5", "-0.5", "nan"] {
             let bad = format!(
                 r#"
@@ -2740,19 +2596,32 @@ device = ["cuda:0"]
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
         let opts: CudaNativeEngineOptions = cfg.model.engine.options.clone().try_into().unwrap();
-        assert_eq!(opts.swap_pool_size, 0);
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Auto);
-        assert_eq!(opts.mxfp4_moe, "auto");
         assert!(opts.mtp_assistant_snapshot_dir.is_none());
-        assert_eq!(opts.mtp_num_drafts, 3);
         assert_eq!(cfg.model.engine.ready_timeout, Duration::from_secs(600));
-        assert_eq!(opts.kv_cache_dtype, "auto");
     }
 
+    /// The keys the boot document took with it are refused BY NAME, not
+    /// silently ignored: a config that states one names a real intent, and the
+    /// struct doc names each key's live successor where one exists.
     #[test]
-    fn rejects_invalid_embedded_kv_cache_dtype() {
-        let bad = r#"
+    fn a_retired_engine_key_refuses_by_its_own_name() {
+        for (key, value) in [
+            ("model_id", r#""qwen35-d0.8b-bf16-kv-bf16""#),
+            ("kv_cache_dtype", r#""auto""#),
+            ("swap_pool_size", "512"),
+            ("runtime_quant", r#""fp8""#),
+            ("mxfp4_moe", r#""routed_dequant""#),
+            ("mtp_num_drafts", "6"),
+            ("stream_routed_experts", "true"),
+            ("expert_cache", r#""4GiB""#),
+            ("expert_host_cache", r#""64GiB""#),
+            ("enable_system_speculation", "true"),
+            ("calibrate_planner", "true"),
+        ] {
+            let bad = format!(
+                r#"
 [model]
 name = "default"
 model = "Qwen/Qwen3-0.6B"
@@ -2762,13 +2631,13 @@ type = "cuda_native"
 device = ["cuda:0"]
 
 [model.engine.options]
-kv_cache_dtype = "turboquant"
-"#;
-        let cfg: Config = toml::from_str(bad).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("kv_cache_dtype"), "got: {err}");
-        assert!(err.contains("fp8_e4m3"), "got: {err}");
-        assert!(err.contains("nvfp4"), "got: {err}");
+{key} = {value}
+"#
+            );
+            let cfg: Config = toml::from_str(&bad).unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(key), "the refusal names the key; got: {err}");
+        }
     }
 
     #[test]
@@ -2842,25 +2711,6 @@ manual_capacity = 1
         assert!(err.contains("manual_capacity"), "got: {err}");
     }
 
-    #[test]
-    fn rejects_invalid_cuda_mxfp4_policy() {
-        let cuda = r#"
-[model]
-name = "default"
-model = "openai/gpt-oss-20b"
-
-[model.engine]
-type = "cuda_native"
-device = ["cuda:0"]
-
-[model.engine.options]
-mxfp4_moe = "mystery"
-"#;
-        let cfg: Config = toml::from_str(cuda).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("mxfp4_moe"), "got: {err}");
-    }
-
     // -------------------------------------------------------------------------
     // [model] max_patches / max_images  (alto multimodal §5.5, the second axis)
     // -------------------------------------------------------------------------
@@ -2880,7 +2730,8 @@ type = "cuda_native"
 device = ["cuda:0"]
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
-        cfg.validate().expect("a config that states nothing is valid");
+        cfg.validate()
+            .expect("a config that states nothing is valid");
         assert_eq!(cfg.model.patch_ceilings(), (None, None));
     }
 

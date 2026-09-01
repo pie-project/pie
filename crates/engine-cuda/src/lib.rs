@@ -113,11 +113,9 @@ pub mod arena;
 /// identity — which is what makes N instances of one adapter one device copy.
 /// Nothing in it is reachable from the fire path.
 pub mod blob;
-/// Reading a boot document — this crate's half of it, in this crate.
+/// Opening a device from a typed [`DeviceBoot`] — the boot seam, in the
+/// crate that declares the type.
 pub mod boot;
-pub mod device;
-mod dispatch;
-mod error;
 /// The export seam and the op-vocabulary scans beside it — pure IR analysis,
 /// lifted out of `serve.rs` (alto article 9's "shells are call order").
 /// **The routed-expert tier** (alto design §7, wave D2): the residency plan a
@@ -125,6 +123,9 @@ mod error;
 /// few of them, and the indirection table that lets a captured graph read
 /// either without knowing which.
 pub mod checkpoint_serving;
+pub mod device;
+mod dispatch;
+mod error;
 pub mod experts;
 pub mod exports;
 pub mod inputs;
@@ -286,6 +287,16 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 /// A further name that wants the lane axis has to earn it one of those two
 /// ways: by reading its lane from something a fire STAGES, or by reading it
 /// off the seat's `win[3]` against fire-wide tables it was handed on purpose.
+///
+/// **AND WHAT A NAME THAT HAS NOT EARNED IT IS NOW REFUSED IS SPELLED
+/// SEPARATELY** ([`LANE_SHIFTED`]). This paragraph used to end at the
+/// sentence above, which stated the rule and enforced nothing: the two
+/// earned exceptions were BUILT, the rest kept their sliced pointer, and
+/// `Windows::admits` went on spending THIS list — a row-axis fact — to admit
+/// a region whose lane origin moves between fires of one key. It does not any
+/// more. The lane axis has a list of its own and a clause of its own, and a
+/// name here that is not there rides a body only where its window begins at
+/// lane zero.
 ///
 /// **AND THE NAMES THAT ARE NOT HERE, BY NAME, BECAUSE EACH IS A DIFFERENT
 /// REASON.**
@@ -542,30 +553,119 @@ pub const SHIFTED: [&str; 84] = [
 /// the last thing standing between a mixed composition and a body.
 pub const PLANNED: [&str; 2] = ["attention.plan_decode", "attention.plan_prefill"];
 
+/// **THE OPS THAT FIND THEIR OWN LANE, AND NOT ONLY THEIR OWN ROW** — by
+/// `model_ir::Operands::name`, the fourth of this shell's answers to a
+/// question the compiler cannot ask, and [`SHIFTED`]'s twin one axis over.
+///
+/// **WHY THERE HAS TO BE A SECOND LIST AT ALL.** [`SHIFTED`]'s promise is
+/// about ROWS and says so in its own words: "the promise is about ROWS", and
+/// then "the second axis, which this promise still does not speak for". A
+/// name on that list computes over plane rows `[start, start + count)` given
+/// the plane's base — and says nothing whatever about where it reads its
+/// PER-LANE tables. Most names there read them at the launch-local ordinal
+/// off a pointer this shell already advanced for them: `Run::pool` hands the
+/// page bounds and last-page fills as `base + lane_offset`, `Run::recurrent`
+/// hands the slot map, the fold predicate and the commit length the same way,
+/// and `Run::cut`'s lane column does it for every `Dim::Lanes` operand. That
+/// is the right reading for an EAGER launch and for a whole-fire one, and it
+/// is a POINTER — which a body bakes.
+///
+/// **AND `lane_offset` IS NOT A FUNCTION OF THE KEY.** It is the sum of the
+/// LANES of the classes standing in front of this window, and a
+/// `record::BodyKey` fixes the sum of their row RUNGS instead — a bound on
+/// that number and not that number. So `base + lane_offset * stride` is a
+/// stale address on every replay but the one it was recorded at, which is the
+/// staleness `Run::qo_indptr_absolute` and `Run::recurrent_absolute` were
+/// each written to remove for their own consumer. Nothing removed it for the
+/// consumers that stayed on the sliced reading, and nothing REFUSED them
+/// either: `Windows::admits` spent [`SHIFTED`] — a row-axis fact — to admit a
+/// region whose LANE origin moves. That is the gap this list closes.
+///
+/// **WHAT A NAME HERE PROMISES, IN ONE SENTENCE.** Under a plane base it
+/// reads every per-lane table it touches ABSOLUTELY: either the table is
+/// handed over whole and the launch names a FIRE lane, or the launch reads no
+/// per-lane table at all. `SHIFTED`'s own account names the two ways a name
+/// earns that and this list is exactly the names that did:
+///
+/// * **the five FA2 arms**, whose request number is a DATUM — it comes off
+///   `request_indices[bx]`, the schedule stages `live.lane_offset + r`
+///   (`Run::planning`), and `Run::pool_absolute` and `Run::mask_indptr` hand
+///   the fire's tables over to match (chunk 2c-b);
+/// * **the four CHUNKED recurrent arms**, which read their lane off the
+///   seat's `win[3]` against the fire's vectors, handed over whole by
+///   `Run::recurrent_absolute` (the chunked-arm wave).
+///
+/// **AND WHO READS IT.** `exports::regions_lane_shifting` turns it into a
+/// per-region fact — this list OR "names nothing lane-indexed", which is that
+/// function's own half of the answer — and `Windows::admits` spends it, on
+/// exactly one clause: a
+/// region whose window does not begin at the fire's LANE zero may ride a body
+/// only when every op in it is named here. A region that begins at lane zero
+/// asks nothing of this list — its sliced reading and its absolute one are the
+/// same address — which is every whole-fire region and the first class of
+/// every split, so the clause costs those nothing at all.
+///
+/// **A NAME MISSING FROM THIS LIST COSTS ITS REGION AND NOT ITS
+/// COMPOSITION**, exactly as a name missing from [`SHIFTED`] does: the region
+/// becomes an ISLAND and the fire re-issues it eagerly between the execs
+/// (`record::Cut`), at this fire's own lane offset, which is always correct.
+///
+/// **AND THE LIST IS A WHITELIST, WHICH IS THE SAFE DIRECTION** —
+/// [`SHIFTED`]'s own closing sentence, one axis over. A name wrongly absent
+/// costs an island; a name wrongly present costs the right number of rows read
+/// from ANOTHER LANE's state, silently. So a name goes on only when every
+/// `Run` door it can reach is one of the two absolute ones.
+///
+/// **AND A NAME THAT READS NO PER-LANE TABLE AT ALL DOES NOT NEED TO BE
+/// HERE**, which is why this list is nine names and not eighty. The reader is
+/// an OPERAND walk, not a name lookup: an op reaches the sliced doors through
+/// a `Def::Cache` space or a lane-shaped rectangle, and one that names neither
+/// cannot be handed a `lane_offset`-baked pointer whatever it is called. So
+/// this list carries only the names that DO name such an operand and read it
+/// absolutely anyway — `exports::regions_lane_shifting` carries that argument
+/// in full, and it is the reason a windowed elementwise or layout region costs
+/// nothing here.
+pub const LANE_SHIFTED: [&str; 9] = [
+    // The five fa2 names: absolute ids staged by the schedule, fire-wide
+    // page bounds and mask spans handed to match.
+    "attention.decode",
+    "attention.decode_lse",
+    "attention.masked",
+    "attention.prefill",
+    "attention.prefill_lse",
+    // The four chunked recurrent arms: fire-wide slot map, fold predicate,
+    // commit length and segment origin, all read at `r + win[3]`.
+    "attention.ple_ngram_ids_chunked",
+    "attention.ssm_causal_conv1d_chunked",
+    "attention.ssm_gated_delta_chunked",
+    "attention.ssm_kda_chunked",
+];
 
+
+pub use api::{ContractFor, Cuda, DeviceBoot};
+pub use boot::{open, ordinal_of};
 pub use error::{Fault, Result};
 pub use mask::{LaneMask, Staged as StagedMask};
 pub use program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
-pub use record::{AxisKey, BodyCensus, BodyKey, BodyStats, BodyTally, Graphs as GraphCache, LastCapture};
+pub use record::{
+    AxisKey, BodyCensus, BodyKey, BodyStats, BodyTally, Graphs as GraphCache, LastCapture,
+};
 pub use run::{
     CacheGeometry, CachePlanning, CachePool, CacheTable, FireBindings, FireTables, Planning,
     PoolSlabs, Run, SlotTable, StructSlot, WeightRow, WeightTable,
 };
-pub use api::{ContractFor, Cuda, DeviceBoot};
-pub use boot::open;
 pub use serve::{
     Boot, DEFAULT_BODIES_MEGABYTES, DEFAULT_GPU_MEM_UTILIZATION, FireCost, Graphs, Knobs, Lane,
     Media, Seated, Shell,
 };
 
+pub use blob::{
+    Adapters, Binding, Site as AdapterSite, Source as AdapterSource, layer_of, role_of, site_of,
+};
 /// What a capturing lane's fire hands back, one entry per exported attention
 /// layer — the contract's own type, re-exported so a caller of
 /// [`Shell::fire_captured`] need not reach two crates deep for the noun its
 /// own signature is written in (design §9, palo C4b).
 pub use engine::fire::LayerScores;
-pub use blob::{
-    Adapters, Binding, Site as AdapterSite, Source as AdapterSource, layer_of, role_of,
-    site_of,
-};
 pub use weights::{AdapterPlane, BankSeat};
 pub use window::{Cursor, Window, WindowShape, Windows};

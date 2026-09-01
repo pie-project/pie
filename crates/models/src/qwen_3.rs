@@ -39,6 +39,23 @@ pub const CATALOG: &[crate::Row] = model_dsl::catalog![
         model_dsl::trace_hybrid,
         Model::a3b(Dtype::U4g64, Dtype::Bf16, 1)
     ),
+    // The width-invariance fixture's row: the same A3B organs at the
+    // miniature's five layers and sixteen routed experts, every other width
+    // production. See [`Model::a3b_mini`].
+    (
+        "qwen36-35b-a3b-mini-mlxu4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::a3b_mini(Dtype::U4g64, Dtype::Bf16, 1)
+    ),
+    // And the same fixture with a crowded tail: five layers again, sixty-four
+    // routed experts against the same top-k 8. See [`Model::a3b_mini64`].
+    (
+        "qwen36-35b-a3b-mini64-mlxu4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::a3b_mini64(Dtype::U4g64, Dtype::Bf16, 1)
+    ),
     (
         "qwen35-a3b-bf16-kv-bf16",
         1,
@@ -224,6 +241,26 @@ pub const IMPORTS: &[crate::ImportRow] = &[
     ("qwen36-35b-a3b-mlxu4-kv-bf16", 1, |src, tp| {
         Model::a3b(Dtype::U4g64, Dtype::Bf16, tp).import(src)
     }),
+    // **AND THE MINIATURE ASKS AFTER THE SHIPPED ROW**, the way
+    // `qwen38-flash-mlxu2` asks after `qwen38-flash-mlxu4`. The two cannot
+    // both hold: the full artifact has forty layers where this row declares
+    // five, and its routed banks lead with 256 experts where this row declares
+    // sixteen — so each misses on the other's file on shape, not on order.
+    // The shipped artifact still keeps its turn first, because it is the one
+    // `identify` is gated on.
+    ("qwen36-35b-a3b-mini-mlxu4-kv-bf16", 1, |src, tp| {
+        Model::a3b_mini(Dtype::U4g64, Dtype::Bf16, tp).import(src)
+    }),
+    // **AND THE TWO MINIATURES SEPARATE ON THE SAME AXIS THE PAIR ABOVE DOES**,
+    // which is why their relative order carries nothing. They are one geometry
+    // apart from the routed bank's leading dimension — sixteen against
+    // sixty-four — and a row that declares one of those misses a file that
+    // stores the other on shape, in both directions. So neither can claim the
+    // other's carve however the walk reaches them, and this row sits beside its
+    // sibling as documentation rather than as reachability.
+    ("qwen36-35b-a3b-mini64-mlxu4-kv-bf16", 1, |src, tp| {
+        Model::a3b_mini64(Dtype::U4g64, Dtype::Bf16, tp).import(src)
+    }),
     ("qwen36-27b-bf16-kv-bf16", 1, |src, tp| {
         Model::d27b(Dtype::Bf16, Dtype::Bf16, tp).import(src)
     }),
@@ -290,6 +327,8 @@ pub const TEMPLATES: &[crate::template::TemplateRow] = &[
     ("qwen38-27b-vision-mlxu4-kv-bf16", template::chatml_interleaved),
     ("qwen36-27b-mlxu4-kv-bf16", template::chatml),
     ("qwen36-35b-a3b-mlxu4-kv-bf16", template::chatml),
+    ("qwen36-35b-a3b-mini-mlxu4-kv-bf16", template::chatml),
+    ("qwen36-35b-a3b-mini64-mlxu4-kv-bf16", template::chatml),
     ("qwen35-a3b-bf16-kv-bf16", template::chatml),
     ("qwen35-d3b-bf16-kv-bf16", template::chatml),
     ("qwen35-d0.8b-bf16-kv-bf16", template::chatml),
@@ -309,6 +348,8 @@ pub const TOKENIZERS: &[crate::tokenizer::ContractRow] = &[
     ("qwen36-27b-mlxu4-kv-bf16", &tokenizer::CONTRACT),
     ("qwen38-27b-mlxu4-kv-bf16", &tokenizer::CONTRACT_38),
     ("qwen36-35b-a3b-mlxu4-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen36-35b-a3b-mini-mlxu4-kv-bf16", &tokenizer::CONTRACT),
+    ("qwen36-35b-a3b-mini64-mlxu4-kv-bf16", &tokenizer::CONTRACT),
     ("qwen35-a3b-bf16-kv-bf16", &tokenizer::CONTRACT),
     ("qwen35-d3b-bf16-kv-bf16", &tokenizer::CONTRACT),
     ("qwen35-d0.8b-bf16-kv-bf16", &tokenizer::CONTRACT),

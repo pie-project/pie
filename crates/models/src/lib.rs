@@ -216,6 +216,8 @@ const PRECISIONS: &[(&str, &str)] = &[
     ("qwen36-27b-mlxu4-kv-bf16", "mlxu4"),
     ("qwen38-27b-mlxu4-kv-bf16", "mlxu4"),
     ("qwen36-35b-a3b-mlxu4-kv-bf16", "mlxu4"),
+    ("qwen36-35b-a3b-mini-mlxu4-kv-bf16", "mlxu4"),
+    ("qwen36-35b-a3b-mini64-mlxu4-kv-bf16", "mlxu4"),
     ("qwen35-a3b-bf16-kv-bf16", "bf16"),
     ("qwen35-d3b-bf16-kv-bf16", "bf16"),
     ("qwen35-d0.8b-bf16-kv-bf16", "bf16"),

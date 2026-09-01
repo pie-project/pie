@@ -39,9 +39,11 @@
 //! `attn_score_window`, `rs_stash_tokens`, `calibrating`, and the KV page size
 //! that is not a knob. `stream_routed_experts` is not among them, and neither
 //! `expert_cache` nor `expert_host_cache` appears anywhere under
-//! `crates/engine-cuda`. The worker composes all three into the boot JSON --
-//! `embedded_engine.rs` does it for `cuda_native` specifically -- and this
-//! engine reads none of them. Every expert stays resident, always.
+//! `crates/engine-cuda`. The three keys are gone from the worker's config too
+//! now -- a `[engine]` table stating one refuses by name, and the residency
+//! knobs that exist are `[model] device_weight_budget` / `host_weight_budget`
+//! (`engine::Residency`). Under an uncapped budget every expert stays
+//! resident, always.
 //!
 //! Which makes the two-run protocol above a comparison of a run with itself,
 //! and it duly agrees with itself: run on `openai/gpt-oss-20b`, both halves
@@ -92,14 +94,14 @@ fn cuda_moe_decodes_the_same_tokens_streamed_or_resident() {
         let streaming = std::env::var("PIE_CUDA_TEST_STREAM_EXPERTS").as_deref() == Ok("1");
         assert!(
             !streaming,
-            "PIE_CUDA_TEST_STREAM_EXPERTS asks for expert paging, and \
-             `engine-cuda` does not do it: `crates/engine-cuda/src/boot.rs` is \
-             every boot knob this engine reads and `stream_routed_experts` is \
-             not one of them, nor are `expert_cache` and `expert_host_cache` \
-             read anywhere under `crates/engine-cuda`. The worker composes all \
-             three into the boot JSON and this engine ignores all three, so a \
-             run with them set is the SAME run. Unset it for the resident \
-             half, which is the half this engine can make."
+            "PIE_CUDA_TEST_STREAM_EXPERTS asks for expert paging through the \
+             retired `stream_routed_experts` / `expert_cache` / \
+             `expert_host_cache` keys, and those are gone from the worker's \
+             config -- no engine ever read them, and `crates/engine-cuda/src/\
+             boot.rs` is every boot knob this engine reads. Expert residency \
+             is `[model] device_weight_budget` / `host_weight_budget` now; \
+             unset the env var for the resident half, which is the half this \
+             harness can make."
         );
         // Pin the resident run to the dispatch streaming is forced onto, so the
         // two runs differ in residency and nothing else.

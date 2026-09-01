@@ -277,6 +277,76 @@ fn a_recorded_if_node_takes_its_body_on_the_arm_a_device_byte_names() {
     eprintln!("conditional node: body {body}, control {control} over four launches");
 }
 
+/// **A GRAPH HOLDING A CONDITIONAL NODE CAN STILL BE COUNTED** — the query
+/// gate, and the one that would have caught the empty-script fault the day
+/// this module landed.
+///
+/// `record::Graphs::fire_body` drops a captured stretch that recorded no
+/// nodes: a cut holding only PREPARE regions captures an empty graph, and an
+/// exec of nothing costs a driver call to do nothing. The count it drops on
+/// used to come from `cudaGraphGetNodes` — the RUNTIME spelling — under an
+/// `else { 0 }`, while this module records `CU_GRAPH_NODE_TYPE_CONDITIONAL`
+/// through the DRIVER one, for the ABI reason its header states. The runtime
+/// query cannot represent that node type and refuses; the refusal read as
+/// "recorded nothing"; every stretch of every body holding a conditional was
+/// dropped; and the key was seated with a SCRIPT OF ZERO STEPS. A fire of it
+/// then launched nothing, counted a hit, and settled a frame whose readout
+/// rectangle still held the last fire that actually ran.
+///
+/// So the claim is not "the graph is non-empty" — it is that **the count is an
+/// ANSWER and not a refusal**, which is what `Option` now spells at the type.
+/// `None` here is the whole fault, and it is why this asserts the variant
+/// before it asserts the number.
+#[test]
+fn a_captured_conditional_graph_answers_its_own_node_count() {
+    let _serial = serialized();
+    let Some(mut rig) = Rig::open("the conditional-node count gate") else {
+        return;
+    };
+
+    // The warm pass, for the reason the gate above states: host work inside a
+    // capture is what the thread-local mode refuses.
+    set_conditional_byte(&rig.ctx, 0, rig.live.ptr(), false, Arm::Warm)
+        .expect("the setter compiles, loads and warms");
+    rig.settle();
+
+    let graph = Graph::capture(rig.main, || {
+        let handle = conditional::handle(rig.main, Kind::If)?;
+        set_conditional_byte(&rig.ctx, handle, rig.live.ptr(), false, Arm::Set)
+            .expect("the setter enqueues into the capture");
+        let cond = conditional::open(rig.main, handle, Kind::If)?;
+        conditional::begin_body(rig.body, cond.body(0).expect("an IF has one body"))?;
+        rig.launch(rig.body, 0);
+        conditional::end_body(rig.body)?;
+        rig.launch(rig.main, 1);
+        Ok(())
+    })
+    .expect("a capture holding a conditional node ends cleanly");
+
+    let counted = graph.nodes();
+    assert!(
+        counted.is_some(),
+        "the driver would not count a graph holding a conditional node. That answer \
+         is indistinguishable from an empty graph at every caller that reads it as a \
+         number, and `record::Graphs::fire_body` DROPS a stretch that recorded \
+         nothing — which is how a body came to be armed with a script that launches \
+         nothing at all",
+    );
+    let counted = counted.unwrap_or(0);
+    assert!(
+        counted > 0,
+        "this capture holds a conditional node, its body's launch and the control \
+         behind it, and the count came back {counted}",
+    );
+    // The edge count is the same question of the same graph, and it is asked
+    // the same way for the same reason.
+    assert!(
+        graph.edges().is_some(),
+        "the node count answered and the edge count did not, on one graph",
+    );
+    eprintln!("a conditional-bearing capture counts {counted} nodes");
+}
+
 /// **THE FORM THE FIRE PATH ACTUALLY USES**, and the arithmetic in it.
 ///
 /// `Cursor::cond_begin` does not hand the setter a byte — it hands it a

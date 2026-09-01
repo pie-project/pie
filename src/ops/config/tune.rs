@@ -146,25 +146,15 @@ pub struct TuneArgs {
     /// Apply the winner to the config file.
     #[arg(long)]
     pub write: bool,
-
-    /// Skip stage one, the memory-planner calibration.
-    ///
-    /// Stage one costs a boot and measures the forward step on this device; its
-    /// result is cached, so a machine that has already been measured does not
-    /// need it again. Nothing else changes -- the sweep then runs against
-    /// whatever shape the planner picks, which is that cached measurement if it
-    /// still applies and the analytic score otherwise.
-    #[arg(long)]
-    pub skip_planner: bool,
-
-    /// Internal: run stage one only, then exit.
-    ///
-    /// `tune` re-execs itself with this to get stage one its own PROCESS, not
-    /// just its own boot — see `calibrate_planner`. Hidden because it is a
-    /// step of this command, not a mode an operator picks.
-    #[arg(long, hide = true)]
-    pub calibrate_only: bool,
 }
+
+// `--skip-planner` and the hidden `--calibrate-only` STOOD HERE, the surface
+// of stage one: a re-exec'd child boot that set `server.calibrate_planner` so
+// the C++ memory planner would measure the forward step instead of scoring
+// it. That planner left with the boot document — the flag it raised reached
+// nothing and `cuda_memory_profiles.json` had no writer left — so the stage
+// reported "the engine declined to calibrate" on every machine. The sweep is
+// the whole command now.
 
 impl TuneArgs {
     /// The load actually run: the objective's shape, with any explicit override
@@ -445,7 +435,8 @@ impl crate::ui::Report for TuneReport {
         }
         println!();
         println!("  Not searched: kv_page_size, max_forward_tokens and max_forward_requests are");
-        println!("  fixed at boot, and belong to stage 1 above rather than to this sweep.");
+        println!("  fixed at boot; state them in the config rather than expecting this sweep");
+        println!("  to move them.");
         // The width caveat, printed whether or not a winner was found, because
         // it bounds the answer either way.
         //
@@ -493,112 +484,7 @@ pub fn apply(content: &str, knobs: Knobs) -> Result<String> {
     Ok(content)
 }
 
-/// When the planner profile was last written, or `None` if it is not there.
-///
-/// Modification time and length together: a calibration that replaces an entry
-/// with one the same size still moves the mtime, and a filesystem with coarse
-/// mtime still changes the length when the numbers differ. Either alone has a
-/// case where a real write looks like no write.
-fn written_at(profile: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
-    let meta = std::fs::metadata(profile).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
-}
-
-/// Measure the memory planner on this device, in its own boot.
-///
-/// **This is why `calibrate_planner` is not a config key.** It is one run of a
-/// measurement, and the only thing that ever needs it is right here: the flag
-/// is set on a config this process derived in memory, the boot that reads it
-/// ends when this function returns, and nothing about it is written down. There
-/// is no state for an operator to leave behind, because there is no state.
-///
-/// It has to be its own boot rather than a stage of the sweep's. A calibrating
-/// planner abandons its score and builds the largest forward shape that fits —
-/// the arena the ladder needs room to sweep inside — and accepts the starved KV
-/// pool that leaves. That is the right arena to measure the forward step in and
-/// the wrong one to measure anything else in, so it goes away before stage two
-/// opens a fresh one from the profile it just wrote.
-///
-/// **The cost is a second weight load, and that is not free.** The premise the
-/// frame-knob sweep is built on is that boots are expensive and knob changes
-/// are not — a TB-scale model spends minutes loading — so a command that boots
-/// twice spends those minutes twice. There is no way around it while the arena
-/// is decided at boot: the two stages need different ones. What there is, is
-/// `--skip-planner`, which is the right flag for every run after the first on a
-/// machine whose forward step has not changed.
-async fn calibrate_planner(content: &str) -> Result<()> {
-    let (controller, gateway, mut worker) = crate::derive::derive_standalone(content)?;
-    worker.server.calibrate_planner = true;
-    // Bind an ephemeral port. The sweep boot that follows wants the configured
-    // one, and a calibration boot serves nothing that needs a stable address.
-    worker.server.port = 0;
-
-    let pie = crate::compose::run_standalone(controller, gateway, worker)
-        .await
-        .context("boot the engine to calibrate the planner")?;
-    // Calibration runs inside the engine's own bootstrap, so by the time the boot
-    // returns the sweep is done and the profile is written. Nothing to drive.
-    pie.shutdown().await;
-    Ok(())
-}
-
-/// Run stage one in a CHILD PROCESS and wait for it.
-///
-/// The engine allows one runtime per process — `bootstrap` latches on the way
-/// up and the admission pools behind it are `OnceLock`s whose own comment says
-/// "reset is by process exit only". Two boots in one process therefore do not
-/// merely fail, they fail three layers deep: the runtime flag first, then the
-/// program-manager and linker singletons, then the execution-slot capacity,
-/// each one a panic rather than an error. Stage two was unreachable on every
-/// machine for exactly this reason.
-///
-/// A child process is the contract the engine states, and it costs nothing
-/// this command was not already paying: stage one is a whole boot, so one more
-/// fork-and-exec is noise beside the weight load inside it.
-///
-/// The child reads the SAME config text this process derived — objective
-/// applied and all — through a temporary file and `PIE_CONFIG`, so the
-/// measurement is taken against the config the sweep is about to serve from
-/// rather than whatever is on disk.
-async fn calibrate_planner_in_child(content: &str, program: &str) -> Result<()> {
-    let dir = std::env::temp_dir().join(format!("pie-tune-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let cfg = dir.join("config.toml");
-    std::fs::write(&cfg, content).with_context(|| format!("write {}", cfg.display()))?;
-
-    let exe = std::env::current_exe().context("locate this executable")?;
-    let mut command = std::process::Command::new(exe);
-    // stdio is inherited, so the child's boot and calibration lines land in
-    // this command's output where the operator is already reading.
-    command
-        .env("PIE_CONFIG", &cfg)
-        .arg("config")
-        .arg("tune")
-        .arg("--calibrate-only")
-        .arg("--program")
-        .arg(program);
-
-    let status = tokio::task::spawn_blocking(move || command.status())
-        .await
-        .context("join the calibration child")?
-        .context("spawn the calibration child")?;
-
-    if !status.success() {
-        // The config is left behind ON FAILURE only: it is the derived one,
-        // not the file on disk, so it is the thing worth looking at when the
-        // calibration boot refuses it.
-        anyhow::bail!(
-            "the calibration boot failed ({status}); its output is above, and \
-             the config it was given is at {}",
-            cfg.display()
-        );
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    Ok(())
-}
-
-/// Calibrate the planner, then sweep the frame knobs inside the arena that
-/// produced.
+/// Sweep the frame knobs against one boot of the derived config.
 pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate::ui::Answer> {
     let (cfg_path, origin) = bootstrap::cli_config_path(global);
     let content = std::fs::read_to_string(&cfg_path).with_context(|| {
@@ -626,14 +512,6 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
         content
     };
 
-    // The child this command re-execs for stage one. Placed after the
-    // objective is folded into `content` so the measurement is taken against
-    // the config the sweep will serve from, and before anything that boots.
-    if args.calibrate_only {
-        calibrate_planner(&content).await?;
-        return Ok(crate::ui::Answer::quiet());
-    }
-
     let (controller, gateway, worker) = crate::derive::derive_standalone(&content)?;
     let baseline = Knobs {
         frame_size: worker.runtime.frame_size as usize,
@@ -658,40 +536,6 @@ pub async fn run(global: &bootstrap::GlobalArgs, args: TuneArgs) -> Result<crate
     );
     println!("  This holds the whole device. Do not run it against a machine that is serving.");
     println!();
-
-    // Stage one, and it has to come first: it decides the forward shape, and
-    // the frame knobs are measured INSIDE whatever arena that shape produces.
-    // Sweeping first would rank candidates against an arena the next boot
-    // replaces.
-    if args.skip_planner {
-        println!("Stage 1/2  planner calibration skipped (--skip-planner)");
-        println!("  The sweep runs against whatever shape the planner picks for this boot --");
-        println!("  a cached measurement if one applies, the analytic score otherwise.");
-    } else {
-        println!("Stage 1/2  calibrating the memory planner (one boot, serves nothing)");
-        // Said before it is paid, not after. The two stages need two different
-        // arenas and therefore two boots, which on a large model is the weight
-        // load twice -- and the whole reason the frame-knob sweep reuses one
-        // boot is that weight loads are the expensive part.
-        println!("  This boots the model a second time; `--skip-planner` reuses an earlier one.");
-        let profile = worker::state::planner_profile_path();
-        // Observed, not assumed. The engine REFUSES to calibrate for
-        // `tensor_parallel_size > 1` and for recurrent-state models, saying so
-        // on stderr and booting normally -- so a successful boot is not a
-        // measurement, and claiming "written to ..." after one would be this
-        // command telling an operator it did something it did not.
-        let before = written_at(&profile);
-        calibrate_planner_in_child(&content, &args.program).await?;
-        if written_at(&profile) == before {
-            println!("  no measurement was recorded -- the engine declined to calibrate");
-            println!("  (it refuses for tensor_parallel_size > 1 and recurrent-state models;");
-            println!("   its reason is on stderr above). Stage 2 runs against the scored shape.");
-        } else {
-            println!("  written to {}", crate::ui::short_path(&profile));
-        }
-    }
-    println!();
-    println!("Stage 2/2  sweeping the frame knobs inside that arena");
 
     let inputs = lane_inputs(workload.fleet, workload.tokens);
     // The CLI's `#[tokio::main]` owns the one runtime (see main.rs's "Model A"
@@ -797,11 +641,10 @@ mod tests {
 
     #[test]
     fn a_calibration_request_cannot_be_written_down() {
-        // The whole reason calibration became a stage rather than a key. A
-        // config that asks for it is refused at parse, so there is no state an
-        // operator can leave behind -- and the sweep can never be ranked
-        // against the arena calibration builds, which is sized to be measured
-        // rather than to serve.
+        // Calibration was a stage of this command rather than a key, and the
+        // stage itself has since retired with the planner it measured -- but a
+        // config written while the key existed still names a real intent, so
+        // it is refused by name rather than silently ignored.
         let asked = "\
 [model]
 name = \"Qwen/Qwen3-0.6B\"
@@ -988,8 +831,6 @@ calibrate_planner = true
             tokens: None,
             budget: None,
             write: false,
-            skip_planner: false,
-            calibrate_only: false,
         };
         let resolved = args.workload(Objective::Latency);
         assert_eq!(resolved.fleet, 7, "an explicit flag wins");

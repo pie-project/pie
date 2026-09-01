@@ -338,6 +338,41 @@ fn a_claimed_profile_that_does_not_read_back_is_refused_not_served_unstamped() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// **THE REAL-ARTIFACT ARM.** The four arms above build their fixtures with
+/// the writer; this one feeds the shell an artifact `pie model import`
+/// actually produced — a cuda-stamped `.zt` that exists on this box because
+/// `this_box()` keys on the linked engine feature and the importing binary
+/// was built without `engine-metal` (the oddity the pending `--backend`
+/// ruling would make explicit). A synthetic fixture proves the gate reads a
+/// stamp; a real import product proves the WRITER and the gate agree on what
+/// a stamp is. Skips with a named reason when no such artifact is on disk —
+/// a fixture this test cannot mint is a fixture it must not require.
+#[test]
+fn a_real_cuda_import_product_is_refused_the_same_way() {
+    if !device::present() {
+        println!("SKIP: this machine publishes no Metal device");
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        println!("SKIP: no HOME to look under");
+        return;
+    };
+    let real = Path::new(&home)
+        .join(".pie/models/mini-l5-e16-k8")
+        .join("mini-l5-e16-k8.qwen36-35b-a3b-mini-mlxu4-kv-bf16.cuda-tp1.mlxu4.zt");
+    if !real.is_file() {
+        println!("SKIP: no cuda-stamped import product at {}", real.display());
+        return;
+    }
+    let device = Context::bind().expect("the system default device binds");
+
+    let (landed, buffers, files) = land(&device, &real, 1, precision());
+    let said = refusal(landed, "a real cuda-stamped import product");
+    assert!(said.contains("backend"), "{said}");
+    assert!(said.contains("\"cuda\"") && said.contains("\"metal\""), "{said}");
+    assert_eq!((buffers, files), (0, 0), "{said}");
+}
+
 /// **TWO ABSENCES, TWO MEANINGS** — the cut both shells implement, asserted on
 /// this one. An ORDINARY checkpoint states no stamp and proceeds, because that
 /// is every load this tree ran before the profile existed; a REQUEST that

@@ -557,6 +557,70 @@ fn an_artifact_for_another_shell_is_refused_naming_the_field() {
     );
 }
 
+/// **A PLANE'S PADDED EXTENT IS REAL, READABLE, AND ZERO.**
+///
+/// `Artifact::part` answers a part's published length, which is what almost
+/// every reader wants. A tier does not: it seats each plane at `reserved` —
+/// the length rounded up to the alignment its layout tiles with — and hands a
+/// kernel a pointer it treats as that wide. Reading `reserved` out of a
+/// `length` slice is reading past it, however certain one is of the bytes.
+///
+/// `Artifact::span` is the accessor that makes the certainty checkable, and
+/// this is what it rests on: §2.4 requires every byte between blobs to be
+/// `0x00`, so the padding after a plane is not merely present but KNOWN. The
+/// assertion below is that claim held against a file this tree wrote, rather
+/// than trusted from the specification.
+///
+/// The over-ask is refused rather than answered with the next object, which
+/// is the half that matters: a reader asking for more padding than the writer
+/// left would otherwise get a neighbouring plane's bytes at exactly the
+/// length it asked for — data, not an error.
+#[test]
+fn a_padded_span_reads_the_file_s_own_zeros_and_refuses_past_them() {
+    let fixture = Fixture::write("span", 4096);
+    let artifact = Artifact::open(&fixture.path).unwrap();
+
+    // **THE PLANE IS CHOSEN AND NOT ASSUMED.** `padded_spans` measures the
+    // distance to the NEXT blob, and this fixture ties `head` to `embed`'s
+    // bytes on purpose — an aliased blob sits wherever its twin does, so a
+    // plane's neighbour in the sequence need not be its neighbour in the
+    // file, and a plane can have no room after it at all. The property is
+    // about whichever plane HAS padding, so the test finds one.
+    let spans = artifact.spans();
+    let padded = serving::padded_spans(&spans);
+    let (at, span) = spans
+        .iter()
+        .enumerate()
+        .find(|(at, span)| padded[*at] > span.length)
+        .expect("some plane of this fixture has padding after it");
+    let (object, part, published, room) = (span.object, span.part, span.length, padded[at]);
+
+    // At and below the published length it is `part`, exactly.
+    let whole_part = artifact.part(object, part).unwrap().to_vec();
+    assert_eq!(artifact.span(object, part, published).unwrap(), &whole_part[..]);
+    assert_eq!(artifact.span(object, part, 16).unwrap(), &whole_part[..16]);
+
+    // Past it, the bytes are the writer's padding and they are zero.
+    let whole = artifact.span(object, part, room).unwrap();
+    assert_eq!(&whole[..published as usize], &whole_part[..]);
+    assert!(
+        whole[published as usize..].iter().all(|byte| *byte == 0),
+        "§2.4 makes inter-blob padding 0x00 and {object:?}/{part:?} does not hold to it",
+    );
+
+    // And one byte past what the writer left is a refusal, not a neighbour.
+    let why = artifact
+        .span(object, part, room + 1)
+        .expect_err("asking for padding the file does not have");
+    let said = format!("{why}");
+    assert!(said.contains("padding this file does not have"), "{said}");
+
+    // An absent name is refused too, rather than answered by position.
+    assert!(artifact.span("layer.0.norm", "scales", 8).is_err());
+    assert!(artifact.span("no.such.plane", "data", 8).is_err());
+    let _ = std::fs::remove_dir_all(&fixture.dir);
+}
+
 // ── the owner's rule, made executable ───────────────────────────────────────
 
 /// **A tp=1 serving artifact, stripped of its serving key, is still an

@@ -14,13 +14,12 @@
 //! rectangle is a function of lane 0's inputs and of nothing else. Bit for
 //! bit, or the wave is not a wave.
 //!
-//! # WHAT IS BROKEN NOW, AND IT IS NOT WHAT THIS FILE WAS WRITTEN FOR
+//! # WHAT THIS GATE CAUGHT THAT IT WAS NOT WRITTEN FOR, AND WHAT FIXED IT
 //!
-//! **This gate is RED on the default configuration, and has been for at least
-//! as long as `8c2aaa7c1`** — verified by checking that commit out and running
-//! it there, byte for byte the same failure. It is not a regression from the
-//! §M-4 wave and it is not the cuBLASLt reassociation the section below
-//! describes.
+//! This gate ran RED on the default configuration for a long time — since at
+//! least `8c2aaa7c1`, verified by checking that commit out and reproducing it
+//! byte for byte — and the failure was not the cuBLASLt reassociation the
+//! section below describes:
 //!
 //! ```text
 //!   [decode  width  2] max |delta logit| 11.046875 at 99129
@@ -30,20 +29,200 @@
 //!   every prefill width               0.000000
 //! ```
 //!
-//! Eleven logits is not an accumulation order. It is a different answer, at
-//! ONE width, deterministic across runs, on a DENSE bf16 SKU whose
-//! `act_x_wt` path this file already fixed.
+//! Eleven logits is not an accumulation order, one width is not a kernel
+//! boundary, and `[engine] graphs = "off"` made it all zero — so it was a
+//! REPLAYED BODY computing something other than what the eager walk computes,
+//! and nothing in any kernel's arithmetic.
 //!
-//! **AND `[engine] graphs = "off"` MAKES IT ALL ZERO.** Same binary, same
-//! model, same probe: every width bit-clean at prefill and decode. So the
-//! divergence is in CUDA GRAPH CAPTURE OR REPLAY at decode width 2 — a
-//! replayed body computing something other than what the eager walk computes
-//! — and not in any kernel's arithmetic.
+//! **AND THE ONE THING THAT MOVED BETWEEN THE CAPTURE AND THE REPLAY WAS THE
+//! LANE SPLIT.** Load-time arming captures the mixed key `b8[c0:8 c1:8]` on a
+//! synthetic fire of seven one-row prefill lanes beside one decode lane, so
+//! the decode class's window begins at lane 7. Width 2 replays that body with
+//! ONE five-row prefill neighbour beside the probe, so the decode class's
+//! window begins at lane 1. Everything the bodies design retargets — the row
+//! offsets, the staged seat, the schedules, the FA2 lane ids and their
+//! fire-wide page tables — moved with it. What did not was the shell's own
+//! pointer arithmetic on the LANE axis: on this SSM hybrid the decode class
+//! runs the per-STEP gated-delta scans, whose slot map, fold predicate and
+//! commit length are handed over sliced at `lane_offset`
+//! (`engine_cuda::run::Run::recurrent`) — an address a body bakes and a
+//! `record::BodyKey` does not fix. The replay read lane 7's recurrent bank
+//! for a decode sitting on lane 1: a wrong-but-real state, which is exactly
+//! why the answer was coherent and wrong rather than garbage.
 //!
-//! That is a worse shape than reassociation and it is on by default:
-//! `Graphs::On` is `Graphs::default()`, so the wrong answer is what a
-//! deployment gets unless it says otherwise. Handed to the cuda-graph session,
-//! whose machinery it is.
+//! `engine_cuda::SHIFTED` had said all along that its promise is about ROWS
+//! and that the lane axis is a separate question with two earned exceptions;
+//! what nothing did was ASK that question at the admissibility door.
+//! `engine_cuda::LANE_SHIFTED` is it, `Windows::admits` spends it on one
+//! clause — a region beginning above the fire's lane zero must find its own
+//! lane — and the gdn decode region is an island on this SKU now. Widths 1
+//! and 3+ were always clean for their own reasons: width 1 is single-class,
+//! so its window begins at lane zero, and width 3+ moves the bucket and walks
+//! eagerly.
+//!
+//! # AND A SECOND FAULT, UNDERNEATH THE FIRST: THE TILED PATH
+//!
+//! With `graphs = "off"` removing the confound above, three SKUs at widths
+//! 2, 3, 4, 8, 16 against a solo baseline:
+//!
+//! ```text
+//!   qwen35-d0.8b-bf16   (dense bf16)          all 0.000000, prefill + decode
+//!   gptoss-20b-mxfp4    (routed, mxfp4)       all 0.000000, prefill + decode
+//!   qwen35-d0.8b-mlxu4  (TILED, U4g64tiled)   prefill 0.156-0.164 at 2..16
+//!                                             decode  0.000000 at 2,
+//!                                                     0.187500 at 3,4,8,16
+//!   qwen36-35b-a3b-mini (TILED **and ROUTED**) prefill 0.063 at 2,
+//!                                                     0.102 at 3..16
+//!                                             decode  0.000000 at 2,
+//!                                                     0.078 at 3..16
+//! ```
+//!
+//! Deterministic across runs. **The tiled affine path is not
+//! batch-invariant**; the dense path and the routed mxfp4 path are.
+//!
+//! That is the shape the mac-engine session predicted from their own vector
+//! point and named by file:line — `kernels_cuda::linear::tiled::carve_for`
+//! picks `kSplit` 32 at `rows <= 8` and 16 above, and `split` PARTITIONS K, so
+//! two fires that differ only in row count walk the contraction in different
+//! orders. A tenth of a logit is two or three bf16 ulp, which is what an
+//! accumulation-order difference looks like and is nothing like the eleven
+//! logits the graph fault produces.
+//!
+//! # THE DANGEROUS COMPOSITION, RUN
+//!
+//! The worry was TILED **and** ROUTED: an mlxu4 MoE row, where top-k over
+//! many experts could turn a ulp into a DIFFERENT EXPERT and that into whole
+//! logits — the a4b-class failure mac-engine root-caused on their plane.
+//! Neither full row fits a 46 GiB card, so they carved a miniature that does:
+//! `qwen36-35b-a3b-mini-mlxu4-kv-bf16`, 5 layers, 8-of-16 experts, **K
+//! untouched** (hidden 2048, expert intermediate 512), vocabulary full.
+//!
+//! ```text
+//!   width      2      3      4      5      6      7      8      9     12     16
+//!   prefill  .063   .102   .102   .102   .102   .102   .102   .102   .102   .102
+//!   decode   .000   .078   .078   .078   .078   .078   .078   .078   .078   .078
+//! ```
+//!
+//! **The same structure, exactly**: three prefill regimes, two decode
+//! regimes, the one boundary between 2 and 3, everything from 3 to 16
+//! identical. So the fault composes with routing and the miniature reproduces
+//! it — which makes it the bisection vehicle, small enough to run per change.
+//!
+//! **AND THE ARGMAX SURVIVED, AT EVERY WIDTH.** Routing did not amplify it
+//! here: the routed delta (0.078) is SMALLER than the same SKU family's
+//! non-routed one (0.188), and no expert flipped. So the amplification that
+//! makes this class catastrophic is demonstrated as POSSIBLE on this plane
+//! and is not demonstrated as REALIZED. Two honest reasons it might not
+//! have fired: 8-of-16 is a less contested tail than the 8-of-256 the
+//! source ships, and five layers compound less than thirty-six.
+//!
+//! **THE FIRST WAS TESTED AND IS NOT THE REASON.** A second carve at
+//! `--experts 64` — same K, same layers, a tail four times as crowded:
+//!
+//! ```text
+//!   width      2      3      4      5      6      7      8      9     12     16
+//!   prefill  .047   .065   .065   .065   .065   .065   .065   .065   .065   .065
+//!   decode   .000   .078   .078   .078   .078   .078   .078   .078   .078   .078
+//! ```
+//!
+//! Same structure, same boundary, argmax intact — and the decode delta is
+//! **identical to the 16-expert carve's, 0.078125 at both**, while
+//! prefill's is SMALLER at 64 than at 16. Crowding the tail fourfold
+//! amplified nothing.
+//!
+//! So on this plane the fault does not compound through expert selection:
+//! its size is insensitive to how many experts there are. That is a real
+//! negative result about the a4b-class CONSEQUENCE and it is not a
+//! clearance of the fault — a tenth of a logit is still a tenth of a logit,
+//! and thirty-six layers were not tested.
+//!
+//! # A THIRD FAULT, FOUND VERIFYING THE FIX FOR THE FIRST
+//!
+//! `e8455cb25` fixed the graph-replay divergence above — a recurrent scan's
+//! slot table baking lane-offset ADDRESSES into the capture — and the dense
+//! SKU is now `0.000000` at every width on the DEFAULT configuration, which
+//! is what that fix promised and what it delivers.
+//!
+//! Re-running the tiled+routed miniature at the default to check my own
+//! findings were independent of it turned up something else:
+//!
+//! ```text
+//!   graphs on (default)   the same ONE-LANE fire twice is not bit-identical
+//!   graphs off            solo repeats exactly; only the width fault remains
+//! ```
+//!
+//! Deterministic across runs, and it is not batch-invariance at all — it is
+//! the same input, the same single lane, twice in one process, answering
+//! differently. That is a stronger property broken than anything else in this
+//! file, and this gate only catches it because it checks its own baseline
+//! before reading anything below it.
+//!
+//! It is model-dependent: the dense 0.8B is clean at the default, the
+//! tiled+routed mini is not. What the mini has that it does not is expert
+//! routing (and this family's hybrid recurrent layers). Handed to the
+//! cuda-graph session as a possible remainder of the same class their fix
+//! addressed, on the model shape their fix did not have to hand.
+//!
+//! # WHAT THE NUMBERS EXCLUDE, WHICH IS EVERY CANDIDATE NAMED SO FAR
+//!
+//! Ten widths on the tiled SKU, graphs off, deterministic:
+//!
+//! ```text
+//!   width      2      3      4      5      6      7      8      9     12     16
+//!   prefill  .164   .156   .156   .156   .156   .156   .156   .156   .156   .156
+//!   decode   .000   .188   .188   .188   .188   .188   .188   .188   .188   .188
+//! ```
+//!
+//! **Two regimes at decode and three at prefill, and the only boundary in
+//! range is between 2 and 3 rows.** Every width from 3 to 16 is identical to
+//! the byte, at the same vocabulary entry. That excludes all three row-count
+//! switches this kernel has:
+//!
+//! * **`carve_for` — excluded by MEASUREMENT.** `THIN_ROWS` is 8 and widths
+//!   8 and 9 agree, straddling the switch from `THIN_SPLIT` (32) to
+//!   `WIDE_SPLIT` (16) without moving.
+//!
+//!   An earlier version of this list also argued it out by arithmetic — "the
+//!   delta is at a vocabulary entry, so `lm_head` carries it, and its split
+//!   clamps to `MIN_SPLIT` at every row count". **The second clause is sound
+//!   and the first is a tautology**: this gate measures logits, so its
+//!   maximum is at a vocabulary entry by construction, whatever produced it.
+//!   The clamp says something true about `lm_head` and nothing about where
+//!   these numbers come from. The measurement is the exclusion; the
+//!   arithmetic was scaffolding on a circle.
+//! * **`bucket` — NOT excluded, and the first version of this list said it
+//!   was.** It instantiates at 1, 2, 4, 8, 16, and buckets 4, 8 and 16 do all
+//!   agree — but that shows the arithmetic is bucket-independent ABOVE two
+//!   rows, not that bucket is irrelevant. **The observed boundary coincides
+//!   exactly with its 2-to-4 step**, and the template is instantiated on
+//!   `rows = bucket(y.rows)` with `Carve::smem(rows)` sized from it. Buckets
+//!   1 and 2 agreeing while 4 and up agree separately is the signature of a
+//!   specialization that changes shape at small row counts, which is what a
+//!   template parameter on the row count can do. It is the surviving
+//!   candidate.
+//! * **`PREFILL_ROWS`** — 12 takes `matmul_gemv` and 16 takes `matmul`, two
+//!   different kernels, and they agree to the byte.
+//!
+//! So two of the three are out — one by measurement and arithmetic together —
+//! and the third is not the alibi the first version of this list gave it.
+//! What survives is a template specialization on the bucketed row count at
+//! the 2-to-4 step, somewhere in the tiled gemv path. WHICH projection
+//! carries it is not established — a logit maximum cannot say — and the
+//! five-SKU pattern only says the tiled path is involved. That is where a fix
+//! should start, and it is not where the file:line handover pointed.
+//!
+//! # And a correction: this is attributed, not proven
+//!
+//! What is measured is that **the mlxu4 SKU's LOGITS depend on lane count**,
+//! at a 2-vs-3 threshold. The logits are the whole forward pass. The tiled
+//! projection is the leading candidate because the two SKUs that do not use
+//! it — dense bf16 and routed mxfp4 — are clean at every width on the same
+//! attention and the same scheduler, which is what makes it a statement about
+//! the quantized projection path rather than about batching in general.
+//!
+//! But with all three of that path's row-count switches excluded, the
+//! MECHANISM is not identified, and "the tiled path is not batch-invariant"
+//! is one inference further than the numbers reach on their own.
 //!
 //! # What was broken BEFORE, and what this file was written for
 
@@ -102,6 +281,7 @@ use engine::{
     Budgets, FrameSubmission, KvDelta, Lane, LaneReadout, Readout, RsReset, RsVerb, Step,
 };
 use model_ir::Platform;
+use runtime::engine::backend::Graphs;
 use runtime::engine::backend::open;
 
 /// The catalog row this gate serves.
@@ -248,7 +428,34 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
     let tokenizer = tokenizer::Tokenizer::from_file(&checkpoint.join("tokenizer.json"))
         .expect("the checkpoint's tokenizer loads");
 
-    let mut engine = open::cuda(std::env::var("PIE_WI_ENGINE_TOML").unwrap_or_else(|_| "[model]\ndevice = \"cuda:0\"\n".to_string()).as_bytes()).expect("the cuda seam opens");
+    // `PIE_WI_DEVICE` picks another card (`"1"` or `"cuda:1"`); the default is
+    // ordinal 0 — the successor of the boot-document override this gate
+    // carried while the seam took TOML.
+    let ordinal = std::env::var("PIE_WI_DEVICE")
+        .map(|d| runtime::engine::backend::ordinal_of(&d))
+        .unwrap_or(0);
+    // **AND `PIE_WI_GRAPHS` COMES BACK, TYPED.** The boot-document override
+    // this gate carried took a whole `[engine]` table, and the seam's move to
+    // a struct kept the card knob and dropped this one — which is the knob
+    // that did the work. Turning capture off is how the two faults this file
+    // records were SEPARATED: with it off the dense SKU's eleven-logit swing
+    // vanished and the tiled path's tenth-of-a-logit stayed, which is the
+    // whole reason they are known to be two faults and not one.
+    //
+    // `Graphs` parses the same three spellings the boot key always took, so
+    // this is the old override's one useful degree of freedom in the type the
+    // seam now speaks. Default is the shell's own, which is `On` — a gate that
+    // silently ran eager would be measuring a configuration nobody deploys.
+    let graphs = match std::env::var("PIE_WI_GRAPHS") {
+        Ok(named) => named.parse().expect("PIE_WI_GRAPHS is on, shaped, or off"),
+        Err(_) => Graphs::default(),
+    };
+    let mut engine = open::cuda(runtime::engine::backend::DeviceBoot {
+        ordinal,
+        graphs,
+        ..Default::default()
+    })
+    .expect("the cuda seam opens");
     let budgets = Budgets {
         max_lanes: 16,
         max_tokens: 1024,
@@ -269,7 +476,14 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
         1,
     )
     .expect("the checkpoint identifies and its SKU traces");
-    assert_eq!(request.trace.name, SKU);
+    // The default snapshot pins its SKU, because a gate that silently ran a
+    // different model would be asserting invariance about something nobody
+    // chose. An OVERRIDDEN snapshot names whatever it identifies as, and says
+    // so: picking the row is the point of the override.
+    match std::env::var("PIE_WIDTH_INVARIANCE_SNAPSHOT") {
+        Err(_) => assert_eq!(request.trace.name, SKU),
+        Ok(_) => eprintln!("[width-invariance] running {}", request.trace.name),
+    }
     let loaded = engine.load(request).expect("the checkpoint lands");
     let vocab = loaded.caps.profile.vocab as usize;
 
@@ -320,7 +534,10 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
     //
     // Width 1 is NOT in the list: it is the solo baseline itself, so comparing
     // it would be comparing a read to itself. 3 is the odd probe.
-    for width in [2usize, 3, 4, 8, 16] {
+    // The ten the header's table was measured at. 5,6,7,9,12 are not padding:
+    // they are what excluded `bucket` and `carve_for`, because a group that
+    // straddles a switch and does not move is what acquits it.
+    for width in [2usize, 3, 4, 5, 6, 7, 8, 9, 12, 16] {
         let crowd = read(engine.as_mut(), prefill(), &neighbours, width);
         report("prefill", &solo, &crowd, width, &tokenizer, &mut failures);
     }
@@ -363,7 +580,10 @@ fn lane_zeros_logits_do_not_move_when_the_fire_gets_wider() {
     //
     // Width 1 is NOT in the list: it is the solo baseline itself, so comparing
     // it would be comparing a read to itself. 3 is the odd probe.
-    for width in [2usize, 3, 4, 8, 16] {
+    // The ten the header's table was measured at. 5,6,7,9,12 are not padding:
+    // they are what excluded `bucket` and `carve_for`, because a group that
+    // straddles a switch and does not move is what acquits it.
+    for width in [2usize, 3, 4, 5, 6, 7, 8, 9, 12, 16] {
         let crowd = decode(engine.as_mut(), width);
         report("decode ", &solo, &crowd, width, &tokenizer, &mut failures);
     }
