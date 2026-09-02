@@ -309,6 +309,23 @@ def build_config(args: argparse.Namespace):
             engine_options["max_forward_requests"] = args.max_forward_requests
         if getattr(args, "total_pages", 0):
             engine_options["total_pages"] = args.total_pages
+        # `--engine-option KEY=VALUE`, handed to the Metal options as typed
+        # (`max_state_slots`, ...), as the cuda arm does.
+        for raw in getattr(args, "engine_option", []) or []:
+            key, sep, value = raw.partition("=")
+            if not sep:
+                raise SystemExit(f"--engine-option wants KEY=VALUE, got {raw!r}")
+            if value in ("true", "false"):
+                parsed: Any = value == "true"
+            else:
+                try:
+                    parsed = int(value)
+                except ValueError:
+                    try:
+                        parsed = float(value)
+                    except ValueError:
+                        parsed = value
+            engine_options[key] = parsed
         # `--max-model-len` is the cross-engine context knob (llama.cpp takes
         # it as `--ctx-size`, vLLM as `max_model_len`), ONE REQUEST's context
         # on every engine — the Metal engine included: its fleet is derived
