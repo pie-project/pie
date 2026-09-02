@@ -45,7 +45,13 @@ async def maybe_server(args: argparse.Namespace, slot_ctx: int | None = None):
         if not args.gguf_model:
             raise ValueError("--gguf-model is required with --server-bin")
         url = f"http://127.0.0.1:{args.port}"
-        parallel = args.num_requests if args.mode == "tput" else 1
+        # One slot per in-flight request: the client caps concurrency, so
+        # `--parallel` = `--concurrency` (every request at once when uncapped).
+        parallel = (
+            (getattr(args, "concurrency", 0) or args.num_requests)
+            if args.mode == "tput"
+            else 1
+        )
         cmd = [
             args.server_bin,
             "--model", args.gguf_model,

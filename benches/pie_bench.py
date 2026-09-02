@@ -316,6 +316,18 @@ def build_config(args: argparse.Namespace):
         # multiplied by the fleet (which this once did) hands an 8-way run
         # one lane. Size `--total-pages` to `fleet * max_model_len / 16`.
         engine_options["max_model_len"] = args.max_model_len
+        # A recurrent model's state pool is sized by `max_state_slots` (default
+        # 256 seats: ~30 GiB of delta state for a qwen3.8-class trunk); one seat
+        # per lane is what a bench needs.
+        engine_options["max_state_slots"] = max(1, args.max_forward_requests)
+        for raw in getattr(args, "engine_option", []) or []:
+            key, sep, value = raw.partition("=")
+            if not sep:
+                raise SystemExit(f"--engine-option wants KEY=VALUE, got {raw!r}")
+            try:
+                engine_options[key] = int(value)
+            except ValueError:
+                engine_options[key] = value
     elif args.engine == "vllm":
         engine_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
