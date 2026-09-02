@@ -29,6 +29,10 @@ pub struct Window {
     /// the runs it compacts. When present, `span` is the compacted
     /// rectangle (offsets 0), not a fire interval.
     pub gathered: Option<Gathered>,
+    /// Which expert-major pass of its region's run this window is, of how
+    /// many (`0` of `1` for a run walked once).
+    pub pass: u32,
+    pub passes: u32,
     /// The mask's interval on the second row axis: patch rows if `span`
     /// covers tokens, image rows if it covers lanes. All zero when the
     /// fire carries no image.
@@ -242,8 +246,12 @@ pub fn gathers(trace: &Trace, compiled: &CompiledModel) -> usize {
 /// Give this window a position in the fire's deduplicated list.
 /// Deduplicated on span and gathered runs (same extent, different rows).
 fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
+    // An expert-major pass is its own window even over the same rows: the
+    // cut reads which pass it is off the window.
     let same = |held: &Window| {
         held.span == window.span
+            && held.pass == window.pass
+            && held.passes == window.passes
             && held.gathered.as_ref().map(|g| &g.runs) == window.gathered.as_ref().map(|g| &g.runs)
     };
     let index = match windows.iter().position(same) {
@@ -340,6 +348,8 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
         }),
         // Filled by the caller: patch interval is the region's, not the union's.
         patch: MaskSpan::default(),
+        pass: 0,
+        passes: 1,
     }
 }
 
@@ -360,6 +370,7 @@ impl Windows {
         indptr_host: &[i32],
         copies: Copies<'_>,
         run_caps: &[u32],
+        run_passes: &[u32],
     ) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
         let mut runs: Vec<u32> = Vec::with_capacity(compiled.template().len());
@@ -422,12 +433,20 @@ impl Windows {
             // rows. A piece inside a lane has no qo boundary of its own to
             // rebase to — its ops are row-local — so it states `[0, rows]`.
             let cap = run_caps.get(at).copied().unwrap_or(0);
-            let capped = cap > 0 && spans.iter().any(|span| span.rows > cap);
-            if capped {
-                model_exec::fire::chunk_spans(&mut spans, cap);
-            }
+            let max_passes = run_passes.get(at).copied().unwrap_or(0);
+            // Expert-major passes walk every span whole (the same row
+            // boundaries as an uncapped run) and cut before each pass.
+            let (capped, passes) = if cap > 0 && max_passes > 1 {
+                (false, model_exec::fire::pass_spans(&mut spans, cap, max_passes))
+            } else {
+                let capped = cap > 0 && spans.iter().any(|span| span.rows > cap);
+                if capped {
+                    model_exec::fire::chunk_spans(&mut spans, cap);
+                }
+                (capped, 1)
+            };
             of_region.push((runs.len() as u32, spans.len() as u32));
-            for &span in &spans {
+            for (i, &span) in spans.iter().enumerate() {
                 let window = Window {
                     span,
                     indptr_host: match axis {
@@ -438,6 +457,8 @@ impl Windows {
                     indptr: Tensor::new(NIL, 0, 1, Dtype::I32),
                     gathered: None,
                     patch,
+                    pass: (i as u32) % passes,
+                    passes,
                 };
                 runs.push(seat(&mut windows, window));
             }

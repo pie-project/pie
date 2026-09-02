@@ -998,6 +998,10 @@ pub struct Shell {
     /// fire whose rows would name more experts than the slab seats is walked
     /// as pieces, each cut and seated on its own (`FireDescriptor::run_caps`).
     run_caps: Vec<u32>,
+    /// Per region, the expert-major passes a capped run is walked in
+    /// (`ceil(experts / slots)` after a streamed router; `0` elsewhere).
+    /// `PIE_EXPERT_PASSES=0` turns the passes off and cuts rows instead.
+    run_passes: Vec<u32>,
     /// Per slot: how many kv tokens it holds.
     held: Vec<u32>,
     /// The trunk's logits, as the plan's `out` seam names them.
@@ -1201,6 +1205,41 @@ impl Shell {
                 }
             })
             .collect();
+        // Expert-major passes for the same regions: one group of the slab's
+        // seats per pass, at most the whole expert set.
+        let passes_on = std::env::var("PIE_EXPERT_PASSES").map_or(true, |v| v != "0");
+        let run_passes: Vec<u32> = (0..compiled.template().len())
+            .map(|region| {
+                let routes = region
+                    .checked_sub(1)
+                    .and_then(|router| cuts.get(router).copied().flatten());
+                match routes {
+                    Some(routes) if passes_on => boot
+                        .residency
+                        .groups()
+                        .iter()
+                        .find(|group| group.routes == routes)
+                        .map_or(0, |group| {
+                            if group.slots > 0 {
+                                group.experts.div_ceil(group.slots)
+                            } else {
+                                0
+                            }
+                        }),
+                    _ => 0,
+                }
+            })
+            .collect();
+        if std::env::var_os("PIE_CUT_TRACE").is_some() {
+            let capped: Vec<(usize, u32, u32)> = run_caps
+                .iter()
+                .zip(&run_passes)
+                .enumerate()
+                .filter(|(_, (cap, _))| **cap > 0)
+                .map(|(at, (cap, passes))| (at, *cap, *passes))
+                .collect();
+            eprintln!("cuts: slots {} capped regions (region, cap, passes) {capped:?}", boot.residency.slots());
+        }
         // **AND THE HASHER CUTS BESIDE THEM**, read here for the same reason
         // and refused here for the same one: a region carrying two hashers
         // that land different id vectors cannot be served by one cut, and the
@@ -1554,6 +1593,7 @@ impl Shell {
             cuts,
             row_cuts,
             run_caps,
+            run_passes,
             held: vec![0; boot.slots as usize],
             out,
             mtp,
@@ -3859,6 +3899,7 @@ impl Shell {
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
         let mut descriptor = FireDescriptor::of(&composition);
         descriptor.run_caps = self.run_caps.clone();
+        descriptor.run_passes = self.run_passes.clone();
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
@@ -4442,6 +4483,7 @@ impl Shell {
                 request_of_token: &request_of_token,
             },
             &self.run_caps,
+            &self.run_passes,
         )?;
         self.last = FireCost {
             launches: windows.launches(),

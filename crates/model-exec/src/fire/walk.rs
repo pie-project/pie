@@ -136,7 +136,12 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
         let once = grouped || copy;
         if !once {
             if let Some(&cap) = descriptor.run_caps.get(index) {
-                super::compose::chunk_spans(&mut runs, cap);
+                let passes = descriptor.run_passes.get(index).copied().unwrap_or(0);
+                if passes > 1 {
+                    super::compose::pass_spans(&mut runs, cap, passes);
+                } else {
+                    super::compose::chunk_spans(&mut runs, cap);
+                }
             }
         }
         // `max(1)` is the empty window: it turns once, at zero rows, so the

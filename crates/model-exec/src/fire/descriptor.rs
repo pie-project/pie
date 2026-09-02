@@ -88,6 +88,10 @@ pub struct FireDescriptor {
     /// at its own cut — sub-batching the segment. Empty means no region is
     /// capped; a shell that streams nothing leaves it so.
     pub run_caps: Vec<u32>,
+    /// Per region, the most expert-major passes a capped run is walked in
+    /// (`compose::pass_spans`): `ceil(experts / slots)` for a streamed
+    /// router's segment, `0`/`1` to cut rows instead. Empty means none.
+    pub run_passes: Vec<u32>,
     /// The patch rung these patch rows round up to — which tower graph runs.
     pub patch_bucket: u32,
     /// One PATCH window per class of the artifact, indexed by class — a
@@ -111,6 +115,7 @@ impl FireDescriptor {
             patch_bucket: composition.patch_bucket(),
             patch_classes: composition.patch_classes().clone(),
             run_caps: Vec::new(),
+            run_passes: Vec::new(),
         }
     }
 
@@ -365,6 +370,7 @@ impl FireDescriptor {
             patch_bucket,
             patch_classes: WindowTable::new(patch_table),
             run_caps: Vec::new(),
+            run_passes: Vec::new(),
         })
     }
 }

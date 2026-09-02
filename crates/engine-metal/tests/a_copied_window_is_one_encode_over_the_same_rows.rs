@@ -132,6 +132,7 @@ fn windows(trace: &Trace, compiled: &CompiledModel, enabled: bool) -> Windows {
             request_of_token: &request_of_token,
         },
         &[],
+    &[],
     )
     .expect("a fire over every class is a fire the artifact promised")
 }

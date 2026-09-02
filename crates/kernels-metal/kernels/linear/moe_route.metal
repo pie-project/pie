@@ -606,9 +606,11 @@ constant constexpr uint kMaxExperts = 1024;
     uint2 gid                  [[thread_position_in_grid]]) {
     if (gid.x >= width || gid.y >= rows) return;
     const int at = inv[gid.y];
+    // A pair the sort dropped (a negative id: another expert-major pass's
+    // work) keeps whatever row it has; zeroing it would erase that pass.
+    if (at < 0) return;
     const uint pitch = out_pitch != 0u ? out_pitch : width;
-    out[uint(gid.y) * pitch + gid.x] =
-        at < 0 ? bfloat(0) : sorted[uint(at) * width + gid.x];
+    out[uint(gid.y) * pitch + gid.x] = sorted[uint(at) * width + gid.x];
 }
 
 [[kernel]] void expert_combine(

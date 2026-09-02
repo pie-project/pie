@@ -247,9 +247,9 @@ impl<'a> Sink<'a> {
             .borrow()
             .hint_for(routes)
             .and_then(|hint| cuts.slots.0.get(hint.0 as usize).copied().flatten());
-        self.across(fire, cuts, routes, "a routing vector", |rect, span, arena| {
+        self.across(fire, cuts, routes, "a routing vector", |rect, span, pass, arena| {
             tier.borrow_mut()
-                .segment(arena, self.handles, routes, rect, hint, span)
+                .segment(arena, self.handles, routes, rect, hint, span, pass)
         })
     }
 
@@ -266,7 +266,7 @@ impl<'a> Sink<'a> {
         let Some(ids) = cuts.ngram.get(region as usize).copied().flatten() else {
             return Ok(());
         };
-        self.across(fire, cuts, ids, "an n-gram id vector", |rect, span, arena| {
+        self.across(fire, cuts, ids, "an n-gram id vector", |rect, span, _pass, arena| {
             rows.borrow_mut()
                 .segment(arena, self.handles, ids, rect, span)
         })
@@ -283,7 +283,7 @@ impl<'a> Sink<'a> {
         cuts: &Cuts<'_>,
         vector: ValueId,
         what: &str,
-        seat: impl FnOnce(Tensor, MaskSpan, &mut Buffer) -> crate::error::Result<()>,
+        seat: impl FnOnce(Tensor, MaskSpan, (u32, u32), &mut Buffer) -> crate::error::Result<()>,
     ) -> Result<(), Error> {
         let Held::Owned(cell) = &self.frame else {
             return Ok(());
@@ -312,22 +312,23 @@ impl<'a> Sink<'a> {
                     what: format!("value {}, {what} the carve gave no rectangle", vector.0),
                 })
             })?;
-        let span = cuts
-            .windows
-            .at(region, cuts.place.run.get())
-            .span;
+        let window = cuts.windows.at(region, cuts.place.run.get());
+        let span = window.span;
+        let pass = (window.pass, window.passes);
         if std::env::var_os("PIE_CUT_TRACE").is_some() {
             eprintln!(
-                "cut: region {region} run {}: rows {}..{} of value {} ({what}; rect {} x {})",
+                "cut: region {region} run {}: rows {}..{} of value {} ({what}; rect {} x {}; pass {} of {})",
                 cuts.place.run.get(),
                 span.row_offset,
                 span.row_offset + span.rows,
                 vector.0,
                 rect.rows,
-                rect.width
+                rect.width,
+                pass.0,
+                pass.1
             );
         }
-        seat(rect, span, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
+        seat(rect, span, pass, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
 
         *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);
         Ok(())

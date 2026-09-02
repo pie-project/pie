@@ -83,6 +83,32 @@ pub type MaskSpan = ClassWindow;
 /// lane interval: the ops of a capped region are row-local (a routed
 /// mixture's matmuls and their combine), and read no lane-shaped value. `0`
 /// caps nothing.
+/// **EXPERT-MAJOR PASSES** over a routed segment: instead of cutting a run
+/// into row pieces (`chunk_spans`), every span is walked whole `passes`
+/// times, and at each pass's cut the tier seats ONE GROUP of the distinct
+/// experts the run routes to and masks the routing vector to it (`-1`
+/// elsewhere), so each expert is copied once per run rather than once per
+/// piece it appears in. The pass count is what `cap` would have cut the
+/// widest span into, bounded by `max_passes` (the groups the whole expert
+/// set fills). Returns the passes; `1` leaves the spans alone.
+pub fn pass_spans(spans: &mut Vec<MaskSpan>, cap: u32, max_passes: u32) -> u32 {
+    if cap == 0 || max_passes <= 1 {
+        return 1;
+    }
+    let widest = spans.iter().map(|span| span.rows).max().unwrap_or(0);
+    let passes = widest.div_ceil(cap).clamp(1, max_passes);
+    if passes <= 1 {
+        return 1;
+    }
+    let whole = std::mem::take(spans);
+    for span in whole {
+        for _ in 0..passes {
+            spans.push(span);
+        }
+    }
+    passes
+}
+
 pub fn chunk_spans(spans: &mut Vec<MaskSpan>, cap: u32) {
     if cap == 0 || spans.iter().all(|span| span.rows <= cap) {
         return;

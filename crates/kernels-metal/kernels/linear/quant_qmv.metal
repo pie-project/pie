@@ -416,6 +416,11 @@ METAL_FUNC void qmv_gptoss_impl(
   const int slot = ROUTED ? int(tid.z) : 0;
   const int sel = row * slots_per_row + slot;
   if (ROUTED) {
+    // A negative id is a pair this pass does not compute (expert-major
+    // passes mask the vector to one group); its row is someone else's.
+    if (expert_ids[sel] < 0) {
+      return;
+    }
     const size_t e = size_t(expert_ids[sel]);
     ws += e * size_t(out_vec_size) * size_t(in_vec_size_w);
     scales += e * size_t(out_vec_size) * size_t(in_vec_size_g);
