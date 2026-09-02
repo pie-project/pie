@@ -1328,8 +1328,10 @@ fn axis(at: usize) -> u32 {
 enum MetaNaming {
     /// `w` publishes `w<suffix>`.
     Extend,
-    /// `w.weight` publishes `w<suffix>`. Refused (not treated as
-    /// [`Self::Extend`]) for a declaration not ending in `.weight`.
+    /// `w.weight` publishes `w<suffix>`; a declaration not ending in
+    /// `.weight` (a text's own name, e.g. `lm_head`) extends instead —
+    /// the companions are found structurally (`LoadPlan::attachments`),
+    /// never by suffix, so the name only has to be unique.
     ReplaceWeight,
 }
 
@@ -1339,10 +1341,7 @@ impl MetaNaming {
             Self::Extend => Ok(format!("{name}{suffix}")),
             Self::ReplaceWeight => match name.strip_suffix(".weight") {
                 Some(stem) => Ok(format!("{stem}{suffix}")),
-                None => Err(Error::Contract(format!(
-                    "'{name}' is encoded into a scheme whose scales are named \
-                     beside a '.weight', but its declared name does not end in one"
-                ))),
+                None => Ok(format!("{name}{suffix}")),
             },
         }
     }

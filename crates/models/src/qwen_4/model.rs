@@ -275,6 +275,9 @@ pub struct Mix {
     pub gdn_ba: Dtype,
     /// Routed expert banks (fused `gate|up` and `down`); most of a layer's bytes live here.
     pub experts: Dtype,
+    /// The `lm_head` bank. The Mixed-2bit conversion ships it bf16 (1.27 GB,
+    /// read whole every token); the import encodes it to this on the way in.
+    pub head: Dtype,
     /// Hashed n-gram table; 160-wide rows can't group by 64, so quantized tables use G32 regardless of the trunk width.
     pub table: Dtype,
 }
@@ -293,6 +296,7 @@ impl Mix {
         };
         Mix {
             embed: proj,
+            head: proj,
             proj,
             // Too narrow for the 8-bit predicate; stay dense while the banks beside them go to 8 bits.
             inject: crate::dense(w),
@@ -306,6 +310,7 @@ impl Mix {
     pub const MIXED_2BIT: Mix = Mix {
         // Plain BF16, no `.scales` companion.
         embed: Dtype::Bf16,
+        head: Dtype::U4g64,
         proj: Dtype::U4g64,
         inject: Dtype::U4g64,
         gdn_ba: Dtype::U4g64,
@@ -468,6 +473,7 @@ impl Model {
         // Each role's width is declared by `mix`; nothing is dequantized at load.
         let Mix {
             embed: embed_w,
+            head: head_w,
             proj,
             inject: inject_w,
             gdn_ba,
@@ -737,7 +743,7 @@ impl Model {
             lowrank: d.lowrank,
             kv,
             embed: Weight::sym("embed", [u64::from(d.vocab), hidden], embed_w),
-            head: Weight::sym("lm_head", [u64::from(d.vocab), hidden], embed_w),
+            head: Weight::sym("lm_head", [u64::from(d.vocab), hidden], head_w),
             layers,
             mixer: residual("mixer", false),
             ple,

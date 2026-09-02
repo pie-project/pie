@@ -1778,10 +1778,14 @@ struct Group {
 }
 
 fn groups_of(plan: &LoadPlan, trace: &runtime::engine::load::Trace) -> Result<Vec<Group>> {
+    // Declared tensors sit at their own index; a companion an encode
+    // GENERATES (a raw source landed as a quantized bank) is numbered past
+    // them and found by id.
     let name_of = |id: TensorId| {
         plan.tensors
             .get(id.0 as usize)
             .filter(|decl| decl.id == id)
+            .or_else(|| plan.tensors.iter().find(|decl| decl.id == id))
             .map(|decl| decl.name.clone())
             .ok_or_else(|| anyhow!("the plan attaches tensor {} and declares no such tensor", id.0))
     };
