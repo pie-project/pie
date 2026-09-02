@@ -97,11 +97,21 @@ pub struct DevGeo {
     /// resolves every write target in-graph, so `lease`/`fresh_dense`/
     /// `w_cont_dense` are inert.
     pub pooled: bool,
+    /// The lanes' row split as the guest states it: one token a lane, or a
+    /// seeded, never-put `embed_indptr` (`[0, w]` for a one-lane window).
+    /// What the recurrent plan reads its rows off; `None` for a leased pass,
+    /// which resolves every row on the device.
+    pub qo_indptr: Option<Vec<u32>>,
 }
 
 impl DevGeo {
-    /// A pool-owned device-geometry pass over `lanes` request rows.
-    pub fn pooled(lanes: usize, has_mask: bool) -> Self {
+    /// A pool-owned device-geometry pass whose lanes `qo_indptr` cuts
+    /// (`detect_pooled_device_geometry`'s answer). One token a lane is the
+    /// decode shape and states no split; a lane of several rows — a
+    /// speculative window on a recurrent state — states it, so the fire
+    /// path can plan the rows the device will resolve.
+    pub fn pooled(qo_indptr: Vec<u32>, has_mask: bool) -> Self {
+        let lanes = qo_indptr.len().saturating_sub(1);
         DevGeo {
             lease: PageLease::new(0),
             b: lanes,
@@ -109,19 +119,24 @@ impl DevGeo {
             w_cont_dense: usize::MAX,
             has_mask,
             pooled: true,
+            qo_indptr: Some(qo_indptr),
         }
     }
 }
 
 /// Detect a pool-owned device-geometry pass: every descriptor port is bound
 /// to a channel the program itself re-publishes, so the engine can resolve
-/// geometry from the channel cells with no page-lease handshake. Requires a
-/// dense device `AttnMask`; mask-free decode loops keep the envelope path.
+/// geometry from the channel cells with no page-lease handshake. A dense
+/// device `AttnMask`, when bound, must be a re-published bool channel; a
+/// pass with no mask is admitted too (a speculative window whose lanes are
+/// the staircase by their own `kv_len`), which is what lets its accepted
+/// count stay on the device. A loop whose pages are a constant the program
+/// never re-publishes is not this class and keeps the envelope path.
 ///
 /// Returns the lane count (`EmbedTokens` extent).
 pub fn detect_pooled_device_geometry(
     container: &eta_ir::container::TraceContainer,
-) -> Option<usize> {
+) -> Option<Vec<u32>> {
     use eta_ir::container::{ChanDType, PortSource};
     use eta_ir::registry::Port;
     use eta_ir::types::Dtype;
@@ -143,15 +158,16 @@ pub fn detect_pooled_device_geometry(
         })
     };
 
-    let mask = channel_of(Port::AttnMask)?;
-    if !matches!(
-        container.channels.get(mask)?.dtype,
-        ChanDType::Concrete(Dtype::Bool)
-    ) {
-        return None;
-    }
-    if !republished(mask) {
-        return None;
+    if let Some(mask) = channel_of(Port::AttnMask) {
+        if !matches!(
+            container.channels.get(mask)?.dtype,
+            ChanDType::Concrete(Dtype::Bool)
+        ) {
+            return None;
+        }
+        if !republished(mask) {
+            return None;
+        }
     }
 
     for port in [
@@ -180,7 +196,27 @@ pub fn detect_pooled_device_geometry(
     ) {
         return None;
     }
-    Some(dims[0] as usize)
+    let count = dims[0];
+    // The row split: one token a lane unless the guest seeded a split it
+    // never re-publishes. `[0, tokens]` is the one-lane WINDOW a recurrent
+    // state can take (its scan runs a lane's rows in order); any other seeded
+    // split is not a shape this class can state, and declines.
+    match channel_of(Port::EmbedIndptr) {
+        Some(split) if !republished(split) => {
+            let declaration = container.channels.get(split)?;
+            if !declaration.seeded
+                || !matches!(declaration.dtype, ChanDType::Concrete(Dtype::U32))
+            {
+                return None;
+            }
+            match declaration.shape.dims() {
+                [2] => Some(vec![0, count]),
+                [bounds] if *bounds == count + 1 => Some((0..=count).collect()),
+                _ => None,
+            }
+        }
+        _ => Some((0..=count).collect()),
+    }
 }
 
 /// Detect a device-geometry pass: `WSlot`/`WOff` write descriptors bind
@@ -419,16 +455,33 @@ mod pooled_tests {
     fn masked_loop_carried_decode_is_pooled_device_geometry() {
         assert_eq!(
             detect_pooled_device_geometry(&masked_decode(1, 128)),
-            Some(1)
+            Some(vec![0, 1])
         );
         assert_eq!(
             detect_pooled_device_geometry(&masked_decode(2, 128)),
-            Some(2)
+            Some(vec![0, 1, 2])
         );
     }
 
+    /// A mask is not what makes the class: a loop that re-publishes every
+    /// descriptor port states its geometry in-graph with or without one (a
+    /// speculative window's lanes are the staircase by their own `kv_len`).
     #[test]
-    fn a_mask_free_decode_keeps_the_envelope_path() {
+    fn a_mask_free_decode_that_republishes_every_port_is_pooled_too() {
+        let mut container = masked_decode(2, 128);
+        let mask = container
+            .ports
+            .iter()
+            .position(|binding| binding.port == Port::AttnMask)
+            .expect("mask port");
+        container.ports.remove(mask);
+        assert_eq!(detect_pooled_device_geometry(&container), Some(vec![0, 1, 2]));
+    }
+
+    /// What keeps the envelope path is a page table the program never
+    /// re-publishes — the ordinary decode loop, whose pages are a constant.
+    #[test]
+    fn a_decode_whose_pages_are_a_constant_keeps_the_envelope_path() {
         let mut container = masked_decode(1, 128);
         let mask = container
             .ports
@@ -436,10 +489,21 @@ mod pooled_tests {
             .position(|binding| binding.port == Port::AttnMask)
             .expect("mask port");
         container.ports.remove(mask);
+        let pages = container
+            .ports
+            .iter()
+            .find_map(|binding| match (&binding.port, &binding.source) {
+                (Port::Pages, PortSource::Channel(c)) => Some(*c),
+                _ => None,
+            })
+            .expect("pages port");
+        container.stages[0]
+            .ops
+            .retain(|op| !matches!(op, Op::ChanPut { chan, .. } if *chan == pages));
         assert_eq!(
             detect_pooled_device_geometry(&container),
             None,
-            "without a dense device mask the decode envelope class still applies"
+            "a page table the program never re-publishes is the envelope class"
         );
     }
 

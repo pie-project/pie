@@ -318,6 +318,8 @@ pub struct StageNeeds {
     pub page_mask: bool,
     /// Reads the MTP draft rows.
     pub mtp_rows: bool,
+    /// Reads the draft head's token ids (`mtp_drafts`).
+    pub mtp_drafts: bool,
     /// Reads a LoRA sink.
     pub lora: bool,
     /// The grouped launch path can cover this stage at all.
@@ -822,6 +824,7 @@ impl GroupedPlan {
                         plan.needs.mtp_rows = true;
                         plan.mtp_rows = rows;
                     }
+                    intrinsic_tags::MTP_DRAFTS => plan.needs.mtp_drafts = true,
                     intrinsic_tags::LOGITS => {}
                     _ => return plan.invalid("stage uses an unsupported intrinsic"),
                 }

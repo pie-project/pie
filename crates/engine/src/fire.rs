@@ -391,6 +391,24 @@ pub enum RsVerb {
         #[serde(default)]
         replay: u32,
     },
+    /// **The device-resident speculative round.** The lane's buffer is two
+    /// page runs used in alternation: `read` holds the previous window at
+    /// buffer token 0, `write` receives this fire's rows at buffer token 0.
+    /// The recurrence replays the first `fold` tokens of `read` AHEAD of the
+    /// rows and persists its state exactly after them — the previous
+    /// window's accepted prefix, which is always its first `fold` rows — so
+    /// no token count, offset or discard ever reaches the host: `fold` is
+    /// the accepted count the verifying epilogue computed and put on the
+    /// `rs_fold_len` channel. The runtime alternates the two runs per fire.
+    Window {
+        /// The previous window's pages, buffer order; may be empty on the
+        /// first round (nothing to replay).
+        read: Vec<u32>,
+        /// This window's pages, buffer order.
+        write: Vec<u32>,
+        /// How many of `read`'s tokens are replayed and folded.
+        fold: FoldLen,
+    },
     /// Replay the buffer through conv+recurrence, truncated at the accepted
     /// boundary: the batch fold, skipping the in-projection GEMM.
     FoldBuffered {

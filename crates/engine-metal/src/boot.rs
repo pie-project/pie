@@ -95,6 +95,7 @@ fn tuning(doc: &toml::Table) {
         moe_batch_min_per_expert: int("moe_batch_min_per_expert"),
         qmv_rows_max: int("qmv_rows_max"),
         qmv_rows_packs: int("qmv_rows_packs"),
+        stream_rows_per_cut: int("stream_rows_per_cut"),
     });
 }
 

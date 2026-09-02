@@ -81,6 +81,13 @@ pub struct FireDescriptor {
     pub patch_rows: u32,
     /// How many IMAGES this fire carries — the patch axis's lane count.
     pub images: u32,
+    /// Per region, the most rows one launch of it may cover, `0` for no
+    /// cap. A streamed load caps the region that reads a router's seats
+    /// (`slots / top_k` rows name at most `slots` experts), so a fire whose
+    /// rows would route past the slab is walked as several runs, each seated
+    /// at its own cut — sub-batching the segment. Empty means no region is
+    /// capped; a shell that streams nothing leaves it so.
+    pub run_caps: Vec<u32>,
     /// The patch rung these patch rows round up to — which tower graph runs.
     pub patch_bucket: u32,
     /// One PATCH window per class of the artifact, indexed by class — a
@@ -103,6 +110,7 @@ impl FireDescriptor {
             images: composition.images(),
             patch_bucket: composition.patch_bucket(),
             patch_classes: composition.patch_classes().clone(),
+            run_caps: Vec::new(),
         }
     }
 
@@ -356,6 +364,7 @@ impl FireDescriptor {
             images,
             patch_bucket,
             patch_classes: WindowTable::new(patch_table),
+            run_caps: Vec::new(),
         })
     }
 }

@@ -96,6 +96,7 @@ impl ForwardHybrid for Model {
                 next,
                 &streams,
                 &ids,
+                false,
             );
         }
 
@@ -147,44 +148,75 @@ impl ForwardHybrid for Model {
             let plan_mtp =
                 ops::attn::plan_prefill(&input_mtp, m.heads, kv_heads, m.head_dim, Some(m.window));
             let (dstreams, _) = streams.split(&Facts::drafts());
-            let (dids, _) = ids.split(&Facts::drafts());
             let (dpos, _) = positions.split(&Facts::drafts());
+            let (dlogits, _) = logits.split(&Facts::drafts());
 
-            let e = ops::layout::embed(&dids, &m.embed, m.vocab);
-            let e = ops::elemwise::rmsnorm(&e, &mtp.enorm, mtp.norm_eps);
-            let e = ops::elemwise::hc_expand(&ops::linear::matmul(&e, &mtp.e_proj), hy.streams);
-            let h = ops::elemwise::rmsnorm_per_head(&dstreams, &mtp.hnorm, m.hidden, mtp.norm_eps);
-            let routes = ops::linear::group_routes(&h, hy.streams);
-            let h = ops::linear::matmul_grouped(&h, &mtp.h_proj, &routes, hy.streams);
-            let fused = ops::elemwise::residual_add(&e, &h);
+            // **THE HEAD'S TOKEN IS THE TRUNK'S ARGMAX.** The module is
+            // trained on `(streams_i, t_{i+1}) → t_{i+2}`, and inside a
+            // verify fire the only `t_{i+1}` a row can name is the token the
+            // trunk just chose there — which is also what the verifier reads
+            // (`reduce_argmax`), so the chain at the row it accepts is the
+            // chain that continues its next window.
+            let mut token = ops::layout::argmax(&[&dlogits]);
+            let mut hidden = dstreams;
+            let mut chain: Vec<Value> = Vec::with_capacity(mtp.depth as usize);
+            for step in 0..mtp.depth {
+                let e = ops::layout::embed(&token, &m.embed, m.vocab);
+                let e = ops::elemwise::rmsnorm(&e, &mtp.enorm, mtp.norm_eps);
+                let e =
+                    ops::elemwise::hc_expand(&ops::linear::matmul(&e, &mtp.e_proj), hy.streams);
+                let h =
+                    ops::elemwise::rmsnorm_per_head(&hidden, &mtp.hnorm, m.hidden, mtp.norm_eps);
+                let routes = ops::linear::group_routes(&h, hy.streams);
+                let h = ops::linear::matmul_grouped(&h, &mtp.h_proj, &routes, hy.streams);
+                let fused = ops::elemwise::residual_add(&e, &h);
 
-            let out = layer(
-                m,
-                &input_mtp,
-                &plan_mtp,
-                &dpos,
-                // Unsplit, as the trunk hands it: the correction inside
-                // splits its own operands on the adapter fact, and a routes
-                // column already cut on the draft fact would be a second arm.
-                &adapter_routes,
-                &mtp.block,
-                None,
-                &fused,
-                &dids,
-            );
-            let normed = ops::elemwise::hc_rmsnorm_f32(&out, hy.norm_eps);
-            let mixes = ops::elemwise::hc_project(&normed, &mtp.hc_head.dynamic, hy.streams);
-            let dy = ops::elemwise::hc_collapse(
-                &mixes,
-                &out,
-                &mtp.hc_head.scale,
-                &mtp.hc_head.base,
-                hy.streams,
-                hy.gate_eps,
-            );
-            let read = ops::elemwise::rmsnorm(&dy, &mtp.norm, mtp.norm_eps);
-            let draft = ops::linear::lm_head(&read, head);
-            seam::at(seam::MTP, &[&draft]);
+                // Step 0 is the module as trained and writes its cache row;
+                // every later step is the same module chained on its own
+                // streams and its own argmax, attending READ-ONLY over the
+                // prefix at the row's own position: it appends no key, so
+                // the true row step 0 wrote stays, and it sees the prefix
+                // up to that row rather than its own chain — the
+                // approximation this depth buys its extra tokens with.
+                let out = layer(
+                    m,
+                    &input_mtp,
+                    &plan_mtp,
+                    &dpos,
+                    // Unsplit, as the trunk hands it: the correction inside
+                    // splits its own operands on the adapter fact, and a
+                    // routes column already cut on the draft fact would be a
+                    // second arm.
+                    &adapter_routes,
+                    &mtp.block,
+                    None,
+                    &fused,
+                    &token,
+                    step > 0,
+                );
+                let normed = ops::elemwise::hc_rmsnorm_f32(&out, hy.norm_eps);
+                let mixes = ops::elemwise::hc_project(&normed, &mtp.hc_head.dynamic, hy.streams);
+                let dy = ops::elemwise::hc_collapse(
+                    &mixes,
+                    &out,
+                    &mtp.hc_head.scale,
+                    &mtp.hc_head.base,
+                    hy.streams,
+                    hy.gate_eps,
+                );
+                let read = ops::elemwise::rmsnorm(&dy, &mtp.norm, mtp.norm_eps);
+                let draft = ops::linear::lm_head(&read, head);
+                if step == 0 {
+                    seam::at(seam::MTP, &[&draft]);
+                }
+                token = ops::layout::argmax(&[&draft]);
+                hidden = out;
+                chain.push(draft);
+            }
+            // The token plane: every step's argmax side by side, `[rows,
+            // depth]`, what `mtp_drafts` reads.
+            let steps: Vec<&Value> = chain.iter().collect();
+            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&steps)]);
         }
 
         logits
@@ -206,6 +238,9 @@ fn layer(
     next: Option<&super::model::Layer>,
     streams: &Value,
     ids: &Value,
+    // Read-only: a draft chain step attends over what the caches hold and
+    // appends nothing — no key, no compressed entry, no index key.
+    chain: bool,
 ) -> Value {
     let hy = &m.hyper;
     let kv_heads = kv_heads(m);
@@ -251,7 +286,9 @@ fn layer(
             false,
             at.yarn,
         );
-        ops::attn::kv_append_shared(&plane, pages, &write_page, &write_offset);
+        if !chain {
+            ops::attn::kv_append_shared(&plane, pages, &write_page, &write_offset);
+        }
 
         let (o, lse) = ops::attn::prefill_lse(
             &q,
@@ -268,17 +305,19 @@ fn layer(
                 // wkv/wgate are `coff * head_dim` wide (the state's row pitch); pool_state_write scatters them
                 // into the source cache's cell so a later boundary can reach back past this fire.
                 let ape = p.compressor.as_ref().map(|c| {
-                    let state_kv = ops::linear::matmul(&x, &c.wkv);
-                    let state_score = ops::linear::matmul(&x, &c.wgate);
-                    ops::attn::pool_state_write(
-                        &state_kv,
-                        &state_score,
-                        pages,
-                        &write_page,
-                        &write_offset,
-                        m.head_dim,
-                        p.ratio,
-                    );
+                    if !chain {
+                        let state_kv = ops::linear::matmul(&x, &c.wkv);
+                        let state_score = ops::linear::matmul(&x, &c.wgate);
+                        ops::attn::pool_state_write(
+                            &state_kv,
+                            &state_score,
+                            pages,
+                            &write_page,
+                            &write_offset,
+                            m.head_dim,
+                            p.ratio,
+                        );
+                    }
                     &c.ape
                 });
                 let entries = inputs.kv(&p.entries);
@@ -306,14 +345,16 @@ fn layer(
                     false,
                     at.yarn,
                 );
-                ops::attn::pool_kv_append(
-                    &pooled,
-                    &bpos,
-                    &breq,
-                    entries,
-                    &entry_page,
-                    &entry_offset,
-                );
+                if !chain {
+                    ops::attn::pool_kv_append(
+                        &pooled,
+                        &bpos,
+                        &breq,
+                        entries,
+                        &entry_page,
+                        &entry_offset,
+                    );
+                }
                 // Scores this layer's compressed rows and selects the top-`index_topk` for the pooled reader; the sliding window is fixed, only the compressed set grows with context.
                 let selection = at.indexer.as_ref().map(|ix| {
                     indexer(
@@ -328,6 +369,7 @@ fn layer(
                         &inputs.write_page(&ix.keys),
                         &inputs.write_offset(&ix.keys),
                         m.act,
+                        chain,
                     )
                 });
                 let (po, plse) = match (&selection, &at.indexer) {
@@ -593,23 +635,26 @@ fn indexer(
     write_page: &Value,
     write_offset: &Value,
     act: Dtype,
+    chain: bool,
 ) -> Value {
     let c = &ix.compressor;
     // Pooling ratio from the indexer's own `ape`, matching the blocks the attention compressor pools.
     let ratio = c.ape.dim(0);
     let ratio = u32::try_from(ratio).expect("a pooling ratio inside u32");
 
-    let state_kv = ops::linear::matmul(x, &c.wkv);
-    let state_score = ops::linear::matmul(x, &c.wgate);
-    ops::attn::pool_state_write(
-        &state_kv,
-        &state_score,
-        keys,
-        write_page,
-        write_offset,
-        ix.head_dim,
-        ratio,
-    );
+    if !chain {
+        let state_kv = ops::linear::matmul(x, &c.wkv);
+        let state_score = ops::linear::matmul(x, &c.wgate);
+        ops::attn::pool_state_write(
+            &state_kv,
+            &state_score,
+            keys,
+            write_page,
+            write_offset,
+            ix.head_dim,
+            ratio,
+        );
+    }
     let k = ops::attn::pool_gather(
         boundary_pos,
         boundary_req,
@@ -631,7 +676,9 @@ fn indexer(
         false,
         ix.yarn,
     );
-    ops::attn::pool_kv_append(&k, boundary_pos, boundary_req, keys, write_page, write_offset);
+    if !chain {
+        ops::attn::pool_kv_append(&k, boundary_pos, boundary_req, keys, write_page, write_offset);
+    }
 
     let q = ops::linear::matmul(q_a, &ix.wq_b);
     let q = ops::elemwise::rope_partial_last_yarn(

@@ -466,6 +466,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs-mtp-speculative-decoding"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "rs-speculative-decoding"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "rs-window-decode"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "sampling-primitives"
 version = "0.1.0"
 dependencies = [

@@ -611,6 +611,16 @@ impl FrameShell for Shell {
                         if fold == 0 { row.rows } else { fold },
                     )
                 }
+                RsVerb::Window { .. } => {
+                    return Err(Fault::program(
+                        "serve::rs",
+                        format!(
+                            "lane {} asks the device-resident window verb, which this plane does \
+                             not serve yet (it replays a buffered prefix ahead of the rows)",
+                            row.source
+                        ),
+                    ));
+                }
                 RsVerb::FoldBuffered {
                     pages,
                     at,

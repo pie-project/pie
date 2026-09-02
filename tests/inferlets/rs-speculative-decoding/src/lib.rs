@@ -36,9 +36,16 @@
 //! committed text that recurs earlier in it proposes what followed it
 //! (`cacheback-speculative-decoding`'s drafter). It needs nothing of the model
 //! and is what makes this program runnable on a SKU that ships no draft head.
-//! `draft = "mtp"` reads the model's own `mtp_logits` in the verify fire's
-//! epilogue, exactly as `mtp-speculative-decoding` does; the runtime refuses
-//! the bind on a model without the head.
+//! `draft = "mtp"` reads the model's own draft chains (`mtp_drafts`: one
+//! `[depth]` argmax chain per verify row) in the verify fire's epilogue, as
+//! `mtp-speculative-decoding` does, and continues with the chain at the row
+//! it accepts; `k` is capped at `mtp_depth`, and the bind is refused on a
+//! model without the head. `draft = "junk"` is a diagnostic drafter that is
+//! always wrong (ids 1000, 1001, …): every round runs the full `k + 1`
+//! window and rejects everything, which is the buffer's discard path with
+//! no head in the fire — the way a k-row window's drift from one-row decode
+//! was pinned on the multi-row vector point (`[engine.tuning]
+//! qmv_rows_packs`), not on the recurrent state.
 //!
 //! # What this is a gate for
 //!
@@ -174,7 +181,6 @@ async fn fire(
     base: u32,
     fold: Option<u32>,
     buffer_pages: u32,
-    k: u32,
     page_size: u32,
     max_pages: u32,
     mask_mode: &str,
@@ -201,7 +207,11 @@ async fn fire(
     let mask = Channel::from_shaped([rows, pool], bound).named("verify_mask");
     let readout = Channel::from_iter(0..rows).named("readout");
     let truth_out = Channel::new([rows], dtype::i32).named("truth");
-    let drafts_out = Channel::new([k.max(1)], dtype::i32).named("drafts");
+    // The head's chains at EVERY readout row, `[rows · depth]` row-major
+    // (`mtp_drafts`' contract): the caller continues with the chain at the
+    // row it accepts.
+    let depth = if drafts_wanted { model::mtp_depth().max(1) } else { 1 };
+    let drafts_out = Channel::new([rows * depth], dtype::i32).named("drafts");
     // Where the folded boundary lands, counted over `[buffer | rows]`: the
     // survivors alone (`Some`), or everything (`None`, the fire-invariant
     // `u32::MAX`).
@@ -234,7 +244,7 @@ async fn fire(
     fwd.epilogue(move || {
         truth_out.put(reduce_argmax(intrinsics::logits()));
         if drafts_wanted {
-            drafts_out.put(reduce_argmax(intrinsics::mtp_logits(k.max(1))));
+            drafts_out.put(intrinsics::mtp_drafts(rows * depth));
         }
     });
     fwd.submit(pipeline).context("verify-and-extend")?;
@@ -264,7 +274,7 @@ async fn main(input: Input) -> Result<Output> {
     if k > 32 {
         return Err("k must be at most 32".into());
     }
-    if !matches!(input.draft.as_str(), "ngram" | "mtp") {
+    if !matches!(input.draft.as_str(), "ngram" | "mtp" | "junk") {
         return Err(format!("unknown draft source: {}", input.draft).into());
     }
     if !matches!(input.mask_mode.as_str(), "none" | "causal") {
@@ -276,6 +286,11 @@ async fn main(input: Input) -> Result<Output> {
             .into());
     }
     let mtp = input.draft == "mtp";
+    if mtp && model::mtp_depth() == 0 {
+        return Err("this SKU ships no draft head (mtp_depth = 0); use --draft ngram".into());
+    }
+    // The head drafts `depth` tokens past a row and no more.
+    let k = if mtp { k.min(model::mtp_depth()) } else { k };
     let w_max = k + 1;
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
@@ -333,7 +348,6 @@ async fn main(input: Input) -> Result<Output> {
             from,
             None,
             0,
-            k,
             page_size,
             max_pages,
             &input.mask_mode,
@@ -342,7 +356,9 @@ async fn main(input: Input) -> Result<Output> {
         .await?;
         if last {
             first = *truth.last().expect("a prefill answers one row per token");
-            pending = drafts;
+            // The chain at the last prompt row: what follows the seed.
+            let depth = drafts.len() / truth.len().max(1);
+            pending = drafts[drafts.len() - depth..].to_vec();
         }
     }
 
@@ -367,6 +383,11 @@ async fn main(input: Input) -> Result<Output> {
         // ── The window: the pending correct token, then the drafts.
         let drafts: Vec<u32> = if mtp {
             pending.iter().copied().take(k as usize).collect()
+        } else if input.draft == "junk" {
+            // DIAGNOSTIC: a drafter that is always wrong, so every round runs
+            // the full `k + 1` window and rejects every draft — the discard
+            // path of the recurrent buffer with no draft head in the fire.
+            (0..k).map(|i| 1000 + i).collect()
         } else {
             draft_from_cache(&committed, k as usize, input.max_ngram)
         };
@@ -393,7 +414,6 @@ async fn main(input: Input) -> Result<Output> {
             base,
             Some(survivors),
             need,
-            k,
             page_size,
             max_pages,
             &input.mask_mode,
@@ -403,10 +423,8 @@ async fn main(input: Input) -> Result<Output> {
         rounds += 1;
         replayed += survivors as usize;
         buffered += w as usize;
-        if rounds == 1 {
-            draft_sample = window[1..].to_vec();
-            truth_sample = truth.clone();
-        }
+        draft_sample.extend_from_slice(&window[1..]);
+        truth_sample.extend_from_slice(&truth);
         let proposed = window.len() - 1;
         drafted += proposed;
 
@@ -452,7 +470,10 @@ async fn main(input: Input) -> Result<Output> {
         base += (m + 1) as u32;
         survivors = (m + 1) as u32;
         x = correction;
-        pending = next;
+        // The chain at the accepted row `m`: conditioned on `truth[m]`, the
+        // token the next window opens with.
+        let depth = next.len() / truth.len().max(1);
+        pending = next[m * depth..(m + 1) * depth].to_vec();
     }
     pipeline.close();
 

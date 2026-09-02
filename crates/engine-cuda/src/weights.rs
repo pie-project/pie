@@ -289,8 +289,11 @@ fn restore_from_checkpoint(
             continue;
         }
         let id = u32::try_from(param).unwrap_or(u32::MAX);
-        let len = place.bytes.min(place.reserved);
-        let Some(src) = serving.plane_padded(id, len) else {
+        let len = place.bytes;
+        let Some(src) = serving
+            .plane(id)
+            .filter(|src| src.len() as u64 == len && len <= place.reserved)
+        else {
             let plane = serving
                 .name(id)
                 .map_or_else(|| format!("param {param}"), |name| format!("`{name}`"));
@@ -449,7 +452,10 @@ fn arm_refill(tier: &mut crate::experts::Tier) {
         }
     };
     let (send, filled) = std::sync::mpsc::channel();
-    let planes = refill.planes.len();
+    // Logged even though every other line here is a refusal: until the fill
+    // lands, every T1 read is an NVMe page fault over HMM, and a log that
+    // never says the road was taken cannot show it.
+    let objects = refill.landings.len();
     let path = refill.path.clone();
     match std::thread::Builder::new()
         .name("pie-tier-refill".to_string())
@@ -457,7 +463,7 @@ fn arm_refill(tier: &mut crate::experts::Tier) {
     {
         Ok(filling) => {
             eprintln!(
-                "engine-cuda: the tier is DEFERRED — {planes} plane(s) of {bytes} byte(s) \
+                "engine-cuda: the tier is DEFERRED — {objects} object(s) of {bytes} byte(s) \
                  served out of {path:?} where they lie while a background thread builds \
                  the page-locked copy; until it lands, a T1 read is a page fault"
             );
@@ -474,7 +480,7 @@ fn arm_refill(tier: &mut crate::experts::Tier) {
 /// Page-lock runs last since `cudaHostAlloc` holds the memory-manager lock
 /// while it runs. A failure sends nothing; the seat keeps serving what it had.
 fn refill_from(
-    refill: &crate::checkpoint_serving::Refill,
+    refill: &crate::checkpoint_serving::Landings,
     bytes: usize,
     ordinal: i32,
     out: &std::sync::mpsc::Sender<crate::device::Pinned>,

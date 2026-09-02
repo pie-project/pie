@@ -118,7 +118,14 @@ impl GemmaVisionConfig {
 
     /// Emits patch rows in pool-block-major order (block-row, block-column,
     /// then row/column within the block) so pooling needs no geometry. Each
-    /// row is HWC, values rescaled to `v / 255`.
+    /// row is HWC, values `2 · (v / 255 − 0.5)`: the processor rescales to
+    /// `[0, 1]` and normalizes nothing (`do_normalize: false`), and the
+    /// MODEL then centres — `Gemma4VisionPatchEmbedder.forward`'s "Gemma4
+    /// applies no normalization and instead scales in model code",
+    /// `2 * (pixel_values - 0.5)`, the same line in mlx_vlm's `_patchify`.
+    /// The tower text has no such op, so the front-end folds it in here.
+    /// Fed `[0, 1]`, the 31B tower called a red square "pink" and a blue one
+    /// "purple"; mlx_vlm on the same 4-bit weights says red and blue.
     ///
     /// # Panics
     ///
@@ -151,15 +158,19 @@ impl GemmaVisionConfig {
                         let pc = ib_c * k + ic;
                         #[allow(clippy::cast_possible_truncation)]
                         {
-                            pos[2 * out_idx] = pr as u32;
-                            pos[2 * out_idx + 1] = pc as u32;
+                            // `(x, y)`, the processor's `meshgrid(..,
+                            // indexing="xy")` order: table 0 and the first
+                            // rotary block are the COLUMN's.
+                            pos[2 * out_idx] = pc as u32;
+                            pos[2 * out_idx + 1] = pr as u32;
                         }
                         let base = out_idx * pd;
                         for r in 0..p {
                             for col in 0..p {
                                 for ch in 0..3 {
                                     let src = ((pr * p + r) * w + (pc * p + col)) * 3 + ch;
-                                    pix[base + (r * p + col) * 3 + ch] = f32::from(rgb[src]) / 255.0;
+                                    pix[base + (r * p + col) * 3 + ch] =
+                                        2.0 * (f32::from(rgb[src]) / 255.0 - 0.5);
                                 }
                             }
                         }
@@ -180,7 +191,7 @@ impl GemmaVisionConfig {
         let rows = positions.len() / 2;
         let mut ids = Vec::with_capacity(rows * 2);
         for row in positions.chunks_exact(2) {
-            let (y, x) = (row[0], row[1]);
+            let (x, y) = (row[0], row[1]);
             #[allow(clippy::cast_possible_wrap)]
             {
                 ids.push(x.min(plane - 1) as i32);

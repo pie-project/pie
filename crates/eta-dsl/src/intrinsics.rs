@@ -49,6 +49,16 @@ pub fn mtp_logits(k: u32) -> Tensor {
         Dtype::F32,
     )
 }
+/// `intrinsics::mtp_drafts(n)` — the draft head's token ids for the fire's
+/// readout rows, `[n]` I32 with `n = n_out × depth`, row-major: readout row
+/// `i`'s chain is `[i·depth, (i+1)·depth)`, and it is conditioned on the
+/// trunk's argmax at row `i` (the same argmax `reduce_argmax(logits())`
+/// reads), so a verifier that accepts row `m` continues with the chain at
+/// `m`. `depth` is the model's (`model::mtp_depth()`), zero without a head.
+/// Model-gated on `mtp_depth > 0`.
+pub fn mtp_drafts(n: u32) -> Tensor {
+    intrinsic_val(IntrinsicId::MtpDrafts, Shape::vector(n.max(1)), Dtype::I32)
+}
 /// `intrinsics::hidden(width)` — the residual stream at read-out (epilogue),
 /// `[n_out, width]`. `width` is a parameter because the hidden size is not
 /// in [`ModelProfile`](eta_ir::registry::ModelProfile); `bind` checks only

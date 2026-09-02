@@ -35,10 +35,10 @@ fn bytes_at(metadata: &Metadata, name: &str) -> Vec<u8> {
     out
 }
 
-fn write_zt(path: &Path, tensors: &[(&str, Vec<u64>, ztensor::DType, Vec<u8>)]) {
+fn write_zt(path: &Path, tensors: &[(&str, Vec<u64>, ztensor::Leaf, Vec<u8>)]) {
     let mut writer = ztensor::Writer::create(path).unwrap();
-    for (name, shape, dtype, data) in tensors {
-        writer.add(*name, shape.to_vec(), *dtype, data).unwrap();
+    for (name, shape, leaf, data) in tensors {
+        writer.add(*name, shape.to_vec(), *leaf, data).unwrap();
     }
     writer.finish().unwrap();
 }
@@ -52,8 +52,8 @@ fn zt_offsets_address_the_right_bytes() {
     write_zt(
         &path,
         &[
-            ("a.weight", vec![2, 2], ztensor::DType::F32, a.clone()),
-            ("b.weight", vec![8], ztensor::DType::F32, b.clone()),
+            ("a.weight", vec![2, 2], ztensor::Leaf::F32, a.clone()),
+            ("b.weight", vec![8], ztensor::Leaf::F32, b.clone()),
         ],
     );
 
@@ -96,8 +96,8 @@ fn safetensors_and_zt_agree_on_the_model() {
     write_zt(
         &zt_path,
         &[
-            ("a.weight", vec![2, 3], ztensor::DType::F32, a.clone()),
-            ("b.weight", vec![16], ztensor::DType::U8, b.clone()),
+            ("a.weight", vec![2, 3], ztensor::Leaf::F32, a.clone()),
+            ("b.weight", vec![16], ztensor::Leaf::U8, b.clone()),
         ],
     );
 
@@ -184,7 +184,7 @@ fn a_sharded_root_addresses_bytes_in_its_shards() {
         &[(
             "embed.weight",
             vec![2, 2],
-            ztensor::DType::F32,
+            ztensor::Leaf::F32,
             payload.clone(),
         )],
     );
@@ -204,7 +204,7 @@ fn a_sharded_root_addresses_bytes_in_its_shards() {
         .unwrap();
     // one tensor of its own, so the root exercises both a local and a foreign part.
     writer
-        .add("norm.weight", vec![2], ztensor::DType::F32, &local)
+        .add("norm.weight", vec![2], ztensor::Leaf::F32, &local)
         .unwrap();
     writer.add_shard("00001", &identity).unwrap();
     writer.link("embed.weight", &shard_object, "00001").unwrap();
@@ -240,7 +240,7 @@ fn a_zt_checkpoint_says_it_is_zt() {
     let path = dir.join("model.zt");
     write_zt(
         &path,
-        &[("w", vec![2], ztensor::DType::F32, f32_bytes(&[1.0, 2.0]))],
+        &[("w", vec![2], ztensor::Leaf::F32, f32_bytes(&[1.0, 2.0]))],
     );
 
     let metadata = zt::parse(&path).unwrap();

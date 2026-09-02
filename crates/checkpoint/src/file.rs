@@ -1,15 +1,8 @@
-//! A checkpoint's own files: reading them, writing them, and the namespace
-//! pie reserves inside one.
-//!
-//! Six modules over one subject. [`read`] turns a snapshot *directory* into
-//! a [`Metadata`], [`zt`] turns a single *container* into one, [`write`]
-//! puts one back on disk, [`meta`] owns the `__meta__/` names that tell a
-//! pie artifact's own payloads apart from its weights, and [`emit`]/[`serve`]
-//! are the `pie.serving/1` writer/reader pair, agreeing in
-//! [`serving`](crate::serving).
-//!
-//! This is the only place in the crate where a *path* becomes a [`Metadata`]
-//! — everything else computes over the value it produces.
+//! A checkpoint's own files. [`read`] turns a snapshot directory into a
+//! [`Metadata`], [`zt`] a single container, [`write`] puts one back on disk,
+//! [`meta`] owns the reserved `__meta__/` names, and [`emit`]/[`serve`] are
+//! the `pie.serving/1` writer/reader pair. The only place in the crate where
+//! a path becomes a [`Metadata`].
 
 pub mod emit;
 pub mod meta;
@@ -179,7 +172,7 @@ impl Metadata {
 
     /// The checkpoint's weights — every object except pie's own metadata.
     /// This is the enumeration a weight consumer wants, not `tensors`: pie
-    /// stores its compiled tokenizer and model descriptor as `dense` `u8`
+    /// stores its compiled tokenizer and model descriptor as `u8`
     /// objects indistinguishable from raw weights except by name.
     pub fn weights(&self) -> impl Iterator<Item = &RawTensor> {
         self.tensors
@@ -204,12 +197,10 @@ impl Metadata {
     }
 }
 
-/// A checkpoint's tensors, indexed by name for the duration of one compile.
-/// `Metadata::tensor_by_name` is a linear scan called once per contract
-/// tensor, which made compiling a 32k-tensor checkpoint quadratic (2.1s).
-/// The index lives here rather than on [`Metadata`] since it is a fact
-/// about a compilation, not a checkpoint. Indexes weights only: a contract
-/// that names one of pie's own metadata objects ([`meta`]) fails to resolve.
+/// A checkpoint's tensors, indexed by name for one compile; the linear
+/// `Metadata::tensor_by_name` makes a 32k-tensor compile quadratic. Indexes
+/// weights only: a contract naming a metadata object ([`meta`]) fails to
+/// resolve.
 pub struct Sources<'a> {
     metadata: &'a Metadata,
     by_name: std::collections::HashMap<&'a str, u32>,

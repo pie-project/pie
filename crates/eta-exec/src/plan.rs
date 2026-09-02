@@ -47,6 +47,8 @@ pub struct ExecPlan {
     pub needs_logits: bool,
 
     pub needs_mtp_logits: bool,
+    /// Reads the draft head's token ids (`mtp_drafts`), a plane of its own.
+    pub needs_mtp_drafts: bool,
 
     /// The program reads [`IntrinsicId::AttnScore`]: the shell must bind the
     /// score rectangle before the epilogue runs, since a program reading
@@ -94,6 +96,7 @@ impl ExecPlan {
     pub fn needs_forward(&self) -> bool {
         self.needs_logits
             || self.needs_mtp_logits
+            || self.needs_mtp_drafts
             || self.needs_attn_scores
             || !self.package.ports.is_empty()
     }
@@ -185,6 +188,7 @@ pub fn classify_exec_plan(plan: &mut ExecPlan) {
     plan.executable = true;
     plan.needs_logits = false;
     plan.needs_mtp_logits = false;
+    plan.needs_mtp_drafts = false;
     plan.needs_attn_scores = false;
     plan.reject_reason = None;
 
@@ -194,9 +198,15 @@ pub fn classify_exec_plan(plan: &mut ExecPlan) {
         match value.intrinsic {
             None => continue,
             Some(IntrinsicId::Logits) => plan.needs_logits = true,
-            Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts) => {
+            Some(IntrinsicId::MtpLogits) => {
                 plan.needs_logits = true;
                 plan.needs_mtp_logits = true;
+            }
+            // The drafts plane is a rectangle of its own, bound at its own
+            // base beside the logits; reading it still runs the readout.
+            Some(IntrinsicId::MtpDrafts) => {
+                plan.needs_logits = true;
+                plan.needs_mtp_drafts = true;
             }
             // The score rectangle is a column of its own, bound at its own
             // base, so reading it does not set `needs_logits`.
@@ -223,6 +233,7 @@ pub fn classify_exec_plan(plan: &mut ExecPlan) {
     if !plan.executable {
         plan.needs_logits = false;
         plan.needs_mtp_logits = false;
+        plan.needs_mtp_drafts = false;
         plan.needs_attn_scores = false;
     }
 }
@@ -304,6 +315,7 @@ pub fn adopt_launch_package_with(
         reject_reason: None,
         needs_logits: false,
         needs_mtp_logits: false,
+        needs_mtp_drafts: false,
         needs_attn_scores: false,
     };
     classify_exec_plan(&mut plan);

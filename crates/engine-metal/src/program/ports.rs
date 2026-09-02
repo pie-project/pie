@@ -49,6 +49,9 @@ pub struct Envelope {
     /// [`Port::AttnMask`]: dense `[rows, keys]` bool rectangle, row-major,
     /// at the pool's key width (may be wider than the extent).
     pub mask: Option<Vec<bool>>,
+    /// [`Port::RsFoldLen`]: how many buffered recurrent tokens each lane
+    /// folds this fire (`crate::rs`); `[lanes]`, or one entry for every lane.
+    pub fold_len: Option<Vec<u32>>,
 }
 
 impl Envelope {
@@ -230,6 +233,17 @@ impl LanePorts<'_> {
             ));
         }
         Ok(Some(stated))
+    }
+
+    /// This lane's device-decided recurrent fold length, or `None` if the
+    /// program binds no `rs_fold_len` port.
+    #[must_use]
+    pub fn fold_len(&self) -> Option<u32> {
+        self.envelope
+            .fold_len
+            .as_ref()
+            .and_then(|lens| lens.get(self.at).or_else(|| lens.first()))
+            .copied()
     }
 
     /// This lane's stated readable extent, or `None` if unbound.
@@ -459,6 +473,7 @@ pub fn resolve(
             Port::PageIndptr => &mut out.page_indptr,
             Port::WSlot => &mut out.w_slot,
             Port::WOff => &mut out.w_off,
+            Port::RsFoldLen => &mut out.fold_len,
             // Anything else has no reader on this path.
             _ => continue,
         };
@@ -494,7 +509,9 @@ pub fn resolves(class: GeometryClass, port: Port) -> bool {
     if class.ports().contains(port) {
         return true;
     }
-    matches!(port, Port::EmbedIndptr | Port::AttnMask) && class == GeometryClass::DeviceGeometry
+    (matches!(port, Port::EmbedIndptr | Port::AttnMask) && class == GeometryClass::DeviceGeometry)
+        || (port == Port::RsFoldLen
+            && matches!(class, GeometryClass::DeviceGeometry | GeometryClass::DecodeEnvelope))
 }
 
 /// One port's committed cell, as geometry indices.

@@ -453,23 +453,33 @@ pub fn emit_grouped_fused_region(
     Ok(source)
 }
 
-/// The `mtp_drafts` intrinsic: a per-draft argmax over the lane's logits.
+/// The `mtp_drafts` intrinsic: the draft head's token ids for this lane's
+/// readout rows, `[n_out × depth]` row-major, copied off the `mtp.drafts`
+/// plane the lane record points at (`lane.mtp_drafts_base`, pitch
+/// `lane.mtp_drafts_depth`). The plane holds the argmax the model text
+/// chained on, so what a guest reads here is the token the head actually
+/// conditioned its next draft on — not a second argmax taken over logits.
 fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
     source.push_str("  {\n");
-    // Per-draft argmax over the vocabulary. Drafts are few, so partition by
-    // draft rather than by column; a lane with one draft keeps one thread busy,
-    // which is what the serial emitter did anyway.
     source.push_str("    const uint draft_begin = m3_tid;\n");
     source.push_str("    const uint draft_step = m3_threads;\n");
     let _ = writeln!(
         source,
         "    const M1ValueDesc draft_desc = descriptors[{base}];"
     );
+    // The plane is bound at the lane's first readout row with the head's
+    // depth as its pitch, so the lane's `n_out` rows of `depth` ids are one
+    // contiguous run. A reader declaring more than the rows it reads out
+    // times the depth has asked for rows past its own.
     let _ = writeln!(
         source,
-        "    if (layout->vocab == 0u || row_meta.mtp_offset > row_meta.count || \
-         draft_desc.len > row_meta.count - row_meta.mtp_offset) \
+        "    if (lane.mtp_drafts_base == 0ul || lane.mtp_drafts_depth == 0u || \
+         draft_desc.len > row_meta.mtp_offset * lane.mtp_drafts_depth) \
          {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
+    );
+    source.push_str(
+        "    const device int* draft_src = \
+         reinterpret_cast<const device int*>(lane.mtp_drafts_base);\n",
     );
     let _ = writeln!(
         source,
@@ -479,24 +489,7 @@ fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str) {
         "    for (uint draft = draft_begin; draft < draft_desc.len; \
          draft += draft_step) {\n",
     );
-    source.push_str(
-        "      const uint source_row = \
-         row_indices[row_meta.offset + row_meta.mtp_offset + draft];\n",
-    );
-    source.push_str("      float best_value = -INFINITY;\n");
-    source.push_str("      uint best_index = 0u;\n");
-    source.push_str("      bool have = false;\n");
-    source.push_str("      for (uint column = 0; column < layout->vocab; ++column) {\n");
-    source.push_str(
-        "        const float value = float(logits[ulong(source_row) * layout->vocab + column]);\n",
-    );
-    source.push_str(
-        "        if (!isnan(value) && (!have || value > best_value || \
-         (value == best_value && column < best_index))) { \
-         best_value = value; best_index = column; have = true; }\n",
-    );
-    source.push_str("      }\n");
-    source.push_str("      draft_out[draft] = int(have ? best_index : 0u);\n");
+    source.push_str("      draft_out[draft] = draft_src[draft];\n");
     source.push_str("    }\n");
     source.push_str("  }\n");
 }

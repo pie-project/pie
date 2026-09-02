@@ -144,7 +144,7 @@ pub struct EngineConfig {
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
     pub has_mtp_logits: bool,
-    pub has_mtp_drafts: bool,
+    pub mtp_depth: u32,
     pub has_value_head: bool,
     pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
@@ -328,8 +328,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         has_lora: !engine_configs.is_empty() && engine_configs.iter().all(|d| d.has_lora),
         has_mtp_logits: !engine_configs.is_empty()
             && engine_configs.iter().all(|d| d.has_mtp_logits),
-        has_mtp_drafts: !engine_configs.is_empty()
-            && engine_configs.iter().all(|d| d.has_mtp_drafts),
+        // One depth for the deployment: every engine states the same head
+        // or the runtime advertises none.
+        mtp_depth: match engine_configs.first().map(|d| d.mtp_depth) {
+            Some(depth) if engine_configs.iter().all(|d| d.mtp_depth == depth) => depth,
+            _ => 0,
+        },
         has_value_head: !engine_configs.is_empty()
             && engine_configs.iter().all(|d| d.has_value_head),
         has_kv_envelopes: !engine_configs.is_empty()

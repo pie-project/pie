@@ -171,7 +171,17 @@ impl Model {
         }
 
         if let Some(ple) = &self.ple {
-            b.read(&ple.model_proj, layout.at("per_layer_model_projection.weight"))?;
+            // The leading rows the declaration states: the whole plane for
+            // the full stack, its first `layers * dim` rows for a miniature
+            // cut below the checkpoint's depth.
+            let rows = i64::try_from(ple.model_proj.shape[0]).expect("a row count inside i64");
+            let name = layout.at("per_layer_model_projection.weight");
+            let stored = src.get(&name).and_then(|t| t.shape().first().copied());
+            if stored.is_some_and(|stored| i64::try_from(stored).ok() != Some(rows)) {
+                b.read_expr(&ple.model_proj, Expr::src(name).slice(0, 0, rows))?;
+            } else {
+                b.read(&ple.model_proj, name)?;
+            }
             b.read(&ple.model_norm, layout.at("per_layer_projection_norm.weight"))?;
             let width = i64::from(ple.dim);
             for (l, p) in ple.per_layer.iter().enumerate() {
@@ -283,11 +293,51 @@ impl Model {
             b.read(&a.down, n("mlp.down_proj.weight"))?;
         }
 
+        // Google's assistant, under the same `aux.` prefix, in its own
+        // (transformers) spelling.
+        if let Some(a) = &self.assistant {
+            // `pre_projection` is one `[hidden, 2 * trunk]` bank in the
+            // published checkpoint, sliced here; a restatement that split
+            // it first (`scripts/quantize_assistant.py`, whose halves are
+            // quantized on their own) names the halves.
+            if src.get("aux.pre_projection_embed.weight").is_some() {
+                b.read(&a.pre_embed, "aux.pre_projection_embed.weight")?;
+                b.read(&a.pre_hidden, "aux.pre_projection_hidden.weight")?;
+            } else {
+                let th = extents(&a.pre_embed)[1];
+                b.read_expr(&a.pre_embed, Expr::src("aux.pre_projection.weight").slice(1, 0, th))?;
+                b.read_expr(&a.pre_hidden, Expr::src("aux.pre_projection.weight").slice(1, th, th))?;
+            }
+            b.read(&a.post, "aux.post_projection.weight")?;
+            b.read(&a.embed, "aux.model.embed_tokens.weight")?;
+            b.read(&a.norm, "aux.model.norm.weight")?;
+            for (l, w) in a.layers.iter().enumerate() {
+                let n = |s: &str| format!("aux.model.layers.{l}.{s}");
+                let AttnBanks::Shared { q_proj } = &w.attn.banks else {
+                    unreachable!("the assistant's attention is declared shared");
+                };
+                for (weight, from) in [
+                    (&w.attn_norm, n("input_layernorm.weight")),
+                    (&w.post_attn_norm, n("post_attention_layernorm.weight")),
+                    (&w.pre_ffw_norm, n("pre_feedforward_layernorm.weight")),
+                    (&w.post_ffw_norm, n("post_feedforward_layernorm.weight")),
+                    (&w.attn.q_norm, n("self_attn.q_norm.weight")),
+                    (q_proj, n("self_attn.q_proj.weight")),
+                    (&w.o_proj, n("self_attn.o_proj.weight")),
+                    (&w.scalar, n("layer_scalar")),
+                    (&w.down, n("mlp.down_proj.weight")),
+                ] {
+                    b.read(weight, from)?;
+                }
+                b.read_concat(&w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+            }
+        }
+
         Ok(b.build())
     }
 
     pub fn import_from_gguf(&self, src: &ztensor::Source, platform: Platform) -> Result<ModelContract, Error> {
-        if self.draft.is_some() {
+        if self.draft.is_some() || self.assistant.is_some() {
             return Err(Error::Illegible {
                 name: "aux".to_string(),
                 detail: "this SKU declares an aux draft head and no GGUF \
@@ -396,7 +446,6 @@ fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr
              {want:?} ({asked} elements)"
         )));
     }
-    let part = tensor.part("data").map_err(|why| illegible(&why))?;
-    let encoding = checkpoint::file::encoding_of(&tensor, &part).map_err(|why| illegible(&why))?;
+    let encoding = checkpoint::file::encoding_of(&tensor).map_err(|why| illegible(&why))?;
     Ok(Expr::src(from).transmute(TensorType::new(want, encoding)))
 }

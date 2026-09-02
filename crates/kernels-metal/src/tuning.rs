@@ -178,6 +178,16 @@ pub struct DeviceTuning {
     /// inputs. The default stays 1 (fast by default); `2` trades ~11% of an
     /// a4b decode for row-count-invariant arithmetic.
     pub qmv_rows_packs: u32,
+
+    /// Rows one run of a streamed routed segment may cover before the walk
+    /// cuts it into pieces, each seated at its own cut. `0` (the default)
+    /// derives the guaranteed cap, `slots / top_k`: that many rows cannot
+    /// name more experts than the slab seats. A larger stated value trades
+    /// that guarantee for fewer cuts and wider GEMM tiles (a routed
+    /// mixture's batched arm wants two pairs an expert); a fire whose rows
+    /// then route past the seats is refused, as every fire was before the
+    /// pieces existed.
+    pub stream_rows_per_cut: u32,
 }
 
 impl Default for DeviceTuning {
@@ -197,6 +207,7 @@ impl Default for DeviceTuning {
             moe_batch_min_per_expert: 2,
             qmv_rows_max: 2,
             qmv_rows_packs: 1,
+            stream_rows_per_cut: 0,
         }
     }
 }
@@ -251,6 +262,7 @@ impl DeviceTuning {
             moe_batch_min_per_expert,
             qmv_rows_max,
             qmv_rows_packs,
+            stream_rows_per_cut,
         );
         self
     }
@@ -296,6 +308,7 @@ pub struct Overrides {
     pub moe_batch_min_per_expert: Option<u32>,
     pub qmv_rows_max: Option<u32>,
     pub qmv_rows_packs: Option<u32>,
+    pub stream_rows_per_cut: Option<u32>,
 }
 
 static DEVICE: OnceLock<DeviceInfo> = OnceLock::new();

@@ -64,7 +64,6 @@ use model_dsl::{
     trace_hybrid,
 };
 use model_ir::{TILED_BAND, TILED_STEP, Trace};
-use ztensor::format::cbor;
 
 // ─────────────────────────────────────────────────────────────────────────
 // The text
@@ -318,9 +317,10 @@ fn repack_factors(factors: &[u8], rows: usize) -> Vec<u8> {
 
 /// **ONE SET OF WEIGHTS, TWO ORDERS.** The reference container holds the
 /// planes as `planes` drew them; the tiled one holds `repack`'s answer under
-/// the banded rectangle `model_dsl::Weight::planes` publishes. Everything
-/// else — the names, the profile, the group, the attributes — is identical,
-/// which is what leaves the ORDER as the only difference between two loads.
+/// the banded rectangle `model_dsl::Weight::planes` publishes, under the
+/// layout id that names that order. Everything else — the names, the profile,
+/// the type, the planes — is identical, which is what leaves the ORDER as the
+/// only difference between two loads.
 fn write_checkpoint(path: &Path, arm: Arm) {
     let mut writer =
         ztensor::Writer::create(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
@@ -334,7 +334,7 @@ fn write_checkpoint(path: &Path, arm: Arm) {
         .add(
             "embed",
             vec![u64::from(VOCAB), HIDDEN],
-            ztensor::DType::BF16,
+            ztensor::Leaf::BF16,
             &embed,
         )
         .expect("the table lands");
@@ -349,8 +349,8 @@ fn write_checkpoint(path: &Path, arm: Arm) {
         .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
 }
 
-/// One affine weight, as the three tensors a triplet is — in whichever order
-/// `arm` asks for.
+/// One affine weight: one object of three planes, codes then scales then
+/// biases — in whichever order `arm` asks for.
 fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, arm: Arm, seed: u64) {
     let drawn = planes(rows, seed);
     let (codes, scales, biases, stated) = match arm {
@@ -366,60 +366,43 @@ fn affine_tensor(writer: &mut ztensor::Writer, name: &str, rows: usize, arm: Arm
     assert_eq!(codes.len(), stated * HIDDEN as usize / 2);
     assert_eq!(scales.len(), stated * groups * 2);
 
-    // The affine-group profile `checkpoint::file::write` stamps on an MLX
-    // bank, which `file::zt::affine_group_scheme` reads back as
-    // `QuantScheme::MlxAffineU4`: four bits, packed low code first, a
-    // zero point stored plain beside the scale, and its factors stated as
-    // `f16_factors`.
-    //
-    // **`scale_form` IS REQUIRED AND THIS FIXTURE HAD BEEN WRITTEN BEFORE IT
-    // WAS.** The QNF wave made it the key that separates schemes agreeing on
-    // every other field — `MlxAffineU4` and `Int8Asymmetric` both read
-    // lsb_first tensor/plain, and only the factor width tells them apart — so
-    // a profile without it names no scheme and the reader says so rather than
-    // guessing. Every field here is the one `write.rs` stamps for this scheme,
-    // `word` included, because a fixture that imitates the writer loosely is a
-    // fixture that stops imitating it the next time the writer moves.
-    let attrs = cbor::map([
-        ("axis", cbor::Value::from(1u64)),
-        ("bits", cbor::Value::from(4u64)),
-        ("group_size", cbor::Value::from(GROUP as u64)),
-        (
-            "packing",
-            cbor::map([
-                ("order", cbor::Value::from("lsb_first")),
-                ("per_word", cbor::Value::from(8u64)),
-                ("word", cbor::Value::from("u32")),
-            ]),
-        ),
-        ("scale_form", cbor::Value::from("f16_factors")),
-        (
-            "zero_point",
-            cbor::map([
-                ("form", cbor::Value::from("tensor")),
-                ("packing", cbor::Value::from("plain")),
-            ]),
-        ),
-    ]);
+    // The type `checkpoint::file::write` states for an MLX bank, which
+    // `file/zt.rs` reads back as `QuantScheme::MlxAffineU4`: u4 codes in
+    // groups of GROUP, a bf16 scale and a bf16 bias stored plain beside it.
+    // The tiled arm is the same planes over the band-padded rectangle under
+    // the layout the writer stamps for a repacked bank, `band`/`step` and all.
+    let term = ztensor::Term::parse(&format!("g{GROUP}_u4_bf16_b_bf16"))
+        .expect("the affine term parses");
+    let shape = vec![stated as u64, HIDDEN];
+    // A named layout takes its blob whole, so the tiled arm lays the same
+    // canonical planes out itself.
+    let blob = canonical_blob(&term, &shape, [&codes, &scales, &biases]);
     writer
         .object(name, |o| {
-            o.shape(vec![stated as u64, HIDDEN])
-                .layout("zt.quant_group/1")
-                .attributes(attrs)
-                .part("data", |p| p.dtype(ztensor::DType::U8).bytes(&codes))
+            let o = o.shape(shape.clone()).term(term.clone());
+            match arm {
+                Arm::RowMajor => o.planes([codes.as_slice(), scales.as_slice(), biases.as_slice()]),
+                Arm::Tiled => o
+                    .layout(checkpoint::serving::MMA_TILED)
+                    .attr("band", u64::from(TILED_BAND))
+                    .attr("step", u64::from(TILED_STEP))
+                    .bytes(&blob),
+            }
         })
         .unwrap_or_else(|why| panic!("`{name}`: {why}"));
-    for (suffix, bytes) in [(".biases", &biases), (".scales", &scales)] {
-        let full = format!("{name}{suffix}");
-        writer
-            .add(
-                &full,
-                vec![stated as u64, groups as u64],
-                ztensor::DType::BF16,
-                bytes,
-            )
-            .unwrap_or_else(|why| panic!("`{full}`: {why}"));
+}
+
+/// The term's planes over `shape`, each at its canonical (64-aligned) offset.
+fn canonical_blob(term: &ztensor::Term, shape: &[u64], planes: [&Vec<u8>; 3]) -> Vec<u8> {
+    let laid = term.planes(shape).expect("the term lays out this shape");
+    assert_eq!(laid.len(), planes.len());
+    let total = term.canonical_size(shape).expect("the term sizes this shape");
+    let mut blob = vec![0u8; total as usize];
+    for (plane, bytes) in laid.iter().zip(planes) {
+        assert_eq!(plane.len as usize, bytes.len(), "plane `{}`", plane.path);
+        blob[plane.range()].copy_from_slice(bytes);
     }
+    blob
 }
 
 /// A scratch directory of this process's own.

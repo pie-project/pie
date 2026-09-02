@@ -1168,14 +1168,3 @@ fn infer_scale_per_block(ty: TensorType, by: TensorType) -> Result<TensorType, E
         encoding: Encoding::Raw(out_dtype),
     })
 }
-#[cfg(test)]
-/// Pins the type checker's rules: totality over `Expr::Shard`, the placement
-/// cost hierarchy (Slice/Stride/Gather), quantized-block alignment, and the
-/// "denotes its operand" refusal.
-mod tests {
-    
-    
-    
-    
-
-}

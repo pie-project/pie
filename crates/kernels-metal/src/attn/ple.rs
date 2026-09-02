@@ -493,6 +493,9 @@ mod tests {
 
 /// The committed form (`engine_metal::rs`): [`ngram_ids_chunked`] over the
 /// extended row run, advancing each lane's window only over its `commit`.
+/// `ids` is the extended run; `ngram_ids` is the op's OWN rectangle (the
+/// lane's rows at the window CSR's offsets), since the gathered-table cut
+/// reads it the instant this kernel is enqueued.
 #[allow(clippy::too_many_arguments)]
 pub fn ngram_ids_committed(
     ctx: &Ctx<'_>,

@@ -120,6 +120,12 @@ class ModelConfig:
     # and `kv_cache_dtype` stay on the engine because they are what the
     # engine computes and stores in.
     weight_dtype: Optional[str] = None
+    # How many weight bytes the load may keep on the device / in the pinned
+    # host cache, with a unit (`"20GiB"`); omit for uncapped. What makes a
+    # streamed-expert artifact (dsv4) loadable: without a device budget every
+    # routed bank is resident and the load refuses at the device's ceiling.
+    device_weight_budget: Optional[str] = None
+    host_weight_budget: Optional[str] = None
     engine: EngineConfig = field(default_factory=EngineConfig)
 
 
@@ -156,6 +162,10 @@ class Config:
             _emit_kv(buf, "sku", m.sku)
         if m.weight_dtype is not None:
             _emit_kv(buf, "weight_dtype", m.weight_dtype)
+        if m.device_weight_budget is not None:
+            _emit_kv(buf, "device_weight_budget", m.device_weight_budget)
+        if m.host_weight_budget is not None:
+            _emit_kv(buf, "host_weight_budget", m.host_weight_budget)
         _emit_table(buf, f"{prefix}model.engine", _engine_block(m.engine),
                     leading_newline=True)
         if m.engine.options:
@@ -227,6 +237,8 @@ class Config:
         model: dict = {"name": m.name, "model": m.hf_repo}
         put(model, "sku", m.sku)
         put(model, "weight_dtype", m.weight_dtype)
+        put(model, "device_weight_budget", m.device_weight_budget)
+        put(model, "host_weight_budget", m.host_weight_budget)
 
         # The section is split by NAME rather than by nesting, so the common
         # keys and the engine's own knobs sit side by side in one `[engine]`.

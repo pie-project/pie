@@ -18,12 +18,11 @@ use checkpoint::file::serve::stamp_of;
 use checkpoint::file::zt;
 use checkpoint::contract::ModelContract;
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
-use model_ir::Trace;
 
-/// The platform every door here takes, handed out beside them: a caller that can
-/// reach [`identify`] should not have to name `engine` to say which
-/// backend it is asking about.
-pub use model_ir::Platform;
+/// The platform every door here takes and the trace it answers with, handed
+/// out beside them: a caller that can reach [`identify`] or [`trace`] should
+/// not have to name `engine` to say which backend it is asking about.
+pub use model_ir::{Platform, Trace};
 
 /// The traced supergraph for `sku`, on `platform`.
 /// Errors if this build's catalog has no such SKU; near misses are named.
@@ -195,7 +194,14 @@ pub fn conversion_contract(
     };
     // `PIE_IMPORT_TRACE=1` says why each row that did not fit did not.
     let trace = std::env::var_os("PIE_IMPORT_TRACE").is_some_and(|v| v != "0");
+    // `PIE_IMPORT_SKU=<name>` converts for that row alone — how a parity
+    // miniature (a row identification never picks, since every real row
+    // fits first) becomes an artifact.
+    let pinned = std::env::var("PIE_IMPORT_SKU").ok();
     for (sku, read) in models::fits(source, platform) {
+        if pinned.as_deref().is_some_and(|name| name != sku.name) {
+            continue;
+        }
         let contract = match read {
             Ok(contract) => contract,
             Err(why) => {

@@ -276,6 +276,10 @@ pub trait AudioFrontEnd: Send + Sync {
 pub fn vision_front_end(arch: &str) -> Option<Box<dyn VisionFrontEnd>> {
     match arch {
         crate::qwen_3::media::ARCH => Some(Box::new(crate::qwen_3::media::Qwen35Vision::new())),
+        // Same processor (patch 16, merge 2, temporal 2, 48-side table,
+        // `<|vision_start|><|image_pad|><|vision_end|>`): qwen3.8-flash-next
+        // ships qwen3.6/3.8's tower over its own trunk.
+        crate::qwen_4::ARCH => Some(Box::new(crate::qwen_3::media::Qwen35Vision::new())),
         crate::gemma_4::media::ARCH => Some(Box::new(crate::gemma_4::media::Gemma4Vision::new())),
         _ => None,
     }

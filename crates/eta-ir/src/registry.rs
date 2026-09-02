@@ -359,7 +359,7 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
 pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
     match intr {
         IntrinsicId::MtpLogits => profile.has_mtp_logits,
-        IntrinsicId::MtpDrafts => profile.has_mtp_drafts,
+        IntrinsicId::MtpDrafts => profile.mtp_depth > 0,
         IntrinsicId::ValueHead => profile.has_value_head,
         IntrinsicId::AttnScore => profile.has_attn_score,
         IntrinsicId::Logits | IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => true,
@@ -400,9 +400,11 @@ pub struct ModelProfile {
     pub activation: Dtype,
     /// `[k, vocab]` F32 draft logits intrinsic available (multi-token-prediction head).
     pub has_mtp_logits: bool,
-    /// `[k]` I32 draft tokens intrinsic ([`IntrinsicId::MtpDrafts`])
-    /// available (device-resident spec-decode drafts).
-    pub has_mtp_drafts: bool,
+    /// The draft head's chain depth: how many tokens past the readout row
+    /// the `[n_out × depth]` I32 [`IntrinsicId::MtpDrafts`] plane carries per
+    /// row. Zero for a model with no draft head (the intrinsic is then
+    /// unavailable).
+    pub mtp_depth: u32,
     /// A scalar value-head intrinsic is available.
     pub has_value_head: bool,
     /// `[layers * heads, kv_max]` F32 per-key attention mass
@@ -446,7 +448,7 @@ impl ModelProfile {
             num_layers: 2,
             activation: Dtype::F32,
             has_mtp_logits: true,
-            has_mtp_drafts: true,
+            mtp_depth: 1,
             has_value_head: true,
             has_attn_score: true,
             has_attn_page_mask: true,

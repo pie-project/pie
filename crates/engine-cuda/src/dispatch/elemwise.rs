@@ -148,6 +148,23 @@ impl Run<'_> {
             Elementwise::ResidualAdd { x, y, y_out: _ } => {
                 elemwise::norm::residual_add(self.ctx(), self.tensor(*x), &mut self.tensor(*y))
             }
+            Elementwise::ResidualAddRmsnorm {
+                x,
+                y,
+                y_out: _,
+                weight,
+                plus_one,
+                eps,
+                out,
+            } => elemwise::norm::residual_add_rmsnorm(
+                self.ctx(),
+                self.tensor(*x),
+                &mut self.tensor(*y),
+                self.tensor(*weight),
+                *plus_one,
+                *eps,
+                &mut self.tensor(*out),
+            ),
             Elementwise::AddBias {
                 bias,
                 out,
@@ -242,6 +259,16 @@ impl Run<'_> {
             } => (match form {
                 MropeForm::Interleaved => elemwise::rope_mrope::interleaved,
                 MropeForm::Blocked => elemwise::rope_mrope::blocked,
+                // Gemma's per-block `rotate_half` (`kernels-metal`'s
+                // `rope_mrope_split`) has no CUDA twin yet; refused by name
+                // rather than served with the blocked pairing, which is a
+                // different rotation.
+                MropeForm::Split => {
+                    // The split (per-block rotate_half) M-RoPE form has no CUDA kernel yet.
+                    return Err(kernels_cuda::Error::Unsupported {
+                        op: "elementwise.rope_mrope",
+                    });
+                }
             })(
                 self.ctx(),
                 &mut self.tensor(*q),

@@ -19,8 +19,8 @@ use checkpoint::file::zt;
 use checkpoint::contract::{ModelContract, TensorContract};
 use checkpoint::error::Error as LoadError;
 use checkpoint::executor::{Execution, sink::TensorSink};
-// The warm arm's reader: `Artifact::open` maps and hashes nothing, `spans`
-// answers where every plane lies, `part` the published bytes there.
+// The warm arm's reader: `Artifact::open` maps and hashes nothing, `locate`
+// answers where every plane lies, `plane` the published bytes there.
 use checkpoint::file::serve::Artifact;
 use checkpoint::plan::{LoadPlan, StorageTarget, compile, compile_streaming};
 // `Stamp::of` fills the four policy fields from the profile's constants;
@@ -763,7 +763,8 @@ const PROBE: usize = 32;
 /// at the artifact's own layout, never `places`'s device-store layout.
 /// Adapter banks and computed residue planes get a small writable
 /// reservation via [`banks`]. Every refusal is `Option<String>`, not a
-/// [`Fault`]: the cold path serves everything this declines.
+/// [`Fault`]: the cold path serves everything this declines. A view is
+/// minted at `blob + plane`, so both offsets are checked against [`ALIGN`].
 #[allow(clippy::too_many_arguments)]
 fn warm(
     device: &Context,
@@ -796,23 +797,11 @@ fn warm(
              device wants {ALIGN}"
         )));
     }
-    // Every plane of the payload, by name. `data` is the only part a
-    // serving object has; a sharded blob has no second mapping here.
-    let mut at: BTreeMap<&str, &serving::Span<'_>> = BTreeMap::new();
-    for span in &spans {
-        if span.part != "data" {
-            continue;
-        }
-        if span.shard.is_some() {
-            return Err(Some(format!(
-                "its plane `{}` lives in shard {:?} and this arm maps the one containing \
-                 file",
-                span.object,
-                span.shard.unwrap_or_default(),
-            )));
-        }
-        at.insert(span.object, span);
-    }
+    // A plane's `(file offset, length)` by the name a `Trace::param` calls it.
+    let locate = |name: &str| -> Option<(u64, u64)> {
+        let located = artifact.locate(name).ok()?;
+        Some((located.at + located.plane.offset, located.plane.len))
+    };
 
     // Planes kept under the checkpoint's own name. A miss falls to the
     // contract: `Expr::Src(name)` alone means the bytes ARE the plane;
@@ -854,15 +843,14 @@ fn warm(
             store_bytes += place.reserved;
             continue;
         }
-        // The plane's own name first, its verbatim source name second.
-        let object = at
-            .get(param.name.as_str())
-            .map(|_| param.name.as_str())
+        // The plane's own name first, and the name it is stored under second
+        // — see `verbatim`.
+        let object = locate(&param.name)
+            .map(|found| (param.name.as_str(), found))
             .or_else(|| {
                 verbatim
                     .get(param.name.as_str())
-                    .copied()
-                    .filter(|from| at.contains_key(from))
+                    .and_then(|from| locate(from).map(|found| (*from, found)))
             });
         let Some(object) = object else {
             // The residue: computed and landed below, capped by the
@@ -890,27 +878,34 @@ fn warm(
             residue_bytes += place.full;
             continue;
         };
-        let span = &at[object];
+        let (object, (offset, length)) = object;
         // `full` is the declared width on both roads; `bytes` (the store's
         // reservation) differs from it only for a streamed band, so the
         // second half of this check is for resident planes alone.
-        if span.length != place.full || (!place.streamed && place.bytes != place.full) {
+        if length != place.full || (!place.streamed && place.bytes != place.full) {
             return Err(Some(format!(
-                "its plane `{}` (stored as `{object}`) is {} bytes and this plan declares \
-                 {}",
-                param.name, span.length, place.full,
+                "its plane `{}` (stored as `{object}`) is {length} bytes and this plan \
+                 declares {}",
+                param.name, place.full,
             )));
         }
-        from_file[index] = Some(span.offset);
+        if !offset.is_multiple_of(ALIGN) {
+            return Err(Some(format!(
+                "its plane `{}` (stored as `{object}`) lies at {offset}, and a matrix \
+                 operand on this device wants {ALIGN}-byte alignment",
+                param.name,
+            )));
+        }
+        from_file[index] = Some(offset);
         stored += place.full;
         objects.push(object);
         if place.streamed {
             // A streamed band gets no view (read-only mapping); its
             // `Tensor` is `slots` seats in the writable reservation.
             if place.gathered {
-                rows_of.insert(index, span.offset);
+                rows_of.insert(index, offset);
             } else {
-                bands.insert(index, span.offset);
+                bands.insert(index, offset);
             }
             seats.push(Seat::Store(store_bytes));
             store_bytes += place.reserved;
@@ -919,8 +914,8 @@ fn warm(
         // A plane a window has to cover: windows are cut over bound planes
         // only, never the whole file, since a window wires whole and a
         // streamed band (read by the CPU, never bound) must stay unwired.
-        covers.push((param.name.as_str(), span.offset, place.full));
-        seats.push(Seat::Artifact(span.offset));
+        covers.push((param.name.as_str(), offset, place.full));
+        seats.push(Seat::Artifact(offset));
     }
 
     // The residue has a ceiling (a sixteenth of what the file stores) so
@@ -956,7 +951,7 @@ fn warm(
             ))
         })?;
         let published = artifact
-            .part(objects[index], "data")
+            .plane(objects[index])
             .map_err(|why| {
                 Some(format!(
                     "its plane `{}` has no zero-copy view ({why})",

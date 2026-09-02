@@ -59,6 +59,13 @@ pub struct Mtp {
     pub hc_head: HcHead,
     pub norm: Weight,
     pub norm_eps: f32,
+    /// How many tokens past a readout row the head drafts: step 0 is the
+    /// module as trained (`streams_i`, the trunk's argmax at `i`), every
+    /// later step chains the head on its own output streams and its own
+    /// argmax (the depth-1 module run deeper, as vLLM/SGLang serve it),
+    /// attending read-only over the prefix. The `mtp.drafts` seam is
+    /// `[rows, depth]` and the shell advertises `depth` as `mtp_depth`.
+    pub depth: u32,
 }
 
 /// Where one block is stated: its name prefix, cadence, gate kind, dtypes
@@ -1024,6 +1031,7 @@ impl Model {
                 },
                 norm: Weight::sym("mtp.norm", [hidden], Dtype::Bf16),
                 norm_eps: d.norm_eps,
+                depth: DRAFT_DEPTH,
             }
         });
 
@@ -1066,6 +1074,14 @@ const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
 
 /// The draft head's routed bank is always the checkpoint's own 256 experts,
 /// whatever miniature the trunk was cut to.
+/// How many tokens the draft head drafts past a readout row: one, the
+/// module as trained. Measured on the full two-bit model on the 32 GB box
+/// (2026-09-02): the first draft lands 80–96 %, a second 45–60 %, and a
+/// window row costs a fire ~2.6× a one-row fire in streamed expert reads, so
+/// k=1 was +60 % and k=2/3 gained nothing. One step also means one router
+/// indexes the head's expert bank, so the bank streams like the trunk's
+/// instead of sitting resident (3.2 GiB, six trunk seats).
+pub const DRAFT_DEPTH: u32 = 1;
 const DRAFT_EXPERTS: u32 = 256;
 
 impl Model {

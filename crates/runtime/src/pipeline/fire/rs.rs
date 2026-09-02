@@ -88,6 +88,19 @@ pub enum RsPlan {
         tokens: Vec<u32>,
         fold_len_is_device: bool,
     },
+    /// **The device-resident speculative round** (`RsVerb::Window`): row
+    /// `r`'s buffer is two page runs of `pages[r]` slots each, alternated by
+    /// `phase[r]`; this fire writes its rows into run `phase` at token 0 and
+    /// replays the first `rs_fold_len` tokens of the other run. The host
+    /// tracks no token count: the fold length is the port's, every round.
+    Window {
+        /// Slots per run, per row.
+        pages: Vec<u32>,
+        /// Which run this fire writes, per row.
+        phase: Vec<bool>,
+        /// Tokens one page holds, per row.
+        page_tokens: Vec<u32>,
+    },
 }
 
 impl RsPlan {
@@ -120,6 +133,22 @@ impl RsPlan {
             RsPlan::FoldBuffered { tokens, .. } => {
                 let n = tokens.get(index).copied().unwrap_or(0);
                 (true, Some(n), Some((0, n)), RsBufferIntent::Replay)
+            }
+            // The write covers the whole run this fire owns; the fold is the
+            // port's and the state is written (the replayed prefix folds).
+            RsPlan::Window {
+                pages,
+                phase,
+                page_tokens,
+            } => {
+                let n = pages.get(index).copied().unwrap_or(0);
+                let page = page_tokens.get(index).copied().unwrap_or(1).max(1);
+                let start = if phase.get(index).copied().unwrap_or(false) {
+                    n * page
+                } else {
+                    0
+                };
+                (true, None, Some((start, n * page)), RsBufferIntent::Write)
             }
         }
     }
@@ -537,6 +566,28 @@ fn prepare_many_impl(
                         }
                     }
                 }
+                RsPlan::Window {
+                    pages,
+                    phase,
+                    ..
+                } => {
+                    let n = pages.get(index).copied().unwrap_or(0) as usize;
+                    let writes = phase.get(index).copied().unwrap_or(false);
+                    let run = |which: bool| -> Vec<u32> {
+                        let first = if which { n } else { 0 };
+                        row.iter()
+                            .skip(first)
+                            .take(n)
+                            .copied()
+                            .take_while(|&slot| slot != crate::store::rs::RS_TRANSLATION_UNMAPPED)
+                            .collect()
+                    };
+                    engine::fire::RsVerb::Window {
+                        read: run(!writes),
+                        write: run(writes),
+                        fold: engine::fire::FoldLen::Device(eta_ir::registry::Port::RsFoldLen),
+                    }
+                }
                 RsPlan::FoldBuffered {
                     tokens,
                     fold_len_is_device,
@@ -578,6 +629,12 @@ fn prepare_many_impl(
     // Every wire array is now built against the pre-fold buffer, so the
     // boundary can finally move.
     store.commit_folds(pending_folds);
+    // A window round hands the other run to the next fire.
+    if matches!(plan, RsPlan::Window { .. }) {
+        for &ws in working_sets {
+            store.toggle_window_phase(ws);
+        }
+    }
     if let Err(error) = read_side {
         // The mapping is committed and cannot be taken back, but the hold on
         // pool retirement can and must be.

@@ -22,6 +22,9 @@ struct M3LaneRecord {
   ulong attn_score_base;
   uint attn_score_row_stride;
   uint reserved1;
+  ulong mtp_drafts_base;
+  uint mtp_drafts_depth;
+  uint reserved2;
 };
 struct M3LaneChannelSlot {
   ulong committed_cell;

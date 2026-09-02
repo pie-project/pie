@@ -182,6 +182,11 @@ inline void ple_hash_row(
 /// `replay[lane0 + r]` buffered ids gathered ahead of the lane's own rows —
 /// with the window state advanced only over the first `commit[lane0 + r]`
 /// rows. Zero leaves the window as it was.
+///
+/// The rows LAND IN THE OP'S OWN RECTANGLE (`ngram_ids[indptr[r] + own row]`),
+/// not in an extended one: the gathered-table cut reads this vector off the
+/// arena the instant this kernel is enqueued, so a copy after it would be a
+/// copy after the read. A replayed row's hash has no reader and is not written.
 [[kernel]] void ple_ngram_ids_committed(
     const device int* ids                   [[buffer(0)]],
     const device int* indptr                [[buffer(1)]],
@@ -226,10 +231,15 @@ inline void ple_hash_row(
     }
     ple_mask_window(window, ngram, eos);
 
+    const int replayed = replay[lane0 + r];
+    if (t < replayed) {
+      continue;
+    }
     int out[PLE_MAX_HEADS];
     ple_hash_row(hash, window, ngram, heads, heads_per_ngram, out);
+    const size_t own = size_t(indptr[r] + (t - replayed));
     for (int k = 0; k < heads; ++k) {
-      ngram_ids[size_t(begin + t) * size_t(heads) + size_t(k)] = out[k];
+      ngram_ids[own * size_t(heads) + size_t(k)] = out[k];
     }
   }
 

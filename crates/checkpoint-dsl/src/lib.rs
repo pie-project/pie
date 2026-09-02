@@ -360,7 +360,13 @@ fn declare(
     w: &Weight,
     expr: Expr,
 ) -> Result<TensorContract, Error> {
-    let want = encoding(w.dtype);
+    // A quantized want states its blocked axis (the contracted, last one),
+    // so a raw source encoded on the way in lands the grouping the bank's
+    // own contract asks for.
+    let want = match encoding(w.dtype) {
+        Encoding::Quant(_) => grouped(w),
+        raw => raw,
+    };
     let stored = agreed(src, &w.name, &expr)?;
     let expr = ladder(&w.name, expr, &stored, &want)?;
     Ok(match &stored {
@@ -386,12 +392,27 @@ fn fused(
     declare(src, w, Expr::concat(pack_axis(w), legs))
 }
 
+/// Whether `name` is stored as a raw floating-point tensor — what a bank the
+/// text wants quantized has to be ENCODED from, rather than transmuted.
+fn stored_raw(src: &ztensor::Source, name: &str) -> Result<bool, Error> {
+    Ok(matches!(
+        stored_encoding(src, name)?,
+        Encoding::Raw(DType::Bf16 | DType::F16 | DType::F32)
+    ))
+}
+
 fn planes(
     src: &ztensor::Source,
     w: &Weight,
     from: impl Into<String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let from = from.into();
+    // A quantized bank stated by a RAW source (a bf16 head overlaid onto a
+    // quantized trunk) is not MLX codes to transmute: it takes the raw
+    // reader, whose ladder has the loader encode it on the way in.
+    if stored_raw(src, &from)? {
+        return Ok(vec![copy(src, w, from)?]);
+    }
     match w.dtype {
         Dtype::U4g64tiled => tiled_planes(src, w, vec![from]),
         Dtype::U4g64
@@ -411,6 +432,9 @@ fn planes_fused(
     parts: impl IntoIterator<Item = String>,
 ) -> Result<Vec<TensorContract>, Error> {
     let parts: Vec<String> = parts.into_iter().collect();
+    if parts.iter().try_fold(true, |all, part| Ok::<bool, Error>(all && stored_raw(src, part)?))? {
+        return Ok(vec![fused(src, w, parts)?]);
+    }
     match w.dtype {
         Dtype::U4g64tiled => tiled_planes(src, w, parts),
         Dtype::U4g64
@@ -951,8 +975,7 @@ pub fn stored_encoding(src: &ztensor::Source, name: &str) -> Result<Encoding, Er
         name: name.to_string(),
         detail: why.to_string(),
     };
-    let part = tensor.part("data").map_err(|why| illegible(&why))?;
-    checkpoint::file::encoding_of(&tensor, &part).map_err(|why| illegible(&why))
+    checkpoint::file::encoding_of(&tensor).map_err(|why| illegible(&why))
 }
 
 fn ladder(name: &str, expr: Expr, stored: &Encoding, want: &Encoding) -> Result<Expr, Error> {

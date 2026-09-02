@@ -53,13 +53,34 @@ fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
 
 /// **A DETERMINISTIC `side × side` 8-BIT RGB PNG OF ONE COLOUR.**
 pub fn solid(side: u32, rgb: [u8; 3]) -> Vec<u8> {
+    image(side, |_, _| rgb)
+}
+
+/// **A DETERMINISTIC TEXTURED PNG**: a diagonal hue sweep over a checker of
+/// 8-pixel cells, so every patch row is a different vector. Not a colour a
+/// caption gate asserts on — a probe of how many routed experts a picture's
+/// rows name at once, which a solid field (every patch identical) understates.
+pub fn textured(side: u32) -> Vec<u8> {
+    image(side, |x, y| {
+        let t = (x + y) as f32 / (2 * side.max(1)) as f32;
+        let checker = ((x / 8) + (y / 8)) % 2 == 0;
+        let base = [
+            (255.0 * (1.0 - t)) as u8,
+            (255.0 * (0.5 - (t - 0.5).abs()) * 2.0) as u8,
+            (255.0 * t) as u8,
+        ];
+        if checker { base } else { [base[0] / 2, base[1] / 2, base[2] / 2] }
+    })
+}
+
+fn image(side: u32, pixel: impl Fn(u32, u32) -> [u8; 3]) -> Vec<u8> {
     let (w, h) = (side, side);
     // Raw scanlines: PNG prefixes each with a filter byte, and 0 is "None".
     let mut raw = Vec::with_capacity((h * (1 + w * 3)) as usize);
-    for _ in 0..h {
+    for y in 0..h {
         raw.push(0u8);
-        for _ in 0..w {
-            raw.extend_from_slice(&rgb);
+        for x in 0..w {
+            raw.extend_from_slice(&pixel(x, y));
         }
     }
 
@@ -88,4 +109,32 @@ pub fn solid(side: u32, rgb: [u8; 3]) -> Vec<u8> {
     chunk(&mut out, b"IDAT", &z);
     chunk(&mut out, b"IEND", &[]);
     out
+}
+
+/// Standard-alphabet base64, padding optional, whitespace ignored — enough
+/// to carry a picture through an argument list without a dependency.
+pub fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
+    let value = |c: u8| -> Result<Option<u32>, String> {
+        Ok(Some(match c {
+            b'A'..=b'Z' => u32::from(c - b'A'),
+            b'a'..=b'z' => u32::from(c - b'a') + 26,
+            b'0'..=b'9' => u32::from(c - b'0') + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\n' | b'\r' | b' ' | b'\t' => return Ok(None),
+            other => return Err(format!("base64: byte {other:#04x} is not in the alphabet")),
+        }))
+    };
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in text.as_bytes() {
+        let Some(v) = value(c)? else { continue };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(out)
 }

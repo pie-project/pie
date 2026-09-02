@@ -223,6 +223,10 @@ const OUT_SEAM: &str = model_compiler::EXPORT_SEAMS[0];
 /// argument index for every intrinsic and this name had no reader on this
 /// plane; `engine-cuda` has resolved it since palo C3b.
 const MTP_SEAM: &str = model_compiler::EXPORT_SEAMS[1];
+/// The draft head's token ids, `[rows, depth]` i32 — what `mtp_drafts` is
+/// pointed at. Resolved at load like `mtp`, and its width is the depth
+/// [`Shell::mtp_depth`] advertises.
+const DRAFTS_SEAM: &str = model_compiler::EXPORT_SEAMS[3];
 
 /// The seam name the attention capture arm's per-query column arrives under —
 /// the plan's declaration that this text OBSERVES (palo C4b), and the list the
@@ -989,6 +993,11 @@ pub struct Shell {
     /// (`crate::gather::cuts`). All `None` for every load whose tables are
     /// resident, which is every load in this tree today.
     row_cuts: Vec<Option<ValueId>>,
+    /// Per region, the most rows one launch may cover (`0`: no cap): the
+    /// region after a streamed router's is capped at `slots / top_k`, so a
+    /// fire whose rows would name more experts than the slab seats is walked
+    /// as pieces, each cut and seated on its own (`FireDescriptor::run_caps`).
+    run_caps: Vec<u32>,
     /// Per slot: how many kv tokens it holds.
     held: Vec<u32>,
     /// The trunk's logits, as the plan's `out` seam names them.
@@ -1003,6 +1012,9 @@ pub struct Shell {
     /// answer in `Exports::mtp`; this plane has no `exports.rs`, so it stands
     /// beside [`Shell::out`] where the out seam is resolved.
     mtp: Option<ValueId>,
+    /// The draft head's token plane (`mtp.drafts`) and its depth — the
+    /// rectangle `mtp_drafts` is bound at, resolved at load beside `mtp`.
+    drafts_plane: Option<(ValueId, u32)>,
     // attn-score — the axis's two fields, kept contiguous.
     /// **THE OBSERVABILITY SLAB** (`.wiki/alto/attn-score.md` §4), or `None`
     /// for a plan that declares no `attn.scores` export — in which case this
@@ -1173,7 +1185,22 @@ impl Shell {
         // **THE CUT TABLE IS READ BEFORE THE LANDING**, so that a plan whose
         // regions carry two mixtures each refuses a streamed load before a
         // byte is moved rather than at the first fire.
-        let cuts = crate::experts::cuts(&boot.trace, &compiled, boot.residency.streams())?;
+        let cuts = crate::experts::cuts(&boot.trace, &compiled, &boot.residency)?;
+        let run_caps: Vec<u32> = (0..compiled.template().len())
+            .map(|region| {
+                let slots = boot.residency.slots();
+                let routes = region
+                    .checked_sub(1)
+                    .and_then(|router| cuts.get(router).copied().flatten());
+                let stated = kernels_metal::tuning::current().stream_rows_per_cut;
+                match (routes, slots) {
+                    (Some(_), slots) if slots > 0 && stated > 0 => stated,
+                    (Some(routes), slots) if slots > 0 => crate::experts::fan_out(&boot.trace, routes)
+                        .map_or(0, |k| (slots / k.max(1)).max(1)),
+                    _ => 0,
+                }
+            })
+            .collect();
         // **AND THE HASHER CUTS BESIDE THEM**, read here for the same reason
         // and refused here for the same one: a region carrying two hashers
         // that land different id vectors cannot be served by one cut, and the
@@ -1352,7 +1379,13 @@ impl Shell {
             .iter()
             .find(|seam| seam.seam == MTP_SEAM)
             .and_then(|seam| seam.values.first().copied());
-        let out_width = {
+        let drafts_seam = boot
+            .trace
+            .seams
+            .iter()
+            .find(|seam| seam.seam == DRAFTS_SEAM)
+            .and_then(|seam| seam.values.first().copied());
+        let (out_width, drafts_plane) = {
             let carved = arena.slots(
                 &handles,
                 &compiled.arena,
@@ -1394,8 +1427,39 @@ impl Shell {
                     });
                 }
             }
+            // The token plane is i32 and its width is the head's depth: the
+            // emitted `mtp_drafts` gather copies ints off it and a guest sizes
+            // its read by `mtp_depth`, so both are fixed here, at load.
+            let drafts_plane = match drafts_seam {
+                Some(value) => {
+                    let plane = carved.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "value {}, the `{DRAFTS_SEAM}` export, which the carve gave no \
+                             rectangle",
+                            value.0
+                        ),
+                    })?;
+                    if plane.dtype != Dtype::I32 {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "a `{DRAFTS_SEAM}` export landed as {:?}, and the draft ids \
+                                 are read as i32",
+                                plane.dtype
+                            ),
+                        });
+                    }
+                    let depth = u32::try_from(plane.width).unwrap_or(u32::MAX);
+                    if depth == 0 {
+                        return Err(Fault::Unbound {
+                            what: format!("a `{DRAFTS_SEAM}` export of width zero drafts nothing"),
+                        });
+                    }
+                    Some((value, depth))
+                }
+                None => None,
+            };
             handles.rewind();
-            logits.width
+            (logits.width, drafts_plane)
         };
 
         // One row per lane the budget admits, `bf16`, per arm. Sized at the
@@ -1486,9 +1550,11 @@ impl Shell {
             corrected,
             cuts,
             row_cuts,
+            run_caps,
             held: vec![0; boot.slots as usize],
             out,
             mtp,
+            drafts_plane,
             scores,
             capturing,
             programs: crate::program::Plane::new(),
@@ -1712,6 +1778,14 @@ impl Shell {
     #[must_use]
     pub const fn drafts(&self) -> bool {
         self.mtp.is_some()
+    }
+
+    /// The draft head's chain depth — the width of the `mtp.drafts` seam the
+    /// model text plants, zero for a text without one. What `mtp_depth`
+    /// reports to a guest, so it can size `mtp_drafts(n_out × depth)`.
+    #[must_use]
+    pub fn mtp_depth(&self) -> u32 {
+        self.drafts_plane.map_or(0, |(_, depth)| depth)
     }
 
     /// How many frames this load may hold in flight at once — the seat count
@@ -2686,6 +2760,7 @@ impl Shell {
         base: u64,
         width: u64,
         draft: Option<(u64, u64)>,
+        drafts: Option<(u64, u64)>,
     ) -> Result<Vec<u64>> {
         if prepared.attachments.is_empty() {
             return Ok(Vec::new());
@@ -2733,6 +2808,7 @@ impl Shell {
             base,
             width,
             draft,
+            drafts,
             &first_row,
             &lane_rows,
             &fire_lane,
@@ -2766,6 +2842,7 @@ impl Shell {
         base: u64,
         width: u64,
         draft: Option<(u64, u64)>,
+        drafts: Option<(u64, u64)>,
         first_row: &[u32],
         lane_rows: &[u32],
         fire_lane: &[u32],
@@ -2878,6 +2955,35 @@ impl Shell {
                     column + u64::from(first_row[lane]) * mtp_width * 2,
                     u32::try_from(mtp_width).unwrap_or(u32::MAX),
                     Dtype::Bf16,
+                )?;
+            }
+
+            // ── **AND THE TOKEN PLANE, AT THE READOUT'S OWN ROW.** Bound at
+            //    `at` like the logits and not at the lane's first row: the
+            //    guest reads `n_out × depth` ids for the rows it reads out,
+            //    and with the plane's pitch being the depth those are one
+            //    contiguous run from the first readout row. The width bound
+            //    here is the depth — what the emitted gather checks its
+            //    declared length against.
+            if self.programs.needs_mtp_drafts(attached.instance)? {
+                let (plane, depth) = drafts.ok_or_else(|| {
+                    Fault::program(
+                        "serve::enqueue",
+                        format!(
+                            "instance {} reads the `mtp_drafts` intrinsic and this load \
+                             carved no `{DRAFTS_SEAM}` rectangle; the attachment gate was \
+                             supposed to have refused it",
+                            attached.instance
+                        ),
+                    )
+                })?;
+                self.programs.bind_intrinsic(
+                    attached.instance,
+                    eta_ir::op::IntrinsicId::MtpDrafts,
+                    self.arena.store(),
+                    plane + u64::from(at) * depth * 4,
+                    u32::try_from(depth).unwrap_or(u32::MAX),
+                    Dtype::I32,
                 )?;
             }
 
@@ -3157,6 +3263,17 @@ impl Shell {
                         "instance {} reads the `mtp_logits` intrinsic and this load's \
                          model text declares no `{MTP_SEAM}` seam, so there is no draft \
                          column to point it at",
+                        attached.instance
+                    ),
+                ));
+            }
+            if self.drafts_plane.is_none() && self.programs.needs_mtp_drafts(attached.instance)? {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "instance {} reads the `mtp_drafts` intrinsic and this load's \
+                         model text declares no `{DRAFTS_SEAM}` seam, so there is no token \
+                         plane to point it at",
                         attached.instance
                     ),
                 ));
@@ -3737,7 +3854,8 @@ impl Shell {
             })
             .collect();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
-        let descriptor = FireDescriptor::of(&composition);
+        let mut descriptor = FireDescriptor::of(&composition);
+        descriptor.run_caps = self.run_caps.clone();
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
@@ -4010,7 +4128,24 @@ impl Shell {
                 }
                 rs_active = true;
             }
-            rs_plans.push(crate::rs::LanePlan::of(seated.rs, row.rows, row.source)?);
+            let plan = crate::rs::LanePlan::of(
+                seated.rs,
+                row.rows,
+                row.source,
+                ports.as_ref().and_then(crate::program::ports::LanePorts::fold_len),
+            )?;
+            // `PIE_RS_TRACE=1`: print every non-fold lane plan — the one place
+            // the resolved fold length, the replayed run and the scattered run
+            // can be read off a serving fire.
+            if !matches!(seated.rs, engine::fire::RsVerb::Fold)
+                && std::env::var_os("PIE_RS_TRACE").is_some_and(|v| v != "0")
+            {
+                eprintln!(
+                    "recurrent seat: lane {} rows {} replay {} commit {} gather {:?} scatter {:?}",
+                    row.source, row.rows, plan.replay, plan.commit, plan.gather, plan.scatter
+                );
+            }
+            rs_plans.push(plan);
             // **THE POSITIONS ARE STATED OR DERIVED, AND THE LENGTH IS WHAT
             // DECIDES WHICH.** A stated vector parallel to the lane's tokens
             // is taken verbatim into rope's seat; anything else is refused by
@@ -4303,6 +4438,7 @@ impl Shell {
                 positions: &positions,
                 request_of_token: &request_of_token,
             },
+            &self.run_caps,
         )?;
         self.last = FireCost {
             launches: windows.launches(),
@@ -4790,27 +4926,11 @@ impl Shell {
         if let Some(rows) = rows {
             rows.borrow_mut().fire();
         }
-        // ── **ONE RUN PER CUT REGION, AND IT IS ASKED BEFORE THE WALK.** A
-        //    region P4 could not seat runs once per interval of its window, so
-        //    its router would fire once per interval and each firing would
-        //    write only its own rows — while the rows the earlier intervals
-        //    wrote already hold SEAT numbers. Rewriting those a second time
-        //    would read a seat number as an expert number, silently. Refused
-        //    by name; the fix is a budget that holds the plan whole, and the
-        //    mechanism that would serve it (a per-interval cut, with the
-        //    pins of every interval live at once) is a later wave's.
-        for (region, cut) in self.cuts.iter().enumerate() {
-            let runs = p.windows.runs(region as u32);
-            if cut.is_some() && runs > 1 {
-                return Err(Fault::Residency(format!(
-                    "region {region} carries a router and this fire splits its window into \
-                     {runs} runs; a streamed load cuts its command buffer once per region, \
-                     so the second run would rewrite the first run's seat numbers as if \
-                     they were expert numbers. Raise `device_weight_budget` to hold this \
-                     plan whole, or submit a composition whose classes are consecutive."
-                )));
-            }
-        }
+        // A cut region in several runs is the ordinary case now: the cut is
+        // taken before each run's first dispatch, over that run's rows alone
+        // (`encode::Sink::fire`), so a router's rows never hold seat numbers
+        // when another run's cut reads them. That is what sub-batches a
+        // segment whose rows would name more experts than the slab seats.
         // The same hazard, one class over, and it is worth stating in its own
         // words: a second run over a region whose hasher already ran would
         // read the FIRST run's seat numbers as table rows and seat them
@@ -5305,7 +5425,45 @@ impl engine::frame::Shell for Shell {
         // prices what that costs). Everything below this line is identical for
         // both — the tail segment is a `Frame` like any other.
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
-            self.walk_streamed(&prepared)?
+            // `PIE_TIER_TRACE=1`: what this fire cost the streamed tier — seat
+            // copies, cuts, hits/misses and the host time inside the cuts —
+            // as deltas, one line a fire. The counters exist for the gates;
+            // this is the serving-side reading of them.
+            let trace = std::env::var_os("PIE_TIER_TRACE").is_some_and(|v| v != "0");
+            let before = trace.then(|| {
+                (self.expert_motion(), self.expert_hits(), self.expert_host_time(), std::time::Instant::now())
+            });
+            let walked = self.walk_streamed(&prepared)?;
+            if let Some(((swaps0, cuts0), (hits0, misses0), (cut0, copy0, wait0), started)) = before {
+                let (swaps, cuts) = self.expert_motion();
+                let (hits, misses) = self.expert_hits();
+                let (cut_ns, copy_ns, wait_ns) = self.expert_host_time();
+                eprintln!(
+                    "tier: fire of {} row(s): {} seat copies over {} cuts, {} hits / {} misses; \
+                     cuts {:.1} ms (copies {:.1} ms, waiting on the device {:.1} ms); walk {:.1} ms",
+                    prepared.descriptor.rows,
+                    swaps - swaps0,
+                    cuts - cuts0,
+                    hits - hits0,
+                    misses - misses0,
+                    (cut_ns - cut0) as f64 / 1e6,
+                    (copy_ns - copy0) as f64 / 1e6,
+                    (wait_ns - wait0) as f64 / 1e6,
+                    started.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            // `PIE_KERNEL_PROFILE=1` beside it: the device time of this fire
+            // by entrypoint, top ten, then the tally starts over.
+            let profile = crate::encode::kernel_profile();
+            if !profile.is_empty() {
+                let total: u64 = profile.iter().map(|(_, ns, _)| ns).sum();
+                eprintln!("kernels: fire of {} row(s), {:.1} ms on the device:", prepared.descriptor.rows, total as f64 / 1e6);
+                for (name, ns, launches) in profile.iter().take(10) {
+                    eprintln!("  {:>9.1} ms  {:>5} launch(es)  {name}", *ns as f64 / 1e6, launches);
+                }
+                crate::encode::reset_kernel_profile();
+            }
+            walked
         } else {
             self.walk_once(&prepared, Mode::Encode)?
         };
@@ -5391,6 +5549,7 @@ impl engine::frame::Shell for Shell {
         //    which `admit_attachments` has already refused an mtp-reading
         //    attachment against.
         let mut draft = None;
+        let mut drafts = None;
         if !prepared.attachments.is_empty() {
             let arena = crate::device::alloc::slab_id(self.arena.store().slab());
             if crate::device::alloc::slab_id(&source) != arena {
@@ -5426,8 +5585,34 @@ impl engine::frame::Shell for Shell {
                 }
                 draft = Some((row.offset(), u64::from(column.width)));
             }
+            if let Some((value, depth)) = self.drafts_plane {
+                let plane = prepared.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "value {}, the `{DRAFTS_SEAM}` export, which the carve gave no rectangle",
+                        value.0
+                    ),
+                })?;
+                let row = self.handles.get(plane.buf).ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "handle {}, the `{DRAFTS_SEAM}` export's, which this load minted no \
+                         row for",
+                        plane.buf
+                    ),
+                })?;
+                if crate::device::alloc::slab_id(row.slab()) != arena {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "the `{DRAFTS_SEAM}` export, which this carve did not put in the \
+                             arena; an attached epilogue is bound against the arena's own \
+                             reservation"
+                        ),
+                    });
+                }
+                drafts = Some((row.offset(), u64::from(depth)));
+            }
         }
-        let attached = self.encode_epilogues(&mut frame, &prepared, base, width, draft)?;
+        let attached =
+            self.encode_epilogues(&mut frame, &prepared, base, width, draft, drafts)?;
 
         // ── The fire is enqueued, so the sequences are longer.
         self.advance(&prepared);

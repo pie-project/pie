@@ -15,7 +15,8 @@ impl Model {
         // arm must run before huggingface, since the flash artifact is otherwise
         // huggingface-named.
         let mut refusals: Vec<String> = Vec::new();
-        let arms: [(&str, fn(&Self, &ztensor::Source, Platform) -> Result<ModelContract, Error>); 3] = [
+        let arms: [(&str, fn(&Self, &ztensor::Source, Platform) -> Result<ModelContract, Error>); 4] = [
+            ("an artifact with an `--aux` overlay", Self::import_from_own_with_aux),
             ("flash mlx", Self::import_from_mlx),
             ("huggingface", Self::import_from_huggingface),
             ("gguf", Self::import_from_gguf),
@@ -34,6 +35,55 @@ impl Model {
                 refusals.join("; "),
             ),
         })
+    }
+
+    /// Reads a STAMPED ARTIFACT of this family's plain row with the draft
+    /// head overlaid beside it (`pie model import <artifact.zt> --aux <head>`):
+    /// every trunk plane by its own name, as the artifact already holds it,
+    /// and the head's planes through the `aux.` reading. What lets a head be
+    /// put onto a ninety-gigabyte artifact whose source snapshot is gone,
+    /// and lets the import write only the head. A row without a draft head
+    /// has nothing to overlay and refuses; a source that is not an artifact
+    /// refuses at the first trunk plane it lacks.
+    pub fn import_from_own_with_aux(
+        &self,
+        src: &ztensor::Source,
+        platform: Platform,
+    ) -> Result<ModelContract, Error> {
+        if self.mtp.is_none() {
+            return Err(Error::Illegible {
+                name: "mtp".to_string(),
+                detail: "this row declares no draft head, so there is no overlay to land \
+                         on an artifact"
+                    .to_string(),
+            });
+        }
+        let is_aux = |name: &str| name.starts_with("aux.");
+        let mut b = Builder::new(src, self.tp, platform);
+        for read in self.mlx_reads() {
+            match read {
+                Read::One(w, name) if is_aux(&name) => b.read(w, name)?,
+                Read::Concat(w, _, names) if names.iter().all(|n| is_aux(n)) && affine(w.dtype) => {
+                    b.read_concat(w, names)?;
+                }
+                Read::Concat(w, axis, names) if names.iter().all(|n| is_aux(n)) => {
+                    let hidden = i64::from(self.hidden);
+                    let parts = names
+                        .into_iter()
+                        .map(|name| {
+                            if w.shape.len() == 3 {
+                                slab(Expr::src(name), vec![-1, -1, hidden], encoding(w.dtype))
+                            } else {
+                                Expr::src(name)
+                            }
+                        })
+                        .collect();
+                    b.read_expr(w, Expr::concat(axis, parts))?;
+                }
+                Read::One(w, _) | Read::Concat(w, _, _) => b.read_own(w)?,
+            }
+        }
+        Ok(b.build())
     }
 
     /// Reads the flash artifact's own names (mlx-community DeepSeek-V4-Flash). This read list also drives

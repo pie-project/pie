@@ -4,6 +4,7 @@
 //! data plus serde, so every crate that reads a plan reads only this one.
 
 pub mod check;
+pub mod fuse;
 pub mod guard;
 pub mod operands;
 pub mod ops;
@@ -27,6 +28,6 @@ pub use ops::{
 };
 pub use trace::{CacheRow, Node, Param, ParamSource, Platform, Seam, Shard, Trace};
 pub use value::{
-    Def, Dim, Dtype, GeomKind, PerAxis, RowAxis, RuntimeInput, StructKind, TILED_BAND,
-    TILED_STEP, Ty, ValueDecl, ValueId,
+    BIASES, Def, Dim, Dtype, GeomKind, PerAxis, RowAxis, RuntimeInput, SCALES, StructKind,
+    TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
 };

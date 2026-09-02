@@ -3,7 +3,9 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{
+    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+};
 use crate::tensor::Tensor;
 
 const FILE: &str = "elemwise/norm.cuh";
@@ -11,6 +13,9 @@ const FILE: &str = "elemwise/norm.cuh";
 const BLOCK: u32 = 256;
 
 const WARP: u32 = 32;
+
+/// Elements one thread of a vectorised row kernel moves at once.
+const VEC_WIDTH: u32 = 8;
 
 /// The single-row rms unit's two weight readings: the bank read absolutely,
 /// or offset by one (`w + 1`).
@@ -411,6 +416,57 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
             // Element-form seat's width: launch is flat over rows*width, so
             // the kernel needs it to read the staged row count/start as elements.
             stated(OP, y.width)?.arg(),
+            // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
+            ctx.stage(),
+        ],
+    )
+}
+
+/// `y += x` in place, then `out = rmsnorm(y)` (`weight + 1` when
+/// `plus_one`): what [`residual_add`] then [`rmsnorm`] land, one launch.
+pub fn residual_add_rmsnorm(
+    ctx: &Ctx,
+    x: Tensor,
+    y: &mut Tensor,
+    weight: Tensor,
+    plus_one: bool,
+    eps: f32,
+    out: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.residual_add_rmsnorm";
+    let t = dtype_dispatch!(OP, y.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert!(
+        x.rows == y.rows && x.width == y.width && out.rows == y.rows && out.width == y.width,
+        "the residual, the stream and the normed row share one shape"
+    );
+    let hidden = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
+    let rows = nonzero(OP, "rows", y.rows)?;
+    let plus = if plus_one { "true" } else { "false" };
+    let vectors = y.dtype == Dtype::Bf16
+        && y.width % VEC_WIDTH == 0
+        && [x.ptr, y.ptr, weight.ptr, out.ptr].iter().all(|&at| aligned16(at));
+    let (entrypoint, block) = if vectors {
+        let block = (y.width / VEC_WIDTH).clamp(WARP, BLOCK).next_power_of_two();
+        (
+            format!("::pie::elemwise::residual_add_rmsnorm_vec8<{block}, {plus}>"),
+            block,
+        )
+    } else {
+        (
+            format!("::pie::elemwise::residual_add_rmsnorm<{t}, 256, {plus}>"),
+            BLOCK,
+        )
+    };
+    ctx.fire(
+        OP,
+        Fire::at(FILE, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),
+        &[
+            x.arg(),
+            y.arg(),
+            weight.arg(),
+            out.arg(),
+            hidden.arg(),
+            eps.arg(),
             // Staged-geometry seat: live-rows word if a body replay armed one, else ABSENT.
             ctx.stage(),
         ],

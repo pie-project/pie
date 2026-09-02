@@ -55,6 +55,8 @@ fn default_seed() -> u32 {
 struct Output {
     sampler: &'static str,
     text: String,
+    /// The generated ids, so an identity gate can find WHERE two runs part.
+    tokens: Vec<u32>,
     count: usize,
     stats: bool,
 }
@@ -84,12 +86,16 @@ async fn main(input: Input) -> Result<Output> {
         return Ok(Output {
             sampler: "naive-baseline",
             text: String::new(),
+            tokens: Vec::new(),
             count: 0,
             stats: want_stats,
         });
     }
 
-    let mut prompt = model::encode(&input.prompt);
+    // The model's opening (`<bos>` where it has one) before the raw text: a
+    // gemma without it answers noise, and no sampler can be read against that.
+    let mut prompt = inferlet::chat::prefix();
+    prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -281,6 +287,7 @@ async fn main(input: Input) -> Result<Output> {
         sampler: "naive-baseline",
         text: model::decode(&generated)?,
         count: generated.len(),
+        tokens: generated,
         stats: want_stats,
     })
 }

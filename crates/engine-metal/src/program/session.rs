@@ -490,6 +490,15 @@ impl Session {
             ));
         }
 
+        if plan.needs_mtp_drafts && self.bound & (1u64 << (IntrinsicId::MtpDrafts as u32)) == 0 {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `mtp_drafts` intrinsic and no buffer has \
+                 been bound to it; a model whose text declares no `mtp.drafts` export \
+                 has no token plane for it to point at",
+            ));
+        }
+
         if plan.needs_attn_scores
             && self.bound & (1u64 << (IntrinsicId::AttnScore as u32)) == 0
         {

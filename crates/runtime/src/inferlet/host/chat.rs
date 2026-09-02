@@ -30,6 +30,10 @@ impl std::fmt::Debug for Decoder {
 }
 
 impl pie::inferlet::chat::Host for ProcessCtx {
+    async fn prefix(&mut self) -> Result<Vec<u32>> {
+        Ok(crate::model::model().instruct().prefix())
+    }
+
     async fn system(&mut self, message: String) -> Result<Vec<u32>> {
         Ok(crate::model::model().instruct().system(&message))
     }

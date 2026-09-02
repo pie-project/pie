@@ -17,7 +17,7 @@ pub use dtype::Dtype;
 /// `model_dsl::Weight::planes` sizes a repacked weight's three planes with
 /// these; `checkpoint` checks a declared repack target against the same two
 /// numbers.
-pub use dtype::{TILED_BAND, TILED_STEP};
+pub use dtype::{BIASES, SCALES, TILED_BAND, TILED_STEP};
 
 /// The shape algebra's symbolic dims, sized by runtime budgets (`Tokens` →
 /// max_tokens, `Lanes` → max_lanes, `Patches` → max_patches) when the arena

@@ -1254,8 +1254,10 @@ impl Tier {
                 None => host.device().saturating_add(host_at),
                 Some(artifact) => {
                     let id = u32::try_from(param).unwrap_or(u32::MAX);
-                    // The reserved extent, not the published one — a seat hands out a pointer treated as `reserved` bytes wide.
-                    let Some(bytes) = artifact.plane_padded(id, reserved) else {
+                    // A seat hands out a pointer treated as `reserved` bytes
+                    // wide, so the mapping must run that far past the plane;
+                    // it may, because no kernel reads past `bytes`.
+                    let Some(bytes) = artifact.plane_reserved(id, reserved) else {
                         let plane = artifact
                             .name(id)
                             .map_or_else(|| format!("param {param}"), |name| format!("`{name}`"));

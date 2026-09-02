@@ -227,302 +227,112 @@ __global__ void rmsnorm_vec8(
     }
 }
 
-template <int BLOCK>
-__global__ void residual_add_rmsnorm_vec8(
-    bf16* __restrict__ hidden,
-    const bf16* __restrict__ residual,
-    const bf16* __restrict__ weight,
-    bf16* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
+// `y += x` in place, then `out = rmsnorm(y)`: the same bf16 rounding of the
+// sum `residual_add` lands, and the norm's moments taken over that rounded
+// row, so the pair lands what the two launches land.
+template <class T, int BLOCK, bool WEIGHT_PLUS_ONE>
+__global__ void residual_add_rmsnorm(
+    const T* __restrict__ x,
+    T* __restrict__ y,
+    const T* __restrict__ weight,
+    T* __restrict__ out,
+    int hidden,
+    float eps,
+    const u32* __restrict__ win)
 {
     const int row = blockIdx.x;
+    // The staged-geometry seat (rmsnorm_row's idiom, one block per row).
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
     const int tid = threadIdx.x;
-    const int nvec = hidden_size / 8;
-    const long long base = static_cast<long long>(row) * hidden_size;
 
-    float4* hr = reinterpret_cast<float4*>(hidden + base);
-    const float4* rr = reinterpret_cast<const float4*>(residual + base);
-    float4* nr = reinterpret_cast<float4*>(norm_out + base);
-    const float4* wr = reinterpret_cast<const float4*>(weight);
+    const T* xr = x + static_cast<long long>(plane_row) * hidden;
+    T* yr = y + static_cast<long long>(plane_row) * hidden;
+    T* outr = out + static_cast<long long>(plane_row) * hidden;
+
+    float local = 0.f;
+    for (int i = tid; i < hidden; i += BLOCK) {
+        const T summed = Elem<T>::from_f32(Elem<T>::to_f32(yr[i]) + Elem<T>::to_f32(xr[i]));
+        yr[i] = summed;
+        const float v = Elem<T>::to_f32(summed);
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
+
+    for (int i = tid; i < hidden; i += BLOCK) {
+        const float xv = Elem<T>::to_f32(yr[i]);
+        float wv = Elem<T>::to_f32(weight[i]);
+        if constexpr (WEIGHT_PLUS_ONE) wv += 1.f;
+        outr[i] = Elem<T>::from_f32(xv * inv_rms * wv);
+    }
+}
+
+// The eight-wide form: `hidden` is a whole number of vectors and the row
+// planes are 16-byte aligned. One vector per thread per pass.
+template <int BLOCK, bool WEIGHT_PLUS_ONE>
+__global__ void residual_add_rmsnorm_vec8(
+    const bf16* __restrict__ x,
+    bf16* __restrict__ y,
+    const bf16* __restrict__ weight,
+    bf16* __restrict__ out,
+    int hidden,
+    float eps,
+    const u32* __restrict__ win)
+{
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const int tid = threadIdx.x;
+    const int nvec = hidden / 8;
+    const long long base = static_cast<long long>(plane_row) * hidden;
+
+    const uint4* xr = reinterpret_cast<const uint4*>(x + base);
+    uint4* yr = reinterpret_cast<uint4*>(y + base);
+    uint4* outr = reinterpret_cast<uint4*>(out + base);
+    const uint4* wr = reinterpret_cast<const uint4*>(weight);
 
     float local = 0.f;
     for (int i = tid; i < nvec; i += BLOCK) {
-        float4 hv = hr[i];
-        float4 rv = rr[i];
-        bf16x2* hh = reinterpret_cast<bf16x2*>(&hv);
-        const bf16x2* rh = reinterpret_cast<const bf16x2*>(&rv);
-#pragma unroll
+        uint4 yv = yr[i];
+        const uint4 xv = xr[i];
+        bf16x2* yh = reinterpret_cast<bf16x2*>(&yv);
+        const bf16x2* xh = reinterpret_cast<const bf16x2*>(&xv);
+        #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const float2 a = bf16x2_to_f32(hh[j]);
-            const float2 b = bf16x2_to_f32(rh[j]);
-            hh[j] = f32_to_bf16x2(a.x + b.x, a.y + b.y);
-            const float2 f = bf16x2_to_f32(hh[j]);
+            const float2 a = bf16x2_to_f32(yh[j]);
+            const float2 b = bf16x2_to_f32(xh[j]);
+            yh[j] = f32_to_bf16x2(a.x + b.x, a.y + b.y);
+            const float2 f = bf16x2_to_f32(yh[j]);
             local += f.x * f.x + f.y * f.y;
         }
-        hr[i] = hv;
+        yr[i] = yv;
     }
 
     __shared__ float buf[BLOCK];
     const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
+    const float inv_rms = rsqrtf(buf_sum / static_cast<float>(hidden) + eps);
 
     for (int i = tid; i < nvec; i += BLOCK) {
-        float4 v = hr[i];
-        float4 g = wr[i];
-        float4 o;
-        const bf16x2* hv = reinterpret_cast<const bf16x2*>(&v);
-        const bf16x2* hg = reinterpret_cast<const bf16x2*>(&g);
-        bf16x2* ho = reinterpret_cast<bf16x2*>(&o);
-#pragma unroll
+        const uint4 yv = yr[i];
+        const uint4 wv = wr[i];
+        uint4 ov;
+        const bf16x2* yh = reinterpret_cast<const bf16x2*>(&yv);
+        const bf16x2* wh = reinterpret_cast<const bf16x2*>(&wv);
+        bf16x2* oh = reinterpret_cast<bf16x2*>(&ov);
+        #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const float2 a = bf16x2_to_f32(hv[j]);
-            const float2 b = bf16x2_to_f32(hg[j]);
-            ho[j] = f32_to_bf16x2(a.x * inv_rms * b.x,
-                                  a.y * inv_rms * b.y);
+            const float2 v = bf16x2_to_f32(yh[j]);
+            float2 w = bf16x2_to_f32(wh[j]);
+            if constexpr (WEIGHT_PLUS_ONE) {
+                w.x += 1.f;
+                w.y += 1.f;
+            }
+            oh[j] = f32_to_bf16x2(v.x * inv_rms * w.x, v.y * inv_rms * w.y);
         }
-        nr[i] = o;
-    }
-}
-
-template <class T, int BLOCK = 256>
-__global__ void residual_add_rmsnorm(
-    T* __restrict__ hidden,
-    const T* __restrict__ residual,
-    const T* __restrict__ weight,
-    T* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    T* hr = hidden + static_cast<long long>(row) * hidden_size;
-    const T* rr = residual + static_cast<long long>(row) * hidden_size;
-    T* nr = norm_out + static_cast<long long>(row) * hidden_size;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float sum = Elem<T>::to_f32(hr[i]) + Elem<T>::to_f32(rr[i]);
-        const T rounded = Elem<T>::from_f32(sum);
-        hr[i] = rounded;
-        const float v = Elem<T>::to_f32(rounded);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
-
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float xv = Elem<T>::to_f32(hr[i]);
-        const float wv = Elem<T>::to_f32(weight[i]);
-        nr[i] = Elem<T>::from_f32(xv * inv_rms * wv);
-    }
-}
-
-template <class T, int BLOCK = 256>
-__global__ void residual_add_scale_rmsnorm(
-    T* __restrict__ hidden,
-    const T* __restrict__ residual,
-    float scale,
-    const T* __restrict__ weight,
-    T* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    T* hr = hidden + static_cast<long long>(row) * hidden_size;
-    const T* rr = residual + static_cast<long long>(row) * hidden_size;
-    T* nr = norm_out + static_cast<long long>(row) * hidden_size;
-    const float scale_rounded = Elem<T>::to_f32(Elem<T>::from_f32(scale));
-
-    float local = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float sum = Elem<T>::to_f32(hr[i]) + Elem<T>::to_f32(rr[i]);
-        const T rounded_sum = Elem<T>::from_f32(sum);
-        const T scaled =
-            Elem<T>::from_f32(Elem<T>::to_f32(rounded_sum) * scale_rounded);
-        hr[i] = scaled;
-        const float v = Elem<T>::to_f32(scaled);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
-
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float xv = Elem<T>::to_f32(hr[i]);
-        const float wv = Elem<T>::to_f32(weight[i]);
-        nr[i] = Elem<T>::from_f32(xv * inv_rms * wv);
-    }
-}
-
-template <class T, int BLOCK = 256>
-__global__ void rmsnorm_residual_add(
-    const T* __restrict__ x,
-    const T* __restrict__ weight,
-    T* __restrict__ hidden,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const T* xr = x + static_cast<long long>(row) * hidden_size;
-    T* hr = hidden + static_cast<long long>(row) * hidden_size;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float v = Elem<T>::to_f32(xr[i]);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const T norm = Elem<T>::from_f32(
-            Elem<T>::to_f32(xr[i]) * inv_rms * Elem<T>::to_f32(weight[i]));
-        hr[i] = Elem<T>::from_f32(
-            Elem<T>::to_f32(hr[i]) + Elem<T>::to_f32(norm));
-    }
-}
-
-template <int BLOCK>
-__global__ void rmsnorm_rasr_vec8(
-    const bf16* __restrict__ x,
-    const bf16* __restrict__ weight,
-    bf16* __restrict__ hidden,
-    float scale,
-    const bf16* __restrict__ next_weight,
-    bf16* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int vecs = hidden_size / 8;
-    const float4* xr = reinterpret_cast<const float4*>(x + (long long)row * hidden_size);
-    const float4* wv = reinterpret_cast<const float4*>(weight);
-    const float4* nwv = reinterpret_cast<const float4*>(next_weight);
-    float4* hr = reinterpret_cast<float4*>(hidden + (long long)row * hidden_size);
-    float4* nr = reinterpret_cast<float4*>(norm_out + (long long)row * hidden_size);
-
-    float local = 0.f;
-    for (int i = tid; i < vecs; i += BLOCK) {
-        const float4 v = xr[i];
-        const bf16* b = reinterpret_cast<const bf16*>(&v);
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const float f = bf16_to_f32(b[j]);
-            local += f * f;
-        }
-    }
-    __shared__ float buf[BLOCK];
-    const float s0 = block_reduce_sum_exact<BLOCK>(local, buf);
-    const float inv_rms = rsqrtf(s0 / static_cast<float>(hidden_size) + eps);
-    const float scale_rounded = bf16_to_f32(f32_to_bf16(scale));
-
-    float local_next = 0.f;
-    for (int i = tid; i < vecs; i += BLOCK) {
-        const float4 xv4 = xr[i];
-        const float4 wv4 = wv[i];
-        float4 hv4 = hr[i];
-        const bf16* xb = reinterpret_cast<const bf16*>(&xv4);
-        const bf16* wb = reinterpret_cast<const bf16*>(&wv4);
-        bf16* hb = reinterpret_cast<bf16*>(&hv4);
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const bf16 norm = f32_to_bf16(
-                bf16_to_f32(xb[j]) * inv_rms * bf16_to_f32(wb[j]));
-            const float sum = bf16_to_f32(hb[j]) + bf16_to_f32(norm);
-            const bf16 rounded = f32_to_bf16(sum);
-            const bf16 scaled = f32_to_bf16(bf16_to_f32(rounded) * scale_rounded);
-            hb[j] = scaled;
-            const float f = bf16_to_f32(scaled);
-            local_next += f * f;
-        }
-        hr[i] = hv4;
-    }
-    __shared__ float buf2[BLOCK];
-    const float s1 = block_reduce_sum_exact<BLOCK>(local_next, buf2);
-    const float inv_next = rsqrtf(s1 / static_cast<float>(hidden_size) + eps);
-
-    for (int i = tid; i < vecs; i += BLOCK) {
-        const float4 hv4 = hr[i];
-        const float4 nw4 = nwv[i];
-        const bf16* hb = reinterpret_cast<const bf16*>(&hv4);
-        const bf16* nb = reinterpret_cast<const bf16*>(&nw4);
-        float4 out4;
-        bf16* ob = reinterpret_cast<bf16*>(&out4);
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            ob[j] = f32_to_bf16(bf16_to_f32(hb[j]) * inv_next * bf16_to_f32(nb[j]));
-        }
-        nr[i] = out4;
-    }
-}
-
-template <class T, int BLOCK>
-__global__ void rmsnorm_residual_add_scale_rmsnorm(
-    const T* __restrict__ x,
-    const T* __restrict__ weight,
-    T* __restrict__ hidden,
-    float scale,
-    const T* __restrict__ next_weight,
-    T* __restrict__ norm_out,
-    int hidden_size,
-    float eps)
-{
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const T* xr = x + static_cast<long long>(row) * hidden_size;
-    T* hr = hidden + static_cast<long long>(row) * hidden_size;
-    T* nr = norm_out + static_cast<long long>(row) * hidden_size;
-
-    float local = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const float v = Elem<T>::to_f32(xr[i]);
-        local += v * v;
-    }
-
-    __shared__ float buf[BLOCK];
-    const float buf_sum = block_reduce_sum_exact<BLOCK>(local, buf);
-
-    const float inv_rms =
-        rsqrtf(buf_sum / static_cast<float>(hidden_size) + eps);
-    const float scale_rounded = Elem<T>::to_f32(Elem<T>::from_f32(scale));
-    float local_next = 0.f;
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        const T norm = Elem<T>::from_f32(
-            Elem<T>::to_f32(xr[i]) * inv_rms * Elem<T>::to_f32(weight[i]));
-        const float sum = Elem<T>::to_f32(hr[i]) + Elem<T>::to_f32(norm);
-        const T rounded_sum = Elem<T>::from_f32(sum);
-        const T scaled =
-            Elem<T>::from_f32(Elem<T>::to_f32(rounded_sum) * scale_rounded);
-        hr[i] = scaled;
-        const float v = Elem<T>::to_f32(scaled);
-        local_next += v * v;
-    }
-
-    __shared__ float buf_next[BLOCK];
-    const float buf_next_sum = block_reduce_sum_exact<BLOCK>(local_next, buf_next);
-
-    const float inv_next =
-        rsqrtf(buf_next_sum / static_cast<float>(hidden_size) + eps);
-    for (int i = tid; i < hidden_size; i += BLOCK) {
-        nr[i] = Elem<T>::from_f32(
-            Elem<T>::to_f32(hr[i]) * inv_next * Elem<T>::to_f32(next_weight[i]));
+        outr[i] = ov;
     }
 }
 

@@ -193,6 +193,13 @@ impl Run<'_> {
     /// rectangle — the rows the rest of the plan reads.
     pub(crate) fn rs_land(&self, op: &'static str, seat: &Seat, ext: Tensor, dest: ValueId) -> Result<(), Error> {
         let target = self.tensor(dest);
+        if std::env::var_os("PIE_RS_TRACE").is_some_and(|v| v != "0") {
+            eprintln!(
+                "rs_land {op}: ext buf {} rows {} width {} {:?} -> target buf {} rows {} width {} {:?}; window {:?}",
+                ext.buf, ext.rows, ext.width, ext.dtype, target.buf, target.rows, target.width, target.dtype,
+                self.qo_indptr_host()
+            );
+        }
         let row_bytes = u64::from(ext.width)
             * model_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| Error::Backend {
                 op,

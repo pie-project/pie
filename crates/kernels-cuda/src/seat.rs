@@ -108,6 +108,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elementwise.mul_scalar", Reads::Rows),
     entry("elementwise.ple_gate", Reads::Rows),
     entry("elementwise.residual_add", Reads::Rows),
+    entry("elementwise.residual_add_rmsnorm", Reads::Rows),
     entry("elementwise.rmsnorm", Reads::Rows),
     entry("elementwise.rmsnorm_gated", Reads::Rows),
     entry("elementwise.rmsnorm_gated_by", Reads::Rows),

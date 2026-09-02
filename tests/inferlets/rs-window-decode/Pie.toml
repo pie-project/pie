@@ -1,0 +1,12 @@
+[package]
+name = "rs-window-decode"
+version = "0.1.0"
+description = "Device-resident greedy decode on a hybrid model through the recurrent WINDOW verb: every step buffers its row and the next step folds it off a device-computed length — the fold-commit loop's recurrent half with no host in it"
+authors = ["Pie Team"]
+
+[runtime]
+core = "^0.2.0"
+
+[parameters]
+prompt = {type = "string", optional = true, description = "Prompt to continue (raw encoding)"}
+max_tokens = {type = "int", optional = true, description = "Tokens to generate (default: 8)"}

@@ -145,6 +145,13 @@ impl Mapping {
         self.span
     }
 
+    /// The mapping's page-aligned base, for the bind and for nothing else.
+    /// Read by the Apple-only `newBufferWithBytesNoCopy` arm, which is why a
+    /// non-Apple dead-code sweep sees no caller.
+    pub(crate) fn base(&self) -> std::ptr::NonNull<u8> {
+        self.at
+    }
+
     /// What was mapped, as the caller named it.
     #[must_use]
     pub fn path(&self) -> &Path {

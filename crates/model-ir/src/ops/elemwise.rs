@@ -123,6 +123,17 @@ pub enum Elementwise {
         y: ValueId,
         y_out: ValueId,
     },
+    /// `y += x`, then `out = rmsnorm(y)`: the residual fold and the norm
+    /// that reads it, one launch. Written by [`crate::fuse`], never traced.
+    ResidualAddRmsnorm {
+        x: ValueId,
+        y: ValueId,
+        y_out: ValueId,
+        weight: ValueId,
+        plus_one: bool,
+        eps: f32,
+        out: ValueId,
+    },
     AddBias {
         bias: ValueId,
         out: ValueId,
@@ -370,6 +381,15 @@ pub enum MropeForm {
     /// contiguous block of pairs, each restarting the frequency ladder
     /// (`sections[0] == 0`, no time axis).
     Blocked,
+    /// Gemma's tower (`apply_multidimensional_rope`, mlx_vlm's spelling of
+    /// the JAX original): each section owns a contiguous CHANNEL block of
+    /// `2 · s` channels, and pair `i` of the block is `(x[b + i], x[b + s +
+    /// i])` — `rotate_half` WITHIN the block, never across axes — turning at
+    /// `theta^(-i / s)`. [`Blocked`](MropeForm::Blocked) pairs `x[p]` with
+    /// `x[p + head_dim/2]` across the whole head and picks the axis by `p`;
+    /// the same sections, a different pairing, and a picture rotated the
+    /// other way is a picture whose patches have lost their places.
+    Split,
 }
 
 impl Operands for Elementwise {
@@ -388,6 +408,7 @@ impl Operands for Elementwise {
             Self::RmsnormGated { x, gate, weight, .. } => sink.extend([*x, *gate, *weight]),
             Self::RmsnormGatedBy { x, gate, weight, .. } => sink.extend([*x, *gate, *weight]),
             Self::ResidualAdd { x, y, .. } => sink.extend([*x, *y]),
+            Self::ResidualAddRmsnorm { x, y, weight, .. } => sink.extend([*x, *y, *weight]),
             Self::AddBias { bias, out, .. } => sink.extend([*bias, *out]),
             Self::Standardize { x, bias, scale, .. } => sink.extend([*x, *bias, *scale]),
             Self::MulScalar { x, .. } => sink.push(*x),
@@ -438,6 +459,7 @@ impl Operands for Elementwise {
             Self::RmsnormGated { y, .. } => sink.push(*y),
             Self::RmsnormGatedBy { y, .. } => sink.push(*y),
             Self::ResidualAdd { y_out, .. } => sink.push(*y_out),
+            Self::ResidualAddRmsnorm { y_out, out, .. } => sink.extend([*y_out, *out]),
             Self::AddBias { out_out, .. } => sink.push(*out_out),
             Self::Standardize { x_out, .. } => sink.push(*x_out),
             Self::MulScalar { x_out, .. } => sink.push(*x_out),
@@ -477,6 +499,7 @@ impl Operands for Elementwise {
             Self::RmsnormGated { .. } => {}
             Self::RmsnormGatedBy { .. } => {}
             Self::ResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
+            Self::ResidualAddRmsnorm { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::AddBias { out_out, out, .. } => sink.push((*out_out, *out)),
             Self::Standardize { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::MulScalar { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -520,6 +543,7 @@ impl Operands for Elementwise {
             Self::RmsnormGated { .. } => "elementwise.rmsnorm_gated",
             Self::RmsnormGatedBy { .. } => "elementwise.rmsnorm_gated_by",
             Self::ResidualAdd { .. } => "elementwise.residual_add",
+            Self::ResidualAddRmsnorm { .. } => "elementwise.residual_add_rmsnorm",
             Self::AddBias { .. } => "elementwise.add_bias",
             Self::Standardize { .. } => "elementwise.standardize",
             Self::MulScalar { .. } => "elementwise.mul_scalar",

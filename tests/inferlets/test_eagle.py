@@ -1,58 +1,36 @@
-"""M-4 — the EAGLE mechanism, executed: does an overlaid draft head serve, and
-does speculating with it change the answer?
+"""M-4 — the speculative mechanism, executed on the device: does the model's
+draft head serve, and does speculating with it change the answer?
 
-The campaign's box (§2, M-4) is "overlay import (`--aux`) bakes a second
-artifact; a SYNTHETIC head passes the identity gate (greedy outputs identical
-to non-speculative, by verify construction); the draft-verify inferlet runs
-mixed with non-spec lanes in one fire". This file asks that as three claims, in
-the order in which failing one makes the next meaningless:
+`mtp-speculative-decoding` runs the whole loop in the epilogue — verify,
+commit, the next window and its geometry — and the host only drains committed
+tokens. This file asks four things, in the order in which failing one makes
+the next meaningless:
 
-  1. THE HEAD IS THERE AND IT DRAFTED. `mtp_logits` is a capability the shell
-     advertises only for a load whose text declares a draft head, so a run that
-     completes at all has already proved the overlay landed and bound. What it
-     has NOT proved is that anything was drafted, so the round and draft
-     counters are read: a loop that proposed nothing would pass claim 2 by
-     doing no speculation whatsoever.
-  2. THE ANSWER IS THE ANSWER. The greedy speculative run's text equals the
-     greedy non-speculative run's text, character for character. This is the
-     claim, and it is true BY CONSTRUCTION for any head — verification keeps
-     the target's own argmax and discards a draft that disagrees — which is
-     exactly why a synthetic head gates the MECHANISM honestly. A failure here
-     is never "the head is bad"; it is the verify loop, the row alignment, the
-     kv rollback or the loop-carry being wrong.
-  3. AND IT HOLDS IN A CROWD. The same run, launched concurrently with plain
-     non-speculative lanes, answers the same text. Speculative lanes and
-     ordinary ones compose into one fire — that is the polymorphic-batching
-     thesis and the drafts window is one more axis of it — so a draft head that
-     was right alone and wrong beside a neighbour would be a window that is not
-     a window.
+  1. THE HEAD IS THERE AND IT DRAFTED. `mtp_drafts` is bound only for a load
+     whose text declares a draft head (`mtp_depth > 0`), so a run that
+     completes has proved the head landed; the counters prove it drafted.
+  2. THE LOOP WITHOUT DRAFTS IS THE BASELINE. `k = 0` is a one-row window
+     through the same fire and the same commit arithmetic; its text must equal
+     `naive-baseline`'s greedy text. A failure here is under the speculation,
+     not in it.
+  3. THE ANSWER IS THE ANSWER. Any `k` answers the `k = 0` text, character
+     for character — true BY CONSTRUCTION for any head, since verification
+     keeps the trunk's own argmax. A failure is the verify, the row alignment,
+     or the loop-carried length being wrong, never the head being bad.
+  4. AND IT HOLDS IN A CROWD. The same run beside plain lanes answers the same
+     text, and so do the plain lanes.
 
-Acceptance is REPORTED AND NOT ASSERTED. The synthetic head is one decoder
-layer over the trunk's final hidden (`tests/eagle/synthesize_head.py` argues
-the construction); how often that agrees with the target is a property of the
-head, and gating on it would make this file a quality measurement of an
-artifact the campaign explicitly says is not the deliverable (§3: "a REAL EAGLE
-head is out; M-4 gates the mechanism with a synthetic head").
+Acceptance is REPORTED AND NOT ASSERTED: how often the head agrees with the
+trunk is a property of the head (a synthetic head, or a real MTP module over
+a truncated miniature, agrees rarely; the mechanism is what this gates).
 
-**TWO RIGS, AND WHICH CLAIMS EACH CAN MAKE** (multimodal §17, §14).
+**THIS FILE NEEDS A DRAFTING ARTIFACT** — a base checkpoint with the head
+overlaid by `pie model import <base> --aux <head>`. Against a plain artifact
+`mtp_depth` is zero and the run refuses at bind. Run it with `--model`
+pointing at the overlay (a store name or a `.zt` path), e.g.
 
-  `gemma4-e4b-eagle`   pure attention. Every claim below is asked and must
-                       pass: gemma attends and does not recur, so a rejected
-                       draft row leaves nothing behind but a kv cell the next
-                       fire overwrites, which is the whole contract
-                       speculation rests on.
-  `qwen35-d0.8b-eagle` a HYBRID. Its gated-delta layers carry a recurrent
-                       state that a rejected draft row FOLDS INTO, and no mask
-                       cuts a fold. Claims 1 and 2 pass there; the width and
-                       identity claims do not, and that is a property of the
-                       text and not of this loop. Run it there to reproduce
-                       §14's isolation, not to expect green.
-
-**THIS FILE NEEDS AN EAGLE ARTIFACT**, not the plain one — a base checkpoint
-with the head overlaid by `pie model import <base> --aux <head>`. Against a
-plain artifact the load has no draft head, `mtp_logits` is not advertised, and
-the run refuses at bind. Run it the way the other standalone gates are run,
-with `--model` pointing at the overlay.
+    uv run python tests/inferlets/test_eagle.py --engine metal \
+        --model /tmp/warmstream/dsv4-mini-mtp.zt
 """
 
 import json
@@ -74,7 +52,8 @@ from conftest import run_inferlet  # noqa: E402
 #: is used here for the same reason and with the same numbers.
 PROMPT = "The capital of France is"
 MAX_TOKENS = 24
-K = 4
+#: Asked for; the inferlet caps it at the model's depth and reports what it used.
+K = 8
 GREEDY = {"temperature": 0.01, "seed": 7}
 
 #: How many plain lanes ride beside the speculative one in claim 3. Enough that
@@ -86,10 +65,18 @@ async def _spec(client, args, extra=None):
     out = await run_inferlet(
         client,
         "mtp-speculative-decoding",
-        {"prompt": PROMPT, "max_tokens": MAX_TOKENS, "k": K, **(extra or {})},
+        {"prompt": PROMPT, "max_tokens": MAX_TOKENS, "k": K, "margin": True, **(extra or {})},
         timeout=args.timeout,
     )
     return json.loads(out[out.find("{"):])
+
+
+def _same_prefix(control, base):
+    """The loop stops at the template's stop tokens; `naive-baseline` does not.
+    So the baseline is read up to the loop's length: the loop's tokens must be
+    the baseline's first tokens, exactly."""
+    n = len(control["tokens"])
+    return n > 0 and base["tokens"][:n] == control["tokens"]
 
 
 async def _base(client, args):
@@ -102,6 +89,42 @@ async def _base(client, args):
     return json.loads(out[out.find("{"):])
 
 
+#: Below this top-1/top-2 gap (bf16 logit units) an argmax is a tie: fires of
+#: different widths take different kernel tilings on the routed two-bit path
+#: and part by up to ~1.4 logits at the readout (measured in
+#: `engine-metal/tests/a_drafting_neighbour_leaves_a_plain_lane_alone`, with
+#: no head anywhere), so which side of a gap narrower than that they land on
+#: is the floor, not the mechanism. The claim that owes no floor is the
+#: shape-matched one below, asked exactly.
+TIE = 1.5
+
+
+def _round_of(run, index):
+    """The verify round that committed token `index` (`0` is the prefill's seed)."""
+    at = 1
+    for r, n in enumerate(run["commits_trace"]):
+        if index < at + n:
+            return r
+        at += n
+    return None
+
+
+def _same_up_to_a_tie(control, run, what):
+    a, b = control["tokens"], run["tokens"]
+    div = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
+    if div is None:
+        return "identical"
+    r = _round_of(control, div)
+    margin = control["margin_trace"][r] if r is not None and r < len(control["margin_trace"]) else None
+    assert margin is not None and margin < TIE, (
+        f"{what}: the runs diverge at token {div} (round {r}) where the control's "
+        f"top-2 margin is {margin}, wider than a tie ({TIE}) — that is the verify, the "
+        f"row alignment or the loop-carried length, not the bf16 floor:\n"
+        f"  control = {control['text']!r}\n  run     = {run['text']!r}"
+    )
+    return f"identical for {div} tokens, then a tie (margin {margin:.3f})"
+
+
 async def test_the_overlaid_head_serves_and_drafts(client, args):
     r = await _spec(client, args)
     print(f"  rounds = {r['rounds']}  drafted = {r['drafted']}  accepted = {r['accepted']}")
@@ -112,8 +135,9 @@ async def test_the_overlaid_head_serves_and_drafts(client, args):
         "no verify round committed a token, so the loop never turned and every "
         "claim below is about a run that did not happen"
     )
-    assert r["drafted"] == r["rounds"] * K, (
-        f"{r['drafted']} drafts over {r['rounds']} rounds at k={K}; a round that "
+    assert 0 < r["k"] <= r["depth"], f"k={r['k']} against depth={r['depth']}: {r}"
+    assert r["drafted"] == r["rounds"] * r["k"], (
+        f"{r['drafted']} drafts over {r['rounds']} rounds at k={r['k']}; a round that "
         f"drafted a different number is a window whose shape moved"
     )
     assert r["accepted"] <= r["drafted"], r
@@ -138,7 +162,7 @@ async def test_the_loop_without_drafts_is_the_baseline(client, args):
     print(f"  baseline = {base['text']!r}")
 
     assert control["drafted"] == 0, f"k=0 drafted {control['drafted']} tokens"
-    assert control["text"] == base["text"], (
+    assert _same_prefix(control, base), (
         "the loop with NO drafts answered differently from the non-speculative "
         "run, so the defect is under the speculation and not in it — the "
         "window's geometry, its pages, or the length it carries.\n"
@@ -148,130 +172,110 @@ async def test_the_loop_without_drafts_is_the_baseline(client, args):
     print("  [ ok ] the machinery under the speculation is the machinery")
 
 
-async def test_the_fire_shape_does_not_change_the_answer(client, args):
-    """The variable the width gate confounds, held on its own.
-
-    `qo_one` is a fact, so a one-row window takes the decode arm and a
-    multi-row one takes prefill. `k = 0` against `k = 4` therefore moves TWO
-    things — the fire's shape and the presence of drafts — and cannot say which
-    one a divergence belongs to. `pad` adds rows the loop ignores, so this asks
-    the shape alone: a padded no-draft window must answer what an unpadded one
-    answers.
-
-    It passes at `pad = 1` — and that is the whole of what it proves, because
-    `pad = 2` does NOT (`.wiki/alto/multimodal.md` §17). One passenger row
-    carrying the pending token again is one extra fold of a token the recurrent
-    state already holds; two are not. So read this as "the decode and prefill
-    arms answer the same argmax" and nothing wider: the width gate below is red
-    for the state and not for the drafts.
+async def test_the_drafts_change_nothing_at_the_same_fire_shape(client, args):
+    """The mechanism claim with the width held: `k = 0` padded to the window's
+    width (pad rows carry the correction again and are rejected like any wrong
+    draft) against `k = depth` — the same lanes, the same fires, the same
+    kernel paths, drafts or no drafts. Verification keeps the trunk's argmax,
+    so the two texts are the same text EXACTLY; nothing here is a tie.
     """
-    flat = await _spec(client, args, {"k": 0})
-    padded = await _spec(client, args, {"k": 0, "pad": 1})
-    print(f"  1 row  = {flat['text']!r}")
-    print(f"  2 rows = {padded['text']!r}")
-
+    wide = await _spec(client, args)
+    padded = await _spec(client, args, {"k": 0, "pad": wide["k"]})
+    print(f"  k={wide['k']}       = {wide['text']!r}")
+    print(f"  k=0 pad={wide['k']} = {padded['text']!r}")
     assert padded["drafted"] == 0, f"a padded control drafted {padded['drafted']}"
-    assert padded["text"] == flat["text"], (
-        "the same loop with no drafts answered differently at two fire shapes, "
-        "so the decode and prefill arms disagree on the same keys and every "
-        "claim about speculation below is measuring that instead.\n"
-        f"  1 row  = {flat['text']!r}\n"
-        f"  2 rows = {padded['text']!r}"
+    assert padded["tokens"] == wide["tokens"], (
+        "the same fire shape answered differently with drafts in it than without, "
+        "so the drafts are changing the answer — the verify, the row alignment or "
+        "the loop-carried length:\n"
+        f"  k={wide['k']}       = {wide['text']!r}\n  k=0 pad={wide['k']} = {padded['text']!r}"
     )
-    print("  [ ok ] prefill and decode answer the same argmax")
+    print("  [ ok ] at one shape, the drafts buy fires and nothing else")
 
 
 async def test_the_draft_width_does_not_change_the_answer(client, args):
-    """The claim, asked WITHOUT a second program.
-
-    `k` is how many tokens a round proposes and nothing else: verification
-    keeps the target's argmax at every position whatever the window's width, so
-    two runs that differ only in `k` must answer the same string. If the
-    window's geometry, the KV rollback or the accepted-count arithmetic were
-    wrong, the two would diverge — and this asks it against the same program,
-    the same artifact and the same decision rule, so nothing about a second
-    inferlet's sampler can flatter or spoil it.
-
-    **IT IS RED, AND §17 SAYS WHY — NOT §14.** The KV is not the carrier: on a
-    NON-recurrent SKU (gemma-4-E4B, measured) the same fire shapes answer
-    bit-identically at every `pad` width and every pad token, and on the hybrid
-    default SKU masking the rewritten cell out does not remove the dependence.
-    What carries it is the gated-delta state, which three layers in four keep:
-    a round folds all `w` rows into it, the loop accepts one, and nothing
-    retracts the rest — "overwritten by the next fire" is a sentence about
-    addressed KV cells and says nothing about a fold. `pad=1` carrying the
-    pending token again survives because it is one extra fold of a token that
-    is already there; `pad=2` and up do not (`pad=2` diverges at round 5,
-    which is what falsified §14's reading of the same knob).
+    """Claim 3, asked without a second program: `k` is how many tokens a round
+    proposes and nothing else, so `k = 0`, `k = 1` and `k = depth` must answer
+    one string — up to a tie. A one-row window and a many-row one take
+    different kernel paths and differ in the last bits, so an argmax the
+    control decided by less than `TIE` may fall either way; a divergence at a
+    wider margin is the window's geometry, the KV rollback or the commit
+    arithmetic, and is the failure this asserts against.
     """
-    wide = await _spec(client, args)
+    control = await _spec(client, args, {"k": 0})
     narrow = await _spec(client, args, {"k": 1})
-    print(f"  k={K} = {wide['text']!r}")
+    wide = await _spec(client, args)
+    print(f"  k=0 = {control['text']!r}")
     print(f"  k=1 = {narrow['text']!r}")
-
-    assert narrow["text"] == wide["text"], (
-        "the same loop answered differently at two draft widths, so `k` is "
-        "changing the answer and not only the number of fires:\n"
-        f"  k={K} = {wide['text']!r}\n"
-        f"  k=1  = {narrow['text']!r}"
-    )
+    print(f"  k={wide['k']} = {wide['text']!r}  (acceptance {wide['acceptance_rate']:.3f})")
+    for name, run in (("k=1", narrow), (f"k={wide['k']}", wide)):
+        print(f"  {name} against k=0: {_same_up_to_a_tie(control, run, name)}")
     print("  [ ok ] the width buys fires and nothing else")
 
 
 async def test_greedy_speculation_answers_the_greedy_baseline(client, args):
+    """The claim through a second program: the speculative run answers the
+    non-speculative greedy baseline. Exact through `k = 0` (one row, the same
+    kernel path as the baseline), and up to a tie at full width.
+    """
+    control = await _spec(client, args, {"k": 0})
     spec = await _spec(client, args)
     base = await _base(client, args)
     print(f"  baseline    = {base['text']!r}")
     print(f"  speculative = {spec['text']!r}")
-
     assert base["text"], f"the baseline generated no text: {base}"
-    assert spec["text"] == base["text"], (
-        "the speculative run answered a different string from the non-speculative "
-        "one. Verification keeps the target's own argmax, so this is never the "
-        "draft head being wrong — it is the verify comparison, the draft row "
-        "alignment, or the loop-carried length.\n"
-        f"  baseline    = {base['text']!r}\n"
-        f"  speculative = {spec['text']!r}"
+    assert _same_prefix(control, base), (
+        "the one-row loop answered a different string from the baseline:\n"
+        f"  baseline = {base['text']!r}\n  k=0      = {control['text']!r}"
     )
-    print("  [ ok ] byte for byte, and the head only changed how fast it got there")
+    print(f"  speculative against k=0: {_same_up_to_a_tie(control, spec, 'speculative')}")
+    print("  [ ok ] byte for byte to the floor, and the head only changed how fast it got there")
 
 
 async def test_it_holds_beside_non_speculative_lanes(client, args):
-    """Claim 3: mixed in one fire.
+    """Claim 4: mixed in one fire.
 
     The lanes are launched concurrently and the scheduler composes whatever
-    arrives together; what this asserts is the OUTCOME of that composition —
-    the speculative lane's answer, and every plain lane's answer, are the
-    answers each gives alone. A run where the two never met would pass, which
-    is why the concurrency is what it is and the assertion is not about it.
+    arrives together; what this asserts is the speculative lane's answer with
+    neighbours, against its answer alone, up to a tie. The plain lanes are
+    REPORTED and not asserted: their fires are wider beside a window than
+    alone, and a plain lane's logits move with the fire's width by up to the
+    floor with no head anywhere (`a_drafting_neighbour_leaves_a_plain_lane_
+    alone` holds a window against a plain crowd of the SAME width exactly);
+    the widths of a crowd cannot be matched across two runs, since a window
+    that accepts drafts ends its rounds sooner than one that does not.
     """
     import asyncio
 
     alone = await _base(client, args)
+    spec_alone = await _spec(client, args)
+    control = await _spec(client, args, {"k": 0})
     results = await asyncio.gather(
         _spec(client, args),
         *[_base(client, args) for _ in range(CROWD)],
     )
     spec, crowd = results[0], results[1:]
     print(f"  speculative in a crowd of {CROWD} = {spec['text']!r}")
-
-    assert spec["text"] == alone["text"], (
-        "the speculative lane answered differently with neighbours in the fire "
-        f"than without:\n  alone = {alone['text']!r}\n  mixed = {spec['text']!r}"
+    print(f"  mixed against alone: {_same_up_to_a_tie(spec_alone, spec, 'speculative in a crowd')}")
+    assert _same_prefix(control, alone), (
+        "the one-row loop and the baseline disagree, so the crowd has no control:\n"
+        f"  baseline = {alone['text']!r}\n  k=0      = {control['text']!r}"
     )
     for at, plain in enumerate(crowd):
-        assert plain["text"] == alone["text"], (
-            f"plain lane {at} answered differently beside a speculative one:\n"
-            f"  alone = {alone['text']!r}\n  mixed = {plain['text']!r}"
-        )
-    print("  [ ok ] the drafts window is a window, and the neighbours never saw it")
+        a, b = control["tokens"], plain["tokens"]
+        div = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
+        r = _round_of(control, div) if div is not None else None
+        margin = control["margin_trace"][r] if r is not None and r < len(control["margin_trace"]) else None
+        print(f"  plain lane {at}: " + ("identical" if div is None else
+              f"parts at token {div} (control margin {margin}) — the width floor, reported not asserted"))
+    print("  [ ok ] the drafts window is a window")
 
 
 def tests():
     return [
         test_the_overlaid_head_serves_and_drafts,
         test_the_loop_without_drafts_is_the_baseline,
-        test_the_fire_shape_does_not_change_the_answer,
+        test_the_drafts_change_nothing_at_the_same_fire_shape,
         test_the_draft_width_does_not_change_the_answer,
         test_greedy_speculation_answers_the_greedy_baseline,
         test_it_holds_beside_non_speculative_lanes,
@@ -281,13 +285,11 @@ def tests():
 if __name__ == "__main__":
     from conftest import run_tests
 
-    # `mtp_logits` is NOT in `conftest.UNADVERTISED`, and that is the point of
-    # this wave: the cuda shell answers `has_mtp_logits: shell.drafts()`, so
-    # the capability is exactly "does this load's text declare a draft head".
-    # Against the overlay artifact it is true; against a plain one the suite
-    # refuses at bind, which is the honest failure and not a skip.
+    # `mtp_depth` is exactly "does this load's text declare a draft head".
+    # Against a drafting artifact it is positive; against a plain one the
+    # suite refuses at bind, which is the honest failure and not a skip.
     run_tests(
         tests(),
-        description="M-4 EAGLE mechanism (needs an --aux overlay artifact; "
-        "green on the pure-attention rig, see the header for the hybrid)",
+        description="M-4 speculative mechanism (needs a drafting artifact, "
+        "e.g. the dsv4 `--aux` overlay)",
     )

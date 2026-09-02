@@ -3,7 +3,7 @@
 use model_dsl::{Dtype, Weight};
 
 
-pub use crate::qwen_3::model::{Attn, Gdn, Mlp};
+pub use crate::qwen_3::model::{Attn, Gdn, Merger, Mlp, Tower, TowerBlock};
 
 pub struct Model {
     pub hidden: u32,
@@ -30,7 +30,111 @@ pub struct Model {
 
     /// The layer it applies to is recorded inside [`Ple`], not by this field's position.
     pub ple: Option<Ple>,
+
+    /// The checkpoint's own draft head (`mtp.*`), or `None` for a text that
+    /// does not declare it. See [`Mtp`].
+    pub mtp: Option<Mtp>,
+
+    /// The vision tower (`vision_tower.*`), or `None` for a text-only
+    /// reading. qwen_3's tower type verbatim: this checkpoint ships the
+    /// 27-block, 1152-wide tower qwen3.6/3.8-27B ship, merged into a 2560-wide
+    /// trunk instead of a 5120-wide one. `Some` also decides the trunk's
+    /// rotation: every attention layer takes the interleaved three-section
+    /// mrope (`mrope_interleaved: true`, `mrope_section: [11, 11, 10]`),
+    /// which on an image-free row is the plain rotation, position `(p, p, p)`.
+    pub tower: Option<Tower>,
 }
+
+/// A tower's own numbers, read off `config.json`'s `vision_config`.
+#[derive(Clone, Copy)]
+struct TowerDims {
+    depth: u32,
+    hidden: u32,
+    heads: u32,
+    inter: u32,
+    /// `in_channels · temporal_patch_size · patch_size²`.
+    patch_width: u32,
+    merge: u32,
+    positions: u32,
+    out_hidden: u32,
+    theta: f32,
+    norm_eps: f32,
+    taps: u32,
+}
+
+impl TowerDims {
+    /// `Qwen/Qwen3.8-Flash-Next`'s `vision_config`: depth 27, hidden 1152,
+    /// 16 heads, intermediate 4304, patch 16, temporal patch 2, merge 2,
+    /// 2304 learned positions (a 48-side grid), `out_hidden_size` 2560, no
+    /// deepstack. `theta` and `norm_eps` are the class defaults, unset by
+    /// the config.
+    const fn flash_next() -> TowerDims {
+        TowerDims {
+            depth: 27,
+            hidden: 1152,
+            heads: 16,
+            inter: 4304,
+            patch_width: 1536,
+            merge: 2,
+            positions: 2304,
+            out_hidden: 2560,
+            theta: 10_000.0,
+            norm_eps: 1e-6,
+            taps: 4,
+        }
+    }
+}
+
+/// **THE DRAFT HEAD** (`mtp.*`, "1 layer, trained with multi-steps"): one
+/// trunk-shaped block over the WIDE residual, fused with the next token's
+/// embedding, collapsed by its own mixer and read through the trunk's
+/// `lm_head`. Wiring per the tensor shapes and llama.cpp's NextN port
+/// (`ggml-org/llama.cpp#27836`): transformers ignores `mtp.*`, so there is no
+/// reference forward to quote.
+///
+/// ```text
+/// h_s   = rms_s(y_wide) · pre_fc_norm_hidden         per stream s, [S·H]
+/// e     = rms(embed(t)) · pre_fc_norm_embedding      [H]
+/// r     = expand(fc_embedding · e) + [fc_hidden · h_s]_s   wide, [S·H]
+/// r    += attn(mix_in(r)) ; r += moe(mix_in(r))      the block, its own kv row
+/// draft = lm_head(mix_in(r; hyper_connection_mixer))  no final norm
+/// ```
+///
+/// `fc_hidden` is declared `[S·H, H]`: the one stored `[H, H]` plane
+/// `streams` times over, the block-diagonal bank `matmul_grouped` applies per
+/// stream (`deepseek_v4`'s `h_proj`, for the same reason). The block's
+/// experts are the checkpoint's Q4, not the trunk's Q2.
+pub struct Mtp {
+    /// `[hidden]`, scales the next token's embedding before the fusion.
+    pub norm_embed: Weight,
+    /// `[streams · hidden]`, scales the wide residual per stream before the fusion.
+    pub norm_hidden: Weight,
+    /// `[hidden, hidden]`.
+    pub fc_embed: Weight,
+    /// `[streams · hidden, hidden]` — see above.
+    pub fc_hidden: Weight,
+    /// Full attention with its own kv row (`kv.mtp`), hyper-connected, MoE.
+    pub block: Layer,
+    /// The head's own collapse, `hyper_connection_mixer` (no inject bank).
+    pub mixer: Residual,
+    pub eps: f32,
+    /// How many tokens past a readout row the head drafts: step 0 is the
+    /// module as trained (the wide residual at `i`, the trunk's argmax at
+    /// `i`), every later step chains it on its own output and its own
+    /// argmax, attending read-only. The `mtp.drafts` seam is `[rows, depth]`.
+    pub depth: u32,
+}
+
+/// The draft chain's depth: the module's own step and one chained one. The
+/// chained step routes the head's expert bank by a second routing vector,
+/// so under a weight budget the streamed tier holds that bank WHOLE rather
+/// than seating it (`engine_metal::experts`: a bank two routers index stays
+/// resident). Measured warm on qwen38 full, that is the right side of the
+/// trade: streamed through one slab cut twice, the head's per-fire misses
+/// cost more than the 1.3 GiB of trunk seats the resident bank displaces
+/// (k = 2: 26 ms/token resident against 52 streamed; plain decode 33 against
+/// 39). Acceptance falls with every chained step, so deeper buys little.
+pub const DRAFT_DEPTH: u32 = 2;
 
 /// One gated-residual site.
 ///
@@ -151,6 +255,10 @@ struct Dims {
     vocab: u32,
     eos: u32,
     norm_eps: f32,
+    /// Whether the text declares the checkpoint's draft head ([`Mtp`]).
+    draft: bool,
+    /// The vision tower this reading declares, or `None`.
+    tower: Option<TowerDims>,
 }
 
 /// Per-role weight dtypes; a single dtype can't express this family's checkpoints
@@ -276,7 +384,32 @@ impl Model {
             vocab: 248_320,
             eos: 248_044,
             norm_eps: 1e-6,
+            draft: false,
+            tower: None,
         }
+    }
+
+    /// [`flash_mix`](Model::flash_mix) with the checkpoint's draft head declared.
+    pub fn flash_mix_mtp(mix: Mix, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::flash_dims();
+        d.draft = true;
+        Model::new(mix, kv, tp, d)
+    }
+
+    /// [`flash_mix`](Model::flash_mix) with the checkpoint's vision tower
+    /// declared — a two-unit plan (patch axis and token axis).
+    pub fn flash_mix_vision(mix: Mix, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::flash_dims();
+        d.tower = Some(TowerDims::flash_next());
+        Model::new(mix, kv, tp, d)
+    }
+
+    /// Tower and draft head together: what the shipped checkpoint publishes.
+    pub fn flash_mix_mtp_vision(mix: Mix, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::flash_dims();
+        d.draft = true;
+        d.tower = Some(TowerDims::flash_next());
+        Model::new(mix, kv, tp, d)
     }
 
     /// A qwen4 small enough to run against the reference implementation for parity testing.
@@ -323,6 +456,8 @@ impl Model {
                 vocab: 256,
                 eos: 3,
                 norm_eps: 1e-6,
+                draft: false,
+                tower: None,
             },
         )
     }
@@ -359,10 +494,18 @@ impl Model {
             eps: d.norm_eps,
         };
 
-        let layers = (0..d.layers)
-            .map(|l| {
-                let n = |s: &str| format!("layer.{l}.{s}");
-                let mixer = if attn_at(l) {
+        // One block, at a name prefix, with the mixer kind, its cache names
+        // and its routed-expert width stated: the trunk's forty-eight and the
+        // draft head's one are the same shape at different names.
+        let block = |n: &dyn Fn(&str) -> String,
+                     attn: bool,
+                     kv_name: String,
+                     conv_name: String,
+                     delta_name: String,
+                     experts_w: Dtype|
+         -> Layer {
+            {
+                let mixer = if attn {
                     let hd = u64::from(d.head_dim);
                     Mixer::Attn(Attn {
                         rotary_dim: d.rotary_dim,
@@ -384,7 +527,7 @@ impl Model {
                         q_norm_eps: d.norm_eps,
                         k_norm: Weight::sym(n("k_norm"), [hd], dense),
                         k_norm_eps: d.norm_eps,
-                        kv: format!("kv.{l}"),
+                        kv: kv_name,
                     })
                 } else {
                     let k_heads = d.k_heads / tp;
@@ -409,8 +552,8 @@ impl Model {
                         norm: Weight::sym(n("gdn_norm"), [u64::from(d.v_dim)], Dtype::F32),
                         norm_eps: d.norm_eps,
                         out_proj: Weight::sym(n("out_proj"), [hidden, v_w], proj).rows(),
-                        conv_state: format!("conv.{l}"),
-                        delta_state: format!("delta.{l}"),
+                        conv_state: conv_name,
+                        delta_state: delta_name,
                     })
                 };
                 let inter = d.moe.inter / tp;
@@ -454,8 +597,102 @@ impl Model {
                         shared_inter,
                     },
                 }
+            }
+        };
+        let layers = (0..d.layers)
+            .map(|l| {
+                block(
+                    &|s: &str| format!("layer.{l}.{s}"),
+                    attn_at(l),
+                    format!("kv.{l}"),
+                    format!("conv.{l}"),
+                    format!("delta.{l}"),
+                    experts_w,
+                )
             })
             .collect();
+        // The tower, when declared: every plane replicated and `dense` — the
+        // conversion ships it in bf16 whatever the trunk's width — under
+        // `visual.*`, the plan's own namespace (qwen_3's, so the import
+        // spelling is shared too).
+        let tower = d.tower.map(|t| {
+            assert_eq!(
+                t.out_hidden, d.hidden,
+                "a tower's `out_hidden_size` is the TRUNK's width — the merger's \
+                 answer is a token row, and a mismatch would scatter a rectangle \
+                 of the wrong width into the embedding"
+            );
+            assert_eq!(t.hidden % t.heads, 0, "a {}-wide tower does not divide into {} heads", t.hidden, t.heads);
+            let th = u64::from(t.hidden);
+            let ti = u64::from(t.inter);
+            let merged = u64::from(t.merge) * u64::from(t.merge) * th;
+            let head_dim = t.hidden / t.heads;
+            let n = |s: String| format!("visual.{s}");
+            let plane = |s: String, dims: [u64; 2]| Weight::sym(n(s), dims, dense);
+            let vec1 = |s: String, len: u64| Weight::sym(n(s), [len], dense);
+            Tower {
+                hidden: t.hidden,
+                heads: t.heads,
+                head_dim,
+                merge: t.merge,
+                patch_width: t.patch_width,
+                taps: t.taps,
+                positions: t.positions,
+                theta: t.theta,
+                norm_eps: t.norm_eps,
+                sm_scale: (head_dim as f32).sqrt().recip(),
+                patch_embed: plane("patch_embed".into(), [th, u64::from(t.patch_width)]),
+                patch_embed_bias: vec1("patch_embed_bias".into(), th),
+                pos_embed: plane("pos_embed".into(), [u64::from(t.positions), th]),
+                blocks: (0..t.depth)
+                    .map(|l| {
+                        let b = |s: &str| format!("block.{l}.{s}");
+                        TowerBlock {
+                            norm1: vec1(b("norm1"), th),
+                            norm1_bias: vec1(b("norm1_bias"), th),
+                            qkv: plane(b("qkv"), [3 * th, th]),
+                            qkv_bias: vec1(b("qkv_bias"), 3 * th),
+                            proj: plane(b("proj"), [th, th]),
+                            proj_bias: vec1(b("proj_bias"), th),
+                            norm2: vec1(b("norm2"), th),
+                            norm2_bias: vec1(b("norm2_bias"), th),
+                            fc1: plane(b("fc1"), [ti, th]),
+                            fc1_bias: vec1(b("fc1_bias"), ti),
+                            fc2: plane(b("fc2"), [th, ti]),
+                            fc2_bias: vec1(b("fc2_bias"), th),
+                        }
+                    })
+                    .collect(),
+                merger: Merger {
+                    norm: vec1("merger_norm".into(), th),
+                    norm_bias: vec1("merger_norm_bias".into(), th),
+                    fc1: plane("merger_fc1".into(), [merged, merged]),
+                    fc1_bias: vec1("merger_fc1_bias".into(), merged),
+                    fc2: plane("merger_fc2".into(), [hidden, merged]),
+                    fc2_bias: vec1("merger_fc2_bias".into(), hidden),
+                },
+            }
+        });
+
+        let mtp = d.draft.then(|| Mtp {
+            norm_embed: Weight::sym("mtp.norm_embed", [hidden], dense),
+            norm_hidden: Weight::sym("mtp.norm_hidden", [sh], dense),
+            fc_embed: Weight::sym("mtp.fc_embed", [hidden, hidden], dense),
+            fc_hidden: Weight::sym("mtp.fc_hidden", [sh, hidden], dense),
+            // The head's experts are the checkpoint's Q4 (the trunk's are Q2
+            // in the mixed conversion): the projection dtype is that width.
+            block: block(
+                &|s: &str| format!("mtp.layer.{s}"),
+                true,
+                "kv.mtp".to_string(),
+                "conv.mtp".to_string(),
+                "delta.mtp".to_string(),
+                proj,
+            ),
+            mixer: residual("mtp.mixer", false),
+            eps: d.norm_eps,
+                depth: DRAFT_DEPTH,
+        });
 
         let ple = d.ple.as_ref().map(|p| {
             let (mults, primes, offsets) = hash_constants(p, u64::from(d.vocab));
@@ -504,6 +741,8 @@ impl Model {
             layers,
             mixer: residual("mixer", false),
             ple,
+            mtp,
+            tower,
         }
     }
 

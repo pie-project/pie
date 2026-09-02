@@ -83,12 +83,47 @@ impl Drop for Consumed<'_> {
     }
 }
 
+/// The marker a consuming import leaves beside its source from the first
+/// released byte until it succeeds. A source that still carries one was
+/// half-eaten by a run that died: its weight files keep their sizes and read
+/// as zeros where they were released, so a retry — or a re-download, which
+/// sees nothing missing — would convert holes into an artifact that loads
+/// and answers noise.
+const CONSUMING_MARKER: &str = ".pie-consuming";
+
+fn consuming_marker(source: &Path) -> PathBuf {
+    if source.is_dir() {
+        source.join(CONSUMING_MARKER)
+    } else {
+        source
+            .parent()
+            .map_or_else(|| PathBuf::from(CONSUMING_MARKER), |dir| dir.join(CONSUMING_MARKER))
+    }
+}
+
 pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui::Answer> {
     let mut source = resolve_source(&args.source)?;
+    if consuming_marker(&source.path).is_file() {
+        bail!(
+            "{}: a consuming import of this source died partway (`{CONSUMING_MARKER}` is \
+             beside it), so its weight files are holes where they were read and would \
+             convert to zeros. Delete the snapshot and fetch it again — a re-download alone \
+             does not notice, since the files keep their sizes.",
+            crate::ui::short_path(&source.path)
+        );
+    }
     let mut metadata = parse_metadata(&source.path)
         .map_err(|err| anyhow!("cannot read {}: {err}", source.path.display()))?;
+    // An overlay onto an artifact is written into that artifact, and its
+    // staging goes beside it — not into a store directory named for a file.
+    let onto_artifact = args.aux.is_some()
+        && metadata
+            .files
+            .iter()
+            .all(|file| file.format == CheckpointFormat::Zt);
     let out_file = match &args.out {
         Some(out) => artifact_path(out, &source.name),
+        None if onto_artifact => source.path.clone(),
         None => store_path(&source.name),
     };
     // The overlay joins `origin`, so an artifact built from the base alone is
@@ -102,6 +137,19 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
         None => None,
     };
     let source = source;
+
+    // **AN OVERLAY ONTO AN ARTIFACT IS IN PLACE.** The base is already pie's
+    // own format and may be a ninety-gigabyte file whose source snapshot is
+    // gone; only the head's planes are written, appended to the artifact,
+    // which is then restamped for the row that reads both.
+    if let Some(overlay) = overlay.as_ref().filter(|_| {
+        metadata
+            .files
+            .iter()
+            .all(|file| file.format == CheckpointFormat::Zt)
+    }) {
+        return overlay_onto_artifact(&args, &source, metadata, overlay);
+    }
 
     let clobbered: Vec<&str> = metadata
         .files
@@ -269,10 +317,14 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
         .sum();
 
     let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), sku);
-    let ranked = runtime::engine::load::trace(sku, platform)
-        .ok()
-        .and_then(|trace| runtime::engine::load::sequence(&trace));
-    let entries = merge_order(plan.as_ref(), &split.copies, &meta, ranked.as_deref());
+    let trace = runtime::engine::load::trace(sku, platform)?;
+    let ranked = runtime::engine::load::sequence(&trace);
+    // Off the LANDING, not the decode plan: a quantized plane copied through
+    // untouched (a 4-bit `embed`, every U4 projection the lanes read as-is)
+    // has its scales and biases attached in the landing alone, and the writer
+    // groups every object's planes with its codes, copied or decoded.
+    let groups = groups_of(&landing, &trace)?;
+    let entries = merge_order(plan.as_ref(), &split.copies, &meta, ranked.as_deref(), &groups);
     // The decode streams straight into the merge when it produces planes in
     // the order the merge asks for them; otherwise it runs first into a spool.
     let ordered = plan.as_ref().is_none_or(|plan| {
@@ -367,6 +419,11 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
     ]);
     let mut writer = Writer::create_serving(&out_file, &provenance, stamp.clone())
         .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
+    for group in &groups {
+        writer
+            .group(group.object.clone(), group.planes.iter().cloned(), group.tiled)
+            .map_err(|err| anyhow!("cannot write the artifact: {err}"))?;
+    }
     if consume {
         println!(
             "import: consuming the source as it is read; {} will not survive this run",
@@ -376,6 +433,9 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
                 "the source files"
             }
         );
+        let marker = consuming_marker(&source.path);
+        std::fs::write(&marker, out_file.to_string_lossy().as_bytes())
+            .with_context(|| format!("cannot mark {} as being consumed", marker.display()))?;
     }
     let consumed = consume.then(|| Consumed {
         metadata: &metadata,
@@ -425,6 +485,7 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
     }
     if let Some(consumed) = consumed {
         drop(consumed);
+        let _ = std::fs::remove_file(consuming_marker(&source.path));
         println!(
             "{}: consumed {} source file(s), {}",
             source.name,
@@ -439,6 +500,269 @@ pub fn run(args: ImportArgs, global: &bootstrap::GlobalArgs) -> Result<crate::ui
 /// An `--aux` overlay, staged as one `.zt` whose tensors carry
 /// [`AUX_PREFIX`], so the base and the head read as one name space. Removed
 /// on drop.
+/// `pie model import <artifact.zt> --aux <head>`: land a draft head's planes
+/// onto an artifact the store already holds, in place.
+///
+/// The row is identified against the artifact's own names plus the overlay
+/// (`Model::import_from_own_with_aux`), so the contract reads every trunk
+/// plane from where it already is and every head plane through `aux.`; only
+/// the latter are converted and written. They are appended to the artifact
+/// through [`Writer::append_serving`], which restamps the file for the
+/// drafting row on finish, and the file is renamed for its new SKU. The
+/// append is the one non-atomic write in this command: the file's length is
+/// held and the file cut back to it on any failure, which restores the
+/// artifact byte for byte (its footer sits inside that length).
+fn overlay_onto_artifact(
+    args: &ImportArgs,
+    source: &Source,
+    mut metadata: Metadata,
+    overlay: &Overlay,
+) -> Result<crate::ui::Answer> {
+    if args.out.is_some() {
+        bail!(
+            "an overlay onto an artifact is written in place ({}); `--out` would mean a \
+             second copy of the artifact, which this command does not make",
+            crate::ui::short_path(&source.path)
+        );
+    }
+    if args.delete_source || args.consume_source {
+        bail!("an overlay onto an artifact keeps the artifact; nothing is deleted or consumed");
+    }
+    let platform = engine_or_refuse()?;
+    let base_file = source.path.clone();
+    let before = checkpoint::file::serve::stamp_of(&base_file)
+        .map_err(|err| anyhow!("cannot read {}: {err}", base_file.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "{} carries no serving stamp; an overlay lands on an artifact `pie model \
+                 import` wrote",
+                crate::ui::short_path(&base_file)
+            )
+        })?;
+
+    let mut opened = runtime::engine::load::open_source(&base_file)?;
+    let head = ztensor::Source::open(&overlay.path)
+        .with_context(|| format!("open {}", overlay.path.display()))?;
+    opened = ztensor::Source::merge(vec![opened, head])
+        .with_context(|| "merge the overlay into the artifact's name space")?;
+    merge_metadata(&mut metadata, overlay.metadata.clone());
+    let metadata = metadata;
+    let Some((sku, contract)) =
+        runtime::engine::load::conversion_contract(&opened, &metadata, platform)
+    else {
+        return Err(refuse_a_source_no_sku_in_this_build_claims(&base_file));
+    };
+    drop(opened);
+    if sku == before.sku {
+        bail!(
+            "{} already serves `{sku}`; the overlay lands on a row that reads the head, and \
+             identification chose the row it already was",
+            crate::ui::short_path(&base_file)
+        );
+    }
+    refuse_a_decode_of_packed_codes(sku, &contract, &metadata)?;
+
+    // Only the head is written: every plane whose every source is an overlay
+    // tensor. A trunk plane the contract reads is where it already is.
+    let is_head = |expr: &Expr| {
+        let sources = expr.sources();
+        !sources.is_empty() && sources.iter().all(|name| name.starts_with(AUX_PREFIX))
+    };
+    let landing = checkpoint::plan::compile(&metadata, &contract, decode_target())
+        .map_err(|err| anyhow!("{sku}: the contract does not fit this artifact: {err}"))?;
+    let split = split_contract(&contract, &landing, &metadata)?;
+    let copies: Vec<Copy<'_>> = split
+        .copies
+        .into_iter()
+        .filter(|copy| copy.raw.name.starts_with(AUX_PREFIX))
+        .collect();
+    let decode = ModelContract {
+        alignment: split.decode.alignment,
+        tensors: split
+            .decode
+            .tensors
+            .iter()
+            .filter(|tensor| is_head(&tensor.expr))
+            .cloned()
+            .collect(),
+        groups: Vec::new(),
+    };
+    let head_planes = copies.len() + decode.tensors.iter().filter(|t| t.visibility.is_public()).count();
+    let trunk_planes = contract
+        .tensors
+        .iter()
+        .filter(|tensor| !is_head(&tensor.expr))
+        .count();
+    println!(
+        "overlay: {sku} lands {head_planes} head plane(s) onto {} ({} copied through, {} \
+         transformed here); {trunk_planes} trunk plane(s) stay where they are",
+        crate::ui::short_path(&base_file),
+        copies.len(),
+        decode.tensors.iter().filter(|t| t.visibility.is_public()).count(),
+    );
+    if head_planes == 0 {
+        bail!("the overlay contributes no plane the row `{sku}` reads");
+    }
+
+    let plan = if decode.tensors.is_empty() {
+        None
+    } else {
+        Some(compile_decode(&metadata, &decode)?)
+    };
+    let decode_bytes: u64 = decode
+        .tensors
+        .iter()
+        .flat_map(|tensor| tensor.expr.sources())
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .filter_map(|name| metadata.tensor_by_name(name))
+        .map(|raw| raw.span_bytes)
+        .sum();
+    let copy_bytes: u64 = copies.iter().map(|copy| copy.raw.span_bytes).sum();
+    let stamp = checkpoint::serving::Stamp::of(&backend_word(platform), sku);
+    let trace = runtime::engine::load::trace(sku, platform)?;
+    let ranked = runtime::engine::load::sequence(&trace);
+    // The landing's attachments, as on the import path: a copied-through
+    // quantized head plane is grouped with its companions too.
+    let groups = groups_of(&landing, &trace)?;
+    let entries = merge_order(plan.as_ref(), &copies, &[], ranked.as_deref(), &groups);
+    // The decode produces in its own order; the artifact wants the boot's.
+    // Where the two differ the decode goes through a spool beside the
+    // artifact first (the head is a few gigabytes), as `run` does.
+    let ordered = plan.as_ref().is_none_or(|plan| {
+        let asked: Vec<&str> = entries
+            .iter()
+            .filter(|(_, from)| matches!(from, From::Decoded(_)))
+            .map(|(name, _)| *name)
+            .collect();
+        let produced: Vec<&str> = plan
+            .tensors
+            .iter()
+            .filter(|decl| decl.visibility.is_public())
+            .map(|decl| decl.name.as_str())
+            .collect();
+        asked == produced
+    });
+    if args.dry_run {
+        return Ok(crate::ui::Answer::noop(format!(
+            "dry run: would append {} decoded and {} copied through to {} and restamp it `{sku}`",
+            crate::ui::bytes(decode_bytes),
+            crate::ui::bytes(copy_bytes),
+            crate::ui::short_path(&base_file)
+        )));
+    }
+
+    let started = std::time::Instant::now();
+    let mut bar = ProgressLine::new();
+    let base = source.base();
+    let mut spool = match &plan {
+        Some(plan) if !ordered => {
+            let mut spool = Spool::create(&base_file)?;
+            checkpoint::executor::Execution::new(plan, &base)
+                .streaming()
+                .sink(&mut spool)
+                .progress(&mut |progress| {
+                    bar.render(&Progress {
+                        read_bytes: progress.read_bytes,
+                        total_read_bytes: decode_bytes + copy_bytes,
+                        finalized: progress.finalized,
+                    });
+                })
+                .run()
+                .map_err(|err| anyhow!("decoding the head failed: {err}"))?;
+            Some(spool)
+        }
+        _ => None,
+    };
+    let held = std::fs::metadata(&base_file)
+        .with_context(|| format!("stat {}", base_file.display()))?
+        .len();
+    let provenance = BTreeMap::from([
+        (VERSION_KEY.to_string(), pie_version().to_string()),
+        (SOURCE_KEY.to_string(), source.origin.clone()),
+    ]);
+    let restore = |why: anyhow::Error| -> anyhow::Error {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .open(&base_file)
+            .and_then(|file| file.set_len(held))
+        {
+            Ok(()) => anyhow!(
+                "{why:#}. {} was cut back to its {} bytes and is as it was.",
+                crate::ui::short_path(&base_file),
+                held
+            ),
+            Err(cut) => anyhow!(
+                "{why:#}. {} could NOT be cut back to its {} bytes ({cut}); truncate it \
+                 by hand to restore the artifact.",
+                crate::ui::short_path(&base_file),
+                held
+            ),
+        }
+    };
+    let outcome = (|| -> Result<u64> {
+        let mut writer = Writer::append_serving(&base_file, &provenance, stamp.clone())
+            .map_err(|err| anyhow!("cannot append to the artifact: {err}"))?;
+        for group in &groups {
+            writer
+                .group(group.object.clone(), group.planes.iter().cloned(), group.tiled)
+                .map_err(|err| anyhow!("cannot append to the artifact: {err}"))?;
+        }
+        let written = write_artifact(
+            &mut writer,
+            &entries,
+            plan.as_ref(),
+            &base,
+            spool.as_mut(),
+            &mut bar,
+            decode_bytes,
+            copy_bytes,
+            None,
+        )?;
+        writer
+            .finish()
+            .map_err(|err| anyhow!("cannot finish the artifact: {err}"))?;
+        Ok(written)
+    })();
+    if let Some(spool) = spool {
+        spool.remove();
+    }
+    let written_bytes = outcome.map_err(restore)?;
+
+    // The store names an artifact for its SKU; the file follows its stamp.
+    let renamed = match base_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| checkpoint::serving::Name::parse(name).ok())
+    {
+        Some(name) => {
+            let renamed = base_file
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(checkpoint::serving::Name::of(&stamp, &name.slug).render());
+            std::fs::rename(&base_file, &renamed)
+                .with_context(|| format!("cannot rename the artifact to {}", renamed.display()))?;
+            renamed
+        }
+        None => base_file.clone(),
+    };
+    if let Err(why) = runtime::engine::load::verify_artifact(&renamed, platform) {
+        bail!(
+            "{}: the overlaid artifact does not load as `{sku}` ({why:#}); cut it back to \
+             {held} bytes and rename it for `{}` to restore the artifact",
+            crate::ui::short_path(&renamed),
+            before.sku
+        );
+    }
+    Ok(crate::ui::Answer::did(format!(
+        "overlaid {} — {} in {} → {}",
+        overlay.path.display(),
+        crate::ui::bytes(written_bytes),
+        crate::ui::duration(started.elapsed()),
+        crate::ui::short_path(&renamed)
+    )))
+}
+
 struct Overlay {
     path: PathBuf,
     metadata: Metadata,
@@ -460,8 +784,18 @@ fn stage_overlay(head: &Source, out_file: &Path) -> Result<Overlay> {
     let path = out_file.with_extension("aux.zt");
     let mut writer = Writer::create(&path, &BTreeMap::new())
         .map_err(|err| anyhow!("cannot stage the overlay at {}: {err}", path.display()))?;
+    // An object the head's file splits into planes goes back as one object,
+    // grouped as that file grouped it, under the aux names.
+    let groups = checkpoint::file::read::parse_groups(&head.path)
+        .map_err(|err| anyhow!("cannot read {}: {err}", head.path.display()))?;
+    for (object, planes) in groups {
+        let planes = planes.into_iter().map(|name| format!("{AUX_PREFIX}{name}"));
+        writer
+            .group(format!("{AUX_PREFIX}{object}"), planes, false)
+            .map_err(|err| anyhow!("cannot stage '{object}': {err}"))?;
+    }
     let mut tensors: Vec<&RawTensor> = metadata.weights().collect();
-    tensors.sort_by(|a, b| a.name.cmp(&b.name));
+    tensors.sort_by_cached_key(|raw| writer.order_key(&format!("{AUX_PREFIX}{}", raw.name)));
     let mut copied = 0u64;
     for (id, raw) in tensors.iter().enumerate() {
         let file = metadata
@@ -1434,13 +1768,52 @@ enum From<'a> {
     Meta(&'a [u8]),
 }
 
+/// One quantized weight's planes as the artifact stores them: one object,
+/// its codes then its scales then its biases, read off the plan's own
+/// attachments (never a name suffix).
+struct Group {
+    object: String,
+    planes: Vec<String>,
+    tiled: bool,
+}
+
+fn groups_of(plan: &LoadPlan, trace: &runtime::engine::load::Trace) -> Result<Vec<Group>> {
+    let name_of = |id: TensorId| {
+        plan.tensors
+            .get(id.0 as usize)
+            .filter(|decl| decl.id == id)
+            .map(|decl| decl.name.clone())
+            .ok_or_else(|| anyhow!("the plan attaches tensor {} and declares no such tensor", id.0))
+    };
+    let mut groups = Vec::with_capacity(plan.attachments.len());
+    for attachment in &plan.attachments {
+        let object = name_of(attachment.tensor)?;
+        let mut planes = vec![object.clone(), name_of(attachment.scale_tensor)?];
+        if let Some(zero) = attachment.zero_point_tensor {
+            planes.push(name_of(zero)?);
+        }
+        let tiled = trace.params.iter().any(|param| {
+            param.name == object && param.dtype == checkpoint::types::DType::U4g64tiled
+        });
+        groups.push(Group {
+            object,
+            planes,
+            tiled,
+        });
+    }
+    Ok(groups)
+}
+
 /// The order the artifact's objects are written in: the shell's ranking when
 /// there is one (hottest planes first, one forward walk), names otherwise.
+/// A group's planes follow its codes in canonical order whatever the
+/// ranking says, since they are one object.
 fn merge_order<'a>(
     plan: Option<&'a LoadPlan>,
     copies: &'a [Copy<'a>],
     meta: &'a [(String, Vec<u8>)],
     ranked: Option<&[String]>,
+    groups: &[Group],
 ) -> Vec<(&'a str, From<'a>)> {
     let mut entries: Vec<(&'a str, From<'a>)> = Vec::new();
     if let Some(plan) = plan {
@@ -1454,14 +1827,26 @@ fn merge_order<'a>(
     for (name, bytes) in meta {
         entries.push((name.as_str(), From::Meta(bytes)));
     }
-    match ranked {
-        Some(order) => {
-            let rank: BTreeMap<&str, usize> =
-                order.iter().enumerate().map(|(at, name)| (name.as_str(), at)).collect();
-            entries.sort_by_key(|(name, _)| (rank.get(name).copied().unwrap_or(usize::MAX), *name));
-        }
-        None => entries.sort_by(|a, b| a.0.cmp(b.0)),
-    }
+    let rank: BTreeMap<&str, usize> = ranked
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(at, name)| (name.as_str(), at))
+        .collect();
+    let member: BTreeMap<&str, (&str, usize)> = groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .planes
+                .iter()
+                .enumerate()
+                .map(|(at, plane)| (plane.as_str(), (group.object.as_str(), at)))
+        })
+        .collect();
+    entries.sort_by_key(|(name, _)| {
+        let (head, at) = member.get(name).copied().unwrap_or((name, 0));
+        (rank.get(head).copied().unwrap_or(usize::MAX), head, at)
+    });
     entries
 }
 

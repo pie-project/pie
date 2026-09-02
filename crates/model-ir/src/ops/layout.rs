@@ -119,6 +119,14 @@ pub enum Layout {
         vocab: u32,
         y: ValueId,
     },
+    /// The per-row argmax of each of `xs`, laid side by side: `y[r, j] =
+    /// argmax_c xs[j][r, c]`, `y` being `[rows, xs.len()]` i32. One value in
+    /// `xs` is the token a draft chain feeds its next step; every step's
+    /// logits together are the `[rows, depth]` drafts plane the `mtp.drafts`
+    /// seam exports. Ties go to the lowest column and a NaN never wins — the
+    /// same rule the epilogue's `reduce_argmax` states, so a draft the head
+    /// chained on is the token the verifier would have read.
+    Argmax { xs: Vec<ValueId>, y: ValueId },
 }
 
 impl Operands for Layout {
@@ -137,6 +145,7 @@ impl Operands for Layout {
             Self::MergeRows { x, .. } => sink.push(*x),
             Self::ScatterLiveRows { src, routes, y, .. } => sink.extend([*src, *routes, *y]),
             Self::EmbedConcat { ids, table, .. } => sink.extend([*ids, *table]),
+            Self::Argmax { xs, .. } => sink.extend(xs.iter().copied()),
         }
     }
     fn outputs(&self, sink: &mut Vec<ValueId>) {
@@ -152,6 +161,7 @@ impl Operands for Layout {
             Self::MergeRows { y, .. } => sink.push(*y),
             Self::ScatterLiveRows { y_out, .. } => sink.push(*y_out),
             Self::EmbedConcat { y, .. } => sink.push(*y),
+            Self::Argmax { y, .. } => sink.push(*y),
         }
     }
     /// The one aliasing row this family has, and it is the scatter's: every
@@ -169,7 +179,8 @@ impl Operands for Layout {
             // The pool writes a fresh rectangle, not `x` narrowed in place.
             | Self::PoolRows { .. }
             | Self::MergeRows { .. }
-            | Self::EmbedConcat { .. } => {}
+            | Self::EmbedConcat { .. }
+            | Self::Argmax { .. } => {}
             Self::ScatterRows { y_out, y, .. }
             | Self::ScatterLiveRows { y_out, y, .. } => sink.push((*y_out, *y)),
         }
@@ -187,6 +198,7 @@ impl Operands for Layout {
             Self::MergeRows { .. } => "layout.merge_rows",
             Self::ScatterLiveRows { .. } => "layout.scatter_live_rows",
             Self::EmbedConcat { .. } => "layout.embed_concat",
+            Self::Argmax { .. } => "layout.argmax",
         }
     }
 }

@@ -38,7 +38,73 @@ pub struct Model {
     /// not recur: a rejected draft row leaves only a kv cell to be
     /// overwritten, unlike a hybrid text with recurrent state.
     pub draft: Option<Draft>,
+
+    /// Google's own Gemma 4 assistant — the trained MTP drafter
+    /// (`google/gemma-4-*-it-assistant`), when an overlay carries one. See
+    /// [`Assistant`].
+    pub assistant: Option<Assistant>,
 }
+
+/// **GEMMA 4'S OWN DRAFTER**: a four-layer text stack that reads the trunk's
+/// kv instead of keeping any. Per draft step it is fed the concatenation of
+/// the trunk's token embedding (of the token the trunk chose) and a 2816-wide
+/// hidden state — the trunk's post-norm readout at step 0, its own
+/// `post_projection` after — projected by `pre_projection` to its hidden
+/// width. Its layers are ordinary Gemma 4 layers whose attention has only a
+/// `q_proj`: the sliding ones attend over the trunk's LAST sliding layer's kv
+/// row, the global one over the last global's, every query rotated at the
+/// row's own position and held there across the chain (transformers'
+/// `SinglePositionMultiTokenCandidateGenerator`, mlx-vlm's `draft_block`).
+/// It reads out through its own tied `embed_tokens`, no softcap. Its banks
+/// take the row's weight dtype — the import quantizes the bf16 source on the
+/// way in — because a chain step reads the whole head, and at bf16 that is
+/// 0.8 GB a step, more than the trunk's own active bytes. A bank encoded on
+/// the way in is named `*.weight`, where its scales are named beside it.
+pub struct Assistant {
+    /// Draft tokens chained per row; what `mtp_depth` advertises.
+    pub depth: u32,
+    /// `pre_projection`'s two column halves: `[hidden, trunk_hidden]` each,
+    /// the embedding half first.
+    pub pre_embed: Weight,
+    pub pre_hidden: Weight,
+    /// `post_projection`: `[trunk_hidden, hidden]`.
+    pub post: Weight,
+    /// Its own `[vocab, hidden]` table, read out through as the lm head.
+    pub embed: Weight,
+    pub norm: Weight,
+    pub norm_eps: f32,
+    pub layers: Vec<AssistantLayer>,
+}
+
+pub struct AssistantLayer {
+    /// `banks` is always [`AttnBanks::Shared`]; `kv` names the trunk row it
+    /// borrows.
+    pub attn: Attn,
+    pub o_proj: Weight,
+    pub attn_norm: Weight,
+    pub post_attn_norm: Weight,
+    pub pre_ffw_norm: Weight,
+    pub post_ffw_norm: Weight,
+    pub gate_up: Weight,
+    pub inter: u32,
+    pub down: Weight,
+    pub scalar: Weight,
+}
+
+/// The assistant's shape, the same for every published size: the trunk's
+/// width differs, the drafter's does not.
+const ASSISTANT_HIDDEN: u32 = 1024;
+const ASSISTANT_INTER: u32 = 8192;
+const ASSISTANT_READINGS: [Reading; 4] =
+    [Reading::Sliding, Reading::Sliding, Reading::Sliding, Reading::Global];
+/// Chained drafts per verify. Every chain step is a head pass paid whether
+/// or not the window uses it, and on the M1 Max a verify row costs 0.5–0.6
+/// of a first row, so the only window that pays for itself is `k = 1`:
+/// measured on the 26B-A4B, depth 2 at `k = 1` is 18.0 ms a token against
+/// 16.3 plain, depth 1 is 16.6 — parity. mlx-vlm's best block (three, two
+/// drafts) is a batch-of-four number on an M3 Max. A device where rows are
+/// cheap wants this at 2 or 3; that is a re-import, not a runtime knob.
+pub const ASSISTANT_DEPTH: u32 = 1;
 
 /// One EAGLE-style aux head: fuses a hidden state with the next token's
 /// embedding, runs one decoder block, and reads out through the base
@@ -350,6 +416,8 @@ struct Dims {
     tower: Option<TowerDims>,
     /// Whether this SKU's artifact carries an `aux.*` overlay head.
     draft: bool,
+    /// Whether it carries Google's assistant instead (see [`Assistant`]).
+    assistant: bool,
     hidden: u32,
     layers: u32,
     full_every: u32,
@@ -386,10 +454,24 @@ impl Model {
         Model::new(w, kv, tp, Model::e4b_dims())
     }
 
+    /// E4B cut to its first `layers` layers — the miniature a parity gate
+    /// reads against an external reference truncated the same way, when the
+    /// full stack cannot be tapped layer by layer. The shared tail keeps its
+    /// place: layers from 24 on borrow their kv, however many of them the cut
+    /// keeps. Everything else is the E4B's own.
+    pub fn e4b_mini(layers: u32, w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::e4b_dims();
+        let owned = d.layers - d.shared_tail.unwrap_or(0);
+        d.layers = layers;
+        d.shared_tail = (layers > owned).then(|| layers - owned);
+        Model::new(w, kv, tp, d)
+    }
+
     fn e4b_dims() -> Dims {
         Dims {
                 tower: None,
                 draft: false,
+                assistant: false,
                 hidden: 2560,
                 layers: 42,
                 full_every: 6,
@@ -448,6 +530,7 @@ impl Model {
             Dims {
                 tower: None,
                 draft: false,
+                assistant: false,
                 hidden: 5376,
                 layers: 60,
                 full_every: 6,
@@ -481,6 +564,15 @@ impl Model {
         Model::new(w, kv, tp, Model::a4b_dims())
     }
 
+    /// The mixture with Google's own drafter overlaid
+    /// (`gemma-4-26B-A4B-it-assistant`). A separate row: whether a head
+    /// exists is a fact about the artifact.
+    pub fn a4b_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::a4b_dims();
+        d.assistant = true;
+        Model::new(w, kv, tp, d)
+    }
+
     /// The mixture reading the same wide tower as [`Model::b31_vision`],
     /// landing in 2816 instead of 5376.
     pub fn a4b_vision(w: Dtype, kv: Dtype, tp: u32) -> Model {
@@ -493,6 +585,7 @@ impl Model {
             Dims {
                 tower: None,
                 draft: false,
+                assistant: false,
                 hidden: 2816,
                 layers: 30,
                 full_every: 6,
@@ -788,6 +881,66 @@ impl Model {
             }
         });
 
+        // The assistant borrows the trunk's LAST row of each reading —
+        // the kv the trunk itself publishes as `shared_kv_states`.
+        let assistant = d.assistant.then(|| {
+            assert_eq!(tp, 1, "the assistant head is written for one rank");
+            let last = |want_full: bool| {
+                (0..d.layers)
+                    .rev()
+                    .find(|&l| !shared_at(l) && full_at(l) == want_full)
+                    .map(owner)
+                    .expect("the trunk has a layer of each reading")
+            };
+            let ah = ASSISTANT_HIDDEN as u64;
+            let iw = ASSISTANT_INTER as u64;
+            let n = |s: &str| format!("aux.{s}");
+            let layers = ASSISTANT_READINGS
+                .iter()
+                .enumerate()
+                .map(|(l, &reading)| {
+                    let n = |s: &str| format!("aux.layer.{l}.{s}");
+                    let norm = |s: &str, len: u64| Weight::sym(n(s), [len], dense);
+                    let hd = match reading {
+                        Reading::Sliding => sliding.head_dim,
+                        Reading::Global => global.head_dim,
+                    } as u64;
+                    let q_w = q_heads as u64 * hd;
+                    AssistantLayer {
+                        attn: Attn {
+                            sm_scale: d.sm_scale,
+                            q_norm: norm("q_norm", hd),
+                            q_norm_eps: d.norm_eps,
+                            kv: format!("kv.{}", last(reading == Reading::Global)),
+                            banks: AttnBanks::Shared {
+                                q_proj: Weight::sym(n("q_proj.weight"), [q_w, ah], w),
+                            },
+                            reading,
+                        },
+                        o_proj: Weight::sym(n("o_proj.weight"), [ah, q_w], w),
+                        attn_norm: norm("attn_norm", ah),
+                        post_attn_norm: norm("post_attn_norm", ah),
+                        pre_ffw_norm: norm("pre_ffw_norm", ah),
+                        post_ffw_norm: norm("post_ffw_norm", ah),
+                        gate_up: Weight::sym(n("gate_up.weight"), [2 * iw, ah], w).packed([iw, iw]),
+                        inter: ASSISTANT_INTER,
+                        down: Weight::sym(n("down.weight"), [ah, iw], w),
+                        scalar: norm("scalar", 1),
+                    }
+                })
+                .collect();
+            Assistant {
+                depth: ASSISTANT_DEPTH,
+                pre_embed: Weight::sym(n("pre_embed.weight"), [ah, hidden], w),
+                pre_hidden: Weight::sym(n("pre_hidden.weight"), [ah, hidden], w),
+                post: Weight::sym(n("post.weight"), [hidden, ah], w),
+                embed: Weight::sym(n("embed.weight"), [d.vocab as u64, ah], w),
+                norm: Weight::sym(n("final_norm"), [ah], dense),
+                norm_eps: d.norm_eps,
+                layers,
+            }
+        });
+
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
@@ -827,6 +980,7 @@ impl Model {
             final_norm: Weight::sym("final_norm", [hidden], dense),
             final_norm_eps: d.norm_eps,
             draft,
+            assistant,
         }
     }
 }

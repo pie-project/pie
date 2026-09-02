@@ -1,65 +1,35 @@
-//! Speculative decoding with a model's native multi-token-prediction head:
-//! draft `k` tokens from the head, verify them against the target's own
-//! logits in the same fire, and commit only the accepted prefix.
-//!
-//! # Why the loop turns on the HOST
-//!
-//! This pass was once a single loop-carried fire whose epilogue computed the
-//! next round's `kv_len`, `positions`, `w_slot`, `w_off` and `page_indptr`
-//! in-graph and put them back into the channels the next fire would read. That
-//! is not servable and never was: the page CSR and the arena rectangles are
-//! carved on the HOST before a launch, so the fire path answers `KvLen is not
-//! host-derivable` and the program had never run end to end (its own README
-//! said so). See `.wiki/alto/multimodal.md` §10.3.
-//!
-//! The shape that works is `cacheback-speculative-decoding`'s, which passes
-//! the census: geometry is host-known, one fire per verify round, and the
-//! round's accepted count — which this loop already read back every round to
-//! decide what to emit — is what the next round's geometry is computed from.
-//! What stays in the graph is the part worth having: the verify itself, so the
-//! host learns a COUNT and never a comparison.
-//!
-//! # The rule
+//! **THE SPECULATIVE LOOP, ON THE DEVICE.** Draft `k` tokens from the model's
+//! own head, verify them against the trunk's argmax in the same fire, commit
+//! the accepted prefix and the correction, and build the next window — all of
+//! it in the epilogue. The host drains committed tokens and watches for a
+//! stop; it never learns the accepted count between one fire and the next.
 //!
 //! ```text
-//! window = [x, d_1 .. d_k]              pending correct token, then drafts
-//! truth  = argmax(logits at each row)   row i is the truth after window[..=i]
-//! m      = |{ i : d_{i+1} == truth_i, and every draft before it matched }|
-//! commit = window[0 ..= m]              the correction plus the accepted run
-//! next   = [truth_m, fresh drafts]
+//! window = [x, d_1 .. d_k]           the correction, then the head's chain
+//! truth  = argmax(logits)            what the trunk says follows each row
+//! m      = |longest prefix with d_{i+1} == truth_i|
+//! commit = window[1 ..= m], truth_m  the accepted run, then the correction
+//! next   = [truth_m, chain_m[0..k]]  the head's chain at the accepted row
 //! ```
 //!
-//! Only `m + 1` tokens advance the KV length. The `k - m` rejected cells sit
-//! above it and the next round writes over them, which is why nothing has to
-//! be retracted: shape decides slots, the length decides what is real.
+//! **WHY THE HEAD'S CHAIN AT ROW `m` IS THE RIGHT ONE.** The head is fed
+//! `(hidden_i, argmax_i)` and drafts what follows — the model text's
+//! contract, `mtp_drafts` — so row `m`'s chain is conditioned on exactly the
+//! token the next window starts with. That is what lets one fire both verify
+//! this window and draft the next; a head fed the row's own token could not
+//! (see `.wiki/big/dsv4.md` §3.4).
 //!
-//! # What this is a gate for
+//! **THE ANSWER IS THE ANSWER, BY CONSTRUCTION.** Verification keeps the
+//! trunk's argmax at every position, so the text equals greedy decoding
+//! whatever the head proposes; `k = 0` runs the same loop with a one-row
+//! window and nothing drafted — the controlled A/B `test_eagle.py` reads.
+//! Acceptance is reported, not asserted: it is a property of the head.
 //!
-//! The greedy output must equal the greedy non-speculative output BYTE FOR
-//! BYTE, and that is true for any draft head — verification keeps the target's
-//! own argmax — which is what makes a synthetic head a fair test of the
-//! MECHANISM (campaign M-4, and `tests/inferlets/test_eagle.py` asks it).
-//! The acceptance counters say how much of the mechanism actually ran; a loop
-//! that drafted nothing would satisfy the identity by doing no speculation.
-//!
-//! # And it is RED for a reason outside this program (`.wiki/alto/multimodal.md` §17)
-//!
-//! The default SKU is a HYBRID text — three layers in four are gated-delta
-//! recurrences — and a recurrence is a FOLD, not an addressed cell. "Rejected
-//! drafts sit above the advanced length and are overwritten by the next fire"
-//! is true of the paged KV and has no meaning for the state: every row of a
-//! verify window is folded into it and nothing retracts the rejected ones. On
-//! a non-recurrent SKU (measured: gemma-4-E4B) the same fire shapes answer
-//! BIT-IDENTICALLY at every `pad` width and every pad token, which is what
-//! says the geometry, the pages, the mask and the KV rewrite are all right.
-//!
-//! `pad_token`, `no_drafts` and `peak_trace` are the instruments that said so
-//! and are kept for the wave that fixes it: `no_drafts` runs the loop against
-//! a SKU with no draft head at all, `pad_token` decides what a passenger row
-//! carries, and `peak_trace` exports row 0's max logit as an f32 so a
-//! perturbation is visible BEFORE it flips an argmax — round 0 identical and
-//! round 1 not is what separates "the rows see each other" from "the last
-//! round left something behind".
+//! **ATTENTION-ONLY.** Rejected rows leave KV cells above the committed
+//! length that the next fire overwrites (`nb + i`), so nothing is discarded
+//! explicitly. A hybrid (recurrent-state) text binds the same `m` as its
+//! `fold_len` — the fold-commit contract `model.wit` states — and is the RS
+//! half's business, not this file's.
 
 use inferlet::chat;
 use inferlet::eta::attention::prelude::*;
@@ -71,53 +41,45 @@ struct Input {
     prompt: String,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
-    /// **`k = 0` IS THE CONTROLLED A/B, AND IT IS NOT A DISABLED FEATURE.**
-    /// The window is one row, nothing is drafted, nothing is verified, and the
-    /// loop degenerates to sequential greedy decoding — through the SAME
-    /// geometry, the same fire and the same commit arithmetic. So `k = 0`
-    /// against `k = 4` separates "the loop's rows and pages are right" from
-    /// "the speculation on top of them is right", which no comparison against
-    /// a second program can do. `cacheback-speculative-decoding` states the
-    /// same trick for the same reason under the name `draft_length`.
+    /// Draft tokens per round, capped at the model's `mtp_depth`. **`k = 0`
+    /// IS THE CONTROLLED A/B**: the window is one row, nothing is drafted or
+    /// verified, and the loop is sequential greedy decoding through the same
+    /// geometry, fire and commit arithmetic.
     #[serde(default = "default_k")]
     k: u32,
-    /// **WHICH MASK THE VERIFY FIRE BINDS**, and it exists so that this
-    /// program can falsify its own reading of the door rather than trust it.
-    ///
-    ///   `causal`  the per-row staircase: row `i` sees `j <= base + i`.
-    ///             Semantically the derived bound, so a LIVE mask changes
-    ///             nothing and an inert one changes nothing either — which is
-    ///             why it cannot be the only mode.
-    ///   `prefix`  row `i` sees `j <= base` and nothing of the window after
-    ///             it. Semantically DIFFERENT from the derived bound at every
-    ///             row but the first, so a live mask must move the answer and
-    ///             an inert one cannot. This is the discriminator.
-    ///   `none`    no mask bound at all — the control.
-    #[serde(default = "default_mask_mode")]
-    mask_mode: String,
-    /// **PAD THE WINDOW WITH ROWS THE LOOP IGNORES**, so that a run with no
-    /// drafts can be given the same fire SHAPE as a run with `k` of them.
-    ///
-    /// It exists to separate two claims the campaign's identity gate asks at
-    /// once: that the speculative LOGIC is right, and that a `w`-row verify
-    /// fire and a one-row decode fire answer the same argmax. The first is
-    /// this program's; the second is the engine's, and `k = 0` against
-    /// `k = 4` cannot tell them apart because it moves both at once —
-    /// `qo_one` is a fact, so a one-row window takes the decode arm and a
-    /// five-row one takes prefill.
+    /// DIAGNOSTIC: at `k = 0` the accepted count is a constant and the
+    /// geometry folds on the host; this makes it device-decided (a zero read
+    /// off the logits) so the one-row loop takes the pool-owned
+    /// device-geometry class the wider windows take — separating "that class
+    /// moves the answer" from "the drafting window does".
+    #[serde(default)]
+    device_geometry: bool,
+    /// DIAGNOSTIC: extra lanes carrying the correction token again, verified
+    /// and rejected like any wrong draft, so a run with no drafts can be
+    /// given the fire SHAPE of one with `pad` of them — separating "a wider
+    /// window moves the answer" from "the draft head does".
     #[serde(default)]
     pad: u32,
-    /// DIAGNOSTIC: the token the pad rows carry (default: the pending token).
+    /// DIAGNOSTIC: run only the first `max_layers` layers (the layerskip
+    /// door), to bisect a divergence by depth.
     #[serde(default)]
-    pad_token: Option<u32>,
-    /// DIAGNOSTIC: run the fire with NO draft head at all (no mtp_logits), so
-    /// the lane's `drafts` fact is false and the head's region is empty.
+    max_layers: Option<u32>,
+    /// Prefill chunk cap in tokens. A streamed-expert artifact seats a bounded
+    /// number of distinct experts per segment, and a long prompt routes past
+    /// it; chunking the prefill keeps every fire under the seat count.
     #[serde(default)]
-    no_drafts: bool,
-}
-
-fn default_mask_mode() -> String {
-    "causal".into()
+    prefill_chunk: Option<u32>,
+    /// DIAGNOSTIC: record the first rounds' proposals and answers
+    /// (`proposed_trace`/`truth_trace`) instead of the per-round margin — a
+    /// pass binds at most twelve channels, and this is the twelfth.
+    #[serde(default)]
+    trace: bool,
+    /// DIAGNOSTIC: record lane 0's top-1/top-2 logit margin every round
+    /// (`margin_trace`). Opt-in because it is a `top_k` over the whole
+    /// vocabulary in the epilogue, ~170 ms a fire on the full dsv4 — a third
+    /// of the fire — and a gate's tie-judging is the only reader.
+    #[serde(default)]
+    margin: bool,
 }
 
 fn default_prompt() -> String {
@@ -132,346 +94,398 @@ fn default_k() -> u32 {
     4
 }
 
-/// **WHAT THE GATE READS** (campaign M-4).
-///
-/// The text is the claim. The counters beside it are the honest half: they say
-/// how much of the mechanism ran, and neither number alone is the gate.
+/// What the gate reads: the text is the claim, the counters say how much of
+/// the mechanism ran.
 #[derive(Serialize)]
 struct Output {
     sampler: &'static str,
     text: String,
+    tokens: Vec<u32>,
     count: usize,
-    /// Verify rounds that committed at least one token.
+    /// Verify fires after the prefill.
     rounds: usize,
     /// Draft tokens proposed, `k` per round.
     drafted: usize,
-    /// Draft tokens the target's own argmax agreed with.
+    /// Draft tokens the trunk's own argmax agreed with.
     accepted: usize,
     /// `accepted / drafted`, or zero when nothing was drafted.
     acceptance_rate: f64,
-    /// The draft-window length this run used.
+    /// The draft-window length this run used (the input's, capped at depth).
     k: u32,
-    /// The FIRST round's proposals and the truths they were judged against —
-    /// two short vectors, so a reader can tell "the head proposed nothing
-    /// sensible" from "the verify compared the wrong rows".
-    draft_sample: Vec<u32>,
-    truth_sample: Vec<u32>,
-    /// Row 0's argmax in every round — the token the loop actually commits.
-    truth0_trace: Vec<u32>,
-    peak_trace: Vec<f32>,
+    /// The model's draft depth.
+    depth: u32,
+    /// Where the generation started (prompt tokens) and the KV page size —
+    /// what a divergence between two widths is read against.
+    prompt_tokens: u32,
+    page_size: u32,
+    /// Per round, lane 0's top-1 minus top-2 logit — whether a divergence
+    /// between two widths is a near-tie (the bf16 floor: a one-row and a
+    /// many-row fire take different kernel paths and differ in the last
+    /// bits) or a real gap (a mechanism fault).
+    margin_trace: Vec<f32>,
+    /// Per round, how many tokens were committed (the accepted run plus the
+    /// correction) — what maps a token index back to its round.
+    commits_trace: Vec<u32>,
+    /// DIAGNOSTIC, the first rounds only: what the window proposed (its
+    /// `k` drafts) and what the trunk said at each of those rows — so a head
+    /// that proposes nonsense can be told from a verify that compares the
+    /// wrong rows.
+    proposed_trace: Vec<Vec<u32>>,
+    truth_trace: Vec<Vec<u32>>,
 }
 
 impl Output {
-    /// What a zero-token ask answers: the same fields, every counter zero. A
-    /// shape the gate can read without a branch is worth more than a shorter
-    /// one it has to special-case.
-    fn empty(k: u32) -> Output {
+    fn empty(k: u32, depth: u32) -> Output {
         Output {
             sampler: "mtp-speculative-decoding",
             text: String::new(),
+            tokens: Vec::new(),
             count: 0,
             rounds: 0,
             drafted: 0,
             accepted: 0,
             acceptance_rate: 0.0,
             k,
-            draft_sample: Vec::new(),
-            truth_sample: Vec::new(),
-            truth0_trace: Vec::new(),
-            peak_trace: Vec::new(),
+            depth,
+            prompt_tokens: 0,
+            page_size: 0,
+            margin_trace: Vec::new(),
+            commits_trace: Vec::new(),
+            proposed_trace: Vec::new(),
+            truth_trace: Vec::new(),
         }
     }
 }
 
-/// One fire over `rows` token ids beginning at KV position `base`, answering
-/// the target's argmax at every row and the head's `k` drafts.
-///
-/// **EVERY GEOMETRY CHANNEL HERE IS HOST-KNOWN**, which is the whole point of
-/// the rewrite: `base` is an integer this side computed from the last round's
-/// accepted count, and every vector below is arithmetic on it.
-#[allow(clippy::type_complexity)]
-async fn fire(
-    ws: &WorkingSet,
-    pipeline: &Pipeline,
-    tokens: &[u32],
-    base: u32,
-    k: u32,
-    page_size: u32,
-    max_pages: u32,
-    mask_mode: &str,
-    drafts_wanted: bool,
-) -> Result<(Vec<u32>, Vec<u32>, Vec<f32>)> {
-    let rows = tokens.len() as u32;
-    let total = base + rows;
-
-    // **THE WINDOW'S ROWS ARE CAUSALLY ISOLATED BY A MASK, AND NOTHING ELSE
-    // WOULD DO IT** (`.wiki/alto/multimodal.md` §13). A window of `w` rows in
-    // one lane is a chunked prefill whose queries all see the lane's whole
-    // `kv_len` — so without this, row 0's logits are computed with rows
-    // 1..w's DRAFT keys in the context, and the "correction" the loop commits
-    // is a token the target never proposed.
-    //
-    // MEASURED, and this is the experiment the mask has to answer: with no
-    // mask, `k = 0` (a one-row window, nothing drafted) answered the greedy
-    // non-speculative run BYTE FOR BYTE while `k = 1` and `k = 4` did not —
-    // at ZERO accepted drafts in all three, so every round committed one
-    // token and all three had to agree. The rows were seeing each other.
-    //
-    // Row `i` sits at position `base + i` and may see key `j` exactly when
-    // `j <= base + i`: its own prefix, itself, and nothing drafted after it.
-    // That is the staircase, and a dense `[rows, pool]` mask is how this
-    // vocabulary says it (`naive-masked`'s `dense-prefill` builds the same
-    // shape for the same reason).
-    //
-    // **A BOUND MASK REPLACES THE DERIVED CAUSAL BOUND** rather than ANDing
-    // with it (`Port::AttnMask`'s own doc, and `trackb-snapkv`'s note on the
-    // same door), which is why every row states its whole prefix here and not
-    // just the part that is about drafts.
-    let pages = total.div_ceil(page_size);
-    let pool = max_pages * page_size;
-
-    let ids = Channel::from_iter(tokens.iter().map(|&t| t as i32));
-    let embed_indptr = Channel::from([0u32, rows]).named("embed_indptr");
-    let positions = Channel::from_iter(base..total).named("positions");
-    let page_list = Channel::from_iter(0..pages).named("pages");
-    let page_indptr = Channel::from([0u32, pages]).named("page_indptr");
-    let w_slot = Channel::from_iter((base..total).map(|p| p / page_size)).named("w_slot");
-    let w_off = Channel::from_iter((base..total).map(|p| p % page_size)).named("w_off");
-    let kv_len = Channel::from([total]).named("kv_len");
-    let bound: Vec<bool> = match mask_mode {
-        "prefix" => (0..rows)
-            .flat_map(|_| (0..pool).map(move |j| j <= base))
-            .collect(),
-        // DIAGNOSTIC: row `i` sees `j < base + i` — its own cell EXCLUDED.
-        "noself" => (base..total)
-            .flat_map(|p| (0..pool).map(move |j| j + 1 <= p))
-            .collect(),
-        // DIAGNOSTIC: row `i` sees `j <= base + i + 1` — one cell of the
-        // future INCLUDED.
-        "wide" => (base..total)
-            .flat_map(|p| (0..pool).map(move |j| j <= p + 1))
-            .collect(),
-        // DIAGNOSTIC: causal, MINUS the cell just below the window's base.
-        "nolast" => (base..total)
-            .flat_map(|p| (0..pool).map(move |j| j <= p && j + 1 != base))
-            .collect(),
-        // DIAGNOSTIC: causal, MINUS the two cells below the window's base.
-        "nolast2" => (base..total)
-            .flat_map(|p| (0..pool).map(move |j| j <= p && j + 1 != base && j + 2 != base))
-            .collect(),
-        // DIAGNOSTIC: causal, minus everything from base-1 up (row 0 sees
-        // only cells strictly below base-1).
-        "back2" => (base..total)
-            .flat_map(|p| (0..pool).map(move |j| j + 2 <= p))
-            .collect(),
-        _ => (base..total)
-            .flat_map(|p| (0..pool).map(move |j| j <= p))
-            .collect(),
-    };
-    let mask = Channel::from_shaped([rows, pool], bound).named("verify_mask");
-    let readout = Channel::from_iter(0..rows).named("readout");
-    let truth_out = Channel::new([rows], dtype::i32).named("truth");
-    let peak_out = Channel::new([rows], dtype::f32).named("peak");
-    let drafts_out = Channel::new([k.max(1)], dtype::i32).named("drafts");
-
-    let fwd = ForwardPass::new();
-    fwd.embed(&ids, &embed_indptr)?;
-    fwd.readout(&readout)?;
-    fwd.attention(
-        ws,
-        KvGeometry {
-            readable_pages: ..,
-            writable_pages: ..,
-            kv_len: &kv_len,
-            pages: &page_list,
-            page_indptr: &page_indptr,
-            w_slot: &w_slot,
-            w_off: &w_off,
-            positions: &positions,
-            mask: (mask_mode != "none").then_some(&mask),
-        },
-    )?;
-    // **THE VERIFY'S HALF THAT STAYS IN THE GRAPH.** The argmax over the whole
-    // readout is one reduction on the device; comparing it against the drafts
-    // is arithmetic on `k + 1` integers and belongs where the loop is.
-    fwd.epilogue(move || {
-        truth_out.put(reduce_argmax(intrinsics::logits()));
-        peak_out.put(reduce_max(intrinsics::logits()));
-        if drafts_wanted {
-            drafts_out.put(reduce_argmax(intrinsics::mtp_logits(k.max(1))));
-        }
-    });
-    fwd.submit(pipeline).context("verify-and-extend")?;
-
-    let truth = truth_out
-        .take_host::<Vec<i32>>()
-        .await?
-        .into_iter()
-        .map(|t| t as u32)
-        .collect();
-    let peak = peak_out.take_host::<Vec<f32>>().await?;
-    let drafts = if drafts_wanted {
-        drafts_out
-            .take_host::<Vec<i32>>()
-            .await?
-            .into_iter()
-            .map(|t| t as u32)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    Ok((truth, drafts, peak))
-}
+/// The token slots of a window that is not there: `-1` embeds nothing.
+const NONE: i32 = -1;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
+    let depth = model::mtp_depth();
+    let k = input.k.min(depth);
+    let device_geometry = input.device_geometry;
     if input.max_tokens == 0 {
-        return Ok(Output::empty(input.k));
+        return Ok(Output::empty(k, depth));
     }
-    if input.k > 32 {
-        return Err("k must be at most 32".into());
-    }
-
-    let k = input.k;
-    let mode = input.mask_mode.clone();
-    if !matches!(
-        mode.as_str(),
-        "causal" | "prefix" | "none" | "noself" | "wide" | "nolast" | "nolast2" | "back2"
-    ) {
-        return Err(format!("unknown mask_mode: {mode}").into());
-    }
-    let w = (k + 1) as usize;
+    let w = k + 1 + input.pad;
     let page_size = kv_page_size();
 
-    // **THE RAW ENCODING, AND THAT IS WHAT MAKES THE GATE A GATE.** The claim
-    // this program exists to be measured against is that speculation changes
-    // how many fires run and nothing about the tokens — so it has to decode
-    // the SAME context `naive-baseline` decodes, and that one encodes the
-    // prompt and nothing else. A chat wrap here would have made the identity a
-    // comparison of two different conversations.
-    let mut prompt = model::encode(&input.prompt);
+    // The raw encoding, so the identity against `naive-baseline` compares the
+    // same context.
+    // The model's opening (`<bos>` where it has one) before the raw text: a
+    // gemma without it answers noise, and no sampler can be read against that.
+    let mut prompt = chat::prefix();
+    prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }
     let n = prompt.len() as u32;
     let stop_tokens = chat::stop_tokens();
 
-    // One working set for the whole generation: the prompt's KV is written
-    // once and every later round appends to it. The lease covers the prompt,
-    // every token the host may keep, and the transient overshoot of a window
-    // whose drafts are rejected (up to `w` cells above the committed length).
+    // One working set for the generation: the prompt's KV, every token the
+    // host may keep, and one window of rejected cells above the committed
+    // length that the next fire writes over.
     let ws = WorkingSet::new();
-    let max_extent = n + input.max_tokens as u32 + w as u32;
+    // A round commits up to `w` tokens and the loop stops on the host, so
+    // the device may have advanced one window past `max_tokens` and laid out
+    // the window after that; a page of slack keeps every `pages` cut inside
+    // the run every lane carries.
+    let max_extent = n + input.max_tokens as u32 + 2 * w + page_size;
     let max_pages = max_extent.div_ceil(page_size);
     ws.reserve(max_pages).context("reserve KV")?;
-    let pipeline = Pipeline::new();
+    let pipe = Pipeline::new();
 
-    // ── Prefill: the prompt, one fire, and the first window it seeds ────
-    let want_drafts = !input.no_drafts;
-    let (truth, drafts, _) = fire(
-        &ws, &pipeline, &prompt, 0, k, page_size, max_pages, &mode, want_drafts,
-    )
-    .await?;
-    let mut peak_trace: Vec<f32> = Vec::new();
-    let mut x = *truth.last().expect("a prefill answers one row per token");
-    let mut pending = drafts;
-    let mut base = n;
+    // ── PREFILL: the prompt, chunked; the last chunk seeds the loop ──────
+    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    let spans = prefill_chunks(n, input.prefill_chunk);
+    let last_span = spans.len() - 1;
+    let mut seed: Vec<i32> = Vec::new();
+    for (at, &(base, end)) in spans.iter().enumerate() {
+        let len = end - base;
+        let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
+        let indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
+        let positions_p = Channel::from_iter(base..end).named("positions_p");
+        let pages_p = Channel::from_iter(0..max_pages).named("pages_p");
+        let page_indptr_p = Channel::from([0u32, end.div_ceil(page_size)]).named("page_indptr_p");
+        let w_slot_p = Channel::from_iter((base..end).map(|p| p / page_size)).named("w_slot_p");
+        let w_off_p = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
+        let kv_len_p = Channel::from([end]).named("kv_len_p");
+        // The last row only: the first window is seeded off it.
+        let readout_p = Channel::from([len - 1]).named("readout_p");
+        let seed_p = Channel::new([w], dtype::i32).named("seed_p");
+        let drafting = at == last_span && k > 0;
+
+        let fwd_p = ForwardPass::new();
+        if let Some(layers) = input.max_layers {
+            fwd_p.set_max_layers(layers)?;
+        }
+        fwd_p.embed(&toks_p, &indptr_p)?;
+        fwd_p.readout(&readout_p)?;
+        fwd_p.attention(
+            &ws,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len_p,
+                pages: &pages_p,
+                page_indptr: &page_indptr_p,
+                w_slot: &w_slot_p,
+                w_off: &w_off_p,
+                positions: &positions_p,
+                mask: None,
+            },
+        )?;
+        fwd_p.epilogue(move || {
+            // One readout row: `logits()` is `[vocab]`, its argmax a scalar.
+            let t = reshape(reduce_argmax(intrinsics::logits()), [1]);
+            let i = iota(w);
+            let first = eq(&i, Tensor::constant(0u32));
+            let window = if drafting {
+                // The head's chain at the readout row, `[depth]`; the window
+                // takes its first `k`, and any pad lane carries `t` again.
+                let chain = intrinsics::mtp_drafts(depth);
+                let j = min_elem(
+                    max_elem(&i, Tensor::constant(1u32)) - Tensor::constant(1u32),
+                    Tensor::constant(depth - 1),
+                );
+                let drafted = and(not(&first), le(&i, Tensor::constant(k)));
+                select(&drafted, gather(&chain, &j), broadcast(&t, [w]))
+            } else {
+                broadcast(&t, [w])
+            };
+            seed_p.put(&window);
+        });
+        fwd_p
+            .submit(&pipe)
+            .with_context(|| format!("prefill submit @{base}"))?;
+        // Every chunk's put is drained; only the last chunk's seeds the loop.
+        seed = seed_p
+            .take_host::<Vec<i32>>()
+            .await
+            .with_context(|| format!("@{base}"))?;
+    }
 
     let mut generated: Vec<u32> = Vec::with_capacity(input.max_tokens);
-    let (mut rounds, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
-    let (mut draft_sample, mut truth_sample) = (Vec::new(), Vec::new());
-    let mut truth0_trace: Vec<u32> = Vec::new();
-
-    // The seed token is the first thing the model said and is committed
-    // unconditionally: nothing drafted it, so nothing can reject it.
+    let x = seed[0] as u32;
     generated.push(x);
-    let mut stopped = stop_tokens.contains(&x) || generated.len() == input.max_tokens;
+    let (mut rounds, mut drafted, mut accepted) = (0usize, 0usize, 0usize);
+    let mut margin_trace: Vec<f32> = Vec::new();
+    let mut commits_trace: Vec<u32> = Vec::new();
+    let mut proposed_trace: Vec<Vec<u32>> = Vec::new();
+    let mut truth_trace: Vec<Vec<u32>> = Vec::new();
+    let mut stopped = stop_tokens.contains(&x) || generated.len() >= input.max_tokens;
 
-    while !stopped {
-        // ── The window: the pending correct token, then the drafts ──────
-        let mut window = Vec::with_capacity(w);
-        window.push(x);
-        window.extend(pending.iter().copied().take(k as usize));
-        // Padding rows carry the pending token again. They are verified like
-        // any other row and rejected like any other wrong one — nothing here
-        // treats them specially, which is what makes the comparison fair.
-        for _ in 0..input.pad {
-            window.push(input.pad_token.unwrap_or(x));
-        }
-        while window.len() < w {
-            // A head that answered fewer drafts than asked is a head with a
-            // shorter horizon, not an error; the window shrinks and the round
-            // still verifies what it has.
-            window.pop();
-            break;
-        }
+    // ── DECODE: one window per fire, loop-carried on the device ──────────
+    //
+    // **THE WINDOW IS `w` LANES OF ONE TOKEN, NOT ONE LANE OF `w` TOKENS.**
+    // The runtime's device-geometry class (the decode envelope) admits one
+    // token per lane, and that shape is also the staircase without a mask:
+    // lane `i` holds the window's `i`-th token at position `nb + i` and
+    // reads `nb + i + 1` keys — its prefix, itself, and nothing drafted
+    // after it — over the pages every lane shares (beam-search's shape,
+    // with a per-lane `kv_len` where beam search has a mask). Every lane's
+    // key is appended before any lane attends, so lane `i + 1` sees lane
+    // `i`'s.
+    if !stopped {
+        let win = Channel::from(seed.as_slice()).named("win");
+        let base = Channel::from([n]).named("base");
+        let indptr_d = Channel::from_iter(0..=w).named("embed_indptr");
+        let positions = Channel::from_iter(n..n + w).named("positions");
+        let page_count0 = (n + w).div_ceil(page_size);
+        let pages = Channel::from_iter((0..w * max_pages).map(|j| j % page_count0)).named("pages");
+        let page_indptr =
+            Channel::from_iter((0..=w).map(|lane| lane * page_count0)).named("page_indptr");
+        let w_slot = Channel::from_iter((n..n + w).map(|p| p / page_size)).named("w_slot");
+        let w_off = Channel::from_iter((n..n + w).map(|p| p % page_size)).named("w_off");
+        let kv_len = Channel::from_iter((n..n + w).map(|p| p + 1)).named("kv_len");
+        let out = Channel::new([w], dtype::i32)
+            .capacity(channel_capacity() as u32)
+            .named("out");
+        // The twelfth channel is either the margin or the trace: a declared
+        // channel is bound whether or not a stage touches it, and the pass
+        // has room for twelve.
+        let tracing = input.trace;
+        let margin = input.margin;
+        // One diagnostic channel, the margin or the trace: a declared channel
+        // takes a reader cell whether or not a stage touches it, and the pass
+        // has room for exactly this many. f32 for both — a token id is exact
+        // in f32.
+        let aux = Channel::new([if tracing { 2 * w } else { 1 }], dtype::f32)
+            .capacity(channel_capacity() as u32)
+            .named("aux");
 
-        let (truth, drafts, peak) = fire(
-            &ws, &pipeline, &window, base, k, page_size, max_pages, &mode, want_drafts,
-        )
-        .await?;
-        peak_trace.push(peak[0]);
-        rounds += 1;
-        if rounds == 1 {
-            draft_sample = window[1..].to_vec();
-            truth_sample = truth.clone();
+        let fwd = ForwardPass::new();
+        if let Some(layers) = input.max_layers {
+            fwd.set_max_layers(layers)?;
         }
-        truth0_trace.push(truth[0]);
-        let proposed = (window.len() - 1).saturating_sub(input.pad as usize);
-        drafted += proposed;
-
-        // ── Verify: the longest matching prefix, and nothing after it ────
-        let mut m = 0usize;
-        while m < proposed && window[m + 1] == truth[m] {
-            m += 1;
-        }
-        accepted += m;
-
-        // ── Commit `window[1 ..= m]` — `window[0]` was committed last round
-        //    as the correction that produced it — then the new correction.
-        for &token in &window[1..=m] {
-            generated.push(token);
-            if stop_tokens.contains(&token) || generated.len() == input.max_tokens {
-                stopped = true;
-                break;
+        fwd.embed(&win, &indptr_d)?;
+        fwd.attention(
+            &ws,
+            KvGeometry {
+                readable_pages: ..,
+                writable_pages: ..,
+                kv_len: &kv_len,
+                pages: &pages,
+                page_indptr: &page_indptr,
+                w_slot: &w_slot,
+                w_off: &w_off,
+                positions: &positions,
+                mask: None,
+            },
+        )?;
+        fwd.epilogue(move || {
+            let window = win.take(); // [w] i32
+            let b = base.take(); // [1] u32
+            // One readout row per lane: `[w, vocab]`, or `[vocab]` at w = 1.
+            let logits = intrinsics::logits();
+            let truth = reshape(reduce_argmax(&logits), [w]); // [w] i32
+            if tracing {
+                let j = iota(2 * w);
+                let lower = lt(&j, Tensor::constant(w));
+                let at = &j % Tensor::constant(w);
+                aux.put(&cast(
+                    select(&lower, gather(&window, &at), gather(&truth, &at)),
+                    dtype::f32,
+                ));
+            } else if margin {
+                let vocab = intrinsics::vocab();
+                let row0 = reshape(gather(reshape(&logits, [w, vocab]), iota(1)), [vocab]);
+                let (top, _) = top_k(&row0, 2);
+                aux.put(&reshape(
+                    gather(&top, iota(1)) - gather(&top, iota(1) + Tensor::constant(1u32)),
+                    [1],
+                ));
+            } else {
+                // A declared channel takes a reader cell every fire.
+                aux.put(&broadcast(Tensor::constant(0f32), [1]));
             }
-        }
-        if stopped {
-            break;
-        }
-        let correction = truth[m];
-        generated.push(correction);
-        if stop_tokens.contains(&correction) || generated.len() == input.max_tokens {
-            break;
-        }
+            let i = iota(w); // [w] u32
+            let one = Tensor::constant(1u32);
+            let none = broadcast(Tensor::constant(NONE), [w]);
 
-        // Only the accepted run advances the length; the rejected cells stay
-        // above it and the next fire writes over them.
-        base += (m + 1) as u32;
-        x = correction;
-        pending = drafts;
+            // ── verify: the longest prefix of drafts the trunk agreed with
+            let m = if k > 0 {
+                let proposed = gather(&window, iota(k) + &one); // window[1..=k]
+                let said = gather(&truth, iota(k)); // truth[0..k]
+                let hit = cast(eq(&proposed, &said), dtype::u32);
+                reshape(reduce_sum(cumprod(&hit)), [1])
+            } else if device_geometry {
+                // Zero, but read off the logits so the host cannot fold it.
+                let t0 = gather(&truth, iota(1));
+                cast(ne(&t0, &t0), dtype::u32)
+            } else {
+                &b - &b
+            };
+            let mb = broadcast(&m, [w]);
+
+            // ── commit: window[1..=m], then truth[m]; -1 past that
+            let next_of = gather(&window, min_elem(&i + &one, Tensor::constant(w - 1)));
+            let correction = broadcast(gather(&truth, &m), [w]);
+            let committed = select(lt(&i, &mb), &next_of, select(eq(&i, &mb), &correction, &none));
+            out.put(&committed);
+
+            // ── the next window: the correction, then row m's chain
+            let first = eq(&i, Tensor::constant(0u32));
+            let next = if k > 0 {
+                let chains = intrinsics::mtp_drafts(w * depth); // [w·depth]
+                let j = min_elem(max_elem(&i, &one) - &one, Tensor::constant(depth - 1));
+                let at = &mb * Tensor::constant(depth) + &j;
+                let drafted = and(not(&first), le(&i, Tensor::constant(k)));
+                select(&drafted, gather(&chains, &at), &correction)
+            } else {
+                correction
+            };
+            win.put(&next);
+
+            // ── the geometry of that window, from the new committed length:
+            //    lane i at nb + i, reading nb + i + 1 keys, every lane over
+            //    the same page run.
+            let nb = &b + &m + &one; // [1]
+            base.put(&nb);
+            let p = broadcast(&nb, [w]) + &i; // [w]
+            positions.put(&p);
+            w_slot.put(&p / page_size);
+            w_off.put(&p % page_size);
+            kv_len.put(&p + &one);
+            let page_count = (&nb + Tensor::constant(w)).div_ceil(page_size); // [1]
+            pages.put(gather(
+                iota(max_pages),
+                iota(w * max_pages) % broadcast(&page_count, [w * max_pages]),
+            ));
+            page_indptr.put(iota(w + 1) * broadcast(&page_count, [w + 1]));
+        });
+
+        let budget = input.max_tokens;
+        run_ahead(&pipe, &fwd, budget, async || {
+            let committed = out.take_host::<Vec<i32>>().await?;
+            if tracing {
+                let traced = aux.take_host::<Vec<f32>>().await?;
+                if proposed_trace.len() < 12 {
+                    let (fired, answered) = traced.split_at(w as usize);
+                    proposed_trace.push(fired.iter().skip(1).map(|&t| t as u32).collect());
+                    truth_trace.push(answered.iter().map(|&t| t as u32).collect());
+                }
+            } else {
+                let value = aux.take_host::<f32>().await?;
+                if margin {
+                    margin_trace.push(value);
+                }
+            }
+            rounds += 1;
+            drafted += k as usize;
+            let live: Vec<u32> = committed
+                .iter()
+                .filter(|&&t| t != NONE)
+                .map(|&t| t as u32)
+                .collect();
+            // Everything before the correction was a draft the trunk kept.
+            accepted += live.len().saturating_sub(1);
+            commits_trace.push(live.len() as u32);
+            for t in live {
+                generated.push(t);
+                if stop_tokens.contains(&t) || generated.len() >= input.max_tokens {
+                    stopped = true;
+                    break;
+                }
+            }
+            Ok(if stopped {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            })
+        })
+        .await?;
     }
-    pipeline.close();
+    pipe.close();
 
+    // A stop token ends the text; anything the last window committed past
+    // it is not the answer.
+    if let Some(at) = generated.iter().position(|t| stop_tokens.contains(t)) {
+        generated.truncate(at + 1);
+    }
+    generated.truncate(input.max_tokens);
     let acceptance_rate = if drafted == 0 {
         0.0
     } else {
         accepted as f64 / drafted as f64
     };
-    // The seed is not a generated-by-speculation token, but it IS text; the
-    // count is what the caller asked for and the text is what it reads.
     Ok(Output {
         sampler: "mtp-speculative-decoding",
         text: model::decode(&generated)?,
         count: generated.len(),
+        tokens: generated,
         rounds,
         drafted,
         accepted,
         acceptance_rate,
         k,
-        draft_sample,
-        truth_sample,
-        truth0_trace,
-        peak_trace,
+        depth,
+        prompt_tokens: n,
+        page_size,
+        margin_trace,
+        commits_trace,
+        proposed_trace,
+        truth_trace,
     })
 }

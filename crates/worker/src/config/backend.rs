@@ -241,6 +241,12 @@ pub struct MetalEngineOptions {
     /// in-memory boot document — the one key of the old bootstrap file the
     /// shell ever read.
     pub gpu_mem_utilization: f64,
+    /// Kernel-selection overrides for the Metal shell, `[engine.tuning]`,
+    /// handed through verbatim as the boot document's `[metal.tuning]`
+    /// (`kernels_metal::tuning::Overrides` names the keys: `qmv_rows_packs`,
+    /// `qmm_min_batch`, `sdpa_mma`, …). Empty by default; an unknown key is
+    /// dropped there, not refused here.
+    pub tuning: toml::Table,
     /// Metal device string, e.g. `"metal:0"`. Populated from
     /// `model.engine.device` rather than written here.
     #[serde(skip)]
@@ -260,6 +266,7 @@ impl Default for MetalEngineOptions {
             max_forward_requests: 512,
             max_model_len: None,
             gpu_mem_utilization: 0.90,
+            tuning: toml::Table::new(),
             device: "metal:0".to_string(),
             verbose: false,
         }

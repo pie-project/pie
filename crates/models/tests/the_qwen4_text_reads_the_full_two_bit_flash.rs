@@ -1,5 +1,5 @@
 //! Pins the qwen4 text's names and widths against the shipped 2-bit
-//! artifact `qwen38-flash-full-u4g64-u2g128-kv-bf16` (the parent
+//! artifact `qwen38-flash-next-full-u4g64-u2g128-kv-bf16` (the parent
 //! `mini-l4-e16-p8` was carved from), at the shipped `Dims`. Reads facts
 //! from a local snapshot or `$PIE_HEADER_MANIFEST` (a JSON header census
 //! that avoids downloading the 68 GiB artifact); neither present is a
@@ -9,8 +9,8 @@
 
 
 /// The catalog row the shipped artifact is declared by — not the plain
-/// `qwen38-flash-u4g64-u2g128-kv-bf16`, which is the miniature's.
-const SKU: &str = "qwen38-flash-full-u4g64-u2g128-kv-bf16";
+/// `qwen38-flash-next-u4g64-u2g128-kv-bf16`, which is the miniature's.
+const SKU: &str = "qwen38-flash-next-full-u4g64-u2g128-kv-bf16";
 
 // ── where a census gets its facts ───────────────────────────────────────────
 

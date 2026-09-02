@@ -129,9 +129,18 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
             dispatch.gather(region)?;
         }
 
+        // A capped region (`FireDescriptor::run_caps`: a streamed load's
+        // routed segment) is walked in pieces of at most `cap` rows, each
+        // its own launch — the sink cuts and seats before each. Cut after
+        // the grouped/copy decisions, which read the class intervals.
+        let once = grouped || copy;
+        if !once {
+            if let Some(&cap) = descriptor.run_caps.get(index) {
+                super::compose::chunk_spans(&mut runs, cap);
+            }
+        }
         // `max(1)` is the empty window: it turns once, at zero rows, so the
         // collective rule below still sees every node.
-        let once = grouped || copy;
         let launches = if once { 1 } else { runs.len().max(1) };
         for launch in 0..launches {
             sink.run(launch as u32, launches as u32);

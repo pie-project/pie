@@ -774,12 +774,43 @@ impl ProcessCtx {
                         w_cont_dense,
                         has_mask,
                         pooled: false,
+                        qo_indptr: None,
                     })
                 }
                 None => None,
             };
 
             let taint = prog.geometry_taint();
+            // A device-carried decode that re-publishes EVERY descriptor port
+            // — tokens, positions, pages, page bounds, kv length, write
+            // targets — states its whole geometry in-graph, so the engine
+            // resolves it there and the host only leases the pool. Asked
+            // before the envelope class: an envelope still folds every port
+            // but the token on the host, and a loop whose accepted count is
+            // device-decided (a speculative window) has nothing for the host
+            // to fold.
+            let devgeo = match devgeo {
+                Some(devgeo) => Some(devgeo),
+                None if devgeo_capable
+                    && !taint.host_derivable()
+                    && readable.start == 0
+                    && readable.end.is_none() =>
+                {
+                    crate::pipeline::fire::lease::detect_pooled_device_geometry(
+                        &prog.bound.container,
+                    )
+                    .map(|qo_indptr| {
+                        tracing::info!(
+                            "device-carried decode ({} lane(s), {} row(s)) re-publishes every \
+                             descriptor port: executes as a pool-owned device-geometry pass",
+                            qo_indptr.len().saturating_sub(1),
+                            qo_indptr.last().copied().unwrap_or(0)
+                        );
+                        crate::pipeline::fire::lease::DevGeo::pooled(qo_indptr, needs_mask_port)
+                    })
+                }
+                None => None,
+            };
             let decode_envelope = if devgeo.is_some() || taint.host_derivable() {
                 None
             } else {
@@ -825,30 +856,6 @@ impl ProcessCtx {
                         .to_string(),
                 ));
             }
-            // A decode loop carrying a dense device AttnMask fits neither the
-            // envelope class nor Host; route it to pool-owned device geometry,
-            // where the descriptor resolver reads every port including the mask.
-            let devgeo = match devgeo {
-                Some(devgeo) => Some(devgeo),
-                None if decode_envelope.is_none()
-                    && devgeo_capable
-                    && !taint.host_derivable()
-                    && readable.start == 0
-                    && readable.end.is_none() =>
-                {
-                    crate::pipeline::fire::lease::detect_pooled_device_geometry(
-                        &prog.bound.container,
-                    )
-                    .map(|lanes| {
-                        tracing::info!(
-                            "masked device-carried decode ({lanes} lane(s)) executes as a \
-                             pool-owned device-geometry pass"
-                        );
-                        crate::pipeline::fire::lease::DevGeo::pooled(lanes, true)
-                    })
-                }
-                None => None,
-            };
             let geometry_class = if devgeo.is_some() {
                 GeometryClass::DeviceGeometry
             } else if decode_envelope.is_some() {
@@ -1305,8 +1312,9 @@ impl pie::inferlet::forward::Host for ProcessCtx {
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward, PassKind::Attention);
 
-    /// Only the attention interface carries `media` for now; hybrid and
-    /// recurrent get it when a tower family needs it.
+    /// `media` rides the attention and hybrid interfaces (a hybrid tower
+    /// family exists: qwen3.8-flash-next); recurrent-only gets it when one
+    /// of those grows a tower.
     async fn media(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1390,6 +1398,16 @@ impl pie::inferlet::forward_hybrid::Host for ProcessCtx {
 
 impl pie::inferlet::forward_hybrid::HostForwardPass for ProcessCtx {
     forward_pass_common!(forward_hybrid, PassKind::Hybrid);
+
+    /// The attention interface's `media`, same host half: the span type is
+    /// `forward`'s (`use forward.{media-span}`), so nothing is translated.
+    async fn media(
+        &mut self,
+        this: Resource<ForwardPass>,
+        spans: Vec<pie::inferlet::forward_hybrid::MediaSpan>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_media(this, spans).await
+    }
 
     async fn attention(
         &mut self,

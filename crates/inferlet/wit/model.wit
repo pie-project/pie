@@ -14,6 +14,13 @@ interface model {
     // Whether the bound model enables system speculation by default
     default-system-speculation: func() -> bool;
 
+    // The draft head's chain depth: how many tokens past each readout row
+    // the `mtp_drafts` intrinsic carries (`[n_out × depth]`, row-major,
+    // each row's chain conditioned on the trunk's argmax at that row). Zero
+    // for a model with no draft head, in which case `mtp_drafts` and
+    // `mtp_logits` are unavailable. Static, like `frame-size`.
+    mtp-depth: func() -> u32;
+
     // Which forward-pass kind the bound model requires. A guest may only
     // construct the `forward-pass` of the matching interface; the other
     // interfaces' constructors error immediately.

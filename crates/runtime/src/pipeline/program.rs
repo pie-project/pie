@@ -422,7 +422,7 @@ fn profile_from(
         activation: eta_ir::types::Dtype::F32,
         has_lora: eta.has_lora,
         has_mtp_logits: eta.has_mtp_logits,
-        has_mtp_drafts: eta.has_mtp_drafts,
+        mtp_depth: eta.mtp_depth,
         has_value_head: eta.has_value_head,
         has_attn_score: eta.has_attn_score,
         has_attn_page_mask: eta.has_attn_page_mask,

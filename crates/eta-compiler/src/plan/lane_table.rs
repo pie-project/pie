@@ -13,7 +13,7 @@
 //! the reinterpretation [`crate::codegen::layout`] exists to rule out.
 
 /// Stamped into [`LaneTableHeader::abi_version`]; every backend decoder checks it.
-pub const LANE_TABLE_ABI_VERSION: u32 = 3;
+pub const LANE_TABLE_ABI_VERSION: u32 = 4;
 
 /// Runtime extents never enter a stage signature.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -97,6 +97,15 @@ pub struct LaneRecord {
     pub attn_score_row_stride: u32,
     /// Padding to 8-byte alignment. Must be zero, for [`reserved0`](Self::reserved0)'s reason.
     pub reserved1: u32,
+    /// *Address.* Base of this lane's block of the `mtp.drafts` plane — the
+    /// draft head's `[rows, depth]` i32 token ids, at the lane's first readout
+    /// row — or zero for a load with no draft head. Zero is honest absence,
+    /// as for [`attn_score_base`](Self::attn_score_base).
+    pub mtp_drafts_base: u64,
+    /// Row pitch of that plane in i32 elements: the head's chain depth.
+    pub mtp_drafts_depth: u32,
+    /// Padding to 8-byte alignment. Must be zero, for [`reserved0`](Self::reserved0)'s reason.
+    pub reserved2: u32,
 }
 
 /// One stage-local channel's per-lane state: the cells a put/take touches and the ring tickets the kernel checks.

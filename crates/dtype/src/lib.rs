@@ -466,6 +466,14 @@ pub const TILED_BAND: u32 = 16;
 /// belongs where the text said it rather than at the launch.
 pub const TILED_STEP: u32 = 64;
 
+/// The suffix a quantized weight's gain plane is named by. One home for one
+/// string: the declaring side (`model_dsl`) and the file side (`checkpoint`)
+/// must agree exactly.
+pub const SCALES: &str = ".scales";
+
+/// The suffix a quantized weight's offset plane is named by; see [`SCALES`].
+pub const BIASES: &str = ".biases";
+
 #[cfg(feature = "serde")]
 impl serde::Serialize for Dtype {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {

@@ -1,20 +1,14 @@
-//! The convert path, end to end: a checkpoint in, a `.zt` artifact out, and
-//! the artifact read back as a checkpoint.
-//!
-//! `pie model import` writes what the runtime will later load, so the two
-//! halves have to agree about more than shapes: the bytes a plan addresses in
-//! the artifact must be the bytes the executor produced. These tests run the
-//! write and the read against each other and compare payloads, not just
-//! metadata.
+//! The convert path, end to end: a checkpoint in, a `.zt` artifact out, read
+//! back as a checkpoint with every payload compared, not just metadata.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use checkpoint::contract::materialize::materialize_contract;
 use checkpoint::file::read::parse_metadata;
-use checkpoint::file::write::WriteTensor;
-use checkpoint::file::write::write_zt;
+use checkpoint::file::write::{write_zt, write_zt_grouped, WriteTensor};
 use checkpoint::file::zt;
+use checkpoint::serving::plane_name;
 
 use checkpoint::types::{
     DType, Encoding, QuantScheme, QuantSpec, TensorDecl, TensorId, Visibility,
@@ -52,6 +46,49 @@ fn bytes_at(metadata: &checkpoint::file::Metadata, name: &str) -> Vec<u8> {
     let mut out = vec![0u8; tensor.span_bytes as usize];
     handle.read_exact(&mut out).unwrap();
     out
+}
+
+/// The declarations `convert` writes a quantized weight by: the codes under
+/// the weight's own name, then one per companion plane of its type, each
+/// declared in the dtype its plane's leaf reads as.
+fn planes(codes: &TensorDecl, seed: u8) -> (Vec<String>, Vec<(TensorDecl, Vec<u8>)>) {
+    let Encoding::Quant(spec) = &codes.encoding else {
+        panic!("{} is not quantized", codes.name);
+    };
+    let term = ztensor::Term::parse(spec.term().expect("a scheme with a term").mangle().as_str())
+        .unwrap();
+    let shape: Vec<u64> = codes.shape.iter().map(|&d| d as u64).collect();
+    let mut out = Vec::new();
+    for (at, plane) in term.planes(&shape).unwrap().into_iter().enumerate() {
+        let name = plane_name(&codes.name, &plane.path);
+        let decl = match at {
+            0 => codes.clone(),
+            _ => {
+                let leaf = match plane.leaf {
+                    ztensor::Leaf::BF16 => DType::Bf16,
+                    ztensor::Leaf::F16 => DType::F16,
+                    ztensor::Leaf::F32 => DType::F32,
+                    ztensor::Leaf::E8M0 => DType::E8m0,
+                    other => panic!("{name} holds `{other}`, which no scheme here declares"),
+                };
+                let shape = plane.shape.iter().map(|&d| d as i64).collect();
+                decl(&name, shape, Encoding::Raw(leaf))
+            }
+        };
+        out.push((decl, pattern(plane.len as usize, seed.wrapping_add(at as u8))));
+    }
+    let names = out.iter().map(|(decl, _)| decl.name.clone()).collect();
+    (names, out)
+}
+
+/// Writes one grouped quantized weight and its planes' bytes.
+fn write_grouped(path: &Path, object: &str, planes: &[(TensorDecl, Vec<u8>)]) -> Result<(), checkpoint::error::Error> {
+    let tensors: Vec<WriteTensor<'_>> = planes
+        .iter()
+        .map(|(decl, bytes)| WriteTensor { decl, bytes })
+        .collect();
+    let names = planes.iter().map(|(decl, _)| decl.name.clone()).collect();
+    write_zt_grouped(path, &BTreeMap::new(), &tensors, &[(object.to_string(), names)])
 }
 
 /// A model of the shapes `convert` actually produces — plain dtypes decoded
@@ -161,26 +198,25 @@ fn a_corrupt_artifact_is_caught_by_its_digest() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The quantized schemes safetensors has no tag for, and the property that
-/// makes the profile parametric: each one comes back as *itself*.
-///
-/// AWQ and GPTQ differ only in packing order, and MLX-affine only in how its
-/// zero points are stored. If the reader recovered the scheme from a name the
-/// writer had left behind, this test would pass while telling us nothing. It
-/// passes because the parameters are in the file.
+/// Each affine group scheme is recovered from the object's `type`, never
+/// from a name. AWQ and GPTQ are refused: their u4 zero-point plane lands on
+/// no device dtype, so the bridge states no type for them.
 #[test]
 fn each_affine_group_scheme_round_trips_as_itself() {
+    enum Back {
+        Scheme(QuantScheme),
+        NoType,
+    }
     let dir = tmpdir("schemes");
-    for (scheme, group, bits) in [
-        (QuantScheme::AwqInt4, 128u32, 4u8),
-        (QuantScheme::GptqInt4, 128, 4),
-        (QuantScheme::MlxAffineU4, 64, 4),
-        (QuantScheme::Int4B8, 32, 4),
-        (QuantScheme::Int8Symmetric, 0, 8),
-        (QuantScheme::Int8Asymmetric, 0, 8),
+    for (scheme, group, bits, back) in [
+        (QuantScheme::AwqInt4, 128u32, 4u8, Back::NoType),
+        (QuantScheme::GptqInt4, 128, 4, Back::NoType),
+        (QuantScheme::MlxAffineU4, 64, 4, Back::Scheme(QuantScheme::MlxAffineU4)),
+        (QuantScheme::Int4B8, 32, 4, Back::Scheme(QuantScheme::Int4B8)),
+        (QuantScheme::Int8Symmetric, 0, 8, Back::Scheme(QuantScheme::Int8Symmetric)),
+        (QuantScheme::Int8Asymmetric, 0, 8, Back::NoType),
     ] {
         let path = dir.join(format!("{scheme:?}.zt"));
-        let payload = vec![0x5au8; 512];
         let spec = QuantSpec {
             scheme,
             logical_dtype: DType::Bf16,
@@ -188,16 +224,29 @@ fn each_affine_group_scheme_round_trips_as_itself() {
             group_size: group,
             channel_axis: None,
         };
-        let d = decl("w", vec![1024], Encoding::Quant(spec));
-        write_zt(
-            &path,
-            &BTreeMap::new(),
-            &[WriteTensor {
-                decl: &d,
-                bytes: &payload,
-            }],
-        )
-        .unwrap_or_else(|err| panic!("{scheme:?} could not be written: {err}"));
+        let d = decl("w", vec![1024], Encoding::Quant(spec.clone()));
+        let Back::Scheme(back) = back else {
+            let err = write_zt(
+                &path,
+                &BTreeMap::new(),
+                &[WriteTensor {
+                    decl: &d,
+                    bytes: &[0u8; 1024],
+                }],
+            )
+            .expect_err("a scheme with no term cannot be stated");
+            assert!(err.to_string().contains("no type"), "{scheme:?}: {err}");
+            continue;
+        };
+        let (_, planes) = planes(&d, 0x5a);
+        write_grouped(&path, "w", &planes)
+            .unwrap_or_else(|err| panic!("{scheme:?} could not be written: {err}"));
+        let manifest = ztensor::read::manifest_of(&path).unwrap().unwrap();
+        assert_eq!(
+            manifest.objects["w"].term.as_ref().map(ToString::to_string).as_deref(),
+            Some(spec.term().unwrap().mangle().as_str()),
+            "{scheme:?}: the file states another type"
+        );
 
         let metadata = zt::parse(&path).unwrap_or_else(|err| {
             panic!("{scheme:?} was written but could not be read back: {err}")
@@ -206,84 +255,63 @@ fn each_affine_group_scheme_round_trips_as_itself() {
         match &w.encoding {
             Encoding::Quant(got) => {
                 assert_eq!(
-                    got.scheme, scheme,
-                    "{scheme:?} came back as {:?} — the parameters did not identify it",
+                    got.scheme, back,
+                    "{scheme:?} came back as {:?} — the type did not identify it",
                     got.scheme
                 );
                 assert_eq!(got.bits_per_element, bits, "{scheme:?}: bits");
             }
             other => panic!("{scheme:?} read back as {other:?}"),
         }
-        assert_eq!(bytes_at(&metadata, "w"), payload, "{scheme:?}: payload");
+        for (decl, bytes) in &planes {
+            assert_eq!(&bytes_at(&metadata, &decl.name), bytes, "{scheme:?}: {}", decl.name);
+        }
     }
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// No name is carried. The file describes the scheme by its parameters, so a
-/// reader that never heard of pie's enum can still decode it — and a reader
-/// that has one recovers it without being told.
+/// No name is carried. The object's `type` states the arithmetic by its
+/// parameters, so a reader that never heard of pie's enum can still decode
+/// it — and a reader that has one recovers it without being told.
 #[test]
 fn the_artifact_names_parameters_not_schemes() {
     let dir = tmpdir("parametric");
     let path = dir.join("model.zt");
     let spec = QuantSpec {
-        scheme: QuantScheme::GptqInt4,
+        scheme: QuantScheme::MlxAffineU4,
         logical_dtype: DType::Bf16,
         bits_per_element: 4,
         group_size: 128,
         channel_axis: None,
     };
-    let d = decl("w", vec![1024], Encoding::Quant(spec));
-    write_zt(
-        &path,
-        &BTreeMap::new(),
-        &[WriteTensor {
-            decl: &d,
-            bytes: &vec![0u8; 512],
-        }],
-    )
-    .unwrap();
+    let d = decl("w", vec![1024], Encoding::Quant(spec.clone()));
+    let (_, planes) = planes(&d, 0x11);
+    write_grouped(&path, "w", &planes).unwrap();
 
-    let reader = ztensor::Source::open(&path).unwrap();
-    let object = reader.get("w").unwrap();
-    assert_eq!(object.layout(), "zt.quant_group/1");
-
-    let attributes = object.attributes().expect("parameters are recorded");
-    let rendered = format!("{attributes:?}");
-    for parameter in ["bits", "group_size", "packing", "scale_form", "zero_point"] {
-        assert!(rendered.contains(parameter), "missing {parameter}");
+    let manifest = ztensor::read::manifest_of(&path).unwrap().unwrap();
+    let object = &manifest.objects["w"];
+    assert_eq!(object.layout, None, "the planes lie canonically");
+    assert_eq!(object.attributes, None, "nothing beside the type describes them");
+    let stated = object.term.as_ref().expect("the type is recorded").to_string();
+    assert_eq!(stated, spec.term().unwrap().mangle().as_str());
+    for parameter in ["g128", "u4", "bf16"] {
+        assert!(stated.contains(parameter), "{stated} does not state {parameter}");
     }
     // The scheme's own name appears nowhere: that is the point.
+    let rendered = format!("{manifest:?}").to_ascii_lowercase();
     assert!(
-        !rendered.contains("GptqInt4"),
+        !rendered.contains("mlx") && !rendered.contains("affine"),
         "the file carries the scheme's name: {rendered}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// SERVE-AS-STORED, END TO END (campaign J5, step 1)
-//
-// A GGUF in, an artifact out, and the two questions the serving wave will
-// ask of it: are the block's bytes still the block's bytes, and does the
-// artifact say what they MEAN. Everything above writes a hand-built
-// declaration; the first below writes a real GGUF header and lets
-// `materialize_contract` decide the split, because the split is the claim.
-// ─────────────────────────────────────────────────────────────────────────
-
-/// A GGUF v3 file: header, tensor infos, then the data section on a 32-byte
-/// boundary.
-///
-/// Built here rather than fetched because the fixture has to hold schemes no
-/// small public checkpoint carries together — a K-quant, an IQ lattice and two
-/// plain widths in one file — and because a downloaded file would make these
-/// tests depend on the network. The layout is the one `ztensor-compat`'s
-/// `gguf` projection reads: magic, `u32` version, `u64` tensor count, `u64` KV
-/// count, the KVs, then per tensor a name, a dimension count, the dimensions
-/// **fastest-first**, a ggml type id and an offset into the data section.
-///
-/// No metadata KVs, so `general.alignment` takes its default of 32.
+/// A GGUF v3 file, built by hand so one fixture holds a K-quant, an IQ
+/// lattice and two plain widths without the network: magic, `u32` version,
+/// `u64` tensor count, `u64` KV count, the KVs, then per tensor a name, a
+/// dimension count, the dimensions fastest-first, a ggml type id and a data
+/// offset. No KVs, so `general.alignment` defaults to 32.
 fn gguf(tensors: &[(&str, Vec<u64>, u32, Vec<u8>)]) -> Vec<u8> {
     const ALIGN: usize = 32;
     let mut head = Vec::new();
@@ -323,23 +351,18 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
-/// The `qnf` attribute a written object carries, or `None` when it carries
-/// none.
-fn qnf_of(source: &ztensor::Source, name: &str) -> Option<String> {
-    let object = source.get(name).expect("the artifact holds the tensor");
-    let attributes = object.attributes()?;
-    match attributes.get("qnf")? {
-        ztensor::format::cbor::Value::Text(spelling) => Some(spelling.clone()),
-        other => panic!("{name}: qnf is {other:?} and not text"),
-    }
+/// The `type` a written object states, or `None` when it states none.
+fn type_of(source: &ztensor::Source, name: &str) -> Option<String> {
+    source
+        .get(name)
+        .expect("the artifact holds the tensor")
+        .term()
+        .map(ToString::to_string)
 }
 
-/// Writes what `pie model import` would write for `metadata`: the decoded set
-/// through the plan, the passthrough set copied, both in ascending name order.
-///
-/// The same two calls the command makes — `Writer::add_tensor` for a decoded
-/// tensor and `begin_tensor`/`write`/`end_tensor` for a copy — so a test that
-/// passes here is a statement about the command and not about a shortcut.
+/// Writes what `pie model import` writes for `metadata`, through the same
+/// two calls the command makes: `Writer::add_tensor` for a decoded tensor,
+/// `begin_tensor`/`write`/`end_tensor` for a copy.
 fn convert(source_dir: &std::path::Path, metadata: &checkpoint::file::Metadata, out: &Path) {
     use checkpoint::plan::{CONVERT_TILE_MAP_MASK, StorageTarget};
 
@@ -351,10 +374,8 @@ fn convert(source_dir: &std::path::Path, metadata: &checkpoint::file::Metadata, 
             tile_map_mask: CONVERT_TILE_MAP_MASK,
             ..StorageTarget::default()
         };
-        // `compile` and not `compile_streaming`, which is what the command
-        // itself uses (`ops::model::import::compile_decode`): the two differ
-        // only in the SCHEDULE, and these tests read payloads. The schedule is
-        // pinned where it matters, beside the call site.
+        // `compile` rather than the command's `compile_streaming`: the two
+        // differ only in schedule, and these tests read payloads.
         let plan =
             checkpoint::plan::compile(metadata, &materialization.contract, target).unwrap();
         let storage = checkpoint::executor::Execution::new(&plan, source_dir)
@@ -406,20 +427,9 @@ fn convert(source_dir: &std::path::Path, metadata: &checkpoint::file::Metadata, 
     writer.finish().unwrap();
 }
 
-/// A GGUF's blocks reach the artifact byte for byte, under `.zt`'s own name
-/// for the scheme, with the QNF spelling of what they mean beside it.
-///
-/// **The passthrough half is a PIN, not a change.** A self-contained block has
-/// been kept as stored since the decode moved to the point that needs it
-/// unpacked, and this states that in the terms the serving wave will use: a
-/// Q4_K tensor's 144 bytes are the source's 144 bytes, the profile is
-/// `gguf.q4_k/1`, and nothing about the file says bf16. Without this, the
-/// property is asserted only against a hand-built `Metadata` in
-/// `contract::materialize`'s own tests and never against a real GGUF header.
-///
-/// **The `qnf` half is new.** A layout profile says how bytes are ADDRESSED;
-/// two schemes can share one and mean different arithmetic. The attribute says
-/// what they mean, in the one spelling a kernel table can be keyed on.
+/// A GGUF's blocks reach the artifact byte for byte under `gguf.<type>/2`,
+/// with the QNF spelling of their arithmetic as the object's `type`: the
+/// layout says how bytes are addressed, the type what they mean.
 #[test]
 fn a_gguf_block_reaches_the_artifact_as_stored_and_says_what_it_means() {
     let dir = tmpdir("stored");
@@ -450,9 +460,8 @@ fn a_gguf_block_reaches_the_artifact_as_stored_and_says_what_it_means() {
 
     let metadata = parse_metadata(&source).unwrap();
     let materialization = materialize_contract(&metadata).unwrap();
-    // The whole of the split, stated: only the width no kernel reads is
-    // rewritten. Both blocks stay stored — the IQ one as much as the K one,
-    // because keeping bytes needs no decoder, only a name to keep them under.
+    // Only the width no kernel reads is rewritten; both blocks stay stored,
+    // since keeping bytes needs no decoder.
     assert_eq!(materialization.decoded, ["plain.f32"]);
     assert_eq!(
         materialization.passthrough,
@@ -463,13 +472,16 @@ fn a_gguf_block_reaches_the_artifact_as_stored_and_says_what_it_means() {
     convert(&dir, &metadata, &out);
 
     let reader = ztensor::Source::open(&out).unwrap();
-    assert_eq!(reader.get("block.q4_k").unwrap().layout(), "gguf.q4_k/1");
+    assert_eq!(
+        reader.get("block.q4_k").unwrap().layout(),
+        Some("gguf.q4_k/2")
+    );
     assert_eq!(
         reader.get("lattice.iq2_xxs").unwrap().layout(),
-        "gguf.iq2_xxs/1"
+        Some("gguf.iq2_xxs/2")
     );
-    assert_eq!(reader.get("plain.bf16").unwrap().layout(), "dense");
-    assert_eq!(reader.get("plain.f32").unwrap().layout(), "dense");
+    assert_eq!(reader.get("plain.bf16").unwrap().layout(), None);
+    assert_eq!(reader.get("plain.f32").unwrap().layout(), None);
 
     // Byte for byte, through the reader's own coordinates.
     let artifact = parse_metadata(&out).unwrap();
@@ -486,9 +498,8 @@ fn a_gguf_block_reaches_the_artifact_as_stored_and_says_what_it_means() {
         other => panic!("the block read back as {other:?}"),
     }
 
-    // What the bytes MEAN, in QNF. Read off the bridge rather than typed out,
-    // so a row that moves moves here too; the literal is asserted beside it
-    // because a spelling is a wire fact once a kernel table keys on it.
+    // The type, read off the bridge so a moved row moves here too; the
+    // literal beside it is a wire fact once a kernel table keys on it.
     let q4_k = QuantSpec {
         scheme: QuantScheme::GgufQ4K,
         logical_dtype: DType::Bf16,
@@ -499,17 +510,15 @@ fn a_gguf_block_reaches_the_artifact_as_stored_and_says_what_it_means() {
     .term()
     .expect("Q4_K has a term");
     assert_eq!(q4_k.mangle().as_str(), "g32_u4_g8_u6_f16_n_b_g8_u6_f16_n");
-    assert_eq!(qnf_of(&reader, "block.q4_k").as_deref(), Some(q4_k.mangle().as_str()));
+    assert_eq!(type_of(&reader, "block.q4_k").as_deref(), Some(q4_k.mangle().as_str()));
 
     // A decoded tensor and a copied one that hold the same width say the same
     // word: the stamp follows the encoding, not the route.
-    assert_eq!(qnf_of(&reader, "plain.bf16").as_deref(), Some("bf16"));
-    assert_eq!(qnf_of(&reader, "plain.f32").as_deref(), Some("bf16"));
+    assert_eq!(type_of(&reader, "plain.bf16").as_deref(), Some("bf16"));
+    assert_eq!(type_of(&reader, "plain.f32").as_deref(), Some("bf16"));
 
-    // The refusal, and it is silence rather than a guess. An IQ lattice's
-    // points are compiled into llama.cpp, so no group width and no code leaf
-    // describes its bytes — the tensor keeps its profile and carries no
-    // spelling at all.
+    // An IQ lattice's points are compiled into llama.cpp, so no term
+    // describes its bytes: it keeps its layout and states no type.
     assert_eq!(
         QuantSpec {
                 scheme: QuantScheme::GgufIq2Xxs,
@@ -522,10 +531,9 @@ fn a_gguf_block_reaches_the_artifact_as_stored_and_says_what_it_means() {
         None,
         "the bridge would have to name a lattice to stamp one"
     );
-    assert_eq!(qnf_of(&reader, "lattice.iq2_xxs"), None);
-    // And the profile's own attributes are still there: the stamp ADDS a key
-    // or adds nothing, and a scheme with no signature must not lose the
-    // constants a reader sizes its blocks from.
+    assert_eq!(type_of(&reader, "lattice.iq2_xxs"), None);
+    // And the layout's own attributes are still there: a scheme with no
+    // type must not lose the constants a reader sizes its blocks from.
     let rendered = format!(
         "{:?}",
         reader.get("lattice.iq2_xxs").unwrap().attributes().unwrap()
@@ -536,22 +544,15 @@ fn a_gguf_block_reaches_the_artifact_as_stored_and_says_what_it_means() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Every scheme the bridge names gets its spelling into the file, and every
-/// one it refuses gets none — checked over the whole enum rather than the four
-/// a fixture happens to hold.
-///
-/// The exhaustive half is what makes this worth writing: `stamp_qnf` reads an
-/// `Option` and the compiler cannot tell a refused row from a forgotten one,
-/// so the only thing standing between "no signature yet" and "the stamp
-/// silently stopped working" is asking every row and comparing against the
-/// bridge's own answer.
+/// Every scheme the bridge names is written as the object's `type` and every
+/// one it refuses gets none, checked over the whole enum: the bridge answers
+/// an `Option`, so only asking every row tells a refused one from a forgotten
+/// one.
 #[test]
 fn every_scheme_the_bridge_names_is_stamped_and_every_one_it_refuses_is_not() {
     let dir = tmpdir("stamp");
     // 256 elements of each scheme, and the bytes that takes. A blocked scheme
-    // answers through `block_layout`; the rest store a plain array, and the
-    // two FP8 rows are the ones whose LOGICAL type is the element itself —
-    // `dense` plus that type is how the writer says "plain f8 values".
+    // stores one block array; the rest store one plane per node of the term.
     for (scheme, logical) in [
         (QuantScheme::GgufQ4_0, DType::Bf16),
         (QuantScheme::GgufQ4_1, DType::Bf16),
@@ -590,48 +591,56 @@ fn every_scheme_the_bridge_names_is_stamped_and_every_one_it_refuses_is_not() {
         }
         .normalized();
         let path = dir.join(format!("{scheme:?}.zt"));
+        let expected =
+            checkpoint::term_of(&Encoding::Quant(spec.clone())).map(|term| term.to_string());
+        let d = decl("w", vec![256], Encoding::Quant(spec.clone()));
         // 256 elements is a whole super-block for every K-quant and a whole
         // number of blocks for the rest, so the payload is a legal extent
         // whatever the scheme.
-        let stored = match spec.block_layout() {
-            Some((elems, bytes)) => 256 / elems as usize * bytes as usize,
-            // OCP MXFP4's element is half a byte and the writer says so with
-            // the `f4_e2m1` logical type; everything else here is a byte.
-            None if scheme == QuantScheme::Mxfp4E2M1E8M0 => 128,
-            None => 256,
-        };
-        let payload = pattern(stored, 0x2b);
-        let d = decl("w", vec![256], Encoding::Quant(spec.clone()));
-        write_zt(
-            &path,
-            &BTreeMap::new(),
-            &[WriteTensor {
-                decl: &d,
-                bytes: &payload,
-            }],
-        )
-        .unwrap_or_else(|err| panic!("{scheme:?} could not be written: {err}"));
+        if let Some((elems, bytes)) = spec.block_layout() {
+            let payload = pattern(256 / elems as usize * bytes as usize, 0x2b);
+            write_zt(
+                &path,
+                &BTreeMap::new(),
+                &[WriteTensor {
+                    decl: &d,
+                    bytes: &payload,
+                }],
+            )
+            .unwrap_or_else(|err| panic!("{scheme:?} could not be written: {err}"));
+        } else if expected.is_some() {
+            let (_, planes) = planes(&d, 0x2b);
+            write_grouped(&path, "w", &planes)
+                .unwrap_or_else(|err| panic!("{scheme:?} could not be written: {err}"));
+        } else {
+            // Neither a block layout nor a type: nothing to write it under.
+            let err = write_zt(
+                &path,
+                &BTreeMap::new(),
+                &[WriteTensor {
+                    decl: &d,
+                    bytes: &[0u8; 256],
+                }],
+            )
+            .expect_err("a scheme the bridge refuses has no type to write");
+            assert!(err.to_string().contains("no type"), "{scheme:?}: {err}");
+            continue;
+        }
 
         let reader = ztensor::Source::open(&path).unwrap();
-        let expected = spec.term().map(|term| term.mangle().as_str().to_string());
         assert_eq!(
-            qnf_of(&reader, "w"),
+            type_of(&reader, "w"),
             expected,
             "{scheme:?}: the file disagrees with the bridge"
         );
-        // Whatever the stamp did, the file still reads back — the check that
-        // would have caught the first draft of `stamp_qnf`, which dropped a
-        // profile's own attributes for every scheme the bridge refused.
-        zt::parse(&path)
-            .unwrap_or_else(|err| panic!("{scheme:?} was stamped into unreadability: {err}"));
+        // Whatever the type said, the file reads back.
+        zt::parse(&path).unwrap_or_else(|err| panic!("{scheme:?} was typed into unreadability: {err}"));
     }
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A plain dtype is stamped too, and with the leaf that names it.
-///
-/// `Dtype::repr` is total, so `dense` is the case where an absent attribute
-/// can only mean the stamp did not run.
+/// A plain dtype is typed too, with the leaf that names it, and lies
+/// canonically (no layout).
 #[test]
 fn a_plain_tensor_carries_its_own_leaf() {
     let dir = tmpdir("plain");
@@ -655,8 +664,8 @@ fn a_plain_tensor_carries_its_own_leaf() {
         )
         .unwrap();
         let reader = ztensor::Source::open(&path).unwrap();
-        assert_eq!(reader.get("w").unwrap().layout(), "dense");
-        assert_eq!(qnf_of(&reader, "w").as_deref(), Some(spelling));
+        assert_eq!(reader.get("w").unwrap().layout(), None);
+        assert_eq!(type_of(&reader, "w").as_deref(), Some(spelling));
         assert_eq!(dtype.repr().mangle().as_str(), spelling);
     }
     std::fs::remove_dir_all(&dir).ok();

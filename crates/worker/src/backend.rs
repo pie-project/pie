@@ -405,6 +405,10 @@ pub(crate) fn create_engine_backend(
                 "[metal]\ngpu_mem_utilization = {:?}\n",
                 opts.gpu_mem_utilization
             );
+            if !opts.tuning.is_empty() {
+                boot_doc.push_str("\n[metal.tuning]\n");
+                boot_doc.push_str(&opts.tuning.to_string());
+            }
             // Quoted through `toml::Value` so an unusual path cannot break the document.
             if let Some(mount) = adapter_dir {
                 boot_doc.push_str(&format!(
@@ -429,9 +433,15 @@ pub(crate) fn create_engine_backend(
                     page_size,
                     max_context,
                     slots: (opts.total_pages / pages_per_slot).max(1),
-                    // The metal mirror binds no patch seat.
-                    max_patches: None,
-                    max_images: None,
+                    // `[model] max_patches` / `max_images` when stated; absent,
+                    // the shell derives a ladder from the loaded text
+                    // (`engine_metal::api::patch_ladder`: the token ceiling,
+                    // capped at two native-grid images) — which for a qwen
+                    // tower (256 patches at its smallest image) is under one
+                    // picture at a 128-token fire, so a vision deployment
+                    // states it.
+                    max_patches: patch_ceilings.0,
+                    max_images: patch_ceilings.1,
                 },
                 model_ir::Platform::Metal,
             )

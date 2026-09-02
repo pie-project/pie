@@ -180,6 +180,19 @@ impl Run<'_> {
                 // Whole, for `scatter_live_rows`' reason one arm up.
                 self.uncut(*y),
             ),
+            // One launch per operand: each writes its own column of the i32
+            // plane, so the plane is whole once the last has run.
+            Layout::Argmax { xs, y } => {
+                for (column, x) in xs.iter().enumerate() {
+                    layout::argmax(
+                        self.ctx(),
+                        self.tensor(*x),
+                        u32::try_from(column).expect("a draft depth inside u32"),
+                        self.tensor(*y),
+                    )?;
+                }
+                Ok(())
+            }
             Layout::Select {
                 table,
                 layer,

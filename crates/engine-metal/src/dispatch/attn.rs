@@ -623,8 +623,11 @@ impl Run<'_> {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_metal::Error::Unsupported { op: op.name() });
                 };
+                // The ids run extended; the hashed rows land in the op's own
+                // rectangle — the gathered-table cut reads them the instant
+                // this dispatch is enqueued (`Sink::fire`'s hasher point), so
+                // nothing may stand between the kernel and the arena.
                 let ext_ids = self.rs_extend(OP, &seat, *ids)?;
-                let ext_out = self.rs_out(OP, &seat, *ngram_ids)?;
                 attn::ple::ngram_ids_committed(
                     self.ctx(),
                     ext_ids,
@@ -637,9 +640,8 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
-                    ext_out,
-                )?;
-                self.rs_land(OP, &seat, ext_out, *ngram_ids)
+                    self.tensor(*ngram_ids),
+                )
             }
             Attention::SsmCausalConv1d {
                 x,

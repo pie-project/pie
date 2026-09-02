@@ -342,7 +342,7 @@ fn bf16_bits(value: f32) -> u16 {
 /// reconstructed from flags.
 ///
 /// `has_mtp_logits` follows [`Shell::drafts`]; `has_attn_score` follows
-/// [`Shell::observes_scores`]. `has_mtp_drafts`/`has_value_head` are always `false` (no device
+/// [`Shell::observes_scores`]; `mtp_depth` follows [`Shell::mtp_depth`]. `has_value_head` is always `false` (no device
 /// path produces them). `has_attn_page_mask` is unrelated to `Lane::mask`.
 fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
     let trace = shell.trace();
@@ -360,7 +360,7 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // Interpreter-visible dtype, not this device's own bf16 activation type.
         activation: Dtype::F32,
         has_mtp_logits: shell.drafts(),
-        has_mtp_drafts: false,
+        mtp_depth: shell.mtp_depth(),
         has_value_head: false,
         has_attn_score: shell.observes_scores(),
         has_attn_page_mask: false,
@@ -635,7 +635,7 @@ impl Engine for Metal {
             profile,
             // This shell resolves the whole fire geometry on the device, letting a
             // sampled token feed the next decode step without a host round-trip.
-            ports: PortMask::DEVICE_GEOMETRY.with(Port::AttnMask),
+            ports: PortMask::DEVICE_GEOMETRY.with(Port::AttnMask).with(Port::RsFoldLen),
             geometry: GeometryClass::DeviceGeometry,
             // Host directions need a pinned swap pool this load reserves none of.
             kv_copy: KvCopyDomains {

@@ -190,3 +190,71 @@ template <typename T>
       const constant int&, uint3, uint3);
 
 instantiate_rope_mrope_blocked(bfloat16, bfloat)
+
+/// **THE SPLIT ROTATION** (`MropeForm::Split`, Gemma's tower): section `a`
+/// owns channels `[2·before_a, 2·before_a + 2·s_a)` where `before_a` is the
+/// pairs of the sections ahead of it, and pair `within` of the block is
+/// `(x[b + within], x[b + s_a + within])` — `rotate_half` inside the block —
+/// at `theta^(-within / s_a)` (mlx_vlm `apply_multidimensional_rope`:
+/// `channels_per_dim = 2·s`, exponent `(2 / channels_per_dim) · i`). The
+/// blocked shader above pairs `x[p]` with `x[p + head_dim/2]` instead; same
+/// sections, other pairs. Lane `i` of the grid is the `i`-th pair of `Σ
+/// sections`, as there.
+template <typename T>
+[[kernel]] void rope_mrope_split(
+    device T* x                       [[buffer(0)]],
+    const device int* positions       [[buffer(1)]],
+    const constant float& base        [[buffer(2)]],
+    const constant int& head_dim      [[buffer(3)]],
+    const constant int& s0            [[buffer(4)]],
+    const constant int& s1            [[buffer(5)]],
+    const constant int& s2            [[buffer(6)]],
+    uint3 pos  [[thread_position_in_grid]],
+    uint3 grid [[threads_per_grid]]) {
+  const int i = int(pos.x);
+  const int h = int(pos.y);
+  const int m = int(pos.z);
+  const int n_head = int(grid.y);
+
+  const int axis_of[3] = {positions[3 * m + 0],
+                          positions[3 * m + 1],
+                          positions[3 * m + 2]};
+
+  int axis;
+  int within;
+  int before;
+  int width;
+  if (i < s0) {
+    axis = 0; within = i; before = 0; width = s0;
+  } else if (i < s0 + s1) {
+    axis = 1; within = i - s0; before = s0; width = s1;
+  } else {
+    axis = 2; within = i - s0 - s1; before = s0 + s1; width = s2;
+  }
+  if (width <= 0) {
+    return;
+  }
+
+  const float d = static_cast<float>(within) / static_cast<float>(width);
+  const float inv_freq = exp2(-d * base);
+  const float theta = static_cast<float>(axis_of[axis]) * inv_freq;
+  const float costheta = fast::cos(theta);
+  const float sintheta = fast::sin(theta);
+
+  const size_t row = (size_t(m) * size_t(n_head) + size_t(h)) * size_t(head_dim);
+  const size_t i1 = row + size_t(2 * before + within);
+  const size_t i2 = i1 + size_t(width);
+  const float x1 = static_cast<float>(x[i1]);
+  const float x2 = static_cast<float>(x[i2]);
+  x[i1] = static_cast<T>(x1 * costheta - x2 * sintheta);
+  x[i2] = static_cast<T>(x1 * sintheta + x2 * costheta);
+}
+
+#define instantiate_rope_mrope_split(name, itype)                          \
+  template [[host_name("rope_mrope_split_" #name)]]                        \
+  [[kernel]] void rope_mrope_split<itype>(                                 \
+      device itype*, const device int*, const constant float&,             \
+      const constant int&, const constant int&, const constant int&,       \
+      const constant int&, uint3, uint3);
+
+instantiate_rope_mrope_split(bfloat16, bfloat)

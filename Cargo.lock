@@ -506,8 +506,10 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror",
+ "xxhash-rust",
  "ztensor",
  "ztensor-compat",
 ]
@@ -6633,9 +6635,7 @@ dependencies = [
 
 [[package]]
 name = "ztensor"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3193d457eb22b13115f37b4d868e3188408c17faa877b20a1ed728fe3258c4b"
+version = "3.0.0"
 dependencies = [
  "libc",
  "memmap2",
@@ -6647,9 +6647,7 @@ dependencies = [
 
 [[package]]
 name = "ztensor-compat"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5812fd585f5e38e6dfc8d13ed9b189b4678ac6900e000b77c2911e503ba08e14"
+version = "3.0.0"
 dependencies = [
  "flate2",
  "memmap2",

@@ -198,7 +198,11 @@ pub fn refuse_orphan_runs(lanes: &[&[u32]], pad: Option<u32>) -> Result<(), Refu
 /// Derives the contract row per lane from the matched runs: anchors, routes,
 /// and positions are facts that only exist once the scan has matched.
 #[must_use]
-pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32]) -> Vec<LaneMedia> {
+/// `lane_base[lane]` is the lane's first row position: the rotation cursor
+/// starts there, so a media fire that is not a sequence's first (text before
+/// the picture prefilled in an earlier fire) rotates its rows where the
+/// sequence's cursor actually stands rather than at zero.
+pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32], lane_base: &[u32]) -> Vec<LaneMedia> {
     let mut out: Vec<LaneMedia> = Vec::new();
     for run in matched {
         let slot = match out.iter().position(|m| m.lane == run.lane) {
@@ -222,7 +226,10 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32]) -> Vec<LaneMedia> {
         for k in 0..run.rows {
             m.routes.push((run.anchor + k) as i32);
         }
-        // positions is (y, x) pairs, fold-block-major, from the front-end.
+        // positions is axis pairs, fold-block-major, in the FRONT-END's order
+        // (Qwen `(y, x)`, Gemma `(x, y)`): the tower's rotation reads the
+        // triple's second and third slots as its two sections, so the order
+        // is the family's to state.
         // Widened here to (t, y, x); t is 0 (still images have no temporal axis).
         let owed = 2 * span.rows as usize;
         if span.positions.len() == owed {
@@ -268,7 +275,7 @@ pub fn lane_media(matched: &[MatchedRun], lane_rows: &[u32]) -> Vec<LaneMedia> {
         // image's run spends h*w rows while advancing the cursor by max(gh, gw).
         // Every triple's axes are offset by the cursor at the run's start.
         m.token_positions = Vec::with_capacity(3 * rows as usize);
-        let mut cursor: u32 = 0;
+        let mut cursor: u32 = lane_base.get(m.lane as usize).copied().unwrap_or(0);
         let mut p: u32 = 0;
         let mut next = 0usize;
         while p < rows {

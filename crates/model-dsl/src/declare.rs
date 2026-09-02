@@ -1,7 +1,7 @@
 //! Weight declarations without generics: `Dtype` is a plain field, so there
 //! is one `Weight` struct and no monomorphized model trees.
 
-use model_ir::{Dtype, Param, ParamSource, Platform, Shard, TILED_BAND, TILED_STEP};
+use model_ir::{BIASES, Dtype, Param, ParamSource, Platform, SCALES, Shard, TILED_BAND, TILED_STEP};
 
 /// One logical weight: name, logical shape, on-device representation, how it
 /// is laid out across ranks, and where its bytes come from. The recorder
@@ -326,15 +326,6 @@ pub(crate) struct BankPlane {
     pub shape: Vec<u64>,
     pub dtype: Dtype,
 }
-
-/// What an mxfp4 bank's e8m0 scales plane is called. One home for one
-/// string: four places write it and must agree exactly, or the loader lands
-/// a plane nothing reads under a name no contract chose.
-const SCALES: &str = ".scales";
-
-/// What an affine bank's zero-point plane is called. Same argument as
-/// [`SCALES`].
-const BIASES: &str = ".biases";
 
 impl Weight {
     /// This weight as `platform` lands it: a placed dtype resolves to the

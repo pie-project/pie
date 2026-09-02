@@ -1,0 +1,39 @@
+# Vendored from github.com/pie-project/ztensor (branch v3, bf72630) until 3.0.0
+# is published; edit upstream first and copy back, so the two do not drift.
+[package]
+name = "ztensor-compat"
+version = "3.0.0"
+description = "Foreign tensor formats projected into the zTensor object model"
+authors = ["In Gim <in.gim@icloud.com>"]
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+repository = "https://github.com/pie-project/ztensor"
+readme = "README.md"
+keywords = ["tensor", "safetensors", "gguf", "onnx", "hdf5"]
+categories = ["encoding", "parser-implementations", "science"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# Defaults are the pure, dependency-light, parse-only formats. `pickle`
+# (torch .pt) is an explicit opt-in: parsing pickle is a larger attack
+# surface than any other format here, even through a restricted VM.
+default = ["safetensors", "gguf"]
+safetensors = ["dep:serde_json"]
+gguf = []
+npz = ["dep:zip"]
+pickle = ["dep:zip"]
+hdf5 = ["dep:flate2"]
+onnx = []
+
+[dependencies]
+ztensor = { workspace = true }
+memmap2 = "0.9"
+serde_json = { version = "1", optional = true }
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
+flate2 = { version = "1", optional = true }
+
+[dev-dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }

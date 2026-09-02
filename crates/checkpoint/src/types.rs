@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::term::gguf_name;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TensorId(pub u32);
 
@@ -30,7 +32,7 @@ pub fn is_block_scaled(dtype: DType) -> bool {
 
 /// Which on-disk format a checkpoint file is. `Unknown` is what a newer
 /// zTensor reports for a format this build has no name for, not a
-/// "cannot read this" marker. New variants are appended; these cross the C ABI.
+/// "cannot read this" marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CheckpointFormat {
     Safetensors,
@@ -56,7 +58,6 @@ pub enum BackendKind {
     Unknown,
 }
 
-/// New variants go on the end; the FFI discriminants cross the C ABI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum QuantScheme {
     None,
@@ -144,38 +145,20 @@ impl QuantScheme {
         }
     }
 
-    /// The block a GGUF-family scheme stores, as `(elements, bytes)`, or
-    /// `None` for a plain bit-packing (GGUF blocks carry scales inside the
-    /// payload, so size isn't `elements * bits / 8`).
+    /// The block a GGUF-family scheme stores, as `(elements, bytes)`, read
+    /// off the container's own `gguf.<type>/2` row; `None` for a plain
+    /// bit-packing (GGUF blocks carry scales inside the payload, so size
+    /// isn't `elements * bits / 8`).
     pub fn block_layout(self) -> Option<(u64, u64)> {
-        match self {
-            Self::GgufQ4_0 => Some((32, 18)),
-            Self::GgufQ4_1 => Some((32, 20)),
-            Self::GgufQ5_0 => Some((32, 22)),
-            Self::GgufQ5_1 => Some((32, 24)),
-            Self::GgufQ8_0 => Some((32, 34)),
-            Self::GgufQ2K => Some((256, 84)),
-            Self::GgufQ3K => Some((256, 110)),
-            Self::GgufQ4K => Some((256, 144)),
-            Self::GgufQ5K => Some((256, 176)),
-            Self::GgufQ6K => Some((256, 210)),
-            Self::GgufIq4Nl => Some((32, 18)),
-            Self::GgufIq4Xs => Some((256, 136)),
-            Self::GgufMxfp4 => Some((32, 17)),
-            Self::GgufIq2Xxs => Some((256, 66)),
-            Self::GgufIq2Xs => Some((256, 74)),
-            Self::GgufIq2S => Some((256, 82)),
-            Self::GgufIq3Xxs => Some((256, 98)),
-            Self::GgufIq3S => Some((256, 110)),
-            _ => None,
-        }
+        let row = ztensor::vocab::gguf::row_of(gguf_name(self)?)?;
+        Some((row.elems_per_block, row.block_bytes))
     }
 
     /// Whether this scheme keeps its scales inside its payload — see
     /// [`block_layout`](Self::block_layout).
     #[must_use]
     pub fn is_self_contained(self) -> bool {
-        self.block_layout().is_some()
+        gguf_name(self).is_some()
     }
 
     pub fn default_group_size(self) -> u32 {
@@ -215,19 +198,18 @@ impl QuantScheme {
 pub use dtype::{TILED_BAND, TILED_STEP};
 
 /// Which backend kernel a [`Expr::Repack`](crate::contract::Expr::Repack)
-/// names. Discriminants start at 1 so an uninitialized FFI field (0)
-/// decodes as an error rather than as a kernel.
+/// names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RepackLayout {
-    MarlinMxfp4Weight = 1,
-    MarlinMxfp4Scale = 2,
+    MarlinMxfp4Weight,
+    MarlinMxfp4Scale,
     /// Four-bit affine code plane in mma fragment order
     /// (`kernels_cuda::linear::tiled::repack_affine_tiled`); target rows
     /// pad to a 16-column band, tail decodes to a zero weight.
-    TiledAffineU4Weight = 3,
+    TiledAffineU4Weight,
     /// Factor plane beside it (`repack_factors_tiled`): a transpose of the
     /// (column, group) rectangle within each 16-column band.
-    TiledAffineFactor = 4,
+    TiledAffineFactor,
 }
 
 /// A repack as the executor needs it: layout plus geometry. `target_rows`/
@@ -441,7 +423,7 @@ pub enum QuantGranularity {
 
 /// What the engine's kernels expect a scale tensor to hold, once read. Not
 /// derivable from the scale tensor's own dtype, so the declaration states
-/// it explicitly. New variants go on the end; discriminants cross the C ABI.
+/// it explicitly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScaleForm {
     /// Consumed as raw E8M0 exponent bytes (MXFP4 GEMM, dequant kernels).

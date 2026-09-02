@@ -317,6 +317,21 @@ pub fn parse_metadata(snapshot_dir: &Path) -> Result<Metadata, Error> {
     }
 }
 
+/// The objects [`parse_metadata`] split into planes, as `(object, plane
+/// names in canonical order)`. Empty for a source whose objects are all one
+/// plane, which is every format but `.zt`.
+pub fn parse_groups(snapshot_dir: &Path) -> Result<Vec<(String, Vec<String>)>, Error> {
+    let paths = match discover(snapshot_dir)? {
+        Discovered::One(path) => vec![path],
+        Discovered::Set(paths) => paths,
+    };
+    let mut groups = Vec::new();
+    for path in &paths {
+        groups.extend(zt::parse_groups(path)?);
+    }
+    Ok(groups)
+}
+
 /// What this checkpoint says about itself, as opposed to its tensors.
 ///
 /// A separate call, not a field on [`Metadata`]: almost nobody asks it,

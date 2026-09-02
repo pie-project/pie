@@ -1,5 +1,5 @@
 //! Reserved metadata namespace of a pie artifact: the compiled tokenizer,
-//! model descriptor and provenance, stored as `dense` `u8` objects named
+//! model descriptor and provenance, stored as `u8` objects named
 //! under [`META_PREFIX`]; everything else is a weight.
 
 /// The name prefix every metadata object carries, and no weight may.

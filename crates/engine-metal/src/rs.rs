@@ -358,18 +358,20 @@ impl LanePlan {
     /// [`Fault::Program`] for a device-resident fold length (this plane has
     /// no descriptor port to read it from), a `FoldBuffered` whose bound is
     /// not the lane's row count, or a fold past the extended run.
-    pub fn of(verb: &RsVerb, rows: u32, lane: u32) -> Result<LanePlan> {
+    pub fn of(verb: &RsVerb, rows: u32, lane: u32, device_fold: Option<u32>) -> Result<LanePlan> {
         let host = |len: FoldLen| -> Result<u32> {
             match len {
                 FoldLen::Host(n) => Ok(n),
-                FoldLen::Device(port) => Err(Fault::program(
-                    "serve::rs",
-                    format!(
-                        "lane {lane} states a device-resident fold length on port {}, and this \
-                         plane resolves no such port at compose; state the count",
-                        port.name()
-                    ),
-                )),
+                FoldLen::Device(port) => device_fold.ok_or_else(|| {
+                    Fault::program(
+                        "serve::rs",
+                        format!(
+                            "lane {lane} states a device-resident fold length on port {}, and the \
+                             program attached to it resolved no such port this fire",
+                            port.name()
+                        ),
+                    )
+                }),
             }
         };
         Ok(match verb {
@@ -416,6 +418,25 @@ impl LanePlan {
                     scatter: (rows > 0).then(|| Run {
                         pages: pages.clone(),
                         from: *at,
+                        count: rows,
+                    }),
+                    override_rows: false,
+                }
+            }
+            RsVerb::Window { read, write, fold } => {
+                let fold = host(*fold)?;
+                LanePlan {
+                    replay: fold,
+                    commit: fold,
+                    rows,
+                    gather: (fold > 0).then(|| Run {
+                        pages: read.clone(),
+                        from: 0,
+                        count: fold,
+                    }),
+                    scatter: (rows > 0).then(|| Run {
+                        pages: write.clone(),
+                        from: 0,
                         count: rows,
                     }),
                     override_rows: false,

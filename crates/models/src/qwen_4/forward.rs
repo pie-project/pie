@@ -1,16 +1,22 @@
 //! Forward pass for the qwen4 hybrid model.
 
 use model_dsl::{
-    Classify, Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, Predicate, Request, Value,
-    ops, seam,
+    Classify, Dtype, ForwardHybrid, GateActivation, HybridSpec, Input, MropeForm, Predicate,
+    Request, Value, ops, seam,
 };
 
-use super::model::{Attn, Gdn, Mixer, Mlp, Model, Ple, Residual};
+use super::model::{Attn, Gdn, Mixer, Mlp, Model, Ple, Residual, Tower};
+
+/// The trunk's mrope section split (`mrope_section: [11, 11, 10]`), summing
+/// to half `rotary_dim`; applied interleaved (`mrope_interleaved: true`).
+const MROPE_SECTIONS: [u32; 3] = [11, 11, 10];
 
 pub struct Facts {
     pub qo_one: bool,
     pub captures_scores: bool,
     pub masked: bool,
+    pub drafts: bool,
+    pub media: bool,
 }
 
 impl Facts {
@@ -31,6 +37,20 @@ impl Facts {
     pub fn masked() -> Predicate {
         Predicate::fact(2)
     }
+
+    /// Requests whose rows the draft head runs over (`Lane::drafts`).
+    #[must_use]
+    pub fn drafts() -> Predicate {
+        Predicate::fact(3)
+    }
+
+    /// Lanes that submitted images. Guards the embed merge only, not the
+    /// tower: the tower's rows are already zero on an image-free fire, but
+    /// the merge writes into the token axis, which is never empty.
+    #[must_use]
+    pub fn media() -> Predicate {
+        Predicate::fact(4)
+    }
 }
 
 impl Classify for Facts {
@@ -39,6 +59,8 @@ impl Classify for Facts {
             qo_one: r.query_len() == 1,
             captures_scores: r.captures_scores(),
             masked: r.has_custom_mask(),
+            drafts: r.drafts(),
+            media: r.has_media(),
         }
     }
 
@@ -46,6 +68,8 @@ impl Classify for Facts {
         u64::from(self.qo_one)
             | (u64::from(self.captures_scores) << 1)
             | (u64::from(self.masked) << 2)
+            | (u64::from(self.drafts) << 3)
+            | (u64::from(self.media) << 4)
     }
 }
 
@@ -75,6 +99,10 @@ impl ForwardHybrid for Model {
                     );
                 }
             }
+        }
+        if self.mtp.is_some() {
+            // The draft head's own attention row, in the trunk's page space.
+            c.kv(kv, "kv.mtp".to_string(), [plane, plane]);
         }
         if let Some(p) = &self.ple {
             let wide = u64::from(self.streams) * u64::from(self.hidden);
@@ -107,8 +135,21 @@ impl ForwardHybrid for Model {
         let plan_s = ops::attn::plan_prefill(&input_s, m.q_heads, m.kv_heads, m.head_dim, None);
         let mask = inputs.mask();
 
+        // Tower nodes must all be emitted before any trunk node, or
+        // `model_compiler` refuses the plan (`Error::UnitsInterleave`).
+        let towered = m.tower.as_ref().map(|t| tower(&inputs, t));
+
         let ids = inputs.tokens();
-        let narrow = ops::layout::embed(&ids, &m.embed, m.vocab);
+        let mut narrow = ops::layout::embed(&ids, &m.embed, m.vocab);
+        // Tower rows written over the token rows the image placeholders
+        // occupy, BEFORE the streams fan out: the merger answers a trunk-wide
+        // token row, and every stream starts from the same one. Uses
+        // `scatter_live_rows`, not a plain scatter, since `merge_rows`
+        // compacts and the tail routes carry a `-1` sentinel.
+        if let Some(t) = &towered {
+            let (imaged, _) = narrow.split(&Facts::media());
+            narrow = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
+        }
         // Streams fan out here from the embedding; they fold back down at the final mixer.
         let mut y = ops::elemwise::hc_expand(&narrow, m.streams);
 
@@ -133,8 +174,93 @@ impl ForwardHybrid for Model {
         }
 
         let (x, _) = mix_in(&y, &m.mixer, m);
-        ops::linear::lm_head(&x, &m.head)
+        let logits = ops::linear::lm_head(&x, &m.head);
+
+        // **THE DRAFT HEAD**, over the drafting lanes' rows, off the WIDE
+        // residual before the collapse (`Mtp`'s doc). **The head's token is
+        // the trunk's argmax**: the module is trained on `(y_i, t_{i+1}) →
+        // t_{i+2}`, and inside a verify fire the only `t_{i+1}` a row can
+        // name is the token the trunk just chose there — the same argmax the
+        // verifier reads, so the chain at the row it accepts continues its
+        // next window. Step 0 is the module as trained and writes its kv row;
+        // every later step chains on its own output and argmax, read-only.
+        if let Some(mtp) = &m.mtp {
+            let (input_mtp, _) = inputs.split(&Facts::drafts());
+            let plan_mtp = ops::attn::plan_prefill(&input_mtp, m.q_heads, m.kv_heads, m.head_dim, None);
+            let (dy, _) = y.split(&Facts::drafts());
+            let (dpos, _) = rotation_positions(&inputs, m).split(&Facts::drafts());
+            let (dlogits, _) = logits.split(&Facts::drafts());
+
+            let w = &mtp.block;
+            let Mixer::Attn(a) = &w.mixer else {
+                unreachable!("the draft head's block is full attention");
+            };
+            let mut token = ops::layout::argmax(&[&dlogits]);
+            let mut hidden = dy;
+            let mut chain: Vec<Value> = Vec::with_capacity(mtp.depth as usize);
+            for step in 0..mtp.depth {
+                let e = ops::layout::embed(&token, &m.embed, m.vocab);
+                let e = ops::elemwise::rmsnorm_plus_one(&e, &mtp.norm_embed, mtp.eps);
+                let e = ops::elemwise::hc_expand(&ops::linear::matmul(&e, &mtp.fc_embed), m.streams);
+                let h = ops::elemwise::rmsnorm_grouped_plus_one(&hidden, &mtp.norm_hidden, m.hidden, mtp.eps);
+                let routes = ops::linear::group_routes(&h, m.streams);
+                let h = ops::linear::matmul_grouped(&h, &mtp.fc_hidden, &routes, m.streams);
+                let mut r = ops::elemwise::residual_add(&e, &h);
+
+                let (x, normed) = mix_in(&r, &w.attn_res, m);
+                let o = mtp_attn(&x, &input_mtp, m, &plan_mtp, &dpos, a, step > 0);
+                r = inject(&o, &normed, &w.attn_res, m, &r);
+                let (x, normed) = mix_in(&r, &w.mlp_res, m);
+                let f = moe(&x, &w.mlp);
+                r = inject(&f, &normed, &w.mlp_res, m, &r);
+
+                let (x, _) = mix_in(&r, &mtp.mixer, m);
+                let draft = ops::linear::lm_head(&x, &m.head);
+                if step == 0 {
+                    seam::at(seam::MTP, &[&draft]);
+                }
+                token = ops::layout::argmax(&[&draft]);
+                hidden = r;
+                chain.push(draft);
+            }
+            // The token plane: every step's argmax side by side, `[rows,
+            // depth]`, what `mtp_drafts` reads.
+            let steps: Vec<&Value> = chain.iter().collect();
+            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&steps)]);
+        }
+
+        logits
     }
+}
+
+/// The draft head's attention: the trunk's gated attention over the draft
+/// rows alone, one prefill arm, against the head's own kv row. A `chain`
+/// step attends over what the row holds and appends nothing.
+#[allow(clippy::too_many_arguments)]
+fn mtp_attn(
+    x: &Value,
+    inputs: &Input<Facts>,
+    m: &Model,
+    plan: &Value,
+    positions: &Value,
+    a: &Attn,
+    chain: bool,
+) -> Value {
+    let pages = inputs.kv(&a.kv);
+    let write_page = inputs.write_page(&a.kv);
+    let write_offset = inputs.write_offset(&a.kv);
+    let d = m.head_dim;
+    let (q, gate) = ops::layout::split_q_gate(&ops::linear::matmul(x, &a.qg_proj), d);
+    let k = ops::linear::matmul(x, &a.k_proj);
+    let v = ops::linear::matmul(x, &a.v_proj);
+    let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
+    let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
+    let (q, k) = rotate(&q, &k, positions, m, a, d);
+    if !chain {
+        ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
+    }
+    let o = ops::attn::prefill(&q, plan, pages, None, d, m.kv_heads, a.sm_scale);
+    ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }
 
 /// Normalizes the wide row and mixes it down to the sublayer input. Returns
@@ -229,7 +355,93 @@ fn ple(y: &Value, ids: &Value, inputs: &Input<Facts>, m: &Model, p: &Ple) -> Val
     ops::elemwise::residual_add(&conv, &gated)
 }
 
-/// Gated attention: text-only so rotation is scalar; no adapter banks in this family.
+/// The position vector the trunk's rotation reads: the scalar row position
+/// for a text-only reading, the `(t, h, w)` triple for a towered one.
+fn rotation_positions(inputs: &Input<Facts>, m: &Model) -> Value {
+    match &m.tower {
+        None => inputs.positions(),
+        Some(_) => inputs.mrope_positions(),
+    }
+}
+
+/// Picks the rotation by whether the model has a tower, not by a per-lane
+/// fact bit: a text-only model keeps the scalar `rope_partial`; a tower model
+/// always uses the interleaved mrope, since an image-free row's position is
+/// just `(p, p, p)` and the two agree there.
+fn rotate(q: &Value, k: &Value, positions: &Value, m: &Model, a: &Attn, d: u32) -> (Value, Value) {
+    match &m.tower {
+        None => ops::elemwise::rope_partial(q, k, positions, a.rotary_dim, d, a.theta),
+        Some(_) => ops::elemwise::rope_mrope(
+            q,
+            k,
+            positions,
+            MROPE_SECTIONS,
+            MropeForm::Interleaved,
+            a.rotary_dim,
+            d,
+            a.theta,
+        ),
+    }
+}
+
+/// The tower, as one function and one capture unit on the patch axis —
+/// qwen_3's, since it is qwen_3's tower. Every rectangle here is unguarded
+/// (`Dim::Patches` is empty on an image-free fire, so it costs nothing) and
+/// must be emitted before any trunk node (`Error::UnitsInterleave`).
+///
+/// Returns the merged `[Dim::Patches, trunk hidden]` rectangle whose leading
+/// `rows / merge^2` rows are live; the caller scatters it with
+/// [`ops::layout::scatter_live_rows`] and a `-1`-sentinel route vector.
+fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
+    let d = t.head_dim;
+    let x = inputs.patches(t.patch_width);
+    let segments = inputs.patch_segments();
+    let grid = inputs.patch_positions();
+
+    let mut y = ops::elemwise::add_bias(&t.patch_embed_bias, &ops::linear::matmul(&x, &t.patch_embed));
+    let ids = inputs.patch_embed_rows(t.taps);
+    let pos = if t.taps == 1 {
+        ops::layout::embed(&ids, &t.pos_embed, t.positions)
+    } else {
+        let weights = inputs.patch_embed_weights(t.taps);
+        ops::layout::embed_weighted(&ids, &weights, &t.pos_embed, t.positions)
+    };
+    y = ops::elemwise::residual_add(&pos, &y);
+
+    for b in &t.blocks {
+        let n = ops::elemwise::layernorm(&y, &b.norm1, &b.norm1_bias, t.norm_eps);
+        let (q, k, v) = ops::layout::split_qkv(
+            &ops::elemwise::add_bias(&b.qkv_bias, &ops::linear::matmul(&n, &b.qkv)),
+            t.hidden,
+            t.hidden,
+        );
+        // Two axes and no time: a zero section rather than a two-wide stream.
+        let (q, k) = ops::elemwise::rope_mrope(&q, &k, &grid, [0, d / 4, d / 4], MropeForm::Blocked, d, d, t.theta);
+        let o = ops::attn::dense(&q, &k, &v, &segments, d, t.sm_scale);
+        y = ops::elemwise::residual_add(
+            &ops::elemwise::add_bias(&b.proj_bias, &ops::linear::matmul(&o, &b.proj)),
+            &y,
+        );
+        let n = ops::elemwise::layernorm(&y, &b.norm2, &b.norm2_bias, t.norm_eps);
+        let h = ops::elemwise::add_bias(&b.fc1_bias, &ops::linear::matmul(&n, &b.fc1));
+        let a = ops::linear::mlp_gelu_tanh(&h);
+        y = ops::elemwise::residual_add(
+            &ops::elemwise::add_bias(&b.fc2_bias, &ops::linear::matmul(&a, &b.fc2)),
+            &y,
+        );
+    }
+
+    // The merger: norm on unmerged rows (`merger.norm` is `[hidden]`), then the fold.
+    let mg = &t.merger;
+    let n = ops::elemwise::layernorm(&y, &mg.norm, &mg.norm_bias, t.norm_eps);
+    let folded = ops::layout::merge_rows(&n, t.merge);
+    let h = ops::elemwise::add_bias(&mg.fc1_bias, &ops::linear::matmul(&folded, &mg.fc1));
+    let a = ops::linear::mlp_gelu_tanh(&h);
+    ops::elemwise::add_bias(&mg.fc2_bias, &ops::linear::matmul(&a, &mg.fc2))
+}
+
+/// Gated attention: scalar or interleaved-mrope rotation by whether the text
+/// declares a tower; no adapter banks in this family.
 #[allow(clippy::too_many_arguments)]
 fn attn_mixer(
     x: &Value,
@@ -252,8 +464,7 @@ fn attn_mixer(
     seam::at(seam::ATTN_QV, &[&q, &v]);
     let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
-    let (q, k) =
-        ops::elemwise::rope_partial(&q, &k, &inputs.positions(), a.rotary_dim, d, a.theta);
+    let (q, k) = rotate(&q, &k, &rotation_positions(inputs, m), m, a, d);
     ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
     seam::at(seam::ATTN_Q, &[&q]);
 

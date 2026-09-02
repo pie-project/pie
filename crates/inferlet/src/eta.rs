@@ -1585,13 +1585,19 @@ impl Pass<wit_attention::ForwardPass> {
 
     /// `pie:inferlet/forward.media` — carries a media span's payload,
     /// order-matched to the placeholder token runs already in the sequence
-    /// (see `img.tokens()`). Attention interface only.
+    /// (see `img.tokens()`). The hybrid pass carries the same verb.
     pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
         wit_attention::ForwardPass::media(&self.wit, spans)
     }
 }
 
 impl Pass<wit_hybrid::ForwardPass> {
+    /// `pie:inferlet/forward-hybrid.media` — the attention pass's `media`,
+    /// same span type, for a tower over a hybrid trunk.
+    pub fn media(&self, spans: &[wit_attention::MediaSpan<'_>]) -> Result<(), String> {
+        wit_hybrid::ForwardPass::media(&self.wit, spans)
+    }
+
     /// Attach the `on_attn_proj` stage (per attention layer, before attention).
     pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::OnAttnProj, body);

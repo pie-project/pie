@@ -398,6 +398,44 @@ fn rs_plan_for(
                 .unwrap_or(0)
         })
         .collect();
+    // **THE DEVICE-RESIDENT ROUND.** A device-decided fold length on a fire
+    // that carries rows is the speculative window verb: the working set's
+    // buffer is two runs of equal length, this fire writes one and replays
+    // the port's count of the other. No occupancy is read or kept — the
+    // host never learns how many tokens were accepted, which is the point.
+    if fold_len.is_none() && row_tokens.iter().all(|&t| t > 0) {
+        let store = stores.rs.lock().unwrap();
+        let mut pages = Vec::with_capacity(rows);
+        let mut phase = Vec::with_capacity(rows);
+        let mut page_tokens = Vec::with_capacity(rows);
+        for (row, id) in ids.iter().enumerate() {
+            let slots = store.buffer_size(*id).map_err(|e| e.to_string())?;
+            if slots < 2 || slots % 2 != 0 {
+                return Err(format!(
+                    "request row {row} folds a device-decided count over rows it buffers, which \
+                     needs its rs-working-set buffer to be TWO equal runs (alloc-buffer an even \
+                     count, twice the pages one window needs); it holds {slots} slot(s)"
+                ));
+            }
+            let page = store.geometry(*id).map_err(|e| e.to_string())?.buffer_page_tokens.max(1);
+            let run = slots / 2;
+            if row_tokens[row] > run * page {
+                return Err(format!(
+                    "request row {row} fires {} rows into a window run of {run} page(s) x {page} \
+                     tokens; grant a larger buffer",
+                    row_tokens[row]
+                ));
+            }
+            pages.push(run);
+            phase.push(store.window_phase(*id).map_err(|e| e.to_string())?);
+            page_tokens.push(page);
+        }
+        return Ok(rs::RsPlan::Window {
+            pages,
+            phase,
+            page_tokens,
+        });
+    }
     // Buffer occupancy, in tokens, exact (not page-granular).
     let mut buffered: Vec<u32> = {
         let store = stores.rs.lock().unwrap();
@@ -1157,10 +1195,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // A decode-envelope pass carries exactly one value the host
             // cannot fold: the sampled token, read off the ring the
             // previous epilogue wrote.
-            let device_resolved = if p.decode_envelope.is_some() {
-                PortMask::of(&[Port::EmbedTokens])
-            } else {
-                PortMask::NONE
+            let device_resolved = match &p.decode_envelope {
+                Some(envelope) if envelope.device_fold_len => {
+                    PortMask::of(&[Port::EmbedTokens, Port::RsFoldLen])
+                }
+                Some(_) => PortMask::of(&[Port::EmbedTokens]),
+                None => PortMask::NONE,
             };
             let geometry_clock = crate::scheduler::probe::ProbeClock::start();
             let (geometry, attn_mask) = {
@@ -1201,12 +1241,25 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let accesses = p.instance.program.channel_accesses.clone();
             let reads_attn_score = p.instance.program.reads_attn_score;
             let reads_mtp_logits = p.instance.program.reads_mtp_logits;
+            // A fold length the envelope resolves on the device is the
+            // device's from the first fire: the host's seed is only the first
+            // cell the port reads, so the plan is the window verb even when
+            // the host could have peeked that cell.
+            let rs_fold_len = if p
+                .decode_envelope
+                .as_ref()
+                .is_some_and(|envelope| envelope.device_fold_len)
+            {
+                None
+            } else {
+                p.rs_fold_len.clone()
+            };
             (
                 geometry,
                 p.cells.clone(),
                 p.kv_ws,
                 p.rs_ws.clone(),
-                p.rs_fold_len.clone(),
+                rs_fold_len,
                 p.kv_declaration,
                 p.kv_declaration_realized,
                 fwd.rep(),
@@ -1296,7 +1349,12 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .iter()
                 .map(|lane| u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX))
                 .collect();
-            req.media = crate::pipeline::media::lane_media(&matched, &lane_rows);
+            let lane_base: Vec<u32> = req
+                .lanes
+                .iter()
+                .map(|lane| lane.positions.first().copied().unwrap_or(0))
+                .collect();
+            req.media = crate::pipeline::media::lane_media(&matched, &lane_rows, &lane_base);
         }
         crate::offload::try_encode(&mut req).await;
         // Resource preparation is independent of token position: realize the
@@ -2320,7 +2378,20 @@ async fn fire_device_geometry<C: FireContext>(
 
     let (ws_rep, rs_reps, rs_fold_len) = {
         let pass = ctx.resources().get(&fwd)?;
-        (pass.kv_ws, pass.rs_ws.clone(), pass.rs_fold_len.clone())
+        // A fold length bound to a channel is the device's from the first
+        // fire (a speculative window's accepted count): the host's seed is
+        // only the first cell the port reads, so the plan is the window verb
+        // and the host never folds the number — as the envelope path states.
+        let device_fold_len = pass.instance.program.bound.container.ports.iter().any(|binding| {
+            binding.port == eta_ir::registry::Port::RsFoldLen
+                && matches!(binding.source, eta_ir::container::PortSource::Channel(_))
+        });
+        let rs_fold_len = if device_fold_len {
+            None
+        } else {
+            pass.rs_fold_len.clone()
+        };
+        (pass.kv_ws, pass.rs_ws.clone(), rs_fold_len)
     };
     let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
     let ws = ctx.resources().get(&ws_res)?.clone();
@@ -2382,7 +2453,7 @@ async fn fire_device_geometry<C: FireContext>(
     } else {
         Vec::new()
     };
-    let (grant_slots, write_indexes, fresh_dense, devgeo_b) = {
+    let (grant_slots, write_indexes, fresh_dense, devgeo_b, devgeo_split) = {
         let p = ctx.resources().get_mut(&fwd)?;
         let devgeo = p
             .devgeo
@@ -2390,6 +2461,7 @@ async fn fire_device_geometry<C: FireContext>(
             .expect("fire_device_geometry on a non-device-geometry pass");
         let fresh_dense = devgeo.fresh_dense;
         let devgeo_b = devgeo.b;
+        let devgeo_split = devgeo.qo_indptr.clone();
 
         // Grant B slots: lease free-list first, then fresh logical reserves.
         // Purely logical, so it runs once (only the physical prepare below
@@ -2413,13 +2485,27 @@ async fn fire_device_geometry<C: FireContext>(
         };
         write_indexes.sort_unstable();
         write_indexes.dedup();
-        (grant_slots, write_indexes, fresh_dense, devgeo_b)
+        (grant_slots, write_indexes, fresh_dense, devgeo_b, devgeo_split)
     };
 
     // Device geometry resolves B request rows in-graph; the zero-valued
     // `qo_indptr` carries only the known row count, since the engine still
-    // resolves its values in-graph.
-    let resolved_qo_indptr = vec![0; devgeo_b + 1];
+    // resolves its values in-graph. A pass whose lanes carry several rows
+    // each (a speculative window on a recurrent state) states its seeded
+    // split instead: the rows are the host's to plan — the lane's facts word
+    // and the recurrent window verb both read them — and the device's to
+    // resolve.
+    let wide = devgeo_split
+        .as_ref()
+        .is_some_and(|split| split.windows(2).any(|lane| lane[1] > lane[0] + 1));
+    let resolved_qo_indptr = match &devgeo_split {
+        Some(split) if wide => split.clone(),
+        _ => vec![0; devgeo_b + 1],
+    };
+    // The recurrent plan reads a row's token count whatever the lane shape:
+    // a one-token lane buffers or folds its one row, and a zero-row lane is
+    // a fire with no effect, refused by name.
+    let rs_qo_indptr = devgeo_split.clone().unwrap_or_else(|| resolved_qo_indptr.clone());
     let rs_ws_ids = match bound_rs_working_set_ids(ctx, ws.model, ws.engine, &rs_reps)? {
         Ok(ids) => ids,
         Err(error) => {
@@ -2450,7 +2536,7 @@ async fn fire_device_geometry<C: FireContext>(
                 "pipeline: KV demand exceeds the planner ABI".to_string()
             ));
         };
-        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &resolved_qo_indptr) {
+        let rs_plan = match rs_plan_for(&rs_fold_len, &stores, &rs_ws_ids, &rs_qo_indptr) {
             Ok(plan) => plan,
             Err(error) => {
                 reclaim_pending_device_grant(ctx, &fwd);
@@ -2515,7 +2601,7 @@ async fn fire_device_geometry<C: FireContext>(
             ws.model,
             ws.engine,
             &rs_reps,
-            &resolved_qo_indptr,
+            &rs_qo_indptr,
             &pipeline_scope,
             &rs_plan,
             &mut grant,
@@ -2635,12 +2721,52 @@ async fn fire_device_geometry<C: FireContext>(
         ..crate::engine::FireRequest::default()
     };
     rs_prepared.apply_to(&mut req);
+    // A lane of several rows reads out the rows its `readout` port names
+    // (all of a verify window's, for the verifier), lane-relative; the port
+    // is a seeded, never-put channel, so the host shadow knows it. One token
+    // a lane keeps the engine's default, its last (only) row.
+    if wide {
+        let p = ctx.resources().get(&fwd)?;
+        let bound = &p.instance.program.bound;
+        let readout = bound.container.ports.iter().find_map(|binding| {
+            match (&binding.port, &binding.source) {
+                (eta_ir::registry::Port::Readout, eta_ir::container::PortSource::Channel(chan)) => {
+                    p.host_shadow.fire_value(bound, &p.cells, *chan)
+                }
+                _ => None,
+            }
+        });
+        if let Some(rows) = readout {
+            let rows = geometry::value_as_u32(&rows);
+            for (lane, span) in req.lanes.iter_mut().zip(resolved_qo_indptr.windows(2)) {
+                let local: Vec<u32> = rows
+                    .iter()
+                    .filter(|&&row| row >= span[0] && row < span[1])
+                    .map(|&row| row - span[0])
+                    .collect();
+                lane.readout = ::engine::Readout::Rows(local);
+            }
+        }
+    }
     let fire_wide_mask = matches!(attn_mask, geometry::FireAttnMask::Device);
     if let Err(error) = attn_mask.apply_to(&mut req) {
         reclaim_pending_device_grant(ctx, &fwd);
         let reason = format!("pipeline: device-geometry attention mask: {error}");
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
+    }
+    // The program's facts ride every lane here as they do on the host path:
+    // a program that materializes a draft-head rectangle is a drafting lane
+    // (the draft arm runs and rewrites its plane every fire — a window that
+    // read a stale plane would replay the prefill's drafts for the whole
+    // generation), and one that materializes the score rectangle captures.
+    {
+        let program = &ctx.resources().get(&fwd)?.instance.program;
+        let (drafts, captures) = (program.reads_mtp_logits, program.reads_attn_score);
+        for lane in &mut req.lanes {
+            lane.drafts = drafts;
+            lane.captures_scores = captures;
+        }
     }
     // `false` is the only word this path can state: token ids are resolved
     // on the device, so there is no host-side token list to scan (this entry

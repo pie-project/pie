@@ -77,6 +77,18 @@ pub const ROWS: &[Row] = &[
     },
     // Full checkpoint the row above is a mini carve of, at its own 43 layers.
     Row {
+        id: "dsv4-flash-mtp-u4g64-u2g64-mxfp4-kv-bf16",
+        layers: 5,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    Row {
+        id: "dsv4-flash-full-mtp-u4g64-u2g64-mxfp4-kv-bf16",
+        layers: 43,
+        vocab: 129_280,
+        arch: "deepseek_v4",
+    },
+    Row {
         id: "dsv4-flash-full-u4g64-u2g64-kv-bf16",
         layers: 43,
         vocab: 129_280,
@@ -102,6 +114,13 @@ pub const ROWS: &[Row] = &[
     },
     Row {
         id: "gemma4-26b-a4b-u4g64-kv-bf16",
+        layers: 30,
+        vocab: 262_144,
+        arch: "gemma4",
+    },
+    // The same mixture with Google's assistant drafter overlaid.
+    Row {
+        id: "gemma4-26b-a4b-mtp-u4g64-kv-bf16",
         layers: 30,
         vocab: 262_144,
         arch: "gemma4",
@@ -269,13 +288,13 @@ pub const ROWS: &[Row] = &[
     // qwen4 hybrid: geometry off `Model::flash`'s own Dims; arch is the
     // checkpoint's `model_type: qwen4_exp`.
     Row {
-        id: "qwen38-flash-u4g64-kv-bf16",
+        id: "qwen38-flash-next-u4g64-kv-bf16",
         layers: 48,
         vocab: 248_320,
         arch: "qwen4_exp",
     },
     Row {
-        id: "qwen38-flash-bf16-kv-bf16",
+        id: "qwen38-flash-next-bf16-kv-bf16",
         layers: 48,
         vocab: 248_320,
         arch: "qwen4_exp",
@@ -283,14 +302,32 @@ pub const ROWS: &[Row] = &[
     // Mini 2-bit snapshot: 4 layers (`num_hidden_layers: 4`,
     // layer_types linear/linear/linear/full).
     Row {
-        id: "qwen38-flash-u4g64-u2g128-kv-bf16",
+        id: "qwen38-flash-next-u4g64-u2g128-kv-bf16",
         layers: 4,
         vocab: 248_320,
         arch: "qwen4_exp",
     },
     // Shipped 2-bit artifact: the mini's parent, 48 layers again.
     Row {
-        id: "qwen38-flash-full-u4g64-u2g128-kv-bf16",
+        id: "qwen38-flash-next-full-u4g64-u2g128-kv-bf16",
+        layers: 48,
+        vocab: 248_320,
+        arch: "qwen4_exp",
+    },
+    Row {
+        id: "qwen38-flash-next-full-mtp-u4g64-u2g128-kv-bf16",
+        layers: 48,
+        vocab: 248_320,
+        arch: "qwen4_exp",
+    },
+    Row {
+        id: "qwen38-flash-next-full-mtp-vision-u4g64-u2g128-kv-bf16",
+        layers: 48,
+        vocab: 248_320,
+        arch: "qwen4_exp",
+    },
+    Row {
+        id: "qwen38-flash-next-full-vision-u4g64-u2g128-kv-bf16",
         layers: 48,
         vocab: 248_320,
         arch: "qwen4_exp",
@@ -581,7 +618,8 @@ pub struct RsCaps {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EtaCaps {
     pub has_mtp_logits: bool,
-    pub has_mtp_drafts: bool,
+    /// The draft head's chain depth; zero without one (`mtp-depth`).
+    pub mtp_depth: u32,
     pub has_value_head: bool,
     /// Backend can execute the `envelope_dot` second-party kernel (Quest).
     pub has_kv_envelopes: bool,

@@ -188,6 +188,32 @@ __global__ void split_rows(
     }
 }
 
+// Eight elements per thread, many blocks per row: the cut falls on a vector
+// boundary, so each 16-byte vector lands whole on one side.
+template <class T>
+__global__ void split_rows_vec8(
+    const T* __restrict__ src,
+    T* __restrict__ left,
+    T* __restrict__ right,
+    int left_dim, int right_dim,
+    const u32* __restrict__ win)
+{
+    constexpr int VEC = 8;
+    const int n = blockIdx.y;
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const int total = left_dim + right_dim;
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+    if (i >= total) return;
+    const uint4 v = *reinterpret_cast<const uint4*>(src + (long long)plane_row * total + i);
+    if (i < left_dim) {
+        *reinterpret_cast<uint4*>(left + (long long)plane_row * left_dim + i) = v;
+    } else {
+        *reinterpret_cast<uint4*>(right + (long long)plane_row * right_dim + (i - left_dim)) = v;
+    }
+}
+
 template <class T>
 __global__ void select(
     const T* __restrict__ table,

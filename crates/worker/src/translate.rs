@@ -107,7 +107,7 @@ fn build_model(
                 rs_cache_slots: g.caps.pools.state_slots as usize,
                 rs_cache_slot_bytes: g.caps.pools.state_slot_bytes,
                 has_mtp_logits: g.caps.profile.has_mtp_logits,
-                has_mtp_drafts: g.caps.profile.has_mtp_drafts,
+                mtp_depth: g.caps.profile.mtp_depth,
                 has_value_head: g.caps.profile.has_value_head,
                 // `has_kv_envelopes` has no successor: it advertised a
                 // model-gated ETA intrinsic the profile does not carry, and

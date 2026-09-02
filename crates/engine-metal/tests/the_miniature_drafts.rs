@@ -131,6 +131,11 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
         shell.drafts()
     );
     assert!(shell.drafts(), "the load declares a draft head and advertises none");
+    assert_eq!(
+        shell.mtp_depth(),
+        models::deepseek_v4::model::DRAFT_DEPTH,
+        "the load's token plane is as deep as the text chains"
+    );
 
     let plain = run(&mut shell, 0, false);
     let drafted = run(&mut shell, 1, true);

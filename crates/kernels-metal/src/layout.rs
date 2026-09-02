@@ -41,6 +41,39 @@ pub fn embed(
     )
 }
 
+/// `y[row, column] = argmax_c x[row, c]` — one column of the i32 plane `y`
+/// (`[rows, depth]`), one threadgroup of 1024 threads per row (the kernel's
+/// thirty-two simdgroups; at 256 a 262k-wide row was a thousand serial
+/// compares a thread and 0.4 ms a launch). Ties go to the lowest column and
+/// a NaN never wins.
+pub fn argmax(ctx: &Ctx<'_>, x: Tensor, column: u32, y: Tensor) -> Result<(), Error> {
+    const OP: &str = "layout.argmax";
+    debug_assert_eq!(y.dtype, Dtype::I32, "`{OP}` writes i32 column indices");
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "argmax_rows_bfloat16",
+        F32 => "argmax_rows_float32",
+    });
+    let rows = nonzero(OP, "rows", x.rows)?;
+    nonzero(OP, "width", x.width)?;
+    if column >= y.width {
+        return Err(refuse(
+            OP,
+            format!("column {column} is outside the {}-wide plane it writes", y.width),
+        ));
+    }
+    debug_assert_eq!(x.rows, y.rows, "an argmax lands one entry per row");
+    ctx.fire(
+        Fire::at("layout/argmax.metal", entry).apply(Grid::of([1024, rows, 1], [1024, 1, 1])),
+        &[
+            x.arg(),
+            y.arg_mut(),
+            stated(OP, x.width)?.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, column)?.arg(),
+        ],
+    )
+}
+
 /// The concatenating gather's geometry (qwen4's PLE): `ids` is one row of
 /// `heads` ids per token, `y` is `heads` table rows laid side by side, so this
 /// is [`embed`] with the head axis folded into the row axis — `(rows · heads)`

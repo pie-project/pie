@@ -197,6 +197,10 @@ struct RsEntry {
     /// their physical offsets: logical token `k` lives at physical
     /// `buffer_head + k`.
     buffer_head: u32,
+    /// Which of the two runs the next `RsVerb::Window` fire writes; toggled
+    /// after every window fire. Meaningless for a working set that is not
+    /// driven by window verbs.
+    window_phase: bool,
 }
 
 /// The RS store: WorkingSets + the typed backing pool.
@@ -252,6 +256,7 @@ impl RsStore {
             buffer: Vec::new(),
             occupancy: Occupancy::EMPTY,
             buffer_head: 0,
+            window_phase: false,
         })
     }
 
@@ -280,6 +285,7 @@ impl RsStore {
             buffer,
             occupancy,
             buffer_head,
+            window_phase: false,
         }))
     }
 
@@ -977,6 +983,18 @@ impl RsStore {
             .iter()
             .map(|slot| slot.map_or(RS_TRANSLATION_UNMAPPED, |id| id.0))
             .collect())
+    }
+
+    /// Which run the next window fire writes (`RsVerb::Window`).
+    pub fn window_phase(&self, ws: RsWorkingSetId) -> Result<bool, RsError> {
+        Ok(self.entry(ws)?.window_phase)
+    }
+
+    /// The window fire is published: the other run is next.
+    pub fn toggle_window_phase(&mut self, ws: RsWorkingSetId) {
+        if let Ok(entry) = self.entry_mut(ws) {
+            entry.window_phase = !entry.window_phase;
+        }
     }
 
     pub fn folded_slot(&self, ws: RsWorkingSetId) -> Result<Option<RsSlotId>, RsError> {

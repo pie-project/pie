@@ -359,6 +359,7 @@ impl Windows {
         patches: &WindowTable,
         indptr_host: &[i32],
         copies: Copies<'_>,
+        run_caps: &[u32],
     ) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
         let mut runs: Vec<u32> = Vec::with_capacity(compiled.template().len());
@@ -416,11 +417,21 @@ impl Windows {
                 continue;
             }
 
+            // A capped region (`FireDescriptor::run_caps`, the same cap the
+            // walk cuts its launches by) is seated in pieces of at most `cap`
+            // rows. A piece inside a lane has no qo boundary of its own to
+            // rebase to — its ops are row-local — so it states `[0, rows]`.
+            let cap = run_caps.get(at).copied().unwrap_or(0);
+            let capped = cap > 0 && spans.iter().any(|span| span.rows > cap);
+            if capped {
+                model_exec::fire::chunk_spans(&mut spans, cap);
+            }
             of_region.push((runs.len() as u32, spans.len() as u32));
             for &span in &spans {
                 let window = Window {
                     span,
                     indptr_host: match axis {
+                        model_ir::RowAxis::Tokens if capped => vec![0, span.rows as i32],
                         model_ir::RowAxis::Tokens => rebase(indptr_host, span)?,
                         model_ir::RowAxis::Patches => Vec::new(),
                     },

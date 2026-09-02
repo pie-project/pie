@@ -35,7 +35,7 @@ struct Export {
 
 /// The export set: names `model_dsl::seam` states for values materializing
 /// outside the graph. Republished as [`crate::EXPORT_SEAMS`].
-const EXPORTS: [Export; 3] = [
+const EXPORTS: [Export; 4] = [
     // Trunk logits, into the runtime's sampler.
     Export {
         seam: "out",
@@ -51,10 +51,16 @@ const EXPORTS: [Export; 3] = [
         seam: "attn.scores",
         read_by: Readers::ItsOwnClasses,
     },
+    // The draft head's token ids, `[rows, depth]` i32, into `mtp_drafts`.
+    Export {
+        seam: "mtp.drafts",
+        read_by: Readers::ItsOwnClasses,
+    },
 ];
 
 /// The export seam names, in the order [`EXPORTS`] states them.
-pub const EXPORT_SEAMS: [&str; 3] = [EXPORTS[0].seam, EXPORTS[1].seam, EXPORTS[2].seam];
+pub const EXPORT_SEAMS: [&str; 4] =
+    [EXPORTS[0].seam, EXPORTS[1].seam, EXPORTS[2].seam, EXPORTS[3].seam];
 
 /// How many rows a value has, in the terms the carve evaluates rather than
 /// `model_ir::Dim`'s serializable form.

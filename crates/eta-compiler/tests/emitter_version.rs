@@ -16,8 +16,8 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 /// fingerprint change that doesn't move the version fails
 /// `the_pinned_versions_are_the_compiled_ones` until someone updates it here.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 25, 0xf481_2e2f_7393_1f3e),
-    ("metal", 42, 0x166f_c41f_c8b1_ff87),
+    ("cuda", 26, 0xa9ff_c409_891c_d517),
+    ("metal", 43, 0xf408_d19f_6f20_2e5a),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the

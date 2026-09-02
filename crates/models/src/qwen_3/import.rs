@@ -431,7 +431,7 @@ impl Model {
 /// matmul bank it already is. `[hidden, C, T, P, P]` and `[hidden, C*T*P^2]`
 /// are the same bytes in the same order, so this is a transmute: it checks
 /// the element count and re-states the type.
-fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, Error> {
+pub(crate) fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, Error> {
     let Some(tensor) = src.get(&from) else {
         return Err(Error::Missing(from));
     };
@@ -450,8 +450,7 @@ fn flattened(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr
              {want:?} ({asked} elements)"
         )));
     }
-    let part = tensor.part("data").map_err(|why| illegible(&why))?;
-    let encoding = checkpoint::file::encoding_of(&tensor, &part).map_err(|why| illegible(&why))?;
+    let encoding = checkpoint::file::encoding_of(&tensor).map_err(|why| illegible(&why))?;
     Ok(Expr::src(from).transmute(TensorType::new(want, encoding)))
 }
 
@@ -479,8 +478,7 @@ pub(crate) fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, Erro
             )));
         }
     };
-    let part = tensor.part("data").map_err(|why| illegible(&why))?;
-    let stored = checkpoint::file::encoding_of(&tensor, &part).map_err(|why| illegible(&why))?;
+    let stored = checkpoint::file::encoding_of(&tensor).map_err(|why| illegible(&why))?;
     Ok(Expr::src(from).transmute(TensorType::new(
         vec![extent(channels), extent(kernel)],
         stored,

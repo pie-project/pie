@@ -17,7 +17,7 @@ use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context};
 use crate::error::{Fault, Result};
 
-use super::compile::Region;
+use super::compile::{Form, Region};
 use super::shared::SharedRing;
 
 /// The buffer index the first channel's committed cell binds at, below
@@ -556,6 +556,15 @@ impl Grouped {
         self.write_record()
     }
 
+    /// Point the lane at its run of the draft head's token plane — its own
+    /// reservation, pitched by the head's depth. Zero for none bound; the
+    /// emitted gather faults rather than dereferencing it.
+    fn set_drafts(&mut self, base: u64, depth: u32) -> Result<()> {
+        self.record.mtp_drafts_base = base;
+        self.record.mtp_drafts_depth = depth;
+        self.write_record()
+    }
+
     /// Write the one lane's record back whole, rather than patched at a
     /// field offset. Errors if the lane is outside its own table.
     fn write_record(&mut self) -> Result<()> {
@@ -898,7 +907,12 @@ impl Prepared {
                     format!("{intrinsic:?} has no element width in the M2 slot table"),
                 )
             })?;
-        let wanted = if element == 4 { Dtype::F32 } else { Dtype::Bf16 };
+        // The token plane is the one integer rectangle: four bytes an id.
+        let wanted = match intrinsic {
+            IntrinsicId::MtpDrafts => Dtype::I32,
+            _ if element == 4 => Dtype::F32,
+            _ => Dtype::Bf16,
+        };
         if dtype != wanted {
             return Err(Fault::program(
                 "program::launch",
@@ -1018,6 +1032,16 @@ impl Prepared {
             .as_mut()
             .expect("the seat was there one statement ago")
             .set_scores(score_base, score_stride)?;
+        // The token plane likewise: its own base and pitch (the depth).
+        let (drafts_base, drafts_depth) =
+            match self.intrinsics[IntrinsicId::MtpDrafts as usize].as_ref() {
+                Some(slot) => (address_of(&slot.base, slot.offset)?, slot.width),
+                None => (0, 0),
+            };
+        self.grouped
+            .as_mut()
+            .expect("the seat was there one statement ago")
+            .set_drafts(drafts_base, drafts_depth)?;
         let Some(trunk) = self.intrinsics[IntrinsicId::Logits as usize].as_ref() else {
             return Ok(());
         };

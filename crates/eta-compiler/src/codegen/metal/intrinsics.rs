@@ -32,13 +32,14 @@ pub fn m2_intrinsic_buffer(intr: u16) -> Option<usize> {
 }
 
 /// How wide one element of `intr`'s rectangle is, in bytes — `None` for an
-/// id this backend cannot bind at all. `ATTN_SCORE` is F32 (4 bytes); every
-/// other bindable intrinsic is bf16 (2 bytes). Must stay consistent with
-/// `engine_metal::program::launch`, which uses this for bounds checks.
+/// id this backend cannot bind at all. `ATTN_SCORE` is F32 and `MTP_DRAFTS`
+/// is I32 (4 bytes each); every other bindable intrinsic is bf16 (2 bytes).
+/// Must stay consistent with `engine_metal::program::launch`, which uses
+/// this for bounds checks.
 #[must_use]
 pub fn m2_intrinsic_element_bytes(intr: u16) -> Option<u32> {
     match intr {
-        intrinsic_tags::ATTN_SCORE => Some(4),
+        intrinsic_tags::ATTN_SCORE | intrinsic_tags::MTP_DRAFTS => Some(4),
         _ => m2_intrinsic_buffer(intr).map(|_| 2),
     }
 }

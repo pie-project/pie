@@ -31,6 +31,10 @@ members = [
 
     # checkpoints -> verified memory layouts a device can be pointed at
     "crates/checkpoint",
+    # the checkpoint container format and its foreign-format projections,
+    # vendored (see `crates/ztensor/Cargo.toml`)
+    "crates/ztensor",
+    "crates/ztensor-compat",
 
     # the guest-program toolchain: eDSL -> ETA -> planning -> CUDA/Metal codegen
     "crates/eta-ir",
@@ -88,6 +92,8 @@ default-members = [
     "crates/checkpoint-dsl",
     "crates/model-compiler",
     "crates/checkpoint",
+    "crates/ztensor",
+    "crates/ztensor-compat",
     "crates/kernels-cuda",
     "crates/kernels-metal",
     "crates/eta-ir",
@@ -206,9 +212,10 @@ linkme = "0.3"
 # The same registry on wasm, where the object format has no link sections and
 # `linkme` refuses the target. `#[routine]` emits one row per target, never two.
 inventory = "0.3"
-# 2.1.1 floor: 2.1.0 has an API this tree does not compile against.
-ztensor = "2.1.1"
-ztensor-compat = "2.1.1"
+# Vendored under `crates/` (see `crates/ztensor/Cargo.toml`): `ztensor` is the
+# container format, `ztensor-compat` the foreign-format projections.
+ztensor = { path = "crates/ztensor" }
+ztensor-compat = { path = "crates/ztensor-compat" }
 
 # Opt in per crate with `[lints] workspace = true`. Today only the compiler
 # crates do: they are the only ones at zero warnings, so the only ones CI can

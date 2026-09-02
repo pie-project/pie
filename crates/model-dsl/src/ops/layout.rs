@@ -174,6 +174,25 @@ pub fn merge_rows(x: &Value, side: u32) -> Value {
     y
 }
 
+/// The per-row argmax of each of `xs`, side by side: `[rows, xs.len()]` i32.
+/// `argmax(&[&logits])` is the token a draft chain feeds its next step;
+/// `argmax(&[&l0, &l1, &l2])` is the `[rows, depth]` drafts plane
+/// [`seam::MTP_DRAFTS`](crate::seam::MTP_DRAFTS) exports. Every `xs` shares
+/// one row space.
+pub fn argmax(xs: &[&Value]) -> Value {
+    let first = xs.first().expect("an argmax over at least one value");
+    let r = first.rec();
+    let y = r.fresh(tensor(first.rows(), xs.len() as u64, Dtype::I32));
+    r.push(
+        Layout::Argmax {
+            xs: xs.iter().map(|x| x.id()).collect(),
+            y: y.id(),
+        },
+        xs,
+    );
+    y
+}
+
 /// [`scatter_rows`] plus a negative `routes` entry meaning "this row has no
 /// destination" — what a compacting fold ([`pool_rows`], [`merge_rows`])
 /// owes the scatter, since `routes` has one entry per row of the full

@@ -328,12 +328,10 @@ pub(crate) fn default_lattice(max_tokens: u32) -> Vec<u32> {
     lattice
 }
 
-/// Where the default lattice starts, and why it is not 1: a one-lane decode
-/// takes the gemv arm and a two-lane one does not, so naming 1 keeps that
-/// arm flip alive at the lattice's own floor. A decode fire's linear
-/// layers are weight-bound, so the tail below the floor rides reads that
-/// were happening anyway.
-pub(crate) const LATTICE_FLOOR: u32 = 8;
+/// Where the default lattice starts. One, so a lone decode lane runs its
+/// linear layers at M=1 and takes the gemv arm the tuner picks for it,
+/// rather than riding an eight-row tile.
+pub(crate) const LATTICE_FLOOR: u32 = 1;
 
 /// The shape lattice policy, at the door: a caller that stated a lattice
 /// keeps it exactly; one that stated none gets [`default_lattice`], since
@@ -422,7 +420,7 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         has_mtp_logits: shell.drafts(),
         // `MtpDrafts` is `[k]` i32 token ids, an argmax the guest can take
         // for itself off `MtpLogits`; no device path here produces it.
-        has_mtp_drafts: false,
+        mtp_depth: 0,
         has_value_head: false,
         // Does this load export a capture column, and did the slab that
         // observes it get carved.
@@ -534,6 +532,7 @@ impl Engine for Cuda {
             ordinal,
             frames_in_flight,
         } = request;
+        let trace = model_ir::fuse::residual_norm(trace);
 
         // Serving eagerly is a choice a deployment may make but never one
         // it should make silently: an uncaptured decode pays hundreds of
@@ -1584,7 +1583,7 @@ fn refuse_an_artifact_for_another_deployment(
 #[cfg(test)]
 mod serving_stamp_tests {
     use super::refuse_an_artifact_for_another_deployment as refuse;
-    use checkpoint::file::emit::{self, Object, Part, Payload};
+    use checkpoint::file::emit::{self, Object};
     use checkpoint::serving::Stamp;
     use std::collections::BTreeMap;
 
@@ -1596,18 +1595,7 @@ mod serving_stamp_tests {
             &Stamp::of(backend, sku),
             &BTreeMap::new(),
             4096,
-            &[Object {
-                name: "embed",
-                shape: vec![8192],
-                layout: "dense",
-                attributes: None,
-                parts: vec![Part {
-                    name: "data",
-                    dtype: ztensor::DType::U8,
-                    logical: None,
-                    payload: Payload::Whole(&bytes),
-                }],
-            }],
+            &[Object::leaf("embed", vec![8192], ztensor::Leaf::U8, &bytes)],
             |o, p, _| panic!("{o}/{p} is not streamed here"),
         )
         .expect("the fixture artifact writes");

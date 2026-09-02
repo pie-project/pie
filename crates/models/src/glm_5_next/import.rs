@@ -173,8 +173,7 @@ fn squeezed(src: &ztensor::Source, from: String) -> Result<Expr, Error> {
              this one is stored {shape:?}"
         )));
     };
-    let part = tensor.part("data").map_err(|why| illegible(&why))?;
-    let stored = checkpoint::file::encoding_of(&tensor, &part).map_err(|why| illegible(&why))?;
+    let stored = checkpoint::file::encoding_of(&tensor).map_err(|why| illegible(&why))?;
     Ok(Expr::src(from).transmute(TensorType::new(
         vec![extent(channels), extent(kernel)],
         stored,

@@ -22,6 +22,10 @@ pub struct DecodeEnvelope {
     /// `Positions` binds a channel (device-carried) rather than a const —
     /// executing the class demands the positions device port.
     pub device_positions: bool,
+    /// `RsFoldLen` binds a channel: the recurrent fold length is the
+    /// device's, read off the `rs_fold_len` port at compose — the
+    /// speculative round's accepted count (`RsVerb::Window`).
+    pub device_fold_len: bool,
 }
 
 /// Test-only shape derivation. Production uses the split
@@ -192,31 +196,73 @@ pub fn classify_decode_envelope_why(
                 .channels
                 .get(*channel as usize)
                 .ok_or_else(|| "decode envelope EmbedIndptr channel is out of range".to_string())?;
-            if declaration.shape.dims() != [token_count + 1]
+            let dims = declaration.shape.dims();
+            if dims.len() != 1
+                || dims[0] < 2
+                || dims[0] > token_count + 1
                 || !matches!(
                     declaration.dtype,
                     eta_ir::container::ChanDType::Concrete(Dtype::U32)
                 )
             {
                 return Err(format!(
-                    "decode envelope EmbedIndptr channel must be a [{}] u32 vector",
-                    token_count + 1
+                    "decode envelope EmbedIndptr channel must be a [lanes + 1] u32 vector with \
+                     at most {} lane(s)",
+                    token_count
                 ));
             }
-            (0..=token_count).collect()
+            if dims[0] == token_count + 1 {
+                // One token a lane, whether the split is seeded or a stage
+                // puts it: the only CSR of that length.
+                (0..=token_count).collect()
+            } else if declaration.seeded && !puts_channel(*channel as usize) {
+                // A seeded, never-put split: fixed for the pass's life and
+                // evaluated off the seed on every fire
+                // (`map_geometry_evaluated_with`), so the lanes it cuts are
+                // the host's to check there. `[0, tokens]` is the one-lane
+                // window a recurrent state can take; a wider seeded split is
+                // admitted on the same terms and its CSR is the host's, not
+                // this classifier's (`token_indptr` is left empty).
+                let lanes = dims[0] - 1;
+                if lanes == 1 {
+                    vec![0, token_count]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                return Err(
+                    "decode envelope EmbedIndptr put by a stage must declare one token per lane"
+                        .to_string(),
+                );
+            }
         }
         Some(_) => {
             return Err("decode envelope EmbedIndptr must be a u32 vector".to_string());
         }
     };
-    if qo_indptr.len() < 2
-        || qo_indptr[0] != 0
-        || qo_indptr.last().copied() != Some(token_count)
-        || qo_indptr.windows(2).any(|pair| pair[1] != pair[0] + 1)
+    // A lane is one token (the decode shape) or a fixed run of them (a
+    // speculative WINDOW: the correction and the drafts after it, one lane,
+    // `w` rows — the shape a recurrent state can take, since its scan runs a
+    // lane's rows in order and a token spread over lanes has no order). The
+    // split is a host-known constant either way: what moves between fires is
+    // the ids and the geometry, never the row count.
+    if !qo_indptr.is_empty()
+        && (qo_indptr.len() < 2
+            || qo_indptr[0] != 0
+            || qo_indptr.last().copied() != Some(token_count)
+            || qo_indptr.windows(2).any(|pair| pair[1] <= pair[0]))
     {
-        return Err("decode envelope EmbedIndptr must declare one token per lane".to_string());
+        return Err(
+            "decode envelope EmbedIndptr must cut the tokens into non-empty lanes, in order"
+                .to_string(),
+        );
     }
-    let lane_count = (qo_indptr.len() - 1) as u32;
+    let lane_count = match channel_for(Port::EmbedIndptr) {
+        Some(PortSource::Channel(channel)) => {
+            container.channels[*channel as usize].shape.dims()[0] - 1
+        }
+        _ => (qo_indptr.len() - 1) as u32,
+    };
     if kv_len.shape.dims() != [lane_count]
         || !matches!(
             kv_len.dtype,
@@ -229,9 +275,32 @@ pub fn classify_decode_envelope_why(
     }
 
     let mut device_positions = false;
+    let mut device_fold_len = false;
     for binding in &container.ports {
         match (&binding.port, &binding.source) {
             (Port::EmbedTokens | Port::KvLen, PortSource::Channel(_)) => {}
+            // The recurrent fold length on a channel: the device's number
+            // (a speculative round's accepted count), one per lane or one
+            // for all. A const one is host territory and needs no port.
+            (Port::RsFoldLen, PortSource::Channel(channel)) => {
+                let declaration = container.channels.get(*channel as usize).ok_or_else(|| {
+                    "decode envelope rs_fold_len channel is out of range".to_string()
+                })?;
+                let dims = declaration.shape.dims();
+                if !(dims == [lane_count] || dims == [1])
+                    || !matches!(
+                        declaration.dtype,
+                        eta_ir::container::ChanDType::Concrete(Dtype::U32)
+                            | eta_ir::container::ChanDType::Concrete(Dtype::I32)
+                    )
+                {
+                    return Err(format!(
+                        "device rs_fold_len must be a [{lane_count}] (or [1]) u32/i32 vector"
+                    ));
+                }
+                device_fold_len = true;
+            }
+            (Port::RsFoldLen, _) => {}
             (Port::EmbedIndptr, PortSource::Const { dtype, shape, data })
                 if *dtype == Dtype::U32
                     && shape.dims() == [lane_count + 1]
@@ -381,6 +450,7 @@ pub fn classify_decode_envelope_why(
         token_indptr: qo_indptr,
         loop_carried,
         device_positions,
+        device_fold_len,
     }))
 }
 
@@ -390,6 +460,9 @@ pub fn envelope_required_ports(envelope: &DecodeEnvelope) -> PortMask {
     let mut required = PortMask::of(&[Port::EmbedTokens, Port::KvLen]);
     if envelope.device_positions {
         required = required.with(Port::Positions);
+    }
+    if envelope.device_fold_len {
+        required = required.with(Port::RsFoldLen);
     }
     // No AttnMask entry: the classifier declines a channel-bound mask
     // outright, so no envelope reaching here carries one.
@@ -1314,7 +1387,34 @@ mod tests {
             Op::ChanPut { chan: 1, value: 1 },
         ];
         add_explicit_geometry(&mut multi_token, 4, 1);
-        assert!(classify_decode_envelope(&multi_token).is_err());
+        // One lane of four rows: a speculative window's shape, and the one a
+        // recurrent state can take.
+        let envelope = classify_decode_envelope(&multi_token).unwrap().unwrap();
+        assert_eq!((envelope.token_count, envelope.lane_count), (4, 1));
+        assert_eq!(envelope.token_indptr, vec![0, 4]);
+        assert_eq!(envelope.template(&multi_token).unwrap().qo_indptr, vec![0, 4]);
+
+        // The same split as a seeded, never-put channel — how a guest states
+        // it — classifies the same way; put by a stage it would not.
+        let mut seeded_window = section3_container();
+        seeded_window.channels[0].shape = Shape::vector(4);
+        let split = seeded_window.channels.len() as u32;
+        seeded_window.channels.push(chan(Shape::vector(2), Dtype::U32));
+        seeded_window.channels[split as usize].seeded = true;
+        seeded_window.ports[1] = PortBinding {
+            port: Port::EmbedIndptr,
+            source: PortSource::Channel(split),
+        };
+        seeded_window.stages[0].ops = vec![
+            Op::ChanPut { chan: 0, value: 0 },
+            Op::ChanPut { chan: 1, value: 1 },
+        ];
+        add_explicit_geometry(&mut seeded_window, 4, 1);
+        let envelope = classify_decode_envelope(&seeded_window).unwrap().unwrap();
+        assert_eq!((envelope.token_count, envelope.lane_count), (4, 1));
+        assert_eq!(envelope.token_indptr, vec![0, 4]);
+        seeded_window.stages[0].ops.push(Op::ChanPut { chan: split, value: 1 });
+        assert!(classify_decode_envelope(&seeded_window).is_err());
 
         let mut multi_lane = section3_container();
         multi_lane.channels[0].shape = Shape::vector(4);

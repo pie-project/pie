@@ -43,6 +43,10 @@ interface forward-hybrid {
     use channel.{channel};
     use working-set.{kv-working-set, rs-working-set, page-span};
     use pipeline.{pipeline};
+    /// The one media-span type, `forward`'s: a decoded image is one resource
+    /// whichever pass kind carries it, and a guest that holds one should not
+    /// have to spell it per interface.
+    use forward.{media-span};
 
     /// Attention geometry. Every input is an individual channel; the record
     /// exists so the whole group can be handled as a unit (and, in
@@ -190,6 +194,14 @@ interface forward-hybrid {
 
         /// Bind an optional readout-index channel separately from embedding.
         readout: func(indices: borrow<channel>) -> result<_, error>;
+
+        /// The media payload beside the ledger, exactly as `forward.media`
+        /// states it (media-door.md §0/§3): spans order-matched to the
+        /// placeholder runs in the submitted tokens, scanned at `submit`. A
+        /// hybrid tower family (qwen3.8-flash-next: a vision tower over a
+        /// GDN/attention/PLE trunk) is what brought the verb here; the host
+        /// half is the attention interface's, unchanged.
+        media: func(spans: list<media-span>) -> result<_, error>;
 
         /// tart (0.3 re-port): run only the first `max-layers` transformer
         /// layers and take the head there. Zero rejected; unset = full

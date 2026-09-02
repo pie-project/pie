@@ -92,6 +92,13 @@ pub mod seam {
     /// `ForwardHybrid::forward` hands back only the trunk's logits).
     pub const MTP: Def = Def { name: "mtp" };
 
+    /// The draft readout as TOKENS: the `[rows, depth]` i32 plane a draft
+    /// head's argmax chain writes (`ops::layout::argmax` over every step's
+    /// logits), one entry per readout row per step. What `mtp_drafts` is
+    /// pointed at; a text with a draft head plants it once, and its width
+    /// is the depth the shell advertises.
+    pub const MTP_DRAFTS: Def = Def { name: "mtp.drafts" };
+
     /// The score readout: the attention's per-query log-sum-exp over the
     /// capture window, the mass the softmax normalized by. Observation runs
     /// in-graph (a declared column); whatever a guest does with the numbers

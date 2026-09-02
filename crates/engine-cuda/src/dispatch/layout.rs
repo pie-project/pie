@@ -173,6 +173,14 @@ impl Run<'_> {
                 // Whole, for `scatter_live_rows`' reason one arm up.
                 &mut self.fire_wide(*y),
             ),
+            Layout::Argmax { .. } => {
+                return Err(kernels_cuda::Error::Backend {
+                    op: "layout.argmax",
+                    detail: "the per-row argmax a draft chain feeds itself is not yet read on \
+                             the CUDA arm"
+                        .to_string(),
+                });
+            }
             Layout::Select {
                 table,
                 layer,

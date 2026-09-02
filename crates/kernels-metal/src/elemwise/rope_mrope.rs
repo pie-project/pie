@@ -281,3 +281,61 @@ pub fn blocked(
     )
 }
 
+/// The split rotation (`MropeForm::Split`): each section owns a contiguous
+/// channel block and `rotate_half` stays inside it — Gemma's tower. Same
+/// validation, grid and refusals as [`blocked`]; a different shader.
+#[allow(clippy::too_many_arguments)]
+pub fn split(
+    ctx: &Ctx<'_>,
+    q: Tensor,
+    k: Tensor,
+    positions: Tensor,
+    sections: [u32; AXES as usize],
+    rotary_dim: u32,
+    head_dim: u32,
+    theta: f32,
+) -> Result<(), Error> {
+    const OP: &str = "elementwise.rope_mrope";
+    let entry = dtype_dispatch!(OP, q.dtype, { Bf16 => "rope_mrope_split_bfloat16" });
+    let geom = validate(OP, q, k, positions, sections, rotary_dim, head_dim)?;
+
+    // A zero total is refused rather than launched at zero extent: the
+    // shader divides by it.
+    let total: u32 = sections.iter().copied().sum();
+    if total == 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the sections {sections:?} name no frequency pair, and a blocked rotation \
+                 divides its ladder by the pairs the sections tile"
+            ),
+        ));
+    }
+    let pairs = (rotary_dim / 2).min(total);
+    let base = theta.log2();
+    rotate(
+        ctx,
+        OP,
+        entry,
+        q,
+        positions,
+        base,
+        head_dim,
+        pairs,
+        geom.num_q_heads,
+        sections,
+    )?;
+    rotate(
+        ctx,
+        OP,
+        entry,
+        k,
+        positions,
+        base,
+        head_dim,
+        pairs,
+        geom.num_kv_heads,
+        sections,
+    )
+}
+

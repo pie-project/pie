@@ -509,6 +509,7 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Elementwise::RmsnormGated { .. }
             | Elementwise::RmsnormGatedBy { .. }
             | Elementwise::ResidualAdd { .. }
+            | Elementwise::ResidualAddRmsnorm { .. }
             | Elementwise::AddBias { .. }
             | Elementwise::Standardize { .. }
             | Elementwise::MulScalar { .. }
@@ -545,7 +546,10 @@ fn expect(op: &Operation) -> &'static [(Port, Expect)] {
             | Layout::SplitRows { .. }
             | Layout::Select { .. }
             | Layout::PoolRows { .. }
-            | Layout::MergeRows { .. } => &[],
+            | Layout::MergeRows { .. }
+            // The argmax pins nothing: its operands are the readout's own
+            // dtype and its i32 answer is stated by the value it writes.
+            | Layout::Argmax { .. } => &[],
         },
         Operation::CustomCuda(op) => match op {
             CustomCuda::QkvFusedQknormRopeVnormWrite { .. } => {

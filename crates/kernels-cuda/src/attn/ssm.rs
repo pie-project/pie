@@ -14,7 +14,9 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
+use crate::jit::{
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated,
+};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
 const FILE: &str = "attn/ssm.cuh";
@@ -28,6 +30,16 @@ const FLOAT: u32 = 4;
 
 /// The prep launches' block.
 const PREP_BLOCK: u32 = 128;
+
+/// Channels one thread of the vectorised conv update moves.
+const CONV_VEC: u32 = 8;
+
+/// The widest window the vectorised conv update unrolls.
+const CONV_K_MAX: u32 = 8;
+
+/// The vectorised conv update's block: small, so a one-token row still
+/// spreads over a few dozen SMs.
+const CONV_BLOCK: u32 = 64;
 
 /// The delta scans' block.
 const GDN_BLOCK: u32 = 128;
@@ -173,26 +185,44 @@ pub fn causal_conv1d(
         false,
         false,
     )?;
-    ctx.fire(
-        OP,
-        Fire::at(FILE, "::pie::attn::ssm_causal_conv1d_update_batched<::pie::bf16>")
-            .apply(Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1])),
-        &[
-            x.arg(),
-            weight.arg(),
-            ArgValue::ABSENT, // the bias seat; this point carries none
-            state.conv_slab.arg(),
-            state.slot_ids.arg(),
-            state.conv_stride.arg(),
-            y.arg(),
-            stated(OP, rows)?.arg(),
-            c.arg(),
-            k.arg(),
-            dil.arg(),
-            // ctx.stage(): the region's live-rows word, or ABSENT.
-            ctx.stage(),
-        ],
-    )
+    let vectors = channels % CONV_VEC == 0
+        && conv_width <= CONV_K_MAX
+        && dilation == 1
+        && state.conv_stride % i64::from(CONV_VEC) == 0
+        && aligned16(x.ptr)
+        && aligned16(y.ptr)
+        && aligned16(weight.ptr)
+        && aligned16(state.conv_slab.ptr);
+    let mut args = vec![
+        x.arg(),
+        weight.arg(),
+        ArgValue::ABSENT, // the bias seat; this point carries none
+        state.conv_slab.arg(),
+        state.slot_ids.arg(),
+        state.conv_stride.arg(),
+        y.arg(),
+        stated(OP, rows)?.arg(),
+        c.arg(),
+        k.arg(),
+    ];
+    let (entrypoint, launch) = if vectors {
+        (
+            "::pie::attn::ssm_causal_conv1d_update_batched_vec8<::pie::bf16>",
+            Launch::grid(
+                [(channels / CONV_VEC).div_ceil(CONV_BLOCK), rows, 1],
+                [CONV_BLOCK, 1, 1],
+            ),
+        )
+    } else {
+        args.push(dil.arg());
+        (
+            "::pie::attn::ssm_causal_conv1d_update_batched<::pie::bf16>",
+            Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1]),
+        )
+    };
+    // ctx.stage(): the region's live-rows word, or ABSENT.
+    args.push(ctx.stage());
+    ctx.fire(OP, Fire::at(FILE, entrypoint).apply(launch), &args)
 }
 
 /// Prefill form: walks the fire's request boundaries, one grid row per
@@ -477,6 +507,9 @@ pub fn gated_delta(
     debug_assert_eq!(y.dtype, Dtype::F32, "`{OP}` lands an f32 accumulator");
     let shape = Delta::of(OP, qkv, gates, y, k_heads, v_heads, k_dim, v_dim)?;
     seated(OP, state, "ssm_gated_delta_step_batched_gqa", false, false, false)?;
+    if fused_fits(&shape, state) {
+        return shape.decode_fused(ctx, OP, qkv, gates, state, y);
+    }
     let staged = shape.stage(ctx, OP, qkv, gates)?;
 
     let (entrypoint, launch) = if v_dim == SMEM_ARM_WIDTH && k_dim == SMEM_ARM_WIDTH {
@@ -512,6 +545,66 @@ pub fn gated_delta(
             ctx.stage(),
         ],
     )
+}
+
+/// The fused step's block: 256 threads, eight state columns per thread.
+const FUSED_BLOCK: u32 = 256;
+
+/// The state columns one fused block owns — narrow, so a one-token fire
+/// still spreads a head over the device. The block then stands
+/// `FUSED_BLOCK * 8 / FUSED_BV` rows tall, which bounds the key width.
+const FUSED_BV: u32 = 16;
+
+/// Whether the one-launch step fits this geometry: eight-wide vectors land
+/// on every plane and the key width fits the tile.
+fn fused_fits(shape: &Delta, state: &RecurrentPool) -> bool {
+    const VEC: u32 = 8;
+    shape.conv_dim % VEC == 0
+        && (shape.k_heads * shape.k_dim) % VEC == 0
+        && shape.v_dim % FUSED_BV == 0
+        && (shape.k_dim * shape.v_dim) % VEC == 0
+        && state.slot_stride_elems % i64::from(VEC) == 0
+        && shape.k_dim <= FUSED_BLOCK * VEC / FUSED_BV
+}
+
+impl Delta {
+    /// The one-launch decode step: reads the projection and the gate row
+    /// directly, no staging planes.
+    fn decode_fused(
+        self,
+        ctx: &Ctx,
+        op: &'static str,
+        qkv: Tensor,
+        gates: Tensor,
+        state: &RecurrentPool,
+        y: &mut Tensor,
+    ) -> Result<(), Error> {
+        #[allow(clippy::cast_precision_loss)]
+        let q_scale = (self.k_dim as f32).sqrt().recip();
+        ctx.fire(
+            op,
+            Fire::at(FILE, "::pie::attn::ssm_gdn_decode_step<16>").apply(Launch::grid(
+                [self.v_dim / FUSED_BV, self.n, self.v_heads],
+                [FUSED_BLOCK, 1, 1],
+            )),
+            &[
+                qkv.arg(),
+                gates.arg(),
+                state.slab.arg(),
+                state.slot_ids.arg(),
+                state.slot_stride_elems.arg(),
+                y.arg(),
+                stated(op, self.k_heads)?.arg(),
+                stated(op, self.v_heads)?.arg(),
+                stated(op, self.k_dim)?.arg(),
+                stated(op, self.v_dim)?.arg(),
+                stated(op, self.conv_dim)?.arg(),
+                q_scale.arg(),
+                // ctx.stage(): the region's live-rows word, or ABSENT.
+                ctx.stage(),
+            ],
+        )
+    }
 }
 
 /// Prefill form of [`gated_delta`]: one chunked scan per request. Three

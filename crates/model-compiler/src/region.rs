@@ -17,7 +17,7 @@
 //! in its entirety, so hoisting restores an order rather than choosing one.
 //! [`hoist`] proves that of the plan in front of it instead of assuming it.
 
-use model_ir::{Def, Operands, Operation, RowAxis, Trace, Ty, ValueId};
+use model_ir::{Def, Linear, Operands, Operation, RowAxis, Trace, Ty, ValueId};
 
 use crate::compiled::{Lowering, Phase, Region};
 use crate::error::Error;
@@ -32,6 +32,15 @@ pub(crate) fn coalesce(trace: &Trace, classes: &ClassTable) -> Result<Vec<Region
     // `None` is "nothing in this run has said yet", which a `Const`-shaped
     // node leaves untouched.
     let mut open_axis: Option<RowAxis> = None;
+    // A router ENDS its region, and its last consumer ends the next one: a
+    // streamed load cuts its command buffer before each run of the region
+    // after a router's, seating the experts that run's rows named, and may
+    // walk that region in pieces of a few rows when the fire's rows would
+    // name more experts than the slab seats. For that the region between a
+    // router and its last consumer must hold row-local nodes only — the
+    // routed matmuls and their combine — and the router itself must be the
+    // last node before it. Same nodes, two more launch boundaries a layer.
+    let break_after = routed_breaks(trace);
 
     for (j, node) in trace.nodes.iter().enumerate() {
         let j = j as u32;
@@ -44,6 +53,9 @@ pub(crate) fn coalesce(trace: &Trace, classes: &ClassTable) -> Result<Vec<Region
         // whose counts come out of different window tables entirely. A node
         // that names no axis constrains nothing and joins whatever is open.
         let joins = axis.is_none() || open_axis.is_none() || open_axis == axis;
+        // The fourth: the node before this one closed its region — a router,
+        // or a router's last consumer.
+        let joins = joins && !(j > 0 && break_after.contains(&(j - 1)));
         match regions.last_mut() {
             Some(open) if open.phase == phase && open.mask == mask && joins => {
                 open.nodes.end = j + 1;
@@ -76,6 +88,51 @@ pub(crate) fn coalesce(trace: &Trace, classes: &ClassTable) -> Result<Vec<Region
     }
 
     Ok(regions)
+}
+
+/// The nodes a region ends after: every router, and every router's last
+/// consumer (the last node reading the routes or weights it wrote). Between
+/// the two lies the routed segment — the region a streamed load cuts before
+/// each run of and may walk in pieces.
+fn routed_breaks(trace: &Trace) -> std::collections::BTreeSet<u32> {
+    let mut breaks = std::collections::BTreeSet::new();
+    let mut outs: Vec<ValueId> = Vec::new();
+    let mut ins: Vec<ValueId> = Vec::new();
+    for (r, node) in trace.nodes.iter().enumerate() {
+        if !is_router(node) {
+            continue;
+        }
+        breaks.insert(r as u32);
+        outs.clear();
+        node.op.outputs(&mut outs);
+        let mut last: Option<u32> = None;
+        for (k, later) in trace.nodes.iter().enumerate().skip(r + 1) {
+            ins.clear();
+            later.op.inputs(&mut ins);
+            if ins.iter().any(|id| outs.contains(id)) {
+                last = Some(k as u32);
+            }
+        }
+        if let Some(last) = last {
+            breaks.insert(last);
+        }
+    }
+    breaks
+}
+
+/// A node that decides a mixture: the ranked routers and the lookup one —
+/// the set `engine_metal::experts::cuts` cuts a streamed command buffer after.
+fn is_router(node: &model_ir::Node) -> bool {
+    matches!(
+        node.op,
+        Operation::Linear(
+            Linear::MoeTopkSoftmax { .. }
+                | Linear::MoeTopkSoftmaxScaled { .. }
+                | Linear::MoeTopkSigmoid { .. }
+                | Linear::MoeTopkSqrtSoftplus { .. }
+                | Linear::MoeHashRoute { .. }
+        )
+    )
 }
 
 /// Move the prepare regions in front of the capture regions, keeping each

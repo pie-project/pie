@@ -70,6 +70,10 @@ impl Gemma {
 }
 
 impl Instruct for Gemma {
+    fn prefix(&self) -> Vec<u32> {
+        vec![self.bos]
+    }
+
     fn system(&self, msg: &str) -> Vec<u32> {
         self.opening(&self.system_prefix, msg)
     }

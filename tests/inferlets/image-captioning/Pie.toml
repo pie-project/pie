@@ -13,3 +13,4 @@ side = {type = "int", optional = true, description = "Side of the synthesized sq
 question = {type = "string", optional = true, description = "What to ask about the image"}
 system = {type = "string", optional = true, description = "System prompt"}
 max_tokens = {type = "int", optional = true, description = "Maximum generated tokens (default: 16)"}
+image_b64 = {type = "string", optional = true, description = "A real PNG/JPEG picture, base64, instead of the synthesized square"}

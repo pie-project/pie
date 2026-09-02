@@ -101,6 +101,15 @@ pub trait ToolDecoder: Send {
 /// One format, both directions. `equip` and `answer` default to writing
 /// nothing, for a format without a tool grammar.
 pub trait Instruct: Send + Sync {
+    /// The tokens a conversation — or a raw completion prompt — starts
+    /// with, before any text: `<bos>` for a family whose model reads nothing
+    /// sensible without it (gemma), nothing for one whose tokenizer states
+    /// no opening. A raw-prompt inferlet prepends this to `encode(text)`;
+    /// the turn builders below already include it.
+    fn prefix(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
     fn system(&self, msg: &str) -> Vec<u32>;
 
     fn first_user(&self, msg: &str) -> Vec<u32> {

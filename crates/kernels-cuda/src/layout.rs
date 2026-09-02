@@ -186,10 +186,28 @@ pub fn split_rows(
     );
     let left_dim = stated(OP, nonzero(OP, "the left half of this cut", left.width)?)?;
     let right_dim = stated(OP, nonzero(OP, "the right half of this cut", right.width)?)?;
+    let vectors = left.width % VEC_WIDTH == 0
+        && right.width % VEC_WIDTH == 0
+        && aligned16(x.ptr)
+        && aligned16(left.ptr)
+        && aligned16(right.ptr);
+    let (entrypoint, launch) = if vectors {
+        (
+            "::pie::layout::split_rows_vec8<::pie::bf16>",
+            Launch::grid(
+                [(x.width / VEC_WIDTH).div_ceil(BLOCK), left.rows, 1],
+                [BLOCK, 1, 1],
+            ),
+        )
+    } else {
+        (
+            "::pie::layout::split_rows<::pie::bf16>",
+            route_rows(left.rows, left.width),
+        )
+    };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::split_rows<::pie::bf16>")
-            .apply(route_rows(left.rows, left.width)),
+        Fire::at(FILE, entrypoint).apply(launch),
         &[
             x.arg(),
             left.arg(),

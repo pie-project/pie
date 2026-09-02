@@ -320,6 +320,7 @@ fn found(
 
     // Expert-indexed reads, joined to the router that wrote their routing vector.
     let mut of_group: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    let mut routers_of: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
     for node in &trace.nodes {
         let Operation::Linear(op) = &node.op else {
             continue;
@@ -349,13 +350,25 @@ fn found(
             if !seats.contains(&at) {
                 seats.push(at);
             }
+            routers_of.entry(at).or_default().insert(routes.0);
             for &plane in planes.get(&at).into_iter().flatten() {
                 if !seats.contains(&plane) {
                     seats.push(plane);
                 }
+                routers_of.entry(plane).or_default().insert(routes.0);
             }
         }
     }
+    // **A BANK TWO ROUTERS INDEX STAYS RESIDENT.** A seat number means one
+    // group's seat, and a band shared between two groups would be re-indexed
+    // twice — so such a band (a draft head's experts, routed once per chain
+    // step) is not a streamed band at all: it is held whole, as a dense plane
+    // is, and costs the budget its full size.
+    let shared: BTreeSet<usize> = routers_of
+        .iter()
+        .filter(|(_, routers)| routers.len() > 1)
+        .map(|(&at, _)| at)
+        .collect();
 
     let mut bands: Vec<BandPlan> = Vec::new();
     let mut groups: Vec<GroupPlan> = Vec::new();
@@ -366,6 +379,10 @@ fn found(
             // A router nothing expert-indexed reads isn't a group.
             continue;
         };
+        params.retain(|at| !shared.contains(at));
+        if params.is_empty() {
+            continue;
+        }
         params.sort_unstable();
         let experts = arity[&routes.0];
         // Every group in a plan states the same expert count.
@@ -433,6 +450,25 @@ fn found(
     Ok((bands, groups))
 }
 
+/// How many experts one row of the router writing `routes` picks — the
+/// bound on distinct experts `rows` rows can name, which is what sizes a
+/// streamed segment's sub-batch (`slots / fan_out` rows fit the slab).
+#[must_use]
+pub fn fan_out(trace: &Trace, routes: ValueId) -> Option<u32> {
+    trace.nodes.iter().find_map(|node| match &node.op {
+        Operation::Linear(Linear::MoeTopkSoftmax { routes: r, top_k, .. })
+        | Operation::Linear(Linear::MoeTopkSoftmaxScaled { routes: r, top_k, .. })
+        | Operation::Linear(Linear::MoeTopkSigmoid { routes: r, top_k, .. })
+        | Operation::Linear(Linear::MoeTopkSqrtSoftplus { routes: r, top_k, .. })
+        | Operation::Linear(Linear::MoeHashRoute { routes: r, top_k, .. })
+            if *r == routes =>
+        {
+            Some(*top_k)
+        }
+        _ => None,
+    })
+}
+
 /// The `Trace::params` row a value id names, or a refusal.
 fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
     match trace.values.get(id.0 as usize).map(|decl| &decl.def) {
@@ -449,15 +485,23 @@ fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
 /// the routing vector the router in that region writes, or `None`. The cut
 /// falls after the deciding node and before the nodes that read.
 ///
+/// Only a router whose bands `plan` STREAMS cuts anything: a mixture over a
+/// resident bank (a draft head's experts, held whole because two routers
+/// index them) needs no seat swapped, and a cut is a blocking commit — two
+/// of them a fire, for nothing, on every plain decode.
+///
 /// # Errors
 ///
-/// [`Fault::Residency`] when `streams` and a region holds two routers: the
-/// cut would fall after both, encoding the first mixture against un-swapped seats.
+/// [`Fault::Residency`] when the plan streams and a region holds two
+/// streamed routers: the cut would fall after both, encoding the first
+/// mixture against un-swapped seats.
 pub fn cuts(
     trace: &Trace,
     compiled: &CompiledModel,
-    streams: bool,
+    plan: &Plan,
 ) -> Result<Vec<Option<ValueId>>> {
+    let streams = plan.streams();
+    let streamed: BTreeSet<u32> = plan.groups.iter().map(|group| group.routes.0).collect();
     let mut out = Vec::with_capacity(compiled.template().len());
     for (at, region) in compiled.template().iter().enumerate() {
         let mut here: Option<ValueId> = None;
@@ -478,6 +522,9 @@ pub fn cuts(
                 | Linear::MoeHashRoute { routes, .. } => *routes,
                 _ => continue,
             };
+            if !streamed.contains(&routes.0) {
+                continue;
+            }
             if let Some(first) = here {
                 if first != routes && streams {
                     return Err(Fault::Residency(format!(

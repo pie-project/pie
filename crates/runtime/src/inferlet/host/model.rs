@@ -21,6 +21,10 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(false)
     }
 
+    async fn mtp_depth(&mut self) -> Result<u32> {
+        Ok(model::model().eta_caps().mtp_depth)
+    }
+
     /// Which forward-pass interface the bound model requires, keyed on state
     /// semantics: recurrent state is present iff the engine handshake
     /// reports a non-zero folded-state size; paged KV is present iff the

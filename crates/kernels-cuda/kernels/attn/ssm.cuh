@@ -358,6 +358,90 @@ __global__ void ssm_causal_conv1d_update_batched(
     state[span * C + c] = Elem<T>::from_f32(new_x);
 }
 
+// Eight channels per thread, dilation 1: the row, the window and the
+// weights move as 16-byte vectors, every read issued before any arithmetic,
+// and the shift is written back from the window already in registers.
+template <class T>
+__global__ void ssm_causal_conv1d_update_batched_vec8(
+    const T* __restrict__ x,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ state_base,
+    const int* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    T* __restrict__ y,
+    int R, int C, int K,
+    const u32* __restrict__ win)
+{
+    constexpr int VEC = 8;
+    constexpr int K_MAX = 8;
+    union Vec { uint4 raw; T e[VEC]; };
+
+    const int r = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
+    const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+    if (r >= R || c0 >= C) return;
+
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+    T* state = state_base + (long long)slot * slot_stride_elems;
+    const int span = K - 1;
+
+    Vec xv;
+    xv.raw = *reinterpret_cast<const uint4*>(x + (long long)r_row * C + c0);
+    Vec bv;
+    bv.raw = make_uint4(0u, 0u, 0u, 0u);
+    if (bias != nullptr) {
+        bv.raw = *reinterpret_cast<const uint4*>(bias + c0);
+    }
+    // `weight` is `[C][K]`: this thread's eight channels are `K` vectors.
+    Vec wv[K_MAX];
+    const uint4* w = reinterpret_cast<const uint4*>(weight + (long long)c0 * K);
+    #pragma unroll
+    for (int t = 0; t < K_MAX; ++t) {
+        if (t < K) wv[t].raw = w[t];
+    }
+    Vec window[K_MAX - 1];
+    #pragma unroll
+    for (int k = 0; k < K_MAX - 1; ++k) {
+        if (k < span) {
+            window[k].raw = *reinterpret_cast<const uint4*>(state + (long long)(k + 1) * C + c0);
+        }
+    }
+    const T* wflat = &wv[0].e[0];
+
+    float acc[VEC];
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) {
+        acc[u] = bias != nullptr ? Elem<T>::to_f32(bv.e[u]) : 0.f;
+    }
+    #pragma unroll
+    for (int k = 0; k < K_MAX - 1; ++k) {
+        if (k >= span) break;
+        #pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            acc[u] += Elem<T>::to_f32(wflat[u * K + k]) * Elem<T>::to_f32(window[k].e[u]);
+        }
+    }
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) {
+        acc[u] += Elem<T>::to_f32(wflat[u * K + span]) * Elem<T>::to_f32(xv.e[u]);
+    }
+    Vec yv;
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) yv.e[u] = Elem<T>::from_f32(silu_f(acc[u]));
+    *reinterpret_cast<uint4*>(y + (long long)r_row * C + c0) = yv.raw;
+
+    #pragma unroll
+    for (int k = 0; k < K_MAX - 1; ++k) {
+        if (k < span) {
+            *reinterpret_cast<uint4*>(state + (long long)k * C + c0) = window[k].raw;
+        }
+    }
+    *reinterpret_cast<uint4*>(state + (long long)span * C + c0) = xv.raw;
+}
+
 template <class T>
 __global__ void widen(
     const T* __restrict__ x, float* __restrict__ y, usize n)
@@ -1750,6 +1834,200 @@ __global__ void ssm_gated_delta_step_batched_gqa_smem(
         const uint4* __restrict__ src = reinterpret_cast<const uint4*>(s_state);
         uint4* __restrict__ dst = reinterpret_cast<uint4*>(state);
         for (int i = threadIdx.x; i < n_vec; i += BV) dst[i] = src[i];
+    }
+}
+
+// ---- fused decode step ------------------------------------------------------
+//
+// One launch per step: q/k are L2-normed in the block, v and the gates are
+// read where the projection landed them, and each block owns a `K_d x BV`
+// tile of the head's state, so a one-token fire still spreads the state over
+// the device. Same arithmetic as the smem step above: the decayed state is
+// rounded to bf16 before the update, `kv_mem` reads it unrounded.
+
+__device__ __forceinline__ void gdn_load8(
+    const __nv_bfloat16* __restrict__ p, float (&s)[8]) {
+    if ((reinterpret_cast<usize>(p) & 15) == 0) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(p);
+        const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float2 f = __bfloat1622float2(pairs[u]);
+            s[2 * u] = f.x;
+            s[2 * u + 1] = f.y;
+        }
+    } else {
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) s[u] = __bfloat162float(p[u]);
+    }
+}
+
+__device__ __forceinline__ void gdn_store8(
+    __nv_bfloat16* __restrict__ p, const float (&s)[8]) {
+    if ((reinterpret_cast<usize>(p) & 15) == 0) {
+        uint4 raw;
+        __nv_bfloat162* pairs = reinterpret_cast<__nv_bfloat162*>(&raw);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            pairs[u] = __floats2bfloat162_rn(s[2 * u], s[2 * u + 1]);
+        }
+        *reinterpret_cast<uint4*>(p) = raw;
+    } else {
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) p[u] = __float2bfloat16(s[u]);
+    }
+}
+
+// Sums `x` over the rows of the tile: lanes `TPR` apart in a warp hold the
+// same columns, the warps meet in `red`, and the first `BV` threads fold the
+// warps into `tot`. Every thread leaves with the totals of its own eight
+// columns.
+template <int TPR, int WARPS, int BV>
+__device__ __forceinline__ void gdn_column_sum(
+    float (&x)[8], float (*red)[BV], float* tot, int tid, int lane, int warp) {
+    #pragma unroll
+    for (int off = TPR; off < 32; off <<= 1) {
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) x[u] += __shfl_xor_sync(0xffffffffu, x[u], off);
+    }
+    __syncthreads();
+    if (lane < TPR) {
+        #pragma unroll
+        for (int u = 0; u < 8; ++u) red[warp][lane * 8 + u] = x[u];
+    }
+    __syncthreads();
+    if (tid < BV) {
+        float acc = 0.f;
+        #pragma unroll
+        for (int w = 0; w < WARPS; ++w) acc += red[w][tid];
+        tot[tid] = acc;
+    }
+    __syncthreads();
+    const int c = (tid % TPR) * 8;
+    #pragma unroll
+    for (int u = 0; u < 8; ++u) x[u] = tot[c + u];
+}
+
+template <int BV>
+__global__ void __launch_bounds__(256) ssm_gdn_decode_step(
+    const bf16* __restrict__ qkv_post,
+    const float* __restrict__ gates,
+    __nv_bfloat16* __restrict__ state_base,
+    const i32* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    float* __restrict__ out,
+    int K_h, int V_h, int K_d, int V_d, int conv_dim,
+    float q_scale,
+    const u32* __restrict__ win)
+{
+    constexpr int BLOCK = 256;
+    constexpr int VEC = 8;
+    constexpr int TPR = BV / VEC;
+    constexpr int RPP = BLOCK / TPR;
+    constexpr int WARPS = BLOCK / 32;
+    static_assert(BV % VEC == 0 && BLOCK % TPR == 0 && TPR <= 32 && 32 % TPR == 0,
+                  "a tile row is a whole number of eight-wide vectors");
+
+    const int vt = blockIdx.x;
+    const int r = blockIdx.y;
+    const int h = blockIdx.z;
+    // The staged-geometry seat (qkv_fused.cuh's idiom): the live-rows word
+    // retires a bucket's padded rows, `win[1]` is the plane row the launch's
+    // first row stands at; the slot table is the lanes'.
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const int r_row = win != nullptr ? r + static_cast<int>(win[1]) : r;
+    const int slot = slot_ids[r];
+    if (slot < 0) return;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int h_k = h / (V_h / K_h);
+    const int K_dim = K_h * K_d;
+    const bf16* row = qkv_post + (long long)r_row * conv_dim;
+    const bf16* q = row + (long long)h_k * K_d;
+    const bf16* k = row + K_dim + (long long)h_k * K_d;
+
+    __shared__ float sq[RPP];
+    __shared__ float sk[RPP];
+    __shared__ float red[WARPS][BV];
+    __shared__ float tot[BV];
+    __shared__ float norms[2];
+
+    // Every global read is issued here, before the first barrier, so the
+    // block pays one memory latency rather than one per phase.
+    const int i = tid / TPR;
+    const int j0 = vt * BV + (tid % TPR) * VEC;
+    const bool live = i < K_d;
+    __nv_bfloat16* cell = state_base
+        + (long long)slot * slot_stride_elems
+        + (long long)h * K_d * V_d
+        + (long long)i * V_d + j0;
+    float qv = 0.f;
+    float kv = 0.f;
+    if (tid < K_d) {
+        qv = Elem<bf16>::to_f32(q[tid]);
+        kv = Elem<bf16>::to_f32(k[tid]);
+    }
+    float s[VEC];
+    if (live) {
+        gdn_load8(cell, s);
+    } else {
+        #pragma unroll
+        for (int u = 0; u < VEC; ++u) s[u] = 0.f;
+    }
+    float vv[VEC];
+    gdn_load8(reinterpret_cast<const __nv_bfloat16*>(row + 2 * K_dim + (long long)h * V_d + j0), vv);
+    const float* gate_row = gates + (long long)r_row * 2 * V_h;
+    const float g = __expf(gate_row[h]);
+    const float beta = gate_row[V_h + h];
+
+    const float qs = warp_sum(qv * qv);
+    const float ks = warp_sum(kv * kv);
+    if (lane == 0) {
+        red[warp][0] = qs;
+        red[warp][1] = ks;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float a = 0.f;
+        float b = 0.f;
+        #pragma unroll
+        for (int w = 0; w < WARPS; ++w) {
+            a += red[w][0];
+            b += red[w][1];
+        }
+        norms[0] = rsqrtf(a + 1e-6f) * q_scale;
+        norms[1] = rsqrtf(b + 1e-6f);
+    }
+    __syncthreads();
+    if (tid < K_d) {
+        sq[tid] = qv * norms[0];
+        sk[tid] = kv * norms[1];
+    }
+    __syncthreads();
+    const float ki = live ? sk[i] : 0.f;
+    const float qi = live ? sq[i] : 0.f;
+
+    float x[VEC];
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) x[u] = s[u] * g * ki;
+    gdn_column_sum<TPR, WARPS, BV>(x, red, tot, tid, lane, warp);
+
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) {
+        const float delta = (vv[u] - x[u]) * beta;
+        const float sg = __bfloat162float(__float2bfloat16(s[u] * g));
+        const float sn = sg + ki * delta;
+        s[u] = sn;
+        x[u] = sn * qi;
+    }
+    if (live) gdn_store8(cell, s);
+    gdn_column_sum<TPR, WARPS, BV>(x, red, tot, tid, lane, warp);
+    if (tid < TPR) {
+        float* o = out + ((long long)r_row * V_h + h) * V_d + j0;
+        #pragma unroll
+        for (int u = 0; u < VEC; ++u) o[u] = x[u];
     }
 }
 

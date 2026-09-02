@@ -419,12 +419,19 @@ impl ForwardHybrid for Model {
                 None,
             );
             let (dx, _) = x.split(&Facts::drafts());
-            let (dids, _) = ids.split(&Facts::drafts());
+            // **THE HEAD'S TOKEN IS THE TRUNK'S ARGMAX**, not the row's own
+            // id: a trained draft head is fed `(hidden_i, t_{i+1})` and
+            // predicts `t_{i+2}`, and inside a verify fire the only
+            // `t_{i+1}` a row can name is the one the trunk just chose. The
+            // verifier reads the same argmax, so the chain at the row it
+            // accepts is conditioned on the token it continues with.
+            let (dlogits, _) = logits.split(&Facts::drafts());
+            let chosen = ops::layout::argmax(&[&dlogits]);
 
             // `[a|b]·[We|Wh]^T = a·We^T + b·Wh^T`: two matmuls and an add
             // since this IR has no concat op. No pre-fusion norms (EAGLE's
             // design). Embedding scale matches the trunk's own.
-            let e = ops::layout::embed(&dids, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
+            let e = ops::layout::embed(&chosen, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
             let mut dy = ops::elemwise::residual_add(
                 &ops::linear::matmul(&e, &a.fc_embed),
                 &ops::linear::matmul(&dx, &a.fc_hidden),
@@ -465,6 +472,101 @@ impl ForwardHybrid for Model {
                 None => draft,
             };
             seam::at(seam::MTP, &[&draft]);
+            // Depth one: the synthetic head chains nothing, so its token
+            // plane is one column — the argmax the verifier's next window
+            // starts from.
+            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&[&draft])]);
+        }
+
+        if let Some(a) = &m.assistant {
+            let (input_draft, _) = inputs.split(&Facts::drafts());
+            let (dpos, _) = positions.split(&Facts::drafts());
+            // One prefill plan per reading covers prefill and decode shapes.
+            let plans = [
+                ops::attn::plan_prefill(
+                    &input_draft,
+                    m.q_heads,
+                    m.sliding.kv_heads,
+                    m.sliding.head_dim,
+                    Some(m.sliding.window),
+                ),
+                ops::attn::plan_prefill(
+                    &input_draft,
+                    m.q_heads,
+                    m.global.kv_heads,
+                    m.global.head_dim,
+                    None,
+                ),
+            ];
+            let (dx, _) = x.split(&Facts::drafts());
+            let (dlogits, _) = logits.split(&Facts::drafts());
+            // The head's token is the trunk's argmax (see the arm above);
+            // its hidden is the trunk's post-norm readout at step 0 and its
+            // own projected state after. Every step attends READ-ONLY over
+            // the trunk's rows at the row's own position: the row's true
+            // token is already in them, the chain's are not — Google's
+            // constant-position drafting, exactly.
+            let mut token = ops::layout::argmax(&[&dlogits]);
+            let mut hidden = dx;
+            let mut chain: Vec<Value> = Vec::with_capacity(a.depth as usize);
+            for step in 0..a.depth {
+                let e = ops::layout::embed(&token, &m.embed, m.vocab) * (m.hidden as f32).sqrt();
+                let mut y = ops::elemwise::residual_add(
+                    &ops::linear::matmul(&e, &a.pre_embed),
+                    &ops::linear::matmul(&hidden, &a.pre_hidden),
+                );
+                for w in &a.layers {
+                    let at = &w.attn;
+                    let (d, kv_heads, win) = match at.reading {
+                        Reading::Sliding => {
+                            (m.sliding.head_dim, m.sliding.kv_heads, Some(m.sliding.window))
+                        }
+                        Reading::Global => (m.global.head_dim, m.global.kv_heads, None),
+                    };
+                    let AttnBanks::Shared { q_proj } = &at.banks else {
+                        panic!("the assistant borrows the trunk's kv and owns no k or v");
+                    };
+                    let pages = inputs.kv(&at.kv);
+                    let normed = ops::elemwise::rmsnorm(&y, &w.attn_norm, a.norm_eps);
+                    let q = q_only(&normed, &dpos, m, at, d, q_proj);
+                    let o = ops::attn::prefill(
+                        &q,
+                        &plans[at.reading as usize],
+                        pages,
+                        win,
+                        d,
+                        kv_heads,
+                        at.sm_scale,
+                    );
+                    let o = ops::linear::matmul(&o, &w.o_proj);
+                    y = ops::elemwise::residual_add(
+                        &ops::elemwise::rmsnorm(&o, &w.post_attn_norm, a.norm_eps),
+                        &y,
+                    );
+                    let mlp_in = ops::elemwise::rmsnorm(&y, &w.pre_ffw_norm, a.norm_eps);
+                    let act = ops::linear::mlp_geglu_tanh_packed(
+                        &ops::linear::matmul(&mlp_in, &w.gate_up),
+                        w.inter,
+                    );
+                    let f = ops::linear::matmul(&act, &w.down);
+                    y = ops::elemwise::residual_add(
+                        &ops::elemwise::rmsnorm(&f, &w.post_ffw_norm, a.norm_eps),
+                        &y,
+                    );
+                    y = ops::elemwise::scale(&w.scalar, &y);
+                }
+                let read = ops::elemwise::rmsnorm(&y, &a.norm, a.norm_eps);
+                // Its own tied head, uncapped.
+                let draft = ops::linear::lm_head(&read, &a.embed);
+                if step == 0 {
+                    seam::at(seam::MTP, &[&draft]);
+                }
+                token = ops::layout::argmax(&[&draft]);
+                hidden = ops::linear::matmul(&read, &a.post);
+                chain.push(draft);
+            }
+            let steps: Vec<&Value> = chain.iter().collect();
+            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&steps)]);
         }
 
         logits
@@ -544,14 +646,18 @@ fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
         let k = ops::elemwise::rmsnorm_per_head(&clipped(&n, &b.k), &b.k_norm, d, t.norm_eps);
         // A per-head norm with no learned weight (same as the trunk's `v` leg).
         let v = ops::elemwise::rmsnorm_no_scale(&clipped(&n, &b.v), d, t.norm_eps);
-        // RoPE restarts per spatial axis (`MropeForm::Blocked`), matching
-        // upstream's `compute_default_rope_parameters`.
+        // Gemma's `apply_multidimensional_rope` (`MropeForm::Split`): the
+        // head is two channel blocks, x's then y's — the front-end states
+        // `(x, y)` — and `rotate_half` turns inside each block at a ladder of
+        // its own width. NOT Qwen's `Blocked`, which pairs across the whole
+        // head: with that pairing the 31B tower saw two cats on a couch as
+        // "an abstract image with a rippled texture".
         let (q, k) = ops::elemwise::rope_mrope(
             &q,
             &k,
             &grid,
             [0, d / 4, d / 4],
-            MropeForm::Blocked,
+            MropeForm::Split,
             d,
             d,
             t.theta,

@@ -188,6 +188,29 @@ impl Run<'_> {
             Elementwise::ResidualAdd { x, y, y_out: _ } => {
                 elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
+            Elementwise::ResidualAddRmsnorm {
+                x,
+                y,
+                y_out: _,
+                weight,
+                plus_one,
+                eps,
+                out,
+            } => {
+                elemwise::norm::residual_add(self.ctx(), self.tensor(*x), self.tensor(*y))?;
+                let norm = if *plus_one {
+                    elemwise::norm::rmsnorm_plus_one
+                } else {
+                    elemwise::norm::rmsnorm
+                };
+                norm(
+                    self.ctx(),
+                    self.tensor(*y),
+                    self.tensor(*weight),
+                    *eps,
+                    self.tensor(*out),
+                )
+            }
             Elementwise::AddBias {
                 bias,
                 out,
@@ -280,6 +303,28 @@ impl Run<'_> {
                 q_out: _,
                 k_out: _,
             } => elemwise::rope_mrope::interleaved(
+                self.ctx(),
+                self.tensor(*q),
+                self.tensor(*k),
+                self.tensor(*positions),
+                *sections,
+                *rotary_dim,
+                *head_dim,
+                *theta,
+            ),
+            // Gemma's tower: contiguous channel blocks, `rotate_half` inside each.
+            Elementwise::RopeMrope {
+                q,
+                k,
+                positions,
+                sections,
+                form: MropeForm::Split,
+                rotary_dim,
+                head_dim,
+                theta,
+                q_out: _,
+                k_out: _,
+            } => elemwise::rope_mrope::split(
                 self.ctx(),
                 self.tensor(*q),
                 self.tensor(*k),

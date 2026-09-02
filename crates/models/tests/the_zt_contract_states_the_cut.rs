@@ -34,7 +34,16 @@ fn scratch() -> PathBuf {
 }
 
 fn write_checkpoint(path: &Path, params: &[Param]) {
-    let mut planes: Vec<&Param> = params.iter().collect();
+    // an mxfp4 bank's `.scales` is a plane of its codes' object, not an object.
+    let banks: BTreeSet<&str> = params
+        .iter()
+        .filter(|p| p.dtype == Dtype::Mxfp4)
+        .map(|p| p.name.as_str())
+        .collect();
+    let mut planes: Vec<&Param> = params
+        .iter()
+        .filter(|p| !p.name.strip_suffix(".scales").is_some_and(|stem| banks.contains(stem)))
+        .collect();
     planes.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut writer =
@@ -49,15 +58,15 @@ fn write_checkpoint(path: &Path, params: &[Param]) {
 
 fn state(writer: &mut ztensor::Writer, param: &Param) {
     match param.dtype {
-        Dtype::Bf16 => raw(writer, param, ztensor::DType::BF16, None, 2),
-        Dtype::F16 => raw(writer, param, ztensor::DType::F16, None, 2),
-        Dtype::F32 => raw(writer, param, ztensor::DType::F32, None, 4),
-        Dtype::I32 => raw(writer, param, ztensor::DType::I32, None, 4),
-        Dtype::U32 => raw(writer, param, ztensor::DType::U32, None, 4),
-        Dtype::U8 => raw(writer, param, ztensor::DType::U8, None, 1),
-        Dtype::I8 => raw(writer, param, ztensor::DType::I8, None, 1),
-        Dtype::E4m3 => raw(writer, param, ztensor::DType::U8, Some("f8_e4m3fn"), 1),
-        Dtype::E8m0 => raw(writer, param, ztensor::DType::U8, Some("f8_e8m0"), 1),
+        Dtype::Bf16 => raw(writer, param, ztensor::Leaf::BF16, 2),
+        Dtype::F16 => raw(writer, param, ztensor::Leaf::F16, 2),
+        Dtype::F32 => raw(writer, param, ztensor::Leaf::F32, 4),
+        Dtype::I32 => raw(writer, param, ztensor::Leaf::I32, 4),
+        Dtype::U32 => raw(writer, param, ztensor::Leaf::U32, 4),
+        Dtype::U8 => raw(writer, param, ztensor::Leaf::U8, 1),
+        Dtype::I8 => raw(writer, param, ztensor::Leaf::I8, 1),
+        Dtype::E4m3 => raw(writer, param, ztensor::Leaf::E4M3, 1),
+        Dtype::E8m0 => raw(writer, param, ztensor::Leaf::E8M0, 1),
         Dtype::Mxfp4 => codes(writer, param),
         Dtype::E2m1 => panic!(
             "`{}` is declared fp4, which names a kv-page scheme and no stored plane",
@@ -79,7 +88,7 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
         ),
         // `ffn.gate.tid2eid` (dsv4-flash's token-id -> expert-id table) is the
         // only I64 plane any catalog SKU declares.
-        Dtype::I64 => raw(writer, param, ztensor::DType::I64, None, 8),
+        Dtype::I64 => raw(writer, param, ztensor::Leaf::I64, 8),
         Dtype::E5m2 | Dtype::I16 | Dtype::U64 | Dtype::U16 | Dtype::Bool => {
             panic!(
                 "`{}` is declared {:?}, which no SKU in the catalog stores",
@@ -103,44 +112,26 @@ fn state(writer: &mut ztensor::Writer, param: &Param) {
     }
 }
 
-fn raw(
-    writer: &mut ztensor::Writer,
-    param: &Param,
-    dtype: ztensor::DType,
-    logical: Option<&str>,
-    width: usize,
-) {
+fn raw(writer: &mut ztensor::Writer, param: &Param, leaf: ztensor::Leaf, width: usize) {
     let data = vec![0u8; width];
     let shape = vec![1u64; param.shape.len()];
     writer
-        .object(param.name.as_str(), |o| {
-            o.shape(shape).part("data", |p| {
-                let p = p.dtype(dtype);
-                match logical {
-                    Some(id) => p.logical(id),
-                    None => p,
-                }
-                .bytes(&data)
-            })
-        })
+        .add(param.name.as_str(), shape, leaf, &data)
         .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
 }
 
 fn codes(writer: &mut ztensor::Writer, param: &Param) {
-    let data = vec![0u8; 16];
+    let codes = [0u8; 16];
+    let scale = [0u8; 1];
     let axis = block_axis(param);
-    let stated = u64::try_from(axis).expect("an axis no u64 holds");
     let mut shape = vec![1u64; axis];
     shape.push(GROUP);
+    let term = ztensor::Term::parse(&format!("g{GROUP}_e2m1_e8m0_n")).expect("the mxfp4 term");
     writer
         .object(param.name.as_str(), |o| {
             o.shape(shape)
-                .layout("zt.mx/1")
-                .attr("axis", stated)
-                .attr("block_size", GROUP)
-                .part("data", |p| {
-                    p.dtype(ztensor::DType::U8).logical("f4_e2m1").bytes(&data)
-                })
+                .term(term)
+                .planes([codes.as_slice(), scale.as_slice()])
         })
         .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
 }
@@ -481,12 +472,8 @@ fn write_unquantized_checkpoint(path: &Path, params: &[Param]) {
         match param.dtype {
             Dtype::Mxfp4 => {
                 let logical = param.shape.len().saturating_sub(1);
-                let data = [0u8, 0u8];
                 writer
-                    .object(param.name.as_str(), |o| {
-                        o.shape(vec![1u64; logical])
-                            .part("data", |p| p.dtype(ztensor::DType::BF16).bytes(&data))
-                    })
+                    .add(param.name.as_str(), vec![1u64; logical], ztensor::Leaf::BF16, &[0u8, 0u8])
                     .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
             }
             _ => state(&mut writer, param),

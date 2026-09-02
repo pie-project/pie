@@ -10,6 +10,11 @@ interface chat {
         done(string),
     }
 
+    /// The tokens a conversation or a raw completion prompt starts with —
+    /// `<bos>` where the model needs one, empty otherwise. The role fillers
+    /// below include it; a raw prompt is `prefix() ++ encode(text)`.
+    prefix: func() -> list<u32>;
+
     /// Fill roles for history replay
     system: func(message: string) -> list<u32>;
     first-user: func(message: string) -> list<u32>;

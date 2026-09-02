@@ -110,10 +110,7 @@ fn write_a_checkpoint_of_one_stranger(path: &Path) {
     let mut writer =
         ztensor::Writer::create(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
     writer
-        .object("a.tensor.no.model.in.this.catalog.reads", |o| {
-            o.shape(vec![1u64])
-                .part("data", |p| p.dtype(ztensor::DType::U8).bytes(&[0u8]))
-        })
+        .add("a.tensor.no.model.in.this.catalog.reads", vec![1u64], ztensor::Leaf::U8, &[0u8])
         .unwrap_or_else(|why| panic!("{}: {why}", path.display()));
     writer
         .finish()

@@ -61,6 +61,18 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     # suite that wants the tower names the row.
     parser.add_argument("--sku", default=None,
                         help="Catalog SKU to serve (default: identify one from the checkpoint)")
+    parser.add_argument("--max-total-pages", type=int, default=None,
+                        help="[model.engine.options] total_pages: cap the KV page pool "
+                             "(a dsv4 page carries every layer's index-key and compressor "
+                             "caches, so the derived pool can outrun the device)")
+    parser.add_argument("--engine-option", action="append", default=[],
+                        metavar="KEY=VALUE",
+                        help="one `[model.engine.options]` entry, repeatable (e.g. "
+                             "max_forward_tokens=64); integers and floats are typed, the "
+                             "rest is text")
+    parser.add_argument("--device-weight-budget", default=None,
+                        help="[model] device_weight_budget, e.g. 20GiB: what a streamed-expert "
+                             "artifact (dsv4) needs to load on a box that cannot hold it whole")
     parser.add_argument("--device", default=None,
                         help="Device(s), comma-separated. Default: 'metal:0' for --engine metal, "
                              "'gpu:0' for --engine wgpu or vulkan, else 'cuda:0'")
@@ -326,6 +338,18 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         engine_subsection["spec_ngram_num_drafts"] = args.spec_num_drafts
     if args.graphs is not None:
         engine_subsection["graphs"] = args.graphs
+    if args.max_total_pages is not None:
+        engine_subsection["total_pages"] = args.max_total_pages
+    for entry in args.engine_option:
+        key, _, value = entry.partition("=")
+        typed: object = value
+        for cast in (int, float):
+            try:
+                typed = cast(value)
+                break
+            except ValueError:
+                continue
+        engine_subsection[key.strip()] = typed
 
     cfg = Config(
         server=ServerConfig(port=0),
@@ -334,12 +358,12 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
             name="default",
             hf_repo=args.model,
             sku=args.sku,
+            device_weight_budget=args.device_weight_budget,
+            # `kv_pages` retired from the schema (6d3189654): the worker
+            # refuses the key by name, so the flag is not forwarded.
             engine=EngineConfig(
                 type=args.engine,
                 device=device,
-                # KV geometry, so it sits with the rest of it under
-                # `[engine]` rather than on the model.
-                kv_pages=args.kv_pages,
                 options=engine_subsection,
             ),
         ),

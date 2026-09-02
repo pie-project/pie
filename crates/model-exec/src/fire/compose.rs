@@ -78,6 +78,35 @@ pub struct ClassWindow {
 /// shape as [`ClassWindow`], over a mask's classes rather than one.
 pub type MaskSpan = ClassWindow;
 
+/// Cut every span of `spans` longer than `cap` rows into consecutive pieces
+/// of at most `cap` rows, in place and in order. A piece keeps its span's
+/// lane interval: the ops of a capped region are row-local (a routed
+/// mixture's matmuls and their combine), and read no lane-shaped value. `0`
+/// caps nothing.
+pub fn chunk_spans(spans: &mut Vec<MaskSpan>, cap: u32) {
+    if cap == 0 || spans.iter().all(|span| span.rows <= cap) {
+        return;
+    }
+    let whole = std::mem::take(spans);
+    for span in whole {
+        if span.rows <= cap {
+            spans.push(span);
+            continue;
+        }
+        let mut done = 0;
+        while done < span.rows {
+            let take = (span.rows - done).min(cap);
+            spans.push(MaskSpan {
+                row_offset: span.row_offset + done,
+                rows: take,
+                lane_offset: span.lane_offset,
+                lanes: span.lanes,
+            });
+            done += take;
+        }
+    }
+}
+
 /// The window table: one [`ClassWindow`] per class, indexed by class
 /// position. [`walk()`](fn@crate::fire::walk) checks the width first, or a
 /// wrong-width table finds the wrong class.
