@@ -1,11 +1,13 @@
 use checkpoint::contract::{Expr, ModelContract, TensorType};
 use model_dsl::{Platform, Shard, Weight};
 
-use super::model::{Indexer, Kda, Mixer, Mla, Mlp, Model};
+use super::model::{Indexer, Kda, Mixer, Mla, Mlp, Model, Tower};
 use checkpoint_dsl::{Builder, Error};
 
 /// The checkpoint's draft head, `layers.45` of the language model.
 const HEAD: &str = "model.language_model.layers.45.";
+/// The checkpoint's vision tower.
+const VISUAL: &str = "model.visual.";
 
 /// Where a trunk plane is read from: the checkpoint's names, or (for an
 /// overlay onto an artifact) the artifact's own — every trunk plane by its
@@ -69,7 +71,10 @@ impl Model {
     ) -> Result<ModelContract, Error> {
         // An artifact with the head overlaid (`pie model import <artifact.zt>
         // --aux <shards>`): the head under `aux.`, every trunk plane its own.
-        if self.mtp.is_some() && src.get(&format!("aux.{HEAD}enorm.weight")).is_some() {
+        let overlaid = |name: &str| src.get(&format!("aux.{name}")).is_some();
+        if (self.mtp.is_some() && overlaid(&format!("{HEAD}enorm.weight")))
+            || (self.tower.is_some() && overlaid(&format!("{VISUAL}post_layernorm.weight")))
+        {
             return self.import_from_own_with_aux(src, platform);
         }
         self.import_from_mlx(src, platform)
@@ -83,7 +88,7 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        self.land(src, platform, From::Source, HEAD)
+        self.land(src, platform, From::Source, "")
     }
 
     /// Reads a STAMPED ARTIFACT of this family's text row with the draft head
@@ -95,23 +100,25 @@ impl Model {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<ModelContract, Error> {
-        if self.mtp.is_none() {
+        if self.mtp.is_none() && self.tower.is_none() {
             return Err(Error::Illegible {
                 name: "mtp".to_string(),
-                detail: "this row declares no draft head, so there is no overlay to land \
-                         on an artifact"
+                detail: "this row declares neither a draft head nor a tower, so there is \
+                         no overlay to land on an artifact"
                     .to_string(),
             });
         }
-        self.land(src, platform, From::Own, &format!("aux.{HEAD}"))
+        self.land(src, platform, From::Own, "aux.")
     }
 
+    /// `new` prefixes the names of the planes an overlay brings (the head,
+    /// the tower): empty for a snapshot, `aux.` for an artifact overlay.
     fn land(
         &self,
         src: &ztensor::Source,
         platform: Platform,
         from: From,
-        head: &str,
+        new: &str,
     ) -> Result<ModelContract, Error> {
         let mut b = Land {
             b: Builder::new(src, self.tp, platform),
@@ -147,16 +154,23 @@ impl Model {
             }
         }
 
-        // The draft head: new bytes on either road, so read by name.
+        // The draft head and the tower: new bytes when the overlay brings
+        // them, so read by name — unless the artifact already holds them
+        // (a tower overlaid onto a drafting artifact), when they are its own.
+        let held = |own: &str| matches!(from, From::Own) && src.get(own).is_some();
+        let mut b = Land {
+            b: b.b,
+            from: if held("vision.post_norm") { From::Own } else { From::Source },
+        };
+        if let Some(t) = &self.tower {
+            tower(src, &mut b, &|s: &str| format!("{new}{VISUAL}{s}"), t)?;
+        }
         let Some(mtp) = &self.mtp else {
             return Ok(b.b.build());
         };
-        let n = |s: &str| format!("{head}{s}");
+        b.from = if held("mtp.enorm") { From::Own } else { From::Source };
+        let n = |s: &str| format!("{new}{HEAD}{s}");
         let hidden = i64::from(self.hidden);
-        let mut b = Land {
-            b: b.b,
-            from: From::Source,
-        };
         b.read(&mtp.enorm, n("enorm.weight"))?;
         b.read(&mtp.hnorm, n("hnorm.weight"))?;
         // `eh_proj` is one `[hidden, 2·hidden]` plane over `[e; h]`: its first
@@ -174,6 +188,81 @@ impl Model {
         b.read(&mtp.norm, n("shared_head.norm.weight"))?;
         Ok(b.b.build())
     }
+}
+
+fn tower(
+    src: &ztensor::Source,
+    b: &mut Land,
+    v: &dyn Fn(&str) -> String,
+    t: &Tower,
+) -> Result<(), Error> {
+    // The Conv3d kernel `[hidden, C, T, P, P]` is already stored in the
+    // matmul bank's byte order (a transmute).
+    b.read_expr(&t.patch_embed, || {
+        reshaped(src, v("patch_embed.proj.weight"), vec![i64::from(t.hidden), i64::from(t.patch_width)])
+    })?;
+    b.read(&t.patch_embed_bias, v("patch_embed.proj.bias"))?;
+    for (l, blk) in t.blocks.iter().enumerate() {
+        let n = |s: &str| v(&format!("blocks.{l}.{s}"));
+        for (weight, from) in [
+            (&blk.norm1, n("norm1.weight")),
+            (&blk.qkv, n("attn.qkv.weight")),
+            (&blk.qkv_bias, n("attn.qkv.bias")),
+            (&blk.q_norm, n("attn.q_norm.weight")),
+            (&blk.k_norm, n("attn.k_norm.weight")),
+            (&blk.proj, n("attn.proj.weight")),
+            (&blk.proj_bias, n("attn.proj.bias")),
+            (&blk.norm2, n("norm2.weight")),
+            (&blk.down, n("mlp.down_proj.weight")),
+            (&blk.down_bias, n("mlp.down_proj.bias")),
+        ] {
+            b.read(weight, from)?;
+        }
+        b.read_concat(&blk.gate_up, vec![n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])?;
+        b.read_concat(&blk.gate_up_bias, vec![n("mlp.gate_proj.bias"), n("mlp.up_proj.bias")])?;
+    }
+    b.read(&t.post_norm, v("post_layernorm.weight"))?;
+    // The Conv2d kernel `[out, C, kh, kw]` flattens to `(c, kh, kw)` columns;
+    // the merged rows come `(kh, kw, c)`, so the columns are permuted.
+    b.read_expr(&t.downsample, || {
+        let (c, k) = (i64::from(t.hidden), i64::from(t.merge));
+        let out = extent(t.downsample.dim(0));
+        let flat = reshaped(src, v("downsample.weight"), vec![out, c * k * k])?;
+        let indices = (0..k * k)
+            .flat_map(|kk| (0..c).map(move |ch| ch * k * k + kk))
+            .collect();
+        Ok(flat.gather(1, indices))
+    })?;
+    b.read(&t.downsample_bias, v("downsample.bias"))?;
+    let m = &t.merger;
+    b.read(&m.proj, v("merger.proj.weight"))?;
+    b.read(&m.norm, v("merger.post_projection_norm.weight"))?;
+    b.read(&m.norm_bias, v("merger.post_projection_norm.bias"))?;
+    b.read_concat(&m.gate_up, vec![v("merger.gate_proj.weight"), v("merger.up_proj.weight")])?;
+    b.read(&m.down, v("merger.down_proj.weight"))?;
+    Ok(())
+}
+
+/// The same bytes read as `want`: a stored rank-N kernel as a rank-2 bank.
+fn reshaped(src: &ztensor::Source, from: String, want: Vec<i64>) -> Result<Expr, Error> {
+    let Some(tensor) = src.get(&from) else {
+        return Err(Error::Missing(from));
+    };
+    let illegible = |why: &dyn std::fmt::Display| Error::Illegible {
+        name: from.clone(),
+        detail: why.to_string(),
+    };
+    let shape = tensor.shape();
+    let stored: i128 = shape.iter().map(|&n| i128::from(n)).product();
+    let asked: i128 = want.iter().map(|&n| i128::from(n)).product();
+    if stored > 1 && stored != asked {
+        return Err(illegible(&format!(
+            "is stored {shape:?} ({stored} elements) and the plan reads it as {want:?} \
+             ({asked} elements)"
+        )));
+    }
+    let stored = checkpoint::file::encoding_of(&tensor).map_err(|why| illegible(&why))?;
+    Ok(Expr::src(from).transmute(TensorType::new(want, stored)))
 }
 
 fn moe(b: &mut Land, n: &dyn Fn(&str) -> String, mlp: &Mlp) -> Result<(), Error> {

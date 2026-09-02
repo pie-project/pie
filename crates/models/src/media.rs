@@ -281,6 +281,7 @@ pub fn vision_front_end(arch: &str) -> Option<Box<dyn VisionFrontEnd>> {
         // ships qwen3.6/3.8's tower over its own trunk.
         crate::qwen_4::ARCH => Some(Box::new(crate::qwen_3::media::Qwen35Vision::new())),
         crate::gemma_4::media::ARCH => Some(Box::new(crate::gemma_4::media::Gemma4Vision::new())),
+        crate::glm_5_next::media::ARCH => Some(Box::new(crate::glm_5_next::media::Glm5Vision::new())),
         _ => None,
     }
 }

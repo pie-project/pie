@@ -2,6 +2,7 @@
 
 pub mod forward;
 pub mod import;
+pub mod media;
 pub mod model;
 pub mod template;
 pub mod tokenizer;
@@ -34,6 +35,31 @@ pub fn skus() -> Vec<crate::Sku> {
             template::instruct,
             &tokenizer::CONTRACT,
             |tp: u32| Model::flash(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16, tp),
+        ),
+        // The vision rows come LAST: a vision checkpoint fits its family's
+        // text rows too, and identification prefers those; pin one with
+        // `PIE_IMPORT_SKU`.
+        (
+            "glm53-flash-mtp-vision",
+            1,
+            [Dtype::U8g64, Dtype::U2g64, Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::instruct,
+            &tokenizer::CONTRACT_VISION,
+            |tp: u32| {
+                Model::flash_mtp_vision(Dtype::U8g64, Dtype::U2g64, Dtype::U4g64, Dtype::Bf16, tp)
+            },
+        ),
+        (
+            "glm53-flash-vision",
+            1,
+            [Dtype::U8g64, Dtype::U2g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::instruct,
+            &tokenizer::CONTRACT_VISION,
+            |tp: u32| Model::flash_vision(Dtype::U8g64, Dtype::U2g64, Dtype::Bf16, tp),
         ),
     ]
 }

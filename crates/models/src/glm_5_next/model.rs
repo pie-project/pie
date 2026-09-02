@@ -26,6 +26,65 @@ pub struct Model {
     pub final_norm_eps: f32,
     /// The draft head, or `None` for a row without one.
     pub mtp: Option<Mtp>,
+    /// The vision tower, or `None` for a text row.
+    pub tower: Option<Tower>,
+}
+
+/// **THE VISION TOWER** (`model.visual.*`, `glm5_next_vision`): 24 prenorm
+/// bidirectional blocks of 1024 over 14-pixel patches, q/k RMS-normed per
+/// head under a 2-D rotary, a clamped SwiGLU MLP with biases, a post norm,
+/// a 2×2 `downsample` conv (read as a matmul over merged rows) into the
+/// trunk's width, and the merger (`proj`, LayerNorm, GELU, clamped SwiGLU).
+/// No learned position table.
+pub struct Tower {
+    pub hidden: u32,
+    pub heads: u32,
+    pub head_dim: u32,
+    /// `spatial_merge_size`: `downsample` folds `merge²` consecutive patch
+    /// rows into one (`layout.merge_rows`).
+    pub merge: u32,
+    /// `C · T · P²`: width of one pre-unfolded patch row.
+    pub patch_width: u32,
+    pub inter: u32,
+    pub merger_inter: u32,
+    pub limit: f32,
+    pub theta: f32,
+    pub norm_eps: f32,
+    pub sm_scale: f32,
+    /// `[hidden, patch_width]`: the Conv3d kernel as a matmul bank.
+    pub patch_embed: Weight,
+    pub patch_embed_bias: Weight,
+    pub blocks: Vec<TowerBlock>,
+    pub post_norm: Weight,
+    /// `[out, merge² · hidden]`: the Conv2d kernel over one merge block, its
+    /// columns in the merged rows' `(kh, kw, c)` order.
+    pub downsample: Weight,
+    pub downsample_bias: Weight,
+    pub merger: Merger,
+}
+
+pub struct TowerBlock {
+    pub norm1: Weight,
+    pub qkv: Weight,
+    pub qkv_bias: Weight,
+    pub q_norm: Weight,
+    pub k_norm: Weight,
+    pub proj: Weight,
+    pub proj_bias: Weight,
+    pub norm2: Weight,
+    /// `[2·inter, hidden]`, gate then up.
+    pub gate_up: Weight,
+    pub gate_up_bias: Weight,
+    pub down: Weight,
+    pub down_bias: Weight,
+}
+
+pub struct Merger {
+    pub proj: Weight,
+    pub norm: Weight,
+    pub norm_bias: Weight,
+    pub gate_up: Weight,
+    pub down: Weight,
 }
 
 pub use crate::adapter::Adapters;
@@ -250,14 +309,30 @@ impl Model {
     /// `Vontra/GLM-5.3-Flash-MLX-2bit-MTP`, text only: 45 layers, hidden 4096,
     /// 288 routed experts top-8, the KDA/DSA cadence, mHC over four streams.
     pub fn flash(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, experts, None, kv, tp, Model::flash_dims())
+        Model::new(w, experts, None, false, kv, tp, Model::flash_dims())
+    }
+
+    /// [`flash`](Model::flash) with the vision tower.
+    pub fn flash_vision(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, experts, None, true, kv, tp, Model::flash_dims())
+    }
+
+    /// Tower and draft head together: what the shipped checkpoint publishes.
+    pub fn flash_mtp_vision(
+        w: Dtype,
+        experts: Dtype,
+        head_experts: Dtype,
+        kv: Dtype,
+        tp: u32,
+    ) -> Model {
+        Model::new(w, experts, Some(head_experts), true, kv, tp, Model::flash_dims())
     }
 
     /// [`flash`](Model::flash) with the draft head over it: the checkpoint's
     /// `layers.45` block, its routed experts in `head_experts` (Q4 in
     /// Vontra's conversion, where the trunk's are Q2).
     pub fn flash_mtp(w: Dtype, experts: Dtype, head_experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(w, experts, Some(head_experts), kv, tp, Model::flash_dims())
+        Model::new(w, experts, Some(head_experts), false, kv, tp, Model::flash_dims())
     }
 
     fn flash_dims() -> Dims {
@@ -308,6 +383,7 @@ impl Model {
         weights: Dtype,
         experts: Dtype,
         draft: Option<Dtype>,
+        vision: bool,
         kv: Dtype,
         tp: u32,
         d: Dims,
@@ -542,6 +618,8 @@ impl Model {
             depth: DRAFT_DEPTH,
         });
 
+        let tower = vision.then(|| Model::tower(&d));
+
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
@@ -564,6 +642,64 @@ impl Model {
             final_norm: Weight::sym("final_norm", [hidden], dense),
             final_norm_eps: d.norm_eps,
             mtp,
+            tower,
+        }
+    }
+
+    /// The `glm5_next_vision` tower at the checkpoint's numbers, every plane
+    /// bf16 as stored, under `vision.`.
+    fn tower(d: &Dims) -> Tower {
+        let (hidden, heads, depth, inter, merger_inter) = (1024u64, 16u32, 24u32, 4096u64, 10240u64);
+        let (patch, temporal, merge) = (14u64, 2u64, 2u64);
+        let out = d.hidden as u64;
+        let head_dim = hidden / u64::from(heads);
+        let bf = Dtype::Bf16;
+        let v = |s: &str| format!("vision.{s}");
+        let blocks = (0..depth)
+            .map(|l| {
+                let n = |s: &str| v(&format!("blocks.{l}.{s}"));
+                TowerBlock {
+                    norm1: Weight::sym(n("norm1"), [hidden], bf),
+                    qkv: Weight::sym(n("qkv"), [3 * hidden, hidden], bf).packed([hidden, hidden, hidden]),
+                    qkv_bias: Weight::sym(n("qkv_bias"), [3 * hidden], bf).packed([hidden, hidden, hidden]),
+                    q_norm: Weight::sym(n("q_norm"), [head_dim], bf),
+                    k_norm: Weight::sym(n("k_norm"), [head_dim], bf),
+                    proj: Weight::sym(n("proj"), [hidden, hidden], bf),
+                    proj_bias: Weight::sym(n("proj_bias"), [hidden], bf),
+                    norm2: Weight::sym(n("norm2"), [hidden], bf),
+                    gate_up: Weight::sym(n("gate_up"), [2 * inter, hidden], bf).packed([inter, inter]),
+                    gate_up_bias: Weight::sym(n("gate_up_bias"), [2 * inter], bf).packed([inter, inter]),
+                    down: Weight::sym(n("down"), [hidden, inter], bf),
+                    down_bias: Weight::sym(n("down_bias"), [hidden], bf),
+                }
+            })
+            .collect();
+        Tower {
+            hidden: hidden as u32,
+            heads,
+            head_dim: head_dim as u32,
+            merge: merge as u32,
+            patch_width: (3 * temporal * patch * patch) as u32,
+            inter: inter as u32,
+            merger_inter: merger_inter as u32,
+            limit: d.swiglu_limit,
+            theta: 10_000.0,
+            norm_eps: d.norm_eps,
+            sm_scale: (head_dim as f32).sqrt().recip(),
+            patch_embed: Weight::sym(v("patch_embed"), [hidden, 3 * temporal * patch * patch], bf),
+            patch_embed_bias: Weight::sym(v("patch_embed_bias"), [hidden], bf),
+            blocks,
+            post_norm: Weight::sym(v("post_norm"), [hidden], bf),
+            downsample: Weight::sym(v("downsample"), [out, merge * merge * hidden], bf),
+            downsample_bias: Weight::sym(v("downsample_bias"), [out], bf),
+            merger: Merger {
+                proj: Weight::sym(v("merger_proj"), [out, out], bf),
+                norm: Weight::sym(v("merger_norm"), [out], bf),
+                norm_bias: Weight::sym(v("merger_norm_bias"), [out], bf),
+                gate_up: Weight::sym(v("merger_gate_up"), [2 * merger_inter, out], bf)
+                    .packed([merger_inter, merger_inter]),
+                down: Weight::sym(v("merger_down"), [out, merger_inter], bf),
+            },
         }
     }
 }

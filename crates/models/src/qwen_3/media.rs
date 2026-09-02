@@ -11,7 +11,7 @@ pub const ARCH: &str = "qwen3_5";
 
 /// The processor's constants, as a field rather than a `const` so a future
 /// SKU can vary them without forking the type.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QwenVisionConfig {
     /// Pixels per patch side.
     pub patch_size: u32,
@@ -25,6 +25,10 @@ pub struct QwenVisionConfig {
     pub max_pixels: u32,
     /// `int(num_position_embeddings ** 0.5)` — the learned table's grid side.
     pub num_grid_per_side: u32,
+    /// `image_mean` / `image_std`, per channel: qwen's are 0.5 (pixels land
+    /// in `[-1, 1]`), GLM's tower keeps CLIP's.
+    pub mean: [f32; 3],
+    pub std: [f32; 3],
 }
 
 impl Default for QwenVisionConfig {
@@ -36,6 +40,8 @@ impl Default for QwenVisionConfig {
             min_pixels: 65536,
             max_pixels: 16_777_216,
             num_grid_per_side: 48,
+            mean: [0.5; 3],
+            std: [0.5; 3],
         }
     }
 }
@@ -151,7 +157,7 @@ impl QwenVisionConfig {
 
         let mut pix = vec![0.0f32; n * pd];
         let mut pos = vec![0u32; n * 2];
-        let norm = |v: u8| -> f32 { ((f32::from(v) / 255.0) - 0.5) / 0.5 };
+        let norm = |v: u8, ch: usize| -> f32 { ((f32::from(v) / 255.0) - self.mean[ch]) / self.std[ch] };
 
         let mut out_idx = 0usize;
         for ih_blk in 0..bh {
@@ -172,7 +178,7 @@ impl QwenVisionConfig {
                                     for col in 0..p {
                                         let off = ((ch * tp + t) * p + r) * p + col;
                                         let src = ((pr * p + r) * w + (pc * p + col)) * 3 + ch;
-                                        pix[base + off] = norm(rgb[src]);
+                                        pix[base + off] = norm(rgb[src], ch);
                                     }
                                 }
                             }

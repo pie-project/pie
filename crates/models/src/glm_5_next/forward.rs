@@ -2,7 +2,8 @@ use model_dsl::{
     Classify, Dtype, ForwardHybrid, HybridSpec, Input, Predicate, Request, Value, ops, seam,
 };
 
-use super::model::{Hyper, Indexer, Kda, Mix, Mixer, Mla, Mlp, Model};
+use super::model::{Hyper, Indexer, Kda, Mix, Mixer, Mla, Mlp, Model, Tower};
+use model_dsl::MropeForm;
 
 /// How a DSA mixer's rows are read: the trunk splits them on `qo_one` into
 /// a decode arm and a prefill arm; the draft head reads every row through
@@ -18,6 +19,8 @@ pub struct Facts {
     pub qo_one: bool,
     pub has_adapter: bool,
     pub drafts: bool,
+    /// Lanes whose fire carries an image span.
+    pub media: bool,
 }
 
 impl Facts {
@@ -35,6 +38,10 @@ impl Facts {
     pub fn drafts() -> Predicate {
         Predicate::fact(2)
     }
+
+    pub fn media() -> Predicate {
+        Predicate::fact(3)
+    }
 }
 
 impl Classify for Facts {
@@ -43,11 +50,15 @@ impl Classify for Facts {
             qo_one: r.query_len() == 1,
             has_adapter: r.has_adapter(),
             drafts: r.drafts(),
+            media: r.has_media(),
         }
     }
 
     fn word(&self) -> u64 {
-        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1) | (u64::from(self.drafts) << 2)
+        u64::from(self.qo_one)
+            | (u64::from(self.has_adapter) << 1)
+            | (u64::from(self.drafts) << 2)
+            | (u64::from(self.media) << 3)
     }
 }
 
@@ -111,9 +122,20 @@ impl ForwardHybrid for Model {
             ops::attn::mla_plan(&input_p, m.heads, m.kv_lora_rank),
         ];
         let positions = inputs.positions();
+        // Tower nodes must all be emitted before any trunk node, or
+        // `model_compiler` refuses the plan (`Error::UnitsInterleave`).
+        let towered = m.tower.as_ref().map(|t| tower(&inputs, t));
         let ids = inputs.tokens();
-        let mut streams =
-            ops::elemwise::hc_expand(&ops::layout::embed(&ids, &m.embed, m.vocab), hy.streams);
+        let mut narrow = ops::layout::embed(&ids, &m.embed, m.vocab);
+        // Tower rows written over the token rows the image placeholders
+        // occupy, BEFORE the streams fan out. `scatter_live_rows`, not a
+        // plain scatter: `merge_rows` compacts and the tail routes carry a
+        // `-1` sentinel.
+        if let Some(t) = &towered {
+            let (imaged, _) = narrow.split(&Facts::media());
+            narrow = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
+        }
+        let mut streams = ops::elemwise::hc_expand(&narrow, hy.streams);
 
         let routes = inputs.adapter_routes();
         for (_, w) in inputs.walk_layers(&m.layers) {
@@ -492,6 +514,66 @@ fn kda_mixer(x: &Value, inputs: &Input<Facts>, k: &Kda) -> Value {
     let g = ops::linear::matmul(&ops::linear::matmul(x, &k.g_a), &k.g_b);
     let o = ops::elemwise::rmsnorm_gated_by(&core, &g, &k.o_norm, k.heads, k.o_norm_eps);
     ops::linear::matmul(&o, &k.o_proj)
+}
+
+/// The vision tower over every patch row of the fire, answering one merged
+/// row per `merge²` patches (`rows / merge²` live rows; the caller scatters
+/// them with `scatter_live_rows` and a `-1`-sentinel route vector).
+fn tower(inputs: &Input<Facts>, t: &Tower) -> Value {
+    let d = t.head_dim;
+    // Pre-unfolded patch vectors, the per-image indptr the bidirectional
+    // attention is block-diagonal over, and each patch's (t, h, w).
+    let x = inputs.patches(t.patch_width);
+    let segments = inputs.patch_segments();
+    let grid = inputs.patch_positions();
+    let mut y = ops::elemwise::add_bias(&t.patch_embed_bias, &ops::linear::matmul(&x, &t.patch_embed));
+    for b in &t.blocks {
+        let n = ops::elemwise::rmsnorm(&y, &b.norm1, t.norm_eps);
+        let (q, k, v) = ops::layout::split_qkv(
+            &ops::elemwise::add_bias(&b.qkv_bias, &ops::linear::matmul(&n, &b.qkv)),
+            t.hidden,
+            t.hidden,
+        );
+        let q = ops::elemwise::rmsnorm_per_head(&q, &b.q_norm, d, t.norm_eps);
+        let k = ops::elemwise::rmsnorm_per_head(&k, &b.k_norm, d, t.norm_eps);
+        // Two axes and no time: `rotary_pos_emb(head_dim / 2)` over (h, w),
+        // the (h, w) frequencies side by side and the pair repeated across
+        // the head, rotated by `rotate_half` — qwen's tower form.
+        let (q, k) = ops::elemwise::rope_mrope(
+            &q,
+            &k,
+            &grid,
+            [0, d / 4, d / 4],
+            MropeForm::Blocked,
+            d,
+            d,
+            t.theta,
+        );
+        let o = ops::attn::dense(&q, &k, &v, &segments, d, t.sm_scale);
+        y = ops::elemwise::residual_add(
+            &ops::elemwise::add_bias(&b.proj_bias, &ops::linear::matmul(&o, &b.proj)),
+            &y,
+        );
+        let n = ops::elemwise::rmsnorm(&y, &b.norm2, t.norm_eps);
+        let h = ops::elemwise::add_bias(&b.gate_up_bias, &ops::linear::matmul(&n, &b.gate_up));
+        let a = ops::linear::mlp_swiglu_clamp(&h, t.inter, t.limit);
+        y = ops::elemwise::residual_add(
+            &ops::elemwise::add_bias(&b.down_bias, &ops::linear::matmul(&a, &b.down)),
+            &y,
+        );
+    }
+    let y = ops::elemwise::rmsnorm(&y, &t.post_norm, t.norm_eps);
+    // The 2×2 downsample conv: one merge block's rows side by side, times
+    // the kernel laid out in the same `(kh, kw, c)` order.
+    let folded = ops::layout::merge_rows(&y, t.merge);
+    let y = ops::elemwise::add_bias(&t.downsample_bias, &ops::linear::matmul(&folded, &t.downsample));
+    let m = &t.merger;
+    let p = ops::linear::matmul(&y, &m.proj);
+    let n = ops::elemwise::layernorm(&p, &m.norm, &m.norm_bias, t.norm_eps);
+    let g = ops::linear::mlp_gelu_tanh(&n);
+    let h = ops::linear::matmul(&g, &m.gate_up);
+    let a = ops::linear::mlp_swiglu_clamp(&h, t.merger_inter, t.limit);
+    ops::linear::matmul(&a, &m.down)
 }
 
 /// `hc_gates` splits a `2M + M²` row into pre weights, post weights and the

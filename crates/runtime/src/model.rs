@@ -179,6 +179,18 @@ pub const ROWS: &[Row] = &[
         arch: "glm5_next",
     },
     Row {
+        id: "glm53-flash-mtp-vision-u8g64-u2g64-u4g64-kv-bf16",
+        layers: 45,
+        vocab: 154_880,
+        arch: "glm5_next",
+    },
+    Row {
+        id: "glm53-flash-vision-u8g64-u2g64-kv-bf16",
+        layers: 45,
+        vocab: 154_880,
+        arch: "glm5_next",
+    },
+    Row {
         id: "glm53-flash-u8g64-u2g64-kv-bf16",
         layers: 45,
         vocab: 154_880,
