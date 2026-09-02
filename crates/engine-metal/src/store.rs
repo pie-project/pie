@@ -67,14 +67,21 @@ enum Shape {
         head_dim: u32,
         kv_heads: u32,
         dtype: Dtype,
-        /// One plane's length in bytes, and therefore the length each plane's
+        /// The key plane's length in bytes, and therefore the length its
         /// handle is minted at.
         plane_bytes: u64,
         /// Bytes from the front of the allocation to the value pages:
         /// [`plane_bytes`](Shape::Kv::plane_bytes) for the two-plane form,
         /// zero for the one-plane shared form (key and value reader address
-        /// the same cells).
+        /// the same cells) and for an empty value plane (MLA with no rope
+        /// plane: the handle aliases the key plane at width zero).
         values_at: u64,
+        /// The value plane's row width in elements (the key plane's is
+        /// `kv_heads * head_dim`), and its length in bytes: MLA keeps its
+        /// latent in the key plane and its rope in the value plane, at
+        /// different widths.
+        values_width: u64,
+        values_bytes: u64,
     },
     /// A recurrent slab: elements per slot.
     State { stride: u64, dtype: Dtype },
@@ -262,7 +269,8 @@ impl Pools {
                     dtype,
                     space,
                 } => {
-                    let (planes, width) = split(name, planes)?;
+                    let planes = split(name, planes)?;
+                    let width = planes.keys;
                     // A restatement (kv_heads != 0) exists only where a paged
                     // launch made one; its absence is not an error, since some
                     // consumers take their widths from their own operands.
@@ -288,15 +296,26 @@ impl Pools {
                     let head_dim = restated.map_or(width, |seat| u64::from(seat.head_dim));
                     let kv_heads = restated.map_or(1, |seat| u64::from(seat.kv_heads));
                     let element = elem_bytes(name, *dtype)?;
-                    let plane = paging.pages() * u64::from(paging.page_size) * width * element;
-                    slabs.push(Buffer::zeroed(device, plane * planes)?);
+                    let cells = paging.pages() * u64::from(paging.page_size);
+                    let plane = cells * width * element;
+                    let values_bytes = cells * planes.values * element;
+                    let own_values = !planes.shared && planes.values != 0;
+                    slabs.push(Buffer::zeroed(
+                        device,
+                        plane + if own_values { values_bytes } else { 0 },
+                    )?);
                     shapes.push(Shape::Kv {
                         space: *space,
                         head_dim: u32::try_from(head_dim).unwrap_or(u32::MAX),
                         kv_heads: u32::try_from(kv_heads).unwrap_or(u32::MAX),
                         dtype: *dtype,
                         plane_bytes: plane,
-                        values_at: if planes == 2 { plane } else { 0 },
+                        values_at: if own_values { plane } else { 0 },
+                        values_width: planes.values,
+                        // An empty value plane aliases the key plane's bytes:
+                        // a zero-length handle has no seat, and no reader
+                        // touches it at width zero.
+                        values_bytes: if planes.values == 0 { plane } else { values_bytes },
                     });
                 }
                 CacheRow::State { name, slab, dtype } => {
@@ -405,6 +424,8 @@ impl Pools {
                     dtype,
                     plane_bytes,
                     values_at,
+                    values_width,
+                    values_bytes,
                 } => {
                     let seat =
                         seats
@@ -417,17 +438,17 @@ impl Pools {
                                 ),
                             })?;
                     let cells = self.paging.pages() * u64::from(self.paging.page_size);
-                    let plane = |at: u64| -> Result<Tensor> {
+                    let plane = |at: u64, bytes: u64, width: u64| -> Result<Tensor> {
                         Ok(Tensor::new(
-                            handles.bind(slab, at, plane_bytes)?,
+                            handles.bind(slab, at, bytes)?,
                             u32::try_from(cells).unwrap_or(u32::MAX),
-                            kv_heads * head_dim,
+                            u32::try_from(width).unwrap_or(u32::MAX),
                             dtype,
                         ))
                     };
                     CachePool::Kv(KvPool {
-                        keys: plane(0)?,
-                        values: plane(values_at)?,
+                        keys: plane(0, plane_bytes, u64::from(kv_heads) * u64::from(head_dim))?,
+                        values: plane(values_at, values_bytes, values_width)?,
                         page_indices: seat.page_indices,
                         page_indptr: seat.page_indptr,
                         page_size: narrow(u64::from(self.paging.page_size)),
@@ -544,18 +565,20 @@ impl Pools {
                 kv_heads,
                 dtype,
                 values_at,
+                values_width,
                 ..
             } = *shape
             else {
                 continue;
             };
-            let cell =
-                u64::from(kv_heads) * u64::from(head_dim) * u64::from(elem_size(dtype));
+            let element = u64::from(elem_size(dtype));
+            let keys_cell = u64::from(kv_heads) * u64::from(head_dim) * element;
             // A shared row has one plane base: copying it twice would be a
-            // self-overlapping blit (device fault).
-            let bases = [0, values_at];
+            // self-overlapping blit (device fault). So does an empty value
+            // plane, which aliases the key plane.
+            let bases = [(0, keys_cell), (values_at, values_width * element)];
             let bases = if values_at == 0 { &bases[..1] } else { &bases[..] };
-            for &plane in bases {
+            for &(plane, cell) in bases {
                 for span in moves {
                     if span.tokens == 0 {
                         continue;
@@ -646,10 +669,11 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
                 dtype,
                 ..
             } => {
-                let (count, width) = split(name, planes)?;
+                let planes = split(name, planes)?;
                 let element = elem_bytes(name, *dtype)?;
-                let plane = paging.pages() * u64::from(paging.page_size) * width * element;
-                bytes = bytes.saturating_add(plane.saturating_mul(count));
+                let cells = paging.pages() * u64::from(paging.page_size);
+                let width = if planes.shared { planes.keys } else { planes.keys + planes.values };
+                bytes = bytes.saturating_add(cells * width * element);
             }
             CacheRow::State { name, slab, dtype } => {
                 let stride: u64 = slab.iter().product();
@@ -665,19 +689,28 @@ pub fn pool_demand(trace: &Trace, paging: Paging) -> Result<u64> {
     Ok(bytes)
 }
 
-/// A kv row's `(planes, width)`: how many planes one entry is written as, and
-/// how wide one of them is. Two forms served: `[w, w]` (key/value halves)
-/// and `[w]` (MLA's shared latent, read as both k and v). `[k, v]` at
-/// different widths is refused.
-fn split(name: &str, planes: &[u64]) -> Result<(u64, u64)> {
+/// A kv row's planes: how wide the key plane and the value plane are, and
+/// whether they are one shared plane. Forms served: `[w]` (a shared latent,
+/// read as both k and v), `[w, w]` (key/value halves), and `[k, v]` at
+/// different widths (MLA's latent beside its rope plane; `v` may be zero
+/// for a nope-only mixer).
+struct Planes {
+    keys: u64,
+    values: u64,
+    shared: bool,
+}
+
+fn split(name: &str, planes: &[u64]) -> Result<Planes> {
     match planes {
-        [shared] => Ok((1, *shared)),
-        [keys, values] if keys == values => Ok((2, *keys)),
-        [keys, values] => Err(Fault::Unbound {
-            what: format!(
-                "cache `{name}`, whose planes are {keys} and {values} wide — this \
-                 shell cuts kv pages into equal key and value halves"
-            ),
+        [shared] => Ok(Planes {
+            keys: *shared,
+            values: *shared,
+            shared: true,
+        }),
+        [keys, values] => Ok(Planes {
+            keys: *keys,
+            values: *values,
+            shared: false,
         }),
         other => Err(Fault::Unbound {
             what: format!(

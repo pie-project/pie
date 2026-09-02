@@ -1170,13 +1170,19 @@ pub mod mla {
         let heads = crate::encode::nonzero(op, "the head count this attention states", heads)?;
         let rows = crate::encode::nonzero(op, "rows", q.rows)?;
         let ckv = latent_strip(op, "latent rank", kv_lora_rank, MAX_CKV)?;
-        if q_pe.width == 0 || q_pe.width % heads != 0 {
+        if q_pe.width % heads != 0 {
             return Err(refuse(
                 op,
                 format!("the {}-wide rotated q plane does not divide by the {heads} heads", q_pe.width),
             ));
         }
-        let kpe = latent_strip(op, "rope width", q_pe.width / heads, MAX_KPE)?;
+        // A nope-only mixer states no rope plane: the kernel walks zero
+        // rope strips and never reads `q_pe` or the values pages.
+        let kpe = if q_pe.width == 0 {
+            0
+        } else {
+            latent_strip(op, "rope width", q_pe.width / heads, MAX_KPE)?
+        };
         debug_assert!(
             positions.dtype == Dtype::I32 && request_of_token.dtype == Dtype::I32,
             "the fire's position and owning-request tables are i32, one entry per row"
@@ -1583,10 +1589,10 @@ pub mod index {
         (n_heads.div_ceil(32) * 32).max(32)
     }
 
-    /// The rotated prefix this launch may state: an even, nonzero width
-    /// inside both the row it rotates and the authority's ceiling.
+    /// The rotated prefix this launch may state: an even width inside both
+    /// the row it rotates and the authority's ceiling. Zero rotates nothing
+    /// (a nope-only indexer: the kernels loop over `rope_dim / 2` pairs).
     fn rotated(op: &'static str, rope_dim: u32, head_dim: u32) -> Result<i32, Error> {
-        let rope_dim = nonzero(op, "the rotated prefix this rotation states", rope_dim)?;
         if rope_dim % 2 != 0 {
             return Err(refuse(
                 op,
@@ -2185,20 +2191,22 @@ pub mod pool {
         }
         let head_dim = nonzero(OP, "the head width this compressor states", head_dim)?;
         let ratio = nonzero(OP, "the pooling ratio", ratio)?;
-        let coff = compressor_coff(ratio);
-        // The columns one state row holds for this layer — what the gather
-        // over the same ratio reads back.
-        let width = head_dim.saturating_mul(coff.unsigned_abs());
-        if kv.width != width || score.width != width {
+        // The projection's own width states the window (the CUDA twin's
+        // rule): `head_dim` for one block per pool (GLM's kpool compressor),
+        // `2 * head_dim` for the overlapping pair (dsv4). What the gather
+        // over the same plane reads back.
+        let width = nonzero(OP, "the compressor's row width", kv.width)?;
+        if (width != head_dim && width != 2 * head_dim) || score.width != width {
             return Err(refuse(
                 OP,
                 format!(
-                    "a ratio-{ratio} compressor projects coff {coff} x head width \
-                     {head_dim} = {width} columns; the pair handed over is {} and {}",
+                    "a ratio-{ratio} compressor projects head width {head_dim} or twice \
+                     it; the pair handed over is {} and {}",
                     kv.width, score.width
                 ),
             ));
         }
+        let coff = width / head_dim;
         debug_assert_eq!(
             score.rows, kv.rows,
             "the two projections are one row per token row"
@@ -2305,7 +2313,23 @@ pub mod pool {
         }
         let rows = nonzero(OP, "rows", boundary_pos.rows)?;
         let ratio = nonzero(OP, "the pooling ratio", ratio)?;
-        let coff = compressor_coff(ratio);
+        // The window's blocks: read off the `[ratio, coff * head_dim]` ape
+        // when one is stated (the CUDA twin's rule), else the ratio's own
+        // default.
+        let coff = match ape {
+            None => compressor_coff(ratio),
+            Some(ape) if ape.width == head_dim => 1,
+            Some(ape) if ape.width == 2 * head_dim => 2,
+            Some(ape) => {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "an ape {} wide is neither one head width ({head_dim}) nor two",
+                        ape.width
+                    ),
+                ));
+            }
+        };
         // The columns this gather reads out of one state row.
         let width = head_dim.saturating_mul(coff.unsigned_abs());
         // The row pitch is the slab's, which is not always this gather's

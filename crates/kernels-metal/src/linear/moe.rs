@@ -260,6 +260,43 @@ pub fn topk_sigmoid(
     )
 }
 
+/// [`topk_sigmoid`] under a per-expert correction bias (`noaux_tc`): the bias
+/// ranks the pick, the weights stay the unbiased sigmoid.
+#[allow(clippy::too_many_arguments)]
+pub fn topk_sigmoid_biased(
+    ctx: &Ctx<'_>,
+    logits: Tensor,
+    bias: Tensor,
+    experts: u32,
+    top_k: u32,
+    renormalize: bool,
+    scaling: f32,
+    routes: Tensor,
+    weights: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.moe_topk_sigmoid";
+    let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sigmoid_biased" });
+    debug_assert_eq!(
+        bias.dtype,
+        Dtype::F32,
+        "`{OP}` reads an f32 correction bias"
+    );
+    let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
+    ctx.fire(
+        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        &[
+            logits.arg(),
+            bias.arg(),
+            routes.arg_mut(),
+            weights.arg_mut(),
+            experts.arg(),
+            top_k.arg(),
+            u32::from(renormalize).arg(),
+            scaling.arg(),
+        ],
+    )
+}
+
 /// Sigmoid routing with a per-expert correction bias; weights pass through
 /// sqrt-softplus.
 #[allow(clippy::too_many_arguments)]

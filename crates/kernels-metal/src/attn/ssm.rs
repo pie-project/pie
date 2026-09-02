@@ -472,6 +472,7 @@ pub fn kda_step(
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
+    gate_floor: f32,
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_step";
@@ -495,6 +496,7 @@ pub fn kda_step(
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
             norm_eps.arg(),
+            gate_floor.arg(),
         ],
     )
 }
@@ -512,6 +514,7 @@ pub fn kda_chunked(
     heads: u32,
     head_dim: u32,
     norm_eps: f32,
+    gate_floor: f32,
     y: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attention.ssm_kda_chunked";
@@ -536,6 +539,7 @@ pub fn kda_chunked(
             stated(OP, shape.heads)?.arg(),
             stated(OP, shape.head_dim)?.arg(),
             norm_eps.arg(),
+            gate_floor.arg(),
         ],
     )
 }

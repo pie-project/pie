@@ -98,6 +98,51 @@ impl Handles {
         Ok(at as u32)
     }
 
+    /// Copy `len` bytes out of the view `handle` names — a load-time read
+    /// of a shared-storage buffer (every buffer this shell allocates is
+    /// shared, see `Context::bind`).
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Unbound`] for a handle no row answers, [`Fault::Ceiling`]
+    /// when the read leaves the buffer.
+    pub fn read(&self, handle: u32, len: u64) -> Result<Vec<u8>> {
+        let binding = self.get(handle).ok_or_else(|| Fault::Unbound {
+            what: format!("handle {handle}, which no row answers"),
+        })?;
+        let mut out = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
+        #[cfg(target_vendor = "apple")]
+        {
+            use objc2_metal::MTLBuffer as _;
+            let have = binding.slab().length() as u64;
+            if binding.offset().saturating_add(len) > have {
+                return Err(Fault::Ceiling {
+                    what: "bytes read off one handle",
+                    need: binding.offset().saturating_add(len),
+                    have,
+                });
+            }
+            // SAFETY: a shared-storage buffer's contents are host-addressable
+            // for its whole length, and the span was checked just above.
+            unsafe {
+                let base = binding.slab().contents().as_ptr().cast::<u8>();
+                std::ptr::copy_nonoverlapping(
+                    base.add(usize::try_from(binding.offset()).expect("an offset inside a live mapping")),
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = binding;
+            return Err(Fault::Unbound {
+                what: "a buffer read on a platform with no Metal buffers".to_string(),
+            });
+        }
+        Ok(out)
+    }
+
     /// Mint a handle `skip` bytes further into whatever `handle` names.
     ///
     /// # Errors

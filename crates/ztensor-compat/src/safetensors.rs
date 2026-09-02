@@ -88,6 +88,11 @@ pub(crate) fn project(store: &Store) -> Result<Projection> {
 
     for (name, entry) in entries {
         if name == "__metadata__" {
+            // Some writers (MLX conversions among them) emit `"__metadata__":
+            // null` for "no metadata"; that reads as an empty block.
+            if entry.is_null() {
+                continue;
+            }
             let Json::Object(meta) = entry else {
                 return Err(bad("__metadata__ must be an object"));
             };

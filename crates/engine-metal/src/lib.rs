@@ -36,7 +36,8 @@ pub mod run;
 /// The observability slab the attention capture arm writes and the
 /// epilogue's `attn_score` intrinsic reads.
 pub mod scores;
-pub mod scratch;
+pub mod decoded;
+mod scratch;
 pub mod serve;
 /// The settlement plane: run-ahead counters, completion seam, and the A/B
 /// seat ring the asynchronous fire path is built on.

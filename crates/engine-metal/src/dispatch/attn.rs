@@ -894,7 +894,7 @@ impl Run<'_> {
                 heads,
                 head_dim,
                 norm_eps,
-                gate_floor: _,
+                gate_floor,
                 y,
             } => attn::ssm::kda_step(
                 self.ctx(),
@@ -907,6 +907,7 @@ impl Run<'_> {
                 *heads,
                 *head_dim,
                 *norm_eps,
+                *gate_floor,
                 self.tensor(*y),
             ),
             Attention::SsmKdaChunked {
@@ -919,7 +920,7 @@ impl Run<'_> {
                 heads,
                 head_dim,
                 norm_eps,
-                gate_floor: _,
+                gate_floor,
                 y,
             } => attn::ssm::kda_chunked(
                 self.ctx(),
@@ -932,6 +933,7 @@ impl Run<'_> {
                 *heads,
                 *head_dim,
                 *norm_eps,
+                *gate_floor,
                 self.tensor(*y),
             ),
 

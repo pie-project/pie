@@ -14,6 +14,7 @@ template <typename T, int WIDTH, int DMAX>
     const constant int& heads      [[buffer(8)]],
     const constant int& head_dim   [[buffer(9)]],
     const constant float& norm_eps [[buffer(10)]],
+    const constant float& gate_floor [[buffer(11)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]]) {
   threadgroup float sq[DMAX];
@@ -32,9 +33,10 @@ template <typename T, int WIDTH, int DMAX>
   const size_t head = size_t(h) * size_t(d);
 
   float2 sums = float2(0.0f, 0.0f);
-  for (int i = tid; i < plane; i += WIDTH) {
-    const float qv = float(mixed[row + size_t(i)]);
-    const float kv = float(mixed[row + wide + size_t(i)]);
+  // q and k are L2-normed PER HEAD (the reference's `l2norm(q, dim=-1)`).
+  for (int i = tid; i < d; i += WIDTH) {
+    const float qv = float(mixed[row + head + size_t(i)]);
+    const float kv = float(mixed[row + wide + head + size_t(i)]);
     sums += float2(qv * qv, kv * kv);
   }
   fold[tid] = sums;
@@ -49,13 +51,20 @@ template <typename T, int WIDTH, int DMAX>
   const float kinv = metal::rsqrt(fold[0].y + norm_eps);
 
   const float alpha = metal::exp(a_log[h]);
+  // The reference recurrence's `scale`: q carries head_dim^-1/2.
+  const float qscale = metal::rsqrt(float(d));
   for (int i = tid; i < d; i += WIDTH) {
     const size_t at = head + size_t(i);
-    sq[i] = float(mixed[row + at]) * qinv;
+    sq[i] = float(mixed[row + at]) * qinv * qscale;
     sk[i] = float(mixed[row + wide + at]) * kinv;
     const float z = float(f[size_t(n) * wide + at]) + dt_bias[at];
-    const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::exp(z));
-    sg[i] = metal::exp(-alpha * sp);
+    if (gate_floor != 0.0f) {
+      // A floored decay (`gate_lower_bound`): log-gate = floor * sigmoid(alpha * z).
+      sg[i] = metal::exp(gate_floor / (1.0f + metal::exp(-alpha * z)));
+    } else {
+      const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::exp(z));
+      sg[i] = metal::exp(-alpha * sp);
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -100,6 +109,7 @@ template <typename T, int WIDTH, int DMAX>
     const constant int& heads      [[buffer(9)]],
     const constant int& head_dim   [[buffer(10)]],
     const constant float& norm_eps [[buffer(11)]],
+    const constant float& gate_floor [[buffer(12)]],
     uint3 pos [[thread_position_in_grid]],
     uint3 lpos [[thread_position_in_threadgroup]]) {
   threadgroup float sq[DMAX];
@@ -122,6 +132,8 @@ template <typename T, int WIDTH, int DMAX>
   const size_t wide = size_t(plane);
   const size_t head = size_t(h) * size_t(d);
   const float alpha = metal::exp(a_log[h]);
+  // The reference recurrence's `scale`: q carries head_dim^-1/2.
+  const float qscale = metal::rsqrt(float(d));
   device float* state =
       rstate + (size_t(slots[begin]) * size_t(heads) + size_t(h)) * size_t(d) *
                    size_t(d);
@@ -130,9 +142,10 @@ template <typename T, int WIDTH, int DMAX>
     const size_t row = size_t(t) * 3 * wide;
 
     float2 sums = float2(0.0f, 0.0f);
-    for (int i = tid; i < plane; i += WIDTH) {
-      const float qv = float(mixed[row + size_t(i)]);
-      const float kv = float(mixed[row + wide + size_t(i)]);
+    // q and k are L2-normed PER HEAD (the reference's `l2norm(q, dim=-1)`).
+    for (int i = tid; i < d; i += WIDTH) {
+      const float qv = float(mixed[row + head + size_t(i)]);
+      const float kv = float(mixed[row + wide + head + size_t(i)]);
       sums += float2(qv * qv, kv * kv);
     }
     fold[tid] = sums;
@@ -148,11 +161,16 @@ template <typename T, int WIDTH, int DMAX>
 
     for (int i = tid; i < d; i += WIDTH) {
       const size_t at = head + size_t(i);
-      sq[i] = float(mixed[row + at]) * qinv;
+      sq[i] = float(mixed[row + at]) * qinv * qscale;
       sk[i] = float(mixed[row + wide + at]) * kinv;
       const float z = float(f[size_t(t) * wide + at]) + dt_bias[at];
-      const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::exp(z));
-      sg[i] = metal::exp(-alpha * sp);
+      if (gate_floor != 0.0f) {
+        // A floored decay (`gate_lower_bound`): log-gate = floor * sigmoid(alpha * z).
+        sg[i] = metal::exp(gate_floor / (1.0f + metal::exp(-alpha * z)));
+      } else {
+        const float sp = (z > 20.0f) ? z : metal::log(1.0f + metal::exp(z));
+        sg[i] = metal::exp(-alpha * sp);
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -190,7 +208,7 @@ template <typename T, int WIDTH, int DMAX>
       const device float*, const device float*, device float*,           \
       const device uint*, device float*,                                 \
       const constant int&, const constant int&, const constant float&,   \
-      uint3, uint3);
+      const constant float&, uint3, uint3);
 
 #define instantiate_kda_chunked(name, itype, width, dmax)                \
   template [[host_name("kda_chunked_" #name)]]                           \
@@ -199,7 +217,7 @@ template <typename T, int WIDTH, int DMAX>
       const device itype*, const device float*, const device float*,     \
       device float*, const device uint*, device float*,                  \
       const constant int&, const constant int&, const constant float&,   \
-      uint3, uint3);
+      const constant float&, uint3, uint3);
 
 instantiate_kda_step(bfloat16, bfloat, 128, 256)
 

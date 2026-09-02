@@ -181,23 +181,29 @@ impl Run<'_> {
                 scaling,
                 routes,
                 weights,
-            } => {
-                if bias.is_some() {
-                    return Err(kernels_metal::Error::Unsupported {
-                        op: "linear.moe_topk_sigmoid",
-                    });
-                }
-                linear::moe::topk_sigmoid(
-                self.ctx(),
-                self.tensor(*logits),
-                *experts,
-                *top_k,
-                *renormalize,
-                *scaling,
-                self.tensor(*routes),
-                self.tensor(*weights),
-            )
-            }
+            } => match bias {
+                Some(bias) => linear::moe::topk_sigmoid_biased(
+                    self.ctx(),
+                    self.tensor(*logits),
+                    self.tensor(*bias),
+                    *experts,
+                    *top_k,
+                    *renormalize,
+                    *scaling,
+                    self.tensor(*routes),
+                    self.tensor(*weights),
+                ),
+                None => linear::moe::topk_sigmoid(
+                    self.ctx(),
+                    self.tensor(*logits),
+                    *experts,
+                    *top_k,
+                    *renormalize,
+                    *scaling,
+                    self.tensor(*routes),
+                    self.tensor(*weights),
+                ),
+            },
             Linear::MoePredictRoute {
                 logits,
                 bias,

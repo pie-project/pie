@@ -538,7 +538,8 @@ pub(crate) fn carve(
     fold_in_place(trace, &mut placements)?;
     fold_merges(trace, &mut placements)?;
     flatten(&mut placements);
-    let (spans, live_in) = lives(trace, &placements, classes);
+    let (mut spans, live_in) = lives(trace, &placements, classes);
+    outlive_the_region(trace, conc, &mut spans);
 
     // Both walks run, and the smaller wins: placement is greedy and not
     // monotone in general, so the tightened walk is not guaranteed to win.
@@ -753,6 +754,34 @@ fn flatten(placements: &mut [Placement]) {
     for id in 0..placements.len() {
         if let Placement::Alias(to) = placements[id] {
             placements[id] = Placement::Alias(root(placements, to));
+        }
+    }
+}
+
+/// A region the engine walks in pieces (a streamed load's routed segment,
+/// `FireDescriptor::run_caps`) runs its nodes once per piece, so a value
+/// written BEFORE the region and read inside it is read by every piece: its
+/// life runs to the region's last node, not to its last reader's. Otherwise
+/// a later node of the same region may be seated on its bytes and the next
+/// piece reads that node's output as, say, a routing vector. Stated for
+/// every region, since the carve does not know which are capped; the cost
+/// is a few in-region aliasings forgone.
+fn outlive_the_region(trace: &Trace, conc: &Concurrency, spans: &mut [Option<Span>]) {
+    let end = trace.nodes.len() as u32;
+    let mut region_end: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    for at in 0..end {
+        let slot = region_end.entry(conc.region_of(at)).or_insert(at);
+        *slot = (*slot).max(at);
+    }
+    for span in spans.iter_mut().flatten() {
+        if span.last >= end {
+            continue;
+        }
+        let (born, read) = (conc.region_of(span.first), conc.region_of(span.last));
+        if born != read {
+            if let Some(&last) = region_end.get(&read) {
+                span.last = span.last.max(last);
+            }
         }
     }
 }

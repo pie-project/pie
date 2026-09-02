@@ -1210,7 +1210,7 @@ impl Shell {
         } else {
             vec![None; compiled.template().len()]
         };
-        let weights = Weights::resident(
+        let mut weights = Weights::resident(
             &device,
             &handles,
             &boot.trace,
@@ -1222,6 +1222,9 @@ impl Shell {
             // path, so a cross-recipe artifact is refused with the store, the
             // band table and the arena all still unreserved.
         )?;
+        // A bank an op reads whole (the MLA absorbs' `kv_b`) is decoded once
+        // here, before the seal, so its dense row is a load-lived handle.
+        weights.decode_absorbed(&device, &handles, &boot.trace)?;
         // **THE WEIGHT ROWS ARE THE LOAD-LIVED HANDLES, AND THIS IS THE
         // WATERMARK.** Everything minted after this line belongs to one fire
         // and is dropped at the end of it (`Handles::rewind`); everything

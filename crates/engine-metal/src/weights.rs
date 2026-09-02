@@ -76,6 +76,9 @@ pub struct Weights {
     /// How much of this load the warm arm computed rather than read —
     /// `(planes, bytes)`, `(0, 0)` for a cold load.
     residue: (usize, u64),
+    /// Banks decoded to dense bf16 at load for the ops that have no
+    /// quantized arm (`crate::decoded`), each its own buffer.
+    decoded: Vec<Buffer>,
 }
 
 /// One declared adapter bank: where its slots are and how big they are.
@@ -343,6 +346,7 @@ impl Weights {
             banks: banks(trace, &places, |at| places[at].offset),
             // A cold load computes nothing separately: everything lands together.
             residue: (0, 0),
+            decoded: Vec::new(),
         })
     }
 
@@ -469,6 +473,70 @@ impl Weights {
     #[must_use]
     pub fn table(&self) -> &WeightTable {
         &self.table
+    }
+
+    /// Decode, once, every split-plane bank an op with no quantized arm
+    /// reads as one dense plane (the MLA absorbs' `kv_b`), and rebind its
+    /// row as that plane. Runs before `Handles::seal`, so the minted handles
+    /// live as long as the load.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Param`] for a bank this decoder does not unpack,
+    /// [`Fault::Device`]/[`Fault::Ceiling`] for the buffer.
+    pub fn decode_absorbed(
+        &mut self,
+        device: &Context,
+        handles: &Handles,
+        trace: &Trace,
+    ) -> Result<()> {
+        for at in crate::decoded::absorbed_weights(trace) {
+            let Some(Some(WeightRow::Planes(bank))) = self.table.0.get(at).copied() else {
+                continue;
+            };
+            let param = &trace.params[at];
+            let (n, k) = match param.shape.as_slice() {
+                [n, k] => (*n as usize, *k as usize),
+                _ => {
+                    return Err(Fault::Param {
+                        name: param.name.clone(),
+                        why: "is not a two-axis plane, the only shape decoded at load",
+                    });
+                }
+            };
+            let bits = bank.bits as usize;
+            let group = bank.group as usize;
+            let codes = handles.read(bank.codes.buf, (n * k * bits / 8) as u64)?;
+            let scales = handles.read(bank.scales.buf, (n * k / group * 2) as u64)?;
+            let biases = bank
+                .biases
+                .map(|b| handles.read(b.buf, (n * k / group * 2) as u64))
+                .transpose()?;
+            let plane = crate::decoded::decode_affine(
+                &codes,
+                &scales,
+                biases.as_deref(),
+                n,
+                k,
+                group,
+                bits,
+            )
+            .map_err(|why| Fault::Device {
+                call: "decode_absorbed",
+                why: format!("{}: {why}", param.name),
+            })?;
+            let mut buffer = Buffer::zeroed(device, plane.len() as u64)?;
+            buffer.write(0, &plane)?;
+            let handle = handles.bind(&buffer, 0, plane.len() as u64)?;
+            self.table.0[at] = Some(WeightRow::Dense(Tensor::new(
+                handle,
+                u32::try_from(n).unwrap_or(u32::MAX),
+                u32::try_from(k).unwrap_or(u32::MAX),
+                Dtype::Bf16,
+            )));
+            self.decoded.push(buffer);
+        }
+        Ok(())
     }
 
     /// Every byte this load's weight reservations hold: the store for a
@@ -1136,6 +1204,7 @@ fn warm(
         rows,
         banks: banks(trace, places, |at| seated[at]),
         residue: (residue_planes, residue_bytes),
+        decoded: Vec::new(),
     })
 }
 

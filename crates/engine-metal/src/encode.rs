@@ -316,6 +316,17 @@ impl<'a> Sink<'a> {
             .windows
             .at(region, cuts.place.run.get())
             .span;
+        if std::env::var_os("PIE_CUT_TRACE").is_some() {
+            eprintln!(
+                "cut: region {region} run {}: rows {}..{} of value {} ({what}; rect {} x {})",
+                cuts.place.run.get(),
+                span.row_offset,
+                span.row_offset + span.rows,
+                vector.0,
+                rect.rows,
+                rect.width
+            );
+        }
         seat(rect, span, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
 
         *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);

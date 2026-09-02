@@ -212,6 +212,84 @@ inline float router_sigmoid(float x) {
   }
 }
 
+// `router_topk_sigmoid` under a per-expert correction bias (`noaux_tc`,
+// `e_score_correction_bias`): the bias ranks the pick, the weight stays the
+// unbiased sigmoid.
+[[kernel]] void router_topk_sigmoid_biased(
+    const device bfloat* logits    [[buffer(0)]],
+    const device float* correction [[buffer(1)]],
+    device int* expert_ids         [[buffer(2)]],
+    device float* expert_weights   [[buffer(3)]],
+    const constant uint& n_experts         [[buffer(4)]],
+    const constant uint& experts_per_token [[buffer(5)]],
+    const constant uint& renormalize       [[buffer(6)]],
+    const constant float& scaling          [[buffer(7)]],
+    uint3 lid3    [[thread_position_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint3 tgsize  [[threads_per_threadgroup]],
+    uint3 tgid    [[threadgroup_position_in_grid]]) {
+  const uint lid = lid3.x;
+  const uint n = n_experts;
+  const uint k = min(experts_per_token, kRouterMaxTopK);
+  const uint picks = min(k, n);
+  const uint n_simd = min((tgsize.x + 31u) / 32u, kRouterMaxSimdgroups);
+  constexpr float NEG_INF = -3.0e38f;
+
+  const uint row = tgid.y;
+  logits += size_t(row) * size_t(n);
+  expert_ids += size_t(row) * size_t(k);
+  expert_weights += size_t(row) * size_t(k);
+
+  float v = lid < n ? router_sigmoid(float(logits[lid])) + correction[lid] : NEG_INF;
+
+  threadgroup float part_v[kRouterMaxSimdgroups];
+  threadgroup uint part_i[kRouterMaxSimdgroups];
+  threadgroup uint winner_of_round;
+
+  for (uint r = 0; r < picks; ++r) {
+    const float m = simd_max(v);
+    const uint w = simd_min(v == m ? lid : 0xFFFFFFFFu);
+    if (simd_lid == 0) {
+      part_v[simd_gid] = m;
+      part_i[simd_gid] = w;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+      float best = NEG_INF;
+      uint best_i = 0u;
+      for (uint sg = 0; sg < n_simd; ++sg) {
+        if (part_v[sg] > best) {
+          best = part_v[sg];
+          best_i = part_i[sg];
+        }
+      }
+      expert_ids[r] = int(best_i);
+      winner_of_round = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == winner_of_round) v = NEG_INF;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (lid == 0) {
+    float sum = 0.0f;
+    for (uint r = 0; r < picks; ++r) {
+      const float w = router_sigmoid(float(logits[uint(expert_ids[r])]));
+      expert_weights[r] = w;
+      sum += w;
+    }
+    for (uint r = picks; r < k; ++r) {
+      expert_ids[r] = 0;
+      expert_weights[r] = 0.0f;
+    }
+    const float scale = (renormalize != 0u && sum > 0.0f) ? scaling / sum : scaling;
+    for (uint r = 0; r < k; ++r) expert_weights[r] *= scale;
+  }
+}
+
 inline float sqrt_softplus(float x) {
   const float sp = x > 20.0f ? x : metal::log(1.0f + metal::exp(x));
   return metal::sqrt(max(sp, 0.0f));
