@@ -76,11 +76,16 @@ async def maybe_server(args: argparse.Namespace, slot_ctx: int | None = None):
             "--ctx-size", str(min(args.max_model_len, slot_ctx or args.max_model_len)
                               * parallel),
             "--parallel", str(parallel),
-            "--n-gpu-layers", "all",
+            # `all` is the usual reading; on Apple Silicon a GGUF past the
+            # Metal working set (~75% of RAM) fails at its first compute
+            # ("Insufficient Memory") however few layers are offloaded, since
+            # the whole mapping is wired — `--gpu-layers 0` is what runs it.
+            "--n-gpu-layers", str(args.gpu_layers),
             # On, because the comparison is against engines running their own
             # optimized attention; turning llama.cpp's off benchmarks a
             # handicap rather than the engine.
             "--flash-attn", "on",
+            *args.server_extra.split(),
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         deadline = time.time() + 120
@@ -209,6 +214,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--server-bin", default=None)
         sp.add_argument("--gguf-model", default=None)
         sp.add_argument("--port", type=int, default=8080)
+        sp.add_argument("--gpu-layers", default="all",
+                        help="llama-server --n-gpu-layers (default all; 0 for CPU-only)")
+        sp.add_argument("--server-extra", default="",
+                        help="Extra llama-server flags, space-separated")
     return parser
 
 
