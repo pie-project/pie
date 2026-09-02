@@ -4,13 +4,13 @@ table: per model and shape, each engine's tok/s and pie's ratio to the
 better baseline, plus the completed/out/prompt fields that say whether the
 comparison was even (see `three_way.py`).
 
-    python3 benches/matrix_table.py /tmp/warmstream/matrix.jsonl
+    python3 benches/matrix_table.py rows.jsonl [more.jsonl ...]   # later files win per (model, shape, engine)
 """
 import json
 import sys
 from collections import defaultdict
 
-rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+rows = [json.loads(l) for f in sys.argv[1:] for l in open(f) if l.strip()]
 by = defaultdict(dict)
 for r in rows:
     by[(r["model"], r["shape"])][r["engine"]] = r
