@@ -4,9 +4,20 @@ use model_dsl::{
 
 use super::model::{Hyper, Indexer, Kda, Mix, Mixer, Mla, Mlp, Model};
 
+/// How a DSA mixer's rows are read: the trunk splits them on `qo_one` into
+/// a decode arm and a prefill arm; the draft head reads every row through
+/// the prefill (chunked) forms, since its rows already stand in one split
+/// arm (`drafts`) and a value may not sit in two.
+#[derive(Clone, Copy)]
+enum Arms {
+    Split,
+    Whole,
+}
+
 pub struct Facts {
     pub qo_one: bool,
     pub has_adapter: bool,
+    pub drafts: bool,
 }
 
 impl Facts {
@@ -19,6 +30,11 @@ impl Facts {
     pub fn has_adapter() -> Predicate {
         Predicate::fact(1)
     }
+
+    /// Lanes that want the draft head run over their rows.
+    pub fn drafts() -> Predicate {
+        Predicate::fact(2)
+    }
 }
 
 impl Classify for Facts {
@@ -26,11 +42,12 @@ impl Classify for Facts {
         Facts {
             qo_one: r.query_len() == 1,
             has_adapter: r.has_adapter(),
+            drafts: r.drafts(),
         }
     }
 
     fn word(&self) -> u64 {
-        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1)
+        u64::from(self.qo_one) | (u64::from(self.has_adapter) << 1) | (u64::from(self.drafts) << 2)
     }
 }
 
@@ -68,6 +85,17 @@ impl ForwardHybrid for Model {
                 }
             }
         }
+        // The draft head's rows: its own latent row in the trunk's page-id
+        // space (it attends the same sequence) and its own indexer keys.
+        if let Some(mtp) = &self.mtp {
+            let index = c.kv_space(self.kv);
+            c.kv(
+                kv,
+                mtp.attn.kv.clone(),
+                [self.kv_lora_rank as u64, mtp.attn.qk_rope_head_dim as u64],
+            );
+            c.kv(index, mtp.attn.indexer.keys.clone(), [mtp.attn.indexer.head_dim as u64]);
+        }
         c
     }
 
@@ -92,7 +120,7 @@ impl ForwardHybrid for Model {
             let (x, post_mix, comb_mix) = gate(&streams, &w.attn_mix, hy);
             let x = ops::elemwise::rmsnorm(&x, &w.mixer_norm, w.mixer_norm_eps);
             let o = match &w.mixer {
-                Mixer::Mla(a) => mla_mixer(&x, &inputs, &plan, &positions, m, a),
+                Mixer::Mla(a) => mla_mixer(&x, &inputs, &plan, &positions, m, a, Arms::Split),
                 Mixer::Kda(k) => kda_mixer(&x, &inputs, k),
             };
             let o = if m.tp > 1 {
@@ -130,7 +158,68 @@ impl ForwardHybrid for Model {
         let y = ops::elemwise::residual_add(&rest, &y);
 
         let x = ops::elemwise::rmsnorm(&y, &m.final_norm, m.final_norm_eps);
-        ops::linear::lm_head(&x, &m.head)
+        let logits = ops::linear::lm_head(&x, &m.head);
+
+        // **THE DRAFT HEAD**, over the draft window's rows, off the trunk's
+        // collapsed residual `y` (the official `MTP` block takes the last
+        // layer's output, not the readout). **The head's token is the
+        // trunk's argmax**: the module is trained on `(y_i, t_{i+1}) →
+        // t_{i+2}`, and inside a verify fire the only `t_{i+1}` a row can
+        // name is the token the trunk just chose there — the same argmax the
+        // verifier reads, so the chain at the row it accepts continues its
+        // next window. Row alignment is the runtime's: lane row `r` carries
+        // the token one position past the residual the trunk leaves at `r`.
+        if let Some(mtp) = &m.mtp {
+            let (input_mtp, _) = inputs.split(&Facts::drafts());
+            // One prefill plan over every draft row (`Arms::Whole`).
+            let plan_one = ops::attn::mla_plan(&input_mtp, m.heads, m.kv_lora_rank);
+            let plan_mtp = [plan_one.clone(), plan_one];
+            let (dy, _) = y.split(&Facts::drafts());
+            let (dpos, _) = positions.split(&Facts::drafts());
+            let (dlogits, _) = logits.split(&Facts::drafts());
+            let mut token = ops::layout::argmax(&[&dlogits]);
+            let mut hidden = dy;
+            let mut chain: Vec<Value> = Vec::with_capacity(mtp.depth as usize);
+            for step in 0..mtp.depth {
+                let e = ops::layout::embed(&token, &m.embed, m.vocab);
+                let e = ops::elemwise::rmsnorm(&e, &mtp.enorm, mtp.norm_eps);
+                let h = ops::elemwise::rmsnorm(&hidden, &mtp.hnorm, mtp.norm_eps);
+                // `eh_proj([e; h])` as its two column halves.
+                let fused = ops::elemwise::residual_add(
+                    &ops::linear::matmul(&e, &mtp.e_proj),
+                    &ops::linear::matmul(&h, &mtp.h_proj),
+                );
+                let x = ops::elemwise::rmsnorm(&fused, &mtp.mixer_norm, mtp.mixer_norm_eps);
+                let o = mla_mixer(&x, &input_mtp, &plan_mtp, &dpos, m, &mtp.attn, Arms::Whole);
+                let o = if m.tp > 1 {
+                    ops::collective::all_reduce(&o)
+                } else {
+                    o
+                };
+                let r = ops::elemwise::residual_add(&o, &fused);
+                let x = ops::elemwise::rmsnorm(&r, &mtp.mlp_norm, mtp.mlp_norm_eps);
+                let f = mlp(&x, &mtp.mlp);
+                let f = if m.tp > 1 {
+                    ops::collective::all_reduce(&f)
+                } else {
+                    f
+                };
+                let r = ops::elemwise::residual_add(&f, &r);
+                let read = ops::elemwise::rmsnorm(&r, &mtp.norm, mtp.norm_eps);
+                let draft = ops::linear::lm_head(&read, &m.head);
+                if step == 0 {
+                    seam::at(seam::MTP, &[&draft]);
+                }
+                token = ops::layout::argmax(&[&draft]);
+                hidden = r;
+                chain.push(draft);
+            }
+            // The token plane: every step's argmax side by side, `[rows,
+            // depth]`, what `mtp_drafts` reads.
+            let steps: Vec<&Value> = chain.iter().collect();
+            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&steps)]);
+        }
+        logits
     }
 }
 
@@ -196,6 +285,7 @@ fn mla_mixer(
     positions: &Value,
     m: &Model,
     a: &Mla,
+    arms: Arms,
 ) -> Value {
     let pages = inputs.kv(&a.kv);
     let write_page = inputs.write_page(&a.kv);
@@ -207,7 +297,7 @@ fn mla_mixer(
     let kv_a = ops::linear::matmul(x, &a.kv_a_proj);
     seam::at(seam::ATTN_QV, &[&q_b, &kv_a]);
 
-    let selection = index_select(x, &q_a, inputs, positions, m.act, &a.indexer);
+    let selection = index_select(x, &q_a, inputs, positions, m.act, &a.indexer, arms);
 
     let (kv_c, k_pe) = ops::attn::mla_latents(&kv_a, &a.kv_a_norm, a.kv_a_norm_eps, m.kv_lora_rank);
     ops::attn::mla_kv_append(&kv_c, &k_pe, pages, &write_page, &write_offset);
@@ -224,32 +314,46 @@ fn mla_mixer(
     );
     seam::at(seam::ATTN_Q, &[&q]);
 
-    let one = Facts::qo_one();
-    let (dq, pq) = q.split(&one);
-    let (dpe, ppe) = q_pe.split(&one);
-    let (d_sel, p_sel) = selection.split(&one);
-    let scored = Value::merge(vec![
-        ops::attn::mla_decode_selected(
-            &dq,
-            &plan[0],
-            &dpe,
-            &d_sel,
-            pages,
-            m.heads,
-            m.kv_lora_rank,
-            a.sm_scale,
-        ),
-        ops::attn::mla_prefill_selected(
-            &pq,
+    let scored = match arms {
+        Arms::Split => {
+            let one = Facts::qo_one();
+            let (dq, pq) = q.split(&one);
+            let (dpe, ppe) = q_pe.split(&one);
+            let (d_sel, p_sel) = selection.split(&one);
+            Value::merge(vec![
+                ops::attn::mla_decode_selected(
+                    &dq,
+                    &plan[0],
+                    &dpe,
+                    &d_sel,
+                    pages,
+                    m.heads,
+                    m.kv_lora_rank,
+                    a.sm_scale,
+                ),
+                ops::attn::mla_prefill_selected(
+                    &pq,
+                    &plan[1],
+                    &ppe,
+                    &p_sel,
+                    pages,
+                    m.heads,
+                    m.kv_lora_rank,
+                    a.sm_scale,
+                ),
+            ])
+        }
+        Arms::Whole => ops::attn::mla_prefill_selected(
+            &q,
             &plan[1],
-            &ppe,
-            &p_sel,
+            &q_pe,
+            &selection,
             pages,
             m.heads,
             m.kv_lora_rank,
             a.sm_scale,
         ),
-    ]);
+    };
 
     let v = ops::attn::mla_absorb_out(
         &scored,
@@ -272,6 +376,7 @@ fn index_select(
     positions: &Value,
     act: Dtype,
     ix: &Indexer,
+    arms: Arms,
 ) -> Value {
     let keys = inputs.kv(&ix.keys);
     let write_page = inputs.write_page(&ix.keys);
@@ -300,7 +405,7 @@ fn index_select(
         ix.kpool,
     );
 
-    let (bpos, breq, _brope) = boundaries(positions, &row_valid, ix.kpool);
+    let (bpos, breq, _brope) = boundaries(positions, &row_valid, ix.kpool, arms);
     let k = ops::attn::pool_gather(
         &bpos,
         &breq,
@@ -334,7 +439,15 @@ fn index_select(
 
 /// The three boundary columns, decode and prefill merged: the cell each pooled
 /// entry is cached at, its lane, and the compressed row's position.
-fn boundaries(positions: &Value, row_valid: &Value, ratio: u32) -> (Value, Value, Value) {
+fn boundaries(
+    positions: &Value,
+    row_valid: &Value,
+    ratio: u32,
+    arms: Arms,
+) -> (Value, Value, Value) {
+    if let Arms::Whole = arms {
+        return ops::attn::pool_boundary_prefill(positions, row_valid, ratio);
+    }
     let (one, many) = positions.split(&Facts::qo_one());
     let (dpos, dreq, drope) = ops::attn::pool_boundary_decode(&one, row_valid, ratio);
     let (ppos, preq, prope) = ops::attn::pool_boundary_prefill(&many, row_valid, ratio);

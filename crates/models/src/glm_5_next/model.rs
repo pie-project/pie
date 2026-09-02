@@ -24,9 +24,43 @@ pub struct Model {
     pub layers: Vec<Layer>,
     pub final_norm: Weight,
     pub final_norm_eps: f32,
+    /// The draft head, or `None` for a row without one.
+    pub mtp: Option<Mtp>,
 }
 
 pub use crate::adapter::Adapters;
+
+/// **THE DRAFT HEAD** — GLM-5.3-Flash's one `nextn` layer (`layers.45`, the
+/// DeepSeek-V3 `MTP` shape): the next token's embedding and the trunk's
+/// collapsed residual each normed, fused by `eh_proj` (stored as one
+/// `[hidden, 2·hidden]` plane, read as its two column halves), one DSA+MoE
+/// block over the fused row, the head's own norm (`shared_head.norm`) and
+/// the base `lm_head`. No hyper connections: the head reads the collapsed
+/// residual, not the streams.
+///
+/// ```text
+/// x   = e_proj(enorm(embed(tok))) + h_proj(hnorm(y))
+/// x   = block(x)                                   (DSA + MoE, pre-norm)
+/// out = lm_head(norm(x))
+/// ```
+pub struct Mtp {
+    pub enorm: Weight,
+    pub hnorm: Weight,
+    pub e_proj: Weight,
+    pub h_proj: Weight,
+    pub mixer_norm: Weight,
+    pub mixer_norm_eps: f32,
+    pub attn: Mla,
+    pub mlp_norm: Weight,
+    pub mlp_norm_eps: f32,
+    pub mlp: Mlp,
+    pub norm: Weight,
+    pub norm_eps: f32,
+    /// How many tokens past a readout row the head drafts (the checkpoint
+    /// ships one prediction layer, run at depth 1). The `mtp.drafts` seam is
+    /// `[rows, depth]` and the shell advertises `depth` as `mtp_depth`.
+    pub depth: u32,
+}
 
 /// The manifold hyper-connection tower's own constants (`hc_mult`, `hc_eps`,
 /// `hc_sinkhorn_iters`).
@@ -216,11 +250,17 @@ impl Model {
     /// `Vontra/GLM-5.3-Flash-MLX-2bit-MTP`, text only: 45 layers, hidden 4096,
     /// 288 routed experts top-8, the KDA/DSA cadence, mHC over four streams.
     pub fn flash(w: Dtype, experts: Dtype, kv: Dtype, tp: u32) -> Model {
-        Model::new(
-            w,
-            experts,
-            kv,
-            tp,
+        Model::new(w, experts, None, kv, tp, Model::flash_dims())
+    }
+
+    /// [`flash`](Model::flash) with the draft head over it: the checkpoint's
+    /// `layers.45` block, its routed experts in `head_experts` (Q4 in
+    /// Vontra's conversion, where the trunk's are Q2).
+    pub fn flash_mtp(w: Dtype, experts: Dtype, head_experts: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, experts, Some(head_experts), kv, tp, Model::flash_dims())
+    }
+
+    fn flash_dims() -> Dims {
             Dims {
                 hidden: 4096,
                 layers: 45,
@@ -261,11 +301,17 @@ impl Model {
                 theta: 10_000.0,
                 vocab: 154_880,
                 norm_eps: 1e-5,
-            },
-        )
+            }
     }
 
-    fn new(weights: Dtype, experts: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+    fn new(
+        weights: Dtype,
+        experts: Dtype,
+        draft: Option<Dtype>,
+        kv: Dtype,
+        tp: u32,
+        d: Dims,
+    ) -> Model {
         assert!(
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
@@ -299,6 +345,104 @@ impl Model {
 
         let dsa_at = |l: u32| d.full_attn_every > 0 && (l + 1).is_multiple_of(d.full_attn_every);
 
+        // **ONE MLA, STATED FOR A SITE**: the trunk's eleven DSA mixers and the
+        // draft head's one are the same block; what differs per site is its
+        // name prefix and its cache rows.
+        let mla_at = |prefix: String, kv_row: String, index_row: String| -> Mla {
+            let n = |s: &str| format!("{prefix}.{s}");
+            let norm = |s: &str, width: u64| Weight::sym(n(s), [width], dense);
+            Mla {
+                qk_nope_head_dim: a.qk_nope_head_dim,
+                qk_rope_head_dim: a.qk_rope_head_dim,
+                v_head_dim: a.v_head_dim,
+                sm_scale: (qk_head_dim as f32).sqrt().recip(),
+                q_a_proj: Weight::sym(n("q_a_proj"), [q_lora, hidden], weights),
+                q_a_norm: norm("q_a_norm", q_lora),
+                q_a_norm_eps: d.norm_eps,
+                q_b_proj: Weight::sym(n("q_b_proj"), [q_b_width, q_lora], weights)
+                    .columns(),
+                kv_a_proj: Weight::sym(n("kv_a_proj"), [kv_a_width, hidden], weights),
+                kv_a_norm: norm("kv_a_norm", kv_lora),
+                kv_a_norm_eps: d.norm_eps,
+                kv_b_proj: Weight::sym(n("kv_b_proj"), [kv_b_width, kv_lora], weights)
+                    .columns(),
+                o_proj: Weight::sym(n("o_proj"), [hidden, v_width], weights).rows(),
+                indexer: Indexer {
+                    heads: d.index_heads,
+                    head_dim: d.index_head_dim,
+                    top_k: d.index_top_k,
+                    kpool: d.index_kpool,
+                    rope_dim: a.qk_rope_head_dim,
+                    theta: d.theta,
+                    wq_b: Weight::sym(n("index_q_proj"), [index_width, q_lora], weights),
+                    wk: Weight::sym(
+                        n("index_k_proj"),
+                        [d.index_head_dim as u64, hidden],
+                        weights,
+                    ),
+                    weights_proj: Weight::sym(
+                        n("index_weights"),
+                        [d.index_heads as u64, hidden],
+                        weights,
+                    ),
+                    k_norm: norm("index_k_norm", d.index_head_dim as u64),
+                    k_norm_bias: Weight::sym(
+                        n("index_k_norm_bias"),
+                        [d.index_head_dim as u64],
+                        dense,
+                    ),
+                    k_norm_eps: d.norm_eps,
+                    kpool_ape: Weight::sym(
+                        n("index_kpool_ape"),
+                        [d.index_kpool as u64, d.index_head_dim as u64],
+                        Dtype::F32,
+                    ),
+                    kpool_gate: Weight::sym(
+                        n("index_kpool_gate"),
+                        [d.index_head_dim as u64, hidden],
+                        dense,
+                    ),
+                    keys: index_row,
+                },
+                kv: kv_row,
+            }
+        };
+        // **ONE ROUTED MLP, STATED FOR A SITE**: the trunk's and the head's
+        // differ in prefix and in the experts' dtype.
+        let routed_at = |prefix: String, experts: Dtype| -> Mlp {
+            let n = |s: &str| format!("{prefix}.{s}");
+            let m = &d.moe;
+            let iw = moe_inter as u64;
+            let sw = shared_inter as u64;
+            Mlp::Routed {
+                router: Weight::sym(n("router"), [m.experts as u64, hidden], dense),
+                bias: Weight::sym(n("router_bias"), [m.experts as u64], Dtype::F32),
+                gate_up: Weight::sym(
+                    n("experts_gate_up"),
+                    [m.experts as u64, 2 * iw, hidden],
+                    experts,
+                )
+                .bank([iw, iw]),
+                down: Weight::sym(
+                    n("experts_down"),
+                    [m.experts as u64, hidden, iw],
+                    experts,
+                )
+                .rows(),
+                shared: (shared_inter > 0).then(|| Shared {
+                    gate_up: Weight::sym(n("shared_gate_up"), [2 * sw, hidden], weights)
+                        .packed([sw, sw]),
+                    down: Weight::sym(n("shared_down"), [hidden, sw], weights).rows(),
+                    inter: shared_inter,
+                }),
+                experts: m.experts,
+                top_k: m.top_k,
+                inter: moe_inter,
+                limit: d.swiglu_limit,
+                renorm: m.renorm,
+                scaling: m.scaling,
+            }
+        };
         let layers = (0..d.layers)
             .map(|l| {
                 let n = |s: &str| format!("layer.{l}.{s}");
@@ -312,61 +456,11 @@ impl Model {
                     crate::adapter::banks(&format!("layer.{l}"), ADAPTERS, hidden, dense);
 
                 let mixer = if dsa_at(l) {
-                    Mixer::Mla(Mla {
-                        qk_nope_head_dim: a.qk_nope_head_dim,
-                        qk_rope_head_dim: a.qk_rope_head_dim,
-                        v_head_dim: a.v_head_dim,
-                        sm_scale: (qk_head_dim as f32).sqrt().recip(),
-                        q_a_proj: Weight::sym(n("q_a_proj"), [q_lora, hidden], weights),
-                        q_a_norm: norm("q_a_norm", q_lora),
-                        q_a_norm_eps: d.norm_eps,
-                        q_b_proj: Weight::sym(n("q_b_proj"), [q_b_width, q_lora], weights)
-                            .columns(),
-                        kv_a_proj: Weight::sym(n("kv_a_proj"), [kv_a_width, hidden], weights),
-                        kv_a_norm: norm("kv_a_norm", kv_lora),
-                        kv_a_norm_eps: d.norm_eps,
-                        kv_b_proj: Weight::sym(n("kv_b_proj"), [kv_b_width, kv_lora], weights)
-                            .columns(),
-                        o_proj: Weight::sym(n("o_proj"), [hidden, v_width], weights).rows(),
-                        indexer: Indexer {
-                            heads: d.index_heads,
-                            head_dim: d.index_head_dim,
-                            top_k: d.index_top_k,
-                            kpool: d.index_kpool,
-                            rope_dim: a.qk_rope_head_dim,
-                            theta: d.theta,
-                            wq_b: Weight::sym(n("index_q_proj"), [index_width, q_lora], weights),
-                            wk: Weight::sym(
-                                n("index_k_proj"),
-                                [d.index_head_dim as u64, hidden],
-                                weights,
-                            ),
-                            weights_proj: Weight::sym(
-                                n("index_weights"),
-                                [d.index_heads as u64, hidden],
-                                weights,
-                            ),
-                            k_norm: norm("index_k_norm", d.index_head_dim as u64),
-                            k_norm_bias: Weight::sym(
-                                n("index_k_norm_bias"),
-                                [d.index_head_dim as u64],
-                                dense,
-                            ),
-                            k_norm_eps: d.norm_eps,
-                            kpool_ape: Weight::sym(
-                                n("index_kpool_ape"),
-                                [d.index_kpool as u64, d.index_head_dim as u64],
-                                Dtype::F32,
-                            ),
-                            kpool_gate: Weight::sym(
-                                n("index_kpool_gate"),
-                                [d.index_head_dim as u64, hidden],
-                                dense,
-                            ),
-                            keys: format!("index.{l}"),
-                        },
-                        kv: format!("kv.{l}"),
-                    })
+                    Mixer::Mla(mla_at(
+                        format!("layer.{l}"),
+                        format!("kv.{l}"),
+                        format!("index.{l}"),
+                    ))
                 } else {
                     Mixer::Kda(Kda {
                         heads: kda_heads,
@@ -412,37 +506,7 @@ impl Model {
                         limit: d.swiglu_limit,
                     }
                 } else {
-                    let m = &d.moe;
-                    let iw = moe_inter as u64;
-                    let sw = shared_inter as u64;
-                    Mlp::Routed {
-                        router: Weight::sym(n("router"), [m.experts as u64, hidden], dense),
-                        bias: Weight::sym(n("router_bias"), [m.experts as u64], Dtype::F32),
-                        gate_up: Weight::sym(
-                            n("experts_gate_up"),
-                            [m.experts as u64, 2 * iw, hidden],
-                            experts,
-                        )
-                        .bank([iw, iw]),
-                        down: Weight::sym(
-                            n("experts_down"),
-                            [m.experts as u64, hidden, iw],
-                            experts,
-                        )
-                        .rows(),
-                        shared: (shared_inter > 0).then(|| Shared {
-                            gate_up: Weight::sym(n("shared_gate_up"), [2 * sw, hidden], weights)
-                                .packed([sw, sw]),
-                            down: Weight::sym(n("shared_down"), [hidden, sw], weights).rows(),
-                            inter: shared_inter,
-                        }),
-                        experts: m.experts,
-                        top_k: m.top_k,
-                        inter: moe_inter,
-                        limit: d.swiglu_limit,
-                        renorm: m.renorm,
-                        scaling: m.scaling,
-                    }
+                    routed_at(format!("layer.{l}"), experts)
                 };
 
                 Layer {
@@ -459,6 +523,24 @@ impl Model {
                 }
             })
             .collect();
+
+        // **THE DRAFT HEAD** (`layers.45` of the checkpoint): its planes come
+        // in under `mtp.`; `eh_proj` is read as two column halves.
+        let mtp = draft.map(|head_experts| Mtp {
+            enorm: Weight::sym("mtp.enorm", [hidden], dense),
+            hnorm: Weight::sym("mtp.hnorm", [hidden], dense),
+            e_proj: Weight::sym("mtp.e_proj", [hidden, hidden], Dtype::Bf16),
+            h_proj: Weight::sym("mtp.h_proj", [hidden, hidden], Dtype::Bf16),
+            mixer_norm: Weight::sym("mtp.mixer_norm", [hidden], dense),
+            mixer_norm_eps: d.norm_eps,
+            attn: mla_at("mtp".to_string(), "kv.mtp".to_string(), "index.mtp".to_string()),
+            mlp_norm: Weight::sym("mtp.mlp_norm", [hidden], dense),
+            mlp_norm_eps: d.norm_eps,
+            mlp: routed_at("mtp".to_string(), head_experts),
+            norm: Weight::sym("mtp.norm", [hidden], dense),
+            norm_eps: d.norm_eps,
+            depth: DRAFT_DEPTH,
+        });
 
         Model {
             hidden: d.hidden,
@@ -481,9 +563,14 @@ impl Model {
             layers,
             final_norm: Weight::sym("final_norm", [hidden], dense),
             final_norm_eps: d.norm_eps,
+            mtp,
         }
     }
 }
 
 /// Deployment ceiling for adapter slots/rank; change and re-trace to grow it.
 const ADAPTERS: Adapters = Adapters { slots: 8, rank: 16 };
+
+/// Tokens the draft head drafts past a readout row: the checkpoint's one
+/// prediction layer, run as trained.
+const DRAFT_DEPTH: u32 = 1;
