@@ -139,6 +139,46 @@ impl Buffer {
             // bytes, matching what `newBufferWithBytesNoCopy` requires; the
             // window checked above lies inside it.
             let at = unsafe { map.base().add(cut.base()) };
+            // `PIE_METAL_COPY_RESIDENT=1`: an experiment — copy the window
+            // into a buffer Metal allocated rather than binding the mapping,
+            // to price the no-copy binding's first-use wiring.
+            if std::env::var_os("PIE_METAL_COPY_RESIDENT").is_some_and(|v| v != "0") {
+                let started = std::time::Instant::now();
+                let mut owned = Buffer::zeroed(device, cut.span() as u64)?;
+                let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+                let chunk = (cut.span() / threads).next_multiple_of(1 << 20).max(1 << 20);
+                let dst = owned.slab.contents().as_ptr().cast::<u8>() as usize;
+                let src = at.as_ptr() as usize;
+                std::thread::scope(|scope| {
+                    for t in 0..threads {
+                        let lo = t * chunk;
+                        if lo >= cut.span() {
+                            break;
+                        }
+                        let len = (cut.span() - lo).min(chunk);
+                        scope.spawn(move || {
+                            // SAFETY: disjoint `[lo, lo + len)` windows of two
+                            // live allocations of at least `span` bytes.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    (src + lo) as *const u8,
+                                    (dst + lo) as *mut u8,
+                                    len,
+                                );
+                            }
+                        });
+                    }
+                });
+                if std::env::var_os("PIE_TIER_TRACE").is_some() {
+                    eprintln!(
+                        "load: copied a {:.2} GiB resident window in {:.2} s",
+                        cut.span() as f64 / (1u64 << 30) as f64,
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                owned.bytes = cut.bytes();
+                return Ok(owned);
+            }
             let slab = unsafe { device.no_copy(at, cut.span()) }.map_err(|why| Fault::Mapped {
                 step: "bind",
                 what: map.path().display().to_string(),

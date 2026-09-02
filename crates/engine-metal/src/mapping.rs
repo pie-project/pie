@@ -287,6 +287,9 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
 
     let mut sorted: Vec<(&str, u64, u64)> = bound.to_vec();
     sorted.sort_by_key(|(_, offset, length)| (*offset, *length));
+    if std::env::var_os("PIE_METAL_PREFAULT").is_some_and(|v| v != "0") {
+        prefault(map, &sorted);
+    }
 
     let chunk = |base: usize, end: usize| Cut {
         base,
@@ -480,4 +483,64 @@ mod tests {
         assert!(said.contains("past-the-end"), "the refusal names it: {said}");
     }
 
+}
+
+/// **PREFAULT THE RESIDENT PLANES** (`PIE_METAL_PREFAULT=1`): the artifact is
+/// mapped and bound without a copy, so the device's first touch of a plane
+/// page-faults it in — a random walk over the whole resident tier that the
+/// first fire after boot waits on. Asking the kernel for the pages up front,
+/// sequentially and on several threads, is the same bytes at the disk's
+/// sequential rate instead.
+fn prefault(map: &Mapping, planes: &[(&str, u64, u64)]) {
+    let page = page() as u64;
+    let base = map.base().as_ptr() as usize as u64;
+    let len = map.len();
+    let started = std::time::Instant::now();
+    let mut ranges: Vec<(u64, u64)> = planes
+        .iter()
+        .map(|&(_, offset, length)| {
+            let lo = offset / page * page;
+            let hi = (offset + length).min(len).div_ceil(page) * page;
+            (lo, hi.min(map.span() as u64))
+        })
+        .filter(|(lo, hi)| hi > lo)
+        .collect();
+    ranges.sort_unstable();
+    let total: u64 = ranges.iter().map(|(lo, hi)| hi - lo).sum();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let shares: Vec<Vec<(u64, u64)>> = (0..threads)
+        .map(|t| ranges.iter().copied().skip(t).step_by(threads).collect())
+        .collect();
+    std::thread::scope(|scope| {
+        for share in &shares {
+            scope.spawn(move || {
+                let mut sink = 0u64;
+                for &(lo, hi) in share {
+                    // SAFETY: `[lo, hi)` lies inside the live PROT_READ mapping.
+                    unsafe {
+                        libc::madvise(
+                            (base + lo) as *mut libc::c_void,
+                            (hi - lo) as usize,
+                            libc::MADV_WILLNEED,
+                        );
+                        let mut at = lo;
+                        while at < hi {
+                            sink = sink.wrapping_add(u64::from(std::ptr::read_volatile(
+                                (base + at) as *const u8,
+                            )));
+                            at += page;
+                        }
+                    }
+                }
+                std::hint::black_box(sink);
+            });
+        }
+    });
+    if std::env::var_os("PIE_TIER_TRACE").is_some() {
+        eprintln!(
+            "load: prefaulted {:.2} GiB of resident planes in {:.2} s",
+            total as f64 / (1u64 << 30) as f64,
+            started.elapsed().as_secs_f64()
+        );
+    }
 }

@@ -490,6 +490,8 @@ impl Weights {
         handles: &Handles,
         trace: &Trace,
     ) -> Result<()> {
+        let started = std::time::Instant::now();
+        let mut decoded_bytes = 0u64;
         for at in crate::decoded::absorbed_weights(trace) {
             let Some(Some(WeightRow::Planes(bank))) = self.table.0.get(at).copied() else {
                 continue;
@@ -528,6 +530,7 @@ impl Weights {
             let mut buffer = Buffer::zeroed(device, plane.len() as u64)?;
             buffer.write(0, &plane)?;
             let handle = handles.bind(&buffer, 0, plane.len() as u64)?;
+            decoded_bytes += plane.len() as u64;
             self.table.0[at] = Some(WeightRow::Dense(Tensor::new(
                 handle,
                 u32::try_from(n).unwrap_or(u32::MAX),
@@ -535,6 +538,13 @@ impl Weights {
                 Dtype::Bf16,
             )));
             self.decoded.push(buffer);
+        }
+        if decoded_bytes > 0 && std::env::var_os("PIE_TIER_TRACE").is_some() {
+            eprintln!(
+                "load: decoded {:.2} GiB of absorbed banks to bf16 in {:.2} s",
+                decoded_bytes as f64 / (1u64 << 30) as f64,
+                started.elapsed().as_secs_f64()
+            );
         }
         Ok(())
     }
